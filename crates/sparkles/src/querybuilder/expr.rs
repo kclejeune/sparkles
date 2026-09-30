@@ -5,7 +5,7 @@
 //!
 //! * `&str` / `String` — SPARQL expression text such as `"?age > 30"` or
 //!   `"STRLEN(?name)"`. A string that is a single term (`"?x"`, `"ex:p"`, `"42"`) becomes
-//!   that term. Raw text is *syntax*: never splice untrusted data into it, use [`lit`](super::lit)
+//!   that term. Raw text is *syntax*: never splice untrusted data into it, use [`lit`]
 //!   and friends instead.
 //! * [`Node`] and everything that converts into one (`var("x")`, `iri(..)`, `lit(..)`,
 //!   numbers, booleans, `oxrdf` terms).
@@ -227,7 +227,11 @@ node_into_expr!(
 // ------------------------------------------------------------------ operators ----
 
 fn bin(op: BinOp, a: impl IntoExpr, b: impl IntoExpr) -> Expr {
-    Expr(E::Binary(op, Box::new(a.into_expr()), Box::new(b.into_expr())))
+    Expr(E::Binary(
+        op,
+        Box::new(a.into_expr()),
+        Box::new(b.into_expr()),
+    ))
 }
 
 /// `a || b`
@@ -428,7 +432,11 @@ pub fn regex(e: impl IntoExpr, pattern: &str) -> Expr {
 pub fn regex_flags(e: impl IntoExpr, pattern: &str, flags: &str) -> Expr {
     call(
         "REGEX",
-        vec![e.into_expr(), lit(pattern).into_expr(), lit(flags).into_expr()],
+        vec![
+            e.into_expr(),
+            lit(pattern).into_expr(),
+            lit(flags).into_expr(),
+        ],
     )
 }
 /// `CONCAT(e1, e2, …)`
@@ -437,7 +445,10 @@ pub fn concat<T: IntoExpr>(es: impl IntoIterator<Item = T>) -> Expr {
 }
 /// `COALESCE(e1, e2, …)`
 pub fn coalesce<T: IntoExpr>(es: impl IntoIterator<Item = T>) -> Expr {
-    call("COALESCE", es.into_iter().map(IntoExpr::into_expr).collect())
+    call(
+        "COALESCE",
+        es.into_iter().map(IntoExpr::into_expr).collect(),
+    )
 }
 /// `IF(cond, then, else)`
 pub fn if_(c: impl IntoExpr, then: impl IntoExpr, otherwise: impl IntoExpr) -> Expr {

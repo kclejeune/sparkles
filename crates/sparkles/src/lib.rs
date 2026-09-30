@@ -4,6 +4,7 @@ pub mod error;
 pub mod id;
 pub mod index;
 pub mod io;
+pub mod querybuilder;
 pub mod sparql;
 pub mod store;
 pub mod vocab;

@@ -417,7 +417,9 @@ macro_rules! int_into_node {
         }
     )*};
 }
-int_into_node!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+int_into_node!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
 
 fn float_node(v: f64, dt: &str, display: String) -> Node {
     if v.is_nan() {
@@ -499,8 +501,7 @@ fn pn_local_len(s: &str) -> usize {
         let step;
         let ok_end;
         if c == '%' {
-            if b.len() >= i + 3 && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit()
-            {
+            if b.len() >= i + 3 && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
                 step = 3;
                 ok_end = true;
             } else {
@@ -538,8 +539,10 @@ static LANGTAG: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z]+(-[a-zA-Z0-9]+)*(--[a-zA-Z]+)?$").expect("valid regex")
 });
 static NUMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^[+-]?([0-9]+|[0-9]*\.[0-9]+|([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)[eE][+-]?[0-9]+)$")
-        .expect("valid regex")
+    regex::Regex::new(
+        r"^[+-]?([0-9]+|[0-9]*\.[0-9]+|([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)[eE][+-]?[0-9]+)$",
+    )
+    .expect("valid regex")
 });
 
 // ---------------------------------------------------------------------- lexer ----
@@ -617,8 +620,7 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<(Tok, usize, usize)>, String> {
                 i -= 1;
             }
             Tok::Blank
-        } else if c.is_ascii_digit() || (c == '.' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
-        {
+        } else if c.is_ascii_digit() || (c == '.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
             while i < src.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
                 i += 1;
             }
@@ -741,7 +743,12 @@ fn unescape_string(s: &str) -> Result<String, String> {
                     .ok_or_else(|| format!("invalid \\{u} escape"))?;
                 out.push(ch);
             }
-            other => return Err(format!("invalid escape sequence \\{}", other.unwrap_or(' '))),
+            other => {
+                return Err(format!(
+                    "invalid escape sequence \\{}",
+                    other.unwrap_or(' ')
+                ));
+            }
         }
     }
     Ok(out)
@@ -887,7 +894,10 @@ mod tests {
         assert_eq!(parse_term("$x"), var("x"));
         assert_eq!(parse_term("<http://e/x>"), iri("http://e/x"));
         assert_eq!(parse_term("a").0, N::A);
-        assert_eq!(parse_term("foaf:name").0, N::Prefixed("foaf".into(), "name".into()));
+        assert_eq!(
+            parse_term("foaf:name").0,
+            N::Prefixed("foaf".into(), "name".into())
+        );
         assert_eq!(parse_term(":x").0, N::Prefixed("".into(), "x".into()));
         assert_eq!(parse_term("\"a\\\"b\""), lit("a\"b"));
         assert_eq!(parse_term("'''x\ny'''"), lit("x\ny"));
@@ -906,6 +916,31 @@ mod tests {
         assert!(matches!(parse_term("\"x\" } ").0, N::Invalid(_)));
         assert!(matches!(parse_term("?").0, N::Invalid(_)));
         assert!(matches!(parse_term("ex:p ; ?x").0, N::Invalid(_)));
+    }
+
+    #[test]
+    fn never_panics_on_unicode() {
+        for s in [
+            "?é",
+            "\"é\\é\"",
+            "\"é\\",
+            "ex:é.",
+            "'é",
+            "<é",
+            "_:é.",
+            "é:ü%4",
+            "\"\"\"é\"\"é",
+            "ex:a\\é",
+            "?x\u{0}",
+            "«»",
+            ".é",
+            "1.é",
+            "\"x\"@é",
+            "\"x\"^^é",
+        ] {
+            let _ = parse_term(s);
+            let _ = tokenize(s);
+        }
     }
 
     #[test]
