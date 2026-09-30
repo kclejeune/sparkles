@@ -1,0 +1,40 @@
+[package]
+name = "sparkles"
+description = "High-performance RDF/SPARQL database engine (Jena-compatible, QLever-style index)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxrdf.workspace = true
+oxrdfio.workspace = true
+oxttl.workspace = true
+oxiri.workspace = true
+spargebra.workspace = true
+sparesults.workspace = true
+oxsdatatypes.workspace = true
+imbl.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+memmap2.workspace = true
+lz4_flex.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+rand.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+quick_cache = "0.7.0"
+tempfile = "3"
+
+[dev-dependencies]
+tempfile.workspace = true
