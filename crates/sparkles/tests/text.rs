@@ -484,3 +484,23 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
         assert!(!root.join("text.dirty").exists(), "{name}");
     }
 }
+
+#[test]
+fn searches_count_toward_the_memory_budget() {
+    let s = mem();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(8),
+        ..Default::default()
+    };
+    let Err(e) = query(
+        s.snapshot(),
+        &format!("{P}SELECT ?s {{ ?s text:query \"fox\" }}"),
+        &opts,
+    ) else {
+        panic!("over budget");
+    };
+    assert!(
+        matches!(e, sparkles::Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::Memory),
+        "{e}"
+    );
+}

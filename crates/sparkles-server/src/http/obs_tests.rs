@@ -791,3 +791,24 @@ async fn client_disconnect_cancels_the_query() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn error_bodies_carry_the_request_id() {
+    let s = server();
+    let r = get(&s.app, "/nope/sparql?query=ASK%7B%7D").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let j = r.json();
+    assert_eq!(j["requestId"], r.header("x-request-id"), "{j}");
+    assert!(j["error"].as_str().unwrap().contains("nope"));
+    // an incoming id is the one reported
+    let r = get_with(
+        &s.app,
+        "/ds/sparql?query=SELEC",
+        "x-request-id",
+        "client-42",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["requestId"], "client-42");
+    assert_eq!(r.header("content-length"), r.body.len().to_string());
+}

@@ -2425,6 +2425,7 @@ fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> R
         dedup: spec.dedup,
     };
     let hits = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+    ctx.check_output(hits.len(), vars.len())?;
     let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
     let cs = match spec.subject {
         PathEnd::Var(v) => col(Some(v)),

@@ -108,6 +108,9 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
+        /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
+        #[arg(long, default_value_t = 4096)]
+        vector_memory_mb: u64,
         /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
         #[arg(long, default_value_t = 0.0)]
         update_timeout: f64,
@@ -559,6 +562,7 @@ fn main() -> Result<()> {
             max_result_mb,
             max_rows,
             update_timeout,
+            vector_memory_mb,
             auto_reason,
             auto_reason_max_delay,
         } => {
@@ -566,6 +570,7 @@ fn main() -> Result<()> {
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
+            sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             let mib = |m: u64| (m > 0).then_some(m << 20);

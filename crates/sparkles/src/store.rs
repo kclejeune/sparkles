@@ -161,6 +161,15 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// The same snapshot, reading through the block cache without filling it: for full
+    /// scans such as exports, which would evict the blocks queries use.
+    pub fn without_cache_fill(&self) -> Snapshot {
+        Snapshot {
+            cache: Arc::new(self.cache.read_through()),
+            ..self.clone()
+        }
+    }
+
     #[inline]
     pub fn perm(&self, p: Perm) -> &PermIndex {
         self.generation.perm(p)
@@ -1651,7 +1660,7 @@ impl Store {
 
     /// Write all quads as N-Quads to `w`.
     pub fn dump_nquads(&self, w: impl Write) -> Result<u64> {
-        let snap = self.snapshot();
+        let snap = self.snapshot().without_cache_fill();
         let mut ser = oxttl::NQuadsSerializer::new().for_writer(w);
         let mut n = 0;
         snap.for_each_quad(|q| {

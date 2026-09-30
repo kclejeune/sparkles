@@ -79,6 +79,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/upload", post(upload))
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
+        .route("/$/vector/{ds}", get(vector_status))
+        .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(cors)
@@ -116,13 +118,40 @@ impl IntoResponse for ApiError {
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
         };
-        RequestReport {
+        let mut resp = RequestReport {
             outcome,
             budget,
             ..Default::default()
         }
-        .attach((self.0, Json(self.1)).into_response())
+        .attach((self.0, Json(self.1.clone())).into_response());
+        resp.extensions_mut().insert(ErrorJson(self.1));
+        resp
     }
+}
+
+/// The JSON body of an [`ApiError`] response, for [`error_request_id`].
+#[derive(Clone)]
+struct ErrorJson(J);
+
+/// Add the request's id to JSON error bodies (`requestId`), so an error shown by a
+/// client can be found in the logs. Runs inside the layer that assigns the id.
+async fn error_request_id(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let id = req
+        .headers()
+        .get(&crate::obs::X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut resp = next.run(req).await;
+    if let (Some(ErrorJson(mut body)), Some(id)) = (resp.extensions_mut().remove(), id)
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("requestId".into(), id.into());
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        resp.headers_mut()
+            .insert(header::CONTENT_LENGTH, bytes.len().into());
+        *resp.body_mut() = axum::body::Body::from(bytes);
+    }
+    resp
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
@@ -580,6 +609,38 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
 }
 
+// ------------------------------------------------------------------- vectors ------
+
+/// `GET /$/vector/{ds}`: the vector memory budget and the predicates whose vectors are
+/// packed in the current generation (packing happens on a predicate's first search).
+async fn vector_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    let snap = ds.store.snapshot();
+    let vectors = &snap.generation.vectors;
+    let predicates: Vec<J> = vectors
+        .status()
+        .into_iter()
+        .map(|p| {
+            let iri = match snap.term(Id(p.predicate)) {
+                Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
+                other => other.map(|t| t.to_string()).unwrap_or_default(),
+            };
+            json!({
+                "predicate": iri,
+                "bytes": p.bytes,
+                "malformed": p.malformed,
+                "dimensions": p.dims.iter().map(|(dim, rows)| json!({ "dimension": dim, "vectors": rows })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "budgetBytes": sparkles::vector::budget(),
+        "usedBytes": vectors.used_bytes(),
+        "generation": snap.generation.name,
+        "predicates": predicates,
+    })))
+}
+
 // ---------------------------------------------------------------- full-text ------
 
 #[cfg(feature = "text")]
@@ -980,6 +1041,8 @@ async fn graph_body(
 ) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
     let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = quads.clone();
+    // an export reads every block once: keep the blocks queries use cached
+    let snap = snap.without_cache_fill();
     let prefixes = ds.store.prefixes();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let mut ser = RdfSerializer::from_format(fmt);
@@ -1958,6 +2021,7 @@ async fn shacl(
         );
         let buf = crate::shacl::write_report(&report, rfmt)?;
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
+        let resp = with_commit(resp, &ds, snap.commit);
         Ok(with_inferences(
             resp,
             &ds,

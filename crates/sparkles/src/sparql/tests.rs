@@ -1279,3 +1279,22 @@ fn limited_writer_enforces_the_result_size() {
     let e = std::io::Write::write_all(&mut w, &big).unwrap_err();
     assert!(matches!(w.classify(Error::Io(e)), Error::Cancelled));
 }
+
+#[test]
+fn exports_read_through_the_block_cache() {
+    let s = store();
+    let before = s.cache().bytes();
+    let mut out = Vec::new();
+    let n = s.dump_nquads(&mut out).unwrap();
+    assert!(n > 0);
+    // a full export decodes every block but keeps none of them
+    assert_eq!(s.cache().bytes(), before);
+    // a query still fills the cache, and the export can use what it holds
+    q(&s, "SELECT * { ?s ?p ?o }");
+    let warm = s.cache().bytes();
+    assert!(warm > before);
+    let mut again = Vec::new();
+    assert_eq!(s.dump_nquads(&mut again).unwrap(), n);
+    assert_eq!(s.cache().bytes(), warm);
+    assert_eq!(out, again);
+}

@@ -359,7 +359,8 @@ load, reasoning) gets the next `seq`. A write with no net effect, such as insert
 quad that is already present, creates no commit. Commit 0 is the root. Compaction keeps
 the head. Ids survive restarts and are durable exactly when the data is.
 
-**Headers.** Every successful query, update, Graph Store and explain response carries:
+**Headers.** Every successful query, update, Graph Store, explain and SHACL validation
+response carries:
 
 ```
 Sparkles-Commit: 42                 (the commit a read saw, or a write produced)
@@ -502,8 +503,12 @@ as written; one that does not parse is stored but never matched.
 * **Implementation:** vectors are packed per predicate and dimension on first use and
   cached per index generation. Every query overlays its snapshot's uncommitted inserts
   and deletes, so results always match its data. A process-wide budget (default 4 GiB)
-  caps the packed vectors; beyond it a search returns `507`. A variable query vector
-  gives `501`.
+  caps the packed vectors (`sparkles serve --vector-memory-mb`, default 4096); beyond it
+  a search returns `507`. A variable query vector gives `501`.
+* **Status:** `GET /$/vector/{ds}` returns
+  `{ budgetBytes, usedBytes, generation, predicates: [{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }] }`
+  for the predicates packed so far in the current generation (packing happens on a
+  predicate's first search; `vectors` counts a vector once per graph it is in).
 
 ## Reasoning status and diagnostics
 
@@ -697,7 +702,8 @@ type PlanNode = {
 
 ## Errors
 
-Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number }`
+Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`
+(`requestId` is the response's `X-Request-Id`, for finding the request in the logs)
 with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `503` for a
 cancelled query or when a write-ahead log write failed (writes are refused until restart;
 reads continue), `500` otherwise.

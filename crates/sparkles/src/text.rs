@@ -1027,6 +1027,8 @@ mod imp {
                 requested: hits.len() as u64,
             }));
         }
+        // the per-query memory budget, before the output is built
+        ctx.check_output(hits.len(), vars.len())?;
         // columns
         let mut t = Table::new(vars.to_vec());
         let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));

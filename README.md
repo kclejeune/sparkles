@@ -400,6 +400,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
 | `--max-result-mb N` | `1024` | budget for the body of a query response (`0`: unlimited); Graph Store GET streams and has none |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
+| `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |
 | `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |
