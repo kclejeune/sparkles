@@ -15,7 +15,7 @@ use crate::index::Perm;
 use crate::store::{Chunk, Snapshot};
 pub use ctx::{Ctx, DatasetSpec};
 pub use exec::PlanInfo;
-use oxrdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
 use plan::{ActiveGraph, Planner};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -38,6 +38,9 @@ pub struct QueryOptions {
     pub max_rows: Option<usize>,
     pub allow_service: bool,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Graphs merged into the store's default graph when the query does not specify a
+    /// dataset (used for the materialized-inference overlay).
+    pub default_graph_extra: Vec<String>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
 }
@@ -124,20 +127,18 @@ fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryData
     }
     ctx.allow_service = opts.allow_service;
     ctx.base_iri = base.cloned();
-    let resolve = |iris: &[String]| -> Vec<Id> {
-        iris.iter()
-            .map(|i| ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(i.as_str()))))
-            .collect()
-    };
+    let resolve = |iris: &[String]| -> Vec<Id> { iris.iter().map(|i| ctx.graph_id(i)).collect() };
     let mut ds = DatasetSpec::default();
     if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
-        if !opts.default_graph_uris.is_empty() {
+        if opts.default_graph_uris.iter().any(|g| g == ctx::UNION_GRAPH_IRI) {
+            ds.union_default = true;
+        } else if !opts.default_graph_uris.is_empty() {
             ds.default = Some(resolve(&opts.default_graph_uris));
         }
         if !opts.named_graph_uris.is_empty() {
             ds.named = Some(resolve(&opts.named_graph_uris));
         }
-        if ds.default.is_some() && ds.named.is_none() {
+        if (ds.default.is_some() || ds.union_default) && ds.named.is_none() {
             ds.named = Some(Vec::new());
         }
     } else if let Some(d) = dataset {
@@ -145,6 +146,12 @@ fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryData
         ds.named = Some(resolve(
             &d.named.iter().flatten().map(|n| n.as_str().to_string()).collect::<Vec<_>>(),
         ));
+    }
+    // extra graphs merged into the store's default graph (inference overlay)
+    if ds.default.is_none() && !ds.union_default && !opts.default_graph_extra.is_empty() {
+        let mut d = vec![Id::DEFAULT_GRAPH];
+        d.extend(resolve(&opts.default_graph_extra));
+        ds.default = Some(d);
     }
     ctx.dataset = ds;
     ctx

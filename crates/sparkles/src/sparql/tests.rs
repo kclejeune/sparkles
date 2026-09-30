@@ -242,6 +242,16 @@ fn named_graphs() {
     assert_eq!(strs(&r), ["a", "a", "b", "c"]);
     let r = q(&s, "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }");
     assert_eq!(strs(&r), ["g1", "g2"]);
+    let r = q(&s, "SELECT ?o WHERE { GRAPH <urn:x-arq:DefaultGraph> { ?s ex:p ?o } }");
+    assert_eq!(strs(&r), ["9"]);
+    let r = q(&s, "SELECT ?o WHERE { GRAPH <urn:x-arq:UnionGraph> { ex:a ex:p ?o } }");
+    assert_eq!(strs(&r), ["1", "3"]);
+    let opts = QueryOptions { default_graph_extra: vec!["http://ex.org/g1".into()], ..Default::default() };
+    let r = query(s.snapshot(), "SELECT ?o WHERE { ?s <http://ex.org/p> ?o }", &opts).unwrap();
+    assert_eq!(strs(&r), ["1", "2", "9"]);
+    let opts = QueryOptions { default_graph_uris: vec!["urn:x-arq:DefaultGraph".into()], ..Default::default() };
+    let r = query(s.snapshot(), "SELECT ?o WHERE { { ?s <http://ex.org/p> ?o } UNION { GRAPH ?g { ?s <http://ex.org/p> ?o } } }", &opts).unwrap();
+    assert_eq!(strs(&r), ["9"]);
     let r = q(&s, "SELECT ?g ?x WHERE { GRAPH ?g { ex:a ex:p* ?x } }");
     assert_eq!(r.table.len(), 4);
 }

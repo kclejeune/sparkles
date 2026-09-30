@@ -14,6 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Jena's IRI for the default graph (`Quad.defaultGraphIRI`).
+pub const DEFAULT_GRAPH_IRI: &str = "urn:x-arq:DefaultGraph";
+/// Jena's IRI for the union of all named graphs (`Quad.unionGraph`).
+pub const UNION_GRAPH_IRI: &str = "urn:x-arq:UnionGraph";
+
 /// RDF dataset for a query (`FROM` / `FROM NAMED` or protocol parameters).
 #[derive(Clone, Debug, Default)]
 pub struct DatasetSpec {
@@ -22,6 +27,8 @@ pub struct DatasetSpec {
     pub default: Option<Vec<Id>>,
     /// Named graphs; `None` = all named graphs in the store.
     pub named: Option<Vec<Id>>,
+    /// default graph is the union of all named graphs
+    pub union_default: bool,
 }
 
 pub struct Ctx {
@@ -125,6 +132,15 @@ impl Ctx {
         }
         let key = id::term_key(t);
         self.intern_key(&key)
+    }
+
+    /// Id for a graph name, mapping Jena's special default-graph IRI.
+    pub fn graph_id(&self, iri: &str) -> Id {
+        if iri == DEFAULT_GRAPH_IRI {
+            Id::DEFAULT_GRAPH
+        } else {
+            self.intern_term(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(iri)))
+        }
     }
 
     pub fn intern_key(&self, key: &[u8]) -> Id {

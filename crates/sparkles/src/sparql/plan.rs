@@ -29,6 +29,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub enum ActiveGraph {
     Default,
+    /// union of all named graphs (`GRAPH <urn:x-arq:UnionGraph>`)
+    Union,
     Named(Id),
     Var(VarId),
 }
@@ -543,9 +545,15 @@ impl<'a> Planner<'a> {
                 self.collect(right, g, items, filters)?;
             }
             GP::Graph { name, inner } => {
-                let g2 = match self.named_pattern(name) {
-                    PT::C(id) => ActiveGraph::Named(id),
-                    PT::V(v) => ActiveGraph::Var(v),
+                let g2 = match name {
+                    NamedNodePattern::NamedNode(n) if n.as_str() == super::ctx::DEFAULT_GRAPH_IRI => {
+                        ActiveGraph::Named(Id::DEFAULT_GRAPH)
+                    }
+                    NamedNodePattern::NamedNode(n) if n.as_str() == super::ctx::UNION_GRAPH_IRI => ActiveGraph::Union,
+                    _ => match self.named_pattern(name) {
+                        PT::C(id) => ActiveGraph::Named(id),
+                        PT::V(v) => ActiveGraph::Var(v),
+                    },
                 };
                 if let GP::Filter { .. } = &**inner {
                     items.push(Item::Node(self.plan(inner, &g2, Vec::new())?));
@@ -603,9 +611,10 @@ impl<'a> Planner<'a> {
                     s.sort_unstable();
                     (GraphFilter::Set(s), None)
                 }
-                None if self.ctx.snap.union_default_graph => (GraphFilter::Named, None),
+                None if ds.union_default || self.ctx.snap.union_default_graph => (GraphFilter::Named, None),
                 None => (GraphFilter::Default, None),
             },
+            ActiveGraph::Union => (GraphFilter::Named, None),
             ActiveGraph::Named(id) => {
                 if id.tag() == Tag::Local {
                     return None;
