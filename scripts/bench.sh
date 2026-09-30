@@ -5,8 +5,9 @@
 #
 # All three engines are queried over HTTP (SPARQL protocol, TSV results) so JVM start-up
 # is not measured. QLever's result cache is cleared in hyperfine's --prepare step (outside
-# the timed region) so repeated runs measure execution rather than cache hits; Sparkles and
-# Fuseki have no query-result cache. Results go to WORKDIR/results/*.{md,json} and a combined
+# the timed region) and Sparkles runs with its result cache disabled (--result-cache-mb 0),
+# so repeated runs measure execution rather than cache hits; Fuseki has no result cache.
+# Results go to WORKDIR/results/*.{md,json} and a combined
 # WORKDIR/results/summary.md.
 #
 # Jena, Fuseki and QLever come from nixpkgs when not on PATH.
@@ -50,7 +51,7 @@ fi
 
 # ---------------------------------------------------------------------------- servers
 SPORT=3931; JPORT=3933; QPORT=3932
-"$SPARKLES" serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
+"$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
 PIDS=($!)
 JVM_ARGS="-Xmx8G" "$FUSEKI" --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
 PIDS+=($!)
