@@ -101,7 +101,8 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
             .parse::<f64>()
             .ok()
             .filter(|t| t.is_finite() && *t > 0.0)
-            .map(Duration::from_secs_f64)
+            .and_then(|t| Duration::try_from_secs_f64(t).ok())
+            .map(|t| st.limits.cap_timeout(t, Some(st.default_timeout)))
             .ok_or_else(|| bad("timeout must be a positive number of seconds"))?,
     };
     let cursor = params

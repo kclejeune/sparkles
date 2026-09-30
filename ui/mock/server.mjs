@@ -196,6 +196,7 @@ const BUCKETS = [
 const OUTCOMES = ['ok', 'client_error', 'error', 'timeout', 'cancelled', 'budget', 'rate_limited'];
 const LIMITS = {
   timeoutSeconds: 60,
+  maxTimeoutSeconds: 1800,
   queryMemoryBytes: 8 * 2 ** 30,
   maxResultBytes: 2 ** 30,
   maxRows: 200_000_000,

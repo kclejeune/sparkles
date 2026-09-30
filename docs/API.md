@@ -37,7 +37,7 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
 
 ### Request ids and the access log
@@ -553,6 +553,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 | Method     | Path                  | Description |
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol (`query=` param, `application/sparql-query` body, or form). `default-graph-uri` / `named-graph-uri` supported. |
+| any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`) and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`: with neither it is refused (`400`, or the authorization error of a write for a caller without write access), never read as RDF. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
@@ -567,9 +568,11 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
 Query parameters beyond the standard protocol:
 
-* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`). Updates
-  accept it too; without it they run under `--update-timeout` (none by default). A timed-out
-  update changes nothing.
+* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`), capped
+  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates accept
+  it too, under the same cap (never below `--update-timeout`); without it they run under
+  `--update-timeout` (none by default). A timed-out update changes nothing. A `408` names
+  the timeout that applied in `timeoutSeconds`.
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
 * `nocache=true` — bypass the query result cache: nothing is read from or stored in it
@@ -1072,6 +1075,11 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6; a number applies to whichever algorithm is chosen |
 | `--http-compression-algorithms` | `zstd,br,gzip,deflate` | the encodings offered |
 | `--max-decompressed-mb` | `65536` | cap on a compressed request body or upload after decompression (0: none) |
+| `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
+| `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
+| `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
+| `--max-upload-mb` | `65536` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
+| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory (0: no check) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
@@ -1079,6 +1087,22 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 recognised as compressed by their first bytes (gzip, zstd, LZ4 frames) and, for uploads,
 by file name (`.gz`, `.zst`, `.br`, `.lz4`). A body that decompresses past
 `--max-decompressed-mb` fails with `413` and commits nothing.
+
+**Body ceilings.** A body that is read whole has the ceiling of its request class:
+`--max-query-body-mb` for queries (also `/{ds}/explain` and the shapes graph of
+`/{ds}/shacl`), `--max-update-body-mb` for updates, `--max-admin-body-mb` for `/$/…`
+requests and prefix changes, and a fixed 64 KiB for `/$/auth/*`. It counts decompressed
+bytes and is checked while the body is read (a declared `Content-Length` over it is
+refused before anything is read), so no more than the ceiling is held; past it the request
+fails with `413`. A form POST to `/{ds}` may hold either operation, so it is read up to
+the larger of the query and update ceilings. Graph Store PUT/POST (also through `/{ds}`)
+and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead,
+up to `--max-upload-mb` (default 65536, i.e. 64 GiB; counted after HTTP decompression;
+`0`: unlimited), else `413`. Files compressed inside the body are capped separately by
+`--max-decompressed-mb` as they are parsed. Before a spooled body is written to the
+temporary directory (every 64 MiB), the server checks that the file system keeps
+`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`. Storage quotas per
+dataset do not exist yet.
 
 **Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
 `auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs
@@ -1096,8 +1120,8 @@ Indexes built before zstd was available keep LZ4 until they are rebuilt.
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`
 (`requestId` is the response's `X-Request-Id`, for finding the request in the logs)
 with `400` for parse errors, `401`/`403` for authentication and permissions, `404` unknown
-dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a
-compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
+dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a body
+over its ceiling or a compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
 `Content-Encoding`, `429` over a rate limit, `503` for a cancelled query, over a concurrency limit (see
 [Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
 until restart; reads continue), `500` otherwise.
@@ -1117,7 +1141,8 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query response. Graph Store GET has no such budget and suits whole-dataset exports.
+  query or Graph Store GET response. A whole-dataset export larger than that needs a
+  higher budget (or `0`), or `sparkles dump` next to the server.
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
@@ -1143,6 +1168,12 @@ the peak estimate of a query.
 `sparkles serve --auth-config FILE` turns authentication on. Without it nothing changes:
 no credentials, permissive CORS, and every request may do everything. With it the server
 **denies by default**: a caller may do only what a grant allows.
+
+Without it the server listens on loopback only: `--host` defaults to `127.0.0.1`, and a
+non-loopback address is refused at startup unless `--allow-open-network` (or
+`SPARKLES_ALLOW_OPEN_NETWORK=1`) is given, which logs a warning. A Unix socket
+(`--unix-socket`) counts as local. An authenticating reverse proxy is no substitute: the
+backend it protects must not be reachable around it.
 
 ### Principals and credentials
 

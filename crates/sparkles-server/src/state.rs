@@ -261,6 +261,18 @@ pub struct Limits {
     pub update_timeout: Option<std::time::Duration>,
     /// decompressed size of a compressed request body or uploaded file
     pub max_decompressed_bytes: Option<u64>,
+    /// request body of a SPARQL query (also `/{ds}/explain` and `/{ds}/shacl`)
+    pub max_query_body_bytes: Option<u64>,
+    /// request body of a SPARQL update
+    pub max_update_body_bytes: Option<u64>,
+    /// request body of an admin (`/$/…`) or prefix change
+    pub max_admin_body_bytes: Option<u64>,
+    /// streamed request body of a Graph Store write or upload (decompressed)
+    pub max_upload_bytes: Option<u64>,
+    /// free space a spooled request body must leave in the temporary directory
+    pub min_free_disk_bytes: Option<u64>,
+    /// the largest `timeout` a request may ask for (never below the server's default)
+    pub max_timeout: Option<std::time::Duration>,
 }
 
 impl Default for Limits {
@@ -271,21 +283,46 @@ impl Default for Limits {
             max_rows: 200_000_000,
             update_timeout: None,
             max_decompressed_bytes: Some(64 << 30),
+            max_query_body_bytes: Some(16 << 20),
+            max_update_body_bytes: Some(256 << 20),
+            max_admin_body_bytes: Some(16 << 20),
+            max_upload_bytes: Some(64 << 30),
+            min_free_disk_bytes: Some(1 << 30),
+            max_timeout: Some(std::time::Duration::from_secs(1800)),
         }
     }
 }
 
 impl Limits {
-    /// `{timeoutSeconds, updateTimeoutSeconds, queryMemoryBytes, maxResultBytes, maxRows}`;
-    /// 0 means unlimited.
+    /// `{timeoutSeconds, updateTimeoutSeconds, maxTimeoutSeconds, queryMemoryBytes,
+    /// maxResultBytes, maxRows, max…BodyBytes, maxUploadBytes}`; 0 means unlimited.
     pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
+        let secs = |t: Option<std::time::Duration>| t.map_or(0.0, |t| t.as_secs_f64());
         serde_json::json!({
             "timeoutSeconds": timeout.as_secs_f64(),
-            "updateTimeoutSeconds": self.update_timeout.map_or(0.0, |t| t.as_secs_f64()),
+            "updateTimeoutSeconds": secs(self.update_timeout),
+            "maxTimeoutSeconds": secs(self.max_timeout.map(|m| m.max(timeout))),
             "queryMemoryBytes": self.query_memory_bytes.unwrap_or(0),
             "maxResultBytes": self.max_result_bytes.unwrap_or(0),
             "maxRows": self.max_rows,
+            "maxQueryBodyBytes": self.max_query_body_bytes.unwrap_or(0),
+            "maxUpdateBodyBytes": self.max_update_body_bytes.unwrap_or(0),
+            "maxAdminBodyBytes": self.max_admin_body_bytes.unwrap_or(0),
+            "maxUploadBytes": self.max_upload_bytes.unwrap_or(0),
         })
+    }
+
+    /// A requested timeout, capped at `max_timeout` but never below `floor` (the
+    /// server's own default, which a client may always ask for).
+    pub fn cap_timeout(
+        &self,
+        requested: std::time::Duration,
+        floor: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        match self.max_timeout {
+            Some(max) => requested.min(floor.map_or(max, |f| max.max(f))),
+            None => requested,
+        }
     }
 }
 

@@ -80,6 +80,7 @@ let
     "--unix-socket"
     cfg.unixSocket
   ]
+  ++ lib.optional cfg.allowOpenNetwork "--allow-open-network"
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
   ++ lib.optional cfg.otel.enable "--otel"
@@ -133,6 +134,17 @@ in
       type = types.str;
       default = "127.0.0.1";
       description = "Address the HTTP server binds to.";
+    };
+
+    allowOpenNetwork = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Serve without {option}`auth.configFile` on a non-loopback {option}`listenAddress`
+        (`--allow-open-network`). Every client that can reach the port may then read,
+        write and administer every dataset; an authenticating proxy in front protects
+        nothing if the port can be reached around it.
+      '';
     };
 
     port = mkOption {
@@ -207,7 +219,7 @@ in
     queryTimeout = mkOption {
       type = types.ints.positive;
       default = 60;
-      description = "Default query timeout in seconds (clients can lower it with `timeout=`).";
+      description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
     };
 
     readOnly = mkOption {
@@ -389,6 +401,18 @@ in
       }
       {
         assertion =
+          cfg.auth.configFile != null
+          || cfg.allowOpenNetwork
+          || cfg.unixSocket != null
+          || lib.elem cfg.listenAddress [
+            "127.0.0.1"
+            "::1"
+            "localhost"
+          ];
+        message = "services.sparkles: listenAddress ${cfg.listenAddress} is not loopback; set auth.configFile, or allowOpenNetwork = true to serve it without authentication.";
+      }
+      {
+        assertion =
           cfg.auth.configFile == null
           || (lib.hasPrefix "/" cfg.auth.configFile && !lib.hasPrefix "/nix/store" cfg.auth.configFile);
         message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
@@ -451,11 +475,12 @@ in
         rateLimits != null
       ) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
-        # re-reads the rate-limit configuration (without one, SIGHUP would stop it)
-        ExecReload = mkIf (rateLimits != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        # re-reads the rate-limit and auth configurations (without either, SIGHUP would
+        # stop the server)
+        ExecReload = mkIf (
+          rateLimits != null || cfg.auth.configFile != null
+        ) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
-        # re-reads the auth configuration
-        ExecReload = mkIf (cfg.auth.configFile != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         RuntimeDirectory = mkIf (
           cfg.unixSocket != null && lib.hasPrefix "/run/sparkles/" cfg.unixSocket
         ) "sparkles";

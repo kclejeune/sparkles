@@ -8,6 +8,7 @@ mod auth;
 mod check_cmd;
 mod clone;
 mod compress;
+mod exposure;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -336,7 +337,9 @@ enum Cmd {
         /// Directory holding the dataset registry, databases and backups
         #[arg(long, default_value = "./data")]
         data: PathBuf,
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Address to listen on; a non-loopback address needs --auth-config or
+        /// --allow-open-network
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 3030)]
         port: u16,
@@ -349,6 +352,10 @@ enum Cmd {
         /// Default query timeout in seconds
         #[arg(long, default_value_t = 60.0)]
         timeout: f64,
+        /// Largest `timeout` a query or update may ask for, in seconds (0: unlimited);
+        /// never below --timeout or --update-timeout
+        #[arg(long, default_value_t = 1800.0)]
+        max_timeout: f64,
         /// Reject updates, uploads and admin changes
         #[arg(long)]
         read_only: bool,
@@ -417,6 +424,26 @@ enum Cmd {
         /// (0: unlimited)
         #[arg(long, default_value_t = 65536)]
         max_decompressed_mb: u64,
+        /// Largest request body of a SPARQL query (also explain and a /shacl shapes
+        /// graph), in MiB (0: unlimited)
+        #[arg(long, default_value_t = 16)]
+        max_query_body_mb: u64,
+        /// Largest request body of a SPARQL update, in MiB (0: unlimited); bulk data
+        /// goes through the Graph Store or upload endpoints
+        #[arg(long, default_value_t = 256)]
+        max_update_body_mb: u64,
+        /// Largest request body of an admin (/$/…) request or a prefix change, in MiB
+        /// (0: unlimited)
+        #[arg(long, default_value_t = 16)]
+        max_admin_body_mb: u64,
+        /// Largest body of a Graph Store write or upload, in MiB, counted after HTTP
+        /// decompression (0: unlimited)
+        #[arg(long, default_value_t = 65536)]
+        max_upload_mb: u64,
+        /// Refuse (507) to spool a request body to the temporary directory once that
+        /// would leave less than this much free disk space, in MiB (0: no check)
+        #[arg(long, default_value_t = 1024)]
+        min_free_disk_mb: u64,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -451,6 +478,15 @@ enum Cmd {
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
         unix_socket: Option<PathBuf>,
+        /// Serve without --auth-config on a non-loopback --host, which is refused
+        /// otherwise: every client that can reach the port may then read, write and
+        /// administer every dataset
+        #[arg(
+            long,
+            env = exposure::ALLOW_OPEN_NETWORK_ENV,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
+        allow_open_network: bool,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -1124,6 +1160,7 @@ fn run() -> Result<()> {
             mem,
             loc,
             timeout,
+            max_timeout,
             read_only,
             no_service,
             outbound,
@@ -1145,14 +1182,27 @@ fn run() -> Result<()> {
             http_compression_level,
             http_compression_algorithms,
             max_decompressed_mb,
+            max_query_body_mb,
+            max_update_body_mb,
+            max_admin_body_mb,
+            max_upload_mb,
+            min_free_disk_mb,
             auth_config,
             unix_socket,
+            allow_open_network,
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
             ..
         } => {
-            // a bad auth configuration stops the server before anything else
+            // an open server on the network, or a bad auth configuration, stops the
+            // server before anything else
+            exposure::check(
+                &host,
+                unix_socket.is_some(),
+                auth_config.is_some(),
+                allow_open_network,
+            )?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
             let auth = auth::load(auth_config.as_deref(), &data, bound)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
@@ -1178,7 +1228,22 @@ fn run() -> Result<()> {
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
                 max_decompressed_bytes: mib(max_decompressed_mb),
+                max_query_body_bytes: mib(max_query_body_mb),
+                max_update_body_bytes: mib(max_update_body_mb),
+                max_admin_body_bytes: mib(max_admin_body_mb),
+                max_upload_bytes: mib(max_upload_mb),
+                min_free_disk_bytes: mib(min_free_disk_mb),
+                max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
+                    .then(|| Duration::from_secs_f64(max_timeout)),
             };
+            if let Some(max) = st.limits.max_timeout
+                && (st.default_timeout > max || st.limits.update_timeout.is_some_and(|u| u > max))
+            {
+                tracing::warn!(
+                    "--max-timeout {}s is below --timeout or --update-timeout: requests may still ask for those",
+                    max.as_secs_f64()
+                );
+            }
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
                     bail!("--auto-reason: built without the `reasoning` feature");
@@ -1208,6 +1273,14 @@ fn run() -> Result<()> {
                         .map_err(anyhow::Error::msg)?
                         .with_keyer(Arc::new(auth::PrincipalKeyer)),
                 ));
+            }
+            for w in exposure::warnings(
+                &host,
+                unix_socket.is_some(),
+                st.auth.is_some(),
+                st.rate_limit.is_some(),
+            ) {
+                tracing::warn!("{w}");
             }
             let st = Arc::new(st);
             otel::register_metrics(&st);

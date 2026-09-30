@@ -190,7 +190,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
             } else if has_param(uri, "query")
                 || ct == "application/sparql-query"
                 || safe(method)
-                // the body may hold `update=`: `dataset_root` re-checks write
+                // the body may hold `update=` or nothing usable: `dataset_root` re-checks
+                // write for anything but a query
                 || (*method == Method::POST && ct == "application/x-www-form-urlencoded")
             {
                 Dataset(Read)
@@ -369,6 +370,45 @@ fn report_of(p: &Principal, denied: Option<Denied>) -> AuthReport {
         denied,
         error: None,
     }
+}
+
+/// For a handler that learns its operation from the body (`POST /{ds}` with a form):
+/// the answer the middleware gives a caller below `lvl` on `ds`, or `None` when the
+/// caller has it. The same responses as the route table's: 401 to anonymous, the
+/// handlers' 404 when the dataset is hidden or missing, else 403.
+pub fn dataset_denial(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    ds: &str,
+    lvl: Level,
+) -> Option<Response> {
+    let have = p.level(ds);
+    if have.is_some_and(|h| h >= lvl) {
+        return None;
+    }
+    if p.is_anonymous() {
+        #[cfg(feature = "auth")]
+        let (realm, basic) = match &st.auth {
+            Some(a) => {
+                let policy = a.policy();
+                (policy.realm.clone(), policy.has_users())
+            }
+            None => ("sparkles".to_string(), false),
+        };
+        #[cfg(not(feature = "auth"))]
+        let (realm, basic) = ("sparkles".to_string(), false);
+        let r = unauthorized(&realm, headers, "authentication required", None, basic);
+        return Some(with_report(r, report_of(p, Some(Denied::Unauthenticated))));
+    }
+    if have.is_none() || st.get(ds).is_none() {
+        let r = json_error(StatusCode::NOT_FOUND, &format!("no such dataset: /{ds}"));
+        return Some(with_report(r, report_of(p, Some(Denied::Hidden))));
+    }
+    Some(forbidden(
+        p,
+        &format!("{} access to /{ds} required", lvl.as_str()),
+    ))
 }
 
 /// The `{ds}` segment of the request path.

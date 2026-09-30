@@ -92,7 +92,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/update", post(update_endpoint))
         .route("/{ds}/data", any(gsp))
         .route("/{ds}/get", get(gsp).head(gsp))
-        .route("/{ds}/upload", post(upload))
+        .route(
+            "/{ds}/upload",
+            post(upload).layer(DefaultBodyLimit::max(
+                state
+                    .limits
+                    .max_upload_bytes
+                    .map_or(usize::MAX, |b| b as usize),
+            )),
+        )
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
         .route("/$/vector/{ds}", get(vector_status))
@@ -116,7 +124,13 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(validation::delete_validation),
         )
         .layer(axum::middleware::from_fn(error_request_id))
-        .layer(DefaultBodyLimit::max(8 << 30))
+        // for extractors without a ceiling of their own (see `limited_body!`)
+        .layer(DefaultBodyLimit::max(
+            state
+                .limits
+                .max_admin_body_bytes
+                .map_or(usize::MAX, |b| b as usize),
+        ))
         .layer(state.http_compression.layer())
         // compressed request bodies: marked (outermost), decompressed, then capped
         .layer(axum::middleware::from_fn_with_state(
@@ -509,24 +523,39 @@ fn truthy(v: &str) -> bool {
     )
 }
 
-fn timeout_param(st: &AppState, params: &Params) -> Duration {
+/// A positive `timeout` parameter in seconds (others are ignored).
+fn timeout_secs(params: &Params) -> Option<Duration> {
     params
         .get("timeout")
         .and_then(|t| t.parse::<f64>().ok())
         .filter(|t| t.is_finite() && *t > 0.0)
-        .map(Duration::from_secs_f64)
+        .and_then(|t| Duration::try_from_secs_f64(t).ok())
+}
+
+/// The `timeout` parameter of a query, capped at `--max-timeout`, else the server's
+/// default.
+fn timeout_param(st: &AppState, params: &Params) -> Duration {
+    timeout_secs(params)
+        .map(|t| st.limits.cap_timeout(t, Some(st.default_timeout)))
         .unwrap_or(st.default_timeout)
 }
 
-/// The `timeout` parameter of an update, else the server's update timeout (none by
-/// default).
+/// The `timeout` parameter of an update, capped at `--max-timeout`, else the server's
+/// update timeout (none by default).
 fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
-    params
-        .get("timeout")
-        .and_then(|t| t.parse::<f64>().ok())
-        .filter(|t| t.is_finite() && *t > 0.0)
-        .map(Duration::from_secs_f64)
+    timeout_secs(params)
+        .map(|t| st.limits.cap_timeout(t, st.limits.update_timeout))
         .or(st.limits.update_timeout)
+}
+
+/// A `408` names the timeout that applied (`timeoutSeconds`).
+fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
+    if e.0 == StatusCode::REQUEST_TIMEOUT
+        && let (Some(t), Some(o)) = (timeout, e.1.as_object_mut())
+    {
+        o.insert("timeoutSeconds".into(), t.as_secs_f64().into());
+    }
+    e
 }
 
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
@@ -560,15 +589,44 @@ async fn dataset_root(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> ApiResult {
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
-    if method == Method::POST && ct == "application/x-www-form-urlencoded" {
+    // the auth layer granted a form POST read access, since only its body tells a query
+    // from an update: every other operation is re-checked here
+    let form = method == Method::POST && ct == "application/x-www-form-urlencoded";
+    let query = params.has("query") || ct == "application/sparql-query";
+    let update = params.has("update") || ct == "application/sparql-update";
+    if !(form || query || update) {
+        // a Graph Store request: its body streams
+        return gsp(st, Path(name), p, method, uri, headers, body).await;
+    }
+    let l = &st.limits;
+    let (limit, flag) = if query {
+        (l.max_query_body_bytes, "--max-query-body-mb")
+    } else if update {
+        (l.max_update_body_bytes, "--max-update-body-mb")
+    } else {
+        // a query or an update, as the body will tell
+        match (l.max_query_body_bytes, l.max_update_body_bytes) {
+            (Some(q), Some(u)) if q > u => (Some(q), "--max-query-body-mb"),
+            (Some(_), Some(u)) => (Some(u), "--max-update-body-mb"),
+            _ => (None, ""),
+        }
+    };
+    let body = read_body(body, limit, flag).await?;
+    if form {
         params.extend_form(&body);
     }
     if params.has("query") || ct == "application/sparql-query" {
-        return query_endpoint(st, Path(name), p, method, uri, headers, body).await;
+        if form && (body.len() as u64) > l.max_query_body_bytes.unwrap_or(u64::MAX) {
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds --max-query-body-mb",
+            ));
+        }
+        return query_endpoint(st, Path(name), p, method, uri, headers, QueryBody(body)).await;
     }
     if params.has("update") || ct == "application/sparql-update" {
         // SPARQL 1.1 Protocol: updates only by POST
@@ -578,15 +636,21 @@ async fn dataset_root(
                 "use POST for SPARQL Update",
             ));
         }
-        // a form body is only seen here: the auth layer checked read
-        if !p.can(&name, Level::Write) {
-            dataset(&st, &name)?;
-            let msg = format!("write access to /{name} required");
-            return Ok(crate::auth::forbidden(&p, &msg));
+        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+            return Ok(denied);
         }
-        return update_endpoint(st, Path(name), p, uri, headers, body).await;
+        return update_endpoint(st, Path(name), p, uri, headers, UpdateBody(body)).await;
     }
-    gsp(st, Path(name), method, uri, headers, body.into()).await
+    // a form with neither a query nor an update: refused as the write any other POST body
+    // would be, and never taken for an RDF payload
+    if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+        return Ok(denied);
+    }
+    dataset(&st, &name)?;
+    Err(err(
+        StatusCode::BAD_REQUEST,
+        "missing 'query' or 'update' parameter",
+    ))
 }
 
 async fn query_endpoint(
@@ -596,7 +660,7 @@ async fn query_endpoint(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -636,6 +700,7 @@ async fn query_endpoint(
     let prefixes = ds.store.prefixes();
     let with_extra = !opts.default_graph_extra.is_empty();
     let at = history::at_param(&params)?;
+    let timeout = opts.timeout;
     let (r, seq, resolved, t0) = blocking({
         let ds = ds.clone();
         move || {
@@ -648,7 +713,8 @@ async fn query_endpoint(
             Ok((r, seq, resolved, t0))
         }
     })
-    .await?;
+    .await
+    .map_err(|e| with_timeout(e, timeout))?;
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let sparkles_doc =
         sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
@@ -836,7 +902,11 @@ async fn text_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<
 /// `PUT /$/text/{ds}`: enable (or reconfigure) full-text search; the body is the
 /// configuration (empty: defaults). The index is built in a background task.
 #[cfg(feature = "text")]
-async fn text_enable(State(st): St, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn text_enable(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -1101,7 +1171,7 @@ async fn update_endpoint(
     Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    UpdateBody(body): UpdateBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -1133,6 +1203,7 @@ async fn update_endpoint(
     crate::auth::restrict(&mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     let wanted = receipt_wanted(&params, &headers);
+    let timeout = opts.timeout;
     blocking(move || {
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
@@ -1159,6 +1230,7 @@ async fn update_endpoint(
         )))
     })
     .await
+    .map_err(|e| with_timeout(e, timeout))
 }
 
 async fn explain(
@@ -1168,7 +1240,7 @@ async fn explain(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -1280,30 +1352,204 @@ fn body_error(e: axum::Error) -> ApiError {
     }
 }
 
+/// Read a whole request body of at most `limit` bytes (`flag` names the setting): `413`
+/// before more than that is held. This runs inside the decompression layer, so the
+/// limit counts decompressed bytes.
+async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> ApiResult<Bytes> {
+    use futures_util::StreamExt;
+    use http_body::Body as _;
+    let max = limit.unwrap_or(u64::MAX);
+    let too_large = || {
+        let size = sparkles::error::human_bytes(max);
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("request body exceeds {size} ({flag})"),
+        )
+    };
+    // a declared length is refused before anything is read
+    if body.size_hint().lower() > max {
+        return Err(too_large());
+    }
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(body_error)?;
+        if (buf.len() + chunk.len()) as u64 > max {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.into())
+}
+
+/// Body extractors with the ceiling of their request class. Only the Graph Store and
+/// upload endpoints stream bodies of any size.
+macro_rules! limited_body {
+    ($(#[$doc:meta])* $name:ident, $field:ident, $flag:literal) => {
+        $(#[$doc])*
+        pub(crate) struct $name(pub Bytes);
+
+        impl axum::extract::FromRequest<Arc<AppState>> for $name {
+            type Rejection = ApiError;
+
+            async fn from_request(
+                req: axum::extract::Request,
+                st: &Arc<AppState>,
+            ) -> Result<Self, ApiError> {
+                read_body(req.into_body(), st.limits.$field, $flag)
+                    .await
+                    .map($name)
+            }
+        }
+    };
+}
+
+limited_body!(
+    /// A SPARQL query body (also `/{ds}/explain` and a `/{ds}/shacl` shapes graph).
+    QueryBody,
+    max_query_body_bytes,
+    "--max-query-body-mb"
+);
+limited_body!(
+    /// A SPARQL update body.
+    UpdateBody,
+    max_update_body_bytes,
+    "--max-update-body-mb"
+);
+limited_body!(
+    /// The body of an admin request (`/$/…`) or a prefix change.
+    AdminBody,
+    max_admin_body_bytes,
+    "--max-admin-body-mb"
+);
+
+/// How often, in bytes written, a spooled body re-checks the free disk space.
+const DISK_CHECK_EVERY: u64 = 64 << 20;
+
+/// The ceilings of a streamed request body (Graph Store writes, uploads): its size
+/// after decoding (`--max-upload-mb`), and the free space its temporary files leave on
+/// disk (`--min-free-disk-mb`).
+struct BodyBudget {
+    max: Option<u64>,
+    reserve: Option<u64>,
+    read: u64,
+    /// bytes written since the last free-space check (`None`: not checked yet)
+    unchecked: Option<u64>,
+}
+
+impl BodyBudget {
+    fn new(limits: &crate::state::Limits) -> BodyBudget {
+        BodyBudget {
+            max: limits.max_upload_bytes,
+            reserve: limits.min_free_disk_bytes,
+            read: 0,
+            unchecked: None,
+        }
+    }
+
+    /// Count `n` more bytes of the body: `413` past `--max-upload-mb`.
+    fn read(&mut self, n: usize) -> ApiResult<()> {
+        self.read += n as u64;
+        match self.max {
+            Some(max) if self.read > max => Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "request body exceeds {} (--max-upload-mb)",
+                    sparkles::error::human_bytes(max)
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Before writing `n` bytes to a file in `dir`: `507` when the free space there
+    /// would come within [`DISK_CHECK_EVERY`] of the reserve. Checked on the first write
+    /// and then every [`DISK_CHECK_EVERY`] bytes.
+    fn disk(&mut self, dir: &std::path::Path, n: usize) -> ApiResult<()> {
+        let Some(reserve) = self.reserve else {
+            return Ok(());
+        };
+        let n = n as u64;
+        if let Some(u) = self.unchecked
+            && u + n < DISK_CHECK_EVERY
+        {
+            self.unchecked = Some(u + n);
+            return Ok(());
+        }
+        let free = free_disk_bytes(dir)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if free < reserve.saturating_add(n).saturating_add(DISK_CHECK_EVERY) {
+            let h = sparkles::error::human_bytes;
+            return Err(err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                format!(
+                    "not enough free disk space to receive the request body ({} free, {} kept free by --min-free-disk-mb)",
+                    h(free),
+                    h(reserve)
+                ),
+            ));
+        }
+        self.unchecked = Some(n);
+        Ok(())
+    }
+}
+
+/// Free space for an unprivileged user on the file system of `dir`.
+#[cfg(unix)]
+fn free_disk_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `s` is valid for writes; statvfs initializes
+    // it when it returns 0
+    if unsafe { libc::statvfs(path.as_ptr(), s.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: initialized by the successful call above
+    let s = unsafe { s.assume_init() };
+    #[allow(clippy::unnecessary_cast)] // the field types differ between platforms
+    Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_: &std::path::Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
 /// Read a request body, spooling it to a temporary file once it passes
 /// [`SPOOL_AFTER`] bytes, so a large upload is never held in memory whole. Large
 /// sources then take the bulk path, which parses them as a stream.
-async fn spool(body: axum::body::Body) -> ApiResult<Spooled> {
-    spool_after(body, SPOOL_AFTER).await
+async fn spool(body: axum::body::Body, budget: &mut BodyBudget) -> ApiResult<Spooled> {
+    spool_after(body, SPOOL_AFTER, budget).await
 }
 
-async fn spool_after(body: axum::body::Body, limit: usize) -> ApiResult<Spooled> {
+async fn spool_after(
+    body: axum::body::Body,
+    limit: usize,
+    budget: &mut BodyBudget,
+) -> ApiResult<Spooled> {
     use futures_util::StreamExt;
     use std::io::Write;
     let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let tmp = std::env::temp_dir();
     let mut stream = body.into_data_stream();
     let mut buf = Vec::new();
     let mut file: Option<tempfile::NamedTempFile> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(body_error)?;
+        budget.read(chunk.len())?;
         match &mut file {
-            Some(f) => f.write_all(&chunk).map_err(io)?,
+            Some(f) => {
+                budget.disk(&tmp, chunk.len())?;
+                f.write_all(&chunk).map_err(io)?
+            }
             None => {
                 buf.extend_from_slice(&chunk);
                 if buf.len() > limit {
+                    budget.disk(&tmp, buf.len())?;
                     let mut f = tempfile::Builder::new()
                         .prefix("sparkles-body-")
-                        .tempfile()
+                        .tempfile_in(&tmp)
                         .map_err(io)?;
                     f.write_all(&buf).map_err(io)?;
                     buf = Vec::new();
@@ -1322,8 +1568,8 @@ async fn spool_after(body: axum::body::Body, limit: usize) -> ApiResult<Spooled>
 }
 
 /// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
-/// snapshot, serialized while scanning (see [`stream`]), so no result-size budget
-/// applies. Returns the body and, for a body returned whole, its bytes and quads.
+/// snapshot, serialized while scanning (see [`stream`]) under the result-size budget.
+/// Returns the body and, for a body returned whole, its bytes and quads.
 async fn graph_body(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
@@ -1375,9 +1621,10 @@ async fn graph_body(
         s.finish()?;
         Ok(())
     };
+    let limit = st.limits.max_result_bytes;
     let (name, st) = (ds.name.clone(), Arc::downgrade(&st));
     drop(ds);
-    let body = stream::serialize(None, write, move |end| {
+    let body = stream::serialize(limit, write, move |end| {
         if let Some(st) = st.upgrade() {
             st.metrics
                 .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
@@ -1400,11 +1647,18 @@ async fn graph_body(
 async fn gsp(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> ApiResult {
+    // every write needs write access, whichever route (or fallthrough) led here
+    if !matches!(method, Method::GET | Method::HEAD)
+        && let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write)
+    {
+        return Ok(denied);
+    }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let target = gsp_target(&params);
@@ -1472,7 +1726,7 @@ async fn gsp(
             let wanted = receipt_wanted(&params, &headers);
             let wopts =
                 validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
-            let body = spool(body).await?;
+            let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -1585,22 +1839,27 @@ async fn upload(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let mut graph: Option<String> = params.get("graph").map(str::to_string);
+    let mut budget = BodyBudget::new(&st.limits);
     if ct == "multipart/form-data" {
         use axum::extract::FromRequest;
+        // the route's body limit (`--max-upload-mb`) applies to the whole stream too
+        let mp_err = |e: axum::extract::multipart::MultipartError| err(e.status(), e.body_text());
         let mut mp = Multipart::from_request(request, &())
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        while let Some(mut field) = mp
-            .next_field()
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-        {
+        while let Some(mut field) = mp.next_field().await.map_err(mp_err)? {
             match field.name() {
                 Some("graph") => {
-                    let g = field
-                        .text()
-                        .await
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    let mut g = Vec::new();
+                    while let Some(chunk) = field.chunk().await.map_err(mp_err)? {
+                        budget.read(chunk.len())?;
+                        g.extend_from_slice(&chunk);
+                        if g.len() > 64 << 10 {
+                            return Err(err(StatusCode::BAD_REQUEST, "graph field too long"));
+                        }
+                    }
+                    let g = String::from_utf8(g)
+                        .map_err(|_| err(StatusCode::BAD_REQUEST, "graph field is not UTF-8"))?;
                     if !g.trim().is_empty() {
                         graph = Some(g.trim().to_string());
                     }
@@ -1617,11 +1876,9 @@ async fn upload(
                         |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
                     let mut out =
                         std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
-                    while let Some(chunk) = field
-                        .chunk()
-                        .await
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-                    {
+                    while let Some(chunk) = field.chunk().await.map_err(mp_err)? {
+                        budget.read(chunk.len())?;
+                        budget.disk(tmp.path(), chunk.len())?;
                         std::io::Write::write_all(&mut out, &chunk).map_err(io)?;
                     }
                     std::io::Write::flush(&mut out).map_err(io)?;
@@ -1637,7 +1894,7 @@ async fn upload(
                 format!("unsupported content type '{ct}'"),
             )
         })?;
-        let body = spool_after(request.into_body(), 0).await?;
+        let body = spool_after(request.into_body(), 0, &mut budget).await?;
         let ext = match format {
             RdfFormat::NTriples => "nt",
             RdfFormat::NQuads => "nq",
@@ -1792,7 +2049,12 @@ async fn get_dataset(
     Ok(Json(dataset_info_for(&ds, &p)))
 }
 
-async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn create_dataset(
+    State(st): St,
+    uri: Uri,
+    headers: HeaderMap,
+    AdminBody(body): AdminBody,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -1855,7 +2117,7 @@ async fn clone_dataset(
     Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -2081,7 +2343,7 @@ async fn dataset_prefixes(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -2203,7 +2465,7 @@ async fn reason(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -2412,7 +2674,7 @@ async fn shacl(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     use crate::shacl::{DataGraph, ReportFormat};
     let ds = dataset(&st, &name)?;
@@ -2506,6 +2768,8 @@ mod compress_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
+mod limits_tests;
+#[cfg(test)]
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
@@ -2519,11 +2783,17 @@ mod spool_tests {
     #[tokio::test]
     async fn large_bodies_are_spooled_to_a_file() {
         let data: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let Ok(small) = spool_after(axum::body::Body::from(data.clone()), 1 << 20).await else {
+        let limits = crate::state::Limits::default();
+        let mut budget = BodyBudget::new(&limits);
+        let Ok(small) =
+            spool_after(axum::body::Body::from(data.clone()), 1 << 20, &mut budget).await
+        else {
             panic!("spooling failed")
         };
         assert!(matches!(&small, Spooled::Memory(b) if *b == data));
-        let Ok(Spooled::File(f)) = spool_after(axum::body::Body::from(data.clone()), 100).await
+        let mut budget = BodyBudget::new(&limits);
+        let Ok(Spooled::File(f)) =
+            spool_after(axum::body::Body::from(data.clone()), 100, &mut budget).await
         else {
             panic!("expected a file")
         };
