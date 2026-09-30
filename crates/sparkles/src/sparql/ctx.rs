@@ -31,10 +31,12 @@ pub struct DatasetSpec {
     pub union_default: bool,
 }
 
+const VALUE_SHARDS: usize = 64;
+
 pub struct Ctx {
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
-    values: RwLock<FxHashMap<Id, Value>>,
+    values: Vec<RwLock<FxHashMap<Id, Value>>>,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     pub deadline: Option<Instant>,
@@ -53,7 +55,7 @@ impl Ctx {
         Ctx {
             snap,
             local: RwLock::new(AppendVocab::default()),
-            values: RwLock::new(FxHashMap::default()),
+            values: (0..VALUE_SHARDS).map(|_| RwLock::new(FxHashMap::default())).collect(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             deadline: None,
@@ -198,14 +200,17 @@ impl Ctx {
             Tag::Int => Some(Value::Integer(id.as_i64().into())),
             Tag::Bool => Some(Value::Bool(id.as_bool())),
             Tag::Double => Some(Value::Double(id.as_f64().into())),
+            Tag::Decimal => Some(Value::Decimal(id::unpack_decimal(id.payload()))),
+            Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
-                if let Some(v) = self.values.read().get(&id) {
+                let shard = &self.values[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS];
+                if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
                 }
                 let v = Value::from_term(&self.term(id)?);
-                let mut w = self.values.write();
-                if w.len() > 1_000_000 {
+                let mut w = shard.write();
+                if w.len() > 1_000_000 / VALUE_SHARDS {
                     w.clear();
                 }
                 w.insert(id, v.clone());
@@ -218,7 +223,7 @@ impl Ctx {
     pub fn kind(&self, id: Id) -> TermKind {
         match id.tag() {
             Tag::Undef | Tag::Special => TermKind::None,
-            Tag::Bool | Tag::Int | Tag::Double => TermKind::Literal,
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => TermKind::Literal,
             Tag::BNode => TermKind::BNode,
             Tag::Vocab | Tag::Delta => match self.snap.key(id) {
                 Some(k) if id::is_key_iri(&k) => TermKind::Iri,

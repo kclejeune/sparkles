@@ -38,6 +38,12 @@ pub enum Tag {
     Delta = 7,
     /// Index into a per-query local vocabulary (computed terms not in the store).
     Local = 8,
+    /// Inline `xsd:decimal`: 4-bit scale + 56-bit two's complement mantissa (TDB2 `DecimalNode56`).
+    Decimal = 9,
+    /// Inline `xsd:dateTime` (packed calendar fields, see [`pack_date_time`]).
+    DateTime = 10,
+    /// Inline `xsd:date`.
+    Date = 11,
 }
 
 impl Tag {
@@ -53,6 +59,9 @@ impl Tag {
             6 => Tag::Vocab,
             7 => Tag::Delta,
             8 => Tag::Local,
+            9 => Tag::Decimal,
+            10 => Tag::DateTime,
+            11 => Tag::Date,
             _ => Tag::Undef,
         }
     }
@@ -88,7 +97,10 @@ impl Id {
     }
     #[inline]
     pub fn is_inline(self) -> bool {
-        matches!(self.tag(), Tag::Bool | Tag::Int | Tag::Double)
+        matches!(
+            self.tag(),
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date
+        )
     }
     #[inline]
     pub fn vocab(i: u64) -> Id {
@@ -151,6 +163,8 @@ impl fmt::Debug for Id {
             Tag::Vocab => write!(f, "V:{}", self.payload()),
             Tag::Delta => write!(f, "Δ:{}", self.payload()),
             Tag::Local => write!(f, "L:{}", self.payload()),
+            Tag::Decimal => write!(f, "Dec:{}", unpack_decimal(self.payload())),
+            Tag::DateTime | Tag::Date => write!(f, "T:{:x}", self.payload()),
         }
     }
 }
@@ -178,9 +192,118 @@ pub fn inline_literal(lex: &str, datatype: &str) -> Option<Id> {
             "false" => Some(Id::from_bool(false)),
             _ => None,
         }
+    } else if datatype == xsd::DECIMAL.as_str() {
+        let d: oxsdatatypes::Decimal = lex.parse().ok()?;
+        (d.to_string() == lex).then_some(())?;
+        pack_decimal(d).map(|p| Id::new(Tag::Decimal, p))
+    } else if datatype == xsd::DATE_TIME.as_str() {
+        let d: oxsdatatypes::DateTime = lex.parse().ok()?;
+        let p = pack_date_time(d.year(), d.month(), d.day(), d.hour(), d.minute(), d.second(), tz_minutes(d.timezone_offset()))?;
+        (unpack_date_time(p, false) == lex).then(|| Id::new(Tag::DateTime, p))
+    } else if datatype == xsd::DATE.as_str() {
+        let d: oxsdatatypes::Date = lex.parse().ok()?;
+        let p = pack_date_time(d.year(), d.month(), d.day(), 0, 0, 0.into(), tz_minutes(d.timezone_offset()))?;
+        (unpack_date_time(p, true) == lex).then(|| Id::new(Tag::Date, p))
     } else {
         None
     }
+}
+
+fn tz_minutes(tz: Option<oxsdatatypes::TimezoneOffset>) -> Option<i16> {
+    tz.map(|t| i16::from_be_bytes(t.to_be_bytes()))
+}
+
+const DEC_MANTISSA_BITS: u32 = 56;
+
+/// Pack a decimal as `scale (4 bits) | mantissa (56 bits)`, value = mantissa / 10^scale.
+pub fn pack_decimal(d: oxsdatatypes::Decimal) -> Option<u64> {
+    // oxsdatatypes stores decimals as i128 with 18 fractional digits
+    let v = i128::from_be_bytes(d.to_be_bytes());
+    for scale in 0..16u32 {
+        let div = 10i128.pow(18 - scale);
+        if v % div == 0 {
+            let m = v / div;
+            let lim = 1i128 << (DEC_MANTISSA_BITS - 1);
+            if m < -lim || m >= lim {
+                return None;
+            }
+            return Some(((scale as u64) << DEC_MANTISSA_BITS) | (m as u64 & ((1 << DEC_MANTISSA_BITS) - 1)));
+        }
+    }
+    None
+}
+
+pub fn unpack_decimal(p: u64) -> oxsdatatypes::Decimal {
+    let scale = (p >> DEC_MANTISSA_BITS) as u32 & 0xF;
+    let m = (((p << (64 - DEC_MANTISSA_BITS)) as i64) >> (64 - DEC_MANTISSA_BITS)) as i128;
+    let v = m * 10i128.pow(18 - scale);
+    oxsdatatypes::Decimal::from_be_bytes(v.to_be_bytes())
+}
+
+// dateTime layout (57 bits, most significant first):
+//   year+8192 (14) | month (4) | day (5) | hour (5) | minute (6) | millis of minute (16) | tz (7)
+// tz = 0: no timezone, else offset/15min + 64. Payload order is chronological for
+// values in the same timezone.
+fn pack_date_time(year: i64, month: u8, day: u8, hour: u8, minute: u8, second: oxsdatatypes::Decimal, tz: Option<i16>) -> Option<u64> {
+    let y = year + 8192;
+    if !(0..16384).contains(&y) {
+        return None;
+    }
+    // milliseconds, only if the seconds have at most 3 fractional digits
+    let sv = i128::from_be_bytes(second.to_be_bytes());
+    let unit = 10i128.pow(15);
+    if sv % unit != 0 {
+        return None;
+    }
+    let ms = (sv / unit) as u64;
+    if ms >= 60_000 {
+        return None;
+    }
+    let tz = match tz {
+        None => 0u64,
+        Some(m) if m % 15 == 0 && (-56 * 15..=56 * 15).contains(&m) => (m / 15 + 64) as u64,
+        Some(_) => return None,
+    };
+    Some(
+        (y as u64) << 43
+            | (month as u64) << 39
+            | (day as u64) << 34
+            | (hour as u64) << 29
+            | (minute as u64) << 23
+            | ms << 7
+            | tz,
+    )
+}
+
+/// Canonical lexical form of a packed dateTime (or date).
+pub fn unpack_date_time(p: u64, date_only: bool) -> String {
+    let year = ((p >> 43) & 0x3FFF) as i64 - 8192;
+    let month = (p >> 39) & 0xF;
+    let day = (p >> 34) & 0x1F;
+    let hour = (p >> 29) & 0x1F;
+    let minute = (p >> 23) & 0x3F;
+    let ms = (p >> 7) & 0xFFFF;
+    let tz = (p & 0x7F) as i64;
+    let mut s = if year < 0 { format!("-{:04}", -year) } else { format!("{year:04}") };
+    let _ = std::fmt::Write::write_fmt(&mut s, format_args!("-{month:02}-{day:02}"));
+    if !date_only {
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("T{hour:02}:{minute:02}:{:02}", ms / 1000));
+        if ms % 1000 != 0 {
+            let frac = format!("{:03}", ms % 1000);
+            s.push('.');
+            s.push_str(frac.trim_end_matches('0'));
+        }
+    }
+    if tz != 0 {
+        let off = (tz - 64) * 15;
+        if off == 0 {
+            s.push('Z');
+        } else {
+            let a = off.abs();
+            let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{}{:02}:{:02}", if off < 0 { '-' } else { '+' }, a / 60, a % 60));
+        }
+    }
+    s
 }
 
 /// Decode an inline id back into a literal.
@@ -195,6 +318,9 @@ pub fn inline_to_literal(id: Id) -> Option<Literal> {
             oxsdatatypes::Double::from(id.as_f64()).to_string(),
             xsd::DOUBLE,
         ),
+        Tag::Decimal => Literal::new_typed_literal(unpack_decimal(id.payload()).to_string(), xsd::DECIMAL),
+        Tag::DateTime => Literal::new_typed_literal(unpack_date_time(id.payload(), false), xsd::DATE_TIME),
+        Tag::Date => Literal::new_typed_literal(unpack_date_time(id.payload(), true), xsd::DATE),
         _ => return None,
     })
 }
@@ -312,6 +438,32 @@ mod tests {
         let d = inline_literal("1.5", xsd::DOUBLE.as_str());
         assert!(d.is_some(), "{}", oxsdatatypes::Double::from(1.5));
         assert_eq!(d.unwrap().as_f64(), 1.5);
+    }
+
+    #[test]
+    fn inline_decimal_and_dates() {
+        for lex in ["0", "1.5", "-199999.02", "12345678.123456789", "0.000000000000001"] {
+            let id = inline_literal(lex, xsd::DECIMAL.as_str()).unwrap_or_else(|| panic!("{lex}"));
+            assert_eq!(inline_to_literal(id).unwrap().value(), lex);
+        }
+        assert!(inline_literal("123456789.123456789", xsd::DECIMAL.as_str()).is_none());
+        for lex in ["1"] {
+            let id = inline_literal(lex, xsd::DECIMAL.as_str()).unwrap_or_else(|| panic!("{lex}"));
+            assert_eq!(inline_to_literal(id).unwrap().value(), lex);
+        }
+        assert!(inline_literal("1.50", xsd::DECIMAL.as_str()).is_none());
+        for lex in ["2020-03-04T10:00:00Z", "2006-08-23T09:00:00+01:00", "1999-12-31T23:59:59.5", "-0044-03-15T12:00:00-05:30"] {
+            let id = inline_literal(lex, xsd::DATE_TIME.as_str()).unwrap_or_else(|| panic!("{lex}"));
+            assert_eq!(inline_to_literal(id).unwrap().value(), lex);
+        }
+        for lex in ["2001-01-01", "2006-08-23Z", "2006-08-23+00:00"] {
+            if let Some(id) = inline_literal(lex, xsd::DATE.as_str()) {
+                assert_eq!(inline_to_literal(id).unwrap().value(), lex);
+            }
+        }
+        let a = inline_literal("2020-01-01T00:00:00Z", xsd::DATE_TIME.as_str()).unwrap();
+        let b = inline_literal("2020-01-02T00:00:00Z", xsd::DATE_TIME.as_str()).unwrap();
+        assert!(a < b);
     }
 
     #[test]

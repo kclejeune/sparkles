@@ -78,6 +78,15 @@ fn select_star_order() {
 }
 
 #[test]
+fn rejects_rebinding_in_scope_variable() {
+    let s = store();
+    let r = query(s.snapshot(), "SELECT (COUNT(*) AS ?c) WHERE { ?a ?b ?c }", &QueryOptions::default());
+    assert!(r.is_err());
+    let r = query(s.snapshot(), "SELECT * WHERE { ?a ?b ?c BIND(1 AS ?c) }", &QueryOptions::default());
+    assert!(r.is_err());
+}
+
+#[test]
 fn bgp_join() {
     let s = store();
     let r = q(&s, "SELECT ?n WHERE { ?p a foaf:Person ; foaf:name ?n ; foaf:knows ex:carol }");

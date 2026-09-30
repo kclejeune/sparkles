@@ -58,6 +58,14 @@ impl Generation {
     fn open(dir: &Path, name: &str, persistent: bool) -> Result<Generation> {
         let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
             .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+        if meta.format_version != crate::builder::FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "{} has index format {} but this build uses {}; dump and reload the data",
+                dir.display(),
+                meta.format_version,
+                crate::builder::FORMAT_VERSION
+            )));
+        }
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
         let dvocab = if persistent {
@@ -191,7 +199,9 @@ impl Snapshot {
     /// Decode a stored id into an RDF term (`None` for UNDEF, specials and local ids).
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
-            Tag::Bool | Tag::Int | Tag::Double => id::inline_to_literal(id).map(Term::Literal),
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                id::inline_to_literal(id).map(Term::Literal)
+            }
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             Tag::Vocab | Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
             _ => None,
@@ -622,6 +632,7 @@ impl Store {
             base,
             guard,
             log: Vec::new(),
+            bulk: Vec::new(),
         }
     }
 
@@ -670,6 +681,12 @@ impl Store {
     fn rebuild(&self, extra: &[Source]) -> Result<u64> {
         let mut w = self.writer.lock();
         let snap = self.snapshot();
+        self.rebuild_locked(&mut w, &snap, extra, &[])
+    }
+
+    /// Rebuild with the writer lock held; `extra_quads` are encoded store ids (from a
+    /// bulk write transaction) added to the new generation.
+    fn rebuild_locked(&self, w: &mut WriterState, snap: &Snapshot, extra: &[Source], extra_quads: &[[Id; 4]]) -> Result<u64> {
         let before = snap.len();
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
@@ -695,11 +712,11 @@ impl Store {
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = w.next_bnode;
         let builder = Builder::new(&dir, bopts)?;
-        if !snap.is_empty() {
+        if !snap.is_empty() || !extra_quads.is_empty() {
             let scope = builder.new_scope();
             let mut enc = builder.encoder(scope);
             let mut keys: [Vec<u8>; 4] = Default::default();
-            snap.for_each_quad(|q| {
+            let mut push = |q: &[Id; 4]| -> Result<()> {
                 for (i, id) in q.iter().enumerate() {
                     keys[i].clear();
                     if matches!(id.tag(), Tag::Vocab | Tag::Delta) {
@@ -716,7 +733,11 @@ impl Store {
                     }
                 };
                 enc.push_slots([slot(0), slot(1), slot(2), slot(3)])
-            })?;
+            };
+            snap.for_each_quad(&mut push)?;
+            for q in extra_quads {
+                push(q)?;
+            }
             enc.flush()?;
         }
         for s in extra {
@@ -836,6 +857,8 @@ pub struct WriteTxn<'s> {
     delta: Delta,
     guard: MutexGuard<'s, WriterState>,
     log: Vec<(u8, [Id; 4])>,
+    /// large insert batches applied by rebuilding the generation on commit
+    bulk: Vec<[Id; 4]>,
 }
 
 impl WriteTxn<'_> {
@@ -956,11 +979,44 @@ impl WriteTxn<'_> {
     }
 
     pub fn is_dirty(&self) -> bool {
-        !self.log.is_empty()
+        !self.log.is_empty() || !self.bulk.is_empty()
+    }
+
+    /// Insert many quads. Batches at or above the store's `bulk_threshold` are not
+    /// applied to the delta; on commit they are merged into a freshly built generation
+    /// (QLever-style rebuild), which is much faster than per-quad delta inserts. Staged
+    /// bulk quads are not visible through [`view`](Self::view) / [`contains`](Self::contains)
+    /// before commit.
+    pub fn insert_bulk(&mut self, quads: Vec<[Id; 4]>) -> Result<()> {
+        if (quads.len() as u64) < self.store.opts.bulk_threshold {
+            for q in quads {
+                self.insert(q)?;
+            }
+            return Ok(());
+        }
+        if quads.iter().flatten().any(|id| matches!(id.tag(), Tag::Local | Tag::Undef)) {
+            return Err(Error::invalid("cannot store query-local or unbound terms"));
+        }
+        self.bulk.extend(quads);
+        Ok(())
     }
 
     /// Durably commit and publish a new snapshot.
     pub fn commit(mut self) -> Result<u64> {
+        if self.bulk.is_empty() {
+            return self.publish_log();
+        }
+        // Build the new generation from this transaction's view (base + uncommitted delta)
+        // plus the bulk quads; switching CURRENT is the atomic commit point, so the
+        // transaction's small changes need no WAL records.
+        let bulk = std::mem::take(&mut self.bulk);
+        let view = self.view();
+        self.base.generation.dvocab.sync()?;
+        self.store.rebuild_locked(&mut self.guard, &view, &[], &bulk)?;
+        Ok(self.store.snapshot().version)
+    }
+
+    fn publish_log(&mut self) -> Result<u64> {
         let gen_ = &self.base.generation;
         if self.log.is_empty() {
             return Ok(self.base.version);
@@ -1064,6 +1120,34 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let store = Store::open(&root, StoreOptions::default()).unwrap();
         assert_eq!(store.snapshot().len(), 5);
         assert!(store.prefixes().contains_key("ex"));
+    }
+
+    #[test]
+    fn bulk_insert_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions { bulk_threshold: 10, ..Default::default() };
+        let store = Store::open(&dir.path().join("db"), opts.clone()).unwrap();
+        store.load(&[src()]).unwrap();
+        let mut t = store.write();
+        let p = t.intern(&Term::NamedNode(named("http://ex.org/bulk"))).unwrap();
+        let quads: Vec<[Id; 4]> = (0..100)
+            .map(|i| [Id::bnode(1000 + i), p, Id::from_i64(i as i64).unwrap(), Id::DEFAULT_GRAPH])
+            .collect();
+        t.insert_bulk(quads).unwrap();
+        let a = t.intern(&Term::NamedNode(named("http://ex.org/a"))).unwrap();
+        let q = t.intern(&Term::NamedNode(named("http://ex.org/p"))).unwrap();
+        t.delete([a, q, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH]).unwrap();
+        t.commit().unwrap();
+        let s = store.snapshot();
+        assert_eq!(s.len(), 5 + 100 - 1);
+        assert!(s.delta.is_empty());
+        let p = s.lookup_iri("http://ex.org/bulk").unwrap();
+        assert_eq!(p.tag(), Tag::Vocab);
+        assert_eq!(s.count(Perm::Pso, &[p.0]).unwrap(), 100);
+        drop(s);
+        drop(store);
+        let store = Store::open(&dir.path().join("db"), opts).unwrap();
+        assert_eq!(store.snapshot().len(), 104);
     }
 
     #[test]

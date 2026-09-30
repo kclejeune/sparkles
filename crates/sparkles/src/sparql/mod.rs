@@ -113,7 +113,47 @@ pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -
     for (k, v) in prefixes {
         p = p.with_prefix(k, v).map_err(|e| Error::invalid(e.to_string()))?;
     }
-    Ok(p.parse_query(q)?)
+    let query = p.parse_query(q)?;
+    let (pattern, _, _) = split(&query);
+    validate_scoping(pattern)?;
+    Ok(query)
+}
+
+/// SPARQL 1.1 §18.2.1: the target of `BIND(... AS ?v)` / `(expr AS ?v)` must not already
+/// be in scope. spargebra does not check this; Jena and QLever reject such queries.
+pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
+    use GraphPattern as GP;
+    match gp {
+        GP::Extend { inner, variable, .. } => {
+            let mut in_scope = false;
+            inner.on_in_scope_variable(|v| in_scope |= v == variable);
+            // `SELECT (agg AS ?v)`: ?v must not occur in the grouped WHERE clause either
+            if let GP::Group { inner: body, .. } = &**inner {
+                body.on_in_scope_variable(|v| in_scope |= v == variable);
+            }
+            if in_scope {
+                return Err(Error::invalid(format!(
+                    "variable ?{} is already in scope and cannot be the target of AS",
+                    variable.as_str()
+                )));
+            }
+            validate_scoping(inner)
+        }
+        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } | GP::LeftJoin { left, right, .. } => {
+            validate_scoping(left)?;
+            validate_scoping(right)
+        }
+        GP::Filter { inner, .. }
+        | GP::Graph { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Group { inner, .. }
+        | GP::Service { inner, .. } => validate_scoping(inner),
+        _ => Ok(()),
+    }
 }
 
 fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryDataset>, base: Option<&oxiri::Iri<String>>) -> Ctx {

@@ -94,7 +94,7 @@ pub struct IndexMeta {
     pub created: String,
 }
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 struct BatchInfo {
     id: usize,
