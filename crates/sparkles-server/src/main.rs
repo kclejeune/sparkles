@@ -1,0 +1,415 @@
+//! `sparkles` — Fuseki-compatible server and Jena-style command line tools
+//! (`serve` ≈ fuseki-server, `load` ≈ tdb2.tdbloader, `query` ≈ tdb2.tdbquery / arq,
+//! `update` ≈ tdb2.tdbupdate, `dump` ≈ tdb2.tdbdump, `compact`, `backup`, `stats`,
+//! `infer` ≈ riot --infer).
+
+mod http;
+mod state;
+mod ui;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use sparkles::io::Source;
+use sparkles::sparql::results::{self, SolutionsFormat};
+use sparkles::sparql::{QueryKind, QueryOptions};
+use sparkles::store::{Store, StoreOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Parser)]
+#[command(name = "sparkles", version, about = "High-performance RDF/SPARQL database (Jena/Fuseki compatible)")]
+struct Cli {
+    /// Block cache size in MiB
+    #[arg(long, global = true, default_value_t = 1024)]
+    cache_mb: u64,
+    /// Treat the default graph as the union of all named graphs
+    #[arg(long, global = true)]
+    union_default_graph: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the SPARQL server with the web UI
+    Serve {
+        /// Directory holding the dataset registry, databases and backups
+        #[arg(long, default_value = "./data")]
+        data: PathBuf,
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        #[arg(long, default_value_t = 3030)]
+        port: u16,
+        /// Add an in-memory dataset (not persisted), e.g. --mem ds
+        #[arg(long)]
+        mem: Vec<String>,
+        /// Serve an existing database directory, e.g. --loc ds=/path/to/db
+        #[arg(long)]
+        loc: Vec<String>,
+        /// Default query timeout in seconds
+        #[arg(long, default_value_t = 60.0)]
+        timeout: f64,
+        /// Reject updates, uploads and admin changes
+        #[arg(long)]
+        read_only: bool,
+        /// Disable federated SERVICE calls
+        #[arg(long)]
+        no_service: bool,
+    },
+    /// Bulk load RDF files into a database (creates it if needed)
+    Load {
+        #[arg(long)]
+        loc: PathBuf,
+        /// Load triples into this named graph
+        #[arg(long)]
+        graph: Option<String>,
+        files: Vec<PathBuf>,
+    },
+    /// Run a SPARQL query against a database or files
+    Query {
+        /// Database directory
+        #[arg(long)]
+        loc: Option<PathBuf>,
+        /// Data files to query (loaded into memory)
+        #[arg(long)]
+        data: Vec<PathBuf>,
+        /// File containing the query
+        #[arg(long)]
+        query: Option<PathBuf>,
+        /// Output format: text, json, xml, csv, tsv, sparkles (graphs: ttl, nt, nq, trig, jsonld, rdfxml)
+        #[arg(long, default_value = "text")]
+        results: String,
+        /// Print the query plan instead of executing
+        #[arg(long)]
+        explain: bool,
+        /// Print the executed plan and timing after the results
+        #[arg(long)]
+        time: bool,
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Query string (if --query is not given)
+        text: Option<String>,
+    },
+    /// Run a SPARQL update against a database
+    Update {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long)]
+        update: Option<PathBuf>,
+        text: Option<String>,
+    },
+    /// Write the database as N-Quads (or TriG) to stdout
+    Dump {
+        #[arg(long)]
+        loc: PathBuf,
+    },
+    /// Merge updates into a freshly built index generation
+    Compact {
+        #[arg(long)]
+        loc: PathBuf,
+    },
+    /// Write a gzipped N-Quads backup
+    Backup {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long, default_value = "./backups")]
+        out: PathBuf,
+    },
+    /// Print database statistics
+    Stats {
+        #[arg(long)]
+        loc: PathBuf,
+    },
+    /// Materialize inferences (rdfs, rdfs-simple, owl-rl or a Jena rules file)
+    Infer {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long, default_value = "rdfs")]
+        profile: String,
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// Remove materialized inferences instead
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+fn store_opts(cli: &Cli) -> StoreOptions {
+    StoreOptions {
+        cache_bytes: cli.cache_mb << 20,
+        union_default_graph: cli.union_default_graph,
+        ..Default::default()
+    }
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "sparkles=info,sparkles_server=info,tower_http=warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let cli = Cli::parse();
+    let opts = store_opts(&cli);
+    match cli.cmd {
+        Cmd::Serve { data, host, port, mem, loc, timeout, read_only, no_service } => {
+            let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            st.read_only = read_only;
+            st.allow_service = !no_service;
+            let st = Arc::new(st);
+            for m in mem {
+                st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
+            }
+            for l in loc {
+                let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
+                st.attach(name.trim_start_matches('/'), state::DbType::Persistent, Some(std::path::Path::new(path)))?;
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(async move {
+                let addr = format!("{host}:{port}");
+                let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
+                tracing::info!("Sparkles {} listening on http://{addr}/ (UI at /ui/)", env!("CARGO_PKG_VERSION"));
+                for name in st.datasets.read().keys() {
+                    tracing::info!("  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data");
+                }
+                axum::serve(listener, http::router(st))
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await?;
+                anyhow::Ok(())
+            })
+        }
+        Cmd::Load { loc, graph, files } => {
+            if files.is_empty() {
+                bail!("no files given");
+            }
+            let store = Store::open(&loc, opts)?;
+            let g = graph.map(oxrdf::NamedNode::new).transpose()?;
+            let sources = files.iter().map(|f| Source::from_path(f, g.clone())).collect::<Result<Vec<_>, _>>()?;
+            let t = Instant::now();
+            let before = store.snapshot().len();
+            store.load(&sources)?;
+            let after = store.snapshot().len();
+            let secs = t.elapsed().as_secs_f64();
+            eprintln!(
+                "loaded {} quads in {:.2}s ({:.0} quads/s); database now has {after} quads",
+                after - before,
+                secs,
+                (after - before) as f64 / secs.max(1e-9)
+            );
+            Ok(())
+        }
+        Cmd::Query { loc, data, query, results: fmt, explain, time, timeout, text } => {
+            let q = match (query, text) {
+                (Some(f), _) => std::fs::read_to_string(f)?,
+                (None, Some(t)) => t,
+                _ => bail!("no query given"),
+            };
+            let store = match loc {
+                Some(l) => Store::open(&l, opts)?,
+                None => {
+                    let s = Store::in_memory(opts);
+                    let sources = data.iter().map(|f| Source::from_path(f, None)).collect::<Result<Vec<_>, _>>()?;
+                    if !sources.is_empty() {
+                        s.load(&sources)?;
+                    }
+                    s
+                }
+            };
+            let qopts = QueryOptions {
+                timeout: timeout.map(Duration::from_secs_f64),
+                allow_service: true,
+                prefixes: store.prefixes().into_iter().collect(),
+                ..Default::default()
+            };
+            if explain {
+                let (sse, plan) = sparkles::sparql::explain(store.snapshot(), &q, &qopts)?;
+                println!("{sse}\n");
+                print_plan(&plan, 0);
+                return Ok(());
+            }
+            let r = sparkles::sparql::query(store.snapshot(), &q, &qopts)?;
+            let out = std::io::stdout();
+            let mut out = out.lock();
+            match r.kind {
+                QueryKind::Select | QueryKind::Ask if fmt == "text" => print_table(&r, &store, &mut out)?,
+                QueryKind::Select | QueryKind::Ask => {
+                    let f = SolutionsFormat::from_name(&fmt).context("unknown result format")?;
+                    results::write_solutions(&r, f, &mut out, None)?;
+                    writeln!(out)?;
+                }
+                _ => {
+                    let f = if fmt == "text" { Some(oxrdfio::RdfFormat::Turtle) } else { results::rdf_format_from_name(&fmt) };
+                    results::write_graph(&r, f.context("unknown RDF format")?, &store.prefixes(), &mut out)?;
+                }
+            }
+            if time {
+                eprintln!(
+                    "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
+                    r.timing.parse_ms, r.timing.plan_ms, r.timing.exec_ms, r.timing.total_ms
+                );
+                print_plan_stderr(&r.plan, 0);
+            }
+            Ok(())
+        }
+        Cmd::Update { loc, update, text } => {
+            let u = match (update, text) {
+                (Some(f), _) => std::fs::read_to_string(f)?,
+                (None, Some(t)) => t,
+                _ => bail!("no update given"),
+            };
+            let store = Store::open(&loc, opts)?;
+            let qopts = QueryOptions {
+                prefixes: store.prefixes().into_iter().collect(),
+                allow_service: true,
+                ..Default::default()
+            };
+            let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
+            eprintln!("inserted {} · deleted {} · {:.2} ms", s.inserted, s.deleted, s.timing.total_ms);
+            Ok(())
+        }
+        Cmd::Dump { loc } => {
+            let store = Store::open(&loc, opts)?;
+            let out = std::io::BufWriter::new(std::io::stdout().lock());
+            store.dump_nquads(out)?;
+            Ok(())
+        }
+        Cmd::Compact { loc } => {
+            let store = Store::open(&loc, opts)?;
+            let t = Instant::now();
+            store.compact()?;
+            eprintln!("compacted into {} in {:.2}s", store.snapshot().generation.name, t.elapsed().as_secs_f64());
+            Ok(())
+        }
+        Cmd::Backup { loc, out } => {
+            let store = Store::open(&loc, opts)?;
+            let name = loc.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "db".into());
+            let p = store.backup(&out, &name)?;
+            eprintln!("backup written to {}", p.display());
+            Ok(())
+        }
+        Cmd::Stats { loc } => {
+            let store = Store::open(&loc, opts)?;
+            let s = store.snapshot();
+            let g = &s.generation;
+            println!("generation      {}", g.name);
+            println!("quads           {}", s.len());
+            println!("  base          {}", g.meta.quads);
+            println!("  delta +/-     {} / {}", s.delta.inserts(), s.delta.deletes());
+            println!("terms           {} (+{} delta)", g.vocab.len(), g.dvocab.len());
+            println!("subjects        {}", g.stats.distinct_subjects);
+            println!("predicates      {}", g.stats.distinct_predicates);
+            println!("objects         {}", g.stats.distinct_objects);
+            println!("named graphs    {}", s.graph_ids()?.len());
+            println!("disk            {:.1} MiB", store.disk_bytes() as f64 / (1 << 20) as f64);
+            let mut preds = g.stats.predicates.clone();
+            preds.sort_by(|a, b| b.count.cmp(&a.count));
+            println!("\ntop predicates:");
+            for p in preds.iter().take(20) {
+                let name = s.term(sparkles::id::Id(p.p)).map(|t| t.to_string()).unwrap_or_default();
+                println!("  {:>12}  {name}  (S {}, O {})", p.count, p.distinct_subjects, p.distinct_objects);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "reasoning"))]
+        Cmd::Infer { .. } => bail!("built without the `reasoning` feature"),
+        #[cfg(feature = "reasoning")]
+        Cmd::Infer { loc, profile, rules, clear } => {
+            let store = Store::open(&loc, opts)?;
+            if clear {
+                let n = sparkles_reasoner::clear(&store)?;
+                eprintln!("removed {n} inferred triples");
+                return Ok(());
+            }
+            let profile = match rules {
+                Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
+                None => profile.parse().map_err(|_| anyhow::anyhow!("unknown profile '{profile}'"))?,
+            };
+            let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
+            eprintln!(
+                "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
+                r.inferred, r.rules, r.iterations, r.millis, sparkles_reasoner::INFERRED_GRAPH
+            );
+            for w in r.warnings {
+                eprintln!("warning: {w}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_plan(p: &sparkles::sparql::PlanInfo, depth: usize) {
+    println!(
+        "{}{} {}  [est {} rows, cost {}]",
+        "  ".repeat(depth),
+        p.operator,
+        p.description,
+        p.estimated_rows,
+        p.estimated_cost
+    );
+    for c in &p.children {
+        print_plan(c, depth + 1);
+    }
+}
+
+fn print_plan_stderr(p: &sparkles::sparql::PlanInfo, depth: usize) {
+    eprintln!(
+        "{}{} {}  [{} rows (est {}), {:.2} ms]",
+        "  ".repeat(depth),
+        p.operator,
+        p.description,
+        p.actual_rows,
+        p.estimated_rows,
+        p.time_ms
+    );
+    for c in &p.children {
+        print_plan_stderr(c, depth + 1);
+    }
+}
+
+/// Jena-style text table (`ResultSetFormatter.out`).
+fn print_table(r: &sparkles::sparql::QueryResult, store: &Store, out: &mut impl Write) -> Result<()> {
+    if r.kind == QueryKind::Ask {
+        writeln!(out, "{}", if r.boolean { "yes" } else { "no" })?;
+        return Ok(());
+    }
+    let prefixes = store.prefixes();
+    let show = |t: Option<oxrdf::Term>| -> String {
+        match t {
+            None => String::new(),
+            Some(oxrdf::Term::NamedNode(n)) => {
+                for (p, ns) in &prefixes {
+                    if let Some(l) = n.as_str().strip_prefix(ns.as_str())
+                        && l.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    {
+                        return format!("{p}:{l}");
+                    }
+                }
+                format!("<{}>", n.as_str())
+            }
+            Some(t) => t.to_string(),
+        }
+    };
+    let rows: Vec<Vec<String>> = r.rows().into_iter().map(|row| row.into_iter().map(show).collect()).collect();
+    let mut widths: Vec<usize> = r.vars.iter().map(|v| v.chars().count() + 1).collect();
+    for row in &rows {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
+        }
+    }
+    let line: String = widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("-");
+    writeln!(out, "-{line}-")?;
+    let hdr: Vec<String> = r.vars.iter().enumerate().map(|(i, v)| format!(" {:w$} ", format!("?{v}"), w = widths[i])).collect();
+    writeln!(out, "|{}|", hdr.join("|"))?;
+    writeln!(out, "={}=", "=".repeat(line.chars().count()))?;
+    for row in &rows {
+        let cells: Vec<String> = row.iter().enumerate().map(|(i, c)| format!(" {:w$} ", c, w = widths[i])).collect();
+        writeln!(out, "|{}|", cells.join("|"))?;
+    }
+    writeln!(out, "-{line}-")?;
+    Ok(())
+}

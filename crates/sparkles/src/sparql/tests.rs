@@ -71,6 +71,13 @@ fn has_op(p: &PlanInfo, op: &str) -> bool {
 }
 
 #[test]
+fn select_star_order() {
+    let s = store();
+    let r = q(&s, "SELECT * WHERE { ?person foaf:age ?age ; foaf:name ?name } LIMIT 1");
+    assert_eq!(r.vars, ["person", "age", "name"]);
+}
+
+#[test]
 fn bgp_join() {
     let s = store();
     let r = q(&s, "SELECT ?n WHERE { ?p a foaf:Person ; foaf:name ?n ; foaf:knows ex:carol }");

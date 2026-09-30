@@ -171,7 +171,39 @@ pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryR
     let t0 = Instant::now();
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    execute_query(snap, &parsed, opts, parse_ms)
+    let mut r = execute_query(snap, &parsed, opts, parse_ms)?;
+    if r.kind == QueryKind::Select {
+        select_star_order(q, &mut r);
+    }
+    Ok(r)
+}
+
+/// `SELECT *`: spargebra projects variables in sorted order; Jena (and users) expect the
+/// order of first appearance in the query text.
+fn select_star_order(q: &str, r: &mut QueryResult) {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
+    if !re.is_match(q) {
+        return;
+    }
+    let pos = |v: &str| {
+        [format!("?{v}"), format!("${v}")]
+            .iter()
+            .filter_map(|pat| {
+                q.match_indices(pat.as_str())
+                    .find(|(i, _)| {
+                        !q[i + pat.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    })
+                    .map(|(i, _)| i)
+            })
+            .min()
+            .unwrap_or(usize::MAX)
+    };
+    let mut order: Vec<usize> = (0..r.vars.len()).collect();
+    order.sort_by_key(|&i| pos(&r.vars[i]));
+    r.vars = order.iter().map(|&i| r.vars[i].clone()).collect();
+    r.table.vars = order.iter().map(|&i| r.table.vars[i]).collect();
+    r.table.cols = order.iter().map(|&i| std::mem::take(&mut r.table.cols[i])).collect();
 }
 
 pub fn execute_query(snap: Arc<Snapshot>, parsed: &Query, opts: &QueryOptions, parse_ms: f64) -> Result<QueryResult> {
