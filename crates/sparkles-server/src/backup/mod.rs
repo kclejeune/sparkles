@@ -551,18 +551,23 @@ fn server_id(data_dir: &Path) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// `restoredFrom` of a restored database (`{repository, backup, datasetId, seq}`, from
-/// its `restore.json`), for the dataset info.
+/// `restoredFrom` of a restored database (`{repository, backup, datasetId, seq}`): from
+/// its `dataset.json`, else from its `restore.json`. For the dataset info.
 pub fn restored_from(root: &Path) -> Option<serde_json::Value> {
-    let r: sparkles_backup::RestoreRecord =
-        serde_json::from_slice(&std::fs::read(root.join("restore.json")).ok()?).ok()?;
-    serde_json::to_value(sparkles::commit::RestoredFrom {
-        repository: r.repository.name,
-        backup: r.backup,
-        dataset_id: r.source.dataset_id,
-        seq: r.source.seq,
-    })
-    .ok()
+    let from = match sparkles::commit::read_restored_from(root) {
+        Ok(Some(f)) => f,
+        _ => {
+            let r: sparkles_backup::RestoreRecord =
+                serde_json::from_slice(&std::fs::read(root.join("restore.json")).ok()?).ok()?;
+            sparkles::commit::RestoredFrom {
+                repository: r.repository.name,
+                backup: r.backup,
+                dataset_id: r.source.dataset_id,
+                seq: r.source.seq,
+            }
+        }
+    };
+    serde_json::to_value(from).ok()
 }
 
 /// Lock the data directory for this server process (`<data>/sparkles-server.lock`, an

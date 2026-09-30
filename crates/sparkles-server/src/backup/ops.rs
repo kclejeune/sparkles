@@ -421,9 +421,15 @@ fn verify_in(
     h: &TaskHandle,
 ) -> Result<(VerifyReport, Outcome), BackupError> {
     let repo = b.repo(repo_name)?;
+    // a `restore`-level verification restores into `<data>/tmp/verify-*` (removed by
+    // the next start if the server stops meanwhile)
+    let tmp = st.data_dir.join("tmp");
+    if level == VerifyLevel::Restore {
+        std::fs::create_dir_all(&tmp)?;
+    }
     let o = VerifyOptions {
         level,
-        tmp_dir: Some(st.data_dir.join("tmp")),
+        tmp_dir: Some(tmp),
         store_opts: st.store_opts.clone(),
         ctl: ctl(h, 0.0, 1.0),
     };
