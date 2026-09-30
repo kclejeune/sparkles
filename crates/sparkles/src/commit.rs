@@ -191,12 +191,18 @@ impl Serialize for CommitInfo {
 
 /// The outcome of a write: the new commit, or the unchanged head when the write had no
 /// net effect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub dataset_id: uuid::Uuid,
     pub committed: bool,
     pub commit: CommitInfo,
+    /// what a write guard found (write-time validation), when one ran
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::guard::serialize_summary"
+    )]
+    pub validation: Option<std::sync::Arc<crate::guard::ValidationSummary>>,
 }
 
 /// A page of the commit catalog.

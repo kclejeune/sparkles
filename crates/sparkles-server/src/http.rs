@@ -1039,7 +1039,7 @@ async fn update_endpoint(
             sparkles::commit::CommitKind::Update,
         )?;
         crate::otel::update_done(t0, &stats);
-        let receipt = stats.commit.expect("update receipts");
+        let receipt = stats.commit.clone().expect("update receipts");
         let report = RequestReport {
             operation: Some(Op::Update),
             rows: Some(stats.inserted + stats.deleted),
@@ -1416,7 +1416,7 @@ async fn gsp(
                     &QueryOptions::default(),
                     sparkles::commit::CommitKind::GspDelete,
                 )?;
-                let receipt = stats.commit.expect("update receipts");
+                let receipt = stats.commit.clone().expect("update receipts");
                 Ok(write_report(Op::Gsp, stats.deleted).attach(write_response(
                     &ds,
                     StatusCode::NO_CONTENT,

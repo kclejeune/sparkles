@@ -3,6 +3,7 @@ pub mod check;
 pub mod commit;
 pub mod dataset;
 pub mod error;
+pub mod guard;
 pub mod history;
 pub mod id;
 pub mod index;

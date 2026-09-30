@@ -592,6 +592,8 @@ pub struct StoreOptions {
     pub history_max_generations: usize,
     /// Named snapshots per dataset.
     pub max_snapshots: usize,
+    /// Allow writes to a dataset that requires a write guard without installing one.
+    pub unvalidated_writes: bool,
 }
 
 impl Default for StoreOptions {
@@ -607,6 +609,7 @@ impl Default for StoreOptions {
             history_cache_bytes: 1 << 30,
             history_max_generations: 8,
             max_snapshots: 256,
+            unvalidated_writes: false,
         }
     }
 }
@@ -649,6 +652,10 @@ pub struct Store {
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Mutex<crate::history::HistoryState>>,
+    /// write guard checked before every commit (write-time validation)
+    guard: parking_lot::RwLock<Option<Arc<dyn crate::guard::CommitGuard>>>,
+    /// `validation.json` asks for a guard: commits fail without one (fail closed)
+    guard_required: AtomicBool,
 }
 
 pub(crate) const WAL_INSERT: u8 = 1;
@@ -736,6 +743,8 @@ impl Store {
             clock: Mutex::new(None),
             text: Default::default(),
             history: None,
+            guard: parking_lot::RwLock::new(None),
+            guard_required: AtomicBool::new(false),
             opts,
         }
     }
@@ -932,6 +941,8 @@ impl Store {
             clock: Mutex::new(None),
             text: Default::default(),
             history: Some(Mutex::new(history)),
+            guard: parking_lot::RwLock::new(None),
+            guard_required: AtomicBool::new(guard_required_by(root)),
             opts,
         };
         store.collect_history(gen_no, head.seq);
@@ -1709,6 +1720,11 @@ impl Store {
 
     /// Begin the write transaction, recording its commit as `kind`.
     pub fn write_as(&self, kind: CommitKind) -> WriteTxn<'_> {
+        self.write_with(kind, Default::default())
+    }
+
+    /// [`write_as`](Self::write_as) with options for the write guard.
+    pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
         let guard = self.writer.lock();
         let base = self.snapshot();
         WriteTxn {
@@ -1721,6 +1737,82 @@ impl Store {
             kind,
             net_ins: 0,
             net_del: 0,
+            opts,
+        }
+    }
+
+    /// Install (or remove) the write guard run before every commit.
+    pub fn set_guard(&self, g: Option<Arc<dyn crate::guard::CommitGuard>>) {
+        *self.guard.write() = g;
+    }
+
+    pub fn guard(&self) -> Option<Arc<dyn crate::guard::CommitGuard>> {
+        self.guard.read().clone()
+    }
+
+    /// The dataset's `validation.json` requires a write guard.
+    pub fn guard_required(&self) -> bool {
+        self.guard_required.load(Ordering::Relaxed)
+    }
+
+    /// Mark whether this dataset requires a guard (set with its configuration).
+    pub fn set_guard_required(&self, required: bool) {
+        self.guard_required.store(required, Ordering::Relaxed);
+    }
+
+    /// Run the write guard on a candidate commit (writer lock held): `Ok(None)` when no
+    /// guard applies, the summary when it passes, [`Error::Rejected`] when it rejects.
+    fn run_guard(
+        &self,
+        base: &Snapshot,
+        view: impl FnOnce() -> Arc<Snapshot>,
+        kind: CommitKind,
+        changes: crate::guard::Changes<'_>,
+        opts: &crate::guard::WriteOptions,
+        head: u64,
+    ) -> Result<Option<Arc<crate::guard::ValidationSummary>>> {
+        use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
+        let g = self.guard();
+        if opts.bypass_validation {
+            if let Some(g) = &g {
+                g.bypassed();
+            }
+            tracing::warn!("a write bypassed write-time validation");
+            return Ok(Some(Arc::new(ValidationSummary::empty(
+                GuardStatus::Bypassed,
+                GuardMode::Off,
+                Severity::Violation,
+            ))));
+        }
+        let Some(g) = g else {
+            if self.guard_required() && !self.opts.unvalidated_writes {
+                return Err(Error::GuardMissing(
+                    "dataset requires write-time SHACL validation; install the guard (sparkles_shacl::guard::ShaclGuard::install) or allow unvalidated writes".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let summary = g.check(&crate::guard::Candidate {
+            base,
+            view: view(),
+            kind,
+            changes,
+            opts,
+        })?;
+        if summary.status == GuardStatus::Rejected {
+            return Err(Error::Rejected(Box::new(crate::guard::Rejection {
+                summary,
+                head,
+                kind,
+            })));
+        }
+        Ok(Some(Arc::new(summary)))
+    }
+
+    /// Tell the guard a commit it checked was published.
+    fn guard_committed(&self, seq: u64) {
+        if let Some(g) = self.guard() {
+            g.committed(seq);
         }
     }
 
@@ -1734,6 +1826,16 @@ impl Store {
 
     /// [`load`](Self::load), recording the commit as `kind`.
     pub fn load_as(&self, sources: &[Source], kind: CommitKind) -> Result<Receipt> {
+        self.load_with(sources, kind, &Default::default())
+    }
+
+    /// [`load_as`](Self::load_as) with options for the write guard.
+    pub fn load_with(
+        &self,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<Receipt> {
         let snap = self.snapshot();
         if snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold {
             let mut w = self.writer.lock();
@@ -1746,11 +1848,12 @@ impl Store {
                 net_del: 0,
                 start_len: snap.len(),
             };
+            let check = Some((crate::guard::Changes::Unknown, o));
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk))?
+                .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk), check)?
                 .1)
         } else {
-            let mut txn = self.write_as(kind);
+            let mut txn = self.write_with(kind, o.clone());
             let mut prefixes = BTreeMap::new();
             for s in sources {
                 let (quads, p) = crate::io::parse_to_vec(s)?;
@@ -1783,8 +1886,19 @@ impl Store {
         sources: &[Source],
         kind: CommitKind,
     ) -> Result<(u64, Receipt)> {
+        self.replace_with(target, sources, kind, &Default::default())
+    }
+
+    /// [`replace_as`](Self::replace_as) with options for the write guard.
+    pub fn replace_with(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<(u64, Receipt)> {
         if estimated_quads(sources) > self.opts.bulk_threshold {
-            return self.replace_bulk(target, sources, kind);
+            return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
@@ -1793,7 +1907,7 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        let mut txn = self.write_as(kind);
+        let mut txn = self.write_with(kind, o.clone());
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
             ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
@@ -1834,6 +1948,7 @@ impl Store {
         target: ReplaceTarget,
         sources: &[Source],
         kind: CommitKind,
+        o: &crate::guard::WriteOptions,
     ) -> Result<(u64, Receipt)> {
         let mut w = self.writer.lock();
         if w.poisoned {
@@ -1859,7 +1974,9 @@ impl Store {
             net_del: dropped,
             start_len,
         };
-        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, Some(bulk))?;
+        let check = Some((crate::guard::Changes::Unknown, o));
+        let (_, r) =
+            self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, Some(bulk), check)?;
         // the quads the replacement holds: what is left, less what was kept
         Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
     }
@@ -1872,7 +1989,7 @@ impl Store {
             return Err(Error::Poisoned);
         }
         let snap = self.snapshot();
-        self.rebuild_locked(&mut w, &snap, &[], &[], &[], None)?;
+        self.rebuild_locked(&mut w, &snap, &[], &[], &[], None, None)?;
         Ok(())
     }
 
@@ -1880,6 +1997,7 @@ impl Store {
     /// sources and `extra_quads` (encoded store ids from a bulk write transaction).
     /// With `bulk`, the rebuild is a new commit; without it (compaction), the head stays.
     /// Returns the number of new quads and the receipt.
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_locked(
         &self,
         w: &mut WriterState,
@@ -1888,6 +2006,7 @@ impl Store {
         extra_quads: &[[Id; 4]],
         drop_graphs: &[Id],
         bulk: Option<BulkCommit>,
+        check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
         // the old generation's WAL is the only other copy of the recent commits' ids:
@@ -1935,7 +2054,39 @@ impl Store {
         let meta = builder.finish()?;
         let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
         gen_._tmp = tmp;
+        let gen_ = Arc::new(gen_);
         w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        // a bulk commit is validated on the built generation, before anything is published
+        let validation = match (&bulk, check) {
+            (Some(b), Some((changes, o))) => {
+                let candidate = || {
+                    Arc::new(Snapshot {
+                        generation: gen_.clone(),
+                        delta: Delta::default(),
+                        version: 0,
+                        cache: self.cache.clone(),
+                        results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
+                        dvocab_len: gen_.dvocab.len(),
+                        commit: w.head.seq,
+                        text: None,
+                        union_default_graph: self.opts.union_default_graph,
+                        delta_stats: Default::default(),
+                        historical: false,
+                    })
+                };
+                match self.run_guard(snap, candidate, b.kind, changes, o, w.head.seq) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        drop(gen_);
+                        if self.root.is_some() {
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            _ => None,
+        };
         let head = match &bulk {
             Some(b) => CommitInfo {
                 seq: w.head.seq + 1,
@@ -1983,7 +2134,7 @@ impl Store {
         let old_name = snap.generation.name.clone();
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
-            generation: Arc::new(gen_),
+            generation: gen_,
             delta: Delta::default(),
             version: snap.version + 1,
             cache: self.cache.clone(),
@@ -2038,10 +2189,14 @@ impl Store {
                 }
             }
         }
+        if validation.is_some() && bulk.is_some() {
+            self.guard_committed(head.seq);
+        }
         let receipt = Receipt {
             dataset_id: self.dataset_id,
             committed: bulk.is_some(),
             commit: head,
+            validation,
         };
         Ok((meta.quads.saturating_sub(before), receipt))
     }
@@ -2406,6 +2561,8 @@ pub struct WriteTxn<'s> {
     /// net quads added / removed relative to `base` (the commit's counts)
     net_ins: u64,
     net_del: u64,
+    /// options for the write guard
+    opts: crate::guard::WriteOptions,
 }
 
 impl WriteTxn<'_> {
@@ -2639,7 +2796,20 @@ impl WriteTxn<'_> {
             return Err(Error::Poisoned);
         }
         if self.bulk.is_empty() {
-            return self.publish_log();
+            if self.net_ins == 0 && self.net_del == 0 {
+                // no net change: no commit, nothing to validate
+                return self.publish_log(None);
+            }
+            let head = self.guard.head.seq;
+            let validation = self.store.run_guard(
+                &self.base,
+                || Arc::new(self.view()),
+                self.kind,
+                crate::guard::Changes::Log(&self.log),
+                &self.opts,
+                head,
+            )?;
+            return self.publish_log(validation);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -2652,13 +2822,30 @@ impl WriteTxn<'_> {
             net_del: self.net_del,
             start_len: self.base.len(),
         };
-        let (_, receipt) =
-            self.store
-                .rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], Some(commit))?;
+        let log = std::mem::take(&mut self.log);
+        let check = Some((
+            crate::guard::Changes::Rebuilt {
+                log: &log,
+                bulk: &bulk,
+            },
+            &self.opts,
+        ));
+        let (_, receipt) = self.store.rebuild_locked(
+            &mut self.guard,
+            &view,
+            &[],
+            &bulk,
+            &[],
+            Some(commit),
+            check,
+        )?;
         Ok(receipt)
     }
 
-    fn publish_log(&mut self) -> Result<Receipt> {
+    fn publish_log(
+        &mut self,
+        validation: Option<Arc<crate::guard::ValidationSummary>>,
+    ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
         let head = self.guard.head;
         if self.net_ins == 0 && self.net_del == 0 {
@@ -2667,6 +2854,7 @@ impl WriteTxn<'_> {
                 dataset_id: self.store.dataset_id,
                 committed: false,
                 commit: head,
+                validation: None,
             });
         }
         gen_.dvocab.sync()?;
@@ -2726,10 +2914,14 @@ impl WriteTxn<'_> {
         };
         self.store.maintain_text(&mut snap, &self.log);
         self.store.current.store(Arc::new(snap));
+        if validation.is_some() {
+            self.store.guard_committed(c.seq);
+        }
         Ok(Receipt {
             dataset_id: self.store.dataset_id,
             committed: true,
             commit: c,
+            validation,
         })
     }
 }
@@ -2746,6 +2938,18 @@ pub enum ReplaceTarget {
 /// Convenience helper for tests and the CLI.
 pub fn named(iri: &str) -> NamedNode {
     NamedNode::new_unchecked(iri)
+}
+
+/// Whether `<root>/validation.json` asks for write-time validation (any mode but
+/// `off`). Only the mode is read: the store does not depend on the validator. A file that
+/// does not parse also requires a guard (fail closed).
+fn guard_required_by(root: &Path) -> bool {
+    match std::fs::read(root.join("validation.json")) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)
+            .map(|j| j.get("mode").and_then(|m| m.as_str()) != Some("off"))
+            .unwrap_or(true),
+        Err(_) => false,
+    }
 }
 
 /// A rough quad count of RDF sources from their size (~80 bytes per quad in text

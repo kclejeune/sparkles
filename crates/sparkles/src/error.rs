@@ -43,6 +43,12 @@ pub enum Error {
     /// A request that conflicts with the current state (e.g. a name already in use).
     #[error("{0}")]
     Conflict(String),
+    /// A write guard (write-time validation) rejected the commit; nothing was written.
+    #[error("{0}")]
+    Rejected(Box<crate::guard::Rejection>),
+    /// The dataset requires a write guard that this process has not installed.
+    #[error("{0}")]
+    GuardMissing(String),
 }
 
 /// Which budget a request exceeded.

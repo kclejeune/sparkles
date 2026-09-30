@@ -143,7 +143,7 @@ impl fmt::Debug for ReasonOptions {
 }
 
 /// Outcome of a reasoning run.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReasonReport {
     pub profile: String,
     /// number of rules that were run (after flattening nested rules and skipping

@@ -72,7 +72,7 @@ pub fn update_as(
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
     };
-    let mut txn = store.write_as(kind);
+    let mut txn = store.write_with(kind, opts.write.clone());
     for op in &parsed.operations {
         req.check()?;
         run_op(&mut txn, op, &req, &mut stats, store)?;

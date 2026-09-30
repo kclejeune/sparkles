@@ -33,6 +33,8 @@ pub use table::Table;
 #[derive(Clone, Debug, Default)]
 pub struct QueryOptions {
     pub timeout: Option<Duration>,
+    /// options for write guards (updates)
+    pub write: crate::guard::WriteOptions,
     /// protocol `default-graph-uri` (overrides FROM)
     pub default_graph_uris: Vec<String>,
     /// protocol `named-graph-uri` (overrides FROM NAMED)

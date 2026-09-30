@@ -172,7 +172,7 @@ pub fn recorded(
     report: &sparkles_reasoner::ReasonReport,
     store: &Store,
 ) -> ReasoningInfo {
-    let receipt = report.receipt;
+    let receipt = report.receipt.as_ref();
     ReasoningInfo {
         reasoning_format: 2,
         profile: profile.name().to_string(),
