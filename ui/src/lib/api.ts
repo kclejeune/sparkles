@@ -66,7 +66,9 @@ export type ReadyInfo = {
 
 export type Operation =
   'query' | 'update' | 'gsp' | 'upload' | 'shacl' | 'explain' | 'admin' | 'other';
-export type Outcome = 'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget';
+export type Outcome =
+  'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget' | 'rate_limited';
+export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 
 type CacheStats = {
@@ -99,6 +101,8 @@ export type MetricsSnapshot = {
     diskBytes: number;
     resultRows: number;
     budgetExceeded: Record<BudgetKind, number> | null;
+    /** Requests refused by a rate or concurrency limit, per limit class. */
+    rateLimited?: Record<LimitClass, number> | null;
     blockCache: CacheStats;
     resultCache: CacheStats & { enabled: boolean };
   }[];

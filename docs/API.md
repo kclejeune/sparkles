@@ -46,7 +46,7 @@ generates one (`{boot:08x}-{seq:012x}`, unique per process and increasing). The 
 `sparkles::access` (`--no-access-log` turns it off; `/ui/*`, `/$/ping`, `/$/ready` and
 `/$/metrics` are logged at DEBUG). Fields: `dataset` (or `$none`), `operation` (`query`,
 `update`, `gsp`, `upload`, `shacl`, `explain`, `admin`, `other`), `status`, `outcome`
-(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`), and where known `rows`,
+(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `rate_limited`), and where known `rows`,
 `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`, `response_bytes` and
 `mem_peak_bytes`. A request whose client disconnects is logged with `status=499` and
 `outcome=cancelled` (never sent). The span holds the matched route (`/{ds}/sparql`), never
@@ -82,6 +82,10 @@ then with all six outcomes. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` 
 are not counted. Deleting a dataset removes its series. Each dataset has its own block and
 result cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
 
+With rate limits configured, `sparkles_rate_limited_total{dataset,class}` (counter)
+counts refused requests per limit class, and `outcome="rate_limited"` appears in
+`sparkles_requests_total`.
+
 ```ts
 type MetricsSnapshot = {
   formatVersion: 1;
@@ -101,11 +105,94 @@ type MetricsSnapshot = {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; resultRows: number;
     budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
+    rateLimited: Record<"auth" | "query" | "update" | "admin", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
   }[];
 };
 ```
+
+### Rate limiting
+
+Off by default. `sparkles serve --rate-limit SPEC` (repeatable) and/or
+`--rate-limit-config FILE` limit each request class per client:
+
+| Class | Requests |
+|-------|----------|
+| `auth` | every path under `/$/auth/` (login, token minting, device flow, OIDC callback), matched or not |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
+| `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
+
+`/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
+
+`SPEC` is `CLASS[@DATASET]=LIMIT`, where `LIMIT` is `off` or a comma-separated list of
+
+* `N/s`, `N/min`, `N/h` or `N/d`: the sustained rate per client;
+* `burst=N`: requests a client may make at once after being idle (default: the rate's `N`);
+* `concurrency=N`: requests of the class in flight server-wide;
+* `client-concurrency=N`: requests in flight per client;
+* `failure-cost=N`: what a `401` or `403` response costs, in requests (default 1), so that
+  failed logins exhaust the budget faster.
+
+`CLASS@DATASET=…` replaces the class limit for requests to that dataset (with its own
+counters); `CLASS@DATASET=off` exempts the dataset. Examples:
+
+```sh
+sparkles serve --rate-limit auth=10/min,burst=5,failure-cost=3 \
+               --rate-limit query=100/s,burst=200,client-concurrency=8,concurrency=64 \
+               --rate-limit update=10/s --rate-limit query@public=5/s
+```
+
+`auth=10/min,burst=5` (with `failure-cost=3`) is a reasonable strict default for
+authentication endpoints. The configuration file is JSON; the flags apply on top of it,
+and `SIGHUP` re-reads it (client counters start afresh; a bad file keeps the running
+configuration):
+
+```json
+{
+  "classes": {
+    "auth":  { "rate": "10/min", "burst": 5, "failureCost": 3 },
+    "query": { "rate": "100/s", "burst": 200, "concurrency": 64, "clientConcurrency": 8 }
+  },
+  "datasets": { "public": { "query": { "rate": "5/s" } } },
+  "trustedProxies": ["127.0.0.1", "::1"],
+  "maxKeys": 100000
+}
+```
+
+**Clients.** A client is its peer address (an IPv6 client by its /64). Behind a reverse
+proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`): for
+requests from a trusted address the client is the rightmost untrusted hop of `Forwarded`
+(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. At most
+`maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of new
+addresses evicts other rarely seen clients, never one with requests in flight. Clients
+whose bucket has refilled are dropped every minute.
+
+**Algorithm.** GCRA (the virtual-scheduling form of a token bucket): a client may send
+`burst` requests at once, then one every `period / N`.
+
+**Responses.** Over the rate: `429 Too Many Requests` with `Retry-After` (whole seconds).
+Over a concurrency cap: `503 Service Unavailable` with `Retry-After: 1`, immediately;
+requests are never queued, so a saturated server sheds load instead of holding waiting
+requests. A request holds its concurrency slot until its response body has been sent
+(streamed Graph Store GETs included). The body uses the error format:
+
+```json
+{ "error": "too many query requests: retry in 2 s",
+  "limitClass": "query", "reason": "rate", "retryAfterSeconds": 2 }
+```
+
+`reason` is `rate`, `concurrency` or `client-concurrency`. Responses of a class with a
+rate carry the headers of draft-ietf-httpapi-ratelimit-headers-11:
+`RateLimit-Policy: "query";q=100;w=1` (the configured rate: `q` requests per `w`
+seconds; the policy name is `CLASS` or `CLASS@DATASET`) and `RateLimit: "query";r=57;t=1`
+(`r` requests available now, `t` seconds until the bucket is full). CORS exposes
+`Retry-After`, `RateLimit` and `RateLimit-Policy`.
+
+**Observability.** Refused requests are logged with `outcome=rate_limited` and counted
+in `sparkles_requests_total{outcome="rate_limited"}` and
+`sparkles_rate_limited_total{dataset,class}`.
 
 ## Datasets (admin)
 
@@ -693,9 +780,10 @@ type PlanNode = {
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number }`
-with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `503` for a
-cancelled query or when a write-ahead log write failed (writes are refused until restart;
-reads continue), `500` otherwise.
+with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `429`
+over a rate limit, `503` for a cancelled query, over a concurrency limit (see
+[Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
+until restart; reads continue), `500` otherwise.
 
 ### Budgets
 

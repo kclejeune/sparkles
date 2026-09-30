@@ -38,6 +38,9 @@ base64 = "0.23"
 mimalloc = { version = "0.1.52", optional = true }
 libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
 rayon.workspace = true
+arc-swap.workspace = true
+quick_cache = "0.7.0"
+http-body = "1"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"

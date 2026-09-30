@@ -120,16 +120,19 @@ pub enum Outcome {
     Timeout,
     Cancelled,
     Budget,
+    /// refused by a rate or concurrency limit (`429`, or `503` when saturated)
+    RateLimited,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 6] = [
+    pub const ALL: [Outcome; 7] = [
         Outcome::Ok,
         Outcome::ClientError,
         Outcome::Error,
         Outcome::Timeout,
         Outcome::Cancelled,
         Outcome::Budget,
+        Outcome::RateLimited,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -140,6 +143,7 @@ impl Outcome {
             Outcome::Timeout => "timeout",
             Outcome::Cancelled => "cancelled",
             Outcome::Budget => "budget",
+            Outcome::RateLimited => "rate_limited",
         }
     }
 
@@ -173,6 +177,8 @@ pub struct RequestReport {
     /// uncompressed body size
     pub response_bytes: Option<u64>,
     pub mem_peak_bytes: Option<u64>,
+    /// the limit class that refused the request (outcome `rate_limited`)
+    pub limit_class: Option<crate::ratelimit::Class>,
 }
 
 impl RequestReport {
@@ -484,7 +490,7 @@ impl Histogram {
 #[derive(Default)]
 struct OpMetrics {
     seen: AtomicBool,
-    outcomes: [AtomicU64; 6],
+    outcomes: [AtomicU64; 7],
     duration: Histogram,
     response_bytes: AtomicU64,
 }
@@ -495,6 +501,7 @@ pub struct DsMetrics {
     ops: [OpMetrics; 8],
     result_rows: AtomicU64,
     budget: [AtomicU64; 3],
+    rate_limited: [AtomicU64; 4],
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -570,6 +577,9 @@ impl Metrics {
             && let Some(k) = r.budget
         {
             ds.budget[budget_index(k)].fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(c) = r.limit_class {
+            ds.rate_limited[c.index()].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -834,6 +844,25 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
+    if st.rate_limit.is_some() {
+        family(
+            &mut o,
+            "sparkles_rate_limited_total",
+            "counter",
+            "Requests refused by a rate or concurrency limit, by limit class.",
+        );
+        for (ds, m) in &series {
+            let ds = escape_label(ds);
+            for c in crate::ratelimit::Class::ALL {
+                let _ = writeln!(
+                    o,
+                    "sparkles_rate_limited_total{{dataset=\"{ds}\",class=\"{}\"}} {}",
+                    c.as_str(),
+                    m.rate_limited[c.index()].load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
 
     type Field = fn(&DsGauges) -> u64;
     let per_dataset: [(&str, &str, &str, Field); 11] = [
@@ -1001,6 +1030,13 @@ pub fn metrics_json(st: &AppState) -> J {
             json!({
                 "resultRows": m.result_rows.load(Ordering::Relaxed),
                 "budgetExceeded": budget,
+                "rateLimited": crate::ratelimit::Class::ALL
+                    .iter()
+                    .map(|c| {
+                        let n = m.rate_limited[c.index()].load(Ordering::Relaxed);
+                        (c.as_str().to_string(), J::from(n))
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
             }),
         );
     }
@@ -1016,6 +1052,7 @@ pub fn metrics_json(st: &AppState) -> J {
                 "diskBytes": g.disk_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
+                "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
                 "blockCache": {
                     "bytes": g.cache_bytes,
                     "capacityBytes": g.cache_capacity,

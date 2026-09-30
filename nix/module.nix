@@ -17,6 +17,25 @@ let
     types
     ;
 
+  json = pkgs.formats.json { };
+
+  # behind the bundled nginx, the client address comes from X-Forwarded-For
+  rateLimits =
+    if cfg.rateLimits == null then
+      null
+    else
+      cfg.rateLimits
+      // lib.optionalAttrs cfg.nginx.enable {
+        trustedProxies = lib.unique (
+          (cfg.rateLimits.trustedProxies or [ ])
+          ++ [
+            "127.0.0.1"
+            "::1"
+          ]
+        );
+      };
+  rateLimitsFile = "/etc/sparkles/rate-limits.json";
+
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
   datasetArgs = lib.concatLists (
@@ -55,6 +74,10 @@ let
   ]
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
+  ++ lib.optionals (rateLimits != null) [
+    "--rate-limit-config"
+    rateLimitsFile
+  ]
   ++ datasetArgs
   ++ cfg.extraArgs;
 
@@ -208,6 +231,27 @@ in
       description = "`RUST_LOG` filter for the service.";
     };
 
+    rateLimits = mkOption {
+      type = types.nullOr json.type;
+      default = null;
+      example = lib.literalExpression ''
+        {
+          classes = {
+            auth = { rate = "10/min"; burst = 5; failureCost = 3; };
+            query = { rate = "100/s"; burst = 200; concurrency = 64; clientConcurrency = 8; };
+            update = { rate = "10/s"; };
+          };
+        }
+      '';
+      description = ''
+        Rate and concurrency limits per request class (`auth`, `query`, `update`,
+        `admin`), written to ${rateLimitsFile} and passed as `--rate-limit-config`
+        (see the Rate limiting section of `docs/API.md`). Changing it reloads the service
+        (SIGHUP) instead of restarting it. With `nginx.enable`, the loopback addresses
+        are added to `trustedProxies`. `null` (the default): no limits.
+      '';
+    };
+
     extraArgs = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -276,6 +320,10 @@ in
 
     environment.systemPackages = lib.optional cfg.installCli cfg.package;
 
+    environment.etc."sparkles/rate-limits.json" = mkIf (rateLimits != null) {
+      source = json.generate "sparkles-rate-limits.json" rateLimits;
+    };
+
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
 
     systemd.tmpfiles.settings."10-sparkles" = lib.listToAttrs (
@@ -295,7 +343,12 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       environment.RUST_LOG = cfg.logLevel;
+      reloadTriggers = lib.optional (
+        rateLimits != null
+      ) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
+        # re-reads the rate-limit configuration (without one, SIGHUP would stop it)
+        ExecReload = mkIf (rateLimits != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
         User = cfg.user;
         Group = cfg.group;

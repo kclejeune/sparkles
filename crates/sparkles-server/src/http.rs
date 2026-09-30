@@ -33,8 +33,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(SPARKLES_DATASET_ID),
         crate::obs::X_REQUEST_ID.clone(),
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        header::RETRY_AFTER,
+        header::HeaderName::from_static("ratelimit"),
+        header::HeaderName::from_static("ratelimit-policy"),
     ]);
-    Router::new()
+    let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui/", get(crate::ui::serve_index))
@@ -79,8 +82,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
         .layer(DefaultBodyLimit::max(8 << 30))
-        .layer(tower_http::compression::CompressionLayer::new())
-        .layer(cors)
+        .layer(tower_http::compression::CompressionLayer::new());
+    // inside `observe` (limited requests are logged and counted) and CORS (browsers
+    // can read the 429)
+    let app = match &state.rate_limit {
+        Some(rl) => app.layer(axum::middleware::from_fn_with_state(
+            rl.clone(),
+            crate::ratelimit::limit,
+        )),
+        None => app,
+    };
+    app.layer(cors)
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(crate::obs::MakeSpan)

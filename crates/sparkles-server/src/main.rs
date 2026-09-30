@@ -7,6 +7,7 @@ mod alloc;
 mod clone;
 mod http;
 mod obs;
+mod ratelimit;
 mod reasoning;
 #[cfg(feature = "shacl")]
 mod shacl;
@@ -119,6 +120,18 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
+        /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
+        /// auth, query, update, admin (e.g. query=100/s,burst=200)
+        #[arg(long, value_name = "SPEC")]
+        rate_limit: Vec<String>,
+        /// JSON file of rate limits (re-read on SIGHUP); --rate-limit flags apply on top
+        #[arg(long, value_name = "FILE")]
+        rate_limit_config: Option<PathBuf>,
+        /// Proxy (address or CIDR) whose Forwarded / X-Forwarded-For names the client
+        /// for rate limiting
+        #[arg(long, value_name = "CIDR")]
+        rate_limit_trusted_proxy: Vec<String>,
     },
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
@@ -561,6 +574,9 @@ fn main() -> Result<()> {
             update_timeout,
             auto_reason,
             auto_reason_max_delay,
+            rate_limit,
+            rate_limit_config,
+            rate_limit_trusted_proxy,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
@@ -589,6 +605,16 @@ fn main() -> Result<()> {
                 st.auto_reason = Some(reasoning::AutoReason::new(
                     Duration::from_secs_f64(secs),
                     max,
+                ));
+            }
+            let limit_sources = ratelimit::Sources {
+                file: rate_limit_config,
+                flags: rate_limit,
+                trusted_proxies: rate_limit_trusted_proxy,
+            };
+            if let Some(cfg) = limit_sources.load()? {
+                st.rate_limit = Some(Arc::new(
+                    ratelimit::RateLimiter::new(&cfg).map_err(anyhow::Error::msg)?,
                 ));
             }
             let st = Arc::new(st);
@@ -632,10 +658,19 @@ fn main() -> Result<()> {
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
                 }
+                if let Some(rl) = &st.rate_limit {
+                    ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));
+                    #[cfg(unix)]
+                    if limit_sources.file.is_some() {
+                        ratelimit::spawn_reload_on_sighup(rl.clone(), limit_sources);
+                    }
+                }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
                 let st2 = st.clone();
-                axum::serve(listener, http::router(st))
+                let app =
+                    http::router(st).into_make_service_with_connect_info::<std::net::SocketAddr>();
+                axum::serve(listener, app)
                     .with_graceful_shutdown(async move {
                         shutdown_signal().await;
                         st2.set_phase(obs::Phase::Draining);

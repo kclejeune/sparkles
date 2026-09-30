@@ -120,6 +120,8 @@ pub struct AppState {
     /// Emit one `sparkles::access` event per request.
     pub access_log: bool,
     pub metrics: crate::obs::Metrics,
+    /// rate and concurrency limits (`None`: no limits, the default)
+    pub rate_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     phase: AtomicU8,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
@@ -270,6 +272,7 @@ impl AppState {
             limits: Limits::default(),
             access_log: true,
             metrics: crate::obs::Metrics::new(true, 100),
+            rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),

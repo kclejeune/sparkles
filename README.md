@@ -94,6 +94,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
 | Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries stop when their client disconnects | ✅ |
+| Rate limiting: per-client GCRA buckets and concurrency caps per request class (`auth`, `query`, `update`, `admin`) with per-dataset overrides, trusted-proxy client addresses, `429`/`503` with `Retry-After` and `RateLimit` headers, bounded client tracking, SIGHUP reload; off by default | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations); Vitest unit tests (built against a mock; server integration pending) | 🚧 |
 
 ## Performance
@@ -404,6 +405,9 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--no-access-log` | | no per-request log lines |
 | `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |
 | `--metrics-max-datasets N` | `100` | datasets with their own metric labels (the rest share `$other`) |
+| `--rate-limit SPEC` | off | limit a request class per client, e.g. `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5` (repeatable; see `docs/API.md`, Rate limiting) |
+| `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP; `--rate-limit` applies on top |
+| `--rate-limit-trusted-proxy CIDR` | | proxy whose `Forwarded` / `X-Forwarded-For` names the client (repeatable) |
 
 Over-budget requests fail with `507` and a JSON body naming the budget; the query stops as
 soon as its client disconnects. `sparkles query --memory-mb N` applies the memory budget

@@ -2540,12 +2540,14 @@ name = "sparkles-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "base64 0.23.1",
  "clap",
  "flate2",
  "form_urlencoded",
  "futures-util",
+ "http-body",
  "libc",
  "libmimalloc-sys",
  "mimalloc",
@@ -2554,6 +2556,7 @@ dependencies = [
  "oxrdfio",
  "parking_lot",
  "percent-encoding",
+ "quick_cache",
  "rayon",
  "regex",
  "rust-embed",
