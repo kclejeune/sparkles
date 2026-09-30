@@ -556,6 +556,17 @@ fn scan_limited(
     let limit = limit.unwrap_or(usize::MAX);
     let mut truncated = false;
     let mut t = Table::new(vars.to_vec());
+    // the exact number of rows under the prefix (at most two block decodes, and those
+    // blocks are read by the scan anyway) bounds the output: reserve it once instead of
+    // growing every column by repeated doubling
+    let bound = ctx.snap.count(spec.perm, &spec.prefix)?;
+    let cap = usize::try_from(bound)
+        .unwrap_or(usize::MAX)
+        .min(limit)
+        .min(ctx.max_rows.saturating_add(1));
+    for c in &mut t.cols {
+        c.reserve_exact(cap);
+    }
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;

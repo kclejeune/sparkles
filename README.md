@@ -118,8 +118,9 @@ Where Sparkles still loses on performance:
   `foaf:knows*` traversal.
 * **Update latency:** Fluree commits faster at 10.5M (it indexes in the background).
 * **Memory:** Sparkles materializes every intermediate result and buffers whole
-  responses. Its RSS after the concurrent throughput test also includes heap that
-  glibc retains (672 MiB with a fixed mmap threshold, against 1.6 GiB by default).
+  responses. The table's 1.6 GiB at 10.5M was mostly heap retained by glibc. The
+  server now uses mimalloc and releases free memory when idle, and ends the same run
+  at 947 MiB, about 500 MiB of which is the block cache.
 * **Untested ground:** nothing above 10.5M triples, cold caches, standard benchmarks
   (LUBM/BSBM/WatDiv) and sustained update workloads. QLever's design targets billions
   of triples.
@@ -337,6 +338,13 @@ pnpm -C ui install && pnpm -C ui build        # optional: the UI is embedded at 
 cargo build --release
 ./target/release/sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
+
+The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
+allocator (the default `mimalloc` cargo feature of `sparkles-server`; the `sparkles`
+library leaves the choice to its embedder). Once no request has been active for
+`--idle-release-ms` (default 1000 ms), `sparkles serve` hands free heap memory back to
+the OS. Built with `--no-default-features --features reasoning,shacl` it uses the
+system allocator and `malloc_trim` instead.
 
 Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data` (GSP),
 `/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`

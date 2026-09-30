@@ -3,6 +3,7 @@
 //! `update` ≈ tdb2.tdbupdate, `dump` ≈ tdb2.tdbdump, `compact`, `backup`, `stats`,
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
+mod alloc;
 mod http;
 #[cfg(feature = "shacl")]
 mod shacl;
@@ -66,6 +67,9 @@ enum Cmd {
         /// Disable federated SERVICE calls
         #[arg(long)]
         no_service: bool,
+        /// Return free heap memory to the OS after this many idle milliseconds (0: never)
+        #[arg(long, default_value_t = 1000)]
+        idle_release_ms: u64,
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
@@ -206,6 +210,7 @@ fn main() -> Result<()> {
             timeout,
             read_only,
             no_service,
+            idle_release_ms,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
@@ -222,6 +227,7 @@ fn main() -> Result<()> {
                     Some(std::path::Path::new(path)),
                 )?;
             }
+            alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;

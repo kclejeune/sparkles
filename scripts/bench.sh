@@ -19,6 +19,7 @@
 # aarch64, macOS) unless FLUREE points at one.
 # Env: WARMUP (default 2), RUNS (default 10), SKIP_LOAD=1 to reuse existing indexes,
 # SKIP_QUERIES=1 to reuse existing per-query results (re-runs updates/throughput/RSS),
+# SKIP_PROBE=1 to skip the Sparkles memory probe (scripts/rss-probe.sh),
 # ANSWERS_ONLY=1 to re-check answers and rebuild the summary without timing anything,
 # ENGINES="sparkles jena qlever fluree" (default) to run a subset. Results are merged per engine
 # into existing results/*.json, so e.g. ENGINES=qlever re-measures only QLever and keeps
@@ -268,9 +269,17 @@ merge results/throughput.new.json results/throughput.json
 # --------------------------------------------------------------------------- memory (RSS)
 rss() { local pid; pid=$(ss -ltnp 2>/dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1); \
   awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$pid/status" 2>/dev/null || echo "?"; }
+sleep 2 # idle servers may hand free memory back (Sparkles does after 1 s)
 kv=(); for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss "${PORT[$e]}")"); done
 setj results/rss.json "" "${kv[@]}"
 echo; echo "RSS (MiB) after the run: $(cat results/rss.json)"
+
+# Sparkles memory probe (scripts/rss-probe.sh): a fresh server, every query once, then
+# 3 x 160 concurrent star-join requests; RSS at each step, block-cache bytes and peak RSS
+if has sparkles && [ -z "${SKIP_PROBE:-}" ]; then
+  echo; echo "== memory probe"
+  SPARKLES="$SPARKLES" "$ROOT/scripts/rss-probe.sh" "$WORK"
+fi
 fi # ANSWERS_ONLY
 
 # ---------------------------------------------------------------------------- summary
@@ -351,6 +360,11 @@ if rs:
 if os.path.exists(f"{d}/rss.json"):
     rss = json.load(open(f"{d}/rss.json"))
     out.append("| **server RSS** after the run (MiB) | " + " | ".join(str(rss.get(c, "—")) for c in cmds) + " |")
+if os.path.exists(f"{d}/rss-probe.json"):
+    pr = json.load(open(f"{d}/rss-probe.json"))
+    cell = lambda c, k: str(pr[c][k]) if c in pr and k in pr[c] else "—"
+    out.append("| **RSS probe**, fresh server: after the queries / after 3×160 star-join (MiB) | "
+               + " | ".join(f"{cell(c, 'after_queries_mib')} / {cell(c, 'after_round3_mib')}" if c in pr else "—" for c in cmds) + " |")
 if notes:
     out += [""] + notes
 open(f"{d}/summary.md", "w").write("\n".join(out) + "\n")

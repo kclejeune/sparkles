@@ -56,6 +56,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(crate::alloc::track))
         .with_state(state)
 }
 

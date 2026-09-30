@@ -128,10 +128,30 @@ re-check every engine's answers without timing anything.
    run the kernel OOM-killed it at 26 GB of anonymous RSS (the machine has 30 GB). It
    was not re-run.
 
-Sparkles' RSS after the 10.5M run is mostly retained heap, not live data. The 16-client
-throughput step makes glibc raise its dynamic mmap threshold, so large buffers that
-were freed stay in the process. With `MALLOC_MMAP_THRESHOLD_=131072` the same workload
-ends at 672 MiB. This includes the 500 MiB of decoded blocks cached by then.
+Sparkles' RSS after the 10.5M run above (1608 MiB) was mostly heap retained by glibc,
+not live data. Since then the server links mimalloc and returns free heap memory to
+the OS once it has been idle for a second (`--idle-release-ms`, default 1000). Scans
+also reserve their output from the exact index count instead of growing it.
+`scripts/rss-probe.sh` measures the effect on a fresh 10.5M server: it runs every query
+once, then 3 × 160 concurrent `star-join` requests, and reads RSS 2 s after each step.
+
+| Build (Sparkles only, same machine, 2026-09-30) | after the queries | after the concurrent rounds | peak |
+|---|---:|---:|---:|
+| glibc malloc (the build measured above) | 701–704 MiB | 1592–1727 MiB | 1845 MiB |
+| glibc, exact scan reservation | 675 MiB | 1426 MiB | 1430 MiB |
+| glibc, reservation + idle release (`malloc_trim`) | 644 MiB | 838 MiB | 1439 MiB |
+| **mimalloc, reservation + idle release (default build)** | 765 MiB | 920 MiB | 1682 MiB |
+
+About 500 MiB of each figure is the decoded-block cache. The allocator comparison also
+changed latency. Sparkles-only 10.5M runs of the default build against the glibc build:
+* throughput 190 vs 144 q/s;
+* `star-join` 38 vs 72 ms, `optional-count` 33 vs 55 ms, `minus` 27 vs 42 ms,
+  `two-hop-count` 65 vs 96 ms;
+* load 4.95 vs 5.5 s.
+
+jemalloc and glibc with fixed mmap thresholds were also measured and were slower.
+The four-engine tables above have not been re-run with this build yet. Sparkles'
+server RSS after its 10.5M run is now 947 MiB.
 
 Index size at 10.5M:
 
@@ -165,7 +185,7 @@ Head to head:
 | `lang-filter` (`LANGMATCHES(LANG(?t), "en")`) | Fluree | 1.2× at 10M (Sparkles 1.9× faster at 1M) | As with `contains`, most of the time is spent materializing the 500k-row title column. |
 | `count-all`, `types-grouped` | Fluree, QLever | within noise at 10M | All of them answer from index metadata or runs. |
 | Single-triple update latency | Fluree | 1.6× at 10M (6.8 vs 10.9 ms; tie at 1M) | Sparkles fsyncs its WAL and publishes a new snapshot before acknowledging. Fluree documents that it indexes in the background. |
-| Memory: server RSS after the 10M run | QLever | 4.4× (362 vs 1608 MiB) | See the note above: most of the difference is allocator retention after the concurrent throughput step. Sparkles also materializes every intermediate result and keeps a 1 GiB decoded-block cache; QLever streams lazily and uses a memory-limited allocator. |
+| Memory: server RSS after the 10M run | QLever | 4.4× (362 vs 1608 MiB); 2.6× (947 MiB) with the current build | See the note above: the 1608 MiB were mostly glibc retention after the concurrent throughput step, which the idle release now returns. Sparkles also materializes every intermediate result and keeps a 1 GiB decoded-block cache (about 500 MiB filled here); QLever streams lazily and uses a memory-limited allocator. |
 | Large results | QLever / Jena (in principle) | — | Sparkles serializes the whole response in memory before sending. The others stream. `export-500k` is still fastest in Sparkles at this size, but memory grows with result size. |
 
 Where Sparkles wins against QLever at 10.5M, it is often by a wide margin:
