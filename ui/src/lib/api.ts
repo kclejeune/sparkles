@@ -313,29 +313,49 @@ async function toError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, `${res.status} ${fallback}`, { requestId });
 }
 
-/** How requests authenticate: the CSRF token of the session, and what a 401 does. */
-const authHooks: { csrf: () => string | undefined; unauthorized: () => void } = {
+/**
+ * How requests authenticate: the CSRF token of the session, what a 401 does, and the first
+ * load of the caller (`/$/whoami`, which brings the CSRF token).
+ */
+const authHooks: {
+  csrf: () => string | undefined;
+  unauthorized: () => void;
+  ready: () => Promise<void>;
+} = {
   csrf: () => undefined,
   unauthorized: () => {},
+  ready: async () => {},
 };
 
 export function setAuthHooks(h: Partial<typeof authHooks>) {
   Object.assign(authHooks, h);
 }
 
+/**
+ * The CSRF token for a request with this method, if it needs one. An unsafe request made
+ * before the caller is known (a page that writes or queries by POST as soon as it opens)
+ * waits for it instead of going out without the header.
+ */
+async function csrfFor(method: string | undefined): Promise<string | undefined> {
+  if (!needsCsrf(method)) return undefined;
+  if (authHooks.csrf() === undefined) await authHooks.ready();
+  return authHooks.csrf();
+}
+
 /** `init` with the CSRF header added to unsafe requests of a session. */
-function withCsrf(init: RequestInit): RequestInit {
-  const token = authHooks.csrf();
-  if (!token || !needsCsrf(init.method)) return init;
+async function withCsrf(init: RequestInit): Promise<RequestInit> {
+  const token = await csrfFor(init.method);
+  if (!token) return init;
   const headers = new Headers(init.headers);
   headers.set(CSRF_HEADER, token);
   return { ...init, headers };
 }
 
 export async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const withToken = await withCsrf(init);
   let res: Response;
   try {
-    res = await fetch(path, withCsrf(init));
+    res = await fetch(path, withToken);
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e;
     throw new ApiError(0, 'Cannot reach the Sparkles server', { detail: String(e) });
@@ -807,11 +827,12 @@ export type UploadResult = {
  * Multipart upload to /{ds}/upload with progress reporting (XHR, since fetch has no upload
  * progress). Asks for a commit receipt (`receipt=true`).
  */
-export function upload(
+export async function upload(
   ds: string,
   files: File[],
   opts: { graph?: string; onProgress?: (p: UploadProgress) => void; signal?: AbortSignal } = {},
 ): Promise<UploadResult | string> {
+  const csrf = await csrfFor('POST');
   return new Promise((resolve, reject) => {
     const form = new FormData();
     if (opts.graph) form.append('graph', opts.graph);
@@ -819,7 +840,6 @@ export function upload(
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/${enc(ds)}/upload?receipt=true`);
     xhr.setRequestHeader('Accept', 'application/json');
-    const csrf = authHooks.csrf();
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>
       opts.onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 });
