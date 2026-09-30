@@ -26,6 +26,9 @@ pub enum Error {
     /// are refused until the store is reopened (reads continue).
     #[error("write-ahead log failed; restart the server to recover")]
     Poisoned,
+    /// The dataset's full-text index is not at the queried snapshot (stale or rebuilding).
+    #[error("{0}")]
+    TextUnavailable(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

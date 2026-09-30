@@ -317,6 +317,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             }
             t
         }
+        Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
         Kind::Service {
             endpoint,
             query,

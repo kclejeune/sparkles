@@ -8,6 +8,7 @@ mod keyfilter;
 pub mod plan;
 pub mod results;
 pub mod table;
+pub mod textpf;
 pub mod update;
 pub mod value;
 

@@ -107,6 +107,29 @@ pub struct IdRange {
     pub exact: bool,
 }
 
+/// A `text:query` call planned as a leaf (full-text search).
+#[derive(Clone, Debug)]
+pub struct TextSpec {
+    pub query: String,
+    /// predicate IRIs to search (empty: all indexed)
+    pub predicates: Vec<String>,
+    pub lang: Option<String>,
+    pub limit: Option<usize>,
+    /// the subject slot: a variable, or a constant restricting the search
+    pub subject: PathEnd,
+    pub score: Option<VarId>,
+    pub literal: Option<VarId>,
+    /// the call's graph slot
+    pub graph_out: Option<VarId>,
+    pub prop: Option<VarId>,
+    /// graph scope of the active graph
+    pub graph: GraphFilter,
+    /// `GRAPH ?g { … }` around the call: bound from each hit's graph
+    pub graph_var: Option<VarId>,
+    /// merge hits of the same (s, p, o) from different graphs (merged default graph)
+    pub dedup: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum JoinAlgo {
     Merge,
@@ -223,6 +246,8 @@ pub enum Kind {
         query: String,
         silent: bool,
     },
+    /// full-text search (`text:query`)
+    TextSearch(Box<TextSpec>),
 }
 
 #[derive(Clone)]
@@ -329,6 +354,7 @@ impl Node {
             Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
             Kind::Service { .. } => "Service",
+            Kind::TextSearch(_) => "TextSearch",
         }
     }
 }
@@ -731,8 +757,12 @@ impl<'a> Planner<'a> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { patterns } => {
-                for tp in patterns {
+                let (calls, patterns) = super::textpf::extract(patterns)?;
+                for tp in &patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
+                }
+                for c in calls {
+                    items.push(Item::Node(self.text_leaf(c, g)?));
                 }
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
@@ -849,6 +879,105 @@ impl<'a> Planner<'a> {
                 graph: g.clone(),
             })),
         }
+    }
+
+    /// A `text:query` call as a search leaf.
+    fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
+        let slot = |t: &Option<TermPattern>| -> Option<VarId> {
+            match t.as_ref().map(|t| self.term_pattern(t)) {
+                Some(PT::V(v)) => Some(v),
+                _ => None,
+            }
+        };
+        let subject = match self.term_pattern(&c.subject) {
+            PT::V(v) => PathEnd::Var(v),
+            PT::C(id) => PathEnd::Const(id),
+        };
+        let (score, literal, graph_out, prop) = (
+            slot(&c.score),
+            slot(&c.literal),
+            slot(&c.graph),
+            slot(&c.prop),
+        );
+        let Some((graph, graph_var)) = self.graph_filter(g) else {
+            let mut vars: Vec<VarId> = [score, literal, graph_out, prop]
+                .into_iter()
+                .flatten()
+                .collect();
+            if let PathEnd::Var(v) = subject {
+                vars.push(v);
+            }
+            vars.sort_unstable();
+            vars.dedup();
+            return Ok(Node::empty(vars));
+        };
+        let dedup = graph_out.is_none() && graph_var.is_none() && graph.multi();
+        let mut vars = Vec::new();
+        for v in [
+            match subject {
+                PathEnd::Var(v) => Some(v),
+                _ => None,
+            },
+            score,
+            literal,
+            graph_out,
+            graph_var,
+            prop,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+        }
+        let desc = format!(
+            "{} ← {:?}{}{}{}",
+            vars.iter()
+                .map(|v| format!("?{}", self.ctx.var_name(*v)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            c.query,
+            if c.predicates.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{}]",
+                    c.predicates
+                        .iter()
+                        .map(|p| format!("<{}>", p.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            },
+            c.lang
+                .as_ref()
+                .map(|l| format!(" lang={l}"))
+                .unwrap_or_default(),
+            c.limit.map(|l| format!(" limit {l}")).unwrap_or_default(),
+        );
+        let spec = TextSpec {
+            query: c.query,
+            predicates: c
+                .predicates
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect(),
+            lang: c.lang,
+            limit: c.limit,
+            subject,
+            score,
+            literal,
+            graph_out,
+            prop,
+            graph,
+            graph_var,
+            dedup,
+        };
+        let est = spec.limit.unwrap_or(1000) as f64;
+        let mut n = Node::leaf(Kind::TextSearch(Box::new(spec)), vars, est, desc);
+        n.cost = est * 4.0;
+        Ok(n)
     }
 
     fn triple(&self, tp: &TriplePattern, g: &ActiveGraph) -> Triple {

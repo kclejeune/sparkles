@@ -141,6 +141,69 @@ type Commit = {
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
 lists commits without taking the database lock, so it works next to a running server.
 
+## Full-text search
+
+Datasets can index their string and language-tagged literals for ranked (BM25) search,
+queried with Jena's `text:query` property function (`PREFIX text: <http://jena.apache.org/text#>`):
+
+```sparql
+SELECT ?s ?score ?label WHERE {
+  (?s ?score ?label) text:query (rdfs:label "brown fox" 10 "lang:en") .
+  ?s a ex:Book .
+} ORDER BY DESC(?score)
+```
+
+* **Subject list** `(?s ?score ?literal ?graph ?predicate)`: every slot after the
+  subject is optional. A constant subject restricts the search to that subject.
+* **Object**: a query string, or `(predicate* "query" limit "lang:xx")`. A language tag
+  on the query string acts as `lang:`.
+* **Query syntax**: terms, `"phrases"` (with `~slop`), `AND`/`OR` (OR by default),
+  `+required`/`-excluded`, parentheses, and phrase prefixes `"quick bro"*`. A literal `:`
+  is written `\:`.
+* **Results**: one solution per matching quad (a subject with two matching literals
+  appears twice). `?score` is an `xsd:float`. In a merged default graph (union default
+  graph, several `FROM`s), identical triples from different graphs count once.
+* **Evaluation**: the search runs once within the active graph (`GRAPH`, `FROM`,
+  `reasoning=false` apply inside the search), so `limit` is the top n of that scope,
+  before any join.
+* **Analyzer**: tokens split on non-alphanumeric characters, lowercased and ASCII-folded
+  (`café` matches `cafe`).
+* **Consistency**: indexes are updated in the same commit as the data, so a query sees
+  the text of its own snapshot. If an index is behind (a failed update, a rebuild in
+  progress), text queries return `503` until it is rebuilt. They never return stale
+  results.
+* **Errors**: `400` for malformed calls, unparseable query strings, predicates that
+  are not indexed, and datasets without an index. `501` if the server was built without
+  the `text` feature.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/$/text/{ds}` | `TextStatus` (below), or `{ "enabled": false }` |
+| PUT | `/$/text/{ds}` | Enable or reconfigure; the body is a `TextConfig` (empty: defaults). `202` with the build `Task` (`kind: "text-rebuild"`) |
+| DELETE | `/$/text/{ds}` | Disable and delete the index (`204`) |
+| POST | `/$/text/{ds}/rebuild` | Rebuild from the current data (`202` Task; `409` if one is running; `400` if not enabled) |
+
+```ts
+type TextConfig = {
+  predicates?: "all" | string[];                         // default "all"
+  graphs?: { include?: "all" | string[]; exclude?: string[] };  // graph IRIs; urn:x-arq:DefaultGraph
+  maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
+  maxHits?: number;                                     // default 1000000 hits without a limit (then 507)
+};
+type TextStatus = {
+  enabled: true; state: "ready" | "stale"; docs: number;
+  seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
+  epoch: number; diskBytes: number; segments: number;
+  config: TextConfig; formatVersion: 1;
+  lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
+};
+```
+
+Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
+in the database directory (`text.json`, index in `text/`). CLI:
+`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--rebuild | --status | --disable]`,
+and `sparkles serve --text NAME[=config.json]`.
+
 ## SHACL validation
 
 `POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against

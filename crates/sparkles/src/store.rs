@@ -137,6 +137,8 @@ pub struct Snapshot {
     pub dvocab_len: u64,
     /// the commit (`seq`) this snapshot reflects
     pub commit: u64,
+    /// full-text search state at this commit (datasets with full-text search)
+    pub text: Option<Arc<crate::text::TextView>>,
     pub union_default_graph: bool,
     /// per-predicate statistics of the delta (computed lazily, once per snapshot)
     pub delta_stats:
@@ -599,6 +601,8 @@ pub struct Store {
     catalog: Mutex<Catalog>,
     /// test hook replacing the wall clock (milliseconds since the epoch)
     clock: Mutex<Option<Clock>>,
+    /// full-text index, when enabled for this dataset
+    text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
 }
 
 const WAL_INSERT: u8 = 1;
@@ -666,6 +670,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len: 0,
                 commit: 0,
+                text: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
             }),
@@ -682,6 +687,7 @@ impl Store {
             dataset_id,
             catalog: Mutex::new(Catalog::memory(root, opts.memory_commit_ring)),
             clock: Mutex::new(None),
+            text: Default::default(),
             opts,
         }
     }
@@ -810,6 +816,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len: u64::MAX,
                 commit: 0,
+                text: None,
                 union_default_graph: false,
                 delta_stats: Default::default(),
             };
@@ -931,7 +938,7 @@ impl Store {
             .append(true)
             .open(&wal_path)?;
         let dvocab_len = gen_.dvocab.len();
-        Ok(Store {
+        let store = Store {
             root: Some(root.to_path_buf()),
             current: ArcSwap::from_pointee(Snapshot {
                 generation: gen_,
@@ -941,6 +948,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len,
                 commit: head.seq,
+                text: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
             }),
@@ -957,8 +965,11 @@ impl Store {
             dataset_id,
             catalog: Mutex::new(catalog),
             clock: Mutex::new(None),
+            text: Default::default(),
             opts,
-        })
+        };
+        store.open_text()?;
+        Ok(store)
     }
 
     /// The dataset id (a UUID created with the database).
@@ -985,6 +996,147 @@ impl Store {
     #[doc(hidden)]
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         *self.clock.lock() = Some(clock);
+    }
+
+    // ------------------------------------------------------------ full-text ------
+
+    /// Open the full-text index if `text.json` enables it (rebuilding it if needed).
+    fn open_text(&self) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        #[cfg(feature = "text")]
+        {
+            let Some(cfg) = crate::text::imp_read_config(root)? else {
+                return Ok(());
+            };
+            let snap = self.snapshot();
+            match crate::text::TextIndex::open(Some(root), cfg, &snap) {
+                Ok((ti, view)) => {
+                    self.text.store(Some(Arc::new(ti)));
+                    let mut s = (*snap).clone();
+                    s.text = Some(view);
+                    self.current.store(Arc::new(s));
+                }
+                Err(e) => tracing::error!("full-text index of {}: {e}", root.display()),
+            }
+        }
+        #[cfg(not(feature = "text"))]
+        if root.join("text.json").exists() {
+            tracing::warn!(
+                "{}: full-text search is configured but this build has no `text` feature",
+                root.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Apply a WAL commit's changes to the full-text index and give `snap` its view.
+    fn maintain_text(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
+        #[cfg(feature = "text")]
+        if let Some(ti) = self.text.load_full() {
+            let touched: Vec<[Id; 4]> = log.iter().map(|(_, q)| *q).collect();
+            let prev = snap.text.take();
+            snap.text = ti.apply_commit(snap, &touched, prev.as_ref());
+        }
+        #[cfg(not(feature = "text"))]
+        let _ = (snap, log);
+    }
+
+    /// After a bulk commit: rebuild the full-text index from the new snapshot (on failure
+    /// the previous view stays, and text queries report the index as stale).
+    fn rebuild_text_locked(&self, snap: &mut Snapshot, prev: Option<Arc<crate::text::TextView>>) {
+        #[cfg(feature = "text")]
+        if let Some(ti) = self.text.load_full() {
+            snap.text = match ti.rebuild(snap) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::error!("full-text rebuild after a bulk commit failed: {e}");
+                    prev
+                }
+            };
+        }
+        #[cfg(not(feature = "text"))]
+        let _ = (snap, prev);
+    }
+
+    /// Enable (or reconfigure) full-text search and build the index from the current
+    /// state. The configuration is kept in `text.json`.
+    #[cfg(feature = "text")]
+    pub fn enable_text(&self, cfg: crate::text::TextConfig) -> Result<crate::text::TextStatus> {
+        let _w = self.writer.lock();
+        self.text.store(None);
+        if let Some(root) = &self.root {
+            write_atomic(
+                &root.join("text.json"),
+                &serde_json::to_vec_pretty(&cfg).unwrap(),
+            )?;
+        }
+        let snap = self.snapshot();
+        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap)?;
+        let ti = Arc::new(ti);
+        self.text.store(Some(ti.clone()));
+        let mut s = (*snap).clone();
+        s.text = Some(view.clone());
+        self.current.store(Arc::new(s));
+        Ok(ti.status(Some(&view), snap.commit))
+    }
+
+    /// Turn full-text search off and delete its index.
+    #[cfg(feature = "text")]
+    pub fn disable_text(&self) -> Result<()> {
+        let _w = self.writer.lock();
+        self.text.store(None);
+        let mut s = (*self.snapshot()).clone();
+        s.text = None;
+        self.current.store(Arc::new(s));
+        if let Some(root) = &self.root {
+            match std::fs::remove_file(root.join("text.json")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+            let _ = std::fs::remove_dir_all(root.join("text"));
+        }
+        Ok(())
+    }
+
+    /// Rebuild the full-text index from the current state (writes wait meanwhile).
+    #[cfg(feature = "text")]
+    pub fn rebuild_text(&self) -> Result<crate::text::TextStatus> {
+        let _w = self.writer.lock();
+        let ti = self
+            .text
+            .load_full()
+            .ok_or_else(|| Error::invalid("full-text search is not enabled"))?;
+        let snap = self.snapshot();
+        let view = ti.rebuild(&snap)?;
+        let mut s = (*snap).clone();
+        s.text = Some(view.clone());
+        self.current.store(Arc::new(s));
+        Ok(ti.status(Some(&view), snap.commit))
+    }
+
+    /// Full-text status (`None`: not enabled).
+    #[cfg(feature = "text")]
+    pub fn text_status(&self) -> Option<crate::text::TextStatus> {
+        let ti = self.text.load_full()?;
+        let snap = self.snapshot();
+        Some(ti.status(snap.text.as_deref(), snap.commit))
+    }
+
+    /// Whether full-text search is enabled.
+    pub fn text_enabled(&self) -> bool {
+        self.text.load().is_some()
+    }
+
+    /// Test hook: make the next full-text update fail.
+    #[cfg(feature = "text")]
+    #[doc(hidden)]
+    pub fn fail_next_text_commit(&self) {
+        if let Some(ti) = self.text.load_full() {
+            ti.fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Timestamp for the commit after `head`: the clock, never before the head's.
@@ -1308,7 +1460,7 @@ impl Store {
         }
         let old = snap.generation.dir.clone();
         let dvocab_len = gen_.dvocab.len();
-        self.current.store(Arc::new(Snapshot {
+        let mut new_snap = Snapshot {
             generation: Arc::new(gen_),
             delta: Delta::default(),
             version: snap.version + 1,
@@ -1316,9 +1468,18 @@ impl Store {
             results: self.results.clone(),
             dvocab_len,
             commit: head.seq,
+            text: if bulk.is_some() {
+                None
+            } else {
+                snap.text.clone()
+            },
             union_default_graph: self.opts.union_default_graph,
             delta_stats: Default::default(),
-        }));
+        };
+        if bulk.is_some() {
+            self.rebuild_text_locked(&mut new_snap, snap.text.clone());
+        }
+        self.current.store(Arc::new(new_snap));
         // Old generation files are unlinked; open readers keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
             && old.starts_with(root)
@@ -1369,7 +1530,7 @@ impl Store {
     }
 }
 
-fn dir_size(p: &Path) -> u64 {
+pub(crate) fn dir_size(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
         return 0;
     };
@@ -1453,6 +1614,7 @@ impl WriteTxn<'_> {
             results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
             dvocab_len: self.base.generation.dvocab.len(),
             commit: self.base.commit,
+            text: self.base.text.clone(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
         }
@@ -1719,7 +1881,7 @@ impl WriteTxn<'_> {
         self.guard.head = c;
         self.store.catalog.lock().append(c);
         let version = self.base.version + 1;
-        self.store.current.store(Arc::new(Snapshot {
+        let mut snap = Snapshot {
             generation: gen_.clone(),
             delta: std::mem::take(&mut self.delta),
             version,
@@ -1727,9 +1889,12 @@ impl WriteTxn<'_> {
             results: self.base.results.clone(),
             dvocab_len: gen_.dvocab.len(),
             commit: c.seq,
+            text: self.base.text.clone(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
-        }));
+        };
+        self.store.maintain_text(&mut snap, &self.log);
+        self.store.current.store(Arc::new(snap));
         Ok(Receipt {
             dataset_id: self.store.dataset_id,
             committed: true,

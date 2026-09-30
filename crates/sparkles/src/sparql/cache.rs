@@ -275,6 +275,12 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
             range.filter.iter().all(deterministic)
         }
+        Kind::TextSearch(t) => {
+            // the view's epoch changes with every rebuild of the index
+            let epoch = ctx.snap.text.as_ref().map_or(0, |v| v.epoch);
+            let _ = write!(s, "{:?}{:?}{:?}{}", t.graph, t.graph_var, t.subject, epoch);
+            true
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),

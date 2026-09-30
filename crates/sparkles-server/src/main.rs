@@ -70,6 +70,29 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Enable full-text search for a dataset: NAME, or NAME=CONFIG.json
+        #[arg(long)]
+        text: Vec<String>,
+    },
+    /// Build, rebuild or inspect a database's full-text index
+    TextIndex {
+        #[arg(long)]
+        loc: PathBuf,
+        /// index only these predicates (default: every predicate)
+        #[arg(long)]
+        predicate: Vec<String>,
+        /// do not index these graphs (IRIs; urn:x-arq:DefaultGraph for the default graph)
+        #[arg(long)]
+        exclude_graph: Vec<String>,
+        /// rebuild even if the index is current
+        #[arg(long)]
+        rebuild: bool,
+        /// print the status as JSON and change nothing
+        #[arg(long)]
+        status: bool,
+        /// turn full-text search off and delete the index
+        #[arg(long)]
+        disable: bool,
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
@@ -202,6 +225,103 @@ fn store_opts(cli: &Cli) -> StoreOptions {
     }
 }
 
+/// `serve --text NAME[=CONFIG]`
+#[cfg(feature = "text")]
+fn enable_text_for(st: &state::AppState, spec: &str) -> Result<()> {
+    let (name, cfg) = match spec.split_once('=') {
+        Some((n, path)) => (
+            n,
+            serde_json::from_slice(
+                &std::fs::read(path).with_context(|| format!("reading {path}"))?,
+            )
+            .with_context(|| format!("{path}: invalid full-text configuration"))?,
+        ),
+        None => (spec, sparkles::text::TextConfig::default()),
+    };
+    let ds = st
+        .get(name.trim_start_matches('/'))
+        .with_context(|| format!("--text: no dataset {name}"))?;
+    let s = ds.store.enable_text(cfg)?;
+    tracing::info!("full-text search on /{name}: {} documents", s.docs);
+    Ok(())
+}
+
+#[cfg(not(feature = "text"))]
+fn enable_text_for(_: &state::AppState, _: &str) -> Result<()> {
+    bail!("built without full-text search (cargo feature \"text\")")
+}
+
+/// `sparkles text-index`
+#[cfg(feature = "text")]
+fn text_index(
+    loc: &std::path::Path,
+    opts: StoreOptions,
+    predicates: Vec<String>,
+    exclude_graph: Vec<String>,
+    rebuild: bool,
+    status: bool,
+    disable: bool,
+) -> Result<()> {
+    use sparkles::text::{PredicateSet, TextConfig};
+    let store = Store::open(loc, opts)?;
+    if disable {
+        store.disable_text()?;
+        eprintln!("full-text search disabled");
+        return Ok(());
+    }
+    if status {
+        let s = store.text_status();
+        println!(
+            "{}",
+            match s {
+                Some(s) => serde_json::to_string_pretty(&s)?,
+                None => r#"{ "enabled": false }"#.to_string(),
+            }
+        );
+        return Ok(());
+    }
+    let t = Instant::now();
+    let configured = !predicates.is_empty() || !exclude_graph.is_empty();
+    let s = match store.text_status() {
+        Some(_) if !configured && rebuild => store.rebuild_text()?,
+        Some(s) if !configured => s,
+        _ => {
+            let mut cfg = TextConfig::default();
+            if !predicates.is_empty() {
+                cfg.predicates = PredicateSet::Only(predicates);
+            }
+            cfg.graphs.exclude = exclude_graph;
+            store.enable_text(cfg)?
+        }
+    };
+    let preds = match &s.config.predicates {
+        PredicateSet::All => "all predicates".to_string(),
+        PredicateSet::Only(v) => format!("{} predicates", v.len()),
+    };
+    eprintln!(
+        "text index: {} docs ({preds}), seq {}, {} in {:.0} ms",
+        s.docs,
+        s.seq,
+        s.state,
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "text"))]
+fn text_index(
+    _: &std::path::Path,
+    _: StoreOptions,
+    _: Vec<String>,
+    _: Vec<String>,
+    _: bool,
+    _: bool,
+    _: bool,
+) -> Result<()> {
+    eprintln!("built without full-text search (cargo feature \"text\")");
+    std::process::exit(2)
+}
+
 /// `sparkles log`: read `dataset.json` and `commits.bin` without taking the database lock.
 fn print_log(
     loc: &std::path::Path,
@@ -304,6 +424,7 @@ fn main() -> Result<()> {
             read_only,
             no_service,
             idle_release_ms,
+            text,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
@@ -319,6 +440,9 @@ fn main() -> Result<()> {
                     state::DbType::Persistent,
                     Some(std::path::Path::new(path)),
                 )?;
+            }
+            for t in text {
+                enable_text_for(&st, &t)?;
             }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -457,6 +581,22 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::TextIndex {
+            loc,
+            predicate,
+            exclude_graph,
+            rebuild,
+            status,
+            disable,
+        } => text_index(
+            &loc,
+            opts,
+            predicate,
+            exclude_graph,
+            rebuild,
+            status,
+            disable,
+        ),
         Cmd::Log {
             loc,
             limit,

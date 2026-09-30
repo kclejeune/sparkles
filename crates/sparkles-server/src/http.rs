@@ -46,6 +46,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/tasks/{id}", get(get_task))
         .route("/$/prefixes/{ds}", get(prefixes))
         .route("/$/cache/clear/{ds}", post(clear_cache))
+        .route(
+            "/$/text/{ds}",
+            get(text_status).put(text_enable).delete(text_disable),
+        )
+        .route("/$/text/{ds}/rebuild", post(text_rebuild))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
@@ -90,7 +95,7 @@ impl From<Error> for ApiError {
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::MemoryLimit(_) => StatusCode::INSUFFICIENT_STORAGE,
-            Error::Poisoned => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -443,6 +448,104 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
     h.get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
+}
+
+// ---------------------------------------------------------------- full-text ------
+
+#[cfg(feature = "text")]
+async fn text_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    Ok(Json(match ds.store.text_status() {
+        Some(s) => serde_json::to_value(s).unwrap(),
+        None => json!({ "enabled": false }),
+    }))
+}
+
+/// `PUT /$/text/{ds}`: enable (or reconfigure) full-text search; the body is the
+/// configuration (empty: defaults). The index is built in a background task.
+#[cfg(feature = "text")]
+async fn text_enable(State(st): St, Path(name): Path<String>, body: Bytes) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    let cfg: sparkles::text::TextConfig = if body.iter().all(u8::is_ascii_whitespace) {
+        Default::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid text configuration: {e}"),
+            )
+        })?
+    };
+    let task = st.start_task("text-rebuild", &name, move |h| {
+        h.progress(0.1, "building the full-text index");
+        let s = ds.store.enable_text(cfg)?;
+        Ok(format!("full-text index: {} documents", s.docs))
+    });
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+#[cfg(feature = "text")]
+async fn text_disable(State(st): St, Path(name): Path<String>) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    blocking(move || {
+        ds.store.disable_text()?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await
+}
+
+#[cfg(feature = "text")]
+async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(&st, &name)?;
+    if !ds.store.text_enabled() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "full-text search is not enabled",
+        ));
+    }
+    let running = st
+        .tasks
+        .lock()
+        .iter()
+        .any(|t| t.kind == "text-rebuild" && t.dataset == name && t.state == "running");
+    if running {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "text index rebuild already running",
+        ));
+    }
+    let task = st.start_task("text-rebuild", &name, move |h| {
+        h.progress(0.1, "rebuilding the full-text index");
+        let s = ds.store.rebuild_text()?;
+        Ok(format!("full-text index: {} documents", s.docs))
+    });
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+#[cfg(not(feature = "text"))]
+async fn text_status() -> ApiResult<Json<J>> {
+    Err(sparkles::text::not_built().into())
+}
+#[cfg(not(feature = "text"))]
+async fn text_enable() -> ApiResult {
+    Err(sparkles::text::not_built().into())
+}
+#[cfg(not(feature = "text"))]
+async fn text_disable() -> ApiResult {
+    Err(sparkles::text::not_built().into())
+}
+#[cfg(not(feature = "text"))]
+async fn text_rebuild() -> ApiResult {
+    Err(sparkles::text::not_built().into())
 }
 
 // ------------------------------------------------------------------ commits ------
@@ -997,6 +1100,16 @@ async fn ping() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain")], now())
 }
 
+/// `{state, docs}` of the dataset's full-text index, or null.
+fn text_summary(ds: &Dataset) -> J {
+    #[cfg(feature = "text")]
+    if let Some(s) = ds.store.text_status() {
+        return json!({ "state": s.state, "docs": s.docs });
+    }
+    let _ = ds;
+    J::Null
+}
+
 fn dataset_info(ds: &Dataset) -> J {
     let n = &ds.name;
     #[allow(unused_mut)]
@@ -1020,6 +1133,7 @@ fn dataset_info(ds: &Dataset) -> J {
         "id": ds.store.dataset_id(),
         "head": head.seq,
         "modified": head.timestamp(),
+        "text": text_summary(ds),
     })
 }
 

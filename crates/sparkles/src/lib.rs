@@ -8,6 +8,7 @@ pub mod io;
 pub mod querybuilder;
 pub mod sparql;
 pub mod store;
+pub mod text;
 pub mod vocab;
 
 pub use dataset::{Dataset, GraphView, Solution, Solutions, Transaction};

@@ -1,0 +1,959 @@
+//! Full-text search over string literals (cargo feature `text`, backed by Tantivy).
+//!
+//! One document per quad `(s, p, o, g)` whose object is a string or language-tagged
+//! literal (and whose predicate and graph are in the configured scope). Documents are
+//! keyed by a hash of the four terms' vocabulary keys, so the index does not depend on
+//! generation-specific ids and survives compaction untouched.
+//!
+//! The index is derived data kept consistent with the store inside the commit path:
+//! every snapshot carries a [`TextView`] whose `seq` is the commit it reflects, and a
+//! search runs only when that equals the snapshot's commit. `<root>/text.json` holds the
+//! configuration; `<root>/text/` the Tantivy index, rebuilt from RDF whenever it is
+//! missing, damaged, or behind the store.
+
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+
+/// Which predicates are indexed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PredicateSet {
+    /// every predicate
+    #[default]
+    All,
+    Only(Vec<String>),
+}
+
+impl Serialize for PredicateSet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            PredicateSet::All => s.serialize_str("all"),
+            PredicateSet::Only(v) => v.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PredicateSet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            List(Vec<String>),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Word(w) if w == "all" => Ok(PredicateSet::All),
+            Repr::Word(w) => Err(serde::de::Error::custom(format!(
+                "predicates: expected \"all\" or a list of IRIs, got {w:?}"
+            ))),
+            Repr::List(v) => Ok(PredicateSet::Only(v)),
+        }
+    }
+}
+
+impl PredicateSet {
+    pub fn contains(&self, iri: &str) -> bool {
+        match self {
+            PredicateSet::All => true,
+            PredicateSet::Only(v) => v.iter().any(|p| p == iri),
+        }
+    }
+}
+
+/// Graphs whose quads are indexed (IRIs; `urn:x-arq:DefaultGraph` for the default graph).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphScope {
+    #[serde(default)]
+    pub include: PredicateSet,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Full-text configuration of a dataset (`text.json`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextConfig {
+    #[serde(default)]
+    pub predicates: PredicateSet,
+    #[serde(default)]
+    pub graphs: GraphScope,
+    /// longer literals are indexed truncated (the documents keep the full term)
+    #[serde(default = "default_max_text_bytes")]
+    pub max_text_bytes: usize,
+    /// hits one `text:query` without a limit may return
+    #[serde(default = "default_max_hits")]
+    pub max_hits: usize,
+}
+
+fn default_max_text_bytes() -> usize {
+    256 << 10
+}
+fn default_max_hits() -> usize {
+    1_000_000
+}
+
+impl Default for TextConfig {
+    fn default() -> Self {
+        TextConfig {
+            predicates: PredicateSet::All,
+            graphs: GraphScope::default(),
+            max_text_bytes: default_max_text_bytes(),
+            max_hits: default_max_hits(),
+        }
+    }
+}
+
+/// The IRI naming the default graph in text documents (`?g` of a default-graph hit).
+pub const DEFAULT_GRAPH_IRI: &str = "urn:x-arq:DefaultGraph";
+
+/// State of a dataset's full-text index.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStatus {
+    pub enabled: bool,
+    /// `ready`, `stale` (behind the store after a failed update) or `failed`
+    pub state: String,
+    pub docs: u64,
+    pub seq: u64,
+    pub store_seq: u64,
+    pub epoch: u64,
+    pub disk_bytes: u64,
+    pub segments: usize,
+    pub config: TextConfig,
+    pub format_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_rebuild: Option<RebuildInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RebuildInfo {
+    pub at: String,
+    pub ms: f64,
+    pub docs: u64,
+}
+
+/// The search state a snapshot sees.
+pub struct TextView {
+    /// the commit the view reflects
+    pub seq: u64,
+    /// +1 per rebuild (part of result-cache keys)
+    pub epoch: u64,
+    #[cfg(feature = "text")]
+    pub(crate) searcher: tantivy::Searcher,
+    #[cfg(feature = "text")]
+    pub(crate) index: std::sync::Arc<imp::Shared>,
+}
+
+impl std::fmt::Debug for TextView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TextView(seq {}, epoch {})", self.seq, self.epoch)
+    }
+}
+
+#[cfg_attr(not(feature = "text"), allow(dead_code))]
+pub(crate) fn unavailable(name: &str, state: &str, index_seq: u64, data_seq: u64) -> Error {
+    Error::TextUnavailable(format!(
+        "full-text index of '{name}' is {state} (index seq {index_seq}, data seq {data_seq}); retry later or rebuild it"
+    ))
+}
+
+/// Error for a build without the `text` feature.
+pub fn not_built() -> Error {
+    Error::Unsupported("built without full-text search (cargo feature \"text\")".into())
+}
+
+#[cfg(feature = "text")]
+pub(crate) use imp::read_config as imp_read_config;
+#[cfg(feature = "text")]
+pub use imp::{TextIndex, search};
+
+#[cfg(not(feature = "text"))]
+/// Placeholder: full-text search is not compiled in.
+pub struct TextIndex;
+
+#[cfg(not(feature = "text"))]
+pub fn search(
+    _ctx: &crate::sparql::ctx::Ctx,
+    _spec: &crate::sparql::plan::TextSpec,
+    _vars: &[crate::sparql::table::VarId],
+) -> Result<crate::sparql::table::Table> {
+    Err(not_built())
+}
+
+#[cfg(feature = "text")]
+mod imp {
+    use super::*;
+    use crate::id::{Id, Tag};
+    use crate::sparql::ctx::Ctx;
+    use crate::sparql::plan::{GraphFilter, PathEnd, TextSpec};
+    use crate::sparql::table::{Table, VarId};
+    use crate::store::Snapshot;
+    use parking_lot::Mutex;
+    use sha2::Digest;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tantivy::collector::TopDocs;
+    use tantivy::query::{
+        BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery,
+    };
+    use tantivy::schema::{
+        BytesOptions, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
+        TextOptions, Value,
+    };
+    use tantivy::tokenizer::{
+        AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    };
+    use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+    const FORMAT: u32 = 1;
+    const TOKENIZER: &str = "sparkles_standard";
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct Fields {
+        key: Field,
+        s: Field,
+        p: Field,
+        o: Field,
+        g: Field,
+        lang: Field,
+        text: Field,
+    }
+
+    fn schema() -> (Schema, Fields) {
+        let mut b = Schema::builder();
+        let bytes_indexed = BytesOptions::default().set_indexed();
+        let text = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let fields = Fields {
+            key: b.add_bytes_field("key", bytes_indexed.clone()),
+            s: b.add_bytes_field("s", bytes_indexed.set_stored()),
+            p: b.add_text_field("p", STRING | STORED),
+            o: b.add_bytes_field("o", BytesOptions::default().set_stored()),
+            g: b.add_text_field("g", STRING | STORED),
+            lang: b.add_text_field("lang", STRING),
+            text: b.add_text_field("text", text),
+        };
+        (b.build(), fields)
+    }
+
+    fn register_tokenizer(index: &Index) {
+        index.tokenizers().register(
+            TOKENIZER,
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(RemoveLongFilter::limit(40))
+                .filter(LowerCaser)
+                .filter(AsciiFoldingFilter)
+                .build(),
+        );
+    }
+
+    /// What every view of one index generation shares.
+    pub(crate) struct Shared {
+        pub(crate) index: Index,
+        pub(crate) fields: Fields,
+        pub(crate) config: TextConfig,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Payload {
+        format: u32,
+        seq: u64,
+        epoch: u64,
+        config: String,
+    }
+
+    struct Live {
+        shared: Arc<Shared>,
+        writer: IndexWriter<TantivyDocument>,
+        reader: IndexReader,
+    }
+
+    /// A dataset's full-text index.
+    pub struct TextIndex {
+        root: Option<PathBuf>,
+        config: TextConfig,
+        live: Mutex<Live>,
+        epoch: AtomicU64,
+        /// set when an update's text maintenance failed: queries get 503 until a rebuild
+        stale: Mutex<Option<String>>,
+        last_rebuild: Mutex<Option<RebuildInfo>>,
+        #[doc(hidden)]
+        pub fail_next_commit: std::sync::atomic::AtomicBool,
+    }
+
+    fn config_hash(c: &TextConfig) -> String {
+        let bytes = serde_json::to_vec(c).unwrap();
+        let d = sha2::Sha256::digest(&bytes);
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn text_err(e: impl std::fmt::Display) -> Error {
+        Error::Invalid(format!("full-text index: {e}"))
+    }
+
+    /// `<root>/text.json`, if the dataset has full-text search enabled.
+    pub(crate) fn read_config(root: &Path) -> Result<Option<TextConfig>> {
+        match std::fs::read(root.join("text.json")) {
+            Ok(b) => serde_json::from_slice(&b)
+                .map(Some)
+                .map_err(|e| Error::Invalid(format!("text.json: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A new, empty index (in `dir`, replacing anything there, or in memory).
+    fn new_index(dir: Option<&Path>) -> Result<(Index, Fields)> {
+        let (schema, fields) = schema();
+        let index = match dir {
+            None => Index::create_in_ram(schema),
+            Some(d) => {
+                if d.exists() {
+                    std::fs::remove_dir_all(d)?;
+                }
+                std::fs::create_dir_all(d)?;
+                Index::create_in_dir(d, schema).map_err(text_err)?
+            }
+        };
+        register_tokenizer(&index);
+        Ok((index, fields))
+    }
+
+    fn open_index(dir: &Path) -> Result<(Index, Fields)> {
+        let index = Index::open_in_dir(dir).map_err(text_err)?;
+        register_tokenizer(&index);
+        let (_, fields) = schema();
+        if index.schema() != schema().0 {
+            return Err(text_err("unexpected index schema"));
+        }
+        Ok((index, fields))
+    }
+
+    /// The single-threaded writer and the reader used between rebuilds.
+    fn live_of(index: Index, fields: Fields, config: &TextConfig) -> Result<Live> {
+        let writer = index
+            .writer_with_num_threads(1, 32 << 20)
+            .map_err(text_err)?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(text_err)?;
+        Ok(Live {
+            shared: Arc::new(Shared {
+                index,
+                fields,
+                config: config.clone(),
+            }),
+            writer,
+            reader,
+        })
+    }
+
+    /// Document key: a hash of the length-prefixed vocabulary keys of s, p, o, g.
+    fn doc_key(keys: [&[u8]; 4]) -> [u8; 16] {
+        let mut h = sha2::Sha256::new();
+        for k in keys {
+            let mut len = Vec::new();
+            crate::vocab::write_varint(&mut len, k.len() as u64);
+            h.update(&len);
+            h.update(k);
+        }
+        h.finalize()[..16].try_into().unwrap()
+    }
+
+    /// The lexical form and language tag of a string literal key; `None` for any other
+    /// term (IRIs, typed literals, blank nodes, triple terms).
+    fn string_literal(key: &[u8]) -> Option<(&str, Option<&str>)> {
+        let rest = key.strip_prefix(b"\"")?;
+        let sep = rest.iter().rposition(|&b| b == 0xFF)?;
+        let lex = std::str::from_utf8(&rest[..sep]).ok()?;
+        match &rest[sep + 1..] {
+            [] => Some((lex, None)),
+            [b'@', tag @ ..] => {
+                let tag = std::str::from_utf8(tag).ok()?;
+                // drop a base direction (`en--ltr`)
+                Some((lex, Some(tag.split("--").next().unwrap_or(tag))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Key bytes of an id for documents (`_` + big-endian id for blank nodes).
+    fn term_key(snap: &Snapshot, id: Id) -> Option<Vec<u8>> {
+        match id.tag() {
+            Tag::BNode => {
+                let mut k = vec![b'_'];
+                k.extend_from_slice(&id.payload().to_be_bytes());
+                Some(k)
+            }
+            Tag::Vocab | Tag::Delta => snap.key(id).map(|k| k.into_owned()),
+            _ => None,
+        }
+    }
+
+    fn graph_name(snap: &Snapshot, g: Id) -> Option<String> {
+        if g == Id::DEFAULT_GRAPH {
+            return Some(DEFAULT_GRAPH_IRI.to_string());
+        }
+        match snap.term(g)? {
+            oxrdf::Term::NamedNode(n) => Some(n.into_string()),
+            oxrdf::Term::BlankNode(b) => Some(format!("_:{}", b.as_str())),
+            _ => None,
+        }
+    }
+
+    struct Doc {
+        key: [u8; 16],
+        doc: Option<TantivyDocument>,
+    }
+
+    /// The document for a quad (`doc: None` when the quad is out of scope: then only its
+    /// key matters, for deletion).
+    fn document(snap: &Snapshot, f: &Fields, cfg: &TextConfig, q: &[Id; 4]) -> Option<Doc> {
+        if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
+            return None;
+        }
+        let o = snap.key(q[2])?;
+        let (lex, lang) = string_literal(&o)?;
+        let p = match snap.term(q[1])? {
+            oxrdf::Term::NamedNode(n) => n.into_string(),
+            _ => return None,
+        };
+        let s = term_key(snap, q[0])?;
+        let pk = crate::id::iri_key(&p);
+        let gk = if q[3] == Id::DEFAULT_GRAPH {
+            Vec::new()
+        } else {
+            term_key(snap, q[3])?
+        };
+        let key = doc_key([&s, &pk, &o, &gk]);
+        let g = graph_name(snap, q[3])?;
+        let in_scope = cfg.predicates.contains(&p)
+            && cfg.graphs.include.contains(&g)
+            && !cfg.graphs.exclude.contains(&g);
+        if !in_scope {
+            return Some(Doc { key, doc: None });
+        }
+        let mut d = TantivyDocument::default();
+        d.add_bytes(f.key, &key);
+        d.add_bytes(f.s, &s);
+        d.add_text(f.p, &p);
+        d.add_bytes(f.o, &o);
+        d.add_text(f.g, &g);
+        if let Some(tag) = lang {
+            let tag = tag.to_ascii_lowercase();
+            if let Some((primary, _)) = tag.split_once('-') {
+                d.add_text(f.lang, primary);
+            }
+            d.add_text(f.lang, &tag);
+        }
+        let mut end = lex.len().min(cfg.max_text_bytes);
+        while !lex.is_char_boundary(end) {
+            end -= 1;
+        }
+        d.add_text(f.text, &lex[..end]);
+        Some(Doc { key, doc: Some(d) })
+    }
+
+    impl TextIndex {
+        /// Open the index of a store at its current state `snap` (`root` = `None` for an
+        /// in-memory store), rebuilding it when it is missing, damaged, configured
+        /// differently, or not at `snap`'s commit. Returns the index and `snap`'s view.
+        pub fn open(
+            root: Option<&Path>,
+            config: TextConfig,
+            snap: &Snapshot,
+        ) -> Result<(TextIndex, Arc<TextView>)> {
+            let dir = root.map(|r| r.join("text"));
+            if let Some(r) = root {
+                for stale in ["text.new", "text.old"] {
+                    let _ = std::fs::remove_dir_all(r.join(stale));
+                }
+            }
+            let hash = config_hash(&config);
+            // reuse an index that is exactly at this snapshot's commit
+            let reusable = dir.as_deref().and_then(|d| {
+                let (index, fields) = open_index(d).ok()?;
+                let meta = index.load_metas().ok()?;
+                let p: Payload = serde_json::from_str(meta.payload.as_deref()?).ok()?;
+                if p.format != FORMAT || p.config != hash || p.seq != snap.commit {
+                    return None;
+                }
+                Some((live_of(index, fields, &config).ok()?, p.epoch))
+            });
+            let ti = |live: Live, epoch: u64| TextIndex {
+                root: root.map(Path::to_path_buf),
+                config: config.clone(),
+                live: Mutex::new(live),
+                epoch: AtomicU64::new(epoch),
+                stale: Mutex::new(None),
+                last_rebuild: Mutex::new(None),
+                fail_next_commit: Default::default(),
+            };
+            match reusable {
+                Some((live, epoch)) => {
+                    let t = ti(live, epoch);
+                    let view = t.view(snap.commit)?;
+                    Ok((t, view))
+                }
+                None => {
+                    if dir.as_deref().is_some_and(Path::exists) {
+                        tracing::info!("full-text index is missing or behind the data; rebuilding");
+                    }
+                    // an empty placeholder until the rebuild below swaps the real one in
+                    let (index, fields) = new_index(None)?;
+                    let t = ti(live_of(index, fields, &config)?, 0);
+                    let view = t.rebuild(snap)?;
+                    Ok((t, view))
+                }
+            }
+        }
+
+        pub fn config(&self) -> &TextConfig {
+            &self.config
+        }
+
+        fn view(&self, seq: u64) -> Result<Arc<TextView>> {
+            let live = self.live.lock();
+            Ok(Arc::new(TextView {
+                seq,
+                epoch: self.epoch.load(Ordering::SeqCst),
+                searcher: live.reader.searcher(),
+                index: live.shared.clone(),
+            }))
+        }
+
+        fn payload(&self, seq: u64) -> String {
+            serde_json::to_string(&Payload {
+                format: FORMAT,
+                seq,
+                epoch: self.epoch.load(Ordering::SeqCst),
+                config: config_hash(&self.config),
+            })
+            .unwrap()
+        }
+
+        /// Whether updates are still applied (not stale after a failure).
+        pub fn healthy(&self) -> bool {
+            self.stale.lock().is_none()
+        }
+
+        /// Apply a commit: `touched` are the quads the transaction changed and `snap` the
+        /// state after it (commit `snap.commit`). Each touched quad in scope is deleted and
+        /// re-added if still present, so the result depends only on the final state.
+        /// Returns the new view, or `None` (the index is marked stale) on failure.
+        pub fn apply_commit(
+            &self,
+            snap: &Snapshot,
+            touched: &[[Id; 4]],
+            prev: Option<&Arc<TextView>>,
+        ) -> Option<Arc<TextView>> {
+            if !self.healthy() {
+                return prev.cloned();
+            }
+            let result = (|| -> Result<Arc<TextView>> {
+                let mut live = self.live.lock();
+                let fields = live.shared.fields;
+                let mut changed = false;
+                let mut seen = rustc_hash::FxHashSet::default();
+                for q in touched {
+                    if !seen.insert(*q) {
+                        continue;
+                    }
+                    let Some(d) = document(snap, &fields, &self.config, q) else {
+                        continue;
+                    };
+                    live.writer
+                        .delete_term(Term::from_field_bytes(fields.key, &d.key));
+                    changed = true;
+                    if let Some(doc) = d.doc
+                        && snap.contains(q)?
+                    {
+                        live.writer.add_document(doc).map_err(text_err)?;
+                    }
+                }
+                if !changed {
+                    drop(live);
+                    return self.view(snap.commit);
+                }
+                if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+                    return Err(text_err("injected failure"));
+                }
+                let payload = self.payload(snap.commit);
+                let mut prepared = live.writer.prepare_commit().map_err(text_err)?;
+                prepared.set_payload(&payload);
+                prepared.commit().map_err(text_err)?;
+                live.reader.reload().map_err(text_err)?;
+                drop(live);
+                self.view(snap.commit)
+            })();
+            match result {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::error!("{e}; the full-text index is stale until it is rebuilt");
+                    let _ = self.live.lock().writer.rollback();
+                    *self.stale.lock() = Some(e.to_string());
+                    prev.cloned()
+                }
+            }
+        }
+
+        /// Rebuild the whole index from `snap` and return its view. On disk, the new
+        /// index is built in `text.new/` and swapped in.
+        pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
+            let t0 = std::time::Instant::now();
+            let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
+            let (index, fields) = new_index(new_dir.as_deref())?;
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(8);
+            let mut docs = 0u64;
+            {
+                let mut writer: IndexWriter<TantivyDocument> = index
+                    .writer_with_num_threads(threads, threads * (64 << 20))
+                    .map_err(text_err)?;
+                let mut add = |q: &[Id; 4]| -> Result<()> {
+                    if let Some(Doc { doc: Some(d), .. }) = document(snap, &fields, &self.config, q)
+                    {
+                        writer.add_document(d).map_err(text_err)?;
+                        docs += 1;
+                    }
+                    Ok(())
+                };
+                match &self.config.predicates {
+                    PredicateSet::Only(ps) => {
+                        use crate::index::Perm;
+                        for p in ps {
+                            let Some(pid) = snap.lookup_iri(p) else {
+                                continue;
+                            };
+                            snap.scan(Perm::Pso, &[pid.0], |c| {
+                                match c {
+                                    crate::store::Chunk::Block(b, s, e) => {
+                                        for i in s..e {
+                                            add(&Perm::Pso.to_quad(&b.key(i)))?;
+                                        }
+                                    }
+                                    crate::store::Chunk::Row(k) => add(&Perm::Pso.to_quad(&k))?,
+                                }
+                                Ok(true)
+                            })?;
+                        }
+                    }
+                    PredicateSet::All => snap.for_each_quad(&mut add)?,
+                }
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+                let payload = self.payload(snap.commit);
+                let mut prepared = writer.prepare_commit().map_err(text_err)?;
+                prepared.set_payload(&payload);
+                prepared.commit().map_err(text_err)?;
+                writer.wait_merging_threads().map_err(text_err)?;
+            }
+            let mut live = self.live.lock();
+            let old = match (&self.root, new_dir) {
+                (Some(root), Some(new_dir)) => {
+                    // swap directories, then reopen the index in its final place
+                    let cur = root.join("text");
+                    let old = root.join("text.old");
+                    drop(index);
+                    crate::store::sync_dir(&new_dir)?;
+                    if cur.exists() {
+                        std::fs::rename(&cur, &old)?;
+                    }
+                    std::fs::rename(&new_dir, &cur)?;
+                    crate::store::sync_dir(root)?;
+                    let (index, fields) = open_index(&cur)?;
+                    *live = live_of(index, fields, &self.config)?;
+                    Some(old)
+                }
+                _ => {
+                    *live = live_of(index, fields, &self.config)?;
+                    None
+                }
+            };
+            drop(live);
+            if let Some(old) = old {
+                let _ = std::fs::remove_dir_all(old);
+            }
+            *self.stale.lock() = None;
+            *self.last_rebuild.lock() = Some(RebuildInfo {
+                at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
+                ms: t0.elapsed().as_secs_f64() * 1000.0,
+                docs,
+            });
+            tracing::info!(
+                "full-text index rebuilt: {docs} documents in {:?}",
+                t0.elapsed()
+            );
+            self.view(snap.commit)
+        }
+
+        pub fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
+            let live = self.live.lock();
+            let searcher = live.reader.searcher();
+            let stale = self.stale.lock().clone();
+            let seq = view.map_or(0, |v| v.seq);
+            let state = if stale.is_some() || seq != store_seq {
+                "stale"
+            } else {
+                "ready"
+            };
+            TextStatus {
+                enabled: true,
+                state: state.into(),
+                docs: searcher.num_docs(),
+                seq,
+                store_seq,
+                epoch: self.epoch.load(Ordering::SeqCst),
+                disk_bytes: self
+                    .root
+                    .as_ref()
+                    .map_or(0, |r| crate::store::dir_size(&r.join("text"))),
+                segments: searcher.segment_readers().len(),
+                config: self.config.clone(),
+                format_version: FORMAT,
+                last_rebuild: self.last_rebuild.lock().clone(),
+                message: stale,
+            }
+        }
+    }
+
+    /// Evaluate a `text:query` call against the snapshot's text view.
+    pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
+        let snap = &ctx.snap;
+        let Some(view) = &snap.text else {
+            return Err(Error::invalid(
+                "dataset has no full-text index; enable it with `sparkles text-index` or --text",
+            ));
+        };
+        if view.seq != snap.commit {
+            return Err(unavailable("dataset", "stale", view.seq, snap.commit));
+        }
+        let sh = &view.index;
+        let f = sh.fields;
+        for p in &spec.predicates {
+            if !sh.config.predicates.contains(p) {
+                return Err(Error::invalid(format!(
+                    "text:query: <{p}> is not text-indexed"
+                )));
+            }
+        }
+        let parser = QueryParser::for_index(&sh.index, vec![f.text]);
+        let text = parser
+            .parse_query(&spec.query)
+            .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
+        let mut filters: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let str_terms = |field: Field, vals: &mut dyn Iterator<Item = String>| -> Box<dyn Query> {
+            Box::new(TermSetQuery::new(
+                vals.map(|v| Term::from_field_text(field, &v)),
+            ))
+        };
+        if !spec.predicates.is_empty() {
+            filters.push((
+                Occur::Must,
+                str_terms(f.p, &mut spec.predicates.iter().cloned()),
+            ));
+        }
+        if let Some(lang) = &spec.lang {
+            filters.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.lang, lang),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let PathEnd::Const(s) = &spec.subject {
+            match term_key(snap, *s) {
+                Some(k) => filters.push((
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_bytes(f.s, &k),
+                        IndexRecordOption::Basic,
+                    )),
+                )),
+                None => return Ok(Table::empty(vars.to_vec())),
+            }
+        }
+        let default_term = || Term::from_field_text(f.g, DEFAULT_GRAPH_IRI);
+        match &spec.graph {
+            GraphFilter::All => {}
+            GraphFilter::Default => filters.push((
+                Occur::Must,
+                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
+            )),
+            GraphFilter::Named => filters.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
+            )),
+            GraphFilter::One(g) => {
+                let names: Vec<String> = graph_name(snap, Id(*g)).into_iter().collect();
+                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
+            }
+            GraphFilter::Set(gs) => {
+                let names: Vec<String> =
+                    gs.iter().filter_map(|g| graph_name(snap, Id(*g))).collect();
+                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
+            }
+        }
+        let query: Box<dyn Query> = if filters.is_empty() {
+            text
+        } else {
+            let mut must = vec![(Occur::Must, text)];
+            let has_positive = filters.iter().any(|(o, _)| *o == Occur::Must);
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for (o, q) in filters {
+                match o {
+                    Occur::Must => clauses.push((Occur::Must, q)),
+                    other => must.push((other, q)),
+                }
+            }
+            if has_positive {
+                must.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        Box::new(BooleanQuery::new(clauses)),
+                        0.0,
+                    )),
+                ));
+            }
+            Box::new(BooleanQuery::new(must))
+        };
+        ctx.check()?;
+        let max = sh.config.max_hits;
+        let want = spec.limit.unwrap_or(max);
+        // with dedup (a merged default graph), fetch more until enough distinct hits
+        let mut fetch = if spec.dedup {
+            want.saturating_mul(2)
+        } else {
+            want
+        }
+        .saturating_add(1)
+        .min(max.saturating_add(1));
+        let hits = loop {
+            let hits = view
+                .searcher
+                .search(&query, &TopDocs::with_limit(fetch.max(1)).order_by_score())
+                .map_err(text_err)?;
+            if !spec.dedup || hits.len() < fetch || fetch > max {
+                break hits;
+            }
+            fetch = fetch.saturating_mul(2).min(max.saturating_add(1));
+            if fetch > max {
+                continue;
+            }
+        };
+        ctx.check()?;
+        if spec.limit.is_none() && hits.len() > max {
+            return Err(Error::MemoryLimit(format!(
+                "text:query matched more than {max} documents; add a limit"
+            )));
+        }
+        // columns
+        let mut t = Table::new(vars.to_vec());
+        let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
+        let (cs, cscore, clit, cg_out, cgv, cprop) = (
+            match spec.subject {
+                PathEnd::Var(v) => col(Some(v)),
+                _ => None,
+            },
+            col(spec.score),
+            col(spec.literal),
+            col(spec.graph_out),
+            col(spec.graph_var),
+            col(spec.prop),
+        );
+        let mut seen: rustc_hash::FxHashSet<(Id, Id, Id)> = Default::default();
+        let mut row = vec![Id::UNDEF; vars.len()];
+        let mut stale_hits = 0usize;
+        for (i, (score, addr)) in hits.into_iter().enumerate() {
+            if i % 4096 == 4095 {
+                ctx.check()?;
+            }
+            if t.len() >= want {
+                break;
+            }
+            let d: TantivyDocument = view.searcher.doc(addr).map_err(text_err)?;
+            let get_bytes = |fld: Field| d.get_first(fld).and_then(|v| v.as_bytes());
+            let get_str = |fld: Field| d.get_first(fld).and_then(|v| v.as_str());
+            let (Some(sk), Some(ok), Some(p), Some(g)) =
+                (get_bytes(f.s), get_bytes(f.o), get_str(f.p), get_str(f.g))
+            else {
+                stale_hits += 1;
+                continue;
+            };
+            let s_id = match sk.split_first() {
+                Some((b'_', rest)) if rest.len() == 8 => {
+                    Some(Id::bnode(u64::from_be_bytes(rest.try_into().unwrap())))
+                }
+                _ => snap.lookup_key(sk),
+            };
+            let (Some(s_id), Some(o_id), Some(p_id)) =
+                (s_id, snap.lookup_key(ok), snap.lookup_iri(p))
+            else {
+                stale_hits += 1;
+                continue;
+            };
+            let g_id = if g == DEFAULT_GRAPH_IRI {
+                Some(Id::DEFAULT_GRAPH)
+            } else if let Some(label) = g.strip_prefix("_:") {
+                crate::store::parse_bnode_label(label)
+            } else {
+                snap.lookup_iri(g)
+            };
+            let Some(g_id) = g_id else {
+                stale_hits += 1;
+                continue;
+            };
+            if spec.dedup && !seen.insert((s_id, p_id, o_id)) {
+                continue;
+            }
+            row.fill(Id::UNDEF);
+            if let Some(c) = cs {
+                row[c] = s_id;
+            }
+            if let Some(c) = cscore {
+                row[c] = ctx.intern_value(&crate::sparql::value::Value::Float(score.into()));
+            }
+            if let Some(c) = clit {
+                row[c] = o_id;
+            }
+            // the graph slot names the default graph by its IRI (a term, not the
+            // store's default-graph marker)
+            let g_term = if g_id == Id::DEFAULT_GRAPH {
+                ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                    DEFAULT_GRAPH_IRI,
+                )))
+            } else {
+                g_id
+            };
+            if let Some(c) = cg_out {
+                row[c] = g_term;
+            }
+            if let Some(c) = cgv {
+                if row[c] != Id::UNDEF && row[c] != g_id {
+                    continue; // ?g used both as GRAPH ?g and as the graph slot
+                }
+                row[c] = g_id;
+            }
+            if let Some(c) = cprop {
+                row[c] = p_id;
+            }
+            t.push_row(&row);
+            ctx.check_rows(t.len())?;
+        }
+        if stale_hits > 0 {
+            tracing::warn!(
+                "text:query skipped {stale_hits} hits whose terms are not in the snapshot"
+            );
+        }
+        Ok(t)
+    }
+}

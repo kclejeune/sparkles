@@ -34,6 +34,7 @@ percent-encoding.workspace = true
 reqwest.workspace = true
 flate2.workspace = true
 quick_cache = "0.7.0"
+tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "lz4-compression"], optional = true }
 tempfile = "3"
 
 [dev-dependencies]
@@ -41,3 +42,7 @@ oxrdfio.workspace = true
 sparesults.workspace = true
 spargebra.workspace = true
 tempfile.workspace = true
+
+[features]
+# Full-text search over string literals (Tantivy), `text:query` in SPARQL
+text = ["dep:tantivy"]

@@ -826,3 +826,81 @@ async fn the_commit_catalog_pages_and_rejects_bad_ranges() {
         StatusCode::BAD_REQUEST
     );
 }
+
+// ---------------------------------------------------------------- full-text ------
+
+#[cfg(feature = "text")]
+#[tokio::test]
+async fn full_text_endpoints() {
+    let s = server();
+    let get = |p: &str| Request::get(p.to_string()).body(Body::empty()).unwrap();
+    assert_eq!(
+        send(&s.app, get("/$/text/ds")).await.json()["enabled"],
+        false
+    );
+    let q = "/ds/sparql?query=PREFIX%20text%3A%20%3Chttp%3A%2F%2Fjena.apache.org%2Ftext%23%3E%20SELECT%20%3Fs%20%7B%20%3Fs%20text%3Aquery%20%22alice%22%20%7D";
+    assert_eq!(send(&s.app, get(q)).await.status, StatusCode::BAD_REQUEST);
+    // rebuilding needs an enabled index
+    let rebuild = || {
+        Request::post("/$/text/ds/rebuild")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        send(&s.app, rebuild()).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let r = send(
+        &s.app,
+        Request::put("/$/text/ds")
+            .body(Body::from(r#"{"predicates": "all"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    let task = r.json()["id"].as_str().unwrap().to_string();
+    for _ in 0..100 {
+        let t = send(&s.app, get(&format!("/$/tasks/{task}"))).await.json();
+        if t["state"] != "running" {
+            assert_eq!(t["state"], "done", "{t}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let st = send(&s.app, get("/$/text/ds")).await.json();
+    assert_eq!(
+        (st["enabled"].as_bool(), st["state"].as_str()),
+        (Some(true), Some("ready"))
+    );
+    assert_eq!(st["seq"], st["storeSeq"]);
+    assert!(st["docs"].as_u64().unwrap() >= 2, "{st}");
+    let rows = send(
+        &s.app,
+        Request::get(q)
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .json();
+    assert_eq!(
+        rows["results"]["bindings"][0]["s"]["value"],
+        "http://example.org/alice"
+    );
+    // an unparseable query string is a client error
+    let bad = "/ds/sparql?query=PREFIX%20text%3A%20%3Chttp%3A%2F%2Fjena.apache.org%2Ftext%23%3E%20SELECT%20%3Fs%20%7B%20%3Fs%20text%3Aquery%20%22(alice%22%20%7D";
+    assert_eq!(send(&s.app, get(bad)).await.status, StatusCode::BAD_REQUEST);
+    let info = send(&s.app, get("/$/datasets/ds")).await.json();
+    assert_eq!(info["text"]["state"], "ready");
+    // disable
+    let r = send(
+        &s.app,
+        Request::delete("/$/text/ds").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        send(&s.app, get("/$/text/ds")).await.json()["enabled"],
+        false
+    );
+}
