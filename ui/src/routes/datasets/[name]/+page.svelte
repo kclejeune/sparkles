@@ -4,6 +4,7 @@
   import { page } from '$app/state';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import { receiptSummary } from '$lib/commits';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
@@ -392,18 +393,20 @@ ex:PersonShape a sh:NodeShape ;
       }}><Icon name="query" size={14} /> Query</button
     >
     <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
-    <button
-      class="btn"
-      onclick={() => (cloneOpen = true)}
-      disabled={readOnly || !info}
-      title={readOnly
-        ? 'The server is read-only'
-        : 'Copy this dataset into a new, independent dataset'}
-      ><Icon name="copy" size={14} /> Clone</button
-    >
-    <button class="btn danger" onclick={() => (deleteTarget = name)}
-      ><Icon name="trash" size={14} /> Delete</button
-    >
+    {#if auth.can(name, 'admin')}
+      <button
+        class="btn"
+        onclick={() => (cloneOpen = true)}
+        disabled={readOnly || !info}
+        title={readOnly
+          ? 'The server is read-only'
+          : 'Copy this dataset into a new, independent dataset'}
+        ><Icon name="copy" size={14} /> Clone</button
+      >
+      <button class="btn danger" onclick={() => (deleteTarget = name)}
+        ><Icon name="trash" size={14} /> Delete</button
+      >
+    {/if}
   </header>
 
   {#if cloned}
@@ -465,23 +468,25 @@ ex:PersonShape a sh:NodeShape ;
           <div class="panel-head">
             <h2>Storage</h2>
             <span class="spacer"></span>
-            <button
-              class="btn sm"
-              onclick={() => startTask('Compaction', () => api.compact(name))}
-              disabled={acting != null || !delta?.dirty}
-              title={delta?.dirty
-                ? 'Merge pending updates into a freshly sorted base index'
-                : 'Nothing to compact'}
-            >
-              <Icon name="layers" size={13} /> Compact
-            </button>
-            <button
-              class="btn sm"
-              onclick={() => startTask('Backup', () => api.backup(name))}
-              disabled={acting != null}
-            >
-              <Icon name="archive" size={13} /> Backup
-            </button>
+            {#if auth.can(name, 'admin')}
+              <button
+                class="btn sm"
+                onclick={() => startTask('Compaction', () => api.compact(name))}
+                disabled={acting != null || !delta?.dirty}
+                title={delta?.dirty
+                  ? 'Merge pending updates into a freshly sorted base index'
+                  : 'Nothing to compact'}
+              >
+                <Icon name="layers" size={13} /> Compact
+              </button>
+              <button
+                class="btn sm"
+                onclick={() => startTask('Backup', () => api.backup(name))}
+                disabled={acting != null}
+              >
+                <Icon name="archive" size={13} /> Backup
+              </button>
+            {/if}
           </div>
           <div class="panel-body storage">
             {#if delta}
@@ -530,17 +535,19 @@ ex:PersonShape a sh:NodeShape ;
                     >
                   {/if}
                   <span class="spacer"></span>
-                  <button
-                    class="btn sm"
-                    onclick={clearCache}
-                    disabled={clearingCache || !rc.enabled || rc.entries === 0}
-                    title="Drop cached query results for this dataset"
-                  >
-                    {#if clearingCache}<span class="spinner"></span>{:else}<Icon
-                        name="trash"
-                        size={12}
-                      />{/if} Clear cache
-                  </button>
+                  {#if auth.can(name, 'admin')}
+                    <button
+                      class="btn sm"
+                      onclick={clearCache}
+                      disabled={clearingCache || !rc.enabled || rc.entries === 0}
+                      title="Drop cached query results for this dataset"
+                    >
+                      {#if clearingCache}<span class="spinner"></span>{:else}<Icon
+                          name="trash"
+                          size={12}
+                        />{/if} Clear cache
+                    </button>
+                  {/if}
                 </div>
               {/if}
               <div class="cache">
@@ -784,7 +791,7 @@ ex:PersonShape a sh:NodeShape ;
 
       <div class="col">
         <!-- upload -->
-        <section class="panel">
+        <section class="panel" hidden={!auth.can(name, 'write')}>
           <div class="panel-head"><h2>Upload data</h2></div>
           <div class="panel-body upload">
             <div
@@ -889,7 +896,7 @@ ex:PersonShape a sh:NodeShape ;
           {info}
           {prefixes}
           {explore}
-          {readOnly}
+          readOnly={readOnly || !auth.can(name, 'admin')}
           busy={acting != null}
           onstart={startTask}
           onchanged={refreshAll}
@@ -900,7 +907,7 @@ ex:PersonShape a sh:NodeShape ;
           {name}
           {prefixes}
           predicates={stats.predicates.map((p) => p.iri)}
-          {readOnly}
+          readOnly={readOnly || !auth.can(name, 'admin')}
           busy={acting != null}
           refreshKey={refreshKick}
           onstart={startTask}

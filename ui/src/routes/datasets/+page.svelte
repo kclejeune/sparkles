@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { app } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import Icon from '$components/Icon.svelte';
@@ -39,9 +40,11 @@
     <button class="btn" onclick={refresh} disabled={refreshing}>
       <Icon name="refresh" size={14} /> Refresh
     </button>
-    <button class="btn primary" onclick={() => (createOpen = true)}
-      ><Icon name="plus" size={14} /> New dataset</button
-    >
+    {#if auth.hasServer('server-admin')}
+      <button class="btn primary" onclick={() => (createOpen = true)}
+        ><Icon name="plus" size={14} /> New dataset</button
+      >
+    {/if}
   </header>
 
   {#if app.datasetsError}
@@ -54,9 +57,11 @@
         <div class="empty">
           <Icon name="database" size={24} />
           <p>No datasets yet.</p>
-          <button class="btn primary" onclick={() => (createOpen = true)}
-            ><Icon name="plus" size={14} /> Create your first dataset</button
-          >
+          {#if auth.hasServer('server-admin')}
+            <button class="btn primary" onclick={() => (createOpen = true)}
+              ><Icon name="plus" size={14} /> Create your first dataset</button
+            >
+          {/if}
         </div>
       {:else}
         <table class="data">
@@ -108,14 +113,16 @@
                     }}><Icon name="query" size={13} /> Query</button
                   >
                   <a class="btn sm" href={detail(d.name)}>Details</a>
-                  <button
-                    class="btn sm icon danger"
-                    aria-label="Delete {d.name}"
-                    title="Delete {d.name}"
-                    onclick={() => (deleteTarget = d.name)}
-                  >
-                    <Icon name="trash" size={13} />
-                  </button>
+                  {#if auth.can(d.name, 'admin')}
+                    <button
+                      class="btn sm icon danger"
+                      aria-label="Delete {d.name}"
+                      title="Delete {d.name}"
+                      onclick={() => (deleteTarget = d.name)}
+                    >
+                      <Icon name="trash" size={13} />
+                    </button>
+                  {/if}
                 </td>
               </tr>
             {/each}

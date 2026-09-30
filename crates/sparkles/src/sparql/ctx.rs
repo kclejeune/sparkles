@@ -157,6 +157,9 @@ pub struct Ctx {
     /// highest estimate seen (held tables plus an output under construction)
     mem_peak: AtomicU64,
     pub allow_service: bool,
+    /// SERVICE fails with [`crate::Error::NotPermitted`] (see
+    /// [`QueryOptions::forbid_service`](super::QueryOptions::forbid_service))
+    pub forbid_service: bool,
     /// consult / fill the store's result cache
     pub use_cache: bool,
     pub opt: Optimizations,
@@ -183,6 +186,7 @@ impl Ctx {
             mem_live: AtomicU64::new(0),
             mem_peak: AtomicU64::new(0),
             allow_service: true,
+            forbid_service: false,
             use_cache: true,
             opt: Optimizations::default(),
         }

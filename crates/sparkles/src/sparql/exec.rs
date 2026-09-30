@@ -333,6 +333,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             silent,
         } => match service(ctx, endpoint, query, &n.vars) {
             Ok(t) => t,
+            // SILENT hides failures of the remote service, not a refusal
+            Err(Error::NotPermitted(m)) => return Err(Error::NotPermitted(m)),
             Err(_) if *silent => Table::unit(),
             Err(e) => return Err(e),
         },
@@ -2463,6 +2465,11 @@ fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> R
 fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result<Table> {
     if !ctx.allow_service {
         return Err(Error::Service("SERVICE is disabled".into()));
+    }
+    if ctx.forbid_service {
+        return Err(Error::NotPermitted(
+            "SERVICE requires the federate permission".into(),
+        ));
     }
     let PathEnd::Const(id) = endpoint else {
         return Err(Error::unsupported("SERVICE with a variable endpoint"));

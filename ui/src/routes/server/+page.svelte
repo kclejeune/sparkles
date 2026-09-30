@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import { fmtBytes, fmtDuration, fmtInt, fmtTime } from '$lib/format';
   import { fmtSeconds, hitRatio, requestRows, type RequestRow } from '$lib/metrics';
   import Icon from '$components/Icon.svelte';
@@ -38,7 +39,13 @@
   }
 
   async function loadStatus() {
-    const [r, m] = await Promise.allSettled([api.ready(), api.metricsSnapshot()]);
+    await auth.ensure();
+    const [r, m] = await Promise.allSettled([
+      api.ready(),
+      auth.hasServer('metrics')
+        ? api.metricsSnapshot()
+        : Promise.reject(new Error('requires the metrics permission')),
+    ]);
     if (r.status === 'fulfilled') {
       readiness = r.value;
       readyError = null;
@@ -283,7 +290,7 @@
     {/if}
   </section>
 
-  <section class="panel">
+  <section class="panel" hidden={!auth.hasServer('metrics')}>
     <div class="panel-head">
       <h2>Requests</h2>
       <span class="spacer"></span>
@@ -334,7 +341,7 @@
     {/if}
   </section>
 
-  <section class="panel">
+  <section class="panel" hidden={!auth.hasServer('metrics')}>
     <div class="panel-head">
       <h2>Memory and caches</h2>
       <span class="spacer"></span>

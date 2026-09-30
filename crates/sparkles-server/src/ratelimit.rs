@@ -494,9 +494,13 @@ impl ClientKeyer for PeerKeyer {
 
 /// The address the connection came from, when the server recorded it.
 pub fn peer_ip(req: &Request) -> Option<IpAddr> {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
+    let ext = req.extensions();
+    ext.get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip())
+        .or_else(|| match ext.get::<ConnectInfo<crate::auth::Peer>>() {
+            Some(ConnectInfo(crate::auth::Peer::Tcp(a))) => Some(a.ip()),
+            _ => None,
+        })
 }
 
 // ------------------------------------------------------------------- clock ------

@@ -98,6 +98,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries stop when their client disconnects | ✅ |
 | OpenTelemetry (`otel` cargo feature, off at run time unless `--otel` or `OTEL_*` enable it): OTLP traces with W3C `traceparent` in and out (SERVICE, LOAD), HTTP/database semantic-convention attributes, query phase and operator-tree spans synthesized from recorded timings, commit and background-task spans; metrics (`http.server.request.duration` plus the Prometheus registry, bridged); optional OTLP logs with trace correlation | ✅ |
 | Rate limiting: per-client GCRA buckets and concurrency caps per request class (`auth`, `query`, `update`, `admin`) with per-dataset overrides, trusted-proxy client addresses, `429`/`503` with `Retry-After` and `RateLimit` headers, bounded client tracking, SIGHUP reload; off by default | ✅ |
+| Authentication and per-dataset access control (`serve --auth-config`, off by default): levels `read` < `write` < `admin` by dataset name or pattern plus `metrics` / `federate` / `server-admin`, deny by default, hidden datasets answer `404`; HTTP Basic users (argon2id), scoped, expiring, revocable API tokens (`Authorization: Bearer spk_…`, hashed at rest, never above their owner), OIDC sign-in for the UI (native, authorization code + PKCE), trusted forward-auth proxy headers from configured CIDRs or a Unix socket, group-to-role mapping; CSRF and CORS rules for cookies; `sparkles auth login` (browser loopback or device code) and remote `query` / `update` / `load --server`; see [docs/API.md](docs/API.md#authentication-and-access-control) | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations), commit history and write receipts, full-text search (index admin panel, ranked `text:query` search in Explore), vector similarity ("Similar" in the explorer, compact vector literals); embedded in the server binary; Vitest unit tests, and a mock server for UI development | ✅ |
 
 ## Performance
@@ -159,7 +160,7 @@ feature gaps are:
 | SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD only) |
 | Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` endpoint | ✗ none |
-| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |
+| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | Basic, Bearer tokens, OIDC (UI) and trusted proxy headers, with per-dataset levels; no graph-level ACLs yet; Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |
 | SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
 | Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
 
@@ -193,7 +194,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 | Area | Fluree has | Sparkles |
 |---|---|---|
 | History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog; point-in-time reads of every commit since the last compaction, and of older ones kept by named snapshots or a retention window; no history queries across commits, diffs, branches or merges yet |
-| Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | ✗ none (run behind a proxy) |
+| Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers; no policy language, signed requests or encryption at rest |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL and the Rust API only; JSON-LD as an RDF format only |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |
 | Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk |
@@ -536,17 +537,18 @@ you then extend through the usual `services.nginx.virtualHosts.<name>` options:
             };
             queryTimeout = 120;
             resultCacheMb = 1024;
+            # users, tokens, OIDC (docs/API.md); a secret, never in the Nix store
+            auth.configFile = "/run/secrets/sparkles-auth.toml";
             # readOnly = true; allowService = false; unionDefaultGraph = true;
             nginx = {
               enable = true;
               virtualHost = "sparql.example.org";
             };
           };
-          # standard nginx semantics: TLS, auth, extra locations …
+          # standard nginx semantics: TLS, extra locations …
           services.nginx.virtualHosts."sparql.example.org" = {
             enableACME = true;
             forceSSL = true;
-            basicAuthFile = "/run/secrets/sparkles-htpasswd"; # the server has no auth of its own
           };
           security.acme.acceptTerms = true;
           security.acme.defaults.email = "admin@example.org";
@@ -563,6 +565,13 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
 * `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
 * proxy timeouts to `queryTimeout + 30` seconds;
 * request/response buffering off, so large uploads and results stream through.
+
+With `auth.configFile` the service starts with `--auth-config` and `systemctl reload
+sparkles` re-reads it (SIGHUP). Keep the file out of the Nix store (agenix, sops-nix),
+owned by the `sparkles` user. Do not also set nginx `basicAuthFile`: nginx would forward
+its own `Authorization` header, which Sparkles would then reject. `unixSocket` makes the
+server listen on a Unix socket that nginx proxies to, so trusted proxy headers can be
+limited to it (`proxy.trusted = ["unix"]`).
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so for offline work (`sparkles load`, `compact`) stop the service first,

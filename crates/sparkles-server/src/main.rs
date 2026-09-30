@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
 mod alloc;
+mod auth;
 mod check_cmd;
 mod clone;
 mod http;
@@ -11,6 +12,8 @@ mod obs;
 mod otel;
 mod ratelimit;
 mod reasoning;
+#[cfg(feature = "auth")]
+mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod state;
@@ -374,6 +377,20 @@ enum Cmd {
         /// Export log events over OTLP too (also OTEL_LOGS_EXPORTER=otlp)
         #[arg(long)]
         otel_logs: bool,
+        /// Enable authentication and per-dataset authorization from this TOML file
+        /// (re-read on SIGHUP); without it the server is open
+        #[arg(long, value_name = "FILE")]
+        auth_config: Option<PathBuf>,
+        /// Listen on this Unix socket (mode 0660) instead of TCP; with auth, trusted
+        /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
+        #[arg(long, value_name = "PATH")]
+        unix_socket: Option<PathBuf>,
+    },
+    /// Authentication: hashes, tokens, configuration checks
+    #[cfg(feature = "auth")]
+    Auth {
+        #[command(subcommand)]
+        cmd: auth::cli::AuthCmd,
     },
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
@@ -397,12 +414,21 @@ enum Cmd {
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
-        #[arg(long)]
-        loc: PathBuf,
+        #[arg(long, required_unless_present = "server")]
+        loc: Option<PathBuf>,
         /// Load triples into this named graph
         #[arg(long)]
         graph: Option<String>,
         files: Vec<PathBuf>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Run a SPARQL query against a database or files
     Query {
@@ -434,14 +460,32 @@ enum Cmd {
         memory_mb: u64,
         /// Query string (if --query is not given)
         text: Option<String>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Run a SPARQL update against a database
     Update {
-        #[arg(long)]
-        loc: PathBuf,
+        #[arg(long, required_unless_present = "server")]
+        loc: Option<PathBuf>,
         #[arg(long)]
         update: Option<PathBuf>,
         text: Option<String>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Write the database as N-Quads (or TriG) to stdout
     Dump {
@@ -873,12 +917,18 @@ fn main() -> Result<()> {
             vector_memory_mb,
             auto_reason,
             auto_reason_max_delay,
+            auth_config,
+            unix_socket,
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
             ..
         } => {
+            // a bad auth configuration stops the server before anything else
+            let bound = if unix_socket.is_some() { "unix" } else { &host };
+            let auth = auth::load(auth_config.as_deref(), &data, bound)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            st.auth = auth;
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
@@ -914,8 +964,11 @@ fn main() -> Result<()> {
                 trusted_proxies: rate_limit_trusted_proxy,
             };
             if let Some(cfg) = limit_sources.load()? {
+                // signed-in callers are limited per principal, others per address
                 st.rate_limit = Some(Arc::new(
-                    ratelimit::RateLimiter::new(&cfg).map_err(anyhow::Error::msg)?,
+                    ratelimit::RateLimiter::new(&cfg)
+                        .map_err(anyhow::Error::msg)?
+                        .with_keyer(Arc::new(auth::PrincipalKeyer)),
                 ));
             }
             let st = Arc::new(st);
@@ -948,11 +1001,29 @@ fn main() -> Result<()> {
                 .build()?;
             let served = rt.block_on(async move {
                 let addr = format!("{host}:{port}");
-                let listener = tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .with_context(|| format!("binding {addr}"))?;
+                let tcp = match &unix_socket {
+                    None => Some(
+                        tokio::net::TcpListener::bind(&addr)
+                            .await
+                            .with_context(|| format!("binding {addr}"))?,
+                    ),
+                    Some(_) => None,
+                };
+                #[cfg(unix)]
+                let unix = match &unix_socket {
+                    Some(path) => Some(bind_unix(path)?),
+                    None => None,
+                };
+                #[cfg(not(unix))]
+                if unix_socket.is_some() {
+                    bail!("--unix-socket needs a Unix platform");
+                }
+                let listening = match &unix_socket {
+                    Some(p) => format!("unix:{}", p.display()),
+                    None => format!("http://{addr}/"),
+                };
                 tracing::info!(
-                    "Sparkles {} listening on http://{addr}/ (UI at /ui/)",
+                    "Sparkles {} listening on {listening} (UI at /ui/)",
                     env!("CARGO_PKG_VERSION")
                 );
                 for name in st.datasets.read().keys() {
@@ -969,16 +1040,30 @@ fn main() -> Result<()> {
                 }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
+                auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
-                let app =
-                    http::router(st).into_make_service_with_connect_info::<std::net::SocketAddr>();
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown_signal().await;
-                        st2.set_phase(obs::Phase::Draining);
-                        tracing::info!("shutting down: finishing requests in flight");
-                    })
-                    .await?;
+                let app = http::router(st.clone());
+                let shutdown = async move {
+                    shutdown_signal().await;
+                    st2.set_phase(obs::Phase::Draining);
+                    tracing::info!("shutting down: finishing requests in flight");
+                };
+                // the peer address feeds trusted-proxy checks
+                let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                #[cfg(unix)]
+                if let Some(l) = unix {
+                    axum::serve(l, service)
+                        .with_graceful_shutdown(shutdown)
+                        .await?;
+                    auth::flush(&st);
+                    return anyhow::Ok(());
+                }
+                if let Some(l) = tcp {
+                    axum::serve(l, service)
+                        .with_graceful_shutdown(shutdown)
+                        .await?;
+                }
+                auth::flush(&st);
                 anyhow::Ok(())
             });
             drop(rt);
@@ -986,7 +1071,27 @@ fn main() -> Result<()> {
             otel_guard.shutdown();
             served
         }
-        Cmd::Load { loc, graph, files } => {
+        Cmd::Load {
+            loc,
+            graph,
+            files,
+            server,
+            dataset,
+            insecure_http,
+        } => {
+            let Some(loc) = loc else {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::load(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    graph.as_deref(),
+                    &files,
+                );
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
+            };
             if files.is_empty() {
                 bail!("no files given");
             }
@@ -1021,12 +1126,30 @@ fn main() -> Result<()> {
             at,
             memory_mb,
             text,
+            server,
+            dataset,
+            insecure_http,
         } => {
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
                 _ => bail!("no query given"),
             };
+            if loc.is_none() && data.is_empty() && server.is_some() {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::query(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    &q,
+                    &fmt,
+                    timeout,
+                    explain,
+                );
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
+            }
             let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
@@ -1085,11 +1208,25 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Update { loc, update, text } => {
+        Cmd::Update {
+            loc,
+            update,
+            text,
+            server,
+            dataset,
+            insecure_http,
+        } => {
             let u = match (update, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
                 _ => bail!("no update given"),
+            };
+            let Some(loc) = loc else {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::update(server.as_deref(), insecure_http, ds, &u);
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
             };
             let store = Store::open(&loc, opts)?;
             let qopts = QueryOptions {
@@ -1109,6 +1246,8 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "auth")]
+        Cmd::Auth { cmd } => auth::cli::run(cmd),
         Cmd::TextIndex {
             loc,
             predicate,
@@ -1613,6 +1752,36 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
 }
 
 /// SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+/// The `--dataset` of a remote command (`--server` without `--loc`).
+fn remote_dataset<'a>(server: Option<&str>, dataset: Option<&'a str>) -> Result<&'a str> {
+    if server.is_none() {
+        bail!("give --loc (a local database) or --server URL --dataset NAME");
+    }
+    dataset.context("--dataset NAME is required with --server")
+}
+
+#[cfg(not(feature = "auth"))]
+fn no_remote(_: &str, _: bool) -> Result<()> {
+    bail!("--server: built without the remote client (cargo feature \"auth\")")
+}
+
+/// `serve --unix-socket`: remove a stale socket, bind, and allow owner and group
+/// (mode 0660).
+#[cfg(unix)]
+fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            bail!("{} exists and is not a socket", path.display());
+        }
+        std::fs::remove_file(path)?;
+    }
+    let l = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(l)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

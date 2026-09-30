@@ -170,6 +170,9 @@ pub fn request_span(id: &str, method: &axum::http::Method, route: Option<&str>) 
             otel.kind = "server",
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
+            // recorded by the auth layer
+            principal = tracing::field::Empty,
+            auth = tracing::field::Empty,
         )
     } else {
         tracing::info_span!(
@@ -178,6 +181,8 @@ pub fn request_span(id: &str, method: &axum::http::Method, route: Option<&str>) 
             request_id = %id,
             method = %method,
             route = route.unwrap_or("-"),
+            principal = tracing::field::Empty,
+            auth = tracing::field::Empty,
         )
     }
 }

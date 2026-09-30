@@ -72,6 +72,14 @@ let
     "--timeout"
     (toString cfg.queryTimeout)
   ]
+  ++ lib.optionals (cfg.auth.configFile != null) [
+    "--auth-config"
+    cfg.auth.configFile
+  ]
+  ++ lib.optionals (cfg.unixSocket != null) [
+    "--unix-socket"
+    cfg.unixSocket
+  ]
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
   ++ lib.optional cfg.otel.enable "--otel"
@@ -99,18 +107,21 @@ let
   );
 
   upstream =
-    let
-      host =
-        if cfg.listenAddress == "0.0.0.0" then
-          "127.0.0.1"
-        else if cfg.listenAddress == "::" then
-          "[::1]"
-        else if lib.hasInfix ":" cfg.listenAddress then
-          "[${cfg.listenAddress}]"
-        else
-          cfg.listenAddress;
-    in
-    "http://${host}:${toString cfg.port}";
+    if cfg.unixSocket != null then
+      "http://unix:${cfg.unixSocket}"
+    else
+      let
+        host =
+          if cfg.listenAddress == "0.0.0.0" then
+            "127.0.0.1"
+          else if cfg.listenAddress == "::" then
+            "[::1]"
+          else if lib.hasInfix ":" cfg.listenAddress then
+            "[${cfg.listenAddress}]"
+          else
+            cfg.listenAddress;
+      in
+      "http://${host}:${toString cfg.port}";
 in
 {
   options.services.sparkles = {
@@ -229,6 +240,33 @@ in
       description = "Treat the default graph as the union of all named graphs (TDB2 `unionDefaultGraph`).";
     };
 
+    auth.configFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/sparkles-auth.toml";
+      description = ''
+        Authentication and per-dataset access control: the TOML file passed as
+        `--auth-config` (users, API tokens, OIDC, trusted proxy headers; see
+        `docs/API.md`). It holds password and token hashes and an OIDC client secret
+        path, so it must not be in the Nix store: use an agenix or sops-nix secret owned
+        by the service user. `systemctl reload sparkles` re-reads it. Without it the
+        server is open.
+      '';
+    };
+
+    unixSocket = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/sparkles/sparkles.sock";
+      description = ''
+        Listen on this Unix socket (mode 0660, group {option}`group`) instead of TCP. The
+        nginx virtual host then proxies to it, and nginx joins the group. With
+        authentication, trusted proxy headers can be limited to the socket
+        (`proxy.trusted = [ "unix" ]`). A socket under `/run/sparkles` uses the service's
+        runtime directory.
+      '';
+    };
+
     logLevel = mkOption {
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
@@ -318,7 +356,9 @@ in
         description = ''
           Name of the nginx virtual host that proxies to the server. Extend it through
           `services.nginx.virtualHosts.<name>` as usual, e.g. `enableACME = true;
-          forceSSL = true;` or `basicAuthFile` (the server itself has no authentication).
+          forceSSL = true;`. Do not set `basicAuthFile` together with
+          {option}`auth.configFile`: nginx would forward its own `Authorization` header,
+          which the server would then reject.
           The server must be served at the root of the host (the UI lives at `/ui/`, the
           admin API at `/$/`).
         '';
@@ -347,16 +387,28 @@ in
         );
         message = "services.sparkles.datasets: names must match [A-Za-z0-9_.-]+ and must not be `ui`.";
       }
+      {
+        assertion =
+          cfg.auth.configFile == null
+          || (lib.hasPrefix "/" cfg.auth.configFile && !lib.hasPrefix "/nix/store" cfg.auth.configFile);
+        message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
+      }
     ];
 
-    users.users = mkIf (cfg.user == "sparkles") {
-      sparkles = {
-        isSystemUser = true;
-        group = cfg.group;
-        home = cfg.dataDir;
-        description = "Sparkles RDF server";
-      };
-    };
+    users.users = lib.mkMerge [
+      (mkIf (cfg.user == "sparkles") {
+        sparkles = {
+          isSystemUser = true;
+          group = cfg.group;
+          home = cfg.dataDir;
+          description = "Sparkles RDF server";
+        };
+      })
+      # nginx reaches the Unix socket through the service group
+      (mkIf (cfg.nginx.enable && cfg.unixSocket != null) {
+        nginx.extraGroups = [ cfg.group ];
+      })
+    ];
     users.groups = mkIf (cfg.group == "sparkles") { sparkles = { }; };
 
     environment.systemPackages = lib.optional cfg.installCli cfg.package;
@@ -402,6 +454,12 @@ in
         # re-reads the rate-limit configuration (without one, SIGHUP would stop it)
         ExecReload = mkIf (rateLimits != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
+        # re-reads the auth configuration
+        ExecReload = mkIf (cfg.auth.configFile != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        RuntimeDirectory = mkIf (
+          cfg.unixSocket != null && lib.hasPrefix "/run/sparkles/" cfg.unixSocket
+        ) "sparkles";
+        RuntimeDirectoryMode = "0750";
         User = cfg.user;
         Group = cfg.group;
         WorkingDirectory = cfg.dataDir;

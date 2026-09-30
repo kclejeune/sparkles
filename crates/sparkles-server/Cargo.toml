@@ -21,7 +21,7 @@ serde_json.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 rust-embed.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -39,7 +39,9 @@ base64 = "0.23"
 mimalloc = { version = "0.1.52", optional = true }
 libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
 rayon.workspace = true
+ipnet = "2"
 arc-swap.workspace = true
+chrono.workspace = true
 quick_cache = "0.7.0"
 http-body = "1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
@@ -48,6 +50,16 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = { version = "0.33", default-features = false, optional = true }
 tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
 uuid = { workspace = true, optional = true }
+# authentication (feature `auth`)
+sha2 = { workspace = true, optional = true }
+subtle = { version = "2.6", optional = true }
+getrandom = { version = "0.3", optional = true }
+argon2 = { version = "0.6", optional = true }
+toml = { version = "1", optional = true }
+zeroize = { version = "1", optional = true }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
+reqwest = { workspace = true, optional = true }
+rpassword = { version = "7", optional = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"
@@ -55,15 +67,29 @@ libc = "0.2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "testing"] }
+# signs the ID tokens of the mock OIDC provider in tests (already in the tree via rustls)
+aws-lc-rs = "1"
 
 [features]
-default = ["reasoning", "shacl", "mimalloc", "text", "otel"]
+default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
 shacl = ["dep:sparkles-shacl"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
+# authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)
+auth = [
+    "dep:sha2",
+    "dep:subtle",
+    "dep:getrandom",
+    "dep:argon2",
+    "dep:toml",
+    "dep:zeroize",
+    "dep:rpassword",
+    "dep:jsonwebtoken",
+    "dep:reqwest",
+]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]

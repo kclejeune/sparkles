@@ -120,18 +120,21 @@ pub enum Outcome {
     Timeout,
     Cancelled,
     Budget,
+    /// refused by the auth layer (401, 403, cross-origin, hidden-dataset 404)
+    Denied,
     /// refused by a rate or concurrency limit (`429`, or `503` when saturated)
     RateLimited,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 7] = [
+    pub const ALL: [Outcome; 8] = [
         Outcome::Ok,
         Outcome::ClientError,
         Outcome::Error,
         Outcome::Timeout,
         Outcome::Cancelled,
         Outcome::Budget,
+        Outcome::Denied,
         Outcome::RateLimited,
     ];
 
@@ -143,6 +146,7 @@ impl Outcome {
             Outcome::Timeout => "timeout",
             Outcome::Cancelled => "cancelled",
             Outcome::Budget => "budget",
+            Outcome::Denied => "denied",
             Outcome::RateLimited => "rate_limited",
         }
     }
@@ -302,10 +306,18 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
     );
     pending.otel = otel;
     let mut resp = next.run(req).await;
-    let report = resp
+    let mut report = resp
         .extensions_mut()
         .remove::<RequestReport>()
         .unwrap_or_default();
+    let auth = resp.extensions_mut().remove::<crate::auth::AuthReport>();
+    if auth
+        .as_ref()
+        .is_some_and(|a| a.denied.is_some() || a.error.is_some())
+    {
+        report.outcome = Some(Outcome::Denied);
+    }
+    pending.auth = auth;
     crate::otel::response_headers(&pending.otel, resp.headers_mut());
     pending.complete(resp.status().as_u16(), &report);
     resp.headers_mut().insert(X_REQUEST_ID.clone(), id_value);
@@ -322,6 +334,7 @@ struct Pending {
     quiet: bool,
     start: Instant,
     done: bool,
+    auth: Option<crate::auth::AuthReport>,
     otel: crate::otel::Req,
 }
 
@@ -338,6 +351,7 @@ impl Pending {
             quiet,
             start: Instant::now(),
             done: false,
+            auth: None,
             otel: Default::default(),
         }
     }
@@ -381,6 +395,7 @@ impl Pending {
                 outcome,
                 elapsed,
                 report,
+                self.auth.as_ref(),
             );
         }
     }
@@ -416,8 +431,13 @@ fn access_event(
     outcome: Outcome,
     elapsed: Duration,
     r: &RequestReport,
+    auth: Option<&crate::auth::AuthReport>,
 ) {
     let t = r.timing.as_ref();
+    // the principal's log name only; never a credential
+    let principal = auth.map(|a| a.principal.as_deref().unwrap_or("-"));
+    let scheme = auth.and_then(|a| a.scheme);
+    let auth_error = auth.and_then(|a| a.error);
     macro_rules! event {
         ($level:ident) => {
             tracing::$level!(
@@ -434,6 +454,9 @@ fn access_event(
                 total_ms = ms(elapsed.as_secs_f64() * 1000.0),
                 response_bytes = r.response_bytes,
                 mem_peak_bytes = r.mem_peak_bytes,
+                principal,
+                auth = scheme,
+                auth_error,
                 "completed"
             )
         };
@@ -502,7 +525,7 @@ impl Histogram {
 #[derive(Default)]
 struct OpMetrics {
     seen: AtomicBool,
-    outcomes: [AtomicU64; 7],
+    outcomes: [AtomicU64; 8],
     duration: Histogram,
     response_bytes: AtomicU64,
 }
@@ -992,6 +1015,7 @@ pub fn render_prometheus(st: &AppState) -> String {
             g.rcache_entries
         );
     }
+    crate::auth::render_metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
@@ -1187,13 +1211,16 @@ fn dataset_ready(d: &crate::state::Dataset) -> J {
     v
 }
 
-/// Whether the server is ready, and its `ReadyInfo` document.
-fn ready(st: &AppState) -> (bool, J) {
+/// Whether the server is ready, and its `ReadyInfo` document, listing the datasets the
+/// caller may read (all of them with `metrics`).
+fn ready_for(st: &AppState, p: &crate::auth::Principal) -> (bool, J) {
     let phase = st.phase();
+    let all = p.has(crate::auth::ServerPerm::Metrics);
     let datasets: Vec<J> = st
         .datasets
         .read()
         .values()
+        .filter(|d| all || p.can(&d.name, crate::auth::Level::Read))
         .map(|d| dataset_ready(d))
         .collect();
     let ok = phase == Phase::Ready;
@@ -1222,9 +1249,16 @@ fn ready_response(ok: bool, body: J) -> Response {
         .into_response()
 }
 
+fn ready(st: &AppState) -> (bool, J) {
+    ready_for(st, &crate::auth::Principal::local())
+}
+
 /// `GET /$/ready`: 200 when ready, else 503; the body is always `ReadyInfo`.
-pub async fn ready_endpoint(State(st): State<Arc<AppState>>) -> Response {
-    let (ok, body) = tokio::task::spawn_blocking(move || ready(&st))
+pub async fn ready_endpoint(
+    State(st): State<Arc<AppState>>,
+    axum::Extension(p): axum::Extension<crate::auth::Principal>,
+) -> Response {
+    let (ok, body) = tokio::task::spawn_blocking(move || ready_for(&st, &p))
         .await
         .unwrap_or((false, J::Null));
     ready_response(ok, body)

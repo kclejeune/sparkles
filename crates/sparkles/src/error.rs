@@ -49,6 +49,10 @@ pub enum Error {
     /// The dataset requires a write guard that this process has not installed.
     #[error("{0}")]
     GuardMissing(String),
+    /// The caller lacks a permission the operation needs (outbound SERVICE or LOAD,
+    /// `LOAD <file:…>`); raised before any connection or file is opened.
+    #[error("{0}")]
+    NotPermitted(String),
 }
 
 /// Which budget a request exceeded.

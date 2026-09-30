@@ -129,6 +129,7 @@ impl Request<'_> {
             ctx.mem_limit = m;
         }
         ctx.allow_service = self.opts.allow_service;
+        ctx.forbid_service = self.opts.forbid_service;
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }
@@ -359,8 +360,9 @@ fn run_op(
             source,
             destination,
         } => {
-            let r = load(txn, source, destination, stats);
-            if r.is_err() && !silent {
+            let r = load(txn, source, destination, stats, req.opts);
+            // SILENT hides failures of the source, not a refusal
+            if matches!(r, Err(Error::NotPermitted(_))) || (r.is_err() && !silent) {
                 return r;
             }
         }
@@ -453,8 +455,20 @@ fn load(
     source: &NamedNode,
     dest: &GraphName,
     stats: &mut UpdateStats,
+    opts: &QueryOptions,
 ) -> Result<()> {
     let url = source.as_str();
+    if url.starts_with("file:") {
+        if opts.forbid_file_load {
+            return Err(Error::NotPermitted(
+                "LOAD <file:…> requires server-admin".into(),
+            ));
+        }
+    } else if opts.forbid_remote_load {
+        return Err(Error::NotPermitted(
+            "LOAD <http…> requires the federate permission".into(),
+        ));
+    }
     let graph = match dest {
         GraphName::NamedNode(n) => Some(n.clone()),
         GraphName::DefaultGraph => None,

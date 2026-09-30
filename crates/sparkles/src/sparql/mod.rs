@@ -45,6 +45,13 @@ pub struct QueryOptions {
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
     pub allow_service: bool,
+    /// Refuse SERVICE with [`Error::NotPermitted`] (the caller lacks the permission;
+    /// `allow_service: false` means SERVICE is disabled for everyone).
+    pub forbid_service: bool,
+    /// Refuse `LOAD <http…>` with [`Error::NotPermitted`].
+    pub forbid_remote_load: bool,
+    /// Refuse `LOAD <file:…>` with [`Error::NotPermitted`].
+    pub forbid_file_load: bool,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Graphs merged into the store's default graph when the query does not specify a
     /// dataset (used for the materialized-inference overlay).
@@ -201,6 +208,7 @@ fn make_ctx(
         ctx.mem_limit = m;
     }
     ctx.allow_service = opts.allow_service;
+    ctx.forbid_service = opts.forbid_service;
     ctx.use_cache = !opts.no_cache;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
