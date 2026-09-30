@@ -53,11 +53,12 @@ export type Limits = {
 };
 
 export type ServerInfo = {
-  version: string;
+  /** Absent for anonymous callers of a server with authentication. */
+  version?: string;
   startedAt: string;
   uptimeSeconds: number;
   datasets: DatasetInfo[];
-  /** Absent on servers that predate budgets. */
+  /** Absent on servers that predate budgets, and for anonymous callers with auth. */
   limits?: Limits;
   /** Absent on servers that predate it. */
   readOnly?: boolean;

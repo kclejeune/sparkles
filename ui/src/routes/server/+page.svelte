@@ -212,15 +212,17 @@
           .join(', ')}
       </div>
     </div>
-    {#if info}<span class="version mono">v{info.version}</span>{/if}
+    {#if info?.version}<span class="version mono">v{info.version}</span>{/if}
   </section>
 
   {#if info}
     <dl class="kv panel">
-      <div>
-        <dt>Version</dt>
-        <dd class="mono">{info.version}</dd>
-      </div>
+      {#if info.version}
+        <div>
+          <dt>Version</dt>
+          <dd class="mono">{info.version}</dd>
+        </div>
+      {/if}
       <div>
         <dt>Started</dt>
         <dd>{fmtTime(info.startedAt)}</dd>

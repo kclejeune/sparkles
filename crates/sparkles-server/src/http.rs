@@ -169,6 +169,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         crate::ratelimit::admit,
     ))
     .layer(cors)
+    .layer(axum::middleware::from_fn(security_headers))
     .layer(
         tower_http::trace::TraceLayer::new_for_http()
             .make_span_with(crate::obs::MakeSpan)
@@ -233,6 +234,26 @@ impl IntoResponse for ApiError {
 /// The JSON body of an [`ApiError`] response, for [`error_request_id`].
 #[derive(Clone)]
 pub(crate) struct ErrorJson(pub(crate) J);
+
+/// Headers of every response: `nosniff`, and never in a frame. A response without a
+/// policy of its own (all but the UI's pages, [`crate::ui::page_csp`]) also gets
+/// `default-src 'none'`: API responses are data, never a page that runs anything.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use header::HeaderValue;
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    h.entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'",
+        ));
+    resp
+}
 
 /// Add the request's id to JSON error bodies (`requestId`), so an error shown by a
 /// client can be found in the logs. Runs inside the layer that assigns the id.
@@ -2079,16 +2100,20 @@ fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
     info
 }
 
+/// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
 async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
-    Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
+    let mut doc = json!({
         "startedAt": st.started_at,
         "uptimeSeconds": uptime_secs(&st),
         "readOnly": st.read_only,
         "datasets": visible_datasets(&st, &p),
-        "limits": st.limits.json(st.default_timeout),
         "auth": crate::auth::server_json(&st),
-    }))
+    });
+    if !p.is_anonymous() {
+        doc["version"] = env!("CARGO_PKG_VERSION").into();
+        doc["limits"] = st.limits.json(st.default_timeout);
+    }
+    Json(doc)
 }
 
 async fn list_datasets(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
@@ -2704,13 +2729,59 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
     p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
 }
 
+/// A task as `p` sees it: without `server-admin`, absolute paths in its message are cut
+/// to their last component (`backup written to …/wiki_2026-01-01.nq.gz`).
+fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
+    let mut t = t.clone();
+    if !p.has(crate::auth::ServerPerm::ServerAdmin)
+        && let Some(m) = &t.message
+    {
+        t.message = Some(redact_paths(m));
+    }
+    t
+}
+
+/// `msg` with every absolute path (a word starting with `/` and holding another `/`)
+/// cut to `…/` and its last component.
+fn redact_paths(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find('/') {
+        let at_word = i == 0 || rest[..i].ends_with([' ', '\'', '"', '(', '[', '=', '`']);
+        let end = rest[i..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ']' | ',' | '`'))
+            .map_or(rest.len(), |e| i + e);
+        let word = &rest[i..end];
+        // trailing punctuation of the sentence
+        let core = word.trim_end_matches([':', ';', '.', ',']);
+        // a path, not a dataset (`/ds`) or a URL (`http://…`)
+        let path = at_word
+            && core
+                .trim_end_matches('/')
+                .get(1..)
+                .is_some_and(|w| w.contains('/'));
+        out.push_str(&rest[..i]);
+        if path {
+            let last = core.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            out.push_str("…/");
+            out.push_str(last);
+            out.push_str(&word[core.len()..]);
+        } else {
+            out.push_str(word);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     let tasks: Vec<_> = st
         .tasks
         .lock()
         .iter()
         .filter(|t| task_visible(&p, t))
-        .cloned()
+        .map(|t| task_for(&p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
 }
@@ -2724,7 +2795,7 @@ async fn get_task(
         .lock()
         .iter()
         .find(|t| t.id == id && task_visible(&p, t))
-        .map(|t| Json(serde_json::to_value(t).unwrap()))
+        .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
 
@@ -2759,7 +2830,7 @@ async fn cancel_task(
         return Ok(crate::auth::forbidden(&p, &msg));
     }
     match st.cancel_task(&id) {
-        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(t)).into_response()),
+        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(task_for(&p, &t))).into_response()),
         Some(Err(t)) => {
             let why = if t.active() {
                 "does not accept cancellation"
