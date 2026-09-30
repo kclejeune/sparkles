@@ -1118,6 +1118,20 @@ const server = http.createServer(async (req, res) => {
       switch (what) {
         case 'ping':
           return send(res, 200, new Date().toISOString(), 'text/plain');
+        // the mock runs open, like a server without --auth-config
+        case 'whoami':
+          return send(res, 200, {
+            authEnabled: false,
+            principal: { kind: 'local' },
+            method: 'none',
+            server: ['server-admin'],
+            datasets: Object.fromEntries([...datasets.keys()].map((n) => [n, 'admin'])),
+            canMintTokens: false,
+            logout: false,
+          });
+        case 'auth':
+          if (name === 'config') return send(res, 200, { enabled: false });
+          return fail(res, 404, 'not found');
         case 'ready': {
           const r = readyInfo();
           if (!name) return send(res, 200, r);

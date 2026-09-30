@@ -1,6 +1,7 @@
 // Typed client for the Sparkles HTTP API (see docs/API.md — the source of truth).
 // All paths are absolute from the server root; the UI itself lives under /ui/.
 
+import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
 
 export type DatasetType = 'persistent' | 'mem';
@@ -24,6 +25,8 @@ export type DatasetInfo = {
   forkedFrom?: { id: string; seq: number };
   /** Clones: the source and when the copy was made (`origin.json`). */
   origin?: DatasetOrigin;
+  /** The caller's level on the dataset; absent without auth (then everything goes). */
+  access?: Level;
 };
 
 /** Per-request budgets of the server; 0 means unlimited. */
@@ -66,7 +69,8 @@ export type ReadyInfo = {
 
 export type Operation =
   'query' | 'update' | 'gsp' | 'upload' | 'shacl' | 'explain' | 'admin' | 'other';
-export type Outcome = 'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget';
+export type Outcome =
+  'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget' | 'denied';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 
 type CacheStats = {
@@ -281,19 +285,39 @@ async function toError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, `${res.status} ${fallback}`, { requestId });
 }
 
-async function request(path: string, init: RequestInit = {}): Promise<Response> {
+/** How requests authenticate: the CSRF token of the session, and what a 401 does. */
+const authHooks: { csrf: () => string | undefined; unauthorized: () => void } = {
+  csrf: () => undefined,
+  unauthorized: () => {},
+};
+
+export function setAuthHooks(h: Partial<typeof authHooks>) {
+  Object.assign(authHooks, h);
+}
+
+/** `init` with the CSRF header added to unsafe requests of a session. */
+function withCsrf(init: RequestInit): RequestInit {
+  const token = authHooks.csrf();
+  if (!token || !needsCsrf(init.method)) return init;
+  const headers = new Headers(init.headers);
+  headers.set(CSRF_HEADER, token);
+  return { ...init, headers };
+}
+
+export async function request(path: string, init: RequestInit = {}): Promise<Response> {
   let res: Response;
   try {
-    res = await fetch(path, init);
+    res = await fetch(path, withCsrf(init));
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') throw e;
     throw new ApiError(0, 'Cannot reach the Sparkles server', { detail: String(e) });
   }
+  if (res.status === 401) authHooks.unauthorized();
   if (!res.ok) throw await toError(res);
   return res;
 }
 
-async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await request(path, {
     ...init,
     headers: { Accept: 'application/json', ...(init.headers ?? {}) },
@@ -741,6 +765,8 @@ export function upload(
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/${enc(ds)}/upload`);
     xhr.setRequestHeader('Accept', 'application/json');
+    const csrf = authHooks.csrf();
+    if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>
       opts.onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 });
     xhr.onerror = () => reject(new ApiError(0, 'Upload failed: network error'));

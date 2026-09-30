@@ -6,9 +6,11 @@
   import { resolve } from '$app/paths';
   import { onMount } from 'svelte';
   import { app } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import { fmtCompact } from '$lib/format';
   import Icon from '$components/Icon.svelte';
   import Toasts from '$components/Toasts.svelte';
+  import UserMenu from '$components/UserMenu.svelte';
 
   let { children } = $props();
 
@@ -23,6 +25,8 @@
   ] as const;
 
   const currentInfo = $derived(app.datasets.find((d) => d.name === app.current));
+  // sign-in and CLI approval pages render without the sidebar
+  const bare = $derived(/^\/ui\/(login|cli)(\/|$)/.test(page.url.pathname));
 
   function isActive(href: string) {
     const p = page.url.pathname;
@@ -42,6 +46,7 @@
   }
 
   onMount(() => {
+    void auth.ensure().then(() => auth.guard());
     app.refreshDatasets();
     app.ping();
     const pingTimer = setInterval(() => app.ping(), 10_000);
@@ -59,7 +64,7 @@
   });
 </script>
 
-<div class="shell">
+<div class="shell" class:bare>
   <aside class="sidebar">
     <a class="brand" href={resolve('/query')}>
       <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
@@ -126,6 +131,8 @@
     </nav>
 
     <div class="spacer"></div>
+
+    <UserMenu />
 
     <div class="foot">
       <div
@@ -353,6 +360,12 @@
   .dot.off {
     background: var(--danger);
     box-shadow: 0 0 0 3px var(--danger-soft);
+  }
+  .shell.bare {
+    grid-template-columns: 1fr;
+  }
+  .shell.bare .sidebar {
+    display: none;
   }
   main {
     min-width: 0;

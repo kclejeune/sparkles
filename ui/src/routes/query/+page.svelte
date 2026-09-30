@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { triplesToGraph, type Triple } from '$lib/graph';
@@ -596,7 +597,14 @@
     {#if outcome?.status === 'running' && outcome.controller}
       <button class="btn sm danger" onclick={cancel}><Icon name="x" size={14} /> Cancel</button>
     {:else}
-      <button class="btn sm primary" onclick={run} disabled={!ds}>
+      <button
+        class="btn sm primary"
+        onclick={run}
+        disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
+        title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
+          ? `Requires write access to /${ds}`
+          : undefined}
+      >
         <Icon name="play" size={12} />
         {kind === 'UPDATE' ? 'Run update' : 'Run'}
         <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
