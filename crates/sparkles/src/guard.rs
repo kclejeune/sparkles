@@ -9,7 +9,7 @@ use crate::store::Snapshot;
 use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A check run before every commit of a store.
 pub trait CommitGuard: Send + Sync {
@@ -23,6 +23,18 @@ pub trait CommitGuard: Send + Sync {
     fn bypassed(&self) {}
     /// A short description, for errors and status.
     fn describe(&self) -> String;
+}
+
+/// Sees the outcome of every guard decision of a store (for metrics and logs): the
+/// summary of a check (including rejections) or of a bypass, or the error that aborted
+/// the check, with the time the check took.
+pub trait GuardObserver: Send + Sync {
+    fn observe(
+        &self,
+        kind: CommitKind,
+        outcome: std::result::Result<&ValidationSummary, &crate::Error>,
+        elapsed: Duration,
+    );
 }
 
 /// A commit about to happen.

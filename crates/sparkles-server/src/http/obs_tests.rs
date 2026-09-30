@@ -679,6 +679,17 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
 }
 
 fn access_lines(access_log: bool) -> Vec<String> {
+    access_lines_of(|| async move {
+        let s = server_with(|st| st.access_log = access_log);
+        let r = get_with(&s.app, ALL, "x-request-id", "t-1").await;
+        assert_eq!(r.status, StatusCode::OK);
+        // health checks are logged at DEBUG, below this subscriber's level
+        get(&s.app, "/$/ping").await;
+    })
+}
+
+/// The `sparkles::access` lines logged while `run` runs on a current-thread runtime.
+fn access_lines_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F) -> Vec<String> {
     // While a single dispatcher exists, tracing computes the interest of a callsite first
     // hit on another thread from that thread's default (none, in parallel tests) and
     // caches it for everyone; a second live dispatcher turns that shortcut off.
@@ -698,13 +709,7 @@ fn access_lines(access_log: bool) -> Vec<String> {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(async {
-                let s = server_with(|st| st.access_log = access_log);
-                let r = get_with(&s.app, ALL, "x-request-id", "t-1").await;
-                assert_eq!(r.status, StatusCode::OK);
-                // health checks are logged at DEBUG, below this subscriber's level
-                get(&s.app, "/$/ping").await;
-            });
+            .block_on(run());
     });
     let text = String::from_utf8(buf.0.lock().clone()).unwrap();
     text.lines()
@@ -738,6 +743,151 @@ fn access_log_has_one_structured_line_per_request() {
     assert!(!l.contains("?o") && !l.contains("query="), "{l}");
 
     assert!(access_lines(false).is_empty());
+}
+
+// -------------------------------------------------------- write-time validation ------
+
+/// Turn on `reject` validation of `ds`, then write: rejected, passed, skipped (a graph
+/// outside the data graph). Returns the statuses.
+#[cfg(feature = "shacl")]
+async fn validated_writes(app: &Router) -> Vec<StatusCode> {
+    const SHAPES: &str =
+        "@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> .
+        ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+          sh:property [ sh:path <http://xmlns.com/foaf/0.1/name> ; sh:minCount 1 ] .";
+    let cfg = serde_json::json!({ "mode": "reject", "shapes": { "inline": SHAPES } });
+    let put = Request::put("/$/validation/ds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cfg.to_string()))
+        .unwrap();
+    let r = send(app, put).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let mut out = Vec::new();
+    for u in [
+        "INSERT DATA { ex:eve a ex:Person }",
+        "INSERT DATA { ex:frank a ex:Person ; foaf:name \"Frank\" }",
+        "INSERT DATA { GRAPH ex:g2 { ex:x ex:p 1 } }",
+    ] {
+        let rq = Request::post("/ds/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(format!(
+                "PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> {u}"
+            )))
+            .unwrap();
+        out.push(send(app, rq).await.status);
+    }
+    out
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn validation_metrics_count_writes_by_status_and_severity() {
+    let s = server();
+    assert_eq!(
+        validated_writes(&s.app).await,
+        [
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::OK,
+            StatusCode::OK
+        ]
+    );
+    let m = metrics(&s.app).await;
+    for (series, v) in [
+        (
+            r#"sparkles_validation_total{dataset="ds",status="passed"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_validation_total{dataset="ds",status="rejected"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_validation_total{dataset="ds",status="skipped"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_validation_total{dataset="ds",status="timeout"}"#,
+            0.0,
+        ),
+        (
+            r#"sparkles_validation_duration_seconds_count{dataset="ds",strategy="full"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_duration_seconds_bucket{dataset="ds",strategy="full",le="+Inf"}"#,
+            2.0,
+        ),
+        (
+            r#"sparkles_validation_results_total{dataset="ds",severity="violation"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_validation_results_total{dataset="ds",severity="warning"}"#,
+            0.0,
+        ),
+        // a rejection is not a plain client error
+        (
+            r#"sparkles_requests_total{dataset="ds",operation="update",outcome="rejected"}"#,
+            1.0,
+        ),
+        (
+            r#"sparkles_requests_total{dataset="ds",operation="update",outcome="client_error"}"#,
+            0.0,
+        ),
+    ] {
+        assert_eq!(sample(&m, series), Some(v), "{series}\n{m}");
+    }
+    // no strategy without validations
+    assert!(!m.contains(r#"strategy="incremental""#), "{m}");
+
+    // datasets beyond the label cap share `$other`
+    let s = server_with(|st| st.metrics = crate::obs::Metrics::new(true, 0));
+    validated_writes(&s.app).await;
+    let m = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_validation_total{dataset="$other",status="rejected"}"#
+        ),
+        Some(1.0),
+        "{m}"
+    );
+    assert!(!m.contains(r#"dataset="ds""#), "{m}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn access_log_carries_the_validation_status() {
+    let lines = access_lines_of(|| async {
+        let s = server_with(|st| st.access_log = true);
+        validated_writes(&s.app).await;
+    });
+    let updates: Vec<J> = lines
+        .iter()
+        .map(|l| serde_json::from_str::<J>(l).unwrap()["fields"].clone())
+        .filter(|f| f["operation"] == "update")
+        .collect();
+    assert_eq!(updates.len(), 3, "{lines:#?}");
+    let got: Vec<_> = updates
+        .iter()
+        .map(|f| (f["outcome"].clone(), f["validation"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("rejected".into(), "rejected".into()),
+            ("ok".into(), "passed".into()),
+            ("ok".into(), "skipped".into()),
+        ]
+    );
+    assert!(updates.iter().all(|f| f["validation_ms"].is_number()));
+    // requests without validation have no such fields
+    let admin = lines
+        .iter()
+        .map(|l| serde_json::from_str::<J>(l).unwrap()["fields"].clone())
+        .find(|f| f["operation"] == "admin")
+        .unwrap();
+    assert!(admin.get("validation").is_none(), "{admin}");
 }
 
 // ----------------------------------------------------------------- cancellation ------

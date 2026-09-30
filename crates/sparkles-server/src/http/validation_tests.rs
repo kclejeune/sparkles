@@ -237,3 +237,64 @@ async fn bypass_and_reopen() {
     let r = update(&app, "INSERT DATA { ex:r a ex:Person }").await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
 }
+
+/// A materialization that would break the shapes fails its task with the validation
+/// summary, and commits nothing.
+#[cfg(feature = "reasoning")]
+#[tokio::test]
+async fn rejected_inferences_fail_the_reason_task() {
+    let (_d, st, app) = server(false);
+    let r = update(
+        &app,
+        "INSERT DATA { ex:worksFor <http://www.w3.org/2000/01/rdf-schema#domain> ex:Person . ex:s ex:worksFor ex:acme }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // the inferred `ex:s a ex:Person` has no name
+    let cfg =
+        json!({ "mode": "reject", "includeInferences": true, "shapes": { "inline": SHAPES } });
+    let r = send(
+        &app,
+        req(
+            "PUT",
+            "/$/validation/v",
+            "application/json",
+            &cfg.to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let head = st.get("v").unwrap().store.snapshot().commit;
+    let r = send(
+        &app,
+        req(
+            "POST",
+            "/$/reason/v",
+            "application/json",
+            r#"{"profile":"rdfs"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let t0 = std::time::Instant::now();
+    let task = loop {
+        let t = st.tasks.lock().last().cloned().unwrap();
+        if t.state != "running" {
+            break t;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "task did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(task.state, "failed", "{task:?}");
+    // the first result's source shape is the (blank) property shape
+    let msg = task.message.unwrap_or_default();
+    assert!(
+        msg.starts_with("inferences rejected by SHACL validation: 1 blocking result (first: _:")
+            && msg.ends_with(" at <http://ex.org/s>)"),
+        "{msg}"
+    );
+    assert_eq!(st.get("v").unwrap().store.snapshot().commit, head);
+}

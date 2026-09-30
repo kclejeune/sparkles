@@ -51,12 +51,14 @@ generates one (`{boot:08x}-{seq:012x}`, unique per process and increasing). The 
 `sparkles::access` (`--no-access-log` turns it off; `/ui/*`, `/$/ping`, `/$/ready` and
 `/$/metrics` are logged at DEBUG). Fields: `dataset` (or `$none`), `operation` (`query`,
 `update`, `gsp`, `upload`, `shacl`, `explain`, `admin`, `other`), `status`, `outcome`
-(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `rate_limited`, `denied`),
+(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `rate_limited`, `denied`,
+`rejected`: a write refused by write-time validation),
 with auth the `principal` (`user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`, `anonymous`; never
 a credential), `auth` (`none`, `basic`, `bearer`, `session`, `proxy`) and, for a failed
 login, `auth_error`, and where known `rows`,
 `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`, `response_bytes` and
-`mem_peak_bytes`. A request whose client disconnects is logged with `status=499` and
+`mem_peak_bytes`; writes to a validated dataset add `validation` (the status of the
+`Sparkles-Validation` header) and `validation_ms`. A request whose client disconnects is logged with `status=499` and
 `outcome=cancelled` (never sent). The span holds the matched route (`/{ds}/sparql`), never
 the raw URI; query and update text is logged only at DEBUG under `sparkles::query`
 (`RUST_LOG=sparkles::query=debug`), cut to 2048 characters. `--log-format json` writes one
@@ -81,13 +83,17 @@ JSON object per line.
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
 | `sparkles_result_cache_bytes`, `…_capacity_bytes`, `…_entries` | gauge | `dataset` |
 | `sparkles_result_cache_hits_total`, `…_misses_total` | counter | `dataset` |
+| `sparkles_validation_total` | counter | `dataset`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
+| `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `strategy` = `full` \| `incremental` |
+| `sparkles_validation_results_total` | counter (results found by validated writes) | `dataset`, `severity` = `violation` \| `warning` \| `info` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded: `dataset` is an existing dataset name (at most
 `--metrics-max-datasets`, default 100; the others share `$other`) or `$none` for requests
 that name no existing dataset. A (dataset, operation) pair appears after its first request,
-then with all eight outcomes (`denied`: refused by the auth layer). Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
-are not counted. Deleting a dataset removes its series. Each dataset has its own block and
+then with all nine outcomes (`denied`: refused by the auth layer). Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
+are not counted. The validation series cover every validated write (HTTP, MCP, reasoning
+tasks) of datasets with write-time validation. Deleting a dataset removes its series. Each dataset has its own block and
 result cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
 
 With rate limits configured, `sparkles_rate_limited_total{dataset,class}` (counter)
@@ -909,7 +915,13 @@ whose `validation.json` cannot be loaded refuses writes (`501`) rather than acce
 them unvalidated.
 
 CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`,
-`--status`, `--off`. A write rejected in the CLI exits with status 3. Cost: each validated
+`--status`, `--off`. A write rejected in the CLI exits with status 3; `load`, `update` and
+`infer` end their summary line with the validation status, and `sparkles stats` shows the
+configuration (`validation      reject · 1 shape graph · 20 shapes`). A reasoning task
+whose inferences are rejected fails with
+`inferences rejected by SHACL validation: N blocking results (first: <shape> at <node>)`.
+Rejections are logged at INFO under `sparkles::validation` (dataset, kind, counts, first
+shape and focus node); see [Metrics](#metrics) for the counters. Cost: each validated
 write runs a full validation of the data graph (about 160 ms at 1M triples); writes that do
 not touch the data graph are free.
 

@@ -124,10 +124,12 @@ pub enum Outcome {
     Denied,
     /// refused by a rate or concurrency limit (`429`, or `503` when saturated)
     RateLimited,
+    /// a write rejected by write-time validation (`422`)
+    Rejected,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 8] = [
+    pub const ALL: [Outcome; 9] = [
         Outcome::Ok,
         Outcome::ClientError,
         Outcome::Error,
@@ -136,6 +138,7 @@ impl Outcome {
         Outcome::Budget,
         Outcome::Denied,
         Outcome::RateLimited,
+        Outcome::Rejected,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -148,6 +151,7 @@ impl Outcome {
             Outcome::Budget => "budget",
             Outcome::Denied => "denied",
             Outcome::RateLimited => "rate_limited",
+            Outcome::Rejected => "rejected",
         }
     }
 
@@ -183,6 +187,9 @@ pub struct RequestReport {
     pub mem_peak_bytes: Option<u64>,
     /// the limit class that refused the request (outcome `rate_limited`)
     pub limit_class: Option<crate::ratelimit::Class>,
+    /// write-time validation status and time (from the `Sparkles-Validation` header)
+    pub validation: Option<&'static str>,
+    pub validation_ms: Option<u64>,
 }
 
 impl RequestReport {
@@ -310,6 +317,17 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         .extensions_mut()
         .remove::<RequestReport>()
         .unwrap_or_default();
+    if let Some((status, ms)) = resp
+        .headers()
+        .get(SPARKLES_VALIDATION)
+        .and_then(|v| validation_header(v.to_str().ok()?))
+    {
+        report.validation = Some(status);
+        report.validation_ms = ms;
+        if status == "rejected" && report.outcome.is_none() {
+            report.outcome = Some(Outcome::Rejected);
+        }
+    }
     let auth = resp.extensions_mut().remove::<crate::auth::AuthReport>();
     if auth
         .as_ref()
@@ -421,6 +439,22 @@ fn ms(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+const SPARKLES_VALIDATION: &str = "sparkles-validation";
+
+/// `status` and `ms` of a `Sparkles-Validation` header (`status=passed, mode=…, ms=14`).
+fn validation_header(v: &str) -> Option<(&'static str, Option<u64>)> {
+    let mut status = None;
+    let mut ms = None;
+    for (k, v) in v.split(',').filter_map(|kv| kv.trim().split_once('=')) {
+        match k {
+            "status" => status = VALIDATION_STATUS.iter().copied().find(|s| *s == v),
+            "ms" => ms = v.parse().ok(),
+            _ => {}
+        }
+    }
+    Some((status?, ms))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn access_event(
     span: &Span,
@@ -454,6 +488,8 @@ fn access_event(
                 total_ms = ms(elapsed.as_secs_f64() * 1000.0),
                 response_bytes = r.response_bytes,
                 mem_peak_bytes = r.mem_peak_bytes,
+                validation = r.validation,
+                validation_ms = r.validation_ms,
                 principal,
                 auth = scheme,
                 auth_error,
@@ -525,7 +561,7 @@ impl Histogram {
 #[derive(Default)]
 struct OpMetrics {
     seen: AtomicBool,
-    outcomes: [AtomicU64; 8],
+    outcomes: [AtomicU64; 9],
     duration: Histogram,
     response_bytes: AtomicU64,
 }
@@ -652,6 +688,156 @@ impl Metrics {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+}
+
+// ------------------------------------------------------- write-time validation ------
+
+/// `status` label values of `sparkles_validation_total`.
+const VALIDATION_STATUS: [&str; 7] = [
+    "passed", "warned", "rejected", "skipped", "bypassed", "timeout", "error",
+];
+/// `strategy` label values of `sparkles_validation_duration_seconds`.
+const STRATEGIES: [&str; 2] = ["full", "incremental"];
+/// `severity` label values of `sparkles_validation_results_total`.
+const SEVERITIES: [&str; 3] = ["violation", "warning", "info"];
+
+/// Write-time validation counters of one dataset, fed by its store's guard observer
+/// (every write path: HTTP, MCP, the reasoner) and read when scraped, like the cache
+/// counters. They live with the dataset, so a deleted dataset's series go with it.
+pub struct ValidationMetrics {
+    dataset: String,
+    status: [AtomicU64; 7],
+    duration: [Histogram; 2],
+    /// results found by validated writes, by severity
+    results: [AtomicU64; 3],
+}
+
+impl ValidationMetrics {
+    pub fn new(dataset: &str) -> ValidationMetrics {
+        ValidationMetrics {
+            dataset: dataset.to_string(),
+            status: Default::default(),
+            duration: Default::default(),
+            results: Default::default(),
+        }
+    }
+
+    fn seen(&self) -> bool {
+        self.status.iter().any(|c| c.load(Ordering::Relaxed) > 0)
+    }
+}
+
+impl sparkles::guard::GuardObserver for ValidationMetrics {
+    fn observe(
+        &self,
+        kind: sparkles::commit::CommitKind,
+        outcome: std::result::Result<&sparkles::guard::ValidationSummary, &sparkles::Error>,
+        elapsed: Duration,
+    ) {
+        use sparkles::guard::{GuardStatus, Strategy};
+        let status = match outcome {
+            Ok(s) => match s.status {
+                GuardStatus::Passed => 0,
+                GuardStatus::Warned => 1,
+                GuardStatus::Rejected => 2,
+                GuardStatus::Skipped => 3,
+                GuardStatus::Bypassed => 4,
+            },
+            Err(sparkles::Error::Timeout) => 5,
+            // the client went away: not an outcome of the validation
+            Err(sparkles::Error::Cancelled) => return,
+            Err(_) => 6,
+        };
+        self.status[status].fetch_add(1, Ordering::Relaxed);
+        let s = match outcome {
+            Ok(s) => s,
+            Err(_) => {
+                // Phase 1 validates in full; a timeout or failure still took its time
+                self.duration[0].observe(elapsed);
+                return;
+            }
+        };
+        let strategy = match s.strategy {
+            Strategy::Full => 0,
+            Strategy::Incremental => 1,
+            // skipped or bypassed: nothing was validated
+            Strategy::None => return,
+        };
+        self.duration[strategy].observe(elapsed);
+        let c = &s.by_severity;
+        for (i, n) in [c.violation, c.warning, c.info].into_iter().enumerate() {
+            self.results[i].fetch_add(n, Ordering::Relaxed);
+        }
+        if s.status == GuardStatus::Rejected {
+            let (shape, focus_node) = first_result(s).unzip();
+            tracing::info!(
+                target: "sparkles::validation",
+                dataset = %self.dataset,
+                kind = kind.name(),
+                blocking = s.blocking,
+                total = s.total,
+                shape,
+                focus_node,
+                "write rejected by SHACL validation"
+            );
+        }
+    }
+}
+
+/// The source shape and focus node of a summary's first (highest ranked) result, as
+/// N-Triples-style terms.
+pub fn first_result(s: &sparkles::guard::ValidationSummary) -> Option<(String, String)> {
+    let r = s.results.first()?;
+    let term = |t: &J| {
+        let v = t["value"].as_str().unwrap_or("");
+        match t["type"].as_str() {
+            Some("uri") => format!("<{v}>"),
+            Some("bnode") => format!("_:{v}"),
+            Some("literal") => format!("\"{v}\""),
+            _ => v.to_string(),
+        }
+    };
+    Some((term(&r["sourceShape"]), term(&r["focusNode"])))
+}
+
+/// Validation counters of one dataset label (summed over datasets sharing `$other`).
+#[derive(Default)]
+struct ValidationTotals {
+    status: [u64; 7],
+    /// cumulative buckets and the sum in nanoseconds, per strategy
+    duration: [([u64; 17], u64); 2],
+    results: [u64; 3],
+}
+
+/// Validation counters by dataset label, for datasets with a configuration or counts.
+fn validation_totals(st: &AppState) -> BTreeMap<String, ValidationTotals> {
+    let datasets: Vec<_> = st.datasets.read().values().cloned().collect();
+    let mut out: BTreeMap<String, ValidationTotals> = BTreeMap::new();
+    for d in datasets {
+        let m = &d.validation_metrics;
+        if d.validation.read().is_none() && !m.seen() {
+            continue;
+        }
+        let label = if st.metrics.enabled {
+            st.metrics.series(Some(&d.name)).0
+        } else {
+            d.name.clone()
+        };
+        let t = out.entry(label).or_default();
+        for (a, c) in t.status.iter_mut().zip(&m.status) {
+            *a += c.load(Ordering::Relaxed);
+        }
+        for ((buckets, sum), h) in t.duration.iter_mut().zip(&m.duration) {
+            for (a, n) in buckets.iter_mut().zip(h.cumulative()) {
+                *a += n;
+            }
+            *sum += h.sum_nanos.load(Ordering::Relaxed);
+        }
+        for (a, c) in t.results.iter_mut().zip(&m.results) {
+            *a += c.load(Ordering::Relaxed);
+        }
+    }
+    out
 }
 
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
@@ -903,6 +1089,69 @@ pub fn render_prometheus(st: &AppState) -> String {
                     m.rate_limited[c.index()].load(Ordering::Relaxed)
                 );
             }
+        }
+    }
+
+    let validation = validation_totals(st);
+    family(
+        &mut o,
+        "sparkles_validation_total",
+        "counter",
+        "Write-time SHACL validations by dataset and status.",
+    );
+    for (ds, t) in &validation {
+        let ds = escape_label(ds);
+        for (status, n) in VALIDATION_STATUS.iter().zip(t.status) {
+            let _ = writeln!(
+                o,
+                "sparkles_validation_total{{dataset=\"{ds}\",status=\"{status}\"}} {n}"
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_validation_duration_seconds",
+        "histogram",
+        "Duration of write-time SHACL validations in seconds.",
+    );
+    for (ds, t) in &validation {
+        let ds = escape_label(ds);
+        for (strategy, (cum, sum)) in STRATEGIES.iter().zip(&t.duration) {
+            if cum[16] == 0 {
+                continue;
+            }
+            for (le, n) in BUCKET_LABELS.iter().zip(cum) {
+                let _ = writeln!(
+                    o,
+                    "sparkles_validation_duration_seconds_bucket{{dataset=\"{ds}\",strategy=\"{strategy}\",le=\"{le}\"}} {n}"
+                );
+            }
+            let labels = format!("dataset=\"{ds}\",strategy=\"{strategy}\"");
+            let _ = writeln!(
+                o,
+                "sparkles_validation_duration_seconds_sum{{{labels}}} {}",
+                *sum as f64 / 1e9
+            );
+            let _ = writeln!(
+                o,
+                "sparkles_validation_duration_seconds_count{{{labels}}} {}",
+                cum[16]
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_validation_results_total",
+        "counter",
+        "Validation results found by validated writes, by severity.",
+    );
+    for (ds, t) in &validation {
+        let ds = escape_label(ds);
+        for (severity, n) in SEVERITIES.iter().zip(t.results) {
+            let _ = writeln!(
+                o,
+                "sparkles_validation_results_total{{dataset=\"{ds}\",severity=\"{severity}\"}} {n}"
+            );
         }
     }
 

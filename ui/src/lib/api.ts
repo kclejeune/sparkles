@@ -92,7 +92,8 @@ export type Outcome =
   | 'cancelled'
   | 'budget'
   | 'rate_limited'
-  | 'denied';
+  | 'denied'
+  | 'rejected';
 export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 

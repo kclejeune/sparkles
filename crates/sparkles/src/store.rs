@@ -655,6 +655,8 @@ pub struct Store {
     history: Option<Mutex<crate::history::HistoryState>>,
     /// write guard checked before every commit (write-time validation)
     guard: parking_lot::RwLock<Option<Arc<dyn crate::guard::CommitGuard>>>,
+    /// told the outcome of every guard decision (metrics)
+    guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
 }
@@ -745,6 +747,7 @@ impl Store {
             text: Default::default(),
             history: None,
             guard: parking_lot::RwLock::new(None),
+            guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
             opts,
         }
@@ -943,6 +946,7 @@ impl Store {
             text: Default::default(),
             history: Some(Mutex::new(history)),
             guard: parking_lot::RwLock::new(None),
+            guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
             opts,
         };
@@ -1751,6 +1755,12 @@ impl Store {
         self.guard.read().clone()
     }
 
+    /// Install (or remove) the observer told the outcome of every guard decision; it
+    /// stays when the guard itself is replaced.
+    pub fn set_guard_observer(&self, o: Option<Arc<dyn crate::guard::GuardObserver>>) {
+        *self.guard_observer.write() = o;
+    }
+
     /// The dataset's `validation.json` requires a write guard.
     pub fn guard_required(&self) -> bool {
         self.guard_required.load(Ordering::Relaxed)
@@ -1774,16 +1784,23 @@ impl Store {
     ) -> Result<Option<Arc<crate::guard::ValidationSummary>>> {
         use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
         let g = self.guard();
+        let observer = self.guard_observer.read().clone();
         if opts.bypass_validation {
-            if let Some(g) = &g {
-                g.bypassed();
-            }
-            tracing::warn!("a write bypassed write-time validation");
-            return Ok(Some(Arc::new(ValidationSummary::empty(
+            let summary = ValidationSummary::empty(
                 GuardStatus::Bypassed,
                 GuardMode::Off,
                 Severity::Violation,
-            ))));
+            );
+            if let Some(g) = &g {
+                g.bypassed();
+            }
+            if let Some(o) = &observer
+                && (g.is_some() || self.guard_required())
+            {
+                o.observe(kind, Ok(&summary), std::time::Duration::ZERO);
+            }
+            tracing::warn!("a write bypassed write-time validation");
+            return Ok(Some(Arc::new(summary)));
         }
         let Some(g) = g else {
             if self.guard_required() && !self.opts.unvalidated_writes {
@@ -1793,13 +1810,19 @@ impl Store {
             }
             return Ok(None);
         };
-        let summary = g.check(&crate::guard::Candidate {
+        let view = view();
+        let t0 = std::time::Instant::now();
+        let checked = g.check(&crate::guard::Candidate {
             base,
-            view: view(),
+            view,
             kind,
             changes,
             opts,
-        })?;
+        });
+        if let Some(o) = &observer {
+            o.observe(kind, checked.as_ref(), t0.elapsed());
+        }
+        let summary = checked?;
         if summary.status == GuardStatus::Rejected {
             return Err(Error::Rejected(Box::new(crate::guard::Rejection {
                 summary,
