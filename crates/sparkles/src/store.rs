@@ -803,6 +803,9 @@ impl Store {
         let mut version = 0;
         let gen_ = Arc::new(gen_);
         let mut replayed: Vec<CommitInfo> = Vec::new();
+        // the quads each replayed commit changed, for catching up the full-text index
+        let text_on = cfg!(feature = "text") && root.join("text.json").exists();
+        let mut wal_text: Vec<(u64, Vec<[Id; 4]>)> = Vec::new();
         // quads of the base plus WAL transactions folded into a baseline commit
         let mut base_quads = gen_.meta.quads;
         if wal_path.exists() {
@@ -851,6 +854,12 @@ impl Store {
                             )));
                         }
                         let (mut ins, mut del) = (0i64, 0i64);
+                        let touched: Vec<[Id; 4]> = if text_on {
+                            pending.iter().map(|(_, q)| *q).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let replayed_before = replayed.len();
                         for (op, q) in pending.drain(..) {
                             let k = Perm::Spo.to_key(&q);
                             let in_base = probe.perm(Perm::Spo).contains(&cache, &k)?;
@@ -909,6 +918,9 @@ impl Store {
                                 exact: true,
                                 reconstructed: true,
                             }),
+                        }
+                        if text_on && replayed.len() > replayed_before {
+                            wal_text.push((replayed.last().unwrap().seq, touched));
                         }
                         good = (i + 1) * WAL_REC;
                         txn_start = i + 1;
@@ -975,7 +987,7 @@ impl Store {
             text: Default::default(),
             opts,
         };
-        store.open_text()?;
+        store.open_text(&wal_text)?;
         Ok(store)
     }
 
@@ -1008,7 +1020,7 @@ impl Store {
     // ------------------------------------------------------------ full-text ------
 
     /// Open the full-text index if `text.json` enables it (rebuilding it if needed).
-    fn open_text(&self) -> Result<()> {
+    fn open_text(&self, wal: &[(u64, Vec<[Id; 4]>)]) -> Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
         };
@@ -1018,7 +1030,7 @@ impl Store {
                 return Ok(());
             };
             let snap = self.snapshot();
-            match crate::text::TextIndex::open(Some(root), cfg, &snap) {
+            match crate::text::TextIndex::open(Some(root), cfg, &snap, wal) {
                 Ok((ti, view)) => {
                     self.text.store(Some(Arc::new(ti)));
                     let mut s = (*snap).clone();
@@ -1028,6 +1040,8 @@ impl Store {
                 Err(e) => tracing::error!("full-text index of {}: {e}", root.display()),
             }
         }
+        #[cfg(not(feature = "text"))]
+        let _ = wal;
         #[cfg(not(feature = "text"))]
         if root.join("text.json").exists() {
             tracing::warn!(
@@ -1080,7 +1094,7 @@ impl Store {
             )?;
         }
         let snap = self.snapshot();
-        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap)?;
+        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap, &[])?;
         let ti = Arc::new(ti);
         self.text.store(Some(ti.clone()));
         let mut s = (*snap).clone();
@@ -1103,6 +1117,7 @@ impl Store {
                 _ => {}
             }
             let _ = std::fs::remove_dir_all(root.join("text"));
+            let _ = std::fs::remove_file(root.join("text.dirty"));
         }
         Ok(())
     }
@@ -1360,6 +1375,11 @@ impl Store {
         // the old generation's WAL is the only other copy of the recent commits' ids:
         // the catalog must be durable before it is discarded
         self.catalog.lock().sync()?;
+        // and so must the full-text index, which could otherwise only catch up from it
+        #[cfg(feature = "text")]
+        if let Some(ti) = self.text.load_full() {
+            ti.checkpoint()?;
+        }
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
                 let n: u32 = snap

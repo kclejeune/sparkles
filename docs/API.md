@@ -432,6 +432,11 @@ SELECT ?s ?score ?label WHERE {
   the text of its own snapshot. If an index is behind (a failed update, a rebuild in
   progress), text queries return `503` until it is rebuilt. They never return stale
   results.
+* **Durability**: index commits are not fsynced; the write-ahead log is the durable
+  record. The index is checkpointed (synced) about once a second while writes continue,
+  before compaction and on close. After a crash, an index with unsynced changes
+  (`text.dirty` next to it) is checksum-verified and caught up from the WAL; it is
+  rebuilt only if it is damaged or older than the WAL.
 * **Errors**: `400` for malformed calls, unparseable query strings, predicates that
   are not indexed, and datasets without an index. `501` if the server was built without
   the `text` feature.

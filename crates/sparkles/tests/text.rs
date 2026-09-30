@@ -330,10 +330,12 @@ fn persistence_compaction_bulk_and_recovery() {
         let e = err(&s, "SELECT ?s { ?s text:query \"fox\" }");
         assert!(e.contains("stale"), "{e}");
     }
-    // reopen: the index is behind, so it is rebuilt
+    // reopen: the index is behind, and catches up from the WAL instead of a rebuild
     {
         let s = Store::open(&root, opts()).unwrap();
-        assert_eq!(s.text_status().unwrap().state, "ready");
+        let st = s.text_status().unwrap();
+        assert_eq!(st.state, "ready");
+        assert!(st.last_rebuild.is_none());
         assert!(rows(&s, "SELECT ?s { ?s text:query \"owl\" }").contains(&"b7".to_string()));
     }
     // a deleted index is rebuilt too
@@ -375,4 +377,110 @@ fn merged_default_graphs_merge_hits() {
         .len(),
         2
     );
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else if std::fs::copy(e.path(), &target).is_err() {
+            // removed meanwhile (a merge's garbage collection)
+        }
+    }
+}
+
+fn insert(s: &Store, triples: &str) {
+    sparkles::sparql::update::update(
+        s,
+        &format!("{P}INSERT DATA {{ {triples} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn commits_skip_fsync_until_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let marker = root.join("text.dirty");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        // a fresh build is durable
+        assert!(!marker.exists());
+        // an update writes the index without fsync, so it is marked
+        insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        assert!(marker.exists());
+        // compaction checkpoints it
+        s.compact().unwrap();
+        assert!(!marker.exists());
+        insert(&s, "ex:b9 rdfs:label \"Violet Heron\"");
+        assert!(marker.exists());
+    }
+    // so does closing the store
+    assert!(!marker.exists());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let st = s.text_status().unwrap();
+    assert_eq!(
+        (st.state.as_str(), st.last_rebuild.is_none()),
+        ("ready", true)
+    );
+    let mut got = rows(&s, "SELECT ?s { ?s text:query \"heron\" }");
+    got.sort();
+    assert_eq!(got, ["b8", "b9"]);
+}
+
+#[test]
+fn crash_images_are_verified_caught_up_or_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let img = |n: &str| dir.path().join(n);
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        // a crash image: unsynced index files, marker present, index at the head
+        copy_dir(&root, &img("current"));
+        // a commit the index misses: the image's index is behind the WAL
+        s.fail_next_text_commit();
+        insert(&s, "ex:b9 rdfs:label \"Violet Heron\"");
+        copy_dir(&root, &img("behind"));
+        copy_dir(&root, &img("damaged"));
+    }
+    // damage the largest file of the damaged image's index
+    let victim = std::fs::read_dir(img("damaged").join("text"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e != "json"))
+        .max_by_key(|p| std::fs::metadata(p).unwrap().len())
+        .unwrap();
+    let mut bytes = std::fs::read(&victim).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    std::fs::write(&victim, bytes).unwrap();
+
+    for (name, want, rebuilt) in [
+        ("current", vec!["b8"], false),
+        ("behind", vec!["b8", "b9"], false),
+        ("damaged", vec!["b8", "b9"], true),
+    ] {
+        let root = img(name);
+        assert!(root.join("text.dirty").exists(), "{name}");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.state, "ready", "{name}");
+        assert_eq!(st.last_rebuild.is_some(), rebuilt, "{name}");
+        let mut got = rows(&s, "SELECT ?s { ?s text:query \"heron\" }");
+        got.sort();
+        assert_eq!(got, want, "{name}");
+        // durable again once closed (merges started by the catch-up may still be running
+        // at the checkpoint during open, which then keeps the marker)
+        drop(s);
+        assert!(!root.join("text.dirty").exists(), "{name}");
+    }
 }
