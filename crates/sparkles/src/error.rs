@@ -22,6 +22,10 @@ pub enum Error {
     Corrupt(String),
     #[error("SERVICE error: {0}")]
     Service(String),
+    /// A write-ahead log or generation write failed after a commit started; later writes
+    /// are refused until the store is reopened (reads continue).
+    #[error("write-ahead log failed; restart the server to recover")]
+    Poisoned,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
+use crate::commit::{self, Catalog, CommitInfo, CommitKind, CommitPage, CommitRange, Receipt};
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::index::{Block, BlockCache, Key, Perm, PermIndex, pad};
@@ -134,6 +135,8 @@ pub struct Snapshot {
     pub results: Arc<crate::sparql::cache::ResultCache>,
     /// delta-vocabulary size visible to this snapshot
     pub dvocab_len: u64,
+    /// the commit (`seq`) this snapshot reflects
+    pub commit: u64,
     pub union_default_graph: bool,
     /// per-predicate statistics of the delta (computed lazily, once per snapshot)
     pub delta_stats:
@@ -544,6 +547,8 @@ pub struct StoreOptions {
     /// Loads smaller than this many quads go through the transactional delta; larger
     /// loads trigger a rebuild (bulk path).
     pub bulk_threshold: u64,
+    /// In-memory stores keep the metadata of this many most recent commits.
+    pub memory_commit_ring: usize,
 }
 
 impl Default for StoreOptions {
@@ -555,6 +560,7 @@ impl Default for StoreOptions {
             union_default_graph: false,
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
+            memory_commit_ring: 65_536,
         }
     }
 }
@@ -562,7 +568,22 @@ impl Default for StoreOptions {
 struct WriterState {
     wal: Option<BufWriter<File>>,
     next_bnode: u64,
+    /// the latest commit
+    head: CommitInfo,
+    /// a WAL or generation write failed after a commit started: refuse further writes
+    poisoned: bool,
 }
+
+/// Commit metadata for a transaction that is committed by rebuilding the generation.
+struct BulkCommit {
+    kind: CommitKind,
+    /// quads the transaction deleted (net) before its bulk batch
+    net_del: u64,
+    /// quads in the committed snapshot the transaction started from
+    start_len: u64,
+}
+
+type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 pub struct Store {
     root: Option<PathBuf>,
@@ -574,6 +595,10 @@ pub struct Store {
     prefixes: Mutex<BTreeMap<String, String>>,
     /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
     _lock: Option<File>,
+    dataset_id: uuid::Uuid,
+    catalog: Mutex<Catalog>,
+    /// test hook replacing the wall clock (milliseconds since the epoch)
+    clock: Mutex<Option<Clock>>,
 }
 
 const WAL_INSERT: u8 = 1;
@@ -618,6 +643,19 @@ impl Store {
             opts.result_cache_min_ms,
         ));
         let gen_ = Arc::new(Generation::empty(DeltaVocab::in_memory()));
+        let dataset_id = uuid::Uuid::new_v4();
+        let root = CommitInfo {
+            seq: 0,
+            timestamp_ms: commit::now_ms(),
+            kind: CommitKind::Create,
+            inserted: 0,
+            deleted: 0,
+            quads: 0,
+            generation: 0,
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+        };
         Store {
             root: None,
             current: ArcSwap::from_pointee(Snapshot {
@@ -627,17 +665,23 @@ impl Store {
                 cache: cache.clone(),
                 results: results.clone(),
                 dvocab_len: 0,
+                commit: 0,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
             }),
             writer: Mutex::new(WriterState {
                 wal: None,
                 next_bnode: 0,
+                head: root,
+                poisoned: false,
             }),
             cache,
             results,
             prefixes: Mutex::new(BTreeMap::new()),
             _lock: None,
+            dataset_id,
+            catalog: Mutex::new(Catalog::memory(root, opts.memory_commit_ring)),
+            clock: Mutex::new(None),
             opts,
         }
     }
@@ -648,13 +692,44 @@ impl Store {
         let lock = lock_dir(root)?;
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
-            // create an empty generation
+            // a new database: its id, an empty generation holding the root commit, the
+            // catalog, and CURRENT last (the commit point of the creation)
+            let id = match commit::read_dataset_file(root)? {
+                Some(id) => id,
+                None => {
+                    let id = uuid::Uuid::new_v4();
+                    let bytes = commit::dataset_file_bytes(id, "create", commit::now_ms());
+                    write_atomic(&root.join("dataset.json"), &bytes)?;
+                    id
+                }
+            };
             let name = "gen-0001";
-            Builder::new(&root.join(name), opts.build.clone())?.finish()?;
+            let dir = root.join(name);
+            Builder::new(&dir, opts.build.clone())?.finish()?;
+            let first = CommitInfo {
+                seq: 0,
+                timestamp_ms: commit::now_ms(),
+                kind: CommitKind::Create,
+                inserted: 0,
+                deleted: 0,
+                quads: 0,
+                generation: 1,
+                bulk: false,
+                exact: true,
+                reconstructed: false,
+            };
+            write_synced(
+                &dir.join("commit.json"),
+                &commit::gen_commit_bytes(id, "create", &first),
+            )?;
+            Catalog::create(&root.join("commits.bin"), id, first)?;
+            sync_dir(&dir)?;
+            sync_dir(root)?;
             write_atomic(&current_file, name.as_bytes())?;
         }
         let name = std::fs::read_to_string(&current_file)?.trim().to_string();
         let gen_ = Generation::open(&root.join(&name), &name, true)?;
+        let gen_no = commit::generation_number(&name);
         let cache = Arc::new(BlockCache::new(opts.cache_bytes));
         let results = Arc::new(crate::sparql::cache::ResultCache::new(
             opts.result_cache_bytes,
@@ -667,16 +742,66 @@ impl Store {
         {
             prefixes.extend(p);
         }
+        // The commit the generation's base index holds. A database from an older version
+        // has no dataset.json yet: it gets a baseline root commit after replay.
+        let known_id = commit::read_dataset_file(root)?;
+        let migrating = known_id.is_none();
+        let dataset_id = known_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let catalog_path = root.join("commits.bin");
+        // WAL commits without metadata that precede the first one with it are part of a
+        // baseline commit (written by an older version before the upgrade)
+        let mut fold_legacy = true;
+        let (base, rebased) = match commit::read_gen_commit(&root.join(&name))? {
+            Some((id, c, origin)) if !migrating => {
+                if id != dataset_id {
+                    return Err(Error::Corrupt(format!(
+                        "{name}/commit.json belongs to dataset {id}, not {dataset_id}"
+                    )));
+                }
+                fold_legacy = origin == "baseline";
+                (c, false)
+            }
+            // a generation without commit metadata (built by an older version): its
+            // content becomes a baseline commit after the last cataloged one
+            _ => {
+                let prev = match commit::read_catalog(&catalog_path)? {
+                    Some((id, recs)) if id == dataset_id && !migrating => recs.last().copied(),
+                    _ => None,
+                };
+                let c = CommitInfo {
+                    seq: prev.map_or(0, |c| c.seq + 1),
+                    timestamp_ms: prev.map_or(0, |c| c.timestamp_ms).max(commit::now_ms()),
+                    kind: CommitKind::Baseline,
+                    inserted: gen_.meta.quads,
+                    deleted: 0,
+                    quads: gen_.meta.quads,
+                    generation: gen_no,
+                    bulk: false,
+                    // counts relative to an earlier commit are unknown
+                    exact: prev.is_none(),
+                    reconstructed: false,
+                };
+                (c, true)
+            }
+        };
         // replay the WAL
         let wal_path = root.join(&name).join("wal.log");
         let mut delta = Delta::default();
         let mut version = 0;
         let gen_ = Arc::new(gen_);
+        let mut replayed: Vec<CommitInfo> = Vec::new();
+        // quads of the base plus WAL transactions folded into a baseline commit
+        let mut base_quads = gen_.meta.quads;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
+            let recs = buf.as_chunks::<WAL_REC>().0;
+            // the last complete transaction may be torn; damage before it is corruption
+            let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
             let mut pending: Vec<(u8, [Id; 4])> = Vec::new();
+            let mut txn_start = 0usize;
             let mut good = 0usize;
+            let mut start_delta = delta.clone();
             let probe = Snapshot {
                 generation: gen_.clone(),
                 delta: Delta::default(),
@@ -684,10 +809,13 @@ impl Store {
                 cache: cache.clone(),
                 results: results.clone(),
                 dvocab_len: u64::MAX,
+                commit: 0,
                 union_default_graph: false,
                 delta_stats: Default::default(),
             };
-            for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate() {
+            let mut quads = base_quads;
+            let mut seen_v2 = false;
+            for (i, rec) in recs.iter().enumerate() {
                 let q: [Id; 4] = std::array::from_fn(|j| {
                     Id(u64::from_le_bytes(
                         rec[1 + j * 8..9 + j * 8].try_into().unwrap(),
@@ -696,15 +824,80 @@ impl Store {
                 match rec[0] {
                     WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
                     WAL_COMMIT => {
+                        let meta =
+                            commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
+                        if matches!(meta, Some(Err(()))) {
+                            if Some(i) == last_commit {
+                                break; // torn tail: truncated below
+                            }
+                            return Err(Error::Corrupt(format!(
+                                "{}: checksum mismatch in the transaction ending at byte {}",
+                                wal_path.display(),
+                                (i + 1) * WAL_REC
+                            )));
+                        }
+                        let (mut ins, mut del) = (0i64, 0i64);
                         for (op, q) in pending.drain(..) {
-                            let in_base = probe
-                                .perm(Perm::Spo)
-                                .contains(&cache, &Perm::Spo.to_key(&q))?;
+                            let k = Perm::Spo.to_key(&q);
+                            let in_base = probe.perm(Perm::Spo).contains(&cache, &k)?;
+                            let spo = Perm::Spo.index();
+                            let present = start_delta.ins[spo].contains(&k)
+                                || (in_base && !start_delta.del[spo].contains(&k));
+                            match (op == WAL_INSERT, present) {
+                                (true, false) => ins += 1,
+                                (true, true) => del -= 1,
+                                (false, true) => del += 1,
+                                (false, false) => ins -= 1,
+                            }
                             apply(&mut delta, &q, op == WAL_INSERT, in_base);
                         }
+                        start_delta = delta.clone();
+                        let (ins, del) = (ins.max(0) as u64, del.max(0) as u64);
+                        quads = (quads + ins).saturating_sub(del);
                         next_bnode = next_bnode.max(q[0].0);
                         version += 1;
+                        let prev = replayed.last().copied().unwrap_or(base);
+                        match meta {
+                            Some(Ok((seq, ts, kind))) => {
+                                seen_v2 = true;
+                                if seq != prev.seq + 1 {
+                                    return Err(Error::Corrupt(format!(
+                                        "{}: commit {seq} follows commit {}",
+                                        wal_path.display(),
+                                        prev.seq
+                                    )));
+                                }
+                                replayed.push(CommitInfo {
+                                    seq,
+                                    timestamp_ms: ts,
+                                    kind,
+                                    inserted: ins,
+                                    deleted: del,
+                                    quads,
+                                    generation: gen_no,
+                                    bulk: false,
+                                    exact: true,
+                                    reconstructed: false,
+                                });
+                            }
+                            // a legacy commit record: folded into the baseline when the
+                            // database is being upgraded, otherwise numbered in order
+                            _ if fold_legacy && !seen_v2 => base_quads = quads,
+                            _ => replayed.push(CommitInfo {
+                                seq: prev.seq + 1,
+                                timestamp_ms: prev.timestamp_ms,
+                                kind: CommitKind::Unknown,
+                                inserted: ins,
+                                deleted: del,
+                                quads,
+                                generation: gen_no,
+                                bulk: false,
+                                exact: true,
+                                reconstructed: true,
+                            }),
+                        }
                         good = (i + 1) * WAL_REC;
+                        txn_start = i + 1;
                     }
                     _ => break,
                 }
@@ -716,6 +909,23 @@ impl Store {
                     .set_len(good as u64)?;
             }
         }
+        let mut base = base;
+        if rebased {
+            // record the baseline: in the generation, the catalog, and (for an upgrade)
+            // dataset.json last, whose presence marks the upgrade complete
+            base.quads = base_quads;
+            base.inserted = base_quads;
+            write_atomic(
+                &root.join(&name).join("commit.json"),
+                &commit::gen_commit_bytes(dataset_id, "baseline", &base),
+            )?;
+        }
+        let catalog = Catalog::open(&catalog_path, dataset_id, base, &replayed)?;
+        if migrating {
+            let bytes = commit::dataset_file_bytes(dataset_id, "baseline", base.timestamp_ms);
+            write_atomic(&root.join("dataset.json"), &bytes)?;
+        }
+        let head = replayed.last().copied().unwrap_or(base);
         let wal = OpenOptions::new()
             .create(true)
             .append(true)
@@ -730,19 +940,60 @@ impl Store {
                 cache: cache.clone(),
                 results: results.clone(),
                 dvocab_len,
+                commit: head.seq,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
             }),
             writer: Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
                 next_bnode,
+                head,
+                poisoned: false,
             }),
             cache,
             results,
             prefixes: Mutex::new(prefixes),
             _lock: Some(lock),
+            dataset_id,
+            catalog: Mutex::new(catalog),
+            clock: Mutex::new(None),
             opts,
         })
+    }
+
+    /// The dataset id (a UUID created with the database).
+    pub fn dataset_id(&self) -> uuid::Uuid {
+        self.dataset_id
+    }
+
+    /// The latest commit.
+    pub fn head_commit(&self) -> CommitInfo {
+        self.writer.lock().head
+    }
+
+    /// Metadata of one commit, if it exists and is retained.
+    pub fn commit(&self, seq: u64) -> Option<CommitInfo> {
+        self.catalog.lock().get(seq)
+    }
+
+    /// A page of the commit catalog.
+    pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
+        self.catalog.lock().page(range, limit)
+    }
+
+    /// Replace the wall clock used for commit timestamps (tests).
+    #[doc(hidden)]
+    pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        *self.clock.lock() = Some(clock);
+    }
+
+    /// Timestamp for the commit after `head`: the clock, never before the head's.
+    fn commit_time(&self, head: &CommitInfo) -> i64 {
+        let now = match &*self.clock.lock() {
+            Some(c) => c(),
+            None => commit::now_ms(),
+        };
+        now.max(head.timestamp_ms)
     }
 
     pub fn is_persistent(&self) -> bool {
@@ -792,6 +1043,11 @@ impl Store {
 
     /// Begin the (single) write transaction; blocks while another writer is active.
     pub fn write(&self) -> WriteTxn<'_> {
+        self.write_as(CommitKind::Transaction)
+    }
+
+    /// Begin the write transaction, recording its commit as `kind`.
+    pub fn write_as(&self, kind: CommitKind) -> WriteTxn<'_> {
         let guard = self.writer.lock();
         let base = self.snapshot();
         WriteTxn {
@@ -801,12 +1057,22 @@ impl Store {
             guard,
             log: Vec::new(),
             bulk: Vec::new(),
+            kind,
+            net_ins: 0,
+            net_del: 0,
         }
     }
 
     /// Load RDF sources. Into an empty store (or for large inputs) this runs the bulk
     /// builder and rebuilds the base generation; small loads are transactional inserts.
+    /// Returns the number of new quads.
     pub fn load(&self, sources: &[Source]) -> Result<u64> {
+        let r = self.load_as(sources, CommitKind::Load)?;
+        Ok(if r.committed { r.commit.inserted } else { 0 })
+    }
+
+    /// [`load`](Self::load), recording the commit as `kind`.
+    pub fn load_as(&self, sources: &[Source], kind: CommitKind) -> Result<Receipt> {
         let snap = self.snapshot();
         let mut size_hint: u64 = 0;
         for s in sources {
@@ -820,10 +1086,21 @@ impl Store {
         // ~80 bytes per quad in text formats
         let est_quads = size_hint / 80;
         if snap.is_empty() || est_quads > self.opts.bulk_threshold {
-            self.rebuild(sources)
+            let mut w = self.writer.lock();
+            if w.poisoned {
+                return Err(Error::Poisoned);
+            }
+            let snap = self.snapshot();
+            let bulk = BulkCommit {
+                kind,
+                net_del: 0,
+                start_len: snap.len(),
+            };
+            Ok(self
+                .rebuild_locked(&mut w, &snap, sources, &[], Some(bulk))?
+                .1)
         } else {
-            let before = snap.len();
-            let mut txn = self.write();
+            let mut txn = self.write_as(kind);
             let mut prefixes = BTreeMap::new();
             for s in sources {
                 let (quads, p) = crate::io::parse_to_vec(s)?;
@@ -834,9 +1111,9 @@ impl Store {
                     txn.insert(ids)?;
                 }
             }
-            txn.commit()?;
+            let r = txn.commit()?;
             self.add_prefixes(prefixes)?;
-            Ok(self.snapshot().len().saturating_sub(before))
+            Ok(r)
         }
     }
 
@@ -845,6 +1122,17 @@ impl Store {
     /// parse error leaves the data untouched, and readers see either the old or the new
     /// content, never the cleared graph. Returns the number of quads parsed.
     pub fn replace(&self, target: ReplaceTarget, sources: &[Source]) -> Result<u64> {
+        Ok(self.replace_as(target, sources, CommitKind::Transaction)?.0)
+    }
+
+    /// [`replace`](Self::replace), recording the commit as `kind`; also returns the
+    /// receipt.
+    pub fn replace_as(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+    ) -> Result<(u64, Receipt)> {
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
         for s in sources {
@@ -852,7 +1140,7 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        let mut txn = self.write();
+        let mut txn = self.write_as(kind);
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
             ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
@@ -880,35 +1168,39 @@ impl Store {
         }
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
-        txn.commit()?;
+        let r = txn.commit()?;
         self.add_prefixes(prefixes)?;
-        Ok(n)
+        Ok((n, r))
     }
 
-    /// Compact: merge base ⊕ delta into a new generation.
+    /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
+    /// neither does the head commit.
     pub fn compact(&self) -> Result<()> {
-        self.rebuild(&[])?;
+        let mut w = self.writer.lock();
+        if w.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let snap = self.snapshot();
+        self.rebuild_locked(&mut w, &snap, &[], &[], None)?;
         Ok(())
     }
 
-    /// Build a new generation from the current contents plus `extra` sources and
-    /// switch to it.
-    fn rebuild(&self, extra: &[Source]) -> Result<u64> {
-        let mut w = self.writer.lock();
-        let snap = self.snapshot();
-        self.rebuild_locked(&mut w, &snap, extra, &[])
-    }
-
-    /// Rebuild with the writer lock held; `extra_quads` are encoded store ids (from a
-    /// bulk write transaction) added to the new generation.
+    /// Rebuild with the writer lock held: a new generation from `snap` plus `extra`
+    /// sources and `extra_quads` (encoded store ids from a bulk write transaction).
+    /// With `bulk`, the rebuild is a new commit; without it (compaction), the head stays.
+    /// Returns the number of new quads and the receipt.
     fn rebuild_locked(
         &self,
         w: &mut WriterState,
         snap: &Snapshot,
         extra: &[Source],
         extra_quads: &[[Id; 4]],
-    ) -> Result<u64> {
+        bulk: Option<BulkCommit>,
+    ) -> Result<(u64, Receipt)> {
         let before = snap.len();
+        // the old generation's WAL is the only other copy of the recent commits' ids:
+        // the catalog must be durable before it is discarded
+        self.catalog.lock().sync()?;
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
                 let n: u32 = snap
@@ -971,10 +1263,30 @@ impl Store {
         let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
         gen_._tmp = tmp;
         w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        let head = match &bulk {
+            Some(b) => CommitInfo {
+                seq: w.head.seq + 1,
+                timestamp_ms: self.commit_time(&w.head),
+                kind: b.kind,
+                inserted: (meta.quads + b.net_del).saturating_sub(b.start_len),
+                deleted: b.net_del,
+                quads: meta.quads,
+                generation: commit::generation_number(&name),
+                bulk: true,
+                exact: b.net_del == 0,
+                reconstructed: false,
+            },
+            None => w.head,
+        };
         if let Some(root) = &self.root {
-            // Publication order: the new generation's files and directory entries are
-            // durable (Builder::finish), its WAL file exists durably, then CURRENT
-            // switches durably, and only after that is the old generation removed.
+            // Publication order: the new generation's files (with the commit its base
+            // holds) and directory entries are durable, its WAL file exists durably, then
+            // CURRENT switches durably, and only after that is the old generation removed.
+            let origin = if bulk.is_some() { "bulk" } else { "compaction" };
+            write_synced(
+                &dir.join("commit.json"),
+                &commit::gen_commit_bytes(self.dataset_id, origin, &head),
+            )?;
             let wal = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -984,7 +1296,16 @@ impl Store {
             write_atomic(&root.join("CURRENT"), name.as_bytes())?;
             w.wal = Some(BufWriter::new(wal));
         }
-        self.add_prefixes(meta.prefixes.clone())?;
+        // the switch is the commit point: a failure after it leaves the published state
+        // behind the durable one, so later writes are refused
+        if bulk.is_some() {
+            w.head = head;
+            self.catalog.lock().append(head);
+        }
+        if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
+            w.poisoned = true;
+            return Err(e);
+        }
         let old = snap.generation.dir.clone();
         let dvocab_len = gen_.dvocab.len();
         self.current.store(Arc::new(Snapshot {
@@ -994,6 +1315,7 @@ impl Store {
             cache: self.cache.clone(),
             results: self.results.clone(),
             dvocab_len,
+            commit: head.seq,
             union_default_graph: self.opts.union_default_graph,
             delta_stats: Default::default(),
         }));
@@ -1004,7 +1326,12 @@ impl Store {
         {
             let _ = std::fs::remove_dir_all(old);
         }
-        Ok(meta.quads.saturating_sub(before))
+        let receipt = Receipt {
+            dataset_id: self.dataset_id,
+            committed: bulk.is_some(),
+            commit: head,
+        };
+        Ok((meta.quads.saturating_sub(before), receipt))
     }
 
     /// Write all quads as N-Quads to `w`.
@@ -1107,6 +1434,10 @@ pub struct WriteTxn<'s> {
     log: Vec<(u8, [Id; 4])>,
     /// large insert batches applied by rebuilding the generation on commit
     bulk: Vec<[Id; 4]>,
+    kind: CommitKind,
+    /// net quads added / removed relative to `base` (the commit's counts)
+    net_ins: u64,
+    net_del: u64,
 }
 
 impl WriteTxn<'_> {
@@ -1121,6 +1452,7 @@ impl WriteTxn<'_> {
             cache: self.base.cache.clone(),
             results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
             dvocab_len: self.base.generation.dvocab.len(),
+            commit: self.base.commit,
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
         }
@@ -1234,6 +1566,14 @@ impl WriteTxn<'_> {
         self.in_base(q)
     }
 
+    /// Whether the quad was present in the committed snapshot this transaction started
+    /// from (`in_base`: present in the base index).
+    fn present_at_start(&self, q: &[Id; 4], in_base: bool) -> bool {
+        let k = Perm::Spo.to_key(q);
+        let i = Perm::Spo.index();
+        self.base.delta.ins[i].contains(&k) || (in_base && !self.base.delta.del[i].contains(&k))
+    }
+
     /// Insert a quad; returns true if it was not present.
     pub fn insert(&mut self, q: [Id; 4]) -> Result<bool> {
         if q.iter()
@@ -1245,6 +1585,12 @@ impl WriteTxn<'_> {
             return Ok(false);
         }
         let ib = self.in_base(&q)?;
+        // re-adding a quad this transaction deleted cancels that deletion
+        if self.present_at_start(&q, ib) {
+            self.net_del -= 1;
+        } else {
+            self.net_ins += 1;
+        }
         apply(&mut self.delta, &q, true, ib);
         self.log.push((WAL_INSERT, q));
         Ok(true)
@@ -1256,6 +1602,12 @@ impl WriteTxn<'_> {
             return Ok(false);
         }
         let ib = self.in_base(&q)?;
+        // deleting a quad this transaction added cancels that insertion
+        if self.present_at_start(&q, ib) {
+            self.net_del += 1;
+        } else {
+            self.net_ins -= 1;
+        }
         apply(&mut self.delta, &q, false, ib);
         self.log.push((WAL_DELETE, q));
         Ok(true)
@@ -1288,8 +1640,12 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
-    /// Durably commit and publish a new snapshot.
-    pub fn commit(mut self) -> Result<u64> {
+    /// Durably commit and publish a new snapshot. A transaction without net effect (and
+    /// without a bulk batch) creates no commit: its receipt carries the unchanged head.
+    pub fn commit(mut self) -> Result<Receipt> {
+        if self.guard.poisoned {
+            return Err(Error::Poisoned);
+        }
         if self.bulk.is_empty() {
             return self.publish_log();
         }
@@ -1299,34 +1655,69 @@ impl WriteTxn<'_> {
         let bulk = std::mem::take(&mut self.bulk);
         let view = self.view();
         self.base.generation.dvocab.sync()?;
-        self.store
-            .rebuild_locked(&mut self.guard, &view, &[], &bulk)?;
-        Ok(self.store.snapshot().version)
+        let commit = BulkCommit {
+            kind: self.kind,
+            net_del: self.net_del,
+            start_len: self.base.len(),
+        };
+        let (_, receipt) =
+            self.store
+                .rebuild_locked(&mut self.guard, &view, &[], &bulk, Some(commit))?;
+        Ok(receipt)
     }
 
-    fn publish_log(&mut self) -> Result<u64> {
+    fn publish_log(&mut self) -> Result<Receipt> {
         let gen_ = &self.base.generation;
-        if self.log.is_empty() {
-            return Ok(self.base.version);
+        let head = self.guard.head;
+        if self.net_ins == 0 && self.net_del == 0 {
+            // nothing changed (or every change was undone): no commit, nothing published
+            return Ok(Receipt {
+                dataset_id: self.store.dataset_id,
+                committed: false,
+                commit: head,
+            });
         }
         gen_.dvocab.sync()?;
+        let c = CommitInfo {
+            seq: head.seq + 1,
+            timestamp_ms: self.store.commit_time(&head),
+            kind: self.kind,
+            inserted: self.net_ins,
+            deleted: self.net_del,
+            quads: (head.quads + self.net_ins).saturating_sub(self.net_del),
+            generation: commit::generation_number(&gen_.name),
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+        };
         let next_bnode = self.guard.next_bnode;
         if let Some(wal) = self.guard.wal.as_mut() {
+            let mut data = Vec::with_capacity(self.log.len() * WAL_REC);
             let mut rec = [0u8; WAL_REC];
             for (op, q) in &self.log {
                 rec[0] = *op;
                 for j in 0..4 {
                     rec[1 + j * 8..9 + j * 8].copy_from_slice(&q[j].0.to_le_bytes());
                 }
-                wal.write_all(&rec)?;
+                data.extend_from_slice(&rec);
             }
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
-            rec[9..].fill(0);
-            wal.write_all(&rec)?;
-            wal.flush()?;
-            wal.get_ref().sync_data()?;
+            commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, &data);
+            data.extend_from_slice(&rec);
+            // once the first byte is written, a failure leaves the WAL in an unknown
+            // state: refuse further writes, so a seq can never be written twice
+            let written = wal
+                .write_all(&data)
+                .and_then(|_| wal.flush())
+                .and_then(|_| wal.get_ref().sync_data());
+            if let Err(e) = written {
+                self.guard.poisoned = true;
+                return Err(e.into());
+            }
         }
+        self.guard.head = c;
+        self.store.catalog.lock().append(c);
         let version = self.base.version + 1;
         self.store.current.store(Arc::new(Snapshot {
             generation: gen_.clone(),
@@ -1335,10 +1726,15 @@ impl WriteTxn<'_> {
             cache: self.base.cache.clone(),
             results: self.base.results.clone(),
             dvocab_len: gen_.dvocab.len(),
+            commit: c.seq,
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
         }));
-        Ok(version)
+        Ok(Receipt {
+            dataset_id: self.store.dataset_id,
+            committed: true,
+            commit: c,
+        })
     }
 }
 

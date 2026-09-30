@@ -32,6 +32,7 @@
 //! # Ok::<_, Box<dyn std::error::Error>>(())
 //! ```
 
+use crate::commit::{CommitInfo, CommitKind, CommitPage, CommitRange, Receipt};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{G, O, P, Perm, S};
@@ -132,9 +133,30 @@ impl Dataset {
     }
 
     fn load_sources(&self, sources: Vec<Source>) -> Result<u64> {
-        let before = self.store.snapshot().len();
-        self.store.load(&sources)?;
-        Ok(self.store.snapshot().len().saturating_sub(before))
+        self.store.load(&sources)
+    }
+
+    /// Load sources in one commit and return its receipt.
+    pub fn load_sources_receipt(&self, sources: Vec<Source>) -> Result<Receipt> {
+        self.store.load_as(&sources, CommitKind::Load)
+    }
+
+    // ------------------------------------------------------------------ commits ------
+
+    /// The dataset id: a UUID created with the database, naming its commit history.
+    pub fn dataset_id(&self) -> uuid::Uuid {
+        self.store.dataset_id()
+    }
+
+    /// The latest commit.
+    pub fn head_commit(&self) -> CommitInfo {
+        self.store.head_commit()
+    }
+
+    /// A page of commit metadata (newest first for [`CommitRange::Latest`] and
+    /// [`CommitRange::Before`], oldest first for [`CommitRange::After`]).
+    pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
+        self.store.commits(range, limit)
     }
 
     // ------------------------------------------------------------------- SPARQL ------
@@ -286,13 +308,22 @@ impl Dataset {
     /// Run `f` in a write transaction: committed if `f` returns `Ok`, discarded otherwise
     /// (Jena `Txn.executeWrite`). Only one write transaction runs at a time.
     pub fn transaction<R>(&self, f: impl FnOnce(&mut Transaction<'_>) -> Result<R>) -> Result<R> {
+        Ok(self.transaction_receipt(f)?.0)
+    }
+
+    /// [`transaction`](Self::transaction), also returning the commit receipt (whose
+    /// `committed` is false when the transaction changed nothing).
+    pub fn transaction_receipt<R>(
+        &self,
+        f: impl FnOnce(&mut Transaction<'_>) -> Result<R>,
+    ) -> Result<(R, Receipt)> {
         let mut tx = Transaction {
             txn: self.store.write(),
             labels: HashMap::new(),
         };
         let r = f(&mut tx)?;
-        tx.txn.commit()?;
-        Ok(r)
+        let receipt = tx.txn.commit()?;
+        Ok((r, receipt))
     }
 
     // --------------------------------------------------------------------- admin ------

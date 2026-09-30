@@ -23,13 +23,29 @@ use std::time::Instant;
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateStats {
+    /// quads inserted, summed over the operations
     pub inserted: u64,
+    /// quads deleted, summed over the operations
     pub deleted: u64,
     pub operations: usize,
     pub timing: Timing,
+    /// the commit the request produced (or the unchanged head); not part of the default
+    /// JSON body
+    #[serde(skip)]
+    pub commit: Option<crate::commit::Receipt>,
 }
 
 pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
+    update_as(store, u, opts, crate::commit::CommitKind::Update)
+}
+
+/// [`update`], recording the commit as `kind`.
+pub fn update_as(
+    store: &Store,
+    u: &str,
+    opts: &QueryOptions,
+    kind: crate::commit::CommitKind,
+) -> Result<UpdateStats> {
     let t0 = Instant::now();
     let mut p = SparqlParser::new();
     if let Some(b) = &opts.base_iri {
@@ -54,14 +70,14 @@ pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
     };
-    let mut txn = store.write();
+    let mut txn = store.write_as(kind);
     for op in &parsed.operations {
         req.check()?;
         run_op(&mut txn, op, &req, &mut stats, store)?;
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
-    txn.commit()?;
+    stats.commit = Some(txn.commit()?);
     let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     stats.timing = Timing {
         parse_ms,

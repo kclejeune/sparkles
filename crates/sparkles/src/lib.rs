@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod commit;
 pub mod dataset;
 pub mod error;
 pub mod id;

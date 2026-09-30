@@ -244,7 +244,7 @@ pub fn materialize(
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
     let t0 = Instant::now();
-    let mut txn = store.write();
+    let mut txn = store.write_as(sparkles::commit::CommitKind::Reason);
     let snap = txn.base().clone();
     let d = derive(snap.clone(), profile, opts)?;
     progress(opts, 0.8, "writing inferred graph");
@@ -350,7 +350,7 @@ pub fn materialize(
 
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
-    let mut txn = store.write();
+    let mut txn = store.write_as(sparkles::commit::CommitKind::ReasonClear);
     let snap = txn.base().clone();
     let Some(g) = snap.lookup_iri(INFERRED_GRAPH) else {
         return Ok(0);
