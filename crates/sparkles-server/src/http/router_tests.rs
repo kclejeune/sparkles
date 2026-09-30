@@ -14,9 +14,12 @@ use tower::ServiceExt;
 
 #[cfg(feature = "auth")]
 mod auth;
+#[cfg(feature = "backup")]
+mod backup;
 mod clone;
 #[cfg(feature = "reasoning")]
 mod reasoning;
+mod tasks;
 
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .

@@ -1,0 +1,36 @@
+[package]
+name = "sparkles-backup"
+description = "Backup repositories for Sparkles databases: incremental, deduplicated backups on a filesystem or S3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+lz4_flex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = ["fs", "s3"]
+# `fs` repositories (a local or mounted directory)
+fs = ["object_store/fs"]
+# `s3` repositories (AWS S3 and S3-compatible services: MinIO, Cloudflare R2, Ceph RGW)
+s3 = ["object_store/aws"]
+# `gcs` and `azure` repositories (experimental, not tested in CI)
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]

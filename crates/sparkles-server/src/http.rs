@@ -76,7 +76,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/tasks", get(list_tasks))
-        .route("/$/tasks/{id}", get(get_task))
+        .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
         .route("/$/prefixes/{ds}", get(prefixes))
         .route("/$/cache/clear/{ds}", post(clear_cache))
         .route(
@@ -122,7 +122,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(validation::get_validation)
                 .put(validation::put_validation)
                 .delete(validation::delete_validation),
-        )
+        );
+    // backup repositories, per-dataset backups and backup policies
+    #[cfg(feature = "backup")]
+    let app = app.merge(crate::backup::http::routes());
+    let app = app
+        // a dataset being replaced in place answers 503 (inside the auth layer, so a
+        // hidden dataset stays a 404)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            restoring_guard,
+        ))
         .layer(axum::middleware::from_fn(error_request_id))
         // for extractors without a ceiling of their own (see `limited_body!`)
         .layer(DefaultBodyLimit::max(
@@ -254,6 +264,46 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
     }
     add_request_id(&mut resp, id);
     resp
+}
+
+/// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
+/// place (an in-place restore takes the dataset out of service for the swap), so
+/// clients see the old state, the new one, or a retryable error, never a 404.
+async fn restoring_guard(
+    State(st): St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let task = {
+        let restoring = st.restoring.lock();
+        if restoring.is_empty() {
+            None
+        } else {
+            let route = req
+                .extensions()
+                .get::<axum::extract::MatchedPath>()
+                .map(|m| m.as_str());
+            crate::obs::ds_param(route, req.uri())
+                .and_then(|ds| restoring.get(&ds).map(|t| (ds, t.clone())))
+        }
+    };
+    match task {
+        None => next.run(req).await,
+        Some((ds, task)) => {
+            let body = json!({
+                "error": format!("dataset /{ds} is being restored (task {task})"),
+                "code": "dataset-restoring",
+            });
+            let mut r = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+                Json(body.clone()),
+            )
+                .into_response();
+            r.extensions_mut().insert(ErrorJson(body));
+            r
+        }
+    }
 }
 
 /// Put `requestId` into a response's [`ErrorJson`] body (also used by the auth layer,
@@ -2171,7 +2221,7 @@ async fn clone_dataset(
     let dst = databases.join(&name);
     let st2 = st.clone();
     let target = name.clone();
-    let task = st.start_task_as(id, "clone", &source, Some(&name), move |h| {
+    let task = st.start_task_opts(id, "clone", &source, Some(&name), true, move |h| {
         let h2 = h.clone();
         let progress: sparkles::store::ProgressFn =
             Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
@@ -2184,7 +2234,10 @@ async fn clone_dataset(
             &dst,
             inferences,
             Some(progress),
+            Some(h.cancel_flag()),
         )?;
+        // the clone is in place: registering it is no longer undone by a cancel
+        h.set_cancellable(false);
         h.progress(0.97, "registering");
         st2.adopt(reservation)?;
         Ok(format!(
@@ -2637,15 +2690,21 @@ fn with_inferences(mut r: Response, ds: &Dataset, included: bool, seq: u64) -> R
     r
 }
 
+/// Whether `p` may see task `t`: read on its dataset or the dataset it creates;
+/// `server-admin` for a server-scoped task (no dataset).
+fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
+    if t.dataset.is_empty() {
+        return p.has(crate::auth::ServerPerm::ServerAdmin);
+    }
+    p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
+}
+
 async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     let tasks: Vec<_> = st
         .tasks
         .lock()
         .iter()
-        .filter(|t| {
-            p.can(&t.dataset, Level::Read)
-                || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
-        })
+        .filter(|t| task_visible(&p, t))
         .cloned()
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
@@ -2659,9 +2718,56 @@ async fn get_task(
     st.tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && p.can(&t.dataset, Level::Read))
+        .find(|t| t.id == id && task_visible(&p, t))
         .map(|t| Json(serde_json::to_value(t).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
+}
+
+/// `DELETE /$/tasks/{id}`: cancel a task. Needs `admin` on the task's dataset
+/// (`server-admin` for a server-scoped task). `202` with the task when it accepted,
+/// `409 not-cancellable` when it does not accept cancellation or has finished.
+async fn cancel_task(
+    State(st): St,
+    Path(id): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult {
+    let Some(t) = st
+        .tasks
+        .lock()
+        .iter()
+        .find(|t| t.id == id && task_visible(&p, t))
+        .cloned()
+    else {
+        return Err(err(StatusCode::NOT_FOUND, "no such task"));
+    };
+    let allowed = if t.dataset.is_empty() {
+        p.has(crate::auth::ServerPerm::ServerAdmin)
+    } else {
+        p.can(&t.dataset, Level::Admin)
+    };
+    if !allowed {
+        let msg = if t.dataset.is_empty() {
+            "server-admin permission required".to_string()
+        } else {
+            format!("admin access to /{} required", t.dataset)
+        };
+        return Ok(crate::auth::forbidden(&p, &msg));
+    }
+    match st.cancel_task(&id) {
+        Some(Ok(t)) => Ok((StatusCode::ACCEPTED, Json(t)).into_response()),
+        Some(Err(t)) => {
+            let why = if t.active() {
+                "does not accept cancellation"
+            } else {
+                "has finished"
+            };
+            Err(ApiError(
+                StatusCode::CONFLICT,
+                json!({ "error": format!("task {id} {why}"), "code": "not-cancellable" }),
+            ))
+        }
+        None => Err(err(StatusCode::NOT_FOUND, "no such task")),
+    }
 }
 
 // ------------------------------------------------------------------- SHACL ------

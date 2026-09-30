@@ -351,6 +351,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (clones, until the clone is in place): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
@@ -391,10 +392,13 @@ type DatasetStats = {
 };
 
 type Task = {
-  id: string; kind: "compact" | "backup" | "reason" | "load" | "clone";
-  dataset: string; target?: string /* the dataset a clone creates */;
-  state: "running" | "done" | "failed";
+  id: string; kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild";
+  dataset: string;          // "" for a server-wide task (listed for server admins only)
+  target?: string /* the dataset a clone creates */;
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
   startedAt: string; finishedAt?: string; message?: string; progress?: number /*0..1*/;
+  cancellable: boolean;     // DELETE /$/tasks/{id} would be accepted now
+  detail?: object;          // a typed result, for task kinds that have one
 };
 ```
 
@@ -1252,7 +1256,7 @@ the permission is `403` before any connection or file is opened, even under `SIL
 |---|---|---|
 | `/ui/*`, `/$/ping`, `/$/ready` | GET | nothing (`/$/ready` lists only readable datasets without `metrics`) |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*`, `/$/auth/device`, `/$/auth/token` | | nothing (invalid credentials are still `401`) |
-| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout` | | any caller; listings show readable datasets only |
+| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout` | | any caller; listings show readable datasets only (server-wide tasks: `server-admin`); cancelling a task (DELETE) needs `admin` on its dataset |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |

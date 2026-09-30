@@ -12,6 +12,8 @@ use serde_json::Value as J;
 use sparkles::commit::ForkedFrom;
 use sparkles::store::{CloneOptions, CloneReport, ProgressFn, Store};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What happens to the materialized inferences.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +87,9 @@ pub const FAIL_BEFORE_RENAME: &str = "fail-before-rename";
 /// and renaming it into place. `dst` must not exist, or be an empty directory.
 /// `reasoning` is the source's reasoning status, read before this call: a reasoning run
 /// that commits in between then reads as stale in the clone, never falsely fresh.
+/// Setting `cancel` stops the clone before the rename with `sparkles::Error::Cancelled`,
+/// leaving nothing behind.
+#[allow(clippy::too_many_arguments)]
 pub fn clone_into(
     store: &Store,
     name: &str,
@@ -93,20 +98,28 @@ pub fn clone_into(
     dst: &Path,
     inferences: Inferences,
     progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<CloneReport> {
     if tmp.exists() {
         bail!("{} already exists", tmp.display());
+    }
+    let cancelled = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+    if cancelled() {
+        return Err(sparkles::Error::Cancelled.into());
     }
     let opts = CloneOptions {
         exclude_graphs: match inferences {
             Inferences::Copy => Vec::new(),
             Inferences::Drop => vec![oxrdf::NamedNode::new_unchecked(crate::http::INFERRED_GRAPH)],
         },
-        cancel: None,
+        cancel: cancel.clone(),
         progress,
     };
     let report = store.clone_to(tmp, &opts)?;
     let mut guard = RemoveDir(Some(tmp.to_path_buf()));
+    if cancelled() {
+        return Err(sparkles::Error::Cancelled.into());
+    }
     let origin = OriginFile {
         origin_format: 1,
         cloned_at: crate::state::now(),

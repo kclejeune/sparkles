@@ -10,6 +10,9 @@
 //! * **Compaction** merges base ⊕ delta into a new generation and atomically switches
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
+mod backup;
+pub use backup::{BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard};
+
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
 use crate::codec::{Codec, Level};
 use crate::commit::{

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +128,55 @@ pub struct Task {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<f32>,
+    /// `DELETE /$/tasks/{id}` may cancel it (now)
+    pub cancellable: bool,
+    /// the task's typed result (a backup summary, a verify or GC report, a policy run)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    /// set by a cancel request; the work checks it
+    #[serde(skip)]
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Task states (`Task::state`).
+pub mod task_state {
+    /// waiting for a task slot
+    pub const QUEUED: &str = "queued";
+    pub const RUNNING: &str = "running";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
+    /// ended by a cancel request
+    pub const CANCELLED: &str = "cancelled";
+}
+
+impl Task {
+    /// Still queued or running.
+    pub fn active(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            task_state::QUEUED | task_state::RUNNING
+        )
+    }
+}
+
+/// Whether a task's error comes from a cancellation (`sparkles::Error::Cancelled`, or
+/// a backup operation's `cancelled`) anywhere in its chain.
+fn rooted_in_cancel(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        if matches!(
+            c.downcast_ref::<sparkles::Error>(),
+            Some(sparkles::Error::Cancelled)
+        ) {
+            return true;
+        }
+        #[cfg(feature = "backup")]
+        if c.downcast_ref::<sparkles_backup::BackupError>()
+            .is_some_and(|b| b.is_cancelled())
+        {
+            return true;
+        }
+        false
+    })
 }
 
 pub struct AppState {
@@ -163,6 +212,13 @@ pub struct AppState {
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// dataset names being created by a task (clone), with the task id
     reserved: Mutex<BTreeMap<String, String>>,
+    /// datasets being replaced in place (an in-place restore), with the task id: every
+    /// request naming one of them gets `503` + `Retry-After` (the router's restoring
+    /// layer)
+    pub restoring: Mutex<BTreeMap<String, String>>,
+    /// backup repositories and policies (`serve`; `None` for embedded use)
+    #[cfg(feature = "backup")]
+    pub backup: Option<Arc<crate::backup::BackupState>>,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -361,6 +417,9 @@ impl AppState {
             http_compression: Default::default(),
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
+            restoring: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "backup")]
+            backup: None,
             manage: Mutex::new(()),
         };
         // clones that were being built when the server stopped are never registered
@@ -412,6 +471,9 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
+            restoring: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "backup")]
+            backup: None,
             manage: Mutex::new(()),
             rate_limit: None,
             auth: None,
@@ -561,6 +623,33 @@ impl AppState {
         Ok(true)
     }
 
+    /// Take the registered persistent dataset `name` out of the map for an in-place
+    /// replacement; the persisted registry keeps it (put it back with
+    /// [`reattach`](Self::reattach)). `None` if there is no such dataset, or it is not a
+    /// managed persistent one (`--loc`, `--mem`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
+        let _guard = self.manage.lock();
+        let mut map = self.datasets.write();
+        match map.get(name) {
+            Some(ds) if ds.kind == DbType::Persistent && !ds.ephemeral => map.remove(name),
+            _ => None,
+        }
+    }
+
+    /// Open `databases/<name>` and register it under `name` again (after a swap, or to
+    /// roll one back). Fails if the name is registered.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
+        let _guard = self.manage.lock();
+        if self.datasets.read().contains_key(name) {
+            bail!("dataset '{name}' already exists");
+        }
+        let ds = self.open_dataset(name, DbType::Persistent, None)?;
+        self.datasets.write().insert(name.to_string(), ds.clone());
+        Ok(ds)
+    }
+
     /// The task creating dataset `name`, if one is.
     pub fn reserved_by(&self, name: &str) -> Option<String> {
         self.reserved.lock().get(name).cloned()
@@ -642,17 +731,39 @@ impl AppState {
         target: Option<&str>,
         work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
     ) -> Task {
+        self.start_task_opts(id, kind, dataset, target, false, work)
+    }
+
+    /// Start a task on its own thread. `dataset` is the dataset it works on (`""` for a
+    /// server-scoped task, visible to `server-admin` only), `target` the dataset it
+    /// creates, if any. A `cancellable` task accepts `DELETE /$/tasks/{id}`, which sets
+    /// [`TaskHandle::cancel_flag`]; the work checks the flag and fails with
+    /// `sparkles::Error::Cancelled` (or a backup `cancelled` error), which ends the task
+    /// `cancelled` rather than `failed`.
+    pub fn start_task_opts(
+        self: &Arc<Self>,
+        id: String,
+        kind: &str,
+        dataset: &str,
+        target: Option<&str>,
+        cancellable: bool,
+        work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
+    ) -> Task {
         let task = Task {
             id: id.clone(),
             kind: kind.to_string(),
             dataset: dataset.to_string(),
             target: target.map(str::to_string),
-            state: "running".into(),
+            state: task_state::RUNNING.into(),
             started_at: now(),
             finished_at: None,
             message: None,
             progress: Some(0.0),
+            cancellable,
+            detail: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
+        let cancel = task.cancel.clone();
         {
             let mut tasks = self.tasks.lock();
             tasks.push(task.clone());
@@ -667,25 +778,45 @@ impl AppState {
             let handle = TaskHandle {
                 state: state.clone(),
                 id: id.clone(),
+                cancel,
             };
             let r = span.in_scope(|| work(&handle));
             let mut tasks = state.tasks.lock();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
                 t.finished_at = Some(now());
                 t.progress = Some(1.0);
+                t.cancellable = false;
                 match r {
                     Ok(msg) => {
-                        t.state = "done".into();
+                        t.state = task_state::DONE.into();
                         t.message = Some(msg);
                     }
+                    Err(e) if rooted_in_cancel(&e) => {
+                        t.state = task_state::CANCELLED.into();
+                        t.message = Some("cancelled".into());
+                    }
                     Err(e) => {
-                        t.state = "failed".into();
+                        t.state = task_state::FAILED.into();
                         t.message = Some(format!("{e:#}"));
                     }
                 }
             }
         });
         task
+    }
+
+    /// Ask task `id` to stop: `Ok` with the task when it accepted (the work stops at
+    /// its next check), `Err` with it when it is finished or not cancellable, `None`
+    /// when there is no such task.
+    pub fn cancel_task(&self, id: &str) -> Option<Result<Task, Task>> {
+        let mut tasks = self.tasks.lock();
+        let t = tasks.iter_mut().find(|t| t.id == id)?;
+        if !t.cancellable || !t.active() {
+            return Some(Err(t.clone()));
+        }
+        t.cancel.store(true, Ordering::Relaxed);
+        t.message = Some("cancelling".into());
+        Some(Ok(t.clone()))
     }
 }
 
@@ -705,13 +836,50 @@ impl Drop for Reservation {
 pub struct TaskHandle {
     state: Arc<AppState>,
     id: String,
+    cancel: Arc<AtomicBool>,
 }
 
 impl TaskHandle {
     pub fn progress(&self, p: f32, msg: &str) {
-        if let Some(t) = self.state.tasks.lock().iter_mut().find(|t| t.id == self.id) {
+        self.update(|t| {
             t.progress = Some(p.clamp(0.0, 1.0));
             t.message = Some(msg.to_string());
+        });
+    }
+
+    /// Set by `DELETE /$/tasks/{id}` (for a cancellable task).
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    // is_cancelled, set_detail, set_state: for the backup tasks (and tests until then)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The task's typed result (`detail`), visible while it runs and after.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_detail(&self, detail: serde_json::Value) {
+        self.update(|t| t.detail = Some(detail));
+    }
+
+    /// `queued` (waiting for a slot) or `running` (see [`task_state`]); the final
+    /// state is set when the work returns.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_state(&self, state: &str) {
+        self.update(|t| t.state = state.to_string());
+    }
+
+    /// Whether a cancel request is accepted from now on (e.g. no longer once a restore
+    /// has started to swap directories).
+    pub fn set_cancellable(&self, cancellable: bool) {
+        self.update(|t| t.cancellable = cancellable);
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Task)) {
+        if let Some(t) = self.state.tasks.lock().iter_mut().find(|t| t.id == self.id) {
+            f(t);
         }
     }
 }

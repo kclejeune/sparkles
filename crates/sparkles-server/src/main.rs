@@ -5,6 +5,8 @@
 
 mod alloc;
 mod auth;
+#[cfg(feature = "backup")]
+mod backup;
 mod check_cmd;
 mod clone;
 mod compress;
@@ -477,6 +479,15 @@ enum Cmd {
         /// (re-read on SIGHUP); without it the server is open
         #[arg(long, value_name = "FILE")]
         auth_config: Option<PathBuf>,
+        /// Backup repositories and policies from this TOML file (read-only through the
+        /// API; re-read on SIGHUP)
+        #[cfg(feature = "backup")]
+        #[arg(long, value_name = "FILE", env = "SPARKLES_BACKUP_CONFIG")]
+        backup_config: Option<PathBuf>,
+        /// Backup, restore, verify and GC tasks that run at once; more wait, queued
+        #[cfg(feature = "backup")]
+        #[arg(long, default_value_t = 2)]
+        backup_max_tasks: usize,
         /// Listen on this Unix socket (mode 0660) instead of TCP; with auth, trusted
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
@@ -665,14 +676,26 @@ enum Cmd {
         #[arg(long)]
         loc: PathBuf,
     },
-    /// Write a compressed N-Quads backup (gzip unless --compress says otherwise)
+    /// Back up to a backup repository (create, list, show, delete, restore, verify,
+    /// policy); without a subcommand, write a compressed N-Quads dump of --loc to --out
+    /// (gzip unless --compress says otherwise)
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Backup {
-        #[arg(long)]
-        loc: PathBuf,
+        #[arg(long, required = true)]
+        loc: Option<PathBuf>,
         #[arg(long, default_value = "./backups")]
         out: PathBuf,
         #[command(flatten)]
         compress: CompressArgs,
+        #[cfg(feature = "backup")]
+        #[command(subcommand)]
+        cmd: Option<backup::cli::BackupCmd>,
+    },
+    /// Backup repositories: add, list, show, test, verify, remove, gc, locks
+    #[cfg(feature = "backup")]
+    Repo {
+        #[command(subcommand)]
+        cmd: backup::cli::RepoCmd,
     },
     /// Copy a database into a new, independent one (same data and blank nodes, new
     /// dataset id)
@@ -1198,6 +1221,10 @@ fn run() -> Result<()> {
             max_upload_mb,
             min_free_disk_mb,
             auth_config,
+            #[cfg(feature = "backup")]
+            backup_config,
+            #[cfg(feature = "backup")]
+            backup_max_tasks,
             unix_socket,
             allow_open_network,
             rate_limit,
@@ -1215,8 +1242,20 @@ fn run() -> Result<()> {
             )?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
             let auth = auth::load(auth_config.as_deref(), &data, bound)?;
+            // an in-place restore interrupted between its renames is undone before the
+            // registry's datasets are opened
+            #[cfg(feature = "backup")]
+            backup::recover::startup(&data)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
+            #[cfg(feature = "backup")]
+            {
+                st.backup = Some(Arc::new(backup::BackupState::new(
+                    &data,
+                    backup_config,
+                    backup_max_tasks,
+                )?));
+            }
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.outbound = outbound.policy()?;
@@ -1321,6 +1360,9 @@ fn run() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
+            // backup tasks drive the repository engine on this runtime
+            #[cfg(feature = "backup")]
+            backup::start(&st, rt.handle());
             let served = rt.block_on(async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
@@ -1771,7 +1813,15 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Backup { loc, out, compress } => {
+        #[cfg(feature = "backup")]
+        Cmd::Repo { cmd } => backup::cli::run_repo(cmd),
+        #[cfg(feature = "backup")]
+        Cmd::Backup { cmd: Some(cmd), .. } => backup::cli::run_backup(cmd, opts),
+        Cmd::Backup {
+            loc, out, compress, ..
+        } => {
+            // clap requires --loc without a subcommand
+            let loc = loc.context("--loc is required")?;
             let store = Store::open(&loc, opts)?;
             let name = loc
                 .file_name()
@@ -1814,6 +1864,7 @@ fn run() -> Result<()> {
                 std::path::Path::new(&tmp),
                 &to,
                 inferences,
+                None,
                 None,
             )?;
             eprintln!(
