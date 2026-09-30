@@ -18,6 +18,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
         (lib.fileset.maybeMissing ../ui/node_modules)
         (lib.fileset.maybeMissing ../ui/build)
         (lib.fileset.maybeMissing ../ui/.svelte-kit)
+        # documentation edits do not rebuild the UI (and the server that embeds it)
+        ../ui/README.md
         # the Playwright tests and their output are not part of the build
         (lib.fileset.maybeMissing ../ui/tests)
         (lib.fileset.maybeMissing ../ui/playwright.config.ts)
