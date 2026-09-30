@@ -75,6 +75,7 @@ pub async fn memory_repo() -> Repository {
 
 /// An `fs` repository in `dir`.
 pub async fn fs_repo(dir: &Path) -> Repository {
+    std::fs::create_dir_all(dir).unwrap();
     let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
         .unwrap()
         .with_fsync(true);
