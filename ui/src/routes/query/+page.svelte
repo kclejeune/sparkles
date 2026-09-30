@@ -745,7 +745,12 @@
           {@const err = outcome.error}
           <div class="pad">
             <div class="error-box">
-              <strong>{err.message}</strong>
+              {#if err instanceof api.ApiError && err.budget}
+                <strong>{api.budgetHint(err.budget)}</strong>
+                <div class="muted">{err.message}</div>
+              {:else}
+                <strong>{err.message}</strong>
+              {/if}
               {#if err instanceof api.ApiError && err.line}
                 <span class="muted"
                   >at line {err.line}{#if err.column}, column {err.column}{/if}</span
@@ -759,6 +764,9 @@
                 </button>
               {/if}
               {#if err instanceof api.ApiError && err.detail}<pre>{err.detail}</pre>{/if}
+              {#if err instanceof api.ApiError && err.requestId}
+                <div class="faint rid">Request <span class="mono">{err.requestId}</span></div>
+              {/if}
             </div>
           </div>
         {:else if outcome.updated}
@@ -999,6 +1007,13 @@
     background: var(--surface);
     color: var(--text);
     padding: 0 4px;
+  }
+  .rid {
+    margin-top: 6px;
+    font-size: var(--fs-xs);
+  }
+  .rid .mono {
+    user-select: all;
   }
   .err-dot {
     width: 6px;

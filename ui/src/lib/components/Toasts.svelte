@@ -13,6 +13,11 @@
       <div class="text">
         <div>{t.text}</div>
         {#if t.detail}<div class="detail">{t.detail}</div>{/if}
+        {#if t.requestId}
+          <div class="rid" title="Request id: find this request in the server log">
+            Request <span class="mono">{t.requestId}</span>
+          </div>
+        {/if}
       </div>
       <button class="btn ghost icon sm" aria-label="Dismiss" onclick={() => toasts.dismiss(t.id)}>
         <Icon name="x" size={12} />
@@ -60,6 +65,14 @@
     font-size: var(--fs-sm);
     word-break: break-word;
     margin-top: 2px;
+  }
+  .rid {
+    color: var(--text-3);
+    font-size: var(--fs-xs);
+    margin-top: 4px;
+  }
+  .rid .mono {
+    user-select: all;
   }
   @keyframes slide {
     from {
