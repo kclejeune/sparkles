@@ -199,6 +199,9 @@ impl Codec {
     }
 
     /// Whether this build can read the codec.
+    // without the zstd and brotli features both arms are `false` and clippy asks for
+    // `matches!`, which would hide the per-feature mapping
+    #[allow(clippy::match_like_matches_macro)]
     pub fn supported(self) -> bool {
         match self {
             Codec::Zstd => cfg!(feature = "zstd"),
