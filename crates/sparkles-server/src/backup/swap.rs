@@ -3,9 +3,11 @@
 //! * **New dataset**: rename the restored directory into `databases/<target>` and
 //!   `AppState::adopt` the reservation (the clone code path).
 //! * **In place**: mark `<target>` restoring (`AppState::restoring`: requests get `503`
-//!   with `Retry-After`), take it out of the map (`AppState::detach_for_swap`), wait up
-//!   to 30 s for in-flight requests to release it (`Arc::strong_count == 1`; else put
-//!   it back and fail `409 dataset-busy`), drop it (releasing `sparkles.lock`), rename
+//!   with `Retry-After`), wait for the requests that passed that check before (they
+//!   hold the dataset until they answer, and must still find it registered), take it
+//!   out of the map (`AppState::detach_for_swap`), wait for what still holds it
+//!   (`Arc::strong_count == 1`; both waits together at most 30 s, else put it back
+//!   and fail `409 dataset-busy`), drop it (releasing `sparkles.lock`), rename
 //!   `databases/<t>` → `databases/.replaced-<t>-<task>`, the restored directory →
 //!   `databases/<t>`, fsync `databases/`, reopen (`AppState::reattach`), and remove the
 //!   replaced copy unless kept (then it becomes `databases/.kept-<t>-<task>`). If the
@@ -117,6 +119,19 @@ pub(crate) fn replace_with(
         r.insert(name.to_string(), task.to_string());
     }
     let _restoring = Restoring { st, name };
+    // requests that passed the restoring check hold the dataset until they answer
+    // (the router's restoring layer): wait for them while it is still registered, so
+    // none looks it up after it left the map
+    let t0 = Instant::now();
+    while st
+        .datasets
+        .read()
+        .get(name)
+        .is_some_and(|d| Arc::strong_count(d) > 1)
+        && t0.elapsed() < drain
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let Some(old) = st.detach_for_swap(name) else {
         return Err(match st.get(name) {
             Some(_) => BackupError::new(
@@ -126,7 +141,6 @@ pub(crate) fn replace_with(
             None => BackupError::internal(format!("no dataset /{name}")),
         });
     };
-    let t0 = Instant::now();
     while Arc::strong_count(&old) > 1 {
         if t0.elapsed() >= drain {
             // it stays as it was
