@@ -521,6 +521,7 @@ mise run ci           # fmt:check + lint + test + ui:test
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
+mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
 ```
 
 Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with

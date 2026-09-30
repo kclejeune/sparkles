@@ -189,3 +189,17 @@ f="target/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
 cargo run --release -p sparkles-shacl --example bench -- "$f" - 5
 '''
+
+[tasks."bench:shacl-write"]
+description = "Write-time SHACL validation: 1-triple INSERT DATA latency with validation off / warn / reject"
+depends = ["build"]
+usage = '''
+arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench-shacl-write" help="data, databases and results/ (shacl-write.md)"
+flag "--runs <n>" default="20" help="measured runs per configuration"
+flag "--warmup <n>" default="3" help="warm-up runs per configuration"
+flag "--delta <n>" default="10000" help="pending delta quads of the second round"
+'''
+run = '''
+WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+'''
