@@ -992,6 +992,58 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
+/// ` · validation passed in 14 ms`: the write-time validation of a CLI write, for its
+/// summary line (empty when the database is not validated).
+fn validation_note(v: Option<&sparkles::guard::ValidationSummary>) -> String {
+    use sparkles::guard::{GuardStatus, Strategy};
+    match v {
+        None => String::new(),
+        Some(v) if v.strategy == Strategy::None => format!(" · validation {}", v.status.name()),
+        Some(v) if v.status == GuardStatus::Warned => format!(
+            " · validation warned: {} blocking of {} results in {} ms",
+            v.blocking, v.total, v.millis
+        ),
+        Some(v) => format!(" · validation {} in {} ms", v.status.name(), v.millis),
+    }
+}
+
+/// The `sparkles stats` line of a validated database:
+/// `reject · 2 shape graphs · 20 shapes · last full 164 ms`.
+#[cfg(feature = "shacl")]
+fn validation_stats(store: &Store) -> Option<String> {
+    use sparkles_shacl::guard;
+    let cfg = match guard::read_config(store.root()?) {
+        Ok(c) => c?,
+        Err(e) => return Some(format!("cannot be loaded: {e:#}")),
+    };
+    let mut parts = vec![
+        serde_json::to_string(&cfg.mode)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string(),
+        match &cfg.shapes.graphs {
+            Some(g) => format!(
+                "{} shape graph{}",
+                g.len(),
+                if g.len() == 1 { "" } else { "s" }
+            ),
+            None => "shapes file".to_string(),
+        },
+    ];
+    match guard::install(store) {
+        Ok(Some(g)) => {
+            let s = g.status();
+            parts.push(format!("{} shapes", s.shape_count));
+            if let Some(ms) = s.last_full_millis {
+                parts.push(format!("last full {ms} ms"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => parts.push(format!("shapes cannot be loaded: {e:#}")),
+    }
+    Some(parts.join(" · "))
+}
+
 /// Open a database for a CLI write, with its write-time validation installed (unless
 /// `--no-validate`, which skips it and says so).
 fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) -> Result<Store> {
@@ -1299,11 +1351,12 @@ fn run() -> Result<()> {
             let after = store.snapshot().len();
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
-                "loaded {} quads in {:.2}s ({:.0} quads/s); database now has {after} quads; commit {}",
+                "loaded {} quads in {:.2}s ({:.0} quads/s); database now has {after} quads; commit {}{}",
                 after - before,
                 secs,
                 (after - before) as f64 / secs.max(1e-9),
-                r.commit.seq
+                r.commit.seq,
+                validation_note(r.validation.as_deref())
             );
             Ok(())
         }
@@ -1427,14 +1480,17 @@ fn run() -> Result<()> {
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
-            let commit = match s.commit {
+            let commit = match &s.commit {
                 Some(r) if r.committed => format!("commit {}", r.commit.seq),
                 Some(r) => format!("no change · head {}", r.commit.seq),
                 None => String::new(),
             };
             eprintln!(
-                "inserted {} · deleted {} · {commit} · {:.2} ms",
-                s.inserted, s.deleted, s.timing.total_ms
+                "inserted {} · deleted {} · {commit} · {:.2} ms{}",
+                s.inserted,
+                s.deleted,
+                s.timing.total_ms,
+                validation_note(s.commit.as_ref().and_then(|r| r.validation.as_deref()))
             );
             Ok(())
         }
@@ -1705,6 +1761,10 @@ fn run() -> Result<()> {
             if let Some(info) = state::read_reasoning_file(&loc) {
                 println!("reasoning       {}", reasoning::status_line(&info, &store));
             }
+            #[cfg(feature = "shacl")]
+            if let Some(v) = validation_stats(&store) {
+                println!("validation      {v}");
+            }
             println!(
                 "disk            {:.1} MiB",
                 store.disk_bytes() as f64 / (1 << 20) as f64
@@ -1790,12 +1850,13 @@ fn run() -> Result<()> {
                     Some(&reasoning::recorded(&profile, &r, &store)),
                 )?;
                 eprintln!(
-                    "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
+                    "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",
                     r.inferred,
                     r.rules,
                     r.iterations,
                     r.millis,
-                    sparkles_reasoner::INFERRED_GRAPH
+                    sparkles_reasoner::INFERRED_GRAPH,
+                    validation_note(r.receipt.as_ref().and_then(|r| r.validation.as_deref()))
                 );
                 for w in r.warnings {
                     eprintln!("warning: {w}");

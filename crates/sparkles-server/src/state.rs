@@ -60,6 +60,8 @@ pub struct Dataset {
     pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
     /// write-time SHACL validation, when configured
     pub validation: RwLock<Option<Arc<Validation>>>,
+    /// write-time validation counters (the store's guard observer)
+    pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
 }
 
 #[cfg(feature = "shacl")]
@@ -385,6 +387,8 @@ impl AppState {
         };
         let reasoning = store.root().and_then(read_reasoning_file);
         let validation = install_validation(&store);
+        let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
+        store.set_guard_observer(Some(validation_metrics.clone()));
         Ok(Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -393,6 +397,7 @@ impl AppState {
             ephemeral: loc.is_some(),
             schema_cache: Mutex::new(None),
             validation: RwLock::new(validation),
+            validation_metrics,
         }))
     }
 

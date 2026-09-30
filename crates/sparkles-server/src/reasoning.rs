@@ -231,8 +231,14 @@ pub fn start_reason(
         };
         let report = match sparkles_reasoner::materialize(&ds.store, &profile, &opts) {
             Ok(r) => r,
-            Err(e) if auto => return Err(e.context("auto: reasoning failed")),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let e = match rejection_text(&e) {
+                    Some(text) => anyhow::anyhow!("{prefix}{text}"),
+                    None if auto => e.context("auto: reasoning failed"),
+                    None => e,
+                };
+                return Err(e);
+            }
         };
         ds.set_reasoning(Some(recorded(&profile, &report, &ds.store)))?;
         st2.save_registry()?;
@@ -247,6 +253,31 @@ pub fn start_reason(
                 format!("; warnings: {}", report.warnings.join("; "))
             }
         ))
+    })
+}
+
+/// The task error of a materialization rejected by write-time validation:
+/// `inferences rejected by SHACL validation: 2 blocking results (first: <shape> at <node>)`.
+#[cfg(feature = "reasoning")]
+pub fn rejection_text(e: &anyhow::Error) -> Option<String> {
+    let Some(sparkles::Error::Rejected(r)) = e.downcast_ref::<sparkles::Error>() else {
+        return None;
+    };
+    let s = &r.summary;
+    Some(match &s.shapes_error {
+        Some(err) => {
+            format!(
+                "inferences rejected by SHACL validation: the shapes graph cannot be read ({err})"
+            )
+        }
+        None => format!(
+            "inferences rejected by SHACL validation: {} blocking result{}{}",
+            s.blocking,
+            if s.blocking == 1 { "" } else { "s" },
+            crate::obs::first_result(s)
+                .map(|(shape, node)| format!(" (first: {shape} at {node})"))
+                .unwrap_or_default()
+        ),
     })
 }
 
