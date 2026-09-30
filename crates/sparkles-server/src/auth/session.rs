@@ -10,9 +10,15 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Sessions kept at most; the oldest are evicted.
+/// Sessions kept at most. When the store is full, the owner that holds the most loses its
+/// oldest, never anyone else.
 pub const MAX_SESSIONS: usize = 10_000;
+/// Sessions one owner keeps at most (a user, an OIDC or proxy identity; a token login
+/// counts for the token's owner): a new one ends the owner's oldest, so that no one can
+/// push the others' sessions out.
+pub const MAX_SESSIONS_PER_OWNER: usize = 50;
 
 /// Subkeys derived from the session key file.
 pub struct Keys {
@@ -104,11 +110,18 @@ pub struct SessionRecord {
     pub token_id: Option<String>,
     pub created: String,
     pub expires: String,
+    /// creation order (memory only; `created` has whole seconds)
+    #[serde(skip)]
+    seq: u64,
 }
 
 impl SessionRecord {
     pub fn expires_at(&self) -> i64 {
         parse_rfc3339(&self.expires).unwrap_or(0)
+    }
+
+    fn owner(&self) -> String {
+        self.principal.log_name()
     }
 }
 
@@ -123,6 +136,28 @@ pub struct SessionStore {
     inner: Mutex<HashMap<[u8; 32], SessionRecord>>,
     /// ID tokens of OIDC sessions (memory only), for RP-initiated logout
     id_tokens: Mutex<HashMap<[u8; 32], String>>,
+    next_seq: AtomicU64,
+    /// [`MAX_SESSIONS`] and [`MAX_SESSIONS_PER_OWNER`]
+    caps: (usize, usize),
+}
+
+/// Drop the oldest session of the owner that holds the most (of those tied, the one
+/// with the oldest session); returns its digest.
+fn evict_one(map: &mut HashMap<[u8; 32], SessionRecord>) -> Option<[u8; 32]> {
+    // owner → (sessions, oldest seq, its digest)
+    let mut owners: HashMap<String, (usize, u64, [u8; 32])> = HashMap::new();
+    for (k, s) in map.iter() {
+        let e = owners.entry(s.owner()).or_insert((0, u64::MAX, *k));
+        e.0 += 1;
+        if s.seq < e.1 {
+            (e.1, e.2) = (s.seq, *k);
+        }
+    }
+    let (_, _, k) = owners
+        .into_values()
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))?;
+    map.remove(&k);
+    Some(k)
 }
 
 fn digest_of(id: &str) -> Option<[u8; 32]> {
@@ -139,9 +174,11 @@ impl SessionStore {
                 if f.format != 1 {
                     bail!("{}: unknown format {}", path.display(), f.format);
                 }
-                for s in f.sessions {
+                // the file lists them by creation
+                for (seq, mut s) in f.sessions.into_iter().enumerate() {
                     let d = digest_of(&s.id)
                         .with_context(|| format!("{}: bad session id", path.display()))?;
+                    s.seq = seq as u64;
                     if s.expires_at() > now {
                         map.insert(d, s);
                     }
@@ -150,16 +187,26 @@ impl SessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         }
+        let next = map.values().map(|s| s.seq + 1).max().unwrap_or(0);
         Ok(SessionStore {
             path,
             inner: Mutex::new(map),
             id_tokens: Mutex::new(HashMap::new()),
+            next_seq: AtomicU64::new(next),
+            caps: (MAX_SESSIONS, MAX_SESSIONS_PER_OWNER),
         })
+    }
+
+    /// Other caps than [`MAX_SESSIONS`] and [`MAX_SESSIONS_PER_OWNER`] (tests).
+    #[cfg(test)]
+    pub fn with_caps(mut self, total: usize, per_owner: usize) -> SessionStore {
+        self.caps = (total, per_owner);
+        self
     }
 
     fn save(&self, map: &HashMap<[u8; 32], SessionRecord>) -> Result<()> {
         let mut sessions: Vec<SessionRecord> = map.values().cloned().collect();
-        sessions.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
+        sessions.sort_by_key(|s| s.seq);
         let f = SessionFile {
             format: 1,
             sessions,
@@ -185,21 +232,41 @@ impl SessionStore {
             token_id,
             created: rfc3339(now),
             expires: rfc3339(expires),
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
         };
+        let (max, per_owner) = self.caps;
+        let mut ended = Vec::new();
         let mut map = self.inner.lock();
         map.retain(|_, s| s.expires_at() > now);
-        while map.len() >= MAX_SESSIONS {
-            let Some(oldest) = map
-                .iter()
-                .min_by(|a, b| a.1.created.cmp(&b.1.created))
-                .map(|(k, _)| *k)
-            else {
-                break;
-            };
-            map.remove(&oldest);
+        // the owner's oldest sessions beyond its cap
+        let owner = rec.owner();
+        let mut mine: Vec<(u64, [u8; 32])> = map
+            .iter()
+            .filter(|(_, s)| s.owner() == owner)
+            .map(|(k, s)| (s.seq, *k))
+            .collect();
+        mine.sort_unstable();
+        let excess = (mine.len() + 1).saturating_sub(per_owner.max(1));
+        for (_, k) in mine.into_iter().take(excess) {
+            map.remove(&k);
+            ended.push(k);
+        }
+        // a full store: the biggest owner's oldest
+        while map.len() >= max.max(1) {
+            match evict_one(&mut map) {
+                Some(k) => ended.push(k),
+                None => break,
+            }
         }
         map.insert(digest, rec);
-        self.save(&map)?;
+        let saved = self.save(&map);
+        drop(map);
+        let mut ids = self.id_tokens.lock();
+        for k in ended {
+            ids.remove(&k);
+        }
+        drop(ids);
+        saved?;
         Ok((raw, digest))
     }
 
@@ -321,6 +388,48 @@ mod tests {
         assert_eq!(s2.active(150), 1);
         s2.remove(&digest).unwrap();
         assert!(s2.get(&digest, 150).is_none());
+
+        // caps: two sessions per owner, four in all
+        let s = SessionStore::open(d.path().join("auth/capped.json"), 0)
+            .unwrap()
+            .with_caps(4, 2);
+        let who = |name: &str| Identity {
+            kind: super::super::Kind::User,
+            name: name.into(),
+            groups: vec![],
+            display_name: None,
+        };
+        let new = |name: &str| {
+            s.create(Method::Password, who(name), None, 100, 200)
+                .unwrap()
+                .1
+        };
+        let a: Vec<[u8; 32]> = (0..3).map(|_| new("a")).collect();
+        // a third session of a ends its first, in the same second too
+        assert!(s.get(&a[0], 150).is_none());
+        assert!(s.get(&a[1], 150).is_some() && s.get(&a[2], 150).is_some());
+        let b = new("b");
+        let c = new("c");
+        assert_eq!(s.active(150), 4);
+        // full: the owner with the most sessions (a) loses its oldest, not b or c
+        let d1 = new("d");
+        assert!(s.get(&a[1], 150).is_none());
+        for k in [a[2], b, c, d1] {
+            assert!(s.get(&k, 150).is_some());
+        }
+        // all tied: the oldest session goes
+        new("e");
+        assert!(s.get(&a[2], 150).is_none());
+        assert!(s.get(&b, 150).is_some());
+        assert_eq!(s.active(150), 4);
+        // the order survives a restart
+        let s3 = SessionStore::open(d.path().join("auth/capped.json"), 150)
+            .unwrap()
+            .with_caps(4, 2);
+        s3.create(Method::Password, who("f"), None, 150, 200)
+            .unwrap();
+        assert!(s3.get(&b, 150).is_none());
+        assert!(s3.get(&c, 150).is_some());
 
         let mut h = HeaderMap::new();
         h.insert(

@@ -8,6 +8,11 @@ use crate::ratelimit::{RateLimiter, Sources};
 /// The fixture server with the rate limits `serve --auth-config … --rate-limit FLAG…`
 /// sets up (the pre-authentication limit on by default, callers keyed by owner).
 fn limited(f: Fixture, flags: &[&str]) -> AuthServer {
+    limited_behind(f, flags, &[])
+}
+
+/// [`limited`] with `--rate-limit-trusted-proxy PROXY…`.
+fn limited_behind(f: Fixture, flags: &[&str], proxies: &[&str]) -> AuthServer {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("auth.toml");
     std::fs::write(&config, config_text(&f)).unwrap();
@@ -16,15 +21,17 @@ fn limited(f: Fixture, flags: &[&str]) -> AuthServer {
     st.auth = Some(Arc::new(Auth::open(&config, dir.path()).unwrap().0));
     let sources = Sources {
         flags: flags.iter().map(|s| s.to_string()).collect(),
+        trusted_proxies: proxies.iter().map(|s| s.to_string()).collect(),
         auth: true,
         ..Default::default()
     };
-    let cfg = sources.load().unwrap().unwrap();
-    st.rate_limit = Some(Arc::new(
-        RateLimiter::new(&cfg)
-            .unwrap()
-            .with_keyer(Arc::new(crate::auth::PrincipalKeyer)),
-    ));
+    st.rate_limit = sources.load().unwrap().map(|cfg| {
+        Arc::new(
+            RateLimiter::new(&cfg)
+                .unwrap()
+                .with_keyer(Arc::new(crate::auth::PrincipalKeyer)),
+        )
+    });
     let st = Arc::new(st);
     for name in ["wiki", "public"] {
         let ds = st.attach(name, DbType::Mem, None).unwrap();
@@ -48,7 +55,7 @@ fn limited(f: Fixture, flags: &[&str]) -> AuthServer {
 }
 
 fn from(ip: &str) -> Peer {
-    Peer::Tcp(format!("{ip}:1").parse().unwrap())
+    Peer::Tcp(std::net::SocketAddr::new(ip.parse().unwrap(), 1))
 }
 
 async fn ask_from(s: &AuthServer, ip: &str, auth: &str) -> R {
@@ -89,7 +96,8 @@ async fn failed_logins_spend_the_address_budget_before_hashing() {
     }
     let hashed = || metric(&s.app, "sparkles_auth_password_verifications_total");
     assert_eq!(hashed().await, 3);
-    // spent: refused before the password is looked at, even the right one
+    // spent: a password check is refused before the password is looked at, even the
+    // right one
     let r = ask_from(&s, "203.0.113.1", &wrong).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(r.header("retry-after"), "20");
@@ -102,6 +110,12 @@ async fn failed_logins_spend_the_address_budget_before_hashing() {
         ask_from(&s, "203.0.113.2", &b("bob")).await.status,
         StatusCode::OK
     );
+    // a password verified before needs no hashing: it passes
+    assert_eq!(
+        ask_from(&s, "203.0.113.1", &b("bob")).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(hashed().await, 4);
     // successes cost nothing: the right password many times over
     for _ in 0..10 {
         assert_eq!(
@@ -215,7 +229,8 @@ async fn password_checks_wait_in_a_bounded_queue() {
 
 #[tokio::test]
 async fn concurrent_guesses_from_one_address_stop_at_its_budget() {
-    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    // two: one network may have at least two verifications waiting
+    let s = limited(Fixture::default(), &["preauth=2/min"]);
     let auth = s.auth();
     let hold = auth.hold_verifications();
     let tasks: Vec<_> = (0..10)
@@ -237,12 +252,12 @@ async fn concurrent_guesses_from_one_address_stop_at_its_budget() {
             })
         })
         .collect();
-    // three reserve a failure and wait for a permit; the others are refused unhashed
-    // (when their reservation fails, or at admission once the reservations are made)
-    until(|| auth.argon_load().1 == 3 && tasks.iter().filter(|t| t.is_finished()).count() == 7)
+    // two reserve a failure and wait for a permit; the others are refused unhashed when
+    // their reservation fails
+    until(|| auth.argon_load().1 == 2 && tasks.iter().filter(|t| t.is_finished()).count() == 8)
         .await;
     let refused = ["sparkles_rate_limited_total{", "class=\"preauth\""];
-    assert_eq!(metric_sum(&s.app, &refused).await, 7);
+    assert_eq!(metric_sum(&s.app, &refused).await, 8);
     assert_eq!(
         metric(&s.app, "sparkles_auth_password_verifications_total").await,
         0
@@ -253,11 +268,11 @@ async fn concurrent_guesses_from_one_address_stop_at_its_budget() {
         statuses.push(t.await.unwrap());
     }
     let count = |c: StatusCode| statuses.iter().filter(|s| **s == c).count();
-    assert_eq!(count(StatusCode::TOO_MANY_REQUESTS), 7);
-    assert_eq!(count(StatusCode::UNAUTHORIZED), 3);
+    assert_eq!(count(StatusCode::TOO_MANY_REQUESTS), 8);
+    assert_eq!(count(StatusCode::UNAUTHORIZED), 2);
     assert_eq!(
         metric(&s.app, "sparkles_auth_password_verifications_total").await,
-        3
+        2
     );
 }
 
@@ -356,4 +371,302 @@ async fn device_logins_are_limited_per_address() {
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(r.json()["reason"], "device");
     assert_eq!(start("203.0.113.8").await.status, StatusCode::OK);
+}
+
+/// A failed Basic login to `/wiki` from `peer` with `headers`.
+async fn guess_from(s: &AuthServer, peer: Peer, headers: &[(&str, &str)], pw: &str) -> R {
+    let wrong = basic("bob", pw);
+    let mut h = headers.to_vec();
+    h.push(("authorization", &wrong));
+    call_from(&s.app, peer, "GET", &format!("/wiki{ASK}"), &h, "").await
+}
+
+#[tokio::test]
+async fn a_client_cannot_pick_its_budget_with_forwarded() {
+    // per hour: no failure refills while the test runs
+    let s = limited_behind(Fixture::default(), &["preauth=30/h"], &["127.0.0.1"]);
+    let proxy = || from("127.0.0.1");
+    // one real client behind the proxy, a new Forwarded value with every guess
+    for i in 0..30 {
+        let fwd = format!("for=198.51.100.{i}");
+        let h = [
+            ("x-forwarded-for", "203.0.113.50"),
+            ("forwarded", fwd.as_str()),
+        ];
+        let r = guess_from(&s, proxy(), &h, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let h = [
+        ("x-forwarded-for", "203.0.113.50"),
+        ("forwarded", "for=198.51.100.200"),
+    ];
+    let r = guess_from(&s, proxy(), &h, "wrong-30").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // another client behind the same proxy still signs in
+    let wiki = format!("/wiki{ASK}");
+    let bob = b("bob");
+    let h = [
+        ("x-forwarded-for", "203.0.113.51"),
+        ("authorization", bob.as_str()),
+    ];
+    let r = call_from(&s.app, proxy(), "GET", &wiki, &h, "").await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unix_socket_clients_are_told_apart_by_a_trusted_proxy() {
+    let s = limited_behind(Fixture::default(), &["preauth=3/min"], &["unix"]);
+    let one = [("x-forwarded-for", "203.0.113.1")];
+    for i in 0..3 {
+        let r = guess_from(&s, Peer::Unix, &one, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let r = guess_from(&s, Peer::Unix, &one, "wrong-3").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // another address behind the proxy is not affected
+    let two = [("x-forwarded-for", "203.0.113.2")];
+    let r = guess_from(&s, Peer::Unix, &two, "wrong").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_untrusted_unix_socket_shares_one_budget() {
+    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let one = [("x-forwarded-for", "203.0.113.1")];
+    for i in 0..3 {
+        let r = guess_from(&s, Peer::Unix, &one, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    // guessing is bounded on the socket too: its clients share one budget
+    let two = [("x-forwarded-for", "203.0.113.2")];
+    let r = guess_from(&s, Peer::Unix, &two, "wrong").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        metric(
+            &s.app,
+            "sparkles_rate_limit_untrusted_forwarded_total{limiter=\"requests\"}"
+        )
+        .await,
+        4
+    );
+}
+
+/// Spend the `preauth=3/min` budget of `ip` with wrong passwords.
+async fn exhaust(s: &AuthServer, ip: &str) {
+    for i in 0..3 {
+        let r = guess_from(s, from(ip), &[], &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let r = guess_from(s, from(ip), &[], "wrong-3").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn an_exhausted_address_keeps_valid_credentials_and_health_checks() {
+    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let (cookie, _) = password_session(&s, "bob").await;
+    let ip = "192.0.2.1";
+    exhaust(&s, ip).await;
+    let get = |uri: &'static str, h: Vec<(&'static str, String)>| {
+        let app = s.app.clone();
+        async move {
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            call_from(&app, from(ip), "GET", uri, &h, "").await.status
+        }
+    };
+    let wiki = "/wiki/sparql?query=ASK%7B%7D";
+    // cheap credentials that verify pass: a static token, a session
+    assert_eq!(
+        get(wiki, vec![("authorization", bearer(&t_etl()))]).await,
+        StatusCode::OK
+    );
+    assert_eq!(get(wiki, vec![("cookie", cookie)]).await, StatusCode::OK);
+    // anonymous requests, health checks and the UI
+    assert_eq!(
+        get("/public/sparql?query=ASK%7B%7D", vec![]).await,
+        StatusCode::OK
+    );
+    assert_eq!(get("/$/ping", vec![]).await, StatusCode::OK);
+    assert_eq!(get("/$/ready", vec![]).await, StatusCode::OK);
+    assert_ne!(get("/ui/", vec![]).await, StatusCode::TOO_MANY_REQUESTS);
+    // what would verify a password, or look up an unknown token, is refused
+    let hashed = metric(&s.app, "sparkles_auth_password_verifications_total").await;
+    let refused = [
+        get(wiki, vec![("authorization", b("carol"))]).await,
+        get(wiki, vec![("authorization", bearer(&tok('Q')))]).await,
+        get(wiki, vec![("authorization", basic("x", &tok('Q')))]).await,
+    ];
+    assert_eq!(refused, [StatusCode::TOO_MANY_REQUESTS; 3]);
+    let login = |body: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let h = [("content-type", "application/json")];
+            call_from(&app, from(ip), "POST", "/$/auth/login", &h, body)
+                .await
+                .status
+        }
+    };
+    assert_eq!(
+        login(r#"{"user":"carol","password":"carol-pw"}"#).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let unknown = format!(r#"{{"token":"{}"}}"#, tok('Q'));
+    let unknown: &'static str = Box::leak(unknown.into_boxed_str());
+    assert_eq!(login(unknown).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        metric(&s.app, "sparkles_auth_password_verifications_total").await,
+        hashed
+    );
+}
+
+#[tokio::test]
+async fn only_failed_credentials_spend_the_address_budget() {
+    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let ip = "192.0.2.7";
+    let wiki = format!("/wiki{ASK}");
+    let bob = b("bob");
+    let as_bob = [("authorization", bob.as_str())];
+    // a SERVICE query refused by policy, a hidden dataset, anonymous requests that need
+    // credentials: none of them is a failed check of a credential
+    let q = "SELECT * { SERVICE <http://127.0.0.1:1/x> { ?s ?p ?o } }";
+    let service = format!(
+        "/wiki/sparql?query={}",
+        percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC)
+    );
+    for _ in 0..10 {
+        let r = call_from(&s.app, from(ip), "GET", &service, &as_bob, "").await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+        let r = call_from(
+            &s.app,
+            from(ip),
+            "GET",
+            &format!("/secret{ASK}"),
+            &as_bob,
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        let r = call_from(&s.app, from(ip), "GET", &wiki, &[], "").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    }
+    // the budget is whole: three wrong passwords, and another user still signs in
+    for i in 0..3 {
+        let r = guess_from(&s, from(ip), &[], &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let r = call_from(&s.app, from(ip), "GET", &wiki, &as_bob, "").await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn csrf_refusals_on_auth_routes_spend_the_budget() {
+    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let ip = "192.0.2.8";
+    for _ in 0..3 {
+        let r = call_from(
+            &s.app,
+            from(ip),
+            "POST",
+            "/$/auth/login",
+            &[
+                ("content-type", "application/json"),
+                ("origin", "https://evil.example"),
+            ],
+            r#"{"user":"bob","password":"bob-pw"}"#,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+    }
+    let r = guess_from(&s, from(ip), &[], "wrong").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn ipv6_networks_have_a_budget_of_their_own() {
+    let s = limited(Fixture::default(), &["preauth=3/h"]);
+    // eight /64s of one /48 spend it (eight times a /64's budget; per hour, so nothing
+    // refills while the test runs)
+    for i in 0..8 {
+        for j in 0..3 {
+            let peer = from(&format!("2001:db8:0:{i:x}::1"));
+            let r = guess_from(&s, peer, &[], &format!("wrong-{i}-{j}")).await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i} {j}");
+        }
+    }
+    let r = guess_from(&s, from("2001:db8:0:ff::1"), &[], "wrong").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    let r = guess_from(&s, from("2001:db8:1::1"), &[], "wrong").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn one_network_cannot_fill_the_verification_queue() {
+    let s = limited(Fixture::default(), &["preauth=off"]);
+    let auth = s.auth();
+    let per_client = auth.verifications_per_client();
+    let hold = auth.hold_verifications();
+    let guess = |ip: &'static str, i: usize| {
+        let app = s.app.clone();
+        tokio::spawn(async move {
+            let wrong = basic("bob", &format!("wrong-{i}"));
+            let wiki = format!("/wiki{ASK}");
+            call_from(
+                &app,
+                from(ip),
+                "GET",
+                &wiki,
+                &[("authorization", &wrong)],
+                "",
+            )
+            .await
+            .status
+        })
+    };
+    // one network (an IPv6 /48 here) waits for at most its share; the rest is busy
+    let ips = ["2001:db8::1", "2001:db8:0:1::1"];
+    let tasks: Vec<_> = (0..per_client + 2).map(|i| guess(ips[i % 2], i)).collect();
+    until(|| {
+        auth.argon_load().1 == per_client && tasks.iter().filter(|t| t.is_finished()).count() == 2
+    })
+    .await;
+    // another network still gets in line
+    let other = guess("203.0.113.9", 99);
+    until(|| auth.argon_load().1 == per_client + 1).await;
+    drop(hold);
+    let mut statuses = Vec::new();
+    for t in tasks {
+        statuses.push(t.await.unwrap());
+    }
+    let count = |c: StatusCode| statuses.iter().filter(|s| **s == c).count();
+    assert_eq!(count(StatusCode::SERVICE_UNAVAILABLE), 2);
+    assert_eq!(count(StatusCode::UNAUTHORIZED), per_client);
+    assert_eq!(other.await.unwrap(), StatusCode::UNAUTHORIZED);
+    assert_eq!(auth.argon_load(), (0, 0));
+}
+
+#[tokio::test]
+async fn device_logins_are_limited_per_network_without_preauth() {
+    let s = limited(Fixture::default(), &["preauth=off"]);
+    assert!(s.state.rate_limit.is_none());
+    let app = &s.app;
+    let start = |ip: String| async move {
+        call_from(
+            app,
+            from(&ip),
+            "POST",
+            "/$/auth/device",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            "",
+        )
+        .await
+    };
+    for i in 0..20 {
+        let r = start(format!("2001:db8:0:{i:x}::1")).await;
+        assert_eq!(r.status, StatusCode::OK, "{i}");
+    }
+    let r = start("2001:db8:0:ff::1".into()).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.json()["reason"], "device");
+    assert_eq!(start("2001:db8:1::1".into()).await.status, StatusCode::OK);
+    assert_eq!(start("203.0.113.8".into()).await.status, StatusCode::OK);
 }

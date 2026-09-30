@@ -476,10 +476,14 @@ enum Cmd {
         /// JSON file of rate limits (re-read on SIGHUP); --rate-limit flags apply on top
         #[arg(long, value_name = "FILE")]
         rate_limit_config: Option<PathBuf>,
-        /// Proxy (address or CIDR) whose Forwarded / X-Forwarded-For names the client
-        /// for rate limiting
+        /// Proxy (address, CIDR, or `unix` for the Unix socket) whose forwarding header
+        /// names the client for rate limiting and the auth layer's limits
         #[arg(long, value_name = "CIDR")]
         rate_limit_trusted_proxy: Vec<String>,
+        /// The header trusted proxies name the client in: x-forwarded-for (the default)
+        /// or forwarded; the other one is ignored
+        #[arg(long, value_name = "HEADER")]
+        rate_limit_trusted_proxy_header: Option<String>,
         /// Export traces and metrics over OTLP (also enabled by OTEL_EXPORTER_OTLP_ENDPOINT
         /// and the other OTEL_* variables)
         #[arg(long)]
@@ -529,7 +533,9 @@ enum Cmd {
         /// A host name clients reach the server by without --auth-config, such as a
         /// reverse proxy's (repeatable). An open server answers only IP addresses,
         /// localhost, --host and these names, and refuses any other `Host` with 421,
-        /// which stops web pages that rebind their DNS name to it
+        /// which stops web pages that rebind their DNS name to it; with auth, the same
+        /// holds for requests carrying trusted proxy headers from loopback or the Unix
+        /// socket
         #[arg(long, value_name = "NAME")]
         public_host: Vec<String>,
     },
@@ -1267,6 +1273,7 @@ fn run() -> Result<()> {
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
+            rate_limit_trusted_proxy_header,
             ..
         } => {
             // an open server on the network, or a bad auth configuration, stops the
@@ -1298,6 +1305,9 @@ fn run() -> Result<()> {
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
+            if let Some(w) = auth::proxy_host_warning(&st, !public_host.is_empty()) {
+                tracing::warn!("{w}");
+            }
             #[cfg(feature = "backup")]
             {
                 let mut b = backup::BackupState::new(&data, backup_config, backup_max_tasks)?;
@@ -1365,10 +1375,19 @@ fn run() -> Result<()> {
                 file: rate_limit_config,
                 flags: rate_limit,
                 trusted_proxies: rate_limit_trusted_proxy,
+                trusted_proxy_header: rate_limit_trusted_proxy_header,
                 // with auth, the pre-authentication limit is on by default
                 auth: st.auth.is_some(),
             };
             let limit_cfg = limit_sources.load()?;
+            for w in ratelimit::client_warnings(
+                limit_cfg.as_ref(),
+                st.auth.is_some(),
+                unix_socket.is_some(),
+                exposure::loopback(&host),
+            ) {
+                tracing::warn!("{w}");
+            }
             let requests_limited = exposure::requests_limited(limit_cfg.as_ref());
             if let Some(cfg) = limit_cfg {
                 // signed-in callers are limited per principal, others per address

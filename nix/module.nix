@@ -19,22 +19,41 @@ let
 
   json = pkgs.formats.json { };
 
-  # behind the bundled nginx, the client address comes from X-Forwarded-For
-  rateLimits =
-    if cfg.rateLimits == null then
-      null
-    else
-      cfg.rateLimits
-      // lib.optionalAttrs cfg.nginx.enable {
-        trustedProxies = lib.unique (
-          (cfg.rateLimits.trustedProxies or [ ])
-          ++ [
-            "127.0.0.1"
-            "::1"
-          ]
-        );
-      };
+  rateLimits = cfg.rateLimits;
   rateLimitsFile = "/etc/sparkles/rate-limits.json";
+
+  # behind the bundled nginx the client address comes from its X-Forwarded-For, for the
+  # rate limits and for the limits of authentication (on whenever auth is): the server
+  # trusts the addresses nginx connects from, or the Unix socket
+  nginxPeers =
+    if cfg.unixSocket != null then
+      [ "unix" ]
+    else
+      lib.unique (
+        [
+          "127.0.0.1"
+          "::1"
+        ]
+        # a specific local address is also the source nginx connects from
+        ++ lib.optional (
+          !lib.elem cfg.listenAddress [
+            "0.0.0.0"
+            "::"
+            "localhost"
+          ]
+          && builtins.match "[0-9A-Fa-f.:]+" cfg.listenAddress != null
+        ) cfg.listenAddress
+      );
+
+  # the load directory, and whether it lies where the service's hardening hides homes
+  loadDir = if cfg.loadDir == null then null else lib.removeSuffix "/" (toString cfg.loadDir);
+  loadDirInHome =
+    loadDir != null
+    && lib.any (h: loadDir == h || lib.hasPrefix "${h}/" loadDir) [
+      "/home"
+      "/root"
+      "/run/user"
+    ];
 
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
@@ -81,6 +100,10 @@ let
     cfg.unixSocket
   ]
   ++ lib.optional cfg.allowOpenNetwork "--allow-open-network"
+  ++ lib.optionals (cfg.loadDir != null) [
+    "--load-dir"
+    loadDir
+  ]
   # nginx forwards the name it was reached by: without auth the server answers only
   # IP addresses, localhost and --public-host names
   ++ lib.optionals cfg.nginx.enable (
@@ -104,6 +127,12 @@ let
     "--rate-limit-config"
     rateLimitsFile
   ]
+  ++ lib.optionals cfg.nginx.enable (
+    lib.concatMap (peer: [
+      "--rate-limit-trusted-proxy"
+      peer
+    ]) nginxPeers
+  )
   ++ datasetArgs
   ++ cfg.extraArgs;
 
@@ -235,6 +264,19 @@ in
       description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
     };
 
+    loadDir = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/srv/rdf/import";
+      description = ''
+        Directory that `LOAD <file:…>` over HTTP may read from (`--load-dir`, for
+        server-admin callers); without it such loads are refused. The service reads it
+        read-only, so it must be readable by {option}`user`; it must not contain
+        {option}`dataDir`, and must not be under `/tmp` or `/var/tmp` (the service has a
+        private temporary directory).
+      '';
+    };
+
     readOnly = mkOption {
       type = types.bool;
       default = false;
@@ -351,8 +393,10 @@ in
         Rate and concurrency limits per request class (`auth`, `query`, `update`,
         `admin`), written to ${rateLimitsFile} and passed as `--rate-limit-config`
         (see the Rate limiting section of `docs/API.md`). Changing it reloads the service
-        (SIGHUP) instead of restarting it. With `nginx.enable`, the loopback addresses
-        are added to `trustedProxies`. `null` (the default): no limits.
+        (SIGHUP) instead of restarting it. `null` (the default): no limits, except the
+        failed-authentication budget that is on whenever {option}`auth.configFile` is set.
+        With `nginx.enable` the server trusts nginx (the loopback addresses, or the Unix
+        socket) to name the client in `X-Forwarded-For`, whether or not this is set.
       '';
     };
 
@@ -430,6 +474,25 @@ in
           || (lib.hasPrefix "/" cfg.auth.configFile && !lib.hasPrefix "/nix/store" cfg.auth.configFile);
         message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
       }
+      {
+        assertion =
+          loadDir == null
+          || (
+            lib.hasPrefix "/" loadDir
+            && loadDir != "/"
+            && !lib.hasPrefix "${loadDir}/" "${lib.removeSuffix "/" (toString cfg.dataDir)}/"
+          );
+        message = "services.sparkles.loadDir must be an absolute directory that does not contain dataDir.";
+      }
+      {
+        assertion =
+          loadDir == null
+          || !lib.any (t: loadDir == t || lib.hasPrefix "${t}/" loadDir) [
+            "/tmp"
+            "/var/tmp"
+          ];
+        message = "services.sparkles.loadDir must not be under /tmp or /var/tmp: the service has a private temporary directory.";
+      }
     ];
 
     users.users = lib.mkMerge [
@@ -504,6 +567,7 @@ in
         StateDirectory = mkIf (cfg.dataDir == "/var/lib/sparkles") "sparkles";
         StateDirectoryMode = "0750";
         ReadWritePaths = writablePaths;
+        ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
         Restart = "on-failure";
         RestartSec = 5;
         # graceful shutdown flushes nothing extra (commits are durable), but give
@@ -516,7 +580,8 @@ in
         PrivateTmp = true;
         PrivateDevices = true;
         ProtectSystem = "strict";
-        ProtectHome = true;
+        # a load directory under a home stays readable
+        ProtectHome = if loadDirInHome then "read-only" else true;
         ProtectHostname = true;
         ProtectClock = true;
         ProtectKernelTunables = true;
@@ -554,8 +619,21 @@ in
       virtualHosts.${cfg.nginx.virtualHost} = {
         locations."/" = {
           proxyPass = upstream;
-          recommendedProxySettings = true;
+          # the recommended headers follow, except that X-Forwarded-For is overwritten
+          recommendedProxySettings = false;
           extraConfig = ''
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            # the server trusts this header from nginx and counts failed logins and rate
+            # limits by it, so it names the peer instead of appending to what the client
+            # sent (behind another proxy, configure the realip module so that
+            # $remote_addr is the client)
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Server $hostname;
+            # a client's own Forwarded header never reaches the server
+            proxy_set_header Forwarded "";
             client_max_body_size ${cfg.nginx.clientMaxBodySize};
             proxy_read_timeout ${toString cfg.nginx.proxyTimeout}s;
             proxy_send_timeout ${toString cfg.nginx.proxyTimeout}s;

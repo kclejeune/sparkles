@@ -311,6 +311,48 @@ fn host_of(req: &Request) -> Option<&str> {
     }
 }
 
+/// With trusted proxy headers accepted from a local peer (a loopback address or the Unix
+/// socket), a request that carries them must name a `Host` the server is known by: an IP
+/// address, `localhost`, `--host`, a `--public-host` name or the host of
+/// `server.public_url`. Otherwise a web page that rebinds its DNS name to the server (or
+/// to the proxy in front of it) could send its own `Remote-User`; `421`.
+#[cfg(feature = "auth")]
+fn local_proxy_gate(
+    st: &AppState,
+    policy: &super::policy::Policy,
+    peer: Option<&super::Peer>,
+    req: &Request,
+) -> Option<Response> {
+    let px = policy.proxy.as_ref()?;
+    let local = match peer? {
+        super::Peer::Unix => true,
+        super::Peer::Tcp(a) => a.ip().to_canonical().is_loopback(),
+    };
+    if !local || !px.has_headers(req.headers()) || !px.trusted.trusts(peer) {
+        return None;
+    }
+    let host = host_of(req)?;
+    let public = policy
+        .public_url
+        .as_deref()
+        .and_then(|u| reqwest::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_string));
+    let known = st.hosts.allows(host)
+        || public.is_some_and(|p| {
+            crate::exposure::Hosts::new("unix", &[p]).is_ok_and(|h| h.allows(host))
+        });
+    (!known).then(|| {
+        json_error(
+            StatusCode::MISDIRECTED_REQUEST,
+            &format!(
+                "this server does not take proxy identity headers for host '{host}' (it \
+                 answers IP addresses, localhost, --host and --public-host names, and the \
+                 host of server.public_url)"
+            ),
+        )
+    })
+}
+
 /// Without auth every caller is the local principal, so the only thing between a web
 /// page and the server's data is the browser: refuse a `Host` the server is not known
 /// by (DNS rebinding, `421`), and the requests the origin gate refuses with auth
@@ -573,20 +615,55 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<axum::extract::ConnectInfo<super::Peer>>()
         .map(|c| c.0);
+    // identity headers from a local proxy (loopback or the Unix socket) can also come
+    // from a web page that rebinds its DNS name to the server: they need a known `Host`
+    if let Some(r) = local_proxy_gate(st, &policy, peer.as_ref(), &req) {
+        count(Denied::Forbidden);
+        return with_report(
+            r,
+            AuthReport {
+                principal: None,
+                scheme: Some("proxy"),
+                denied: Some(Denied::Forbidden),
+                error: None,
+            },
+        );
+    }
     let admission = req
         .extensions()
         .get::<crate::ratelimit::Admission>()
         .cloned();
+    let client = req
+        .extensions()
+        .get::<crate::ratelimit::ClientAddr>()
+        .map(|c| c.0.network());
     let authed = match auth
-        .authenticate(req.headers(), peer.as_ref(), admission.as_ref())
+        .authenticate(
+            req.headers(),
+            peer.as_ref(),
+            admission.as_ref(),
+            client.as_ref(),
+        )
         .await
     {
         Ok(a) => a,
-        Err(e) => {
+        Err(mut e) => {
+            // credentials that were checked and failed (not a busy check, this limit's
+            // refusal, or a proxy identity that is not admitted)
+            let failed = matches!(
+                e.failure,
+                Failure::Malformed | Failure::Invalid | Failure::Expired
+            );
+            // an address without failures left has its unknown tokens refused like its
+            // password checks
+            let exhausted = failed && admission.as_ref().is_some_and(|a| a.exhausted());
+            if exhausted {
+                e.failure = Failure::Limited;
+            }
             auth.count_failure(e);
             span.record("principal", "-");
             span.record("auth", e.scheme);
-            let r = match e.failure {
+            let mut r = match e.failure {
                 // the address spent its failures: the pre-authentication limit's 429
                 Failure::Limited => match &admission {
                     Some(a) => a.refusal(),
@@ -627,6 +704,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     basic,
                 ),
             };
+            if failed && !exhausted {
+                r.extensions_mut().insert(crate::ratelimit::AuthFailed);
+            }
             return with_report(
                 r,
                 AuthReport {
@@ -651,6 +731,15 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         }
         r
     };
+    // a refused origin or CSRF token on an auth route (a login, a token, a device
+    // approval) is a failed authentication too
+    let auth_route = route.starts_with("/$/auth/");
+    let csrf_failed = |mut r: Response| {
+        if auth_route {
+            r.extensions_mut().insert(crate::ratelimit::AuthFailed);
+        }
+        r
+    };
     if let Some(n) = p.log_name() {
         span.record("principal", n.as_str());
     }
@@ -670,7 +759,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         )
     {
         let r = json_error(StatusCode::FORBIDDEN, "cross-origin request refused");
-        return finish(deny(Denied::CrossOrigin, r, &p));
+        return finish(csrf_failed(deny(Denied::CrossOrigin, r, &p)));
     }
     if !safe(&method) && p.is_ambient() && !cli_grant_route(&route) {
         let sent = req
@@ -681,7 +770,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         let want = p.info.csrf.as_deref().unwrap_or("");
         if want.is_empty() || !super::crypto::ct_eq(sent, want.as_bytes()) {
             let r = json_error(StatusCode::FORBIDDEN, "CSRF token missing or invalid");
-            return finish(deny(Denied::Csrf, r, &p));
+            return finish(csrf_failed(deny(Denied::Csrf, r, &p)));
         }
     }
 

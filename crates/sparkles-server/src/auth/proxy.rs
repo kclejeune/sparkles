@@ -3,6 +3,7 @@
 
 #[cfg(feature = "auth")]
 use super::config::{ProxyCfg, proxy_preset};
+#[cfg(feature = "auth")]
 use axum::http::HeaderMap;
 use std::net::{IpAddr, SocketAddr};
 
@@ -55,6 +56,16 @@ impl TrustedProxies {
         t
     }
 
+    /// Whether a local peer (a loopback address or the Unix socket) is trusted.
+    #[cfg(feature = "auth")]
+    pub fn local(&self) -> bool {
+        self.unix
+            || self.nets.iter().any(|n| {
+                n.contains(&IpAddr::from([127, 0, 0, 1]))
+                    || n.contains(&IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]))
+            })
+    }
+
     pub fn trusts(&self, peer: Option<&Peer>) -> bool {
         match peer {
             Some(Peer::Unix) => self.unix,
@@ -65,29 +76,6 @@ impl TrustedProxies {
             None => false,
         }
     }
-}
-
-/// The client's address: the peer, or the first `X-Forwarded-For` entry when the peer
-/// is a trusted proxy. `None` on the Unix socket without a forwarded address.
-#[allow(dead_code)] // for per-client limits behind a proxy
-pub fn client_ip(
-    peer: Option<&Peer>,
-    headers: &HeaderMap,
-    trusted: &TrustedProxies,
-) -> Option<IpAddr> {
-    let direct = match peer {
-        Some(Peer::Tcp(a)) => Some(a.ip().to_canonical()),
-        _ => None,
-    };
-    if !trusted.trusts(peer) {
-        return direct;
-    }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .and_then(|v| v.trim().parse().ok())
-        .or(direct)
 }
 
 /// Header settings of `[proxy]`, resolved from its preset and overrides.
@@ -172,7 +160,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn trust_and_client_ip() {
+    fn trust() {
         let t = TrustedProxies::parse(&["127.0.0.1/32".into(), "::1".into(), "unix".into()]);
         let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let other: SocketAddr = "127.0.0.2:5000".parse().unwrap();
@@ -182,19 +170,6 @@ mod tests {
         assert!(!t.trusts(Some(&Peer::Tcp(other))));
         assert!(t.trusts(Some(&Peer::Unix)));
         assert!(!t.trusts(None));
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("203.0.113.9, 10.0.0.1"),
-        );
-        assert_eq!(
-            client_ip(Some(&Peer::Tcp(local)), &h, &t),
-            Some("203.0.113.9".parse().unwrap())
-        );
-        assert_eq!(
-            client_ip(Some(&Peer::Tcp(other)), &h, &t),
-            Some("127.0.0.2".parse().unwrap())
-        );
     }
 
     #[test]

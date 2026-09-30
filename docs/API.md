@@ -101,7 +101,9 @@ With rate limits configured (or authentication on), `sparkles_rate_limited_total
 `outcome="rate_limited"` appears in `sparkles_requests_total`. The size of each limiter's
 client state is in `sparkles_rate_limit_keys{limiter}`, `sparkles_rate_limit_max_keys{limiter}`,
 `sparkles_rate_limit_evictions_total{limiter}` and `sparkles_rate_limit_penalties{limiter}`
-(`limiter` is `requests`, or `auth` for the auth layer's own limits).
+(`limiter` is `requests`, or `auth` for the auth layer's own limits), and
+`sparkles_rate_limit_untrusted_forwarded_total{limiter}` counts requests whose
+`X-Forwarded-For` or `Forwarded` came from a peer that is not a trusted proxy (ignored).
 
 ```ts
 type MetricsSnapshot = {
@@ -219,7 +221,7 @@ Off by default, except for failed authentications when authentication is on (see
 | `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
-| `preauth` | every request, before authentication: authentication failures per client address (no per-dataset form) |
+| `preauth` | every request, before authentication: failed credential checks per client address and IPv6 /48 (no per-dataset form) |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
 
@@ -230,7 +232,8 @@ Off by default, except for failed authentications when authentication is on (see
 * `concurrency=N`: requests of the class in flight server-wide;
 * `client-concurrency=N`: requests in flight per client;
 * `failure-cost=N`: what a `401` or `403` response costs, in requests (default 1), so that
-  failed logins exhaust the budget faster.
+  failed logins exhaust the budget faster (for `preauth`: what a failed credential check
+  costs).
 
 `CLASS@DATASET=…` replaces the class limit for requests to that dataset (with its own
 counters); `CLASS@DATASET=off` exempts the dataset. Examples:
@@ -257,22 +260,32 @@ they drop below it. A bad file keeps the running configuration.
   },
   "datasets": { "public": { "query": { "rate": "5/s" } } },
   "trustedProxies": ["127.0.0.1", "::1"],
+  "trustedProxyHeader": "x-forwarded-for",
   "maxKeys": 100000
 }
 ```
 
 **Clients.** A client is its peer address (an IPv6 client by its /64). Behind a reverse
-proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`): for
-requests from a trusted address the client is the rightmost untrusted hop of `Forwarded`
-(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. With
-authentication, a signed-in caller is counted as its owner instead (see
+proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`;
+`unix` trusts the `--unix-socket`): for requests from a trusted peer the client is the
+rightmost untrusted hop of `X-Forwarded-For`, the header nginx, HAProxy, Caddy, Traefik
+and cloud load balancers set. Only that header is read, so a client's own `Forwarded`
+changes nothing. For a proxy that sets `Forwarded` (RFC 7239) instead, set
+`"trustedProxyHeader": "forwarded"` (or `--rate-limit-trusted-proxy-header forwarded`);
+`X-Forwarded-For` is then the ignored one. A hop that is not an address (`unknown`, an
+obfuscated `_id`) is a client of its own, named by that text; when every hop is trusted,
+the client is the leftmost of them. On the Unix socket without a trusted `unix`, clients
+have no address and share one key. Forwarding headers from untrusted peers are ignored,
+counted in `sparkles_rate_limit_untrusted_forwarded_total`, and the first is logged as a
+warning. With authentication, a signed-in caller is counted as its owner instead (see
 [Authentication](#authentication-and-access-control)), except in `preauth` and `auth`.
 
 Limits by address are only as good as the address: they need a peer address that clients
-cannot choose. List only proxies that overwrite (or append to) the forwarding headers
-they receive, never a network that clients can send from; and behind a proxy that is not
-listed, every client has the proxy's address and shares one budget (with `preauth`, one
-client's failed logins then refuse everybody's requests for a while).
+cannot choose. List only proxies that overwrite (nginx: `proxy_set_header X-Forwarded-For
+$remote_addr;`) or append to the header they receive, never a network that clients can
+send from. Behind a proxy that is not listed, every client has the proxy's address and
+shares one budget, so `serve` warns at startup when authentication is on and the listener
+(the Unix socket, or a loopback address) trusts no proxy.
 
 At most `maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of
 new addresses evicts other rarely seen clients, never one with requests in flight. An
@@ -314,18 +327,30 @@ in `sparkles_requests_total{outcome="rate_limited"}` and
 #### Before authentication (`preauth`)
 
 A first stage runs before any credential is checked, so that password guessing and the
-hashing it costs are bounded per client address. Every address has a budget of
-authentication failures: a `401` or `403`, a refusal of the auth layer (a hidden
-dataset's `404`, a cross-origin or CSRF refusal), an invalid session cookie, or a busy
-password check. Each costs `failure-cost` (default 1); successful requests cost nothing,
-and an address without failures leaves no state behind. An address that has spent its
-budget is refused with `429` (`"limitClass": "preauth"`, `"reason": "failures"`) until it
-refills, whatever it sends and before any password is hashed. A password check (HTTP
-Basic, a UI password login) takes the cost of a failure before it starts and gives it
-back when the password is right, so concurrent guesses from one address cannot all start
-hashing. Responses to failures carry the stage's `RateLimit-Policy` and `RateLimit`.
-Requests without a peer address (over `--unix-socket`) are not counted: they would all
-share one budget.
+hashing it costs are bounded per client address. Every address has a budget of failed
+credential checks: a wrong password (HTTP Basic or a UI login), an unknown, expired or
+malformed token, an invalid session cookie, an unknown device user code or loopback
+code, a failed OIDC callback, and a cross-origin or CSRF refusal on an `/$/auth/` route.
+Nothing else is charged: not a `403` of authorization (a read-only server, `SERVICE` or
+`LOAD` refused by policy, a missing permission), not a hidden dataset's `404`, not the
+`401` of an anonymous request, and not a busy password check. Each failure costs
+`failure-cost` (default 1); an address without failures leaves no state behind. An IPv6
+client also spends the budget of its /48, eight times as large (`"preauth/48"` in the
+headers), so a network that holds many /64s does not get a budget per /64.
+
+An address (or /48) that has spent its budget is refused with `429` (`"limitClass":
+"preauth"`, `"reason": "failures"`) until it refills, but only for what would hash a
+password (HTTP Basic and UI password logins whose credentials are not in the
+verified-credential cache) or turns out to present an unknown token. Valid tokens,
+sessions and proxy identities, anonymous requests, `/$/ping`, `/$/ready` and the UI keep
+working, so one client's guesses from a shared address do not take the others, or a load
+balancer's health checks, down with it. A password check takes the cost of a failure
+before it starts and gives it back when the password is right, so concurrent guesses
+from one address cannot all start hashing. Responses to failures carry the stage's
+`RateLimit-Policy` and `RateLimit`.
+Requests without a client address (over `--unix-socket` with no trusted `unix` proxy)
+share one budget, so guessing stays bounded there too; trust the proxy on the socket so
+that its clients are told apart.
 
 With `--auth-config` it is on by default at `30/min,burst=60` (60 failures at once, then
 one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` or
@@ -1383,7 +1408,11 @@ routes answer `404`.
   OIDC sessions, `proxy.logout_url` for proxy users.
 
 Sessions are kept in `<data>/auth/sessions.json` (hashed ids, 0600) and survive restarts;
-replacing `<data>/auth/session.key` signs everyone out.
+replacing `<data>/auth/session.key` signs everyone out. An owner (a user, an OIDC or
+proxy identity; a token login counts for the token's owner) keeps at most 50 sessions: a
+new one ends the owner's oldest. The server keeps at most 10,000; when full, the owner
+that holds the most loses its oldest, so that no one can sign the others out by opening
+sessions.
 
 ### API tokens
 
@@ -1508,6 +1537,13 @@ the safest; `tailscale serve` connects from 127.0.0.1. Let `/$/auth/config`,
 the proxy unauthenticated so the CLI can sign in, or give the CLI a separate route.
 An `Authorization` header wins over proxy headers. Do not combine a proxy's own Basic
 authentication with Sparkles auth: the proxy would forward its `Authorization` header.
+When a local peer is trusted (a loopback address or `unix`), a request that carries
+identity headers must name a known `Host`: an IP address, `localhost`, `--host`, a
+`--public-host` name or the host of `server.public_url`; any other is refused with `421`,
+so that a web page that rebinds its own DNS name to the server (or to the proxy in
+front of it) cannot send its own `Remote-User`. Pass the name the proxy is reached by
+with `--public-host` or `server.public_url` (the server warns at startup when it knows
+none; the NixOS module passes its virtual host).
 
 Credentials travel as bearer secrets: terminate TLS in front of the server (the server
 warns when auth is on and it listens beyond loopback).
@@ -1529,12 +1565,17 @@ per client address.
 
 The auth layer has limits of its own, which answer `429` with `"limitClass": "auth"`:
 tokens minted per owner (`tokens_policy.mint_rate`, default `60/h`; `reason` `mint`),
-device logins started per address (20, then two a minute, with `preauth` on; `device`) and
-unknown user codes per session (20, then two a minute; `device-code`). An owner has at
+device logins started per client network (an IPv4 address or an IPv6 /48; 20, then two a
+minute, whether `preauth` is on or not; `device`) and
+unknown user codes per client network and per owner (20, then two a minute, whichever
+runs out first; `device-code`; each is also a failure for `preauth`). An owner has at
 most `tokens_policy.max_active_per_owner` unexpired tokens (default 100); minting another
 answers `409` until one is revoked or expires. At most max(1, cores / 2) argon2 password
 verifications run at once and four per permit wait (up to five seconds); a check beyond
-that is refused at once with `503` and `Retry-After: 1`.
+that is refused at once with `503` and `Retry-After: 1`. One client network (an IPv4
+address, an IPv6 /48, or the clients of an untrusted Unix socket together) has at most
+max(2, cores / 2) of them running and waiting, and its further checks are refused the
+same way, so that a single network cannot fill the queue for everyone.
 
 **Metrics.** `sparkles_auth_failures_total{scheme,reason}`,
 `sparkles_auth_denied_total{kind}` (`unauthenticated`, `forbidden`, `hidden`,

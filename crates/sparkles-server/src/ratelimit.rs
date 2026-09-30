@@ -9,10 +9,11 @@
 //! `u64` per client), and caps on the requests in flight, server-wide and per client.
 //!
 //! Enforcement has two stages. [`admit`] runs before authentication and applies the
-//! `preauth` limit: a budget of authentication failures per client address, so that
-//! password guessing and the hashing it costs are bounded before any credential is
-//! checked (the auth layer reserves the cost of a failure through [`Admission`] before
-//! it verifies a password). [`limit`] runs after authentication and applies the class
+//! `preauth` limit: a budget of failed credential checks per client address (and IPv6
+//! /48), so that password guessing and the hashing it costs are bounded (the auth layer
+//! reserves the cost of a failure through [`Admission`] before it verifies a password,
+//! and an address that spent its budget has its password checks and unknown tokens
+//! refused, nothing else). [`limit`] runs after authentication and applies the class
 //! limits, keyed by [`ClientKeyer`] (the signed-in owner with auth).
 //!
 //! * Over the rate: `429 Too Many Requests` with `Retry-After`.
@@ -27,7 +28,8 @@
 //! per owner, failed device-code lookups, …) share the buckets, responses and metrics.
 //!
 //! Clients are keyed by [`ClientKeyer`]: the peer address by default (IPv6 by its /64),
-//! or the address a trusted proxy reports in `Forwarded` / `X-Forwarded-For`. The client
+//! or the client a trusted proxy (a network, or the Unix socket) reports in the one
+//! forwarding header the configuration names ([`ForwardHeader`]). The client
 //! state lives in a bounded cache ([`quick_cache`], sharded, frequency-aware eviction):
 //! a flood of new keys evicts other rarely seen keys, never clients with requests in
 //! flight, and memory stays at about `max_keys` × 100 bytes. An evicted client that
@@ -49,7 +51,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -281,9 +283,12 @@ pub struct Config {
     /// per dataset and class; replaces the class limit on that dataset
     #[serde(default)]
     pub datasets: BTreeMap<String, BTreeMap<String, Limit>>,
-    /// proxies whose `Forwarded` / `X-Forwarded-For` name the client (CIDR or address)
+    /// proxies whose forwarding header names the client (CIDR, address, or `unix` for
+    /// the Unix socket)
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// the header they name it in: `x-forwarded-for` (default) or `forwarded`
+    pub trusted_proxy_header: Option<String>,
     /// clients tracked at most (default 100000)
     pub max_keys: Option<usize>,
     /// limits charged by code under a name ([`RateLimiter::acquire`]), not by route
@@ -366,8 +371,17 @@ impl Config {
         for m in self.datasets.values() {
             check(m, true)?;
         }
-        TrustedProxies::parse(&self.trusted_proxies).map_err(anyhow::Error::msg)?;
+        self.trusted().map_err(anyhow::Error::msg)?;
         Ok(())
+    }
+
+    /// The trusted proxies and the header they name the client in.
+    pub fn trusted(&self) -> Result<TrustedProxies, String> {
+        let header = match &self.trusted_proxy_header {
+            Some(h) => ForwardHeader::parse(h)?,
+            None => ForwardHeader::default(),
+        };
+        Ok(TrustedProxies::parse(&self.trusted_proxies)?.with_header(header))
     }
 
     /// Whether any limit is configured.
@@ -383,15 +397,55 @@ impl Config {
 
 // -------------------------------------------------------------- client keys ------
 
-/// Networks whose forwarding headers are believed.
+/// The forwarding header a trusted proxy names the client in. Only that one is read: a
+/// proxy overwrites or appends to the header it sets and passes any other through, so a
+/// second header would be the client's to choose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardHeader {
+    /// `X-Forwarded-For` (nginx, HAProxy, Caddy, Traefik, cloud load balancers)
+    #[default]
+    XForwardedFor,
+    /// `Forwarded` (RFC 7239), the `for=` of each element
+    Forwarded,
+}
+
+impl ForwardHeader {
+    pub fn parse(s: &str) -> Result<ForwardHeader, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "x-forwarded-for" => Ok(ForwardHeader::XForwardedFor),
+            "forwarded" => Ok(ForwardHeader::Forwarded),
+            _ => Err(format!(
+                "trusted proxy header '{s}': expected x-forwarded-for or forwarded"
+            )),
+        }
+    }
+}
+
+/// Peers whose forwarding header is believed: networks, and the Unix socket (`unix`).
 #[derive(Clone, Debug, Default)]
-pub struct TrustedProxies(Vec<(IpAddr, u8)>);
+pub struct TrustedProxies {
+    nets: Vec<(IpAddr, u8)>,
+    unix: bool,
+    header: ForwardHeader,
+}
+
+/// Where a connection came from, as far as client keys are concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerAddr {
+    Ip(IpAddr),
+    /// the Unix socket (`--unix-socket`)
+    Unix,
+}
 
 impl TrustedProxies {
-    /// Parse `10.0.0.0/8`, `::1`, `fd00::/8`, … .
+    /// Parse `10.0.0.0/8`, `::1`, `fd00::/8`, `unix`, … .
     pub fn parse(items: &[String]) -> Result<TrustedProxies, String> {
-        let mut v = Vec::new();
+        let mut t = TrustedProxies::default();
         for s in items {
+            if s.trim() == "unix" {
+                t.unix = true;
+                continue;
+            }
             let (addr, len) = match s.split_once('/') {
                 Some((a, l)) => (a, Some(l)),
                 None => (s.as_str(), None),
@@ -399,7 +453,7 @@ impl TrustedProxies {
             let ip: IpAddr = addr
                 .trim()
                 .parse()
-                .map_err(|_| format!("trusted proxy '{s}': not an IP address or CIDR"))?;
+                .map_err(|_| format!("trusted proxy '{s}': not an IP address, a CIDR or unix"))?;
             let max = if ip.is_ipv4() { 32 } else { 128 };
             let len = match len {
                 Some(l) => l
@@ -410,18 +464,25 @@ impl TrustedProxies {
                     .ok_or_else(|| format!("trusted proxy '{s}': bad prefix length"))?,
                 None => max,
             };
-            v.push((ip, len));
+            t.nets.push((ip, len));
         }
-        Ok(TrustedProxies(v))
+        Ok(t)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// The same proxies, naming the client in `header`.
+    pub fn with_header(mut self, header: ForwardHeader) -> TrustedProxies {
+        self.header = header;
+        self
+    }
+
+    /// Whether the Unix socket is trusted.
+    pub fn unix(&self) -> bool {
+        self.unix
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
-        self.0.iter().any(|&(net, len)| match (net, ip) {
+        self.nets.iter().any(|&(net, len)| match (net, ip) {
             (IpAddr::V4(n), IpAddr::V4(a)) => {
                 let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
                 u32::from(n) & mask == u32::from(a) & mask
@@ -434,24 +495,41 @@ impl TrustedProxies {
         })
     }
 
-    /// The client address of a request that arrived from `peer`: when `peer` is trusted,
-    /// the rightmost untrusted hop of `Forwarded` (RFC 7239), else of `X-Forwarded-For`.
-    pub fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-        if self.is_empty() || !self.contains(peer) {
-            return peer;
+    /// Whether `peer`'s forwarding header is believed.
+    pub fn trusts(&self, peer: PeerAddr) -> bool {
+        match peer {
+            PeerAddr::Ip(ip) => self.contains(ip),
+            PeerAddr::Unix => self.unix,
         }
-        let hops = forwarded_hops(headers);
-        let mut client = peer;
-        for hop in hops.iter().rev() {
+    }
+
+    /// The client of a request that arrived from `peer`. From a trusted peer it is the
+    /// rightmost untrusted hop of the configured header (every hop to its right was
+    /// written by a trusted proxy); a hop that is not an address (`unknown`, an RFC 7239
+    /// obfuscated `_id`) is keyed by its text, as that proxy reported it. When every hop
+    /// is trusted, the leftmost of them; with no hop at all, the peer, which on the Unix
+    /// socket (like an untrusted socket, or no peer) is one shared [`ClientKey::Unknown`].
+    pub fn client_key(&self, peer: Option<PeerAddr>, headers: &HeaderMap) -> ClientKey {
+        let mut client = match peer {
+            Some(PeerAddr::Ip(ip)) => ClientKey::ip(ip),
+            Some(PeerAddr::Unix) | None => ClientKey::Unknown,
+        };
+        match peer {
+            Some(p) if self.trusts(p) => {}
+            _ => return client,
+        }
+        for hop in forwarded_hops(headers, self.header).into_iter().rev() {
             match hop {
-                Some(ip) => {
-                    client = *ip;
-                    if !self.contains(*ip) {
+                Hop::Ip(ip) => {
+                    client = ClientKey::ip(ip);
+                    if !self.contains(ip) {
                         break;
                     }
                 }
-                // an unparsable or obfuscated hop: stop at the last known address
-                None => break,
+                Hop::Opaque(text) => {
+                    client = ClientKey::Opaque(text.into());
+                    break;
+                }
             }
         }
         client
@@ -466,45 +544,58 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The hops of `Forwarded` (`for=` of each element), else of `X-Forwarded-For`, left
-/// (origin) to right (nearest proxy); `None` for a hop that is not an address.
-fn forwarded_hops(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
-    let parse = |s: &str| -> Option<IpAddr> {
+/// One hop of a forwarding header.
+#[derive(Debug, PartialEq)]
+enum Hop {
+    Ip(IpAddr),
+    /// not an address: its text (at most 64 bytes)
+    Opaque(String),
+}
+
+/// The hops of `header` (for `Forwarded`, the `for=` of each element), left (origin)
+/// to right (nearest proxy).
+fn forwarded_hops(headers: &HeaderMap, header: ForwardHeader) -> Vec<Hop> {
+    let parse = |s: &str| -> Hop {
         let s = s.trim().trim_matches('"');
-        if let Ok(ip) = s.parse() {
-            return Some(ip);
+        let ip = s.parse().ok().or_else(|| match s.strip_prefix('[') {
+            // [v6]:port
+            Some(rest) => rest.split(']').next()?.parse().ok(),
+            // v4:port
+            None => s.parse::<SocketAddr>().ok().map(|a| a.ip()),
+        });
+        match ip {
+            Some(ip) => Hop::Ip(ip),
+            None => {
+                let mut end = s.len().min(64);
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Hop::Opaque(s[..end].to_string())
+            }
         }
-        // [v6]:port, v4:port
-        if let Some(rest) = s.strip_prefix('[') {
-            return rest.split(']').next()?.parse().ok();
-        }
-        s.parse::<SocketAddr>().ok().map(|a| a.ip())
     };
-    let fwd: Vec<&str> = headers
-        .get_all(header::FORWARDED)
+    let name = match header {
+        ForwardHeader::XForwardedFor => "x-forwarded-for",
+        ForwardHeader::Forwarded => "forwarded",
+    };
+    let elements = headers
+        .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .collect();
-    if !fwd.is_empty() {
-        return fwd
-            .iter()
-            .flat_map(|v| v.split(','))
+        .flat_map(|v| v.split(','));
+    match header {
+        ForwardHeader::XForwardedFor => elements.map(parse).collect(),
+        ForwardHeader::Forwarded => elements
             .map(|elem| {
-                elem.split(';').find_map(|pair| {
+                let f = elem.split(';').find_map(|pair| {
                     let (k, v) = pair.split_once('=')?;
                     k.trim().eq_ignore_ascii_case("for").then_some(v)
-                })
+                });
+                // an element without `for=` names no client
+                parse(f.unwrap_or("unknown"))
             })
-            .map(|v| v.and_then(parse))
-            .collect();
+            .collect(),
     }
-    headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(parse)
-        .collect()
 }
 
 /// Whom a request is counted against.
@@ -514,7 +605,10 @@ pub enum ClientKey {
     Ip(u128),
     /// an authenticated principal (or another key a named limit counts by)
     Principal(Arc<str>),
-    /// no address known (in-process requests): one shared key
+    /// a client a trusted proxy reported by a name rather than an address
+    Opaque(Arc<str>),
+    /// no address known (the Unix socket without a trusted proxy, in-process requests):
+    /// one shared key
     Unknown,
 }
 
@@ -544,22 +638,33 @@ pub struct PeerKeyer;
 
 impl ClientKeyer for PeerKeyer {
     fn key(&self, _: Class, req: &Request, trusted: &TrustedProxies) -> ClientKey {
-        match peer_ip(req) {
-            Some(peer) => ClientKey::ip(trusted.client_ip(peer, req.headers())),
-            None => ClientKey::Unknown,
-        }
+        trusted.client_key(peer_addr(req), req.headers())
     }
 }
 
+/// The client a request is counted against by address, in the request extensions:
+/// [`admit`] puts it there (with or without a limiter) for the auth layer's own limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientAddr(pub ClientKey);
+
 /// The address the connection came from, when the server recorded it.
 pub fn peer_ip(req: &Request) -> Option<IpAddr> {
+    match peer_addr(req)? {
+        PeerAddr::Ip(ip) => Some(ip),
+        PeerAddr::Unix => None,
+    }
+}
+
+/// Where the connection came from, when the server recorded it.
+pub fn peer_addr(req: &Request) -> Option<PeerAddr> {
     let ext = req.extensions();
-    ext.get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip())
-        .or_else(|| match ext.get::<ConnectInfo<crate::auth::Peer>>() {
-            Some(ConnectInfo(crate::auth::Peer::Tcp(a))) => Some(a.ip()),
-            _ => None,
-        })
+    if let Some(c) = ext.get::<ConnectInfo<SocketAddr>>() {
+        return Some(PeerAddr::Ip(c.0.ip()));
+    }
+    match ext.get::<ConnectInfo<crate::auth::Peer>>()? {
+        ConnectInfo(crate::auth::Peer::Tcp(a)) => Some(PeerAddr::Ip(a.ip())),
+        ConnectInfo(crate::auth::Peer::Unix) => Some(PeerAddr::Unix),
+    }
 }
 
 // ------------------------------------------------------------------- clock ------
@@ -871,6 +976,8 @@ struct Inner {
     by_class: [Option<u32>; Class::COUNT],
     by_dataset: BTreeMap<String, [Option<u32>; Class::COUNT]>,
     named: HashMap<&'static str, u32>,
+    /// the `preauth` limit of an IPv6 /48 ([`AGGREGATE_FACTOR`])
+    preauth_aggregate: Option<u32>,
     trusted: TrustedProxies,
     buckets: Arc<Buckets>,
 }
@@ -899,6 +1006,10 @@ impl Inner {
             let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
             by_class[class.index()] = add(class, class.as_str().to_string(), l);
         }
+        let preauth_aggregate = match cfg.classes.get(Class::PreAuth.as_str()) {
+            Some(l) => add(Class::PreAuth, "preauth/48".into(), &aggregate_limit(l)),
+            None => None,
+        };
         let mut by_dataset = BTreeMap::new();
         for (ds, m) in &cfg.datasets {
             // a dataset override for one class leaves the others at the class limit
@@ -931,7 +1042,8 @@ impl Inner {
             by_class,
             by_dataset,
             named,
-            trusted: TrustedProxies::parse(&cfg.trusted_proxies)?,
+            preauth_aggregate,
+            trusted: cfg.trusted()?,
             buckets,
         })
     }
@@ -958,6 +1070,9 @@ pub struct RateLimiter {
     evictions: Arc<AtomicU64>,
     clock: Clock,
     keyer: Arc<dyn ClientKeyer>,
+    /// requests with a forwarding header from a peer that is not a trusted proxy
+    untrusted_forwarded: AtomicU64,
+    forwarded_warned: AtomicBool,
 }
 
 /// The size of a limiter's client state (the `sparkles_rate_limit_*` metrics).
@@ -969,6 +1084,8 @@ pub struct Stats {
     pub evictions: u64,
     /// evicted clients whose debt is remembered
     pub penalties: u64,
+    /// requests with a forwarding header from an untrusted peer
+    pub untrusted_forwarded: u64,
 }
 
 impl RateLimiter {
@@ -983,6 +1100,8 @@ impl RateLimiter {
             evictions,
             clock,
             keyer: Arc::new(PeerKeyer),
+            untrusted_forwarded: AtomicU64::new(0),
+            forwarded_warned: AtomicBool::new(false),
         })
     }
 
@@ -1041,6 +1160,35 @@ impl RateLimiter {
             max_keys: b.max_keys as u64,
             evictions: b.evictions.load(Ordering::Relaxed),
             penalties: b.penalties.len() as u64,
+            untrusted_forwarded: self.untrusted_forwarded.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count a forwarding header from a peer that is not a trusted proxy, and warn about
+    /// the first: the server probably runs behind a proxy it does not trust, so every
+    /// client counts as the proxy.
+    fn note_untrusted_forwarding(&self, req: &Request, trusted: &TrustedProxies) {
+        let h = req.headers();
+        if !h.contains_key("x-forwarded-for") && !h.contains_key(header::FORWARDED) {
+            return;
+        }
+        let Some(peer) = peer_addr(req) else { return };
+        if trusted.trusts(peer) {
+            return;
+        }
+        self.untrusted_forwarded.fetch_add(1, Ordering::Relaxed);
+        if !self.forwarded_warned.swap(true, Ordering::Relaxed) {
+            let from = match peer {
+                PeerAddr::Ip(ip) => ip.to_string(),
+                PeerAddr::Unix => "the Unix socket".to_string(),
+            };
+            tracing::warn!(
+                "a request from {from} carries X-Forwarded-For or Forwarded, but {from} is not a \
+                 trusted proxy: the header is ignored. Behind a reverse proxy every client then \
+                 counts as the proxy and shares its budgets; list the proxy with \
+                 --rate-limit-trusted-proxy (warned once; sparkles_rate_limit_untrusted_forwarded_total \
+                 counts them)"
+            );
         }
     }
 
@@ -1123,7 +1271,7 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
     use std::fmt::Write;
     type Field = fn(&Stats) -> u64;
     let stats: Vec<(&str, Stats)> = limiters.iter().map(|(l, rl)| (*l, rl.stats())).collect();
-    let families: [(&str, &str, &str, Field); 4] = [
+    let families: [(&str, &str, &str, Field); 5] = [
         (
             "sparkles_rate_limit_keys",
             "gauge",
@@ -1148,6 +1296,12 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
             "Evicted clients whose unpaid debt is remembered.",
             |s| s.penalties,
         ),
+        (
+            "sparkles_rate_limit_untrusted_forwarded_total",
+            "counter",
+            "Requests with X-Forwarded-For or Forwarded from a peer that is not a trusted proxy (ignored).",
+            |s| s.untrusted_forwarded,
+        ),
     ];
     for (name, kind, help, f) in families {
         let _ = writeln!(o, "# HELP {name} {help}");
@@ -1159,19 +1313,22 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
 }
 
 /// Where a server's rate-limit configuration comes from: `--rate-limit-config`, then
-/// `--rate-limit` and `--rate-limit-trusted-proxy` on top.
+/// `--rate-limit`, `--rate-limit-trusted-proxy` and `--rate-limit-trusted-proxy-header`
+/// on top.
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
     pub file: Option<std::path::PathBuf>,
     pub flags: Vec<String>,
     pub trusted_proxies: Vec<String>,
+    pub trusted_proxy_header: Option<String>,
     /// authentication is on: `preauth` defaults to [`DEFAULT_PREAUTH`]
     pub auth: bool,
 }
 
 impl Sources {
     /// The merged configuration; `None` when nothing is configured and there is no
-    /// file (no limiter at all, so no overhead).
+    /// file (no limiter at all, so no overhead). Trusted proxies alone make a limiter
+    /// without limits: it still names the client the auth layer's own limits count.
     pub fn load(&self) -> anyhow::Result<Option<Config>> {
         let mut cfg = match &self.file {
             Some(f) => Config::read(f)?,
@@ -1182,16 +1339,57 @@ impl Sources {
         }
         cfg.trusted_proxies
             .extend(self.trusted_proxies.iter().cloned());
+        if let Some(h) = &self.trusted_proxy_header {
+            cfg.trusted_proxy_header = Some(h.clone());
+        }
         let preauth = Class::PreAuth.as_str();
         if self.auth && !cfg.classes.contains_key(preauth) {
             let l = Limit::parse(DEFAULT_PREAUTH).map_err(anyhow::Error::msg)?;
             cfg.classes.insert(preauth.to_string(), l);
         }
         cfg.validate()?;
-        Ok((self.file.is_some() || !cfg.is_empty()).then_some(cfg))
+        let any = self.file.is_some() || !cfg.is_empty() || !cfg.trusted_proxies.is_empty();
+        Ok(any.then_some(cfg))
     }
 }
 
+/// Startup warnings about telling clients apart. With authentication on, a server that
+/// listens where a reverse proxy usually connects from (the Unix socket, a loopback
+/// address) and trusts no proxy there counts every client as the proxy: one client's
+/// failed logins then spend everybody's budget.
+pub fn client_warnings(
+    cfg: Option<&Config>,
+    auth: bool,
+    unix_socket: bool,
+    loopback: bool,
+) -> Vec<String> {
+    if !auth {
+        return Vec::new();
+    }
+    let trusted = cfg.and_then(|c| c.trusted().ok()).unwrap_or_default();
+    let mut w = Vec::new();
+    if unix_socket && !trusted.unix() {
+        w.push(
+            "authentication is on and the Unix socket trusts no proxy: every client of the \
+             socket shares one budget of failed authentications and device logins, so one \
+             client's bad passwords refuse everybody's password logins for a while. If a \
+             reverse proxy connects through the socket, pass --rate-limit-trusted-proxy unix \
+             (the proxy must overwrite X-Forwarded-For)"
+                .to_string(),
+        );
+    }
+    if !unix_socket && loopback && trusted.nets.is_empty() {
+        w.push(
+            "authentication is on and the server listens on loopback with no trusted proxy: \
+             behind a reverse proxy every client counts as the proxy and shares one budget of \
+             failed authentications and device logins. Pass --rate-limit-trusted-proxy \
+             127.0.0.1 --rate-limit-trusted-proxy ::1 (the proxy must overwrite \
+             X-Forwarded-For)"
+                .to_string(),
+        );
+    }
+    w
+}
 /// Re-read the configuration on SIGHUP; a bad file keeps the running configuration.
 #[cfg(unix)]
 pub fn spawn_reload_on_sighup(rl: Arc<RateLimiter>, sources: Sources) {
@@ -1366,20 +1564,52 @@ fn reject(
 
 // ------------------------------------------------------ before authentication ------
 
-/// Marks a response as an authentication failure for the `preauth` limit when its
-/// status does not say so (an invalid session cookie is ignored, not refused).
+/// Marks a response as a failed credential check, the only thing the `preauth` limit
+/// charges: a wrong password, an unknown, expired or malformed token, an invalid session
+/// cookie, an unknown device code, a CSRF refusal on an auth route. The auth layer and
+/// its handlers set it; refusals of authorization (a `403`, a hidden dataset's `404`),
+/// handler errors and a busy password check are not failures of the address.
 #[derive(Clone, Copy, Debug)]
 pub struct AuthFailed;
 
-/// Whether authentication or authorization failed: a 401 or 403, or the auth layer's
-/// report of bad credentials or a refusal (a hidden dataset's 404, a busy password check).
-fn auth_failed(r: &Response) -> bool {
-    matches!(r.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        || r.extensions().get::<AuthFailed>().is_some()
-        || r.extensions()
-            .get::<crate::auth::AuthReport>()
-            // `limited`: refused by this very limit, not a failure of its own
-            .is_some_and(|a| a.denied.is_some() || a.error.is_some_and(|e| e != "limited"))
+/// An IPv6 /48 (a site) has this many times the `preauth` budget of one of its /64s,
+/// on top of theirs: a network that holds many /64s cannot multiply its budget.
+pub const AGGREGATE_FACTOR: u32 = 8;
+
+/// The `preauth` limit of a /48: the /64 limit times [`AGGREGATE_FACTOR`].
+fn aggregate_limit(l: &Limit) -> Limit {
+    Limit {
+        rate: l.rate.map(|r| Rate {
+            count: r.count.saturating_mul(AGGREGATE_FACTOR),
+            period: r.period,
+        }),
+        burst: l
+            .burst
+            .or(l.rate.map(|r| r.count))
+            .map(|b| b.saturating_mul(AGGREGATE_FACTOR)),
+        ..l.clone()
+    }
+}
+
+impl ClientKey {
+    /// The network a client belongs to: the /48 of an IPv6 address; an IPv4 address and
+    /// any other key are their own.
+    pub fn network(&self) -> ClientKey {
+        self.ipv6_network().unwrap_or_else(|| self.clone())
+    }
+
+    /// The /48 of an IPv6 address.
+    fn ipv6_network(&self) -> Option<ClientKey> {
+        match self {
+            ClientKey::Ip(a) if !is_mapped_v4(*a) => Some(ClientKey::Ip(a & !((1u128 << 80) - 1))),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a [`ClientKey::Ip`] value is an IPv4 address (mapped into IPv6).
+fn is_mapped_v4(a: u128) -> bool {
+    a >> 32 == 0xffff
 }
 
 /// A request's standing under the `preauth` limit (in the request extensions): the auth
@@ -1390,125 +1620,172 @@ pub struct Admission(Arc<AdmissionState>);
 
 struct AdmissionState {
     inner: Arc<Inner>,
-    policy: u32,
-    client: ClientKey,
+    /// the client's policy and key, then its /48's (IPv6 only)
+    slots: Vec<(u32, ClientKey)>,
     clock: Clock,
     reserved: AtomicU32,
 }
 
 impl Admission {
-    /// The client address the request is counted against.
-    pub fn client(&self) -> &ClientKey {
-        &self.0.client
+    fn new(inner: Arc<Inner>, client: ClientKey, clock: Clock) -> Option<Admission> {
+        let p = inner.by_class[Class::PreAuth.index()]?;
+        let mut slots = vec![(p, client.clone())];
+        if let (Some(a), Some(net)) = (inner.preauth_aggregate, client.ipv6_network()) {
+            slots.push((a, net));
+        }
+        Some(Admission(Arc::new(AdmissionState {
+            inner,
+            slots,
+            clock,
+            reserved: AtomicU32::new(0),
+        })))
+    }
+
+    /// The policies and client states the request is counted under (with a rate).
+    fn each(&self) -> impl Iterator<Item = (&Policy, (u64, u32), SlotKey)> {
+        let a = &self.0;
+        a.slots.iter().filter_map(|(i, client)| {
+            let p = &a.inner.policies[*i as usize];
+            let key = SlotKey {
+                policy: p.id,
+                client: client.clone(),
+            };
+            Some((p, p.gcra?, key))
+        })
+    }
+
+    fn cost(&self) -> u32 {
+        self.0.inner.policies[self.0.slots[0].0 as usize].failure_cost
     }
 
     /// Charge a failure now, before an expensive credential check; it is given back when
-    /// the request does not fail. `false`: the address has no failures left (answer
-    /// [`Admission::refusal`]).
+    /// the request does not fail. `false`: the address (or its network) has no failures
+    /// left (answer [`Admission::refusal`]).
     pub fn reserve(&self) -> bool {
         let a = &self.0;
-        let p = &a.inner.policies[a.policy as usize];
-        let Some(g) = p.gcra else { return true };
         if a.reserved.load(Ordering::Relaxed) > 0 {
             return true;
         }
-        let slot = a.inner.buckets.slot(SlotKey {
-            policy: p.id,
-            client: a.client.clone(),
-        });
-        let ok = slot.acquire(a.clock.now(), g, p.failure_cost).is_ok();
-        if ok {
-            a.reserved.store(p.failure_cost, Ordering::Relaxed);
+        let (now, cost) = (a.clock.now(), self.cost());
+        let mut taken: Vec<(Arc<Slot>, u64)> = Vec::new();
+        for (_, g, key) in self.each() {
+            let slot = a.inner.buckets.slot(key);
+            if slot.acquire(now, g, cost).is_err() {
+                for (s, t) in taken {
+                    s.refund(t, cost);
+                }
+                return false;
+            }
+            taken.push((slot, g.0));
         }
-        ok
+        a.reserved.store(cost, Ordering::Relaxed);
+        true
     }
 
-    /// The `429` of a request whose reservation failed.
+    /// Whether the address (or its network) has no failures left for a request that
+    /// has not reserved one: its password checks and unknown tokens are refused.
+    pub fn exhausted(&self) -> bool {
+        if self.0.reserved.load(Ordering::Relaxed) > 0 {
+            return false;
+        }
+        let (now, cost) = (self.0.clock.now(), self.cost());
+        self.each().any(|(_, g, key)| {
+            self.0
+                .inner
+                .buckets
+                .get(&key)
+                .is_some_and(|s| s.check(now, g, cost).is_err())
+        })
+    }
+
+    /// The `429` of a request whose reservation failed, or of an exhausted address.
     pub fn refusal(&self) -> Response {
+        let (now, cost) = (self.0.clock.now(), self.cost());
+        let mut worst: Option<(&Policy, u64)> = None;
+        for (p, g, key) in self.each() {
+            let wait = self
+                .0
+                .inner
+                .buckets
+                .get(&key)
+                .and_then(|s| s.check(now, g, cost).err())
+                .unwrap_or(0);
+            if worst.is_none_or(|(_, w)| wait > w) {
+                worst = Some((p, wait));
+            }
+        }
         let a = &self.0;
-        let p = &a.inner.policies[a.policy as usize];
-        let key = SlotKey {
-            policy: p.id,
-            client: a.client.clone(),
-        };
-        let wait = match (p.gcra, a.inner.buckets.get(&key)) {
-            (Some(g), Some(s)) => s.check(a.clock.now(), g, p.failure_cost).err(),
-            _ => None,
-        };
+        let (p, wait) = worst.unwrap_or((&a.inner.policies[a.slots[0].0 as usize], 0));
         reject(
             p,
             StatusCode::TOO_MANY_REQUESTS,
-            wait.map_or(1, secs_ceil),
+            secs_ceil(wait.max(1)),
             "failures",
             0,
         )
     }
+
+    /// After the response: charge a failure (what the reservation did not already
+    /// cover) and report the standing, or give the reservation back.
+    fn settle(&self, resp: &mut Response) {
+        let a = &self.0;
+        let reserved = a.reserved.load(Ordering::Relaxed);
+        let failed = resp.extensions().get::<AuthFailed>().is_some();
+        if !failed && reserved == 0 {
+            return;
+        }
+        let now = a.clock.now();
+        let rest = self.cost().saturating_sub(reserved);
+        for (i, (p, g, key)) in self.each().enumerate() {
+            let slot = a.inner.buckets.slot(key);
+            if !failed {
+                if reserved > 0 {
+                    slot.refund(g.0, reserved);
+                }
+                continue;
+            }
+            if rest > 0 {
+                slot.charge(now, g.0, rest);
+            }
+            if i == 0 {
+                let s = slot.standing(now, g);
+                rate_headers(resp.headers_mut(), p, s.remaining, s.reset_secs);
+            }
+        }
+    }
 }
 
 /// The first stage (`from_fn_with_state`, outside the auth layer and inside
-/// `obs::observe` and CORS): refuses an address that spent its `preauth` budget of
-/// authentication failures before any credential is checked, and charges each failure
-/// (`failure-cost`, default 1) to the address. An address without failures costs a cache
-/// lookup; nothing is stored for it. Without a limiter it does nothing.
+/// `obs::observe` and CORS). It names the client ([`ClientAddr`], for the auth layer's
+/// own limits too) and, with a `preauth` limit, puts the request's [`Admission`] into
+/// it: a budget of failed credential checks per address (and IPv6 /48). Only failures
+/// are charged (`failure-cost`, default 1), and only what would verify a password or
+/// look up an unknown token is refused once the budget is spent (the auth layer asks
+/// the admission); valid tokens and sessions, anonymous requests, health checks and the
+/// UI pass. An address without failures costs a cache lookup; nothing is stored for it.
 pub async fn admit(
     State(rl): State<Option<Arc<RateLimiter>>>,
     mut req: Request,
     next: Next,
 ) -> Response {
     let Some(rl) = rl else {
+        // no limiter, so no trusted proxy either: the peer
+        let client = PeerKeyer.key(Class::PreAuth, &req, &TrustedProxies::default());
+        req.extensions_mut().insert(ClientAddr(client));
         return next.run(req).await;
     };
     let inner = rl.inner.load_full();
-    let Some(pi) = inner.by_class[Class::PreAuth.index()] else {
-        return next.run(req).await;
-    };
-    let p = &inner.policies[pi as usize];
-    let Some(g) = p.gcra else {
-        return next.run(req).await;
-    };
+    rl.note_untrusted_forwarding(&req, &inner.trusted);
+    // without an address (the Unix socket without a trusted proxy, in-process requests)
+    // every such client shares one key: a shared budget still bounds password guessing
     let client = PeerKeyer.key(Class::PreAuth, &req, &inner.trusted);
-    if client == ClientKey::Unknown {
-        // no address (the Unix socket, in-process requests): one shared budget would let
-        // any client lock out all the others
+    req.extensions_mut().insert(ClientAddr(client.clone()));
+    let Some(adm) = Admission::new(inner, client, rl.clock.clone()) else {
         return next.run(req).await;
-    }
-    let key = SlotKey {
-        policy: p.id,
-        client: client.clone(),
     };
-    if let Some(s) = inner.buckets.get(&key)
-        && let Err(wait) = s.check(rl.clock.now(), g, 1)
-    {
-        return reject(
-            p,
-            StatusCode::TOO_MANY_REQUESTS,
-            secs_ceil(wait),
-            "failures",
-            0,
-        );
-    }
-    let adm = Admission(Arc::new(AdmissionState {
-        inner: inner.clone(),
-        policy: pi,
-        client,
-        clock: rl.clock.clone(),
-        reserved: AtomicU32::new(0),
-    }));
     req.extensions_mut().insert(adm.clone());
     let mut resp = next.run(req).await;
-    let reserved = adm.0.reserved.load(Ordering::Relaxed);
-    if auth_failed(&resp) {
-        let slot = inner.buckets.slot(key);
-        let now = rl.clock.now();
-        let rest = p.failure_cost.saturating_sub(reserved);
-        if rest > 0 {
-            slot.charge(now, g.0, rest);
-        }
-        let s = slot.standing(now, g);
-        rate_headers(resp.headers_mut(), p, s.remaining, s.reset_secs);
-    } else if reserved > 0 {
-        inner.buckets.slot(key).refund(g.0, reserved);
-    }
+    adm.settle(&mut resp);
     resp
 }
 

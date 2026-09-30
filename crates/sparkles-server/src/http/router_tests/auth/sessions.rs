@@ -281,3 +281,37 @@ async fn sessions_follow_the_policy() {
     .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn one_owner_cannot_log_everyone_out() {
+    use crate::auth::MAX_SESSIONS_PER_OWNER;
+    let s = auth_server();
+    let (alice, _) = password_session(&s, "alice").await;
+    // bob mints one token and signs in with it over and over
+    let m = mint_as(&s.app, &[("authorization", &b("bob"))], r#"{"name":"ui"}"#).await;
+    let token = m.json()["token"].as_str().unwrap().to_string();
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let mut cookies = Vec::new();
+    for _ in 0..MAX_SESSIONS_PER_OWNER + 5 {
+        let r = login(&s, &body, "http://localhost:3030").await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+        cookies.push(r.cookie("sparkles_session").unwrap());
+    }
+    let kind = |cookie: String| {
+        let app = s.app.clone();
+        async move {
+            let who = call(&app, "GET", "/$/whoami", &[("cookie", &cookie)], "")
+                .await
+                .json();
+            who["principal"]["kind"].as_str().unwrap().to_string()
+        }
+    };
+    // his own oldest sessions ended, alice's did not
+    assert_eq!(kind(cookies[0].clone()).await, "anonymous");
+    assert_eq!(kind(cookies[4].clone()).await, "anonymous");
+    assert_eq!(kind(cookies[5].clone()).await, "token");
+    assert_eq!(kind(cookies.last().unwrap().clone()).await, "token");
+    assert_eq!(kind(alice).await, "user");
+    let now = s.auth().now();
+    assert_eq!(s.auth().sessions.active(now), MAX_SESSIONS_PER_OWNER + 1);
+}

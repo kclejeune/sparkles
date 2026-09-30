@@ -8,7 +8,7 @@ use super::session::Method;
 use super::store::rfc3339;
 use super::tokens::{Client, TokenRecord};
 use super::{Auth, Identity, Kind, Level, Principal, Scheme, Scope, ServerPerm, crypto};
-use crate::ratelimit::{Admission, ClientKey};
+use crate::ratelimit::{Admission, AuthFailed, ClientAddr, ClientKey};
 use crate::state::AppState;
 use axum::Router;
 use axum::body::Bytes;
@@ -229,10 +229,22 @@ fn session_cookie(auth: &Auth, h: &HeaderMap, raw: &str, max_age: i64) -> Header
     )
 }
 
+/// A failed credential check: charged to the client's `preauth` budget.
+fn failed(mut r: Response) -> Response {
+    r.extensions_mut().insert(AuthFailed);
+    r
+}
+
+/// The network of the request's client, whose password checks are capped.
+fn network(addr: &Option<Extension<ClientAddr>>) -> Option<ClientKey> {
+    addr.as_ref().map(|Extension(c)| c.0.network())
+}
+
 /// `POST /$/auth/login` with `{user, password}` or `{token}`: a session cookie.
 async fn login(
     State(st): St,
     adm: Option<Extension<Admission>>,
+    addr: Option<Extension<ClientAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -247,9 +259,12 @@ async fn login(
     let b_token = b.token.map(Zeroizing::new);
     let policy = auth.policy();
     let now = auth.now();
-    let invalid = || json_error(StatusCode::UNAUTHORIZED, "invalid credentials");
+    let invalid = || failed(json_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
+    let client = network(&addr);
     let (method, who, token_id, expires) = match (b.user, b_password, b_token) {
-        (Some(user), Some(pw), None) => match auth.check_password(&user, &pw, adm.as_deref()).await
+        (Some(user), Some(pw), None) => match auth
+            .check_password(&user, &pw, adm.as_deref(), client.as_ref())
+            .await
         {
             Ok(Some(_)) => (
                 Method::Password,
@@ -295,6 +310,16 @@ async fn login(
                 _ => None,
             };
             let Some(rec) = rec else {
+                // an address without failures left has its unknown tokens refused
+                if let Some(Extension(a)) = &adm
+                    && a.exhausted()
+                {
+                    auth.count_failure(super::policy::AuthError {
+                        scheme: "session",
+                        failure: Failure::Limited,
+                    });
+                    return a.refusal();
+                }
                 auth.count_login(Method::Token, "denied");
                 auth.count_failure(super::policy::AuthError {
                     scheme: "session",
@@ -467,6 +492,10 @@ async fn oidc_callback(
         );
         tracing::info!(target: "sparkles::audit", event = "login", method = "oidc", result = code);
         let mut r = login_error(code);
+        // a forged or replayed state, or a code the provider refused
+        if failure != Failure::NotAllowed {
+            r.extensions_mut().insert(AuthFailed);
+        }
         r.headers_mut().append(
             header::SET_COOKIE,
             auth.cookie_mode(&headers).set(OIDC_COOKIE, "", 0),
@@ -860,7 +889,7 @@ async fn revoke_by_owner(
 /// `POST /$/auth/device` (RFC 8628 §3.1)
 async fn device_start(
     State(st): St,
-    adm: Option<Extension<Admission>>,
+    addr: Option<Extension<ClientAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -868,10 +897,9 @@ async fn device_start(
         Ok(a) => a,
         Err(r) => return r,
     };
-    // per client address (known with the pre-authentication limit on)
-    if let Some(Extension(a)) = &adm
-        && let Err(r) = auth.throttle.acquire(DEVICE, a.client().clone(), 1)
-    {
+    // per client network (an IPv6 /48), with or without the pre-authentication limit
+    let client = network(&addr).unwrap_or(ClientKey::Unknown);
+    if let Err(r) = auth.throttle.acquire(DEVICE, client, 1) {
         return r;
     }
     let m = body_map(&headers, &body).unwrap_or_default();
@@ -903,19 +931,40 @@ async fn device_start(
     )
 }
 
-/// The key that bounds a principal's failed user-code lookups: its session.
-fn lookup_key(p: &Principal) -> ClientKey {
-    let k = p
-        .info
-        .session
-        .unwrap_or_else(|| crypto::sha256(p.id().as_bytes()));
-    ClientKey::principal(&crypto::hex(&k))
+/// The keys that bound failed user-code lookups: the client's network, and the
+/// principal's owner (whichever sessions and addresses it uses).
+fn lookup_keys(p: &Principal, addr: &Option<Extension<ClientAddr>>) -> [ClientKey; 2] {
+    [
+        network(addr).unwrap_or(ClientKey::Unknown),
+        ClientKey::principal(&p.rate_key()),
+    ]
+}
+
+/// Whether both keys have failed lookups left.
+#[allow(clippy::result_large_err)]
+fn lookups_left(auth: &Auth, keys: &[ClientKey; 2]) -> Result<(), Response> {
+    for k in keys {
+        auth.throttle.check(DEVICE_CODE, k)?;
+    }
+    Ok(())
+}
+
+/// An unknown user code: charged to both keys, and to the address's `preauth` budget.
+fn unknown_code(auth: &Auth, keys: [ClientKey; 2]) -> Response {
+    for k in keys {
+        auth.throttle.charge(DEVICE_CODE, k, 1);
+    }
+    failed(json_error(
+        StatusCode::NOT_FOUND,
+        "no such code, or it expired",
+    ))
 }
 
 /// `GET /$/auth/device/{user_code}` (interactive): the grant, for the approval page.
 async fn device_info(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
 ) -> Response {
     let auth = match auth_of(&st) {
@@ -923,8 +972,8 @@ async fn device_info(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     match auth.cli.lookup(&code, now) {
@@ -938,10 +987,7 @@ async fn device_info(
             }))
             .into_response(),
         ),
-        None => {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
-            json_error(StatusCode::NOT_FOUND, "no such code, or it expired")
-        }
+        None => unknown_code(&auth, keys),
     }
 }
 
@@ -959,6 +1005,7 @@ fn issued(token: &Zeroizing<String>, rec: &TokenRecord, p: &Principal, now: i64)
 async fn device_approve(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
     body: Bytes,
 ) -> Response {
@@ -967,13 +1014,13 @@ async fn device_approve(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     if !auth.cli.is_pending(&code, now) {
         if auth.cli.lookup(&code, now).is_none() {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
+            return unknown_code(&auth, keys);
         }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
@@ -1013,6 +1060,7 @@ async fn device_approve(
 async fn device_deny(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
 ) -> Response {
     let auth = match auth_of(&st) {
@@ -1020,13 +1068,13 @@ async fn device_deny(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     if !auth.cli.decide(&code, None, now) {
         if auth.cli.lookup(&code, now).is_none() {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
+            return unknown_code(&auth, keys);
         }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
@@ -1180,7 +1228,10 @@ async fn token_endpoint(State(st): St, headers: HeaderMap, body: Bytes) -> Respo
             };
             match auth.cli.loopback_redeem(code, verifier, port, now) {
                 Some(i) => token_response(i),
-                None => oauth_error("invalid_grant", "invalid, used or expired code"),
+                None => failed(oauth_error(
+                    "invalid_grant",
+                    "invalid, used or expired code",
+                )),
             }
         }
         "" => oauth_error("invalid_request", "missing grant_type"),

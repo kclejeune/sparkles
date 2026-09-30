@@ -102,7 +102,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries and writes stop when their client disconnects | ✅ |
 | OpenTelemetry (`otel` cargo feature, off at run time unless `--otel` or `OTEL_*` enable it): OTLP traces with W3C `traceparent` in and out (SERVICE, LOAD), HTTP/database semantic-convention attributes, query phase and operator-tree spans synthesized from recorded timings, commit and background-task spans; metrics (`http.server.request.duration` plus the Prometheus registry, bridged); optional OTLP logs with trace correlation | ✅ |
-| Rate limiting: per-client GCRA buckets and concurrency caps per request class (`auth`, `query`, `update`, `admin`) with per-dataset overrides, signed-in callers counted per owner, trusted-proxy client addresses, `429`/`503` with `Retry-After` and `RateLimit` headers, bounded client tracking that remembers evicted debts, SIGHUP reload that keeps client state and in-flight counts; a `preauth` stage before authentication limits failed logins per address before any password is hashed (on by default with auth); off by default otherwise | ✅ |
+| Rate limiting: per-client GCRA buckets and concurrency caps per request class (`auth`, `query`, `update`, `admin`) with per-dataset overrides, signed-in callers counted per owner, trusted-proxy client addresses, `429`/`503` with `Retry-After` and `RateLimit` headers, bounded client tracking that remembers evicted debts, SIGHUP reload that keeps client state and in-flight counts; a `preauth` stage limits failed credential checks per address and IPv6 /48 before any password is hashed, and once spent refuses only password checks and unknown tokens (on by default with auth); off by default otherwise | ✅ |
 | Authentication and per-dataset access control (`serve --auth-config`, off by default): levels `read` < `write` < `admin` by dataset name or pattern plus `metrics` / `federate` / `server-admin`, deny by default, hidden datasets answer `404`; HTTP Basic users (argon2id), scoped, expiring, revocable API tokens (`Authorization: Bearer spk_…`, hashed at rest, never above their owner), OIDC sign-in for the UI (native, authorization code + PKCE), trusted forward-auth proxy headers from configured CIDRs or a Unix socket, group-to-role mapping; CSRF and CORS rules for cookies; `sparkles auth login` (browser loopback or device code) and remote `query` / `update` / `load --server`; see [docs/API.md](docs/API.md#authentication-and-access-control) | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations), commit history and write receipts, full-text search (index admin panel, ranked `text:query` search in Explore), vector similarity ("Similar" in the explorer, compact vector literals); embedded in the server binary; Vitest unit tests, Playwright end-to-end smoke tests against a real server (sign-in with a password and an API token, query, explore, Similar, text search, history), and a mock server for UI development | ✅ |
 
@@ -462,7 +462,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 |---|---|---|
 | `--host ADDR` | `127.0.0.1` | listen address; a non-loopback address needs `--auth-config` or `--allow-open-network` |
 | `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
-| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config` other names than IP addresses, `localhost` and `--host` are refused with `421` |
+| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config` other names than IP addresses, `localhost` and `--host` are refused with `421`, and with it so are requests carrying trusted proxy headers from loopback or the Unix socket |
 | `--cors-origin ORIGIN` | none | a browser origin (`https://yasgui.example`) whose pages may call the API cross-origin, without credentials (repeatable; with `--auth-config`, added to `cors.origins`); without auth such a page may do everything the server allows |
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
@@ -489,7 +489,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--otel-plan-spans` | off | one span per executed plan operator |
 | `--rate-limit SPEC` | off (`preauth=30/min,burst=60` with `--auth-config`) | limit a request class per client, e.g. `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5`; `preauth=…` limits authentication failures per address before credentials are checked (repeatable; see `docs/API.md`, Rate limiting) |
 | `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP; `--rate-limit` applies on top |
-| `--rate-limit-trusted-proxy CIDR` | | proxy whose `Forwarded` / `X-Forwarded-For` names the client (repeatable); limits by address need a peer address clients cannot choose, so list only proxies that overwrite these headers |
+| `--rate-limit-trusted-proxy CIDR` | | proxy whose `X-Forwarded-For` names the client (repeatable; `unix`: the `--unix-socket`); limits by address need a peer address clients cannot choose, so list only proxies that overwrite or append to the header |
+| `--rate-limit-trusted-proxy-header H` | `x-forwarded-for` | the one header trusted proxies name the client in: `x-forwarded-for` or `forwarded` (RFC 7239); the other is ignored |
 | `--no-service` | | refuse `SERVICE` for everyone |
 | `--outbound-allow-private` | off | let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)) |
 | `--outbound-block-private` | | refuse those addresses: already the default of `serve` and `mcp`, an opt-in for the local `query` and `update` (which allow them by default) |
@@ -806,7 +807,16 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
 
 * `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
 * proxy timeouts to `queryTimeout + 30` seconds;
-* request/response buffering off, so large uploads and results stream through.
+* request/response buffering off, so large uploads and results stream through;
+* `X-Forwarded-For` to the client's address (`$remote_addr`, replacing whatever the
+  client sent), and `Forwarded` to nothing. The server always trusts nginx for it
+  (`--rate-limit-trusted-proxy` for 127.0.0.1 and ::1, or `unix` with `unixSocket`),
+  `rateLimits` or not, so failed logins and rate limits count each client rather than
+  nginx. Behind another proxy or CDN, set up nginx's realip module so that
+  `$remote_addr` is the client.
+
+`loadDir` passes `--load-dir`: `LOAD <file:…>` over HTTP may read from that directory
+only (the service gets it read-only; it must not contain `dataDir` or lie under `/tmp`).
 
 With `auth.configFile` the service starts with `--auth-config` and `systemctl reload
 sparkles` re-reads it (SIGHUP). Keep the file out of the Nix store (agenix, sops-nix),

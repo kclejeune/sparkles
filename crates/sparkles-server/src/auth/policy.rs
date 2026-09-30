@@ -8,7 +8,7 @@ use super::{
     Access, Grants, Identity, Kind, Level, Principal, PrincipalInfo, Scheme, ServerPerm, crypto,
     store,
 };
-use crate::ratelimit::Admission;
+use crate::ratelimit::{Admission, ClientKey};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use axum::http::{HeaderMap, header};
@@ -29,9 +29,13 @@ const PERMIT_WAIT: Duration = Duration::from_secs(5);
 /// Password verifications that may wait for a permit, per permit; more are refused at
 /// once (`busy`) instead of queueing without bound.
 const QUEUE_PER_PERMIT: usize = 4;
+/// Password verifications (running and waiting) of one network (an IPv4 address, an
+/// IPv6 /48) at most, at least this many: max(2, permits). Beyond it `busy`, so that one
+/// network cannot fill the whole queue.
+const MIN_PER_CLIENT: usize = 2;
 
 /// Named limits of [`Auth::throttle`]: tokens minted per owner, device logins started per
-/// client address, failed user-code lookups per session.
+/// client network, failed user-code lookups per client network and per owner.
 pub const MINT: &str = "mint";
 pub const DEVICE: &str = "device";
 pub const DEVICE_CODE: &str = "device-code";
@@ -52,7 +56,7 @@ fn per_minute(count: u32, burst: u32) -> crate::ratelimit::Limit {
 
 /// The throttle's limits under `policy`: its mint rate; 20 device logins per address,
 /// then two a minute (the pending grants of one address stay far below the server's cap);
-/// 20 unknown user codes per session, then two a minute.
+/// 20 unknown user codes per client network and per owner, then two a minute.
 fn throttle_config(policy: &Policy) -> crate::ratelimit::Config {
     let mut c = crate::ratelimit::Config {
         max_keys: Some(THROTTLE_KEYS),
@@ -411,6 +415,46 @@ struct Argon {
     permits: tokio::sync::Semaphore,
     size: usize,
     waiting: AtomicUsize,
+    /// verifications running and waiting, per client network
+    clients: Mutex<HashMap<ClientKey, usize>>,
+    per_client: usize,
+}
+
+/// A client network's place among the password verifications, left when dropped.
+struct ClientSlot<'a> {
+    clients: &'a Mutex<HashMap<ClientKey, usize>>,
+    key: ClientKey,
+}
+
+impl<'a> ClientSlot<'a> {
+    fn enter(
+        clients: &'a Mutex<HashMap<ClientKey, usize>>,
+        key: &ClientKey,
+        max: usize,
+    ) -> Option<ClientSlot<'a>> {
+        let mut m = clients.lock();
+        let n = m.entry(key.clone()).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(ClientSlot {
+            clients,
+            key: key.clone(),
+        })
+    }
+}
+
+impl Drop for ClientSlot<'_> {
+    fn drop(&mut self) {
+        let mut m = self.clients.lock();
+        if let Some(n) = m.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// A place in the queue of password verifications, left when dropped (also when the
@@ -490,6 +534,8 @@ impl Auth {
                 permits: tokio::sync::Semaphore::new(permits),
                 size: permits,
                 waiting: AtomicUsize::new(0),
+                clients: Mutex::new(HashMap::new()),
+                per_client: permits.max(MIN_PER_CLIENT),
             },
             throttle,
             hmac_key: crypto::random_bytes(32),
@@ -533,6 +579,12 @@ impl Auth {
     #[cfg(test)]
     pub fn verification_queue(&self) -> (usize, usize) {
         (self.argon.size, self.argon.size * QUEUE_PER_PERMIT)
+    }
+
+    /// Password verifications one client network may have running and waiting.
+    #[cfg(test)]
+    pub fn verifications_per_client(&self) -> usize {
+        self.argon.per_client
     }
 
     /// Move the clock forward (tests).
@@ -623,12 +675,14 @@ impl Auth {
     /// an invalid session cookie is ignored (and cleared).
     ///
     /// `admission`: the request's standing under the pre-authentication limit, charged
-    /// before a password is verified.
+    /// before a password is verified; `client`: the network of the client, whose
+    /// password verifications are capped.
     pub async fn authenticate(
         &self,
         h: &HeaderMap,
         peer: Option<&Peer>,
         admission: Option<&Admission>,
+        client: Option<&ClientKey>,
     ) -> Result<Authenticated, AuthError> {
         let policy = self.policy.load_full();
         let ok = |principal| Authenticated {
@@ -636,7 +690,10 @@ impl Auth {
             clear_cookie: false,
         };
         if let Some(v) = h.get(header::AUTHORIZATION) {
-            return self.authorization(&policy, v, admission).await.map(ok);
+            return self
+                .authorization(&policy, v, admission, client)
+                .await
+                .map(ok);
         }
         let mut clear_cookie = false;
         let mode = self.cookie_mode(h);
@@ -689,6 +746,7 @@ impl Auth {
         policy: &Policy,
         v: &axum::http::HeaderValue,
         admission: Option<&Admission>,
+        client: Option<&ClientKey>,
     ) -> Result<Principal, AuthError> {
         let malformed = |scheme| AuthError {
             scheme,
@@ -717,7 +775,8 @@ impl Auth {
             // Basic-only clients carry a token as the password; the user is ignored
             return self.token_principal(policy, password, Scheme::Basic);
         }
-        self.password(policy, user, password, admission).await
+        self.password(policy, user, password, admission, client)
+            .await
     }
 
     /// A static or minted token.
@@ -857,6 +916,7 @@ impl Auth {
         user: &str,
         password: &str,
         admission: Option<&Admission>,
+        client: Option<&ClientKey>,
     ) -> Result<Principal, AuthError> {
         let err = |failure| AuthError {
             scheme: "basic",
@@ -910,7 +970,7 @@ impl Auth {
             let (phc, principal, pw) = (phc.clone(), principal.clone(), pw.clone());
             cell.get_or_try_init(|| {
                 ran.store(true, Ordering::Relaxed);
-                async move { self.verify(pw, phc, principal).await }
+                async move { self.verify(pw, phc, principal, client).await }
             })
             .await
             .cloned()
@@ -919,7 +979,7 @@ impl Auth {
             Ok(Some(p)) => Some(p),
             Ok(None) if ran.load(Ordering::Relaxed) => None,
             // another request's verification failed: a failure costs each request one
-            Ok(None) => self.verify(pw, phc, principal).await?,
+            Ok(None) => self.verify(pw, phc, principal, client).await?,
             Err(e) => {
                 self.creds.lock().inflight.remove(&key);
                 return Err(e);
@@ -947,6 +1007,7 @@ impl Auth {
         user: &str,
         password: &str,
         admission: Option<&Admission>,
+        client: Option<&ClientKey>,
     ) -> Result<Option<Principal>, AuthError> {
         if admission.is_some_and(|a| !a.reserve()) {
             return Err(AuthError {
@@ -967,7 +1028,7 @@ impl Auth {
             ),
             None => (policy.dummy_hash.clone(), None),
         };
-        self.verify(Zeroizing::new(password.to_string()), phc, principal)
+        self.verify(Zeroizing::new(password.to_string()), phc, principal, client)
             .await
     }
 
@@ -977,12 +1038,17 @@ impl Auth {
         password: Zeroizing<String>,
         phc: String,
         principal: Option<Principal>,
+        client: Option<&ClientKey>,
     ) -> Result<Option<Principal>, AuthError> {
         let busy = AuthError {
             scheme: "basic",
             failure: Failure::Busy,
         };
         let a = &self.argon;
+        let _client = match client {
+            Some(k) => Some(ClientSlot::enter(&a.clients, k, a.per_client).ok_or(busy)?),
+            None => None,
+        };
         let _permit = match a.permits.try_acquire() {
             Ok(p) => p,
             Err(_) => {
