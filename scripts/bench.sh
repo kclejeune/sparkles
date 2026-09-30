@@ -24,7 +24,9 @@
 # ENGINES="sparkles jena qlever fluree" (default) to run a subset. Results are merged per engine
 # into existing results/*.json, so e.g. ENGINES=qlever re-measures only QLever and keeps
 # the other engines' numbers. QUERIES="name …" limits the row check and timings to those
-# queries (e.g. to resume after an engine crashed).
+# queries (e.g. to resume after an engine crashed). SPARKLES_DB (default
+# WORKDIR/sparkles.db) serves another Sparkles database, and SPARKLES_ARGS adds `serve`
+# flags (e.g. "--no-access-log --no-metrics"), for comparing configurations.
 set -euo pipefail
 
 N=${1:-100000}
@@ -33,6 +35,7 @@ WARMUP=${WARMUP:-2}
 RUNS=${RUNS:-10}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
+SPARKLES_ARGS=${SPARKLES_ARGS:-}
 # absolute, so "$WORK/..." paths stay valid after the cd below
 mkdir -p "$WORK/results" "$WORK/queries"
 WORK=$(cd "$WORK" && pwd)
@@ -132,7 +135,8 @@ wait_for() { for _ in $(seq 1 240); do curl -sf "$1" >/dev/null 2>&1 && return 0
 # update file under queries/), port (for RSS)
 declare -A NAME URL UPDATE PORT
 if has sparkles; then
-  "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
+  # shellcheck disable=SC2086 # SPARKLES_ARGS is a list of flags
+  "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="${SPARKLES_DB:-$WORK/sparkles.db}" --port $SPORT --timeout 600 $SPARKLES_ARGS > sparkles.log 2>&1 &
   SPID=$!; PIDS+=($SPID); wait_for "localhost:$SPORT/\$/ping"
   NAME[sparkles]=sparkles; URL[sparkles]=localhost:$SPORT/bench/sparql; PORT[sparkles]=$SPORT
   UPDATE[sparkles]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$SPORT/bench/update"
