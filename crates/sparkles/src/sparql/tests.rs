@@ -606,3 +606,48 @@ fn count_distinct_from_index() {
         "902"
     );
 }
+#[test]
+fn filters_on_keys_match_row_evaluation() {
+    let s = mixed_store();
+    let filters = [
+        r#"CONTAINS(?o, "label 3")"#,
+        r#"CONTAINS(?o, "label"@en)"#,
+        r#"STRSTARTS(STR(?o), "http://ex.org/label/1")"#,
+        r#"STRENDS(STR(?o), "3")"#,
+        r#"REGEX(?o, "^label [0-4]$", "i")"#,
+        r#"REGEX(STR(?o), "label")"#,
+        r#"LANGMATCHES(LANG(?o), "en")"#,
+        r#"LANGMATCHES(LANG(?o), "de") && CONTAINS(?o, "1")"#,
+        r#"LANGMATCHES(LANG(?o), "*")"#,
+        r#"LANG(?o) = """#,
+        r#"!CONTAINS(?o, "label")"#,
+    ];
+    let check = |s: &Store| {
+        for f in filters {
+            let fast = count(
+                s,
+                &format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s ex:label ?o FILTER({f}) }}"),
+            );
+            // RAND() keeps the filter on the row-by-row evaluator
+            let rows = count(
+                s,
+                &format!(
+                    "SELECT (COUNT(*) AS ?c) WHERE {{ ?s ex:label ?o FILTER(RAND() < 2 && ({f})) }}"
+                ),
+            );
+            assert_eq!(fast, rows, "{f}");
+            assert_ne!(fast, "0", "{f}");
+        }
+    };
+    check(&s);
+    // terms added by updates live in the delta vocabulary
+    update::update(
+        &s,
+        r#"PREFIX ex: <http://ex.org/>
+           INSERT DATA { ex:n1 ex:label "label 3, new"@en-US . ex:n2 ex:label "brand new label 3" .
+                         ex:n3 ex:label <http://ex.org/label/1new> }"#,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    check(&s);
+}

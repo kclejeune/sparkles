@@ -4,6 +4,7 @@ pub mod cache;
 pub mod ctx;
 pub mod exec;
 pub mod expr;
+mod keyfilter;
 pub mod plan;
 pub mod results;
 pub mod table;

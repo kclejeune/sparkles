@@ -10,6 +10,7 @@ use oxsdatatypes::*;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use spargebra::algebra::{Expression, Function, GraphPattern};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ pub struct ExistsSpec {
 #[derive(Clone)]
 pub enum Expr {
     Const(Id),
+    /// constant term with its value decoded at compile time
+    Lit(Id, Value),
     Var(VarId),
     Or(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
@@ -67,9 +70,17 @@ pub enum Func {
 }
 
 impl Expr {
+    /// The constant term id, if this is a constant.
+    pub fn const_id(&self) -> Option<Id> {
+        match self {
+            Expr::Const(id) | Expr::Lit(id, _) => Some(*id),
+            _ => None,
+        }
+    }
+
     pub fn vars(&self, out: &mut Vec<VarId>) {
         match self {
-            Expr::Const(_) => {}
+            Expr::Const(_) | Expr::Lit(..) => {}
             Expr::Var(v) | Expr::Bound(v) => out.push(*v),
             Expr::Or(a, b)
             | Expr::And(a, b)
@@ -118,7 +129,7 @@ impl Expr {
     pub fn has_exists(&self) -> bool {
         match self {
             Expr::Exists(_) => true,
-            Expr::Const(_) | Expr::Var(_) | Expr::Bound(_) => false,
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => false,
             Expr::Or(a, b)
             | Expr::And(a, b)
             | Expr::Eq(a, b)
@@ -147,7 +158,7 @@ impl Expr {
             s.push(')');
         };
         match self {
-            Expr::Const(id) => match ctx.term(*id) {
+            Expr::Const(id) | Expr::Lit(id, _) => match ctx.term(*id) {
                 Some(t) => {
                     let _ = write!(s, "{t}");
                 }
@@ -250,7 +261,12 @@ pub struct Row<'a> {
     pub table: &'a Table,
     pub i: usize,
     pub map: &'a [Option<usize>],
+    /// values decoded up front for this operator, per table column and row
+    pub dec: Option<&'a DecodedCols>,
 }
+
+/// Row-aligned decoded values for some columns of a table (`None` = not decoded).
+pub type DecodedCols = Vec<Option<Vec<Option<Value>>>>;
 
 impl Row<'_> {
     #[inline]
@@ -267,19 +283,29 @@ impl Row<'_> {
 pub enum Val {
     Id(Id),
     V(Value),
+    /// an existing term together with its already decoded value
+    Dec(Id, Value),
 }
 
 impl Val {
     fn value(self, ctx: &Ctx) -> EvalResult<Value> {
         match self {
             Val::Id(id) => ctx.value(id).ok_or(TypeError),
-            Val::V(v) => Ok(v),
+            Val::V(v) | Val::Dec(_, v) => Ok(v),
         }
     }
     pub fn into_id(self, ctx: &Ctx) -> Id {
         match self {
-            Val::Id(id) => id,
+            Val::Id(id) | Val::Dec(id, _) => id,
             Val::V(v) => ctx.intern_value(&v),
+        }
+    }
+    /// The term id, if this is an existing term (not a computed value).
+    #[inline]
+    fn id(&self) -> Option<Id> {
+        match self {
+            Val::Id(id) | Val::Dec(id, _) => Some(*id),
+            Val::V(_) => None,
         }
     }
 }
@@ -291,10 +317,17 @@ fn b(v: bool) -> Val {
 pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
     match e {
         Expr::Const(id) => Ok(Val::Id(*id)),
+        Expr::Lit(id, v) => Ok(Val::Dec(*id, v.clone())),
         Expr::Var(v) => {
             let id = row.get(*v);
             if id.is_undef() {
                 Err(TypeError)
+            } else if let Some(dec) = row.dec
+                && let Some(c) = row.map.get(*v as usize).copied().flatten()
+                && let Some(Some(col)) = dec.get(c)
+                && let Some(val) = &col[row.i]
+            {
+                Ok(Val::Dec(id, val.clone()))
             } else {
                 Ok(Val::Id(id))
             }
@@ -487,6 +520,22 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
     }
 }
 
+/// Does evaluating `e` require decoded values (as opposed to only ids / term kinds)?
+pub fn needs_values(e: &Expr) -> bool {
+    let simple = |x: &Expr| matches!(x, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..));
+    match e {
+        Expr::Const(_) | Expr::Lit(..) | Expr::Bound(_) => false,
+        Expr::SameTerm(a, b) => !(simple(a) && simple(b)),
+        Expr::Not(a) => needs_values(a),
+        Expr::And(a, b) | Expr::Or(a, b) => needs_values(a) || needs_values(b),
+        Expr::Call(
+            Func::Builtin(Function::IsIri | Function::IsBlank | Function::IsLiteral),
+            args,
+        ) => !args.iter().all(simple),
+        _ => true,
+    }
+}
+
 pub fn ebv(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<bool> {
     match eval(e, row, ctx)? {
         Val::Id(id) if id.tag() == crate::id::Tag::Bool => Ok(id.as_bool()),
@@ -495,12 +544,12 @@ pub fn ebv(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<bool> {
 }
 
 fn val_eq(x: Val, y: Val, ctx: &Ctx) -> EvalResult<bool> {
-    if let (Val::Id(a), Val::Id(c)) = (&x, &y) {
+    if let (Some(a), Some(c)) = (x.id(), y.id()) {
         if a == c {
             return Ok(true);
         }
         // IRIs / bnodes with different ids are different terms
-        let (ka, kc) = (ctx.kind(*a), ctx.kind(*c));
+        let (ka, kc) = (ctx.kind(a), ctx.kind(c));
         if ka != TermKind::Literal || kc != TermKind::Literal {
             return Ok(false);
         }
@@ -509,7 +558,7 @@ fn val_eq(x: Val, y: Val, ctx: &Ctx) -> EvalResult<bool> {
 }
 
 fn val_cmp(x: Val, y: Val, ctx: &Ctx) -> EvalResult<Option<Ordering>> {
-    if let (Val::Id(a), Val::Id(c)) = (&x, &y) {
+    if let (Some(a), Some(c)) = (x.id(), y.id()) {
         use crate::id::Tag;
         match (a.tag(), c.tag()) {
             (Tag::Int, Tag::Int) => return Ok(Some(a.as_i64().cmp(&c.as_i64()))),
@@ -536,12 +585,29 @@ fn same_kind(lang: Option<&str>, v: String) -> Val {
     }
 }
 
-fn arg(args: &[Expr], i: usize, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Value> {
-    eval(args.get(i).ok_or(TypeError)?, row, ctx)?.value(ctx)
+/// Evaluate a function argument to a value, borrowing constants and pre-decoded columns
+/// instead of cloning them (cloning a shared `Arc` from every thread contends on its
+/// reference count).
+fn arg<'r>(args: &'r [Expr], i: usize, row: &'r Row<'_>, ctx: &Ctx) -> EvalResult<Cow<'r, Value>> {
+    let e = args.get(i).ok_or(TypeError)?;
+    match e {
+        Expr::Lit(_, v) => Ok(Cow::Borrowed(v)),
+        Expr::Var(var) => {
+            if let Some(dec) = row.dec
+                && let Some(c) = row.map.get(*var as usize).copied().flatten()
+                && let Some(Some(col)) = dec.get(c)
+                && let Some(val) = &col[row.i]
+            {
+                return Ok(Cow::Borrowed(val));
+            }
+            Ok(Cow::Owned(eval(e, row, ctx)?.value(ctx)?))
+        }
+        _ => Ok(Cow::Owned(eval(e, row, ctx)?.value(ctx)?)),
+    }
 }
 
 /// SPARQL 17.4.3.1.2 argument compatibility.
-fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
+pub(crate) fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (_, None) => true,
         (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
@@ -625,7 +691,7 @@ fn xpath_replacement(r: &str) -> EvalResult<String> {
     Ok(out)
 }
 
-fn lang_matches(tag: &str, range: &str) -> bool {
+pub(crate) fn lang_matches(tag: &str, range: &str) -> bool {
     if range == "*" {
         return !tag.is_empty();
     }
@@ -640,7 +706,7 @@ fn round_half_up_double(d: f64) -> f64 {
 fn call(f: &Func, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
     match f {
         Func::Builtin(f) => builtin(f, args, row, ctx),
-        Func::Cast(dt) => cast(dt, arg(args, 0, row, ctx)?),
+        Func::Cast(dt) => cast(dt, arg(args, 0, row, ctx)?.into_owned()),
         Func::Ext(iri) => extension(iri, args, row, ctx),
     }
 }
@@ -655,14 +721,14 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     Ok(match f {
         F::Str => {
             let v = eval(&args[0], row, ctx)?;
-            if let Val::Id(id) = &v
-                && let Some(Term::Literal(l)) = ctx.term(*id)
+            if let Some(id) = v.id()
+                && let Some(Term::Literal(l)) = ctx.term(id)
             {
                 return Ok(s(l.value()));
             }
             s(v.value(ctx)?.lexical()?)
         }
-        F::Lang => match a0()? {
+        F::Lang => match a0()?.into_owned() {
             Value::Lang(_, l) => s(l),
             v if v.is_literal() => s(""),
             _ => return Err(TypeError),
@@ -678,7 +744,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Datatype => {
             let v = eval(&args[0], row, ctx)?;
             let dt = match &v {
-                Val::Id(id) => match ctx.term(*id) {
+                Val::Id(id) | Val::Dec(id, _) => match ctx.term(*id) {
                     Some(Term::Literal(l)) => l.datatype().into_owned(),
                     _ => return Err(TypeError),
                 },
@@ -686,7 +752,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             };
             Val::V(Value::Iri(dt.as_str().into()))
         }
-        F::Iri => match a0()? {
+        F::Iri => match a0()?.into_owned() {
             Value::Iri(i) => Val::V(Value::Iri(i)),
             Value::Str(st) => {
                 let iri = match &ctx.base_iri {
@@ -721,25 +787,25 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             }
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),
-        F::Abs => Val::V(match Num::of(&a0()?)? {
+        F::Abs => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i.checked_abs().ok_or(TypeError)?),
             Num::Decimal(d) => Value::Decimal(d.checked_abs().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.abs()),
             Num::Double(d) => Value::Double(d.abs()),
         }),
-        F::Ceil => Val::V(match Num::of(&a0()?)? {
+        F::Ceil => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
             Num::Decimal(d) => Value::Decimal(d.checked_ceil().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.ceil()),
             Num::Double(d) => Value::Double(d.ceil()),
         }),
-        F::Floor => Val::V(match Num::of(&a0()?)? {
+        F::Floor => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
             Num::Decimal(d) => Value::Decimal(d.checked_floor().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.floor()),
             Num::Double(d) => Value::Double(d.floor()),
         }),
-        F::Round => Val::V(match Num::of(&a0()?)? {
+        F::Round => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
             Num::Decimal(d) => Value::Decimal(d.checked_round().ok_or(TypeError)?),
             Num::Float(f) => Value::Float((round_half_up_double(f64::from(f)) as f32).into()),
@@ -764,9 +830,9 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::SubStr => {
             let v = a0()?;
             let (st, l) = v.string_arg()?;
-            let start = Num::of(&a1()?)?.to_double();
+            let start = Num::of(&*a1()?)?.to_double();
             let len = if args.len() > 2 {
-                Some(f64::from(Num::of(&a2()?)?.to_double()))
+                Some(f64::from(Num::of(&*a2()?)?.to_double()))
             } else {
                 None
             };
@@ -858,7 +924,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::Year | F::Month | F::Day | F::Hours | F::Minutes | F::Seconds | F::Timezone | F::Tz => {
             let v = a0()?;
-            let (y, mo, d, h, mi, se, tz) = match &v {
+            let (y, mo, d, h, mi, se, tz) = match &*v {
                 Value::DateTime(dt) => (
                     dt.year(),
                     dt.month(),
@@ -889,7 +955,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 F::Minutes => int(mi as i64),
                 F::Seconds => Val::V(Value::Decimal(se)),
                 F::Timezone => Val::V(Value::DayTime(tz.ok_or(TypeError)?)),
-                _ => s(match &v {
+                _ => s(match &*v {
                     Value::DateTime(dt) => dt
                         .timezone_offset()
                         .map(|t| t.to_string())
@@ -937,7 +1003,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let v = a0()?;
             let dt = a1()?;
             let st = v.as_str().ok_or(TypeError)?;
-            let Value::Iri(dt) = dt else {
+            let Value::Iri(dt) = dt.into_owned() else {
                 return Err(TypeError);
             };
             Val::V(Value::from_literal(&Literal::new_typed_literal(
@@ -1139,7 +1205,7 @@ pub fn is_extension(iri: &str) -> bool {
 
 fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
     let a = |i: usize| arg(args, i, row, ctx);
-    let dbl = |i: usize| -> EvalResult<f64> { Ok(Num::of(&a(i)?)?.to_double().into()) };
+    let dbl = |i: usize| -> EvalResult<f64> { Ok(Num::of(&*a(i)?)?.to_double().into()) };
     let d = |x: f64| Ok(Val::V(Value::Double(x.into())));
     if let Some(l) = iri.strip_prefix(MATH) {
         return match l {
@@ -1216,7 +1282,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
     if let Some(l) = iri.strip_prefix(AFN) {
         return match l {
             "localname" | "namespace" => {
-                let Value::Iri(i) = a(0)? else {
+                let Value::Iri(i) = a(0)?.into_owned() else {
                     return Err(TypeError);
                 };
                 let cut = i.rfind(['#', '/', ':']).map_or(0, |p| p + 1);
@@ -1231,7 +1297,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "pi" => d(std::f64::consts::PI),
             "e" => d(std::f64::consts::E),
             "min" | "max" => {
-                let (x, y) = (a(0)?, a(1)?);
+                let (x, y) = (a(0)?.into_owned(), a(1)?.into_owned());
                 let o = compare(&x, &y)?.ok_or(TypeError)?;
                 let pick_x = if l == "min" {
                     o != Ordering::Greater
@@ -1259,7 +1325,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
         };
     }
     if let Some(Ok(v)) = is_cast(iri).then(|| a(0)) {
-        return cast(&NamedNode::new_unchecked(iri), v);
+        return cast(&NamedNode::new_unchecked(iri), v.into_owned());
     }
     Err(TypeError)
 }
@@ -1278,7 +1344,15 @@ impl Compiler<'_> {
         let bx = |e: &Expression| Box::new(self.compile(e));
         match e {
             E::NamedNode(n) => Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))),
-            E::Literal(l) => Expr::Const(self.ctx.intern_term(&Term::Literal(l.clone()))),
+            E::Literal(l) => {
+                let t = Term::Literal(l.clone());
+                let id = self.ctx.intern_term(&t);
+                if id.is_inline() {
+                    Expr::Const(id)
+                } else {
+                    Expr::Lit(id, Value::from_term(&t))
+                }
+            }
             E::Variable(v) => {
                 let id = self.ctx.var(v.as_str());
                 match self.subst.get(&id) {

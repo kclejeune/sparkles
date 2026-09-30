@@ -122,6 +122,23 @@ except `contains`, where the two are within noise.
 * **Executed-plan feedback.** Every query returns a runtime-information tree
   (estimated vs. actual rows, time per operator), like `qlever-json`. The UI renders it.
 
+### Further scan and filter optimizations
+
+* **`COUNT(DISTINCT ?v)` from index runs.** Over a single triple pattern, the scan is
+  re-targeted to a permutation sorted on `?v` and the distinct values are counted as
+  runs of equal ids (`CountDistinctFromIndex`). No rows are materialized or hashed.
+* **Filters on vocabulary keys.** `CONTAINS` / `STRSTARTS` / `STRENDS` / `REGEX` over
+  `?v` or `STR(?v)`, and `LANGMATCHES(LANG(?v), …)`, are tested directly on the stored
+  key bytes (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in
+  parallel, with no per-term string allocation. Terms added by updates are tested on
+  their delta keys; inline values (numbers, dates) fall back to the general evaluator.
+* **Per-distinct-value filters.** A deterministic filter over one variable is
+  evaluated once per distinct id, and rows look up the outcome. When the column is
+  sorted on the variable, the distinct ids are its runs.
+* **Whole-block scans under graph filters.** A block slice is copied column-wise
+  whenever every row passes the graph filter (one pass over the graph column), so
+  default-graph queries no longer fall back to row-by-row filtering.
+
 ## Divergences from Jena / QLever (decisions)
 
 | Decision | Rationale |

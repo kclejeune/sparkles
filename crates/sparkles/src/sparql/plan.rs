@@ -2170,22 +2170,20 @@ fn equality_constant(e: &Expr, ctx: &Ctx) -> Option<(VarId, Id)> {
         Expr::Eq(a, b) => (a, b),
         Expr::SameTerm(a, b) => {
             return match (&**a, &**b) {
-                (Expr::Var(v), Expr::Const(c)) | (Expr::Const(c), Expr::Var(v))
-                    if c.tag() != Tag::Local =>
-                {
-                    Some((*v, *c))
-                }
+                (Expr::Var(v), c) | (c, Expr::Var(v)) => c
+                    .const_id()
+                    .filter(|c| c.tag() != Tag::Local)
+                    .map(|c| (*v, c)),
                 _ => None,
             };
         }
         _ => return None,
     };
     match (&**a, &**b) {
-        (Expr::Var(v), Expr::Const(c)) | (Expr::Const(c), Expr::Var(v))
-            if ctx.kind(*c) == super::ctx::TermKind::Iri =>
-        {
-            Some((*v, *c))
-        }
+        (Expr::Var(v), c) | (c, Expr::Var(v)) => c
+            .const_id()
+            .filter(|c| ctx.kind(*c) == super::ctx::TermKind::Iri)
+            .map(|c| (*v, c)),
         _ => None,
     }
 }

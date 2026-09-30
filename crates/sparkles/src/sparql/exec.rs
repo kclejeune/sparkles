@@ -658,6 +658,7 @@ fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Tab
                         table: &joined,
                         i,
                         map: &map,
+                        dec: None,
                     },
                     ctx,
                 )
@@ -726,27 +727,214 @@ fn minus(ctx: &Ctx, mut l: Table, r: &Table) -> Result<Table> {
 
 // ------------------------------------------------------------ expressions ------
 
+/// Decode the base-vocabulary ids of the columns the expressions read into row-aligned
+/// value columns: rows are argsorted by id so every distinct term is decoded once and
+/// each front-coded block is touched once (in parallel); per-row lookups are then O(1)
+/// and lock-free.
+fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::DecodedCols> {
+    if t.len() < 4096 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
+        return None;
+    }
+    let mut vars = Vec::new();
+    for e in exprs {
+        e.vars(&mut vars);
+    }
+    vars.sort_unstable();
+    vars.dedup();
+    let vocab = &ctx.snap.generation.vocab;
+    let mut out: super::expr::DecodedCols = vec![None; t.width()];
+    for v in vars {
+        let Some(c) = t.col_of(v) else { continue };
+        let col = &t.cols[c];
+        let mut idx: Vec<u32> = (0..col.len() as u32)
+            .filter(|&i| col[i as usize].tag() == crate::id::Tag::Vocab)
+            .collect();
+        if idx.len() < 4096 {
+            continue;
+        }
+        idx.par_sort_unstable_by_key(|&i| col[i as usize]);
+        let mut uniq: Vec<u64> = idx.iter().map(|&i| col[i as usize].payload()).collect();
+        uniq.dedup();
+        let decoded: Vec<Value> = uniq
+            .par_chunks(4096)
+            .flat_map_iter(|chunk| {
+                let mut part = Vec::with_capacity(chunk.len());
+                vocab.get_sorted(chunk, |_, k| part.push(Value::from_key(k)));
+                part
+            })
+            .collect();
+        if decoded.len() != uniq.len() {
+            continue;
+        }
+        let mut vals: Vec<Option<Value>> = vec![None; col.len()];
+        if decoded.len() == idx.len() {
+            // every row holds a different term: move the values instead of cloning
+            for (&i, v) in idx.iter().zip(decoded) {
+                vals[i as usize] = Some(v);
+            }
+        } else {
+            let mut j = 0;
+            for &i in &idx {
+                let p = col[i as usize].payload();
+                while uniq[j] != p {
+                    j += 1;
+                }
+                vals[i as usize] = Some(decoded[j].clone());
+            }
+        }
+        out[c] = Some(vals);
+    }
+    Some(out)
+}
+
 fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) {
-    let map = t.var_map(ctx.nvars());
-    let test = |i: usize| {
-        let row = Row {
-            table: t,
-            i,
-            map: &map,
-        };
-        exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
-    };
-    let keep: Vec<bool> = if t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists()) {
-        (0..t.len()).into_par_iter().map(test).collect()
-    } else {
-        (0..t.len()).map(test).collect()
+    let t0 = Instant::now();
+    let keep = match distinct_filter_mask(ctx, t, exprs) {
+        Some(keep) => {
+            tracing::debug!("filter evaluated per distinct value in {:?}", t0.elapsed());
+            keep
+        }
+        None => filter_mask(ctx, t, exprs),
     };
     let sorted = t.sorted.clone();
     t.filter_rows(&keep);
     t.sorted = sorted;
 }
 
+/// Evaluate the filter row by row.
+fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Vec<bool> {
+    let t0 = Instant::now();
+    let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
+    tracing::debug!("decoded values in {:?}", t0.elapsed());
+    let t0 = Instant::now();
+    let map = t.var_map(ctx.nvars());
+    let test = |i: usize| {
+        let row = Row {
+            table: t,
+            i,
+            map: &map,
+            dec: dec.as_ref(),
+        };
+        exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
+    };
+    let keep = if t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists()) {
+        (0..t.len()).into_par_iter().map(test).collect()
+    } else {
+        (0..t.len()).map(test).collect()
+    };
+    tracing::debug!("filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
+    keep
+}
+
+/// A deterministic filter that reads a single variable has the same outcome for every
+/// row holding the same id: evaluate it once per distinct id and look the outcome up per
+/// row, instead of decoding and testing every row. Values of a column often repeat
+/// (names, labels, categories), and a column sorted on the variable yields its distinct
+/// ids as runs without sorting.
+fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Option<Vec<bool>> {
+    if t.len() < 4096
+        || !exprs.iter().any(super::expr::needs_values)
+        || !exprs.iter().all(super::cache::deterministic)
+    {
+        return None;
+    }
+    let mut vars = Vec::new();
+    for e in exprs {
+        e.vars(&mut vars);
+    }
+    vars.sort_unstable();
+    vars.dedup();
+    let &[v] = vars.as_slice() else {
+        return None;
+    };
+    let col = &t.cols[t.col_of(v)?];
+    let runs = t.sorted.first() == Some(&v);
+    let mut uniq = col.clone();
+    if !runs {
+        uniq.par_sort_unstable();
+    }
+    uniq.dedup();
+    let (hit, uniq) = match super::keyfilter::KeyFilter::new(exprs, v) {
+        Some(kf) => (key_filter_mask(ctx, &kf, &uniq, v, exprs), uniq),
+        // the general evaluator gains nothing when (nearly) every value is different
+        None if uniq.len() > col.len() / 4 * 3 => return None,
+        None => {
+            let mut values = Table::new(vec![v]);
+            values.len = uniq.len();
+            values.cols[0] = uniq;
+            let hit = filter_mask(ctx, &values, exprs);
+            (hit, std::mem::take(&mut values.cols[0]))
+        }
+    };
+    Some(if runs {
+        // `uniq` lists the runs in column order
+        let mut j = 0;
+        col.iter()
+            .map(|id| {
+                if *id != uniq[j] {
+                    j += 1;
+                }
+                hit[j]
+            })
+            .collect()
+    } else {
+        col.par_iter()
+            .map(|id| hit[uniq.binary_search(id).unwrap()])
+            .collect()
+    })
+}
+
+/// Outcome of a key filter for sorted distinct ids: base-vocabulary terms are tested on
+/// their keys straight from the front-coded blocks (in parallel, each block visited once),
+/// update-added terms on their delta keys, and everything else (inline literals, blank
+/// nodes, unbound) by the general evaluator.
+fn key_filter_mask(
+    ctx: &Ctx,
+    kf: &super::keyfilter::KeyFilter,
+    uniq: &[Id],
+    v: VarId,
+    exprs: &[Expr],
+) -> Vec<bool> {
+    use crate::id::Tag;
+    let vocab = &ctx.snap.generation.vocab;
+    let mut hit = vec![false; uniq.len()];
+    // raw ids sort by tag first, so the vocabulary ids are one contiguous range
+    let lo = uniq.partition_point(|id| id.tag() < Tag::Vocab);
+    let hi = lo + uniq[lo..].partition_point(|id| id.tag() == Tag::Vocab);
+    hit[lo..hi]
+        .par_chunks_mut(4096)
+        .zip(uniq[lo..hi].par_chunks(4096))
+        .for_each(|(h, ids)| {
+            let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
+            let mut j = 0;
+            vocab.get_sorted(&payloads, |p, k| {
+                while payloads[j] != p {
+                    j += 1;
+                }
+                h[j] = kf.test(k);
+            });
+        });
+    let mut rest = Table::new(vec![v]);
+    let mut rest_at = Vec::new();
+    for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {
+        match ctx.snap.key(*id) {
+            Some(k) => hit[i] = kf.test(&k),
+            None => {
+                rest.push_row(&[*id]);
+                rest_at.push(i);
+            }
+        }
+    }
+    if !rest_at.is_empty() {
+        for (i, h) in rest_at.into_iter().zip(filter_mask(ctx, &rest, exprs)) {
+            hit[i] = h;
+        }
+    }
+    hit
+}
+
 fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
+    let dec = decode_for(ctx, t, &[e]);
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
         e,
@@ -754,6 +942,7 @@ fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
             table: t,
             i,
             map: &map,
+            dec: dec.as_ref(),
         },
         ctx,
     ) {
@@ -768,6 +957,7 @@ fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
 }
 
 fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) -> Table {
+    let dec = decode_for(ctx, &t, &keys.iter().map(|(e, _)| e).collect::<Vec<_>>());
     let map = t.var_map(ctx.nvars());
     let key_vals: Vec<Vec<Option<Value>>> = keys
         .iter()
@@ -779,13 +969,14 @@ fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) ->
                         table: &t,
                         i,
                         map: &map,
+                        dec: dec.as_ref(),
                     },
                     ctx,
                 )
                 .ok()
                 .and_then(|v| match v {
                     Val::Id(id) => ctx.value(id),
-                    Val::V(v) => Some(v),
+                    Val::V(v) | Val::Dec(_, v) => Some(v),
                 })
             };
             if t.len() > PAR_THRESHOLD {
@@ -904,6 +1095,7 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
                     table: t,
                     i: i as usize,
                     map,
+                    dec: None,
                 },
                 ctx,
             )

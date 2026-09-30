@@ -69,6 +69,8 @@ pub struct Vocab {
     data: Bytes,
     offsets: Bytes,
     len: u64,
+    /// id of the first IRI key: literal keys (`"…`) sort before IRI keys (`<…`)
+    first_iri: u64,
 }
 
 impl Vocab {
@@ -77,6 +79,7 @@ impl Vocab {
             data: Bytes::Vec(Vec::new()),
             offsets: Bytes::Vec(Vec::new()),
             len: 0,
+            first_iri: 0,
         }
     }
 
@@ -89,12 +92,26 @@ impl Vocab {
         } else {
             0
         };
-        Ok(Vocab { data, offsets, len })
+        let mut v = Vocab {
+            data,
+            offsets,
+            len,
+            first_iri: 0,
+        };
+        v.first_iri = match v.find(b"<") {
+            Ok(i) | Err(i) => i,
+        };
+        Ok(v)
     }
 
     #[inline]
     pub fn len(&self) -> u64 {
         self.len
+    }
+    /// Is base id `id` an IRI (as opposed to a literal)? O(1) thanks to the sort order.
+    #[inline]
+    pub fn is_iri(&self, id: u64) -> bool {
+        id >= self.first_iri
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -158,6 +175,32 @@ impl Vocab {
             }
         });
         out
+    }
+
+    /// Decode many ids (sorted ascending, deduplicated), touching each front-coded
+    /// block once: `f(id, key)`.
+    pub fn get_sorted(&self, ids: &[u64], mut f: impl FnMut(u64, &[u8])) {
+        let mut i = 0;
+        while i < ids.len() {
+            let id = ids[i];
+            if id >= self.len {
+                break;
+            }
+            let b = (id as usize) / FC_BLOCK;
+            let end = ((b + 1) * FC_BLOCK) as u64;
+            let j = i + ids[i..].partition_point(|&x| x < end);
+            let wanted = &ids[i..j];
+            let last = (wanted[wanted.len() - 1] as usize) % FC_BLOCK;
+            let mut w = 0;
+            self.scan_block(b, |pos, k| {
+                if w < wanted.len() && (wanted[w] as usize) % FC_BLOCK == pos {
+                    f(wanted[w], k);
+                    w += 1;
+                }
+                pos < last
+            });
+            i = j;
+        }
     }
 
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
@@ -409,6 +452,24 @@ impl DeltaVocab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_sorted_matches_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = VocabWriter::create(dir.path()).unwrap();
+        for i in 0..1000 {
+            w.push(format!("<http://x/{i:05}").as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        let ids: Vec<u64> = (0..1000).filter(|i| i % 7 == 0 || i % 16 == 15).collect();
+        let mut got = Vec::new();
+        v.get_sorted(&ids, |i, k| got.push((i, k.to_vec())));
+        assert_eq!(got.len(), ids.len());
+        for (i, k) in got {
+            assert_eq!(v.get(i).unwrap(), k);
+        }
+    }
 
     #[test]
     fn front_coded_roundtrip() {

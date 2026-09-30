@@ -32,6 +32,8 @@ pub struct DatasetSpec {
 }
 
 const VALUE_SHARDS: usize = 64;
+/// decoded values kept per shard before the shard is cleared
+const VALUE_SHARD_CAP: usize = 1 << 16;
 
 pub struct Ctx {
     pub snap: Arc<Snapshot>,
@@ -205,20 +207,24 @@ impl Ctx {
             Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
-                let shard = &self.values
-                    [(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS];
+                let shard = self.shard(id);
                 if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
                 }
                 let v = Value::from_term(&self.term(id)?);
                 let mut w = shard.write();
-                if w.len() > 1_000_000 / VALUE_SHARDS {
+                if w.len() > VALUE_SHARD_CAP {
                     w.clear();
                 }
                 w.insert(id, v.clone());
                 Some(v)
             }
         }
+    }
+
+    #[inline]
+    fn shard(&self, id: Id) -> &RwLock<FxHashMap<Id, Value>> {
+        &self.values[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS]
     }
 
     /// Is the id an IRI / blank node / literal (without full decoding where possible)?
@@ -229,7 +235,14 @@ impl Ctx {
                 TermKind::Literal
             }
             Tag::BNode => TermKind::BNode,
-            Tag::Vocab | Tag::Delta => match self.snap.key(id) {
+            Tag::Vocab => {
+                if self.snap.generation.vocab.is_iri(id.payload()) {
+                    TermKind::Iri
+                } else {
+                    TermKind::Literal
+                }
+            }
+            Tag::Delta => match self.snap.key(id) {
                 Some(k) if id::is_key_iri(&k) => TermKind::Iri,
                 Some(_) => TermKind::Literal,
                 None => TermKind::None,

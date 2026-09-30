@@ -64,21 +64,49 @@ impl Value {
     }
 
     pub fn from_literal(l: &Literal) -> Value {
-        let lex = l.value();
-        if let Some(lang) = l.language() {
-            return Value::Lang(lex.into(), lang.into());
+        match l.language() {
+            Some(lang) => Value::Lang(l.value().into(), lang.into()),
+            None => Value::from_typed(l.value(), l.datatype().as_str()),
         }
-        let dt = l.datatype();
+    }
+
+    /// Decode a vocabulary key (see [`crate::id::term_key`]) directly into a value,
+    /// without building an intermediate `Term`.
+    pub fn from_key(key: &[u8]) -> Value {
+        fn s(b: &[u8]) -> std::borrow::Cow<'_, str> {
+            String::from_utf8_lossy(b)
+        }
+        match key.first() {
+            Some(b'<') => Value::Iri(s(&key[1..]).into()),
+            Some(b'"') => {
+                let sep = key
+                    .iter()
+                    .rposition(|&b| b == crate::id::KEY_SEP)
+                    .unwrap_or(key.len());
+                let lex = s(&key[1..sep]);
+                let suffix = key.get(sep + 1..).unwrap_or(&[]);
+                match suffix.first() {
+                    None => Value::Str(lex.into()),
+                    Some(b'@') => Value::Lang(lex.into(), s(&suffix[1..]).into()),
+                    Some(_) => Value::from_typed(&lex, &s(&suffix[1..])),
+                }
+            }
+            _ => Value::from_term(&crate::id::key_to_term(key)),
+        }
+    }
+
+    /// Value of a typed literal given its lexical form and datatype IRI.
+    pub fn from_typed(lex: &str, dt: &str) -> Value {
         let other = || Value::Other {
             lex: lex.into(),
-            dt: dt.as_str().into(),
+            dt: dt.into(),
         };
         macro_rules! parse {
             ($variant:ident) => {
                 lex.parse().map(Value::$variant).unwrap_or_else(|_| other())
             };
         }
-        match dt.as_str() {
+        match dt {
             s if s == xsd::STRING.as_str() => Value::Str(lex.into()),
             s if s == xsd::BOOLEAN.as_str() => match lex {
                 "true" | "1" => Value::Bool(true),

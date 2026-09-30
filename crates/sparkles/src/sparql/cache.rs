@@ -128,7 +128,8 @@ impl ResultCache {
     }
 }
 
-fn deterministic(e: &Expr) -> bool {
+/// Same result for the same variable bindings (no RAND/NOW/UUID/BNODE/EXISTS).
+pub(crate) fn deterministic(e: &Expr) -> bool {
     match e {
         Expr::Call(Func::Builtin(f), args) => {
             !matches!(
@@ -155,7 +156,7 @@ fn deterministic(e: &Expr) -> bool {
         Expr::If(a, b, c) => deterministic(a) && deterministic(b) && deterministic(c),
         // EXISTS results are memoized per query; the pattern text is not in the key
         Expr::Exists(_) => false,
-        Expr::Const(_) | Expr::Var(_) | Expr::Bound(_) => true,
+        Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
     }
 }
 
