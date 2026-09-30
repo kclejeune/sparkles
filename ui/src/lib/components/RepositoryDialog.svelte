@@ -20,8 +20,6 @@
     onsaved?: (r: b.Repository) => void;
   } = $props();
 
-  type CredSource = 'default' | 'env' | 'file';
-
   let name = $state('');
   let type = $state<b.RepositoryType>('fs');
   let path = $state('');
@@ -33,11 +31,8 @@
   let allowHttp = $state(false);
   let sse = $state<'' | 'AES256' | 'aws:kms'>('');
   let kmsKeyId = $state('');
-  let credSource = $state<CredSource>('default');
-  let accessKeyIdVar = $state('AWS_ACCESS_KEY_ID');
-  let secretAccessKeyVar = $state('AWS_SECRET_ACCESS_KEY');
-  let sessionTokenVar = $state('');
-  let credFile = $state('');
+  /** The operator-defined credential source (`[credentials.<name>]` of the backup config). */
+  let credName = $state('');
   let readonly = $state(false);
   let conditionalWrites = $state(true);
   let maxConcurrency = $state<number | null>(null);
@@ -68,12 +63,7 @@
     allowHttp = r?.allowHttp ?? false;
     sse = r?.sse ?? '';
     kmsKeyId = r?.kmsKeyId ?? '';
-    const c = r?.credentials;
-    credSource = c?.source ?? 'default';
-    accessKeyIdVar = c?.source === 'env' ? c.accessKeyIdVar : 'AWS_ACCESS_KEY_ID';
-    secretAccessKeyVar = c?.source === 'env' ? c.secretAccessKeyVar : 'AWS_SECRET_ACCESS_KEY';
-    sessionTokenVar = c?.source === 'env' ? (c.sessionTokenVar ?? '') : '';
-    credFile = c?.source === 'file' ? c.path : '';
+    credName = r?.credentials?.source === 'named' ? r.credentials.name : '';
     readonly = r?.readonly ?? false;
     conditionalWrites = r?.conditionalWrites ?? true;
     maxConcurrency = r?.maxConcurrency ?? null;
@@ -88,12 +78,7 @@
   const locationOk = $derived(
     type === 'fs' ? path.trim().startsWith('/') : bucket.trim().length > 0,
   );
-  const credsOk = $derived(
-    type === 'fs' ||
-      credSource === 'default' ||
-      (credSource === 'env' && !!accessKeyIdVar.trim() && !!secretAccessKeyVar.trim()) ||
-      (credSource === 'file' && credFile.trim().startsWith('/')),
-  );
+  const credsOk = $derived(type === 'fs' || REPO_NAME.test(credName.trim()));
   const valid = $derived(nameOk && locationOk && credsOk && (!httpEndpoint || allowHttp));
 
   function config(): b.RepositoryConfig {
@@ -111,17 +96,7 @@
     else {
       c.bucket = bucket.trim();
       c.prefix = opt(prefix);
-      c.credentials =
-        credSource === 'env'
-          ? {
-              source: 'env',
-              accessKeyIdVar: accessKeyIdVar.trim(),
-              secretAccessKeyVar: secretAccessKeyVar.trim(),
-              ...(sessionTokenVar.trim() ? { sessionTokenVar: sessionTokenVar.trim() } : {}),
-            }
-          : credSource === 'file'
-            ? { source: 'file', path: credFile.trim() }
-            : { source: 'default' };
+      c.credentials = { source: 'named', name: credName.trim() };
     }
     if (type === 's3') {
       c.region = opt(region);
@@ -198,7 +173,7 @@
       <fieldset class="types" disabled={isEdit}>
         <legend>Type</legend>
         <div class="seg" role="radiogroup" aria-label="Repository type">
-          {#each [['fs', 'Filesystem'], ['s3', 'S3'], ['gcs', 'GCS'], ['azure', 'Azure']] as [v, label] (v)}
+          {#each [['fs', 'Filesystem'], ['s3', 'S3'], ['gcs', 'GCS'], ['azure', 'Azure']].filter(([v]) => v === 'fs' || v === 's3' || v === type) as [v, label] (v)}
             <label class:sel={type === v}>
               <input type="radio" bind:group={type} value={v} />{label}
             </label>
@@ -311,53 +286,21 @@
 
         <fieldset class="creds">
           <legend>Credentials</legend>
+          <label class="field">
+            Credential source
+            <input
+              class="input mono"
+              bind:value={credName}
+              placeholder="s3-main"
+              autocomplete="off"
+            />
+          </label>
           <p class="hint">
-            Sparkles never stores secrets. It reads them from the server's environment or from a
-            file when it opens the repository.
+            The name of a source the server's operator defined in its backup config file (<span
+              class="mono">[credentials.&lt;name&gt;]</span
+            >: environment variables, a file or the default chain). Sparkles never stores secrets,
+            and repositories added here cannot pick the server's variables or files themselves.
           </p>
-          <div class="seg" role="radiogroup" aria-label="Credentials source">
-            {#each [['default', 'Default chain'], ['env', 'Environment variables'], ['file', 'File']] as [v, label] (v)}
-              <label class:sel={credSource === v}>
-                <input type="radio" bind:group={credSource} value={v} />{label}
-              </label>
-            {/each}
-          </div>
-          {#if credSource === 'default'}
-            <p class="hint">
-              The standard provider chain: <span class="mono">AWS_ACCESS_KEY_ID</span> and friends, web
-              identity, instance metadata.
-            </p>
-          {:else if credSource === 'env'}
-            <div class="grid2">
-              <label class="field">
-                Access key id variable
-                <input class="input mono" bind:value={accessKeyIdVar} />
-              </label>
-              <label class="field">
-                Secret access key variable
-                <input class="input mono" bind:value={secretAccessKeyVar} />
-              </label>
-              <label class="field">
-                <span>Session token variable <span class="faint">(optional)</span></span>
-                <input class="input mono" bind:value={sessionTokenVar} />
-              </label>
-            </div>
-            <p class="hint">Names of variables in the server's environment, not their values.</p>
-          {:else}
-            <label class="field">
-              Credentials file
-              <input
-                class="input mono"
-                bind:value={credFile}
-                placeholder="/run/secrets/sparkles-s3.json"
-              />
-            </label>
-            <p class="hint">
-              A JSON file on the server, <span class="mono"
-                >{'{accessKeyId, secretAccessKey, sessionToken?}'}</span
-              >, read again at each use so that rotation works. Keep it readable by the server only.
-            </p>
-          {/if}
         </fieldset>
       {/if}
 

@@ -14,11 +14,16 @@ const send = (method: string, body?: unknown): RequestInit =>
 
 export type RepositoryType = 'fs' | 's3' | 'gcs' | 'azure';
 
-/** Where a repository's credentials come from; the server never stores secrets. */
+/**
+ * Where a repository's credentials come from; the server never stores secrets. Repositories
+ * registered through the API only name a source the operator defined in the server's backup
+ * config file (`named`); the other forms are for config-file repositories.
+ */
 export type Credentials =
   | { source: 'default' }
   | { source: 'env'; accessKeyIdVar: string; secretAccessKeyVar: string; sessionTokenVar?: string }
-  | { source: 'file'; path: string };
+  | { source: 'file'; path: string }
+  | { source: 'named'; name: string };
 
 export type RepositoryConfig = {
   name: string;

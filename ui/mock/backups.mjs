@@ -505,6 +505,9 @@ function createMock({
 
   // --- seed data ----------------------------------------------------------------------
 
+  /** `[credentials.<name>]` of the (imaginary) backup config file. */
+  const CREDENTIAL_SOURCES = ['minio', 's3-main'];
+
   function addRepo(config, source, status, extra = {}) {
     const repo = {
       config: {
@@ -602,11 +605,7 @@ function createMock({
         pathStyle: true,
         allowHttp: true,
         conditionalWrites: false,
-        credentials: {
-          source: 'env',
-          accessKeyIdVar: 'MINIO_USER',
-          secretAccessKeyVar: 'MINIO_PASSWORD',
-        },
+        credentials: { source: 'named', name: 'minio' },
       },
       'api',
       {
@@ -1528,7 +1527,7 @@ function createMock({
       ...(body.endpoint ? { endpoint: String(body.endpoint) } : {}),
       ...(body.pathStyle != null ? { pathStyle: !!body.pathStyle } : {}),
       ...(body.allowHttp != null ? { allowHttp: !!body.allowHttp } : {}),
-      credentials: body.credentials ?? (body.type === 'fs' ? undefined : { source: 'default' }),
+      credentials: body.credentials ?? undefined,
       sse: body.sse ?? null,
       ...(body.kmsKeyId ? { kmsKeyId: String(body.kmsKeyId) } : {}),
       conditionalWrites: body.conditionalWrites !== false,
@@ -1541,6 +1540,12 @@ function createMock({
       throw err(400, 'invalid-name', `invalid repository name “${c.name}”`);
     if (!['fs', 's3', 'gcs', 'azure'].includes(c.type))
       throw err(400, 'invalid-config', `unknown type “${c.type}”`);
+    if (c.type === 'gcs' || c.type === 'azure')
+      throw err(
+        400,
+        'invalid-config',
+        `type: ${c.type} repositories use the server's own credentials and are defined in its backup config file`,
+      );
     if (c.type === 'fs' && !/^\//.test(c.path ?? ''))
       throw err(400, 'invalid-config', 'path must be an absolute path');
     if (c.type === 'fs' && /^\/var\/lib\/sparkles(\/|$)/.test(c.path))
@@ -1558,15 +1563,22 @@ function createMock({
       if (u.protocol === 'http:' && !c.allowHttp)
         throw err(400, 'invalid-config', 'an http:// endpoint needs allowHttp: true');
     }
+    // registered through the API: only a credential source the operator named
     const cred = c.credentials;
-    if (cred && cred.source === 'env' && (!cred.accessKeyIdVar || !cred.secretAccessKeyVar))
+    if (c.type === 's3' && cred?.source !== 'named')
       throw err(
         400,
         'invalid-config',
-        'credentials from env need accessKeyIdVar and secretAccessKeyVar',
+        'credentials: repositories registered through the API use a credential source defined in the server\'s backup config file: {"source": "named", "name": …}',
       );
-    if (cred && cred.source === 'file' && !/^\//.test(cred.path ?? ''))
-      throw err(400, 'invalid-config', 'the credentials file must be an absolute path');
+    if (c.type === 's3' && !CREDENTIAL_SOURCES.includes(cred.name))
+      throw err(
+        400,
+        'invalid-config',
+        `credentials.name: no credential source "${cred.name}" in the server's backup config file`,
+      );
+    if (c.type === 'fs' && cred)
+      throw err(400, 'invalid-config', 'credentials: not used by fs repositories');
     if (existing) {
       for (const k of ['type', 'path', 'bucket', 'prefix', 'endpoint'])
         if ((existing.config[k] ?? '') !== (c[k] ?? ''))
