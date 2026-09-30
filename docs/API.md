@@ -1017,6 +1017,9 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6; a number applies to whichever algorithm is chosen |
 | `--http-compression-algorithms` | `zstd,br,gzip,deflate` | the encodings offered |
 | `--max-decompressed-mb` | `65536` | cap on a compressed request body or upload after decompression (0: none) |
+| `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
+| `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
+| `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
@@ -1024,6 +1027,16 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 recognised as compressed by their first bytes (gzip, zstd, LZ4 frames) and, for uploads,
 by file name (`.gz`, `.zst`, `.br`, `.lz4`). A body that decompresses past
 `--max-decompressed-mb` fails with `413` and commits nothing.
+
+**Body ceilings.** A body that is read whole has the ceiling of its request class:
+`--max-query-body-mb` for queries (also `/{ds}/explain` and the shapes graph of
+`/{ds}/shacl`), `--max-update-body-mb` for updates, `--max-admin-body-mb` for `/$/…`
+requests and prefix changes, and a fixed 64 KiB for `/$/auth/*`. It counts decompressed
+bytes and is checked while the body is read (a declared `Content-Length` over it is
+refused before anything is read), so no more than the ceiling is held; past it the request
+fails with `413`. A form POST to `/{ds}` may hold either operation, so it is read up to
+the larger of the query and update ceilings. Graph Store PUT/POST (also through `/{ds}`)
+and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead.
 
 **Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
 `auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs
@@ -1041,8 +1054,8 @@ Indexes built before zstd was available keep LZ4 until they are rebuilt.
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`
 (`requestId` is the response's `X-Request-Id`, for finding the request in the logs)
 with `400` for parse errors, `401`/`403` for authentication and permissions, `404` unknown
-dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a
-compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
+dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a body
+over its ceiling or a compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
 `Content-Encoding`, `429` over a rate limit, `503` for a cancelled query, over a concurrency limit (see
 [Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
 until restart; reads continue), `500` otherwise.

@@ -417,6 +417,18 @@ enum Cmd {
         /// (0: unlimited)
         #[arg(long, default_value_t = 65536)]
         max_decompressed_mb: u64,
+        /// Largest request body of a SPARQL query (also explain and a /shacl shapes
+        /// graph), in MiB (0: unlimited)
+        #[arg(long, default_value_t = 16)]
+        max_query_body_mb: u64,
+        /// Largest request body of a SPARQL update, in MiB (0: unlimited); bulk data
+        /// goes through the Graph Store or upload endpoints
+        #[arg(long, default_value_t = 256)]
+        max_update_body_mb: u64,
+        /// Largest request body of an admin (/$/…) request or a prefix change, in MiB
+        /// (0: unlimited)
+        #[arg(long, default_value_t = 16)]
+        max_admin_body_mb: u64,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -1101,6 +1113,9 @@ fn run() -> Result<()> {
             http_compression_level,
             http_compression_algorithms,
             max_decompressed_mb,
+            max_query_body_mb,
+            max_update_body_mb,
+            max_admin_body_mb,
             auth_config,
             unix_socket,
             allow_open_network,
@@ -1141,6 +1156,9 @@ fn run() -> Result<()> {
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
                 max_decompressed_bytes: mib(max_decompressed_mb),
+                max_query_body_bytes: mib(max_query_body_mb),
+                max_update_body_bytes: mib(max_update_body_mb),
+                max_admin_body_bytes: mib(max_admin_body_mb),
             };
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {

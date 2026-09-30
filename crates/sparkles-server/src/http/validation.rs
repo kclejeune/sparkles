@@ -98,7 +98,7 @@ mod handlers {
     pub(in crate::http) async fn put(
         State(st): St,
         Path(name): Path<String>,
-        body: Bytes,
+        AdminBody(body): AdminBody,
     ) -> ApiResult {
         if st.read_only {
             return Err(err(StatusCode::FORBIDDEN, "server is read-only"));

@@ -92,7 +92,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/update", post(update_endpoint))
         .route("/{ds}/data", any(gsp))
         .route("/{ds}/get", get(gsp).head(gsp))
-        .route("/{ds}/upload", post(upload))
+        .route(
+            "/{ds}/upload",
+            post(upload).layer(DefaultBodyLimit::max(8 << 30)),
+        )
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
         .route("/$/vector/{ds}", get(vector_status))
@@ -116,7 +119,13 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(validation::delete_validation),
         )
         .layer(axum::middleware::from_fn(error_request_id))
-        .layer(DefaultBodyLimit::max(8 << 30))
+        // for extractors without a ceiling of their own (see `limited_body!`)
+        .layer(DefaultBodyLimit::max(
+            state
+                .limits
+                .max_admin_body_bytes
+                .map_or(usize::MAX, |b| b as usize),
+        ))
         .layer(state.http_compression.layer())
         // compressed request bodies: marked (outermost), decompressed, then capped
         .layer(axum::middleware::from_fn_with_state(
@@ -553,18 +562,44 @@ async fn dataset_root(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> ApiResult {
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
     // the auth layer granted a form POST read access, since only its body tells a query
     // from an update: every other operation is re-checked here
     let form = method == Method::POST && ct == "application/x-www-form-urlencoded";
+    let query = params.has("query") || ct == "application/sparql-query";
+    let update = params.has("update") || ct == "application/sparql-update";
+    if !(form || query || update) {
+        // a Graph Store request: its body streams
+        return gsp(st, Path(name), p, method, uri, headers, body).await;
+    }
+    let l = &st.limits;
+    let (limit, flag) = if query {
+        (l.max_query_body_bytes, "--max-query-body-mb")
+    } else if update {
+        (l.max_update_body_bytes, "--max-update-body-mb")
+    } else {
+        // a query or an update, as the body will tell
+        match (l.max_query_body_bytes, l.max_update_body_bytes) {
+            (Some(q), Some(u)) if q > u => (Some(q), "--max-query-body-mb"),
+            (Some(_), Some(u)) => (Some(u), "--max-update-body-mb"),
+            _ => (None, ""),
+        }
+    };
+    let body = read_body(body, limit, flag).await?;
     if form {
         params.extend_form(&body);
     }
     if params.has("query") || ct == "application/sparql-query" {
-        return query_endpoint(st, Path(name), p, method, uri, headers, body).await;
+        if form && (body.len() as u64) > l.max_query_body_bytes.unwrap_or(u64::MAX) {
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds --max-query-body-mb",
+            ));
+        }
+        return query_endpoint(st, Path(name), p, method, uri, headers, QueryBody(body)).await;
     }
     if params.has("update") || ct == "application/sparql-update" {
         // SPARQL 1.1 Protocol: updates only by POST
@@ -577,21 +612,18 @@ async fn dataset_root(
         if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
             return Ok(denied);
         }
-        return update_endpoint(st, Path(name), p, uri, headers, body).await;
+        return update_endpoint(st, Path(name), p, uri, headers, UpdateBody(body)).await;
     }
-    if form {
-        // neither a query nor an update: refused as the write any other POST body would
-        // be, and never taken for an RDF payload
-        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
-            return Ok(denied);
-        }
-        dataset(&st, &name)?;
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "missing 'query' or 'update' parameter",
-        ));
+    // a form with neither a query nor an update: refused as the write any other POST body
+    // would be, and never taken for an RDF payload
+    if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+        return Ok(denied);
     }
-    gsp(st, Path(name), p, method, uri, headers, body.into()).await
+    dataset(&st, &name)?;
+    Err(err(
+        StatusCode::BAD_REQUEST,
+        "missing 'query' or 'update' parameter",
+    ))
 }
 
 async fn query_endpoint(
@@ -601,7 +633,7 @@ async fn query_endpoint(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -841,7 +873,11 @@ async fn text_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<
 /// `PUT /$/text/{ds}`: enable (or reconfigure) full-text search; the body is the
 /// configuration (empty: defaults). The index is built in a background task.
 #[cfg(feature = "text")]
-async fn text_enable(State(st): St, Path(name): Path<String>, body: Bytes) -> ApiResult {
+async fn text_enable(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -1106,7 +1142,7 @@ async fn update_endpoint(
     Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    UpdateBody(body): UpdateBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -1172,7 +1208,7 @@ async fn explain(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -1283,6 +1319,77 @@ fn body_error(e: axum::Error) -> ApiError {
         err(StatusCode::BAD_REQUEST, e.to_string())
     }
 }
+
+/// Read a whole request body of at most `limit` bytes (`flag` names the setting): `413`
+/// before more than that is held. This runs inside the decompression layer, so the
+/// limit counts decompressed bytes.
+async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> ApiResult<Bytes> {
+    use futures_util::StreamExt;
+    use http_body::Body as _;
+    let max = limit.unwrap_or(u64::MAX);
+    let too_large = || {
+        let size = sparkles::error::human_bytes(max);
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("request body exceeds {size} ({flag})"),
+        )
+    };
+    // a declared length is refused before anything is read
+    if body.size_hint().lower() > max {
+        return Err(too_large());
+    }
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(body_error)?;
+        if (buf.len() + chunk.len()) as u64 > max {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.into())
+}
+
+/// Body extractors with the ceiling of their request class. Only the Graph Store and
+/// upload endpoints stream bodies of any size.
+macro_rules! limited_body {
+    ($(#[$doc:meta])* $name:ident, $field:ident, $flag:literal) => {
+        $(#[$doc])*
+        pub(crate) struct $name(pub Bytes);
+
+        impl axum::extract::FromRequest<Arc<AppState>> for $name {
+            type Rejection = ApiError;
+
+            async fn from_request(
+                req: axum::extract::Request,
+                st: &Arc<AppState>,
+            ) -> Result<Self, ApiError> {
+                read_body(req.into_body(), st.limits.$field, $flag)
+                    .await
+                    .map($name)
+            }
+        }
+    };
+}
+
+limited_body!(
+    /// A SPARQL query body (also `/{ds}/explain` and a `/{ds}/shacl` shapes graph).
+    QueryBody,
+    max_query_body_bytes,
+    "--max-query-body-mb"
+);
+limited_body!(
+    /// A SPARQL update body.
+    UpdateBody,
+    max_update_body_bytes,
+    "--max-update-body-mb"
+);
+limited_body!(
+    /// The body of an admin request (`/$/…`) or a prefix change.
+    AdminBody,
+    max_admin_body_bytes,
+    "--max-admin-body-mb"
+);
 
 /// Read a request body, spooling it to a temporary file once it passes
 /// [`SPOOL_AFTER`] bytes, so a large upload is never held in memory whole. Large
@@ -1803,7 +1910,12 @@ async fn get_dataset(
     Ok(Json(dataset_info_for(&ds, &p)))
 }
 
-async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn create_dataset(
+    State(st): St,
+    uri: Uri,
+    headers: HeaderMap,
+    AdminBody(body): AdminBody,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -1866,7 +1978,7 @@ async fn clone_dataset(
     Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -2092,7 +2204,7 @@ async fn dataset_prefixes(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
@@ -2214,7 +2326,7 @@ async fn reason(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -2423,7 +2535,7 @@ async fn shacl(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    QueryBody(body): QueryBody,
 ) -> ApiResult {
     use crate::shacl::{DataGraph, ReportFormat};
     let ds = dataset(&st, &name)?;
@@ -2516,6 +2628,8 @@ async fn shacl() -> ApiResult {
 mod compress_tests;
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod limits_tests;
 #[cfg(test)]
 mod obs_tests;
 #[cfg(test)]

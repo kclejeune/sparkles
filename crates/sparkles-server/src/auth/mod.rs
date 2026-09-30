@@ -50,6 +50,8 @@ pub use routes::{AuthReport, Denied, dataset_denial, forbidden, middleware};
 #[cfg(test)]
 pub use routes::{ROUTES, need};
 
+#[cfg(all(test, feature = "auth"))]
+pub use handlers::MAX_AUTH_BODY;
 #[cfg(feature = "auth")]
 pub use handlers::SESSION_COOKIE;
 #[cfg(feature = "auth")]

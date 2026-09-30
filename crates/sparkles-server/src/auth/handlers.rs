@@ -11,7 +11,7 @@ use super::{Auth, Identity, Kind, Level, Principal, Scheme, Scope, ServerPerm, c
 use crate::state::AppState;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -28,6 +28,9 @@ type St = State<Arc<AppState>>;
 pub const SESSION_COOKIE: &str = "sparkles_session";
 /// Name of the cookie binding an OIDC login to its browser.
 const OIDC_COOKIE: &str = "sparkles_oidc";
+
+/// Largest body of an `/$/auth/*` request (JSON or form, a few fields): `413` past it.
+pub const MAX_AUTH_BODY: usize = 64 << 10;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -47,6 +50,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/auth/device/{user_code}/deny", post(device_deny))
         .route("/$/auth/cli/authorize", post(cli_authorize))
         .route("/$/auth/token", post(token_endpoint))
+        .layer(DefaultBodyLimit::max(MAX_AUTH_BODY))
 }
 
 fn not_found() -> Response {

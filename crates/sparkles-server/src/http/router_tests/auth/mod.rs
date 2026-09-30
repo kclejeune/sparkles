@@ -880,6 +880,49 @@ async fn read_access_never_writes() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn auth_bodies_are_small() {
+    let s = auth_server();
+    let pad = "x".repeat(crate::auth::MAX_AUTH_BODY + 1);
+    let json = format!(r#"{{"user":"alice","password":"{pad}"}}"#);
+    let form = format!("grant_type=x&device_code={pad}");
+    let alice = b("alice");
+    for (uri, ct, body, auth) in [
+        ("/$/auth/login", "application/json", &json, None),
+        ("/$/auth/device", FORM, &form, None),
+        ("/$/auth/token", FORM, &form, None),
+        (
+            "/$/auth/tokens",
+            "application/json",
+            &json,
+            Some(alice.as_str()),
+        ),
+    ] {
+        let mut h = vec![("content-type", ct), ("origin", s.fixture.public_url)];
+        h.extend(auth.map(|a| ("authorization", a)));
+        let r = call(&s.app, "POST", uri, &h, body).await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{uri}: {}",
+            r.text()
+        );
+    }
+    // a login of ordinary size still works
+    let ok = format!(
+        r#"{{"user":"alice","password":"alice-pw","pad":"{}"}}"#,
+        "x".repeat(1000)
+    );
+    let h = [
+        ("content-type", "application/json"),
+        ("origin", s.fixture.public_url),
+    ];
+    let r = call(&s.app, "POST", "/$/auth/login", &h, &ok).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+}
+
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
 async fn no_update_over_get() {
     for enabled in [true, false] {
         let s = auth_server_with(enabled, false);

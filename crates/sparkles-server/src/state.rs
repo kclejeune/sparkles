@@ -257,6 +257,12 @@ pub struct Limits {
     pub update_timeout: Option<std::time::Duration>,
     /// decompressed size of a compressed request body or uploaded file
     pub max_decompressed_bytes: Option<u64>,
+    /// request body of a SPARQL query (also `/{ds}/explain` and `/{ds}/shacl`)
+    pub max_query_body_bytes: Option<u64>,
+    /// request body of a SPARQL update
+    pub max_update_body_bytes: Option<u64>,
+    /// request body of an admin (`/$/…`) or prefix change
+    pub max_admin_body_bytes: Option<u64>,
 }
 
 impl Default for Limits {
@@ -267,6 +273,9 @@ impl Default for Limits {
             max_rows: 200_000_000,
             update_timeout: None,
             max_decompressed_bytes: Some(64 << 30),
+            max_query_body_bytes: Some(16 << 20),
+            max_update_body_bytes: Some(256 << 20),
+            max_admin_body_bytes: Some(16 << 20),
         }
     }
 }

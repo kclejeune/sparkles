@@ -443,6 +443,9 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
 | `--max-result-mb N` | `1024` | budget for the body of a query response (`0`: unlimited); Graph Store GET streams and has none |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
+| `--max-query-body-mb N` | `16` | largest SPARQL query body (also explain and `/shacl` shapes); `413` past it (`0`: unlimited) |
+| `--max-update-body-mb N` | `256` | largest SPARQL update body; bulk data goes through the Graph Store or `/upload` (`0`: unlimited) |
+| `--max-admin-body-mb N` | `16` | largest `/$/…` or prefix-change body (`0`: unlimited); `/$/auth/*` bodies are capped at 64 KiB |
 | `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |

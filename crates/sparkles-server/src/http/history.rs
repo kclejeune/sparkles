@@ -209,7 +209,7 @@ pub(super) async fn create_snapshot(
     Path(name): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -299,7 +299,7 @@ pub(super) async fn get_history(State(st): St, Path(name): Path<String>) -> ApiR
 pub(super) async fn put_history(
     State(st): St,
     Path(name): Path<String>,
-    body: Bytes,
+    AdminBody(body): AdminBody,
 ) -> ApiResult<Json<J>> {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
