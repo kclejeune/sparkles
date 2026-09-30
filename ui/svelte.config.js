@@ -13,7 +13,7 @@ const config = {
     // type-check the Playwright configuration too (tests/ is already included)
     typescript: {
       config: (tsconfig) => {
-        tsconfig.include.push('../playwright.config.ts');
+        tsconfig.include.push('../playwright.config.ts', '../playwright.mock.config.ts');
       },
     },
   },

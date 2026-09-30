@@ -76,6 +76,12 @@ run = '''
 pnpm e2e
 '''
 
+[tasks."ui:e2e:mock"]
+description = "UI end-to-end tests (Playwright) against the mock backend, for pages whose server side is not built yet (backups); extra args go to `playwright test`"
+depends = ["ui:e2e:browsers"]
+dir = "ui"
+run = "pnpm e2e:mock"
+
 [tasks."ui:fmt"]
 description = "Format the UI (oxfmt)"
 depends = ["ui:install"]

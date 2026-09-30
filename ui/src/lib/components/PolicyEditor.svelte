@@ -315,6 +315,7 @@
             <label class="inline"
               >At minute <input
                 class="input narrow"
+                aria-label="Minute"
                 type="number"
                 min="0"
                 max="59"
@@ -324,16 +325,19 @@
           {:else if kind === 'daily' || kind === 'weekly'}
             {#if kind === 'weekly'}
               <label class="inline"
-                >On <select class="select" bind:value={day}>
+                >On <select class="select" bind:value={day} aria-label="Weekday">
                   {#each DAY_ORDER as d (d)}<option value={d}>{WEEKDAYS[d]}</option>{/each}
                 </select></label
               >
             {/if}
-            <label class="inline">At <input class="input" type="time" bind:value={time} /></label>
+            <label class="inline"
+              >At <input class="input" type="time" bind:value={time} aria-label="Time" /></label
+            >
           {:else}
             <label class="inline grow"
               >Cron or interval <input
                 class="input mono grow"
+                aria-label="Cron or interval"
                 bind:value={custom}
                 placeholder="0 */4 * * *  or  every 6h"
                 spellcheck="false"
@@ -341,7 +345,7 @@
             >
           {/if}
           <label class="inline"
-            >Time zone <select class="select" bind:value={timezone}>
+            >Time zone <select class="select" bind:value={timezone} aria-label="Time zone">
               {#each ZONES as z (z)}<option value={z}>{z}</option>{/each}
             </select></label
           >

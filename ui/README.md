@@ -97,6 +97,16 @@ same hash, refreshed with it when the lockfile changes), and Chromium comes from
 With `CI` set, as there, a failed test is retried once and reported as
 flaky, and `test.only` fails the run.
 
+`tests/mock` tests pages whose server side is not built yet (the Backups area) against the
+mock instead: `pnpm e2e:mock` (or `mise run ui:e2e:mock`) uses `playwright.mock.config.ts`,
+which starts `mock/server.mjs` and `vite dev` on free ports (`MOCK_E2E_PORT` and the port
+after it) and runs the tests in one worker, in order, since they share the mock's state. They
+cover the backup table and details drawer, adding a repository with a failing and a passing
+connection test, backing up from the dataset page and restoring into a new dataset,
+replacing a dataset (lost commits, typed name, identity), the policy editor's schedule
+preview, name template and retention sentence, a GC dry run then a run, and cancelling a
+task from Activity. Once the backup endpoints exist they move to `tests/e2e`.
+
 ## Serving from the Rust server
 
 - Serve `ui/build/` at `/ui/`; unknown paths under `/ui/` must fall back to
