@@ -1,0 +1,122 @@
+# Sparkles
+
+A high-performance RDF / SPARQL / OWL database in Rust. It aims to be a
+**functional re-implementation of [Apache Jena](https://jena.apache.org/) + Fuseki**
+(same protocols, same semantics, same operational model), built on the
+**index and execution architecture of [QLever](https://github.com/ad-freiburg/qlever)**.
+It also ships a SvelteKit UI for database management, graph visualization and
+interactive querying.
+
+* `docs/AUDIT.md` covers the Jena and QLever audits and the language decision (Rust vs. Go).
+* `docs/API.md` is the HTTP API contract (Fuseki-compatible, plus `/$/` extensions).
+
+## Philosophy
+
+1. **Jena-compatible where users can see it.** The goal is that anything talking to
+   Fuseki keeps working: the SPARQL 1.1 Query/Update/Graph Store protocols, Fuseki
+   endpoint names (`/{ds}/sparql|query|update|data|get|upload`), the `/$/` admin API,
+   RDF formats, result formats, dataset semantics (default + named graphs, optional
+   union default graph), and TDB2's operational model (bulk load, transactions,
+   compaction, backups).
+2. **QLever-style internals where performance lives.** Terms are dictionary-encoded
+   into 64-bit tagged ids with inline literals. Indexes are fully sorted, compressed
+   permutation files. Execution is column-at-a-time with a cost-based DP planner.
+3. **Reuse the Rust RDF ecosystem.** We don't re-implement parsers that already
+   exist: `oxrdf`, `oxttl`, `oxrdfxml`, `oxjsonld`, `spargebra`, `sparesults` and
+   `oxsdatatypes` from the Oxigraph project supply the term model, parsers, SPARQL
+   algebra and XSD value space. Sparkles provides the storage, planner, executor,
+   server, reasoner and UI.
+4. **Library first.** `crates/sparkles` is an embeddable engine with no HTTP or async
+   dependencies (Jena `core`/`arq`/`tdb2`). The server (`sparkles-server`, the Fuseki
+   equivalent) and the reasoner are separate crates built on its public API.
+
+## Layout
+
+| Path | Role | Jena analogue |
+|---|---|---|
+| `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db |
+| `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, forward chaining *(planned)* | jena-core `reasoner` |
+| `crates/sparkles-server` | axum HTTP server + `sparkles` CLI *(planned)* | jena-fuseki2, jena-cmds |
+| `ui/` | SvelteKit management / query / graph-exploration UI *(in progress)* | jena-fuseki-ui |
+
+## Status
+
+Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of scope for v1
+
+### Storage (TDB2 equivalent)
+
+| Feature | Status |
+|---|---|
+| 64-bit tagged ids, inline `xsd:integer` / `xsd:double` / `xsd:boolean` | ✅ |
+| Sorted, front-coded, mmapped base vocabulary; append-only delta vocabulary | ✅ |
+| 7 permutations (SPO SOP PSO POS OSP OPS GSPO), 32k-row compressed blocks | ✅ |
+| Parallel bulk loader (Turtle / N-Triples / N-Quads / TriG / RDF/XML / JSON-LD, `.gz`) | ✅ |
+| External sort for inputs larger than the memory budget | ✅ |
+| Planner statistics (per predicate counts, distinct S/O, classes, graphs) | ✅ |
+| MVCC snapshots, single writer (MR+SW), WAL with crash-safe replay | ✅ |
+| Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
+| Backups (gzipped N-Quads) | ✅ |
+| In-memory datasets (same engine, temp-dir base) | ✅ |
+
+### SPARQL (ARQ equivalent)
+
+| Feature | Status |
+|---|---|
+| Value space: numeric promotion, comparisons, EBV, ORDER BY total order | 🚧 |
+| SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY / aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET | 🚧 |
+| Property paths | 🚧 |
+| Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | 🚧 |
+| SPARQL 1.1 Update | ⏳ |
+| SERVICE (federated query) | ⏳ |
+| Results: JSON, XML, CSV, TSV; RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ⏳ |
+| W3C SPARQL test suite runner (manifests from the Jena checkout) | ⏳ |
+
+### Server (Fuseki equivalent), reasoning, UI
+
+| Feature | Status |
+|---|---|
+| SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks) | ⏳ |
+| RDFS / OWL 2 RL materialization, Jena rule syntax | ⏳ |
+| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser | 🚧 |
+
+## Notable optimizations adopted from QLever
+
+* **Ids with inline values.** The top 4 bits hold a tag and the low 60 bits a payload.
+  UNDEF is 0, so it sorts first. Numbers and booleans never touch the dictionary.
+* **Sorted vocabulary.** Id order equals term order, so prefix and range restrictions
+  become id ranges (`Vocab::prefix_range`).
+* **Permutation files.** Blocks store columns separately (delta + zig-zag varint +
+  LZ4). Each block's first and last key stays in RAM, which enables block skipping
+  for bound prefixes and exact counts with at most two block decodes.
+* **Bulk build pipeline.** Parallel chunked parsing feeds per-batch partial
+  vocabularies. These are k-way merged into a global vocabulary, ids are remapped in
+  parallel, and each permutation is built with a parallel sort (or sorted runs plus a
+  k-way merge when the data exceeds the memory budget).
+* **Immutable base plus delta.** Updates are layered on the immutable index, in the
+  style of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed
+  by snapshot version.
+* **Columnar execution and planning.** Execution is column-major; the planner is a DP
+  over interesting sort orders with a greedy fallback. Merge joins run on sorted
+  scans.
+* **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
+
+## Divergences from Jena / QLever (decisions)
+
+| Decision | Rationale |
+|---|---|
+| Rust instead of Java/C++ | See `docs/AUDIT.md` §3: `spargebra`, `oxttl` and friends provide the parser and format stack; there is no GC, and performance is predictable. |
+| Sorted-block permutations instead of TDB2's B+trees | Scan-heavy analytics are much faster and the files are smaller. Updates go into a delta that is periodically compacted, rather than being done in place. |
+| Values are inlined only when the lexical form is canonical | QLever inlines lossily (doubles lose 4 bits, and the lexical form is dropped). Sparkles keeps exact RDF term identity (`"01"^^xsd:integer` ≠ `"1"^^xsd:integer`), as Jena does. Doubles whose low mantissa bits are nonzero go to the vocabulary. |
+| Graph stored as a 4th key column in every permutation, plus a GSPO permutation | This matches QLever's graph column. GSPO gives TDB2-style graph-scoped access (dumps, `GRAPH ?g {}` enumeration). |
+| Deltas held as persistent ordered sets (`imbl`) and WAL-logged | Gives O(1) snapshot publication for MVCC. QLever locates delta triples per block instead; we may adopt that later. |
+| Blank nodes are stored ids and serialize as `_:b<hex>` | Labels round-trip through the protocol, like Jena's `<_:…>` handling. |
+| LZ4 instead of zstd for blocks; front coding instead of FSST for the vocabulary | Pure-Rust dependencies and very fast decoding. zstd/FSST remain a possible upgrade for compression ratio. |
+| RDF 1.2 triple terms not yet supported | They are not supported in the id space yet. `spargebra`/`oxrdf` support them behind the `rdf-12`/`sparql-12` features, and enabling those is planned. |
+| Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. |
+
+## Building
+
+```sh
+cargo test --workspace          # engine tests
+cargo build --release
+```

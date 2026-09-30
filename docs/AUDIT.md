@@ -1,0 +1,89 @@
+# Audit: Apache Jena & QLever → Sparkles
+
+Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLever (b0c6d0cd, 2026‑09).
+
+## 1. Apache Jena — functional inventory
+
+| Module | Java LOC (main/test) | Role | Sparkles status |
+|---|---|---|---|
+| jena-base | 19K / 8K | utilities, persistent maps (PMap/PSet) for TIM | replaced by Rust std + `imbl` |
+| jena-iri3986, jena-langtag | 7K + 2K | RFC 3986 IRIs, BCP47 | `oxiri`, `oxilangtag` |
+| jena-core | 141K / 84K | Node/Triple/Graph, Model API, datatypes, **rule reasoners** (RETE fwd, LP bwd), ARP RDF/XML, legacy OntModel | term model via `oxrdf`; reasoners → `sparkles-reasoner` |
+| jena-arq | 309K / 82K | **RIOT** I/O + **SPARQL** (JavaCC parser → algebra → 21 optimizer passes → iterator engine), functions, update, SERVICE | `sparkles::{io,sparql}` |
+| jena-db + jena-tdb2 | 25K + 19K | DBOE: CoW MVCC B+trees, journal, node table (MD5 → NodeId), inline NodeIds, 3 triple + 6 quad indexes, loaders, compaction | `sparkles::store` (QLever-style instead of B+trees) |
+| jena-fuseki2 | ~36K | SPARQL server: query/update/GSP/upload/patch/shacl, `/$/` admin (datasets, stats, compact, backup, tasks, metrics) | `sparkles-server` |
+| jena-ontapi | 35K | OWL2 object API (profiles DL/EL/QL/RL, no DL reasoner) | out of scope (see §5) |
+| jena-shacl / jena-shex | 23K / 18K | SHACL Core + SPARQL; ShEx 2 | SHACL Core planned (phase 2) |
+| jena-text / jena-geosparql | 7.5K / 23K | Lucene text index; GeoSPARQL (JTS/SIS) | out of scope for v1 |
+| jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | patch logs, client APIs, builders, CLI | CLI → `sparkles` binary; others n/a in Rust |
+| jena-tdb1, commonsrdf | — | deprecated | skipped |
+
+Key Jena behaviours to preserve:
+
+* **Data model**: IRIs, blank nodes, literals (lang, datatype; RDF 1.2 triple terms and base direction), triples/quads, datasets with default + named graphs, union default graph option.
+* **XSD value space**: numeric tower (integer ⊂ decimal ⊂ float ⊂ double + derived integer types), dateTime/date/time/durations, boolean, strings. Ordering by `ValueSpace` for ORDER BY.
+* **RIOT**: Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD 1.1 (+ RDF/JSON, Thrift, Protobuf, TriX — Jena-specific); streaming `StreamRDF` sinks; result formats JSON/XML/CSV/TSV.
+* **ARQ**: full SPARQL 1.1 Query + Update, property paths, aggregates, subqueries, VALUES, SERVICE, EXISTS, function library (XPath `fn:`, `math:`, `afn:`), property functions; optimizer transforms (filter placement, filter equality substitution, TopN, implicit joins, …).
+* **TDB2**: inline NodeIds (ints, decimals, doubles, dates, booleans) so FILTER/ORDER BY avoid the node table; MR+SW transactions with snapshot isolation; bulk loader pipeline; compaction into a new `Data-NNNN` generation; backups as `.nq.gz`.
+* **Fuseki**: `/{ds}/sparql|query|update|data|get|upload`, `/$/ping|server|datasets|stats|compact|backup|tasks`.
+* **Reasoning**: RDFS (full/default/simple), OWL Micro/Mini/Full rule sets, `GenericRuleReasoner` with Jena rule syntax `[name: (?a p ?b) builtin(?x) -> (?a q ?b)]`.
+
+Conformance suites available in the Jena checkout (to be used by `sparkles` tests):
+`jena-arq/testing/rdf-tests-cg/sparql/{sparql10,sparql11,sparql12}`, `jena-arq/testing/rdf-tests-cg/rdf/{rdf11,rdf12}`, `jena-arq/testing/ARQ`, `jena-shacl/src/test/files/std`, `jena-core/testing/wg`.
+
+## 2. QLever — architecture and performance mechanisms
+
+| Area | Mechanism | Adopted in Sparkles |
+|---|---|---|
+| Ids | 64-bit `ValueId`: 4-bit datatype + 60-bit payload; all-zero = UNDEF; Int/Double/Bool/Date/GeoPoint inline | ✅ (Int/Double/Bool inline; canonical-lexical-only so term identity is exact, like TDB2) |
+| Vocabulary | IDs assigned in sort order → range/prefix filters on ids; FSST²-compressed, sparse in-RAM sample | ✅ sorted, front-coded, mmapped; prefix ranges on ids |
+| Index build | parallel parse → per-batch partial vocabs → k-way merge → id remap → external sort per permutation | ✅ same pipeline (rayon) |
+| Permutations | 6 perms (SPO SOP PSO POS OSP OPS) + graph column; ~31k-row blocks, per-column zstd; first/last triple of each block in RAM | ✅ 6 + GSPO, 32k-row blocks, per-column delta+varint+LZ4, block metadata in RAM for block skipping |
+| Updates | immutable base + DeltaTriples located per block, snapshot per version, rebuild when delta grows | ✅ persistent (`imbl`) delta sets per permutation, WAL, MVCC snapshots, `compact` rebuild |
+| Planner | DP over connected components with interesting sort orders, greedy fallback past budget; filters applied as soon as bound; cost = row counts; multiplicity-based join estimates | ✅ |
+| Execution | column-major `IdTable`; operators materialize (some lazy); LocalVocab per result | ✅ column-major tables, per-query local vocab |
+| Joins | zipper merge join w/ UNDEF, galloping join for skewed sizes, MultiColumnJoin, OptionalJoin, Minus, TransitivePath w/ bound side | ✅ merge + galloping + hash join; transitive path with bound-side BFS |
+| GROUP BY | COUNT from metadata, sort-based grouping, special cases | ✅ COUNT fast paths + hash grouping |
+| Cache | concurrent LRU keyed by subtree + delta version; pinning | ✅ LRU keyed by canonical plan + snapshot version |
+| Limits | cancellation handle, memory-limited allocator, timeouts | ✅ cancellation/timeouts, row-budget memory guard |
+| Server | streaming results, `qlever-json` with runtime-information tree, websockets for live plan | ✅ `x-sparkles+json` with executed plan tree (see API.md) |
+| Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | ⏭ future work |
+
+## 3. Language decision: Rust
+
+| Criterion | Rust | Go |
+|---|---|---|
+| SPARQL parser/algebra | `spargebra` (SPARQL 1.1 + 1.2, SSE output, 500K+ downloads, maintained with Oxigraph) | none maintained (`knakk/sparql` is an HTTP client template lib) — would need a hand-written parser (~50K lines of JavaCC-equivalent in Jena) |
+| RDF formats | `oxttl` (Turtle/TriG/NT/NQ/N3, **parallel chunked parsing**), `oxrdfxml`, `oxjsonld`, `sparesults` (JSON/XML/CSV/TSV) | `knakk/rdf` (Turtle/NT), `json-gold`; no RDF/XML of note, no result-format libs |
+| XSD datatypes | `oxsdatatypes` (decimal, dateTime, durations, arithmetic/comparison per XPath) | none |
+| Reasoning/OWL | `horned-owl`, `reasonable` (OWL2 RL), `rudof` (SHACL/ShEx) available as references | none |
+| Performance of QLever-style columnar engine | no GC; `u64` columns, predictable layout, LLVM autovectorization, `rayon` parallel sort, mmap via `memmap2` | GC (fine for pointer-free slices, but tail latencies on big materializations), weaker optimizer / bounds-check elimination, no SIMD autovectorization to speak of |
+| Concurrency | `rayon`, `tokio`/`axum`, `arc-swap`, persistent collections (`imbl`) for MVCC | goroutines are excellent, but not the bottleneck here |
+| Build/dev ergonomics | slower compile times | faster compiles, simpler code |
+
+Rust wins decisively on ecosystem (the SPARQL/RDF stack alone saves months) and on the performance
+envelope for a QLever-style engine. Go's advantages (compile speed, simplicity) don't offset having to
+re-create the parser/algebra/datatype stack.
+
+## 4. Sparkles architecture
+
+```
+ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /$/ admin; CLI)
+                                   │
+                  sparkles-reasoner (RDFS / OWL-RL / Jena rules, semi-naive forward chaining)
+                                   │
+sparkles (library)
+ ├─ id        64-bit tagged ids, inline literals
+ ├─ vocab     sorted front-coded base vocab (mmap) + delta vocab + local vocab
+ ├─ index     permutation files: 32k-row blocks, per-column compression, in-RAM block metadata
+ ├─ builder   parallel bulk loader (partial vocabs → merge → remap → external sort)
+ ├─ store     generations, WAL, MVCC snapshots (base ⊕ delta), compaction, backup
+ ├─ sparql    spargebra → planner (DP + interesting orders) → columnar operators → results
+ └─ io        RDF & result-format parsing/serialization
+```
+
+## 5. Explicit non-goals for v1
+
+JavaScript scripting functions, RDF Thrift/Protobuf, TriX, jena-ontapi's object mapping API,
+jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. These are
+documented extension points rather than hidden gaps.
