@@ -8,11 +8,19 @@
 //! The index is derived data kept consistent with the store inside the commit path:
 //! every snapshot carries a [`TextView`] whose `seq` is the commit it reflects, and a
 //! search runs only when that equals the snapshot's commit. `<root>/text.json` holds the
-//! configuration; `<root>/text/` the Tantivy index. Commits write it without fsync (see
-//! `lazydir`): the WAL is the durable record, the index is checkpointed about once a
-//! second, and on open an index that may hold unsynced data is verified, then caught up
-//! from the WAL. It is rebuilt from RDF only when it is missing, damaged, or behind the
-//! WAL.
+//! configuration; `<root>/text/` the Tantivy index.
+//!
+//! A write only stages its documents in the Tantivy writer; the Tantivy commit, which
+//! flushes a segment and costs more than the indexing, is deferred: the views of the
+//! commits in between share a slot that the next search needing one of them fills (read
+//! your writes), as do a background tick about once a second, compaction and close. A
+//! view may so search a later state than its own: documents of quads its commit does not
+//! have are filtered out against the snapshot, and documents of removed quads stay until
+//! their batch is sealed, so every view still finds all of its own. Commits write
+//! without fsync (see `lazydir`): the WAL is the durable record, the index is
+//! checkpointed about once a second, and on open an index that may hold unsynced data is
+//! verified, then caught up from the WAL (which also covers what was only staged). It is
+//! rebuilt from RDF only when it is missing, damaged, or behind the WAL.
 
 use crate::error::{Error, Result};
 
@@ -171,10 +179,14 @@ pub struct TextView {
     pub seq: u64,
     /// +1 per rebuild (part of result-cache keys)
     pub epoch: u64,
+    /// the batch the view belongs to: the searcher, once its commits are sealed
     #[cfg(feature = "text")]
-    pub(crate) searcher: tantivy::Searcher,
+    pub(crate) slot: std::sync::Arc<imp::Slot>,
     #[cfg(feature = "text")]
     pub(crate) index: std::sync::Arc<imp::Shared>,
+    /// the index that seals the batch on demand
+    #[cfg(feature = "text")]
+    pub(crate) owner: std::sync::Weak<imp::Inner>,
 }
 
 impl std::fmt::Debug for TextView {
@@ -280,10 +292,11 @@ mod imp {
     use crate::sparql::table::{Table, VarId};
     use crate::store::Snapshot;
     use parking_lot::Mutex;
+    use rustc_hash::{FxHashMap, FxHashSet};
     use sha2::Digest;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
     use tantivy::collector::TopDocs;
     use tantivy::query::{
@@ -358,6 +371,48 @@ mod imp {
         config: String,
     }
 
+    /// What the views of one batch search: a searcher at or after their commits, and
+    /// the documents in it that may not match a view's commit (hashes of their subject
+    /// and object keys), which are checked against the snapshot.
+    pub(crate) struct Resolved {
+        pub(crate) searcher: tantivy::Searcher,
+        uncertain: Arc<FxHashSet<u64>>,
+    }
+
+    /// The views of the commits applied between two seals share a slot, set when the
+    /// batch is sealed (to `None` if the index failed first).
+    #[derive(Default)]
+    pub(crate) struct Slot(OnceLock<Option<Resolved>>);
+
+    impl Slot {
+        fn sealed(searcher: tantivy::Searcher, uncertain: Arc<FxHashSet<u64>>) -> Arc<Slot> {
+            let slot = Slot::default();
+            let _ = slot.0.set(Some(Resolved {
+                searcher,
+                uncertain,
+            }));
+            Arc::new(slot)
+        }
+    }
+
+    impl super::TextView {
+        /// The searcher of this view, sealing its batch first if needed.
+        pub(crate) fn resolved(&self) -> Result<&Resolved> {
+            if self.slot.0.get().is_none() {
+                match self.owner.upgrade() {
+                    Some(owner) => owner.seal_for(&self.slot),
+                    None => {
+                        let _ = self.slot.0.set(None);
+                    }
+                }
+            }
+            match self.slot.0.get() {
+                Some(Some(r)) => Ok(r),
+                _ => Err(unavailable("dataset", "stale", self.seq, self.seq)),
+            }
+        }
+    }
+
     impl Live {
         fn writer(&mut self) -> Result<&mut IndexWriter<TantivyDocument>> {
             self.writer
@@ -375,14 +430,31 @@ mod imp {
         dir: Option<LazySyncDir>,
         /// the first commit since the last checkpoint
         dirty_since: Option<Instant>,
-        /// the commit the index reflects, and the one its on-disk payload names (behind
-        /// after commits that changed no document)
+        /// the commit the index reflects (staged or committed), and the one its on-disk
+        /// payload names (behind after commits that changed no document, while documents
+        /// of removed quads are kept, and until the next Tantivy commit)
         applied: u64,
         committed: u64,
+        /// operations (additions and deletions) no Tantivy commit has made visible yet
+        staged: usize,
+        /// the batch of the views handed out since the last seal, if any
+        open: Option<Arc<Slot>>,
+        /// the last sealed batch: views of later commits share it while they change
+        /// no document
+        last: Arc<Slot>,
+        /// documents the searcher of the next seal may hold for quads some view of it
+        /// does not have (see [`Resolved`])
+        uncertain: FxHashSet<u64>,
+        /// documents of quads removed since the last seal (key → hash), deleted once it
+        /// is sealed: views of the batch from before the removal still find them
+        removed: FxHashMap<[u8; 16], u64>,
+        /// the first commit that removed one of them
+        removed_since: Option<u64>,
     }
 
-    /// A dataset's full-text index.
-    pub struct TextIndex {
+    /// The index shared by its [`TextIndex`], the commit tick and the views (which seal
+    /// their batch on demand).
+    pub(crate) struct Inner {
         root: Option<PathBuf>,
         config: TextConfig,
         live: Mutex<Live>,
@@ -390,8 +462,25 @@ mod imp {
         /// set when an update's text maintenance failed: queries get 503 until a rebuild
         stale: Mutex<Option<String>>,
         last_rebuild: Mutex<Option<RebuildInfo>>,
-        #[doc(hidden)]
-        pub fail_next_commit: std::sync::atomic::AtomicBool,
+        fail_next_commit: AtomicBool,
+        /// the tick seals and checkpoints (off only in tests)
+        ticks: AtomicBool,
+    }
+
+    /// A dataset's full-text index.
+    pub struct TextIndex {
+        inner: Arc<Inner>,
+        /// the commit tick: dropping the sender stops it
+        ticker: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+    }
+
+    /// The hash that stands for a document in [`Resolved::uncertain`].
+    fn doc_hash(s: &[u8], o: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        s.hash(&mut h);
+        o.hash(&mut h);
+        h.finish()
     }
 
     fn config_hash(c: &TextConfig) -> String {
@@ -587,8 +676,14 @@ mod imp {
         p
     }
 
-    /// How long the index may hold unsynced commits before a checkpoint.
+    /// How long the index may hold unsynced commits before a checkpoint, and the period
+    /// of the tick that seals batches.
     const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
+
+    /// Staged operations at which a write seals its batch itself. Commit time grows with
+    /// the batch (roughly 20 ms for 10k operations, 55 ms for 40k, measured on 1k-triple
+    /// updates), and the first search after a burst would pay it.
+    const STAGED_MAX: usize = 16_384;
 
     /// The single-threaded writer and the reader used between rebuilds.
     fn live_of(
@@ -613,11 +708,17 @@ mod imp {
                 config: config.clone(),
             }),
             writer: Some(writer),
+            last: Slot::sealed(reader.searcher(), Default::default()),
             reader,
             dir,
             dirty_since: None,
             applied: seq,
             committed: seq,
+            staged: 0,
+            open: None,
+            uncertain: Default::default(),
+            removed: Default::default(),
+            removed_since: None,
         })
     }
 
@@ -676,55 +777,104 @@ mod imp {
 
     struct Doc {
         key: [u8; 16],
+        /// see [`doc_hash`]
+        hash: u64,
         doc: Option<TantivyDocument>,
     }
 
-    /// The document for a quad (`doc: None` when the quad is out of scope: then only its
-    /// key matters, for deletion).
-    fn document(snap: &Snapshot, f: &Fields, cfg: &TextConfig, q: &[Id; 4]) -> Option<Doc> {
-        if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
-            return None;
-        }
-        let o = snap.key(q[2])?;
-        let (lex, lang) = string_literal(&o)?;
-        let p = match snap.term(q[1])? {
-            oxrdf::Term::NamedNode(n) => n.into_string(),
-            _ => return None,
-        };
-        let s = term_key(snap, q[0])?;
-        let pk = crate::id::iri_key(&p);
-        let gk = if q[3] == Id::DEFAULT_GRAPH {
-            Vec::new()
-        } else {
-            term_key(snap, q[3])?
-        };
-        let key = doc_key([&s, &pk, &o, &gk]);
-        let g = graph_name(snap, q[3])?;
-        let in_scope = cfg.predicates.contains(&p)
-            && cfg.graphs.include.contains(&g)
-            && !cfg.graphs.exclude.contains(&g);
-        if !in_scope {
-            return Some(Doc { key, doc: None });
-        }
-        let mut d = TantivyDocument::default();
-        d.add_bytes(f.key, &key);
-        d.add_bytes(f.s, &s);
-        d.add_text(f.p, &p);
-        d.add_bytes(f.o, &o);
-        d.add_text(f.g, &g);
-        if let Some(tag) = lang {
-            let tag = tag.to_ascii_lowercase();
-            if let Some((primary, _)) = tag.split_once('-') {
-                d.add_text(f.lang, primary);
+    /// Entries a [`Terms`] memo holds before it starts over (graphs can be many).
+    const MEMO_MAX: usize = 1 << 16;
+
+    /// What documents need of predicates and graphs, decoded once per batch: the IRI (or
+    /// graph name), its key, and whether it is in scope.
+    #[derive(Default)]
+    struct Terms {
+        preds: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+        graphs: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+    }
+
+    impl Terms {
+        /// The document for a quad (`doc: None` when the quad is out of scope: then only
+        /// its key matters, for deletion).
+        fn document(
+            &mut self,
+            snap: &Snapshot,
+            f: &Fields,
+            cfg: &TextConfig,
+            q: &[Id; 4],
+        ) -> Option<Doc> {
+            if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
+                return None;
             }
-            d.add_text(f.lang, &tag);
+            let o = snap.key(q[2])?;
+            let (lex, lang) = string_literal(&o)?;
+            if self.preds.len() >= MEMO_MAX {
+                self.preds.clear();
+            }
+            if self.graphs.len() >= MEMO_MAX {
+                self.graphs.clear();
+            }
+            let (p, pk, p_in) = self
+                .preds
+                .entry(q[1])
+                .or_insert_with(|| match snap.term(q[1])? {
+                    oxrdf::Term::NamedNode(n) => {
+                        let p = n.into_string();
+                        let pk = crate::id::iri_key(&p);
+                        let p_in = cfg.predicates.contains(&p);
+                        Some((p, pk, p_in))
+                    }
+                    _ => None,
+                })
+                .as_ref()?;
+            let (g, gk, g_in) = self
+                .graphs
+                .entry(q[3])
+                .or_insert_with(|| {
+                    let gk = if q[3] == Id::DEFAULT_GRAPH {
+                        Vec::new()
+                    } else {
+                        term_key(snap, q[3])?
+                    };
+                    let g = graph_name(snap, q[3])?;
+                    let g_in = cfg.graphs.include.contains(&g) && !cfg.graphs.exclude.contains(&g);
+                    Some((g, gk, g_in))
+                })
+                .as_ref()?;
+            let s = term_key(snap, q[0])?;
+            let key = doc_key([&s, pk, &o, gk]);
+            let hash = doc_hash(&s, &o);
+            if !(*p_in && *g_in) {
+                return Some(Doc {
+                    key,
+                    hash,
+                    doc: None,
+                });
+            }
+            let mut d = TantivyDocument::default();
+            d.add_bytes(f.key, &key);
+            d.add_bytes(f.s, &s);
+            d.add_text(f.p, p);
+            d.add_bytes(f.o, &o);
+            d.add_text(f.g, g);
+            if let Some(tag) = lang {
+                let tag = tag.to_ascii_lowercase();
+                if let Some((primary, _)) = tag.split_once('-') {
+                    d.add_text(f.lang, primary);
+                }
+                d.add_text(f.lang, &tag);
+            }
+            let mut end = lex.len().min(cfg.max_text_bytes);
+            while !lex.is_char_boundary(end) {
+                end -= 1;
+            }
+            d.add_text(f.text, &lex[..end]);
+            Some(Doc {
+                key,
+                hash,
+                doc: Some(d),
+            })
         }
-        let mut end = lex.len().min(cfg.max_text_bytes);
-        while !lex.is_char_boundary(end) {
-            end -= 1;
-        }
-        d.add_text(f.text, &lex[..end]);
-        Some(Doc { key, doc: Some(d) })
     }
 
     impl TextIndex {
@@ -746,14 +896,17 @@ mod imp {
                 }
             }
             let hash = config_hash(&config);
-            let ti = |live: Live, epoch: u64| TextIndex {
-                root: root.map(Path::to_path_buf),
-                config: config.clone(),
-                live: Mutex::new(live),
-                epoch: AtomicU64::new(epoch),
-                stale: Mutex::new(None),
-                last_rebuild: Mutex::new(None),
-                fail_next_commit: Default::default(),
+            let ti = |live: Live, epoch: u64| {
+                Arc::new(Inner {
+                    root: root.map(Path::to_path_buf),
+                    config: config.clone(),
+                    live: Mutex::new(live),
+                    epoch: AtomicU64::new(epoch),
+                    stale: Mutex::new(None),
+                    last_rebuild: Mutex::new(None),
+                    fail_next_commit: Default::default(),
+                    ticks: AtomicBool::new(true),
+                })
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
                 let (index, fields, dir) = open_index(r)
@@ -777,7 +930,7 @@ mod imp {
                         return None;
                     }
                     for (_, qs) in wal.iter().filter(|(seq, _)| *seq > p.seq) {
-                        touched.extend_from_slice(qs);
+                        touched.extend(qs.iter().map(|q| (*q, true)));
                     }
                 }
                 let live = live_of(index, fields, &config, Some(dir), p.seq).ok()?;
@@ -796,7 +949,7 @@ mod imp {
                     .apply(snap, &touched)
                     .and_then(|v| t.checkpoint().map(|()| v))
                 {
-                    Ok(view) => return Ok((t, view)),
+                    Ok(view) => return Ok((TextIndex::start(t), view)),
                     Err(e) => tracing::warn!("full-text index: {e}; rebuilding"),
                 }
             } else if root.is_some_and(|r| r.join("text").exists()) {
@@ -806,21 +959,116 @@ mod imp {
             let (index, fields) = new_index(None, &config)?;
             let t = ti(live_of(index, fields, &config, None, 0)?, 0);
             let view = t.rebuild(snap)?;
-            Ok((t, view))
+            Ok((TextIndex::start(t), view))
+        }
+
+        /// Start the tick that seals batches and checkpoints the index about once a
+        /// second. Without it (if the thread cannot start) searches, compaction and close
+        /// still seal.
+        fn start(inner: Arc<Inner>) -> TextIndex {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let weak = Arc::downgrade(&inner);
+            let ticker = std::thread::Builder::new()
+                .name("sparkles-text".into())
+                .spawn(move || {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        rx.recv_timeout(CHECKPOINT_AFTER)
+                    {
+                        match weak.upgrade() {
+                            Some(inner) => inner.tick(),
+                            None => break,
+                        }
+                    }
+                })
+                .inspect_err(|e| tracing::warn!("full-text commit tick: {e}"))
+                .ok();
+            TextIndex {
+                inner,
+                ticker: ticker.map(|h| (tx, h)),
+            }
         }
 
         pub fn config(&self) -> &TextConfig {
-            &self.config
+            &self.inner.config
         }
 
-        fn view(&self, seq: u64) -> Result<Arc<TextView>> {
-            let live = self.live.lock();
-            Ok(Arc::new(TextView {
+        /// Whether updates are still applied (not stale after a failure).
+        pub fn healthy(&self) -> bool {
+            self.inner.healthy()
+        }
+
+        /// Apply a commit: `log` holds the transaction's effective inserts and deletes
+        /// (WAL records) and `snap` the state after it (commit `snap.commit`). The
+        /// documents are staged, not committed. Returns the new view, or `None` (the
+        /// index is marked stale) on failure.
+        pub fn apply_commit(
+            &self,
+            snap: &Snapshot,
+            log: &[(u8, [Id; 4])],
+            prev: Option<&Arc<TextView>>,
+        ) -> Option<Arc<TextView>> {
+            let inner = &self.inner;
+            if !inner.healthy() {
+                return prev.cloned();
+            }
+            // a quad the transaction inserted first was absent before it: no document
+            // of it can exist yet
+            let mut first = FxHashSet::default();
+            let touched: Vec<([Id; 4], bool)> = log
+                .iter()
+                .filter(|(_, q)| first.insert(*q))
+                .map(|(op, q)| (*q, *op != crate::store::WAL_INSERT))
+                .collect();
+            match inner.apply(snap, &touched) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    inner.fail_locked(&mut inner.live.lock(), &e);
+                    prev.cloned()
+                }
+            }
+        }
+
+        /// Make the on-disk index durable, with a payload naming the last applied commit:
+        /// reopening it then needs neither verification nor WAL catch-up. Runs about once
+        /// a second after writes, before compaction, and on drop.
+        pub fn checkpoint(&self) -> Result<()> {
+            self.inner.checkpoint()
+        }
+
+        /// Rebuild the whole index from `snap` and return its view. On disk, the new
+        /// index is built in `text.new/` and swapped in.
+        pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
+            self.inner.rebuild(snap)
+        }
+
+        pub fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
+            self.inner.status(view, store_seq)
+        }
+
+        /// Test hook: make the next update fail.
+        #[doc(hidden)]
+        pub fn fail_next_commit(&self) {
+            self.inner.fail_next_commit.store(true, Ordering::SeqCst);
+        }
+
+        /// Test hook: pause (or resume) the tick, so staged documents stay uncommitted
+        /// until a search, compaction or close.
+        #[doc(hidden)]
+        pub fn set_ticks(&self, on: bool) {
+            self.inner.ticks.store(on, Ordering::SeqCst);
+        }
+    }
+
+    impl Inner {
+        /// A view of commit `seq` in `slot`.
+        fn view_in(self: &Arc<Self>, live: &Live, seq: u64, slot: Arc<Slot>) -> Arc<TextView> {
+            Arc::new(TextView {
                 seq,
                 epoch: self.epoch.load(Ordering::SeqCst),
-                searcher: live.reader.searcher(),
+                slot,
                 index: live.shared.clone(),
-            }))
+                owner: Arc::downgrade(self),
+            })
         }
 
         fn payload(&self, seq: u64) -> String {
@@ -833,92 +1081,199 @@ mod imp {
             .unwrap()
         }
 
-        /// Whether updates are still applied (not stale after a failure).
-        pub fn healthy(&self) -> bool {
+        fn healthy(&self) -> bool {
             self.stale.lock().is_none()
         }
 
-        /// Apply a commit: `touched` are the quads the transaction changed and `snap` the
-        /// state after it (commit `snap.commit`). Returns the new view, or `None` (the
-        /// index is marked stale) on failure.
-        pub fn apply_commit(
-            &self,
-            snap: &Snapshot,
-            touched: &[[Id; 4]],
-            prev: Option<&Arc<TextView>>,
-        ) -> Option<Arc<TextView>> {
-            if !self.healthy() {
-                return prev.cloned();
+        /// Mark the index stale after a failure: staged operations are dropped, and the
+        /// views of the open batch cannot search.
+        fn fail_locked(&self, live: &mut Live, e: &Error) {
+            tracing::error!("{e}; the full-text index is stale until it is rebuilt");
+            if let Ok(w) = live.writer() {
+                let _ = w.rollback();
             }
-            match self.apply(snap, touched) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::error!("{e}; the full-text index is stale until it is rebuilt");
-                    if let Ok(w) = self.live.lock().writer() {
-                        let _ = w.rollback();
-                    }
-                    *self.stale.lock() = Some(e.to_string());
-                    prev.cloned()
-                }
+            if let Some(slot) = live.open.take() {
+                let _ = slot.0.set(None);
             }
+            live.staged = 0;
+            live.removed.clear();
+            live.removed_since = None;
+            *self.stale.lock() = Some(e.to_string());
         }
 
-        /// Bring the index to `snap` given the quads changed since its commit. Each touched
-        /// quad in scope is deleted and re-added if still present, so the result depends
-        /// only on the final state. The Tantivy commit is not synced: see `lazydir`.
-        fn apply(&self, snap: &Snapshot, touched: &[[Id; 4]]) -> Result<Arc<TextView>> {
+        /// Bring the index to `snap` given the quads changed since its commit, each with
+        /// whether a document of it may exist, and return the view of `snap`. A present
+        /// quad's document is (re-)added and a removed one's kept until the batch is
+        /// sealed, so the result depends only on the final state. Nothing is committed.
+        fn apply(
+            self: &Arc<Self>,
+            snap: &Snapshot,
+            touched: &[([Id; 4], bool)],
+        ) -> Result<Arc<TextView>> {
             let mut live = self.live.lock();
+            let live = &mut *live;
             let fields = live.shared.fields;
+            let mut terms = Terms::default();
             let mut changed = false;
-            let mut seen = rustc_hash::FxHashSet::default();
-            for q in touched {
+            let mut seen = FxHashSet::default();
+            for (q, indexed) in touched {
                 if !seen.insert(*q) {
                     continue;
                 }
-                let Some(d) = document(snap, &fields, &self.config, q) else {
+                // out of scope: no document can exist (the configuration is the index's)
+                let Some(Doc {
+                    key,
+                    hash,
+                    doc: Some(doc),
+                }) = terms.document(snap, &fields, &self.config, q)
+                else {
                     continue;
                 };
-                live.writer()?
-                    .delete_term(Term::from_field_bytes(fields.key, &d.key));
-                changed = true;
-                if let Some(doc) = d.doc
-                    && snap.contains(q)?
-                {
-                    live.writer()?.add_document(doc).map_err(text_err)?;
+                let present = snap.contains(q)?;
+                if !indexed && !present {
+                    // inserted and removed again by the same transaction
+                    continue;
                 }
+                changed = true;
+                live.uncertain.insert(hash);
+                if present {
+                    // deleting is not free even when nothing matches (every commit with
+                    // deletes opens each segment to apply them): a fresh quad has no
+                    // document unless one was kept for its removal earlier in the batch
+                    if live.removed.remove(&key).is_some() || *indexed {
+                        live.writer()?
+                            .delete_term(Term::from_field_bytes(fields.key, &key));
+                        live.staged += 1;
+                    }
+                    live.writer()?.add_document(doc).map_err(text_err)?;
+                    live.staged += 1;
+                } else {
+                    live.removed.insert(key, hash);
+                    // reopening catches up from the first commit that may have
+                    // removed it
+                    let since = live.applied + 1;
+                    live.removed_since.get_or_insert(since);
+                }
+            }
+            if changed && self.fail_next_commit.swap(false, Ordering::SeqCst) {
+                return Err(text_err("injected failure"));
             }
             live.applied = snap.commit;
-            if changed {
-                if self.fail_next_commit.swap(false, Ordering::SeqCst) {
-                    return Err(text_err("injected failure"));
-                }
-                self.commit_locked(&mut live)?;
+            let slot = if changed || live.open.is_some() {
+                live.open.get_or_insert_with(Default::default).clone()
+            } else {
+                live.last.clone()
+            };
+            // a large batch is sealed right away: the search that would seal it pays
+            // about as much as the commit costs
+            if live.staged + live.removed.len() >= STAGED_MAX {
+                self.seal_locked(live)?;
             }
-            if live
-                .dirty_since
-                .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
-            {
-                self.checkpoint_locked(&mut live)?;
-            }
-            drop(live);
-            self.view(snap.commit)
+            Ok(self.view_in(live, snap.commit, slot))
         }
 
-        /// Commit the writer (payload: the applied commit) and reload the reader.
+        /// Commit the writer and reload the reader. The payload names the applied commit,
+        /// or the one before the first removal whose document is still kept (reopening
+        /// catches up from there).
         fn commit_locked(&self, live: &mut Live) -> Result<()> {
-            let payload = self.payload(live.applied);
+            let seq = live.removed_since.map_or(live.applied, |s| s - 1);
+            let payload = self.payload(seq);
             let mut prepared = live.writer()?.prepare_commit().map_err(text_err)?;
             prepared.set_payload(&payload);
             prepared.commit().map_err(text_err)?;
             live.reader.reload().map_err(text_err)?;
-            live.committed = live.applied;
+            live.committed = seq;
+            live.staged = 0;
             if live.dir.is_some() && live.dirty_since.is_none() {
                 live.dirty_since = Some(Instant::now());
             }
             Ok(())
         }
 
+        /// Seal the open batch: commit what is staged (or reuse the searcher when only
+        /// removals happened) and give the batch's views their searcher. The documents
+        /// of removed quads are then deleted, with the next commit.
+        fn seal_locked(&self, live: &mut Live) -> Result<()> {
+            let Some(slot) = live.open.clone() else {
+                return Ok(());
+            };
+            let committed = live.staged > 0;
+            if committed {
+                self.commit_locked(live)?;
+            }
+            let _ = slot.0.set(Some(Resolved {
+                searcher: live.reader.searcher(),
+                uncertain: Arc::new(live.uncertain.clone()),
+            }));
+            live.open = None;
+            live.last = slot;
+            let removed = std::mem::take(&mut live.removed);
+            if committed {
+                // what later views may still disagree with: the kept documents
+                live.uncertain = removed.values().copied().collect();
+            }
+            let field = live.shared.fields.key;
+            for key in removed.keys() {
+                live.writer()?
+                    .delete_term(Term::from_field_bytes(field, key));
+                live.staged += 1;
+            }
+            live.removed_since = None;
+            Ok(())
+        }
+
+        /// Seal, then commit the deletions of removed quads' documents: the searcher
+        /// then holds exactly the applied state.
+        fn settle_locked(&self, live: &mut Live) -> Result<()> {
+            self.seal_locked(live)?;
+            if live.staged > 0 {
+                self.commit_locked(live)?;
+                live.uncertain.clear();
+                live.last = Slot::sealed(live.reader.searcher(), Default::default());
+            }
+            Ok(())
+        }
+
+        /// Seal the batch of `slot` for a search (read your writes).
+        fn seal_for(&self, slot: &Arc<Slot>) {
+            let mut live = self.live.lock();
+            if slot.0.get().is_some() {
+                return;
+            }
+            if live.open.as_ref().is_some_and(|o| Arc::ptr_eq(o, slot)) {
+                if let Err(e) = self.seal_locked(&mut live) {
+                    self.fail_locked(&mut live, &e);
+                }
+            } else {
+                // not open any more and never sealed: abandoned by a failure
+                let _ = slot.0.set(None);
+            }
+        }
+
+        /// The tick: seal and settle what the last second staged, and checkpoint an
+        /// index that has held unsynced commits for a second.
+        fn tick(&self) {
+            if !self.ticks.load(Ordering::SeqCst) || !self.healthy() {
+                return;
+            }
+            let mut live = self.live.lock();
+            let r = self.settle_locked(&mut live).and_then(|()| {
+                if live
+                    .dirty_since
+                    .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
+                {
+                    self.checkpoint_locked(&mut live)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = r {
+                self.fail_locked(&mut live, &e);
+            }
+        }
+
         fn checkpoint_locked(&self, live: &mut Live) -> Result<()> {
+            self.settle_locked(live)?;
             let Some(dir) = live.dir.clone() else {
                 return Ok(());
             };
@@ -930,10 +1285,7 @@ mod imp {
             Ok(())
         }
 
-        /// Make the on-disk index durable, with a payload naming the last applied commit:
-        /// reopening it then needs neither verification nor WAL catch-up. Runs about once
-        /// a second during writes, before compaction, and on drop.
-        pub fn checkpoint(&self) -> Result<()> {
+        fn checkpoint(&self) -> Result<()> {
             if !self.healthy() {
                 return Ok(());
             }
@@ -941,9 +1293,7 @@ mod imp {
             self.checkpoint_locked(&mut live)
         }
 
-        /// Rebuild the whole index from `snap` and return its view. On disk, the new
-        /// index is built in `text.new/` and swapped in.
-        pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
+        fn rebuild(self: &Arc<Self>, snap: &Snapshot) -> Result<Arc<TextView>> {
             let t0 = std::time::Instant::now();
             let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
             let (index, fields) = new_index(new_dir.as_deref(), &self.config)?;
@@ -955,8 +1305,10 @@ mod imp {
                 let mut writer: IndexWriter<TantivyDocument> = index
                     .writer_with_num_threads(threads, threads * (64 << 20))
                     .map_err(text_err)?;
+                let mut terms = Terms::default();
                 let mut add = |q: &[Id; 4]| -> Result<()> {
-                    if let Some(Doc { doc: Some(d), .. }) = document(snap, &fields, &self.config, q)
+                    if let Some(Doc { doc: Some(d), .. }) =
+                        terms.document(snap, &fields, &self.config, q)
                     {
                         writer.add_document(d).map_err(text_err)?;
                         docs += 1;
@@ -993,6 +1345,13 @@ mod imp {
                 writer.wait_merging_threads().map_err(text_err)?;
             }
             let mut live = self.live.lock();
+            // the views of the old index's open batch get its searcher
+            if let Err(e) = self.seal_locked(&mut live) {
+                tracing::warn!("full-text index: {e}; replaced by the rebuild");
+                if let Some(slot) = live.open.take() {
+                    let _ = slot.0.set(None);
+                }
+            }
             let old = match (&self.root, new_dir) {
                 (Some(root), Some(new_dir)) => {
                     // swap directories, then reopen the index in its final place
@@ -1021,6 +1380,7 @@ mod imp {
                     None
                 }
             };
+            let view = self.view_in(&live, snap.commit, live.last.clone());
             drop(live);
             if let Some(old) = old {
                 let _ = std::fs::remove_dir_all(old);
@@ -1035,11 +1395,17 @@ mod imp {
                 "full-text index rebuilt: {docs} documents in {:?}",
                 t0.elapsed()
             );
-            self.view(snap.commit)
+            Ok(view)
         }
 
-        pub fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
-            let live = self.live.lock();
+        fn status(&self, view: Option<&TextView>, store_seq: u64) -> TextStatus {
+            let mut live = self.live.lock();
+            // counts without staged or kept documents
+            if self.healthy()
+                && let Err(e) = self.settle_locked(&mut live)
+            {
+                self.fail_locked(&mut live, &e);
+            }
             let searcher = live.reader.searcher();
             let stale = self.stale.lock().clone();
             let seq = view.map_or(0, |v| v.seq);
@@ -1066,28 +1432,35 @@ mod imp {
                 message: stale,
             }
         }
+
+        /// Seal and commit, let running merges finish (they write metadata too), then
+        /// sync.
+        fn close(&self) -> Result<()> {
+            if !self.healthy() {
+                return Ok(());
+            }
+            let mut live = self.live.lock();
+            self.settle_locked(&mut live)?;
+            if live.committed != live.applied {
+                self.commit_locked(&mut live)?;
+            }
+            if let Some(w) = live.writer.take() {
+                w.wait_merging_threads().map_err(text_err)?;
+            }
+            match live.dir.clone() {
+                Some(dir) => Ok(dir.checkpoint()?),
+                None => Ok(()),
+            }
+        }
     }
 
     impl Drop for TextIndex {
         fn drop(&mut self) {
-            // commit, let running merges finish (they write metadata too), then sync
-            let close = || -> Result<()> {
-                if !self.healthy() {
-                    return Ok(());
-                }
-                let mut live = self.live.lock();
-                if live.committed != live.applied {
-                    self.commit_locked(&mut live)?;
-                }
-                if let Some(w) = live.writer.take() {
-                    w.wait_merging_threads().map_err(text_err)?;
-                }
-                match live.dir.clone() {
-                    Some(dir) => Ok(dir.checkpoint()?),
-                    None => Ok(()),
-                }
-            };
-            if let Err(e) = close() {
+            if let Some((tx, ticker)) = self.ticker.take() {
+                drop(tx);
+                let _ = ticker.join();
+            }
+            if let Err(e) = self.inner.close() {
                 tracing::warn!("full-text index checkpoint on close: {e}");
             }
         }
@@ -1201,9 +1574,11 @@ mod imp {
             Box::new(BooleanQuery::new(must))
         };
         ctx.check()?;
+        let resolved = view.resolved()?;
         let max = sh.config.max_hits;
         let want = spec.limit.unwrap_or(max);
-        // with dedup (a merged default graph), fetch more until enough distinct hits
+        // with dedup (a merged default graph) or documents filtered out against the
+        // snapshot, fetch more until enough hits remain
         let mut fetch = if spec.dedup {
             want.saturating_mul(2)
         } else {
@@ -1211,32 +1586,7 @@ mod imp {
         }
         .saturating_add(1)
         .min(max.saturating_add(1));
-        let hits = loop {
-            let hits = view
-                .searcher
-                .search(&query, &TopDocs::with_limit(fetch.max(1)).order_by_score())
-                .map_err(text_err)?;
-            if !spec.dedup || hits.len() < fetch || fetch > max {
-                break hits;
-            }
-            fetch = fetch.saturating_mul(2).min(max.saturating_add(1));
-            if fetch > max {
-                continue;
-            }
-        };
-        ctx.check()?;
-        if spec.limit.is_none() && hits.len() > max {
-            // more hits than a search may return without a limit
-            return Err(Error::BudgetExceeded(crate::Budget {
-                kind: crate::BudgetKind::Rows,
-                limit: max as u64,
-                requested: hits.len() as u64,
-            }));
-        }
-        // the per-query memory budget, before the output is built
-        ctx.check_output(hits.len(), vars.len())?;
         // columns
-        let mut t = Table::new(vars.to_vec());
         let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
         let (cs, cscore, clit, cg_out, cgv, cprop) = (
             match spec.subject {
@@ -1249,85 +1599,116 @@ mod imp {
             col(spec.graph_var),
             col(spec.prop),
         );
-        let mut seen: rustc_hash::FxHashSet<(Id, Id, Id)> = Default::default();
-        let mut row = vec![Id::UNDEF; vars.len()];
-        let mut stale_hits = 0usize;
-        for (i, (score, addr)) in hits.into_iter().enumerate() {
-            if i % 4096 == 4095 {
-                ctx.check()?;
+        let mut stale_hits;
+        let t = loop {
+            let hits = resolved
+                .searcher
+                .search(&query, &TopDocs::with_limit(fetch.max(1)).order_by_score())
+                .map_err(text_err)?;
+            ctx.check()?;
+            if spec.limit.is_none() && hits.len() > max {
+                // more hits than a search may return without a limit
+                return Err(Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::Rows,
+                    limit: max as u64,
+                    requested: hits.len() as u64,
+                }));
             }
-            if t.len() >= want {
-                break;
-            }
-            let d: TantivyDocument = view.searcher.doc(addr).map_err(text_err)?;
-            let get_bytes = |fld: Field| d.get_first(fld).and_then(|v| v.as_bytes());
-            let get_str = |fld: Field| d.get_first(fld).and_then(|v| v.as_str());
-            let (Some(sk), Some(ok), Some(p), Some(g)) =
-                (get_bytes(f.s), get_bytes(f.o), get_str(f.p), get_str(f.g))
-            else {
-                stale_hits += 1;
-                continue;
-            };
-            let s_id = match sk.split_first() {
-                Some((b'_', rest)) if rest.len() == 8 => {
-                    Some(Id::bnode(u64::from_be_bytes(rest.try_into().unwrap())))
+            // the per-query memory budget, before the output is built
+            ctx.check_output(hits.len(), vars.len())?;
+            let complete = hits.len() < fetch || fetch > max;
+            let mut t = Table::new(vars.to_vec());
+            let mut seen: FxHashSet<(Id, Id, Id)> = Default::default();
+            let mut row = vec![Id::UNDEF; vars.len()];
+            stale_hits = 0usize;
+            for (i, (score, addr)) in hits.into_iter().enumerate() {
+                if i % 4096 == 4095 {
+                    ctx.check()?;
                 }
-                _ => snap.lookup_key(sk),
-            };
-            let (Some(s_id), Some(o_id), Some(p_id)) =
-                (s_id, snap.lookup_key(ok), snap.lookup_iri(p))
-            else {
-                stale_hits += 1;
-                continue;
-            };
-            let g_id = if g == DEFAULT_GRAPH_IRI {
-                Some(Id::DEFAULT_GRAPH)
-            } else if let Some(label) = g.strip_prefix("_:") {
-                crate::store::parse_bnode_label(label)
-            } else {
-                snap.lookup_iri(g)
-            };
-            let Some(g_id) = g_id else {
-                stale_hits += 1;
-                continue;
-            };
-            if spec.dedup && !seen.insert((s_id, p_id, o_id)) {
-                continue;
-            }
-            row.fill(Id::UNDEF);
-            if let Some(c) = cs {
-                row[c] = s_id;
-            }
-            if let Some(c) = cscore {
-                row[c] = ctx.intern_value(&crate::sparql::value::Value::Float(score.into()));
-            }
-            if let Some(c) = clit {
-                row[c] = o_id;
-            }
-            // the graph slot names the default graph by its IRI (a term, not the
-            // store's default-graph marker)
-            let g_term = if g_id == Id::DEFAULT_GRAPH {
-                ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                    DEFAULT_GRAPH_IRI,
-                )))
-            } else {
-                g_id
-            };
-            if let Some(c) = cg_out {
-                row[c] = g_term;
-            }
-            if let Some(c) = cgv {
-                if row[c] != Id::UNDEF && row[c] != g_id {
-                    continue; // ?g used both as GRAPH ?g and as the graph slot
+                if t.len() >= want {
+                    break;
                 }
-                row[c] = g_id;
+                let d: TantivyDocument = resolved.searcher.doc(addr).map_err(text_err)?;
+                let get_bytes = |fld: Field| d.get_first(fld).and_then(|v| v.as_bytes());
+                let get_str = |fld: Field| d.get_first(fld).and_then(|v| v.as_str());
+                let (Some(sk), Some(ok), Some(p), Some(g)) =
+                    (get_bytes(f.s), get_bytes(f.o), get_str(f.p), get_str(f.g))
+                else {
+                    stale_hits += 1;
+                    continue;
+                };
+                // a document the searcher may hold for a quad this snapshot does not
+                // have (whose terms it may not have either)
+                let uncertain = !resolved.uncertain.is_empty()
+                    && resolved.uncertain.contains(&doc_hash(sk, ok));
+                let s_id = match sk.split_first() {
+                    Some((b'_', rest)) if rest.len() == 8 => {
+                        Some(Id::bnode(u64::from_be_bytes(rest.try_into().unwrap())))
+                    }
+                    _ => snap.lookup_key(sk),
+                };
+                let (Some(s_id), Some(o_id), Some(p_id)) =
+                    (s_id, snap.lookup_key(ok), snap.lookup_iri(p))
+                else {
+                    stale_hits += usize::from(!uncertain);
+                    continue;
+                };
+                let g_id = if g == DEFAULT_GRAPH_IRI {
+                    Some(Id::DEFAULT_GRAPH)
+                } else if let Some(label) = g.strip_prefix("_:") {
+                    crate::store::parse_bnode_label(label)
+                } else {
+                    snap.lookup_iri(g)
+                };
+                let Some(g_id) = g_id else {
+                    stale_hits += usize::from(!uncertain);
+                    continue;
+                };
+                if uncertain && !snap.contains(&[s_id, p_id, o_id, g_id])? {
+                    continue;
+                }
+                if spec.dedup && !seen.insert((s_id, p_id, o_id)) {
+                    continue;
+                }
+                row.fill(Id::UNDEF);
+                if let Some(c) = cs {
+                    row[c] = s_id;
+                }
+                if let Some(c) = cscore {
+                    row[c] = ctx.intern_value(&crate::sparql::value::Value::Float(score.into()));
+                }
+                if let Some(c) = clit {
+                    row[c] = o_id;
+                }
+                // the graph slot names the default graph by its IRI (a term, not the
+                // store's default-graph marker)
+                let g_term = if g_id == Id::DEFAULT_GRAPH {
+                    ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+                        DEFAULT_GRAPH_IRI,
+                    )))
+                } else {
+                    g_id
+                };
+                if let Some(c) = cg_out {
+                    row[c] = g_term;
+                }
+                if let Some(c) = cgv {
+                    if row[c] != Id::UNDEF && row[c] != g_id {
+                        continue; // ?g used both as GRAPH ?g and as the graph slot
+                    }
+                    row[c] = g_id;
+                }
+                if let Some(c) = cprop {
+                    row[c] = p_id;
+                }
+                t.push_row(&row);
+                ctx.check_rows(t.len())?;
             }
-            if let Some(c) = cprop {
-                row[c] = p_id;
+            if t.len() >= want || complete {
+                break t;
             }
-            t.push_row(&row);
-            ctx.check_rows(t.len())?;
-        }
+            fetch = fetch.saturating_mul(2).min(max.saturating_add(1));
+        };
         if stale_hits > 0 {
             tracing::warn!(
                 "text:query skipped {stale_hits} hits whose terms are not in the snapshot"

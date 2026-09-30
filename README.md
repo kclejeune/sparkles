@@ -75,7 +75,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
 | SERVICE (federated query, SILENT), under an outbound network policy: public destinations only by default, allowlists, DNS pinning, checked redirects, timeouts, response ceiling | ✅ |
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
-| Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit, graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
+| Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit (staged, committed by the next search or a 1 s tick), graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
@@ -343,6 +343,7 @@ result cache, and the web UI.
 | `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
 | `serve` listens on `127.0.0.1` by default and refuses a non-loopback address without `--auth-config` unless `--allow-open-network` (or `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given (Fuseki listens on all interfaces) | Without authentication every caller may read, write and administer everything, so exposing that is an explicit choice; the override still logs a warning, as does a network listener without rate limits. |
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0`: no cap) for queries and updates alike; the default query timeout stays 60 s | A request may ask for a longer timeout than the default, but not hold a worker indefinitely. |
+| The full-text index is committed lazily: a write stages its documents, and the next text query that needs them (or a tick about once a second) commits them | A Tantivy commit flushes a segment and cost more than the indexing itself; a burst of writes now shares one. Each snapshot still searches exactly its own documents (later ones are filtered out against it, removed ones are kept until their batch is committed), and after a crash the WAL restores what was only staged. Jena's text index commits with each transaction. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Using the library (no server)

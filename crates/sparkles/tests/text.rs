@@ -36,7 +36,11 @@ fn mem() -> Store {
 }
 
 fn rows(s: &Store, q: &str) -> Vec<String> {
-    let r = query(s.snapshot(), &format!("{P}{q}"), &QueryOptions::default())
+    rows_at(s.snapshot(), q)
+}
+
+fn rows_at(snap: std::sync::Arc<sparkles::store::Snapshot>, q: &str) -> Vec<String> {
+    let r = query(snap, &format!("{P}{q}"), &QueryOptions::default())
         .unwrap_or_else(|e| panic!("{q}: {e}"));
     r.rows()
         .into_iter()
@@ -410,16 +414,22 @@ fn commits_skip_fsync_until_a_checkpoint() {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
+        s.set_text_ticks(false);
         // a fresh build is durable
         assert!(!marker.exists());
-        // an update writes the index without fsync, so it is marked
+        // an update only stages its documents (indexing may write files already); the
+        // search that needs them commits the index, without fsync, so it is marked
         insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"crimson\" }"), ["b8"]);
         assert!(marker.exists());
         // compaction checkpoints it
         s.compact().unwrap();
         assert!(!marker.exists());
         insert(&s, "ex:b9 rdfs:label \"Violet Heron\"");
+        assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"violet\" }"), ["b9"]);
         assert!(marker.exists());
+        // a staged update is committed by closing too
+        insert(&s, "ex:b10 rdfs:label \"Grey Heron\"");
     }
     // so does closing the store
     assert!(!marker.exists());
@@ -431,7 +441,7 @@ fn commits_skip_fsync_until_a_checkpoint() {
     );
     let mut got = rows(&s, "SELECT ?s { ?s text:query \"heron\" }");
     got.sort();
-    assert_eq!(got, ["b8", "b9"]);
+    assert_eq!(got, ["b10", "b8", "b9"]);
 }
 
 #[test]
@@ -443,8 +453,10 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         load(&s);
         s.enable_text(TextConfig::default()).unwrap();
+        s.set_text_ticks(false);
         insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
         // a crash image: unsynced index files, marker present, index at the head
+        assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"heron\" }"), ["b8"]);
         copy_dir(&root, &img("current"));
         // a commit the index misses: the image's index is behind the WAL
         s.fail_next_text_commit();
@@ -503,4 +515,330 @@ fn searches_count_toward_the_memory_budget() {
         matches!(e, sparkles::Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::Memory),
         "{e}"
     );
+}
+
+fn delete(s: &Store, triples: &str) {
+    sparkles::sparql::update::update(
+        s,
+        &format!("{P}DELETE DATA {{ {triples} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn snapshots_search_their_own_state_while_documents_are_staged() {
+    let s = mem();
+    s.set_text_ticks(false);
+    let brown = "SELECT ?s { ?s text:query \"brown\" }";
+    insert(&s, "ex:b5 rdfs:label \"Brown Owl\"");
+    let old = s.snapshot();
+    // the same batch: a removal of a document the old snapshot has, one of a document
+    // staged in the batch, and an addition
+    delete(&s, "ex:b1 rdfs:label \"The Quick Brown Fox\"@en");
+    delete(&s, "ex:b5 rdfs:label \"Brown Owl\"");
+    insert(&s, "ex:b6 rdfs:label \"brown\"");
+    let mid = s.snapshot();
+    // the old snapshot seals the batch, and still finds exactly its own documents
+    assert_eq!(
+        sorted(rows_at(old.clone(), brown)),
+        ["b1", "b2", "b2", "b5"]
+    );
+    // hits filtered out are made up for (b6 scores best)
+    assert_eq!(
+        rows_at(old.clone(), "SELECT ?s { ?s text:query (\"brown\" 2) }").len(),
+        2
+    );
+    // a removed quad added back: one document
+    insert(&s, "ex:b1 rdfs:label \"The Quick Brown Fox\"@en");
+    assert_eq!(sorted(rows_at(mid, brown)), ["b2", "b2", "b6"]);
+    assert_eq!(sorted(rows(&s, brown)), ["b1", "b2", "b2", "b6"]);
+    assert_eq!(sorted(rows_at(old, brown)), ["b1", "b2", "b2", "b5"]);
+    // an addition removed again before any search leaves nothing behind
+    insert(&s, "ex:b7 rdfs:label \"Brown Heron\"");
+    delete(&s, "ex:b7 rdfs:label \"Brown Heron\"");
+    assert_eq!(sorted(rows(&s, brown)), ["b1", "b2", "b2", "b6"]);
+    let st = s.text_status().unwrap();
+    assert_eq!((st.docs, st.state.as_str()), (7, "ready"));
+}
+
+struct RejectAll;
+
+impl sparkles::guard::CommitGuard for RejectAll {
+    fn check(
+        &self,
+        _: &sparkles::guard::Candidate<'_>,
+    ) -> sparkles::Result<sparkles::guard::ValidationSummary> {
+        Ok(sparkles::guard::ValidationSummary::empty(
+            sparkles::guard::GuardStatus::Rejected,
+            sparkles::guard::GuardMode::Reject,
+            sparkles::guard::Severity::Violation,
+        ))
+    }
+    fn describe(&self) -> String {
+        "reject all".into()
+    }
+}
+
+#[test]
+fn rejected_writes_leave_staged_documents_alone() {
+    let s = mem();
+    s.set_text_ticks(false);
+    insert(&s, "ex:b5 rdfs:label \"Brown Owl\"");
+    s.set_guard(Some(std::sync::Arc::new(RejectAll)));
+    let e = sparkles::sparql::update::update(
+        &s,
+        &format!(
+            "{P}DELETE DATA {{ ex:b5 rdfs:label \"Brown Owl\" }} ; INSERT DATA {{ ex:b6 rdfs:label \"brown\" }}"
+        ),
+        &QueryOptions::default(),
+    );
+    assert!(matches!(e, Err(sparkles::Error::Rejected(_))), "{e:?}");
+    s.set_guard(None);
+    assert_eq!(
+        sorted(rows(&s, "SELECT ?s { ?s text:query \"brown\" }")),
+        ["b1", "b2", "b2", "b5"]
+    );
+    let st = s.text_status().unwrap();
+    assert_eq!((st.docs, st.state.as_str()), (7, "ready"));
+}
+
+/// The commit a crash image's full-text index names in its payload.
+fn text_payload_seq(root: &std::path::Path) -> u64 {
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("text/meta.json")).unwrap()).unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(meta["payload"].as_str().unwrap()).unwrap();
+    payload["seq"].as_u64().unwrap()
+}
+
+#[test]
+fn staged_and_kept_documents_are_recovered_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let img = |n: &str| dir.path().join(n);
+    let head;
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        s.set_text_ticks(false);
+        // staged only: the index on disk does not have it
+        insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        copy_dir(&root, &img("staged"));
+        // a search commits the batch, keeping the removed quad's document (the payload
+        // then names the commit before the removal)
+        delete(&s, "ex:b1 rdfs:label \"The Quick Brown Fox\"@en");
+        insert(&s, "ex:b9 rdfs:label \"Violet Heron\"");
+        assert_eq!(
+            sorted(rows(&s, "SELECT ?s { ?s text:query \"heron\" }")),
+            ["b8", "b9"]
+        );
+        copy_dir(&root, &img("kept"));
+        // more staged changes on top
+        insert(&s, "ex:b10 rdfs:label \"Grey Heron\"");
+        delete(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        copy_dir(&root, &img("mixed"));
+        head = s.snapshot().commit;
+    }
+    for (name, heron, fox) in [
+        ("staged", vec!["b8"], vec!["b1"]),
+        ("kept", vec!["b8", "b9"], vec![]),
+        ("mixed", vec!["b10", "b9"], vec![]),
+    ] {
+        let root = img(name);
+        // the crash lost what the index had only staged or kept
+        let payload = text_payload_seq(&root);
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        let data = s.snapshot().commit;
+        assert!(payload < data && data <= head, "{name}: {payload} {data}");
+        let st = s.text_status().unwrap();
+        assert_eq!(st.state, "ready", "{name}");
+        assert!(st.last_rebuild.is_none(), "{name}");
+        assert_eq!(
+            sorted(rows(&s, "SELECT ?s { ?s text:query \"heron\" }")),
+            heron,
+            "{name}"
+        );
+        assert_eq!(
+            rows(&s, "SELECT ?s { ?s text:query \"fox\" }"),
+            fox,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn large_batches_are_committed_by_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    load(&s);
+    s.enable_text(TextConfig::default()).unwrap();
+    s.set_text_ticks(false);
+    let batch = |from: usize, n: usize| {
+        (from..from + n)
+            .map(|i| format!("ex:m{i} rdfs:label \"moose {i}\" ."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // a small batch stays staged
+    insert(&s, &batch(0, 1000));
+    let before = text_payload_seq(&root);
+    assert!(before < s.snapshot().commit);
+    // one that reaches the limit is committed without waiting for a search
+    for k in 1..20 {
+        insert(&s, &batch(k * 1000, 1000));
+    }
+    let head = s.snapshot().commit;
+    let seq = text_payload_seq(&root);
+    assert!(seq > before + 1 && seq < head, "{before} {seq} {head}");
+    assert_eq!(
+        rows(&s, "SELECT (COUNT(*) AS ?n) { ?s text:query \"moose\" }"),
+        ["20000"]
+    );
+}
+
+#[test]
+fn concurrent_searches_match_their_snapshots() {
+    let s = std::sync::Arc::new(mem());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (s, done) = (s.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut n = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) || n == 0 {
+                    let snap = s.snapshot();
+                    let text = rows_at(
+                        snap.clone(),
+                        "SELECT (COUNT(*) AS ?n) { ?s text:query \"walrus\" }",
+                    );
+                    let data = rows_at(
+                        snap,
+                        "SELECT (COUNT(*) AS ?n) { ?s rdfs:label ?l FILTER(CONTAINS(?l, \"walrus\")) }",
+                    );
+                    assert_eq!(text, data);
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    for i in 0..150 {
+        insert(&s, &format!("ex:w{i} rdfs:label \"walrus {i}\""));
+        if i >= 3 {
+            delete(
+                &s,
+                &format!("ex:w{} rdfs:label \"walrus {}\"", i - 3, i - 3),
+            );
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert_eq!(
+        rows(&s, "SELECT (COUNT(*) AS ?n) { ?s text:query \"walrus\" }"),
+        ["3"]
+    );
+}
+
+/// Rough write-path timing with full-text search on and off (not a benchmark: run it
+/// alone, optimized, with `--ignored --nocapture`).
+#[test]
+#[ignore]
+fn batch_insert_timing() {
+    let batch = |verb: &str| {
+        let mut u = format!("{verb} DATA {{ GRAPH <http://example.org/bench/g> {{\n");
+        for i in 0..1000 {
+            u.push_str(&format!("<http://example.org/bench/doc{i}> <http://example.org/title> \"Batch document {i} about graph databases and full text search\" .\n"));
+        }
+        u + "} }"
+    };
+    let (ins, del) = (batch("INSERT"), batch("DELETE"));
+    let mut base = String::new();
+    for i in 0..50_000 {
+        base.push_str(&format!(
+            "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} walrus {}\" .\n",
+            i % 97
+        ));
+    }
+    for text in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(
+            base.clone().into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        if text {
+            s.enable_text(TextConfig::default()).unwrap();
+        }
+        let o = QueryOptions::default();
+        let mut times = Vec::new();
+        for round in 0..30 {
+            let t = std::time::Instant::now();
+            sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+            let el = t.elapsed();
+            if round >= 5 {
+                times.push(el.as_secs_f64() * 1000.0);
+            }
+            sparkles::sparql::update::update(&s, &del, &o).unwrap();
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "text {}: insert 1k median {:.1} ms, min {:.1} ms, max {:.1} ms",
+            if text { "on" } else { "off" },
+            times[times.len() / 2],
+            times[0],
+            times[times.len() - 1]
+        );
+        if text {
+            // read your writes: a search right after each insert commits it
+            let mut times = Vec::new();
+            for _ in 0..10 {
+                sparkles::sparql::update::update(&s, &del, &o).unwrap();
+                let t = std::time::Instant::now();
+                sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+                let n = rows(
+                    &s,
+                    "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query (\"batch\" 10) } }",
+                );
+                assert_eq!(n, ["10"]);
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "insert 1k + top-10 search: median {:.1} ms, min {:.1} ms",
+                times[times.len() / 2],
+                times[0]
+            );
+            // the first search after a burst of writes (no tick meanwhile) commits it
+            s.set_text_ticks(false);
+            for rounds in [1, 5, 10, 20, 40] {
+                let mut times = Vec::new();
+                for _ in 0..5 {
+                    for _ in 0..rounds {
+                        sparkles::sparql::update::update(&s, &del, &o).unwrap();
+                        sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+                    }
+                    let t = std::time::Instant::now();
+                    let n = rows(
+                        &s,
+                        "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query (\"batch\" 10) } }",
+                    );
+                    assert_eq!(n, ["10"]);
+                    times.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!(
+                    "first search after {rounds} x (delete 1k, insert 1k): median {:.1} ms, max {:.1} ms",
+                    times[times.len() / 2],
+                    times[times.len() - 1]
+                );
+            }
+            s.set_text_ticks(true);
+        }
+    }
 }
