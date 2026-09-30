@@ -73,6 +73,8 @@ fn server() -> Server {
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     // SERVICE calls go to a stub on 127.0.0.1
     st.outbound.allow_private = true;
+    // the requests name the server by its public host
+    st.hosts = crate::exposure::Hosts::new("127.0.0.1", &["sparql.example".into()]).unwrap();
     let st = Arc::new(st);
     let ds = st.attach("ds", DbType::Mem, None).unwrap();
     ds.store

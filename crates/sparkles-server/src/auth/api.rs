@@ -9,39 +9,61 @@ use serde_json::{Map, Value as J, json};
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-/// CORS: today's permissive layer without auth; with auth, only the configured origins,
-/// never with credentials (the policy is read per request, so reloads apply).
+/// CORS: only the configured origins (`--cors-origin`, and with auth `cors.origins`),
+/// never with credentials; no origin at all by default (the auth policy is read per
+/// request, so reloads apply).
 pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
+    let mut expose = expose;
+    expose.push(header::WWW_AUTHENTICATE);
+    let fixed = st.cors_origins.clone();
     #[cfg(feature = "auth")]
-    if let Some(auth) = st.auth.clone() {
-        let mut expose = expose;
-        expose.push(header::WWW_AUTHENTICATE);
-        return CorsLayer::new()
-            .allow_origin(AllowOrigin::predicate(move |origin, _| {
-                let o = origin.to_str().unwrap_or("");
-                auth.policy()
+    let auth = st.auth.clone();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            let o = origin.to_str().unwrap_or("");
+            #[cfg(feature = "auth")]
+            if let Some(a) = &auth
+                && a.policy()
                     .cors_origins
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case(o))
-            }))
-            .allow_headers([
-                header::AUTHORIZATION,
-                header::CONTENT_TYPE,
-                header::ACCEPT,
-                crate::obs::X_REQUEST_ID.clone(),
-            ])
-            .allow_methods([
-                Method::GET,
-                Method::HEAD,
-                Method::POST,
-                Method::PUT,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .expose_headers(expose);
+            {
+                return true;
+            }
+            fixed.iter().any(|a| a.eq_ignore_ascii_case(o))
+        }))
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            crate::obs::X_REQUEST_ID.clone(),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .expose_headers(expose)
+}
+
+/// Whether `origin` is an allowed CORS origin (`--cors-origin`, and with auth
+/// `cors.origins`).
+pub fn cors_allowed(st: &AppState, origin: &str) -> bool {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth
+        && a.policy()
+            .cors_origins
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(origin))
+    {
+        return true;
     }
-    let _ = st;
-    CorsLayer::very_permissive().expose_headers(expose)
+    st.cors_origins
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(origin))
 }
 
 /// Outbound requests and local files are server capabilities: SERVICE and
@@ -77,8 +99,7 @@ pub fn load(
         for w in warnings {
             tracing::warn!("auth configuration: {w}");
         }
-        let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost" | "[::1]" | "unix");
-        if !loopback {
+        if !crate::exposure::local_listener(host) {
             tracing::warn!(
                 "credentials are accepted over plain HTTP on {host}; terminate TLS in front of the server"
             );

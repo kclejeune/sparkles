@@ -442,9 +442,12 @@ async fn auth_disabled_is_unchanged() {
         "",
     )
     .await;
-    assert_eq!(pre.all("access-control-allow-credentials"), vec!["true"]);
+    // no CORS without --cors-origin (the open server's gates: router_tests/open.rs)
+    assert!(pre.all("access-control-allow-origin").is_empty());
+    assert!(pre.all("access-control-allow-credentials").is_empty());
     let sv = get_as(&s.app, "/$/server", None).await.json();
     assert_eq!(sv["auth"]["enabled"], false);
+    assert!(sv["version"].is_string() && sv["limits"].is_object());
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1250,77 @@ async fn cors_and_csrf() {
     )
     .await;
     assert_eq!(read.status, StatusCode::OK);
+    // an allowed origin's pages are cross-site, and may write with a token
+    let yasgui = call(
+        &s.app,
+        "POST",
+        "/wiki/update",
+        &[
+            ("authorization", &bob),
+            ("content-type", "application/sparql-update"),
+            ("origin", "https://yasgui.example"),
+            ("sec-fetch-site", "cross-site"),
+            ("host", "localhost:3030"),
+        ],
+        "INSERT DATA { <a:a> <a:b> <a:d> }",
+    )
+    .await;
+    assert_eq!(yasgui.status, StatusCode::OK, "{}", yasgui.text());
+    assert_eq!(
+        yasgui.all("access-control-allow-origin"),
+        vec!["https://yasgui.example"]
+    );
+    // with auth, any Host is answered (the proxy in front names the server)
+    let r = call(
+        &s.app,
+        "GET",
+        &format!("/public{ASK}"),
+        &[("host", "sparql.example.org")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn anonymous_callers_get_no_version_or_limits() {
+    let s = auth_server();
+    let anon = get_as(&s.app, "/$/server", None).await;
+    assert_eq!(anon.status, StatusCode::OK);
+    let anon = anon.json();
+    assert!(anon.get("version").is_none(), "{anon}");
+    assert!(anon.get("limits").is_none(), "{anon}");
+    assert_eq!(names(&anon), ["public"]);
+    let bob = get_as(&s.app, "/$/server", Some(&b("bob"))).await.json();
+    assert!(bob["version"].is_string(), "{bob}");
+    assert!(bob["limits"].is_object(), "{bob}");
+}
+
+#[tokio::test]
+async fn task_messages_show_paths_to_server_admins_only() {
+    let s = auth_server();
+    let file = s.dir.path().join("backups").join("wiki.nq.gz");
+    let msg = format!("backup written to {} (1 KiB)", file.display());
+    let m = msg.clone();
+    let id = s.state.start_task("backup", "wiki", move |_| Ok(m)).id;
+    wait_task(&s.state, &id).await;
+    let bob = get_as(&s.app, &format!("/$/tasks/{id}"), Some(&b("bob"))).await;
+    assert_eq!(bob.status, StatusCode::OK);
+    assert_eq!(
+        bob.json()["message"],
+        "backup written to …/wiki.nq.gz (1 KiB)"
+    );
+    let listed = get_as(&s.app, "/$/tasks", Some(&b("bob"))).await.json();
+    let t = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(t["message"], "backup written to …/wiki.nq.gz (1 KiB)");
+    let alice = get_as(&s.app, &format!("/$/tasks/{id}"), Some(&b("alice"))).await;
+    assert_eq!(alice.json()["message"], msg.as_str());
 }
 
 /// Collects everything the subscriber writes.

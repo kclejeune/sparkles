@@ -2,7 +2,8 @@
 // free port on 127.0.0.1 and an auth configuration with one local user and one static API
 // token. It loads a small dataset (labels, comments for full-text search, vectors for
 // "Similar"), signs the user in, and hands the details to the tests through environment
-// variables (inherited by the workers). The returned function is the global teardown.
+// variables (inherited by the workers). A second server without auth (the default
+// `sparkles serve`) starts empty. The returned function is the global teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log.
@@ -91,6 +92,28 @@ async function check(r: Response, what: string) {
   return r;
 }
 
+/** `sparkles serve` on a free port of 127.0.0.1 with these extra arguments. */
+async function serve(bin: string, data: string, log: string, extra: string[]) {
+  let server: Awaited<ReturnType<typeof start>> | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const port = await freePort();
+    // --host is explicit: the tests must not listen on every interface
+    server = await start(
+      bin,
+      ['serve', '--data', data, '--host', '127.0.0.1', '--port', String(port), ...extra],
+      log,
+    );
+    if (!server.error) break;
+    // retried only when another process took the port in the meantime
+    if (!/address already in use|binding/i.test(readFileSync(log, 'utf8'))) break;
+  }
+  if (!server || server.error) {
+    const tail = readFileSync(log, 'utf8').split('\n').slice(-30).join('\n');
+    throw new Error(`sparkles serve ${server?.error}; log ${log}:\n${tail}`);
+  }
+  return server;
+}
+
 export default async function globalSetup(_config: FullConfig) {
   const bin = binary();
   const dir = mkdtempSync(join(tmpdir(), 'sparkles-e2e-'));
@@ -118,36 +141,13 @@ server = ["server-admin"]
     { mode: 0o600 },
   );
 
-  let server: Awaited<ReturnType<typeof start>> | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const port = await freePort();
-    // --host is explicit: the tests must not listen on every interface
-    server = await start(
-      bin,
-      [
-        'serve',
-        '--data',
-        join(dir, 'data'),
-        '--host',
-        '127.0.0.1',
-        '--port',
-        String(port),
-        '--auth-config',
-        authConfig,
-      ],
-      log,
-    );
-    if (!server.error) break;
-    // retried only when another process took the port in the meantime
-    if (!/address already in use|binding/i.test(readFileSync(log, 'utf8'))) break;
-  }
-  if (!server || server.error) {
-    const tail = readFileSync(log, 'utf8').split('\n').slice(-30).join('\n');
-    throw new Error(`sparkles serve ${server?.error}; log ${log}:\n${tail}`);
-  }
-  const { child, url } = server;
-  // never leave the server running, even if the runner dies without a teardown
-  const kill = () => child.kill('SIGKILL');
+  const { child, url } = await serve(bin, join(dir, 'data'), log, ['--auth-config', authConfig]);
+  // never leave the servers running, even if the runner dies without a teardown
+  let open: ChildProcess | null = null;
+  const kill = () => {
+    child.kill('SIGKILL');
+    open?.kill('SIGKILL');
+  };
   process.once('exit', kill);
 
   try {
@@ -192,15 +192,21 @@ server = ["server-admin"]
     process.env.SPARKLES_E2E_URL = url;
     process.env.SPARKLES_E2E_TOKEN = token;
     process.env.SPARKLES_E2E_STATE = state;
+
+    const openServer = await serve(bin, join(dir, 'open-data'), join(dir, 'open-server.log'), []);
+    open = openServer.child;
+    process.env.SPARKLES_E2E_OPEN_URL = openServer.url;
   } catch (e) {
     process.off('exit', kill);
     await stop(child);
+    if (open) await stop(open);
     throw new Error(`${e instanceof Error ? e.message : e} (server log: ${log})`, { cause: e });
   }
 
   return async () => {
     process.off('exit', kill);
     await stop(child);
+    if (open) await stop(open);
     if (process.env.SPARKLES_E2E_KEEP) console.log(`sparkles e2e: kept ${dir}`);
     else rmSync(dir, { recursive: true, force: true });
   };

@@ -90,6 +90,19 @@ let
     cfg.unixSocket
   ]
   ++ lib.optional cfg.allowOpenNetwork "--allow-open-network"
+  # nginx forwards the name it was reached by: without auth the server answers only
+  # IP addresses, localhost and --public-host names
+  ++ lib.optionals cfg.nginx.enable (
+    lib.concatMap
+      (name: [
+        "--public-host"
+        name
+      ])
+      (
+        [ cfg.nginx.virtualHost ]
+        ++ config.services.nginx.virtualHosts.${cfg.nginx.virtualHost}.serverAliases
+      )
+  )
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
   ++ lib.optional cfg.otel.enable "--otel"

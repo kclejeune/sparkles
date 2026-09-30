@@ -227,7 +227,7 @@ pub struct Limit {
 pub const DEFAULT_PREAUTH: &str = "30/min,burst=60";
 
 impl Limit {
-    fn is_unlimited(&self) -> bool {
+    pub(crate) fn is_unlimited(&self) -> bool {
         self.rate.is_none() && self.concurrency.is_none() && self.client_concurrency.is_none()
     }
 

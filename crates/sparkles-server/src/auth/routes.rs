@@ -277,18 +277,67 @@ fn own_origin(origin: &str, h: &HeaderMap, public_url: Option<&str>) -> bool {
     }
 }
 
-/// OWASP's origin verification with standard headers: a cross-site `Sec-Fetch-Site`, or
-/// an `Origin` that is neither the server's own nor an allowed CORS origin.
-fn cross_origin(h: &HeaderMap, allowed: &[String], public_url: Option<&str>) -> bool {
+/// OWASP's origin verification with standard headers: an `Origin` that is neither the
+/// server's own nor an allowed CORS origin, or else a cross-site `Sec-Fetch-Site` (an
+/// allowed origin's pages are cross-site too).
+fn cross_origin(h: &HeaderMap, allowed: impl Fn(&str) -> bool, public_url: Option<&str>) -> bool {
+    let origin = h.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if origin.is_some_and(&allowed) {
+        return false;
+    }
     if h.get("sec-fetch-site").is_some_and(|v| v == "cross-site") {
         return true;
     }
-    match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        None => false,
-        Some(o) => {
-            !own_origin(o, h, public_url) && !allowed.iter().any(|a| a.eq_ignore_ascii_case(o))
-        }
+    origin.is_some_and(|o| !own_origin(o, h, public_url))
+}
+
+/// Whether a request of `method` that needs `need` passes the origin gate only when it
+/// comes from the server's own pages (or an allowed origin): unsafe methods, and
+/// anything needing `write`, `admin` or `server-admin`.
+fn origin_gated(method: &Method, need: Need) -> bool {
+    !safe(method)
+        || matches!(
+            need,
+            Need::Dataset(Level::Write | Level::Admin) | Need::Server(ServerPerm::ServerAdmin)
+        )
+}
+
+/// The `Host` of a request (`:authority` over HTTP/2).
+fn host_of(req: &Request) -> Option<&str> {
+    match req.headers().get(header::HOST) {
+        // not text: no name it is known by
+        Some(v) => Some(v.to_str().unwrap_or("")),
+        None => req.uri().authority().map(|a| a.as_str()),
     }
+}
+
+/// Without auth every caller is the local principal, so the only thing between a web
+/// page and the server's data is the browser: refuse a `Host` the server is not known
+/// by (DNS rebinding, `421`), and the requests the origin gate refuses with auth
+/// (`403`). Clients that are not browsers (the CLI, curl, other servers) send no
+/// `Origin` or `Sec-Fetch-Site` and pass.
+fn open_gate(st: &AppState, req: &Request) -> Option<Response> {
+    if let Some(host) = host_of(req)
+        && !st.hosts.allows(host)
+    {
+        let msg = format!(
+            "this server does not answer for host '{host}' (without --auth-config it \
+             answers IP addresses, localhost, --host and --public-host names)"
+        );
+        return Some(json_error(StatusCode::MISDIRECTED_REQUEST, &msg));
+    }
+    let route = req.extensions().get::<MatchedPath>()?.as_str();
+    let need = need(route, req.method(), req.uri(), req.headers())
+        .unwrap_or(Need::Server(ServerPerm::ServerAdmin));
+    if origin_gated(req.method(), need)
+        && cross_origin(req.headers(), |o| super::api::cors_allowed(st, o), None)
+    {
+        return Some(json_error(
+            StatusCode::FORBIDDEN,
+            "cross-origin request refused",
+        ));
+    }
+    None
 }
 
 /// Why the auth layer refused a request (metric label `kind`).
@@ -481,7 +530,15 @@ pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next:
         crate::http::add_request_id(&mut resp, id);
         return resp;
     }
-    let _ = &st;
+    if let Some(mut r) = open_gate(&st, &req) {
+        let id = req
+            .headers()
+            .get(&crate::obs::X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        crate::http::add_request_id(&mut r, id);
+        return r;
+    }
     req.extensions_mut().insert(Principal::local());
     next.run(req).await
 }
@@ -638,15 +695,10 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .unwrap_or(Need::Server(ServerPerm::ServerAdmin));
 
     // 3. CSRF gates: (a) the origin, (b) the synchronizer token of ambient principals
-    let gated = !safe(&method)
-        || matches!(
-            need,
-            Need::Dataset(Level::Write | Level::Admin) | Need::Server(ServerPerm::ServerAdmin)
-        );
-    if gated
+    if origin_gated(&method, need)
         && cross_origin(
             req.headers(),
-            &policy.cors_origins,
+            |o| super::api::cors_allowed(st, o),
             policy.public_url.as_deref(),
         )
     {
@@ -834,8 +886,8 @@ mod tests {
 
     #[test]
     fn origins() {
-        let allowed = vec!["https://yasgui.example".to_string()];
-        let x = |pairs: &[(&str, &str)]| cross_origin(&h(pairs), &allowed, None);
+        let allowed = |o: &str| o == "https://yasgui.example";
+        let x = |pairs: &[(&str, &str)]| cross_origin(&h(pairs), allowed, None);
         assert!(!x(&[("host", "a:3030")]));
         assert!(!x(&[("host", "a:3030"), ("origin", "http://a:3030")]));
         assert!(x(&[("host", "a:3030"), ("origin", "https://evil.example")]));
@@ -849,17 +901,28 @@ mod tests {
             ("x-forwarded-proto", "https")
         ]));
         assert!(x(&[("host", "a:3030"), ("sec-fetch-site", "cross-site")]));
+        // an allowed origin's pages are cross-site
+        assert!(!x(&[
+            ("host", "a:3030"),
+            ("origin", "https://yasgui.example"),
+            ("sec-fetch-site", "cross-site")
+        ]));
+        assert!(x(&[
+            ("host", "a:3030"),
+            ("origin", "http://a:3030"),
+            ("sec-fetch-site", "cross-site")
+        ]));
         assert!(!x(&[("host", "a:3030"), ("sec-fetch-site", "same-origin")]));
         // with a public URL, Host does not matter
         let pu = Some("https://sparql.example.org");
         assert!(!cross_origin(
             &h(&[("host", "evil"), ("origin", "https://sparql.example.org")]),
-            &allowed,
+            allowed,
             pu
         ));
         assert!(cross_origin(
             &h(&[("host", "a:3030"), ("origin", "http://a:3030")]),
-            &allowed,
+            allowed,
             pu
         ));
     }
