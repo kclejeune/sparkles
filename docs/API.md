@@ -1089,6 +1089,12 @@ the peak estimate of a query.
 no credentials, permissive CORS, and every request may do everything. With it the server
 **denies by default**: a caller may do only what a grant allows.
 
+Without it the server listens on loopback only: `--host` defaults to `127.0.0.1`, and a
+non-loopback address is refused at startup unless `--allow-open-network` (or
+`SPARKLES_ALLOW_OPEN_NETWORK=1`) is given, which logs a warning. A Unix socket
+(`--unix-socket`) counts as local. An authenticating reverse proxy is no substitute: the
+backend it protects must not be reachable around it.
+
 ### Principals and credentials
 
 Each request resolves to one principal. The first applicable source wins:

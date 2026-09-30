@@ -8,6 +8,7 @@ mod auth;
 mod check_cmd;
 mod clone;
 mod compress;
+mod exposure;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -335,7 +336,9 @@ enum Cmd {
         /// Directory holding the dataset registry, databases and backups
         #[arg(long, default_value = "./data")]
         data: PathBuf,
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Address to listen on; a non-loopback address needs --auth-config or
+        /// --allow-open-network
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 3030)]
         port: u16,
@@ -448,6 +451,15 @@ enum Cmd {
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
         unix_socket: Option<PathBuf>,
+        /// Serve without --auth-config on a non-loopback --host, which is refused
+        /// otherwise: every client that can reach the port may then read, write and
+        /// administer every dataset
+        #[arg(
+            long,
+            env = exposure::ALLOW_OPEN_NETWORK_ENV,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
+        allow_open_network: bool,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -1091,12 +1103,20 @@ fn run() -> Result<()> {
             max_decompressed_mb,
             auth_config,
             unix_socket,
+            allow_open_network,
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
             ..
         } => {
-            // a bad auth configuration stops the server before anything else
+            // an open server on the network, or a bad auth configuration, stops the
+            // server before anything else
+            exposure::check(
+                &host,
+                unix_socket.is_some(),
+                auth_config.is_some(),
+                allow_open_network,
+            )?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
             let auth = auth::load(auth_config.as_deref(), &data, bound)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
@@ -1149,6 +1169,14 @@ fn run() -> Result<()> {
                         .map_err(anyhow::Error::msg)?
                         .with_keyer(Arc::new(auth::PrincipalKeyer)),
                 ));
+            }
+            for w in exposure::warnings(
+                &host,
+                unix_socket.is_some(),
+                st.auth.is_some(),
+                st.rate_limit.is_some(),
+            ) {
+                tracing::warn!("{w}");
             }
             let st = Arc::new(st);
             otel::register_metrics(&st);

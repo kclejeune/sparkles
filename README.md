@@ -416,6 +416,14 @@ library leaves the choice to its embedder). Once no request has been active for
 the OS. Built with `--no-default-features --features reasoning,shacl` it uses the
 system allocator and `malloc_trim` instead.
 
+`serve` listens on `127.0.0.1` by default. A non-loopback `--host` (such as `0.0.0.0`)
+without `--auth-config` is refused at startup, since without authentication every caller
+may read, write and administer every dataset; `--allow-open-network` (or
+`SPARKLES_ALLOW_OPEN_NETWORK=1`) serves it open anyway, with a warning in the log. A
+network listener without rate limits is logged as a warning too. An authenticating
+reverse proxy in front does not make an open backend safe: bind the backend to loopback
+or a Unix socket (`--unix-socket`), or firewall it, so that nothing can bypass the proxy.
+
 Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data` (GSP),
 `/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`
 (see `docs/API.md`). `--mem NAME` adds an in-memory dataset, `--loc NAME=PATH` serves an
@@ -428,6 +436,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--host ADDR` | `127.0.0.1` | listen address; a non-loopback address needs `--auth-config` or `--allow-open-network` |
+| `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
@@ -595,7 +605,8 @@ you then extend through the usual `services.nginx.virtualHosts.<name>` options:
 ```
 
 The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
-`openFirewall`). The nginx location sets:
+`openFirewall`). Another `listenAddress` needs `auth.configFile` or
+`allowOpenNetwork = true` (an assertion checks it). The nginx location sets:
 
 * `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
 * proxy timeouts to `queryTimeout + 30` seconds;
