@@ -208,6 +208,11 @@ pub struct AppState {
     phase: AtomicU8,
     /// authentication and authorization (`serve --auth-config`); `None`: open
     pub auth: Option<Arc<crate::auth::Auth>>,
+    /// browser origins that may call the API cross-origin, without credentials
+    /// (`serve --cors-origin`; with auth, besides the configuration's `cors.origins`)
+    pub cors_origins: Vec<String>,
+    /// the `Host` names answered without auth (`serve --public-host`)
+    pub hosts: crate::exposure::Hosts,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// dataset names being created by a task (clone), with the task id
@@ -413,6 +418,8 @@ impl AppState {
             rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             auth: None,
+            cors_origins: Vec::new(),
+            hosts: crate::exposure::Hosts::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
@@ -477,6 +484,8 @@ impl AppState {
             manage: Mutex::new(()),
             rate_limit: None,
             auth: None,
+            cors_origins: Vec::new(),
+            hosts: crate::exposure::Hosts::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }

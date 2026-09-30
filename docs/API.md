@@ -18,7 +18,7 @@ every route needs credentials or a grant to `anonymous`; see
 | GET    | `/$/ping`     | Plain-text timestamp. Liveness check: `200` whenever the process serves HTTP. |
 | GET    | `/$/ready`    | Readiness: `200` when ready, else `503`; the body is always `ReadyInfo`. `Cache-Control: no-store`. |
 | GET    | `/$/ready/{ds}` | The same for one dataset (`datasets` has one entry); `404` if the dataset is unknown. |
-| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }` |
+| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`; anonymous callers of a server with auth get no `version` or `limits` |
 | GET    | `/$/whoami`   | The caller and its permissions (see [whoami](#whoami)). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`), see [Metrics](#metrics). `?format=json` returns a JSON snapshot of the same counters (`MetricsSnapshot`) for the UI. `404` when started with `--no-metrics`. |
 
@@ -396,7 +396,9 @@ type Task = {
   dataset: string;          // "" for a server-wide task (listed for server admins only)
   target?: string /* the dataset a clone creates */;
   state: "queued" | "running" | "done" | "failed" | "cancelled";
-  startedAt: string; finishedAt?: string; message?: string; progress?: number /*0..1*/;
+  startedAt: string; finishedAt?: string; progress?: number /*0..1*/;
+  message?: string;         // absolute paths cut to "…/" and their last component,
+                            // except for callers with server-admin
   cancellable: boolean;     // DELETE /$/tasks/{id} would be accepted now
   detail?: object;          // a typed result, for task kinds that have one
 };
@@ -1174,15 +1176,30 @@ the peak estimate of a query.
 
 ## Authentication and access control
 
-`sparkles serve --auth-config FILE` turns authentication on. Without it nothing changes:
-no credentials, permissive CORS, and every request may do everything. With it the server
-**denies by default**: a caller may do only what a grant allows.
+`sparkles serve --auth-config FILE` turns authentication on. Without it there are no
+credentials and every request may do everything, as the local principal. With it the
+server **denies by default**: a caller may do only what a grant allows.
 
 Without it the server listens on loopback only: `--host` defaults to `127.0.0.1`, and a
 non-loopback address is refused at startup unless `--allow-open-network` (or
 `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given, which logs a warning. A Unix socket
 (`--unix-socket`) counts as local. An authenticating reverse proxy is no substitute: the
 backend it protects must not be reachable around it.
+
+Since any web page the operator opens can send requests to a local server, a server
+without auth also refuses:
+
+- a `Host` (or HTTP/2 `:authority`) that is not an IP address, `localhost`,
+  `*.localhost`, `--host` or a `--public-host` name: **421** (a page that rebinds its
+  own DNS name to the server's address sends its own name);
+- unsafe requests, and requests needing `write`, `admin` or `server-admin`, that are
+  cross-origin by the rules of [CSRF and CORS](#csrf-and-cors) (`Origin` other than the
+  request's own or a `--cors-origin`, or `Sec-Fetch-Site: cross-site`): **403**
+  `cross-origin request refused`.
+
+CORS headers are sent only for `--cors-origin` origins, without credentials. Requests
+without `Origin` or `Sec-Fetch-Site` (the CLI, curl, other servers) and the server's own
+UI pass.
 
 ### Principals and credentials
 
@@ -1270,7 +1287,9 @@ the permission is `403` before any connection or file is opened, even under `SIL
 | any other route | | `server-admin` (fail closed) |
 
 `/$/metrics` needs the `metrics` permission: counters by dataset name would otherwise
-reveal which datasets exist. Prometheus scrapes it with a static token
+reveal which datasets exist (so `metrics` shows the names of all datasets, up to
+`--metrics-max-datasets`, whatever the holder's dataset grants). Prometheus scrapes it
+with a static token
 (`Authorization: Bearer spk_…`, e.g. `bearer_token_file` in the scrape config).
 
 ### CSRF and CORS
@@ -1278,10 +1297,12 @@ reveal which datasets exist. Prometheus scrapes it with a static token
 With auth, unsafe requests (and any request needing `write`, `admin` or `server-admin`)
 are refused with `403 cross-origin request refused` when `Sec-Fetch-Site: cross-site` is
 sent, or when `Origin` is neither the server's (`server.public_url`, else the request's
-own) nor in `cors.origins`. Session and proxy principals must also send
+own) nor in `cors.origins` or `--cors-origin` (an allowed origin passes even though its
+pages are cross-site). Session and proxy principals must also send
 `X-Sparkles-CSRF: <whoami csrfToken>` on unsafe requests (`403 CSRF token missing or
-invalid`). CORS then allows only `cors.origins`, without credentials; tools such as
-YASGUI send `Authorization: Bearer` themselves.
+invalid`). CORS then allows only `cors.origins` and `--cors-origin`, without
+credentials; tools such as YASGUI send `Authorization: Bearer` themselves. `Host` is not
+checked with auth: a page on another name gets no credentials of this server.
 
 ### whoami
 
