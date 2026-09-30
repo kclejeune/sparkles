@@ -150,7 +150,19 @@ pub enum Kind {
         aggs: Vec<(VarId, Agg)>,
     },
     /// `COUNT(*)` over a single scan answered from index metadata
+    /// `GROUP BY ?k` + `COUNT` over a single scan sorted on ?k: counts runs in the index
+    /// blocks without materializing the scan (QLever `computeGroupByObjectWithCount`)
+    GroupCountScan {
+        spec: ScanSpec,
+        key: VarId,
+        counts: Vec<VarId>,
+    },
     CountScan {
+        spec: ScanSpec,
+        var: VarId,
+    },
+    /// `COUNT(DISTINCT ?k)` over a single scan sorted on ?k: counts runs of equal ids
+    CountDistinctScan {
         spec: ScanSpec,
         var: VarId,
     },
@@ -262,6 +274,8 @@ impl Node {
             Kind::Slice { .. } => "Limit",
             Kind::Group { .. } => "GroupBy",
             Kind::CountScan { .. } => "CountFromIndex",
+            Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
+            Kind::GroupCountScan { .. } => "GroupCountFromIndex",
             Kind::Path { .. } => "TransitivePath",
             Kind::Service { .. } => "Service",
         }
@@ -1927,6 +1941,56 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             return n;
         }
     }
+    // COUNT(DISTINCT ?k) over a single scan: in a permutation sorted on ?k the distinct
+    // values are the runs of equal ids, counted without materializing or hashing rows
+    if keys.is_empty()
+        && aggs.len() == 1
+        && matches!(aggs[0].1.func, AggregateFunction::Count)
+        && aggs[0].1.distinct
+        && let Some(Expr::Var(k)) = &aggs[0].1.expr
+        && let Kind::Scan(spec) = &child.kind
+        && let Some(spec) = reorder_scan(spec, *k)
+    {
+        let var = aggs[0].0;
+        let desc = format!(
+            "{} distinct ?{}",
+            retarget_desc(&child.desc, &spec),
+            ctx.var_name(*k)
+        );
+        let mut n = Node::leaf(Kind::CountDistinctScan { spec, var }, vec![var], 1.0, desc);
+        n.cost = child.est;
+        return n;
+    }
+    // GROUP BY ?k with only COUNT(*) / COUNT(?v) over a single scan
+    if keys.len() == 1
+        && !aggs.is_empty()
+        && let Kind::Scan(spec) = &child.kind
+        && aggs.iter().all(|(_, a)| {
+            matches!(a.func, AggregateFunction::Count)
+                && !a.distinct
+                && match &a.expr {
+                    None => true,
+                    Some(Expr::Var(v)) => child.vars.contains(v),
+                    _ => false,
+                }
+        })
+        && let Some(spec) = reorder_scan(spec, keys[0])
+    {
+        let key = keys[0];
+        let counts: Vec<VarId> = aggs.iter().map(|(v, _)| *v).collect();
+        let est = child.d(key).min(child.est).max(1.0);
+        let mut vars = vec![key];
+        vars.extend(&counts);
+        let desc = format!(
+            "{} by ?{}",
+            retarget_desc(&child.desc, &spec),
+            ctx.var_name(key)
+        );
+        let mut n = Node::leaf(Kind::GroupCountScan { spec, key, counts }, vars, est, desc);
+        n.cost = child.est;
+        n.sorted = vec![key];
+        return n;
+    }
     let est = if keys.is_empty() {
         1.0
     } else {
@@ -1971,6 +2035,77 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
 // ------------------------------------------------------------------------------
 // helpers
 // ------------------------------------------------------------------------------
+
+/// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.
+fn retarget_desc(desc: &str, spec: &ScanSpec) -> String {
+    match desc.split_once(' ') {
+        Some((_, rest)) => format!("{} {rest}", spec.perm.name().to_uppercase()),
+        None => desc.to_string(),
+    }
+}
+
+/// Re-target a scan to a permutation whose first free column holds `first` (same bound
+/// prefix, same variables), if one exists.
+fn reorder_scan(spec: &ScanSpec, first: VarId) -> Option<ScanSpec> {
+    let order = spec.perm.order();
+    if spec.perm == Perm::Gspo {
+        return (spec.cols.first().map(|c| c.1) == Some(first)).then(|| spec.clone());
+    }
+    // component (S/P/O/G) of each bound prefix entry and of each variable column
+    let bound: Vec<(usize, u64)> = spec
+        .prefix
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (order[i], *v))
+        .collect();
+    let comp_of = |kc: usize| order[kc];
+    let key_comp = comp_of(spec.cols.iter().find(|(_, v)| *v == first)?.0);
+    if key_comp == G {
+        return None;
+    }
+    let mut bound_comps: Vec<usize> = bound.iter().map(|b| b.0).collect();
+    bound_comps.sort_unstable();
+    let perm = [
+        Perm::Spo,
+        Perm::Sop,
+        Perm::Pso,
+        Perm::Pos,
+        Perm::Osp,
+        Perm::Ops,
+    ]
+    .into_iter()
+    .find(|p| {
+        let o = p.order();
+        let mut f: Vec<usize> = o[..bound.len()].to_vec();
+        f.sort_unstable();
+        f == bound_comps && o[bound.len()] == key_comp
+    })?;
+    if perm == spec.perm {
+        return Some(spec.clone());
+    }
+    let po = perm.order();
+    let prefix: Vec<u64> = po[..bound.len()]
+        .iter()
+        .map(|c| bound.iter().find(|b| b.0 == *c).unwrap().1)
+        .collect();
+    let remap = |kc: usize| perm.col_of(comp_of(kc));
+    let mut cols: Vec<(usize, VarId)> = spec.cols.iter().map(|&(kc, v)| (remap(kc), v)).collect();
+    cols.sort_by_key(|c| c.0);
+    let eqs = spec
+        .eqs
+        .iter()
+        .map(|&(a, b)| (remap(a), remap(b)))
+        .collect();
+    Some(ScanSpec {
+        perm,
+        prefix,
+        cols,
+        eqs,
+        graph: spec.graph.clone(),
+        graph_col: perm.col_of(G),
+        dedup: spec.dedup,
+    })
+}
 
 fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut Vec<&'g GraphPattern>) {
     if let GraphPattern::Union { left, right } = gp {

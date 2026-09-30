@@ -203,6 +203,12 @@ fn aggregates() {
         "SELECT ?t (COUNT(?p) AS ?c) WHERE { ?p a ?t } GROUP BY ?t HAVING (COUNT(?p) > 1)",
     );
     assert_eq!(strs(&r), ["Person 3"]);
+    assert!(has_op(&r.plan, "GroupCountFromIndex"));
+    let r = q(
+        &s,
+        "SELECT ?t (COUNT(*) AS ?c) WHERE { ?p a ?t } GROUP BY ?t",
+    );
+    assert_eq!(strs(&r), ["Agent 1", "Person 3"]);
     let r = q(
         &s,
         "SELECT (GROUP_CONCAT(?n; SEPARATOR=\",\") AS ?g) WHERE { SELECT ?n WHERE { ?p foaf:age ?a ; foaf:name ?n } ORDER BY ?a }",
@@ -390,6 +396,17 @@ fn named_graphs() {
     assert_eq!(strs(&r), ["1", "2", "3", "4"]);
     let r = q(&s, "SELECT ?s FROM ex:g1 FROM ex:g2 WHERE { ?s ex:p ?o }");
     assert_eq!(strs(&r), ["a", "a", "b", "c"]);
+    let r = q(
+        &s,
+        "SELECT ?s (COUNT(*) AS ?c) FROM ex:g1 FROM ex:g2 WHERE { ?s ex:p ?o } GROUP BY ?s",
+    );
+    assert_eq!(strs(&r), ["a 2", "b 1", "c 1"]);
+    assert!(has_op(&r.plan, "GroupCountFromIndex"));
+    let r = q(
+        &s,
+        "SELECT ?g (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g",
+    );
+    assert_eq!(strs(&r), ["g1 2", "g2 2"]);
     let r = q(&s, "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }");
     assert_eq!(strs(&r), ["g1", "g2"]);
     let r = q(
@@ -500,4 +517,92 @@ fn persistent_query_after_update_and_compact() {
         "SELECT ?p WHERE { ?p foaf:age ?a FILTER(?a > 30) } ORDER BY ?a",
     );
     assert_eq!(strs(&r), ["carol", "zed"]);
+}
+
+/// Enough rows for the per-distinct-value filter paths (≥ 4096): labels of every term
+/// kind that repeat, `ex:knows` edges with repeated objects, and a named graph.
+fn mixed_store() -> Store {
+    let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..6000 {
+        let o = match i % 6 {
+            0 => format!("\"label {}\"", i % 7),
+            1 => format!("\"label {}\"@en", i % 7),
+            2 => format!("\"Label {}\"@de-CH", i % 11),
+            3 => format!("<http://ex.org/label/{}>", i % 13),
+            4 => format!("{}", i % 17),
+            _ => format!("\"label {}\"^^ex:dt", i % 5),
+        };
+        trig.push_str(&format!(
+            "ex:s{i} ex:label {o} ; ex:knows ex:s{} .\n",
+            (i * 7) % 900
+        ));
+    }
+    trig.push_str("ex:s4 ex:knows ex:s4 . ex:g { ex:s1 ex:label \"label 3 in g\" . ex:x ex:knows ex:only-in-g , ex:s1 . }\n");
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    s
+}
+
+fn count(s: &Store, text: &str) -> String {
+    strs(&q(s, text)).join(",")
+}
+#[test]
+fn count_distinct_from_index() {
+    let s = mixed_store();
+    let cases = [
+        ("?s ex:knows ?o", "?o"),
+        ("?s ex:knows ?o", "?s"),
+        ("?s ex:label ?o", "?o"),
+        ("?s ?p ?o", "?p"),
+        ("?s ex:knows ?s", "?s"),
+        ("GRAPH ?g { ?s ex:knows ?o }", "?o"),
+        ("GRAPH ex:g { ?s ex:knows ?o }", "?o"),
+        ("GRAPH <urn:x-arq:UnionGraph> { ?s ex:knows ?o }", "?o"),
+    ];
+    let check = |s: &Store| {
+        for (pattern, v) in cases {
+            let r = q(
+                s,
+                &format!("SELECT (COUNT(DISTINCT {v}) AS ?c) WHERE {{ {pattern} }}"),
+            );
+            // a graph variable keeps the general plan (the scan is not the group's input)
+            assert_eq!(
+                has_op(&r.plan, "CountDistinctFromIndex"),
+                !pattern.contains("?g"),
+                "{pattern} {v}"
+            );
+            let expected = count(
+                s,
+                &format!(
+                    "SELECT (COUNT(*) AS ?c) WHERE {{ SELECT DISTINCT {v} WHERE {{ {pattern} }} }}"
+                ),
+            );
+            assert_eq!(strs(&r).join(","), expected, "{pattern} {v}");
+        }
+    };
+    check(&s);
+    assert_eq!(
+        count(
+            &s,
+            "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }"
+        ),
+        "900"
+    );
+    update::update(
+        &s,
+        "PREFIX ex: <http://ex.org/>
+         DELETE WHERE { ?s ex:knows ex:s0 } ;
+         INSERT DATA { ex:new ex:knows ex:s0, ex:fresh1, ex:fresh2 . GRAPH ex:g { ex:y ex:knows ex:fresh3 } }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    check(&s);
+    assert_eq!(
+        count(
+            &s,
+            "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }"
+        ),
+        "902"
+    );
 }

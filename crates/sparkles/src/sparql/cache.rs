@@ -195,7 +195,10 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                 t.len() <= 10_000
             }
         }
-        Kind::Scan(spec) => {
+        Kind::Scan(spec)
+        | Kind::CountScan { spec, .. }
+        | Kind::CountDistinctScan { spec, .. }
+        | Kind::GroupCountScan { spec, .. } => {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
             true
         }

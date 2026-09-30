@@ -7,7 +7,7 @@ use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{O, P, Perm, S, pad};
+use crate::index::{Block, O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -66,7 +66,12 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         && results.enabled()
         && !matches!(
             n.kind,
-            Kind::Scan(_) | Kind::Values(_) | Kind::Empty | Kind::CountScan { .. }
+            Kind::Scan(_)
+                | Kind::Values(_)
+                | Kind::Empty
+                | Kind::CountScan { .. }
+                | Kind::CountDistinctScan { .. }
+                | Kind::GroupCountScan { .. }
         );
     let key = if cacheable {
         super::cache::key(n, ctx)
@@ -106,6 +111,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
         Kind::Scan(spec) => scan(ctx, spec, &n.vars)?,
+        Kind::GroupCountScan {
+            spec,
+            key: _,
+            counts,
+        } => group_count_scan(ctx, spec, &n.vars, counts.len())?,
         Kind::CountScan { spec, var } => {
             let c = ctx.snap.count(spec.perm, &spec.prefix)?;
             let mut t = Table::new(vec![*var]);
@@ -125,6 +135,12 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                     JoinAlgo::Hash => join_tables(ctx, &l, &r, keys, false)?,
                 }
             }
+        }
+        Kind::CountDistinctScan { spec, var } => {
+            let c = count_distinct_scan(ctx, spec)?;
+            let mut t = Table::new(vec![*var]);
+            t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
+            t
         }
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
@@ -225,10 +241,122 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
 
 // ------------------------------------------------------------------ scans ------
 
+/// Whether every row of `b[s..e]` passes the scan's graph filter and repeated-variable
+/// checks, so the slice can be taken column-wise (for a default-graph query over a store
+/// with few or no named graphs, this is one pass over the graph column).
+fn block_passes(spec: &ScanSpec, b: &Block, s: usize, e: usize) -> bool {
+    spec.eqs.is_empty()
+        && (matches!(spec.graph, GraphFilter::All)
+            || b.cols[spec.graph_col][s..e]
+                .iter()
+                .all(|&g| spec.graph.accepts(g)))
+}
+
+/// Count runs of the first free key column of a scan (graph filter / repeated variables /
+/// union-graph dedup applied row by row; plain blocks counted directly).
+fn group_count_scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId], naggs: usize) -> Result<Table> {
+    let kc = spec.cols[0].0;
+    let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
+    let mut keys: Vec<Id> = Vec::new();
+    let mut counts: Vec<u64> = Vec::new();
+    let mut bump = |k: u64, n: u64| {
+        if keys.last() == Some(&Id(k)) {
+            *counts.last_mut().unwrap() += n;
+        } else {
+            keys.push(Id(k));
+            counts.push(n);
+        }
+    };
+    let mut last: Option<[u64; 4]> = None;
+    ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
+        let mut row = |k: &[u64; 4]| {
+            if !spec.graph.accepts(k[spec.graph_col]) || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+            {
+                return;
+            }
+            if spec.dedup {
+                let mut proj = [0u64; 4];
+                for (i, &c) in kcs.iter().enumerate() {
+                    proj[i] = k[c];
+                }
+                if last == Some(proj) {
+                    return;
+                }
+                last = Some(proj);
+            }
+            bump(k[kc], 1);
+        };
+        match chunk {
+            Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
+                let col = &b.cols[kc][s..e];
+                let mut i = 0;
+                while i < col.len() {
+                    let v = col[i];
+                    let run = col[i..].partition_point(|x| *x == v);
+                    bump(v, run as u64);
+                    i += run;
+                }
+            }
+            Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
+            Chunk::Row(k) => row(&k),
+        }
+        ctx.check()?;
+        Ok(true)
+    })?;
+    let mut t = Table::new(vars.to_vec());
+    t.cols[0] = keys;
+    let cnt: Vec<Id> = counts
+        .iter()
+        .map(|&c| Id::from_i64(c as i64).unwrap_or(Id::UNDEF))
+        .collect();
+    for a in 0..naggs {
+        t.cols[1 + a] = cnt.clone();
+    }
+    t.len = t.cols[0].len();
+    Ok(t)
+}
+
+/// Number of distinct values in the first free key column of a scan sorted on it: the
+/// runs of equal ids. Whole blocks are compared column-wise; rows are checked one by one
+/// only when a graph filter or repeated variables apply (duplicates across graphs fall
+/// into the same run, so union-graph dedup needs nothing extra).
+fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
+    // new runs in `col` given the last value seen before it
+    fn runs(col: &[u64], last: &mut Option<u64>) -> u64 {
+        let Some((&first, _)) = col.split_first() else {
+            return 0;
+        };
+        let n =
+            (*last != Some(first)) as u64 + col.windows(2).filter(|w| w[0] != w[1]).count() as u64;
+        *last = col.last().copied();
+        n
+    }
+    let kc = spec.cols[0].0;
+    let mut n = 0u64;
+    let mut last: Option<u64> = None;
+    ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
+        let mut row = |k: &[u64; 4]| {
+            if spec.graph.accepts(k[spec.graph_col]) && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])
+            {
+                n += runs(&[k[kc]], &mut last);
+            }
+        };
+        match chunk {
+            Chunk::Block(b, s, e) if block_passes(spec, b, s, e) => {
+                n += runs(&b.cols[kc][s..e], &mut last)
+            }
+            Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
+            Chunk::Row(k) => row(&k),
+        }
+        ctx.check()?;
+        Ok(true)
+    })?;
+    Ok(n)
+}
+
 fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
     let mut t = Table::new(vars.to_vec());
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
-    let simple = matches!(spec.graph, GraphFilter::All) && spec.eqs.is_empty() && !spec.dedup;
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
     let mut row = |k: &[u64; 4], t: &mut Table| {
@@ -255,7 +383,7 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
     };
     ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
         match chunk {
-            Chunk::Block(b, s, e) if simple => {
+            Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
                 for (c, &kc) in kcs.iter().enumerate() {
                     t.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                 }
