@@ -1242,6 +1242,9 @@ fn run() -> Result<()> {
             )?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
             let auth = auth::load(auth_config.as_deref(), &data, bound)?;
+            // one server per data directory (held until the process exits)
+            #[cfg(feature = "backup")]
+            let _data_lock = backup::lock_data_dir(&data)?;
             // an in-place restore interrupted between its renames is undone before the
             // registry's datasets are opened
             #[cfg(feature = "backup")]

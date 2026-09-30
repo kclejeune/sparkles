@@ -2052,6 +2052,11 @@ fn dataset_info(ds: &Dataset) -> J {
     if let Some(o) = ds.store.root().and_then(crate::clone::read_origin) {
         info["origin"] = o;
     }
+    // a restore: the backup it came from
+    #[cfg(feature = "backup")]
+    if let Some(r) = ds.store.root().and_then(crate::backup::restored_from) {
+        info["restoredFrom"] = r;
+    }
     info
 }
 
