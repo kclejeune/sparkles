@@ -4,9 +4,8 @@ use crate::blob::{self, HEADER_LEN};
 use crate::error::{Code, Result};
 use crate::layout;
 use crate::{
-    BackupError, BackupVerify, CheckLevel, Identity, LockKind, LockOperation, Manifest, Orphans,
-    Repository, RestoreOptions, VerifyLevel, VerifyOptions, VerifyReport, VerifyRequests,
-    VerifyStatus, lock,
+    BackupError, BackupVerify, LockKind, LockOperation, Manifest, Orphans, Repository, VerifyLevel,
+    VerifyOptions, VerifyReport, VerifyRequests, VerifyStatus, lock,
 };
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
@@ -73,7 +72,8 @@ impl Repository {
     /// status is `error` if any backup failed, `warning` for orphans only, else `ok`.
     ///
     /// A backup whose manifest is unusable has `status: error` and the reason in
-    /// `check.error`; so does a failed restore at level `restore`.
+    /// `check.error`. At level `restore`, a backup whose blobs all check out is then
+    /// restored by [`Repository::verify_restore`], whose result is its entry.
     pub async fn verify(&self, names: &[String], o: &VerifyOptions) -> Result<VerifyReport> {
         o.ctl.check()?;
         let started = Instant::now();
@@ -271,7 +271,7 @@ impl Repository {
                 .filter(|id| corrupt.contains(**id))
                 .map(|s| s.to_string())
                 .collect();
-            let mut v = BackupVerify {
+            let v = BackupVerify {
                 name: it.name.clone(),
                 status: if miss.is_empty() && bad.is_empty() {
                     VerifyStatus::Ok
@@ -283,17 +283,12 @@ impl Repository {
                 check: None,
             };
             if o.level == VerifyLevel::Restore && v.status == VerifyStatus::Ok {
+                // only a backup whose blobs all check out is restored
                 ctl.report(0.9, &format!("restoring {}", it.name));
-                match self.verify_restore(&it.name, o).await {
-                    Ok(check) => v.check = check,
-                    Err(e) if e.is_cancelled() => return Err(e),
-                    Err(e) => {
-                        v.status = VerifyStatus::Error;
-                        v.check = Some(json!({ "error": e.message() }));
-                    }
-                }
+                backups.push(self.verify_restore(&it.name, o).await?);
+            } else {
+                backups.push(v);
             }
-            backups.push(v);
         }
         let status = if backups.iter().any(|b| b.status == VerifyStatus::Error) {
             VerifyStatus::Error
@@ -331,33 +326,6 @@ impl Repository {
         } else {
             BlobState::Corrupt
         })
-    }
-
-    /// Level `restore` of one backup: restore it into a fresh directory, check it in
-    /// full, then remove the directory. The `check` report on success.
-    async fn verify_restore(
-        &self,
-        name: &str,
-        o: &VerifyOptions,
-    ) -> Result<Option<serde_json::Value>> {
-        let base = o.tmp_dir.clone().unwrap_or_else(std::env::temp_dir);
-        std::fs::create_dir_all(&base)?;
-        let dir = base.join(format!("verify-{}", uuid::Uuid::new_v4().simple()));
-        let ro = RestoreOptions {
-            identity: Identity::Keep,
-            check: CheckLevel::Full,
-            id_in_use: Arc::new(|_| false),
-            in_place_head: None,
-            store_opts: o.store_opts.clone(),
-            ctl: o.ctl.clone(),
-        };
-        let r = self.restore(name, &dir, &ro).await;
-        if dir.exists()
-            && let Err(e) = std::fs::remove_dir_all(&dir)
-        {
-            tracing::warn!(target: "sparkles::backup", "removing {}: {e}", dir.display());
-        }
-        Ok(r?.check)
     }
 }
 

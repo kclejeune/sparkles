@@ -927,8 +927,8 @@ impl Repository {
             let version = crate::cache::version_of(&meta);
             match self.cache.get(&name, &version, meta.size) {
                 Some(m) => hits.push(ManifestEntry {
+                    manifest: named(&name, m).map(Arc::new),
                     name,
-                    manifest: Ok(Arc::new(m)),
                 }),
                 None => misses.push((name, meta)),
             }
@@ -936,48 +936,29 @@ impl Repository {
         let gets = misses.len() as u64;
         let fetched: Vec<ManifestEntry> = futures::stream::iter(misses)
             .map(|(name, meta)| async move {
-                let manifest = self.fetch_manifest(&name, &meta).await.map(Arc::new);
+                let manifest = self.fetch_manifest(&name, Some(&meta)).await.map(Arc::new);
                 ManifestEntry { name, manifest }
             })
             .buffer_unordered(self.config.concurrency())
             .collect()
             .await;
-        // a backend failure (not a bad manifest) fails the listing
-        for e in &fetched {
-            if let Err(err) = &e.manifest
-                && err.code() == Code::RepositoryUnavailable
-            {
-                return Err(err.clone());
+        // a backend failure (not a bad manifest) fails the listing; a manifest deleted
+        // since the listing is left out
+        for e in fetched {
+            match &e.manifest {
+                Err(err) if err.code() == Code::RepositoryUnavailable => return Err(err.clone()),
+                Err(err) if err.code() == Code::NoSuchBackup => {}
+                _ => hits.push(e),
             }
         }
-        hits.extend(fetched);
         Ok((hits, gets))
     }
 
-    /// GET and parse the manifest at `meta` (a listed object), then cache it.
-    async fn fetch_manifest(&self, name: &str, meta: &ObjectMeta) -> Result<Manifest> {
-        let got = match self.store.get(&meta.location).await {
-            Ok(g) => g,
-            Err(e) if is_not_found(&e) => {
-                return Err(BackupError::new(
-                    Code::NoSuchBackup,
-                    format!("no such backup: {name}"),
-                ));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let meta = got.meta.clone();
-        let bytes = got.bytes().await?;
-        let m = crate::manifest::parse(&bytes)?;
-        if m.name != name {
-            return Err(BackupError::invalid_backup(
-                "name",
-                format!("{:?} is stored as {name}", m.name),
-            ));
-        }
-        self.cache
-            .put(name, &crate::cache::version_of(&meta), meta.size, &m);
-        Ok(m)
+    /// The manifest at `meta` (a listed object): from the cache, else a `GET` (then
+    /// cached). Its `name` must be its key's.
+    async fn fetch_manifest(&self, name: &str, meta: Option<&ObjectMeta>) -> Result<Manifest> {
+        let (m, _, _) = crate::manifest::fetch(self, name, meta).await?;
+        named(name, m)
     }
 
     /// The backups matching `f`, newest `completed` first: one `LIST backups/`, then the
@@ -1032,30 +1013,7 @@ impl Repository {
     /// The manifest of backup `name` (`404 no-such-backup`), parsed (not validated for
     /// restore: see `manifest::validate`).
     pub async fn manifest(&self, name: &str) -> Result<Manifest> {
-        let missing = || BackupError::new(Code::NoSuchBackup, format!("no such backup: {name}"));
-        if !layout::valid_backup_name(name) {
-            return Err(missing());
-        }
-        let got = match self.store.get(&layout::manifest_key(name)).await {
-            Ok(g) => g,
-            Err(e) if is_not_found(&e) => return Err(missing()),
-            Err(e) => return Err(e.into()),
-        };
-        let meta = got.meta.clone();
-        let version = crate::cache::version_of(&meta);
-        if let Some(m) = self.cache.get(name, &version, meta.size) {
-            return Ok(m);
-        }
-        let bytes = got.bytes().await?;
-        let m = crate::manifest::parse(&bytes)?;
-        if m.name != name {
-            return Err(BackupError::invalid_backup(
-                "name",
-                format!("{:?} is stored as {name}", m.name),
-            ));
-        }
-        self.cache.put(name, &version, meta.size, &m);
-        Ok(m)
+        self.fetch_manifest(name, None).await
     }
 
     /// Totals from a listing of `backups/` and `blobs/` (`stats` of the API).
@@ -1135,6 +1093,18 @@ pub(crate) fn read_only(repo: &str) -> BackupError {
         Code::RepositoryReadOnly,
         format!("repository {repo} is read-only"),
     )
+}
+
+/// `m`, if it is stored under its own name (a manifest copied or renamed to another
+/// key is `422 invalid-backup`).
+fn named(name: &str, m: Manifest) -> Result<Manifest> {
+    if m.name != name {
+        return Err(BackupError::invalid_backup(
+            "name",
+            format!("{:?} is stored as {name}", m.name),
+        ));
+    }
+    Ok(m)
 }
 
 /// A listed manifest object and its parsed content.

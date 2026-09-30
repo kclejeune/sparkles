@@ -214,20 +214,31 @@ pub async fn acquire(
         created: crate::now_rfc3339(),
     })
     .expect("a lock object serializes");
-    let mode = if repo.config.conditional_writes {
-        PutMode::Create
-    } else {
-        PutMode::Overwrite
-    };
     let t0 = Instant::now();
     let mut backoff = BACKOFF_MIN;
     // lock objects never change their content, so their kinds are read once
     let mut kinds: HashMap<String, Option<LockObject>> = HashMap::new();
     loop {
         ctl.check()?;
-        store
-            .put_opts(&key, PutPayload::from(body.clone()), mode.clone().into())
-            .await?;
+        // a fresh key: a conditional create only guards against a colliding id, and a
+        // backend without conditional creates (single writer) gets a plain put
+        let mode = if repo.single_writer() {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+        match store
+            .put_opts(&key, PutPayload::from(body.clone()), mode.into())
+            .await
+        {
+            Err(object_store::Error::NotImplemented { .. }) => {
+                repo.no_conditional_writes();
+                store.put(&key, PutPayload::from(body.clone())).await?;
+            }
+            r => {
+                r?;
+            }
+        }
         let listed = match list_locks(store.as_ref()).await {
             Ok(l) => l,
             Err(e) => {
@@ -642,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs S2 (Source::from_closed_dir, Repository::create)"]
+    #[ignore = "needs S1 (Source::from_closed_dir)"]
     async fn a_create_holds_one_shared_lock_and_honours_exclusive_ones() {
         use crate::{CreateOptions, Source};
         let dir = tempfile::tempdir().unwrap();

@@ -29,8 +29,6 @@ tracing.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-# test wrappers around object stores (the `ObjectStore` trait is an `async_trait`)
-async-trait = "0.1"
 tempfile.workspace = true
 
 [features]
