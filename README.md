@@ -7,7 +7,8 @@ A high-performance RDF / SPARQL / OWL database in Rust. It aims to be a
 It also ships a SvelteKit UI for database management, graph visualization and
 interactive querying.
 
-* `docs/AUDIT.md` covers the Jena and QLever audits and the language decision (Rust vs. Go).
+* `docs/AUDIT.md` covers the Jena and QLever audits, what Sparkles reuses from Oxigraph, why
+  Fluree was not audited, and the language decision (Rust vs. Go).
 * `docs/API.md` is the HTTP API contract (Fuseki-compatible, plus `/$/` extensions).
 
 ## Philosophy
@@ -38,6 +39,8 @@ interactive querying.
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core + SHACL-SPARQL validation over store snapshots | jena-shacl |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
+| `crates/sparkles-backup` | backup repositories (file system or S3): incremental, deduplicated backups, restore, lifecycle policies | Fuseki `/$/backup` (N-Quads dumps only) |
+| `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
 | `ui/` | SvelteKit management / query / graph-exploration UI *(in progress)* | jena-fuseki-ui |
 
 ## Status
@@ -342,6 +345,7 @@ result cache, and the web UI.
 | Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates: the reasoning status records the commit it was made at, so stale inferences are reported (and can be re-run automatically with `serve --auto-reason`). Backward (LP) rules are not supported. |
 | `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
 | `serve` listens on `127.0.0.1` by default and refuses a non-loopback address without `--auth-config` unless `--allow-open-network` (or `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given (Fuseki listens on all interfaces) | Without authentication every caller may read, write and administer everything, so exposing that is an explicit choice; the override still logs a warning, as does a network listener without rate limits. |
+| Without `--auth-config`, `serve` sends no CORS headers unless `--cors-origin` names an origin, refuses cross-site writes (`Origin`, `Sec-Fetch-Site`) and answers only IP addresses, `localhost`, `--host` and `--public-host` names in `Host` (Fuseki answers CORS from any origin) | Every caller of an open server is its administrator, so any web page the operator opens could otherwise read, write and `LOAD` local files through the browser, directly or by rebinding its DNS name. |
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0`: no cap) for queries and updates alike; the default query timeout stays 60 s | A request may ask for a longer timeout than the default, but not hold a worker indefinitely. |
 | The full-text index is committed lazily: a write stages its documents, and the next text query that needs them (or a tick about once a second) commits them | A Tantivy commit flushes a segment and cost more than the indexing itself; a burst of writes now shares one. Each snapshot still searches exactly its own documents (later ones are filtered out against it, removed ones are kept until their batch is committed), and after a crash the WAL restores what was only staged. Jena's text index commits with each transaction. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
@@ -423,9 +427,25 @@ system allocator and `malloc_trim` instead.
 without `--auth-config` is refused at startup, since without authentication every caller
 may read, write and administer every dataset; `--allow-open-network` (or
 `SPARKLES_ALLOW_OPEN_NETWORK=1`) serves it open anyway, with a warning in the log. A
-network listener without rate limits is logged as a warning too. An authenticating
-reverse proxy in front does not make an open backend safe: bind the backend to loopback
-or a Unix socket (`--unix-socket`), or firewall it, so that nothing can bypass the proxy.
+network listener without request rate limits (`query`, `update` or `admin`) is logged as
+a warning too, with or without auth. An authenticating reverse proxy in front does not
+make an open backend safe: bind the backend to loopback or a Unix socket
+(`--unix-socket`), or firewall it, so that nothing can bypass the proxy.
+
+A server without `--auth-config` also guards against the web pages its operator opens: it
+answers only requests whose `Host` is an IP address, `localhost` (or `*.localhost`),
+`--host` or a `--public-host` name (anything else is `421`, which stops a page that
+rebinds its own DNS name to the server), it refuses unsafe requests and anything that
+writes or administers from another site (`403 cross-origin request refused`, by `Origin`
+and `Sec-Fetch-Site`), and it sends no CORS headers unless `--cors-origin` names an
+origin. The UI served by the server itself, the CLI and other non-browser clients are
+unaffected. Behind a reverse proxy, pass the name the proxy is reached by with
+`--public-host` (the NixOS module does this for its nginx virtual host).
+
+Every response carries `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
+The UI's pages have a Content Security Policy that allows scripts only from the UI
+itself (its inline start-up scripts by hash) and no framing; API responses have
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
 
 Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data` (GSP),
 `/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`
@@ -441,6 +461,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 |---|---|---|
 | `--host ADDR` | `127.0.0.1` | listen address; a non-loopback address needs `--auth-config` or `--allow-open-network` |
 | `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
+| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config` other names than IP addresses, `localhost` and `--host` are refused with `421` |
+| `--cors-origin ORIGIN` | none | a browser origin (`https://yasgui.example`) whose pages may call the API cross-origin, without credentials (repeatable; with `--auth-config`, added to `cors.origins`); without auth such a page may do everything the server allows |
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
 | `--max-timeout S` | `1800` | largest `timeout=` a query or update may ask for (`0`: unlimited; never below `--timeout` / `--update-timeout`) |
@@ -495,6 +517,39 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
+
+Backup repositories work offline too, on a stopped database (a server's own backups go
+through its HTTP API). `--repo` takes a name from the backup config file
+(`--backup-config FILE`, `$SPARKLES_BACKUP_CONFIG`, default
+`$XDG_CONFIG_HOME/sparkles/backup.toml`) or a URL: `file:///srv/backups/r`,
+`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true`, or `memory://`.
+Credentials never go in URLs; they come from the environment or a credentials file.
+Manifests are cached in `$XDG_CACHE_HOME/sparkles/backup/`, progress goes to stderr,
+Ctrl-C cancels, and every command takes `--format json` (or `--json`). Exit codes: 0 ok,
+1 errors, 2 warnings only (orphaned blobs in `repo verify`).
+
+```sh
+sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
+sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
+sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
+sparkles repo verify local --level data          # every backup, plus orphaned blobs
+sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
+sparkles repo locks local [--break ID]
+sparkles backup create  --loc db --repo local [--name N] [--note T]   # refused while a server has db open
+sparkles backup list    --repo file:///srv/backups/r [--dataset ds] [--policy P]
+sparkles backup show    --repo local b2
+sparkles backup verify  --repo local b2 --level restore   # exists | data | restore
+sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
+sparkles backup restore --repo local b2 --data /srv/sparkles --as ds  # into a stopped server
+sparkles backup delete  --repo local b1          # blobs go at the next gc
+sparkles backup policy list | show P | history P # policies of the config file
+sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin
+```
+
+`restore --identity auto|new|keep` picks the dataset id (`auto` keeps it unless a dataset
+of the target data directory has it) and `--check quick|full|none` the integrity check
+before the restored database is published. `restore --data` refuses while a server holds
+the data directory.
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
@@ -757,9 +812,14 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 ## Testing
 
 ```sh
-cargo test --workspace
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests
+mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
+mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
+mise run ui:e2e        # Playwright end-to-end tests against a real server
 ```
 
-`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL 1.0 / 1.1 query and update suites that
-are vendored in the Apache Jena checkout (`../../apache/jena` next to this repository, or
-`SPARKLES_W3C_DIR`). Known failures are listed in `crates/sparkles/tests/w3c-known-failures.txt`.
+`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL suites vendored in the Apache Jena
+checkout (`../../apache/jena` next to this repository, or `SPARKLES_W3C_DIR`); the SHACL
+suites come from the same checkout (or `SPARKLES_SHACL_TESTS`). Without the checkout the
+suites are skipped. All of them pass (482/482, 328/328, 157/157, 269/269; SHACL 98/98 and
+20/20); `crates/sparkles/tests/w3c-known-failures.txt` lists known failures and is empty.

@@ -32,6 +32,11 @@
 
     base = "http://sparkles.test"
     machine.succeed(f"curl -sf {base}/\\$/ping")
+    # a name the server is not known by (a DNS-rebinding page) is refused
+    code = machine.succeed(
+        "curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:3030/\\$/datasets"
+    )
+    assert code.strip() == "421", code
     machine.succeed(
         f"curl -sf {base}/demo/update --data-urlencode "
         + "'update=INSERT DATA { <urn:a> <urn:p> 42 . <urn:b> <urn:p> 7 }'"

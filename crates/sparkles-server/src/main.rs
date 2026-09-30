@@ -501,6 +501,18 @@ enum Cmd {
             value_parser = clap::builder::BoolishValueParser::new()
         )]
         allow_open_network: bool,
+        /// A browser origin (scheme://host[:port]) whose pages may call the API
+        /// cross-origin, without credentials (repeatable; with --auth-config, added to
+        /// `cors.origins`). Without auth, such a page may do everything the server
+        /// allows. By default no other origin gets CORS headers
+        #[arg(long, value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
+        /// A host name clients reach the server by without --auth-config, such as a
+        /// reverse proxy's (repeatable). An open server answers only IP addresses,
+        /// localhost, --host and these names, and refuses any other `Host` with 421,
+        /// which stops web pages that rebind their DNS name to it
+        #[arg(long, value_name = "NAME")]
+        public_host: Vec<String>,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -1227,6 +1239,8 @@ fn run() -> Result<()> {
             backup_max_tasks,
             unix_socket,
             allow_open_network,
+            cors_origin,
+            public_host,
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
@@ -1249,8 +1263,14 @@ fn run() -> Result<()> {
             // registry's datasets are opened
             #[cfg(feature = "backup")]
             backup::recover::startup(&data)?;
+            if let Some(o) = cors_origin.iter().find(|o| !exposure::valid_origin(o)) {
+                bail!("--cors-origin '{o}': expected scheme://host[:port]");
+            }
+            let hosts = exposure::Hosts::new(bound, &public_host)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
+            st.cors_origins = cors_origin;
+            st.hosts = hosts;
             #[cfg(feature = "backup")]
             {
                 let mut b = backup::BackupState::new(&data, backup_config, backup_max_tasks)?;
@@ -1319,7 +1339,9 @@ fn run() -> Result<()> {
                 // with auth, the pre-authentication limit is on by default
                 auth: st.auth.is_some(),
             };
-            if let Some(cfg) = limit_sources.load()? {
+            let limit_cfg = limit_sources.load()?;
+            let requests_limited = exposure::requests_limited(limit_cfg.as_ref());
+            if let Some(cfg) = limit_cfg {
                 // signed-in callers are limited per principal, others per address
                 st.rate_limit = Some(Arc::new(
                     ratelimit::RateLimiter::new(&cfg)
@@ -1331,7 +1353,7 @@ fn run() -> Result<()> {
                 &host,
                 unix_socket.is_some(),
                 st.auth.is_some(),
-                st.rate_limit.is_some(),
+                requests_limited,
             ) {
                 tracing::warn!("{w}");
             }

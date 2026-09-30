@@ -412,16 +412,6 @@ fn check_grants(
     Ok(())
 }
 
-/// A valid CORS origin: `scheme://host[:port]`, no path, not `*`.
-fn valid_origin(o: &str) -> bool {
-    let Some((scheme, rest)) = o.split_once("://") else {
-        return false;
-    };
-    matches!(scheme, "http" | "https")
-        && !rest.is_empty()
-        && !rest.contains(['/', '?', '#', '*', '@', ' '])
-}
-
 impl FileConfig {
     /// Parse (errors carry the line and column) and validate.
     pub fn parse(text: &str) -> Result<FileConfig> {
@@ -519,7 +509,7 @@ impl FileConfig {
             )?;
         }
         for o in &self.cors.origins {
-            if !valid_origin(o) {
+            if !crate::exposure::valid_origin(o) {
                 bail!("cors.origins: '{o}' is not scheme://host[:port]");
             }
         }
@@ -783,7 +773,7 @@ origins = ["https://yasgui.example.org"]
         assert!(valid_pattern("a*b*"));
         assert!(!valid_pattern("a b"));
         assert!(!valid_pattern(""));
-        assert!(valid_origin("http://localhost:5173"));
-        assert!(!valid_origin("localhost:5173"));
+        assert!(crate::exposure::valid_origin("http://localhost:5173"));
+        assert!(!crate::exposure::valid_origin("localhost:5173"));
     }
 }

@@ -51,8 +51,9 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = { version = "0.33", default-features = false, optional = true }
 tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
 uuid = { workspace = true, optional = true }
+# the UI's Content Security Policy (hashes of inline scripts); API token hashes
+sha2.workspace = true
 # authentication (feature `auth`)
-sha2 = { workspace = true, optional = true }
 subtle = { version = "2.6", optional = true }
 getrandom = { version = "0.3", optional = true }
 argon2 = { version = "0.6", optional = true }
@@ -86,7 +87,6 @@ shacl = ["dep:sparkles-shacl"]
 text = ["sparkles/text"]
 # authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)
 auth = [
-    "dep:sha2",
     "dep:subtle",
     "dep:getrandom",
     "dep:argon2",
