@@ -45,6 +45,16 @@ let
         ) cfg.listenAddress
       );
 
+  # the load directory, and whether it lies where the service's hardening hides homes
+  loadDir = if cfg.loadDir == null then null else lib.removeSuffix "/" (toString cfg.loadDir);
+  loadDirInHome =
+    loadDir != null
+    && lib.any (h: loadDir == h || lib.hasPrefix "${h}/" loadDir) [
+      "/home"
+      "/root"
+      "/run/user"
+    ];
+
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
   datasetArgs = lib.concatLists (
@@ -90,6 +100,10 @@ let
     cfg.unixSocket
   ]
   ++ lib.optional cfg.allowOpenNetwork "--allow-open-network"
+  ++ lib.optionals (cfg.loadDir != null) [
+    "--load-dir"
+    loadDir
+  ]
   # nginx forwards the name it was reached by: without auth the server answers only
   # IP addresses, localhost and --public-host names
   ++ lib.optionals cfg.nginx.enable (
@@ -248,6 +262,19 @@ in
       type = types.ints.positive;
       default = 60;
       description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
+    };
+
+    loadDir = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = "/srv/rdf/import";
+      description = ''
+        Directory that `LOAD <file:…>` over HTTP may read from (`--load-dir`, for
+        server-admin callers); without it such loads are refused. The service reads it
+        read-only, so it must be readable by {option}`user`; it must not contain
+        {option}`dataDir`, and must not be under `/tmp` or `/var/tmp` (the service has a
+        private temporary directory).
+      '';
     };
 
     readOnly = mkOption {
@@ -447,6 +474,25 @@ in
           || (lib.hasPrefix "/" cfg.auth.configFile && !lib.hasPrefix "/nix/store" cfg.auth.configFile);
         message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
       }
+      {
+        assertion =
+          loadDir == null
+          || (
+            lib.hasPrefix "/" loadDir
+            && loadDir != "/"
+            && !lib.hasPrefix "${loadDir}/" "${lib.removeSuffix "/" (toString cfg.dataDir)}/"
+          );
+        message = "services.sparkles.loadDir must be an absolute directory that does not contain dataDir.";
+      }
+      {
+        assertion =
+          loadDir == null
+          || !lib.any (t: loadDir == t || lib.hasPrefix "${t}/" loadDir) [
+            "/tmp"
+            "/var/tmp"
+          ];
+        message = "services.sparkles.loadDir must not be under /tmp or /var/tmp: the service has a private temporary directory.";
+      }
     ];
 
     users.users = lib.mkMerge [
@@ -521,6 +567,7 @@ in
         StateDirectory = mkIf (cfg.dataDir == "/var/lib/sparkles") "sparkles";
         StateDirectoryMode = "0750";
         ReadWritePaths = writablePaths;
+        ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
         Restart = "on-failure";
         RestartSec = 5;
         # graceful shutdown flushes nothing extra (commits are durable), but give
@@ -533,7 +580,8 @@ in
         PrivateTmp = true;
         PrivateDevices = true;
         ProtectSystem = "strict";
-        ProtectHome = true;
+        # a load directory under a home stays readable
+        ProtectHome = if loadDirInHome then "read-only" else true;
         ProtectHostname = true;
         ProtectClock = true;
         ProtectKernelTunables = true;

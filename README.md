@@ -766,6 +766,9 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
   nginx. Behind another proxy or CDN, set up nginx's realip module so that
   `$remote_addr` is the client.
 
+`loadDir` passes `--load-dir`: `LOAD <file:…>` over HTTP may read from that directory
+only (the service gets it read-only; it must not contain `dataDir` or lie under `/tmp`).
+
 With `auth.configFile` the service starts with `--auth-config` and `systemctl reload
 sparkles` re-reads it (SIGHUP). Keep the file out of the Nix store (agenix, sops-nix),
 owned by the `sparkles` user. Do not also set nginx `basicAuthFile`: nginx would forward
