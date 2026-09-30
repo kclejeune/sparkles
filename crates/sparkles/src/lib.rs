@@ -6,6 +6,7 @@ pub mod history;
 pub mod id;
 pub mod index;
 pub mod io;
+pub mod outbound;
 pub mod querybuilder;
 pub mod schema;
 pub mod sparql;

@@ -39,8 +39,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
         header::LINK,
+        header::RETRY_AFTER,
+        header::HeaderName::from_static("ratelimit"),
+        header::HeaderName::from_static("ratelimit-policy"),
+        header::HeaderName::from_static("traceresponse"),
     ]);
-    Router::new()
+    let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui/", get(crate::ui::serve_index))
@@ -100,8 +104,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
-        .layer(tower_http::compression::CompressionLayer::new())
-        .layer(cors)
+        .layer(tower_http::compression::CompressionLayer::new());
+    // inside `observe` (limited requests are logged and counted) and CORS (browsers
+    // can read the 429)
+    let app = match &state.rate_limit {
+        Some(rl) => app.layer(axum::middleware::from_fn_with_state(
+            rl.clone(),
+            crate::ratelimit::limit,
+        )),
+        None => app,
+    };
+    app.layer(cors)
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(crate::obs::MakeSpan)
@@ -263,10 +276,13 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
 }
 
+/// Run `f` on a blocking thread, inside the request's span (so engine events carry the
+/// request id and engine spans are its children).
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
-    tokio::task::spawn_blocking(f)
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(f))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
@@ -525,15 +541,16 @@ async fn query_endpoint(
     let prefixes = ds.store.prefixes();
     let with_extra = !opts.default_graph_extra.is_empty();
     let at = history::at_param(&params)?;
-    let (r, seq, resolved) = blocking({
+    let (r, seq, resolved, t0) = blocking({
         let ds = ds.clone();
         move || {
             let t = std::time::Instant::now();
+            let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
             let r = sparkles::sparql::query(snap, &query, &opts)?;
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((r, seq, resolved))
+            Ok((r, seq, resolved, t0))
         }
     })
     .await?;
@@ -571,32 +588,31 @@ async fn query_endpoint(
     };
     let dataset_id = ds.store.dataset_id().to_string();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
-        if sparkles_doc {
-            // Build the document once, then patch the serialization time into it.
-            let ts = std::time::Instant::now();
-            let mut doc = results::sparkles_json(&r, send);
-            let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
-            if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
-                let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
-                timing.insert("serializeMs".into(), ser_ms.into());
-                timing.insert("totalMs".into(), (total + ser_ms).into());
-            }
-            if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
-                meta.insert("commit".into(), seq.into());
-                meta.insert("datasetId".into(), dataset_id.into());
-            }
-            serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
-        } else if is_graph {
-            results::write_graph(&r, rfmt, &prefixes, w)
-        } else {
-            results::write_solutions(&r, sfmt, w, send)
-        }
+        let ts = std::time::Instant::now();
+        let written = serialize_result(
+            &r,
+            w,
+            sparkles_doc,
+            is_graph,
+            sfmt,
+            rfmt,
+            send,
+            &prefixes,
+            seq,
+            dataset_id,
+        );
+        // phase spans once serialization has ended (the request span is current here)
+        crate::otel::query_done(t0, &r, ts.elapsed().as_secs_f64() * 1000.0);
+        written
     };
-    let (metrics_st, name) = (st.clone(), ds.name.clone());
+    // weak: the serializer thread must not keep the server state (and its stores' locks)
+    // alive after the response
+    let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
     let body = stream::serialize(limit, write, move |end| {
-        metrics_st
-            .metrics
-            .add_response_bytes(Some(&name), Op::Query, end.bytes);
+        if let Some(st) = metrics_st.upgrade() {
+            st.metrics
+                .add_response_bytes(Some(&name), Op::Query, end.bytes);
+        }
         stream_end_log("query", &end);
     })
     .await?;
@@ -623,6 +639,42 @@ async fn query_endpoint(
         _ => with_inferences(resp, &ds, with_extra, seq),
     };
     Ok(report.attach(resp))
+}
+
+/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
+#[allow(clippy::too_many_arguments)]
+fn serialize_result(
+    r: &sparkles::sparql::QueryResult,
+    w: &mut LimitedWriter<stream::SwitchWriter>,
+    sparkles_doc: bool,
+    is_graph: bool,
+    sfmt: SolutionsFormat,
+    rfmt: RdfFormat,
+    send: Option<usize>,
+    prefixes: &std::collections::BTreeMap<String, String>,
+    seq: u64,
+    dataset_id: String,
+) -> sparkles::Result<()> {
+    if sparkles_doc {
+        // Build the document once, then patch the serialization time into it.
+        let ts = std::time::Instant::now();
+        let mut doc = results::sparkles_json(r, send);
+        let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
+        if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
+            let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
+            timing.insert("serializeMs".into(), ser_ms.into());
+            timing.insert("totalMs".into(), (total + ser_ms).into());
+        }
+        if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
+            meta.insert("commit".into(), seq.into());
+            meta.insert("datasetId".into(), dataset_id.into());
+        }
+        serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
+    } else if is_graph {
+        results::write_graph(r, rfmt, prefixes, w)
+    } else {
+        results::write_solutions(r, sfmt, w, send)
+    }
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).
@@ -805,6 +857,7 @@ fn write_response(
     receipt: &sparkles::commit::Receipt,
     wanted: bool,
 ) -> Response {
+    crate::otel::commit(receipt);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
         if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
@@ -978,12 +1031,14 @@ async fn update_endpoint(
     };
     let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
+        let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,
             &update,
             &opts,
             sparkles::commit::CommitKind::Update,
         )?;
+        crate::otel::update_done(t0, &stats);
         let receipt = stats.commit.expect("update receipts");
         let report = RequestReport {
             operation: Some(Op::Update),
@@ -1197,10 +1252,13 @@ async fn graph_body(
         s.finish()?;
         Ok(())
     };
-    let name = ds.name.clone();
+    let (name, st) = (ds.name.clone(), Arc::downgrade(&st));
+    drop(ds);
     let body = stream::serialize(None, write, move |end| {
-        st.metrics
-            .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
+        if let Some(st) = st.upgrade() {
+            st.metrics
+                .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
+        }
         stream_end_log("graph store", &end);
     })
     .await?;
@@ -2208,6 +2266,7 @@ async fn shacl(
         let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
         opts.timeout = Some(timeout);
         let t = std::time::Instant::now();
+        let _validate = tracing::info_span!("shacl.validate").entered();
         let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
             let msg = format!("{e:#}");
             match e.downcast::<Error>() {

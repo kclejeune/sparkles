@@ -120,16 +120,19 @@ pub enum Outcome {
     Timeout,
     Cancelled,
     Budget,
+    /// refused by a rate or concurrency limit (`429`, or `503` when saturated)
+    RateLimited,
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 6] = [
+    pub const ALL: [Outcome; 7] = [
         Outcome::Ok,
         Outcome::ClientError,
         Outcome::Error,
         Outcome::Timeout,
         Outcome::Cancelled,
         Outcome::Budget,
+        Outcome::RateLimited,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -140,6 +143,7 @@ impl Outcome {
             Outcome::Timeout => "timeout",
             Outcome::Cancelled => "cancelled",
             Outcome::Budget => "budget",
+            Outcome::RateLimited => "rate_limited",
         }
     }
 
@@ -173,6 +177,8 @@ pub struct RequestReport {
     /// uncompressed body size
     pub response_bytes: Option<u64>,
     pub mem_peak_bytes: Option<u64>,
+    /// the limit class that refused the request (outcome `rate_limited`)
+    pub limit_class: Option<crate::ratelimit::Class>,
 }
 
 impl RequestReport {
@@ -283,26 +289,24 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let span = tracing::info_span!(
-        "request",
-        request_id = %id,
-        method = %req.method(),
-        route = route.as_deref().unwrap_or("-"),
-    );
+    let span = crate::otel::request_span(&id, req.method(), route.as_deref());
+    let otel = crate::otel::on_request(&span, &req, route.as_deref(), &id);
     req.extensions_mut().insert(RequestSpan(span.clone()));
     let op = route_op(route.as_deref(), &req);
-    let pending = Pending::new(
+    let mut pending = Pending::new(
         st,
         span,
         op,
         ds_param(route.as_deref(), req.uri()),
         quiet(route.as_deref()),
     );
+    pending.otel = otel;
     let mut resp = next.run(req).await;
     let report = resp
         .extensions_mut()
         .remove::<RequestReport>()
         .unwrap_or_default();
+    crate::otel::response_headers(&pending.otel, resp.headers_mut());
     pending.complete(resp.status().as_u16(), &report);
     resp.headers_mut().insert(X_REQUEST_ID.clone(), id_value);
     resp
@@ -318,6 +322,7 @@ struct Pending {
     quiet: bool,
     start: Instant,
     done: bool,
+    otel: crate::otel::Req,
 }
 
 impl Pending {
@@ -333,6 +338,7 @@ impl Pending {
             quiet,
             start: Instant::now(),
             done: false,
+            otel: Default::default(),
         }
     }
 
@@ -354,6 +360,17 @@ impl Pending {
                 .metrics
                 .record(dataset.as_deref(), op, outcome, elapsed, report);
         }
+        crate::otel::on_response(
+            &self.otel,
+            &self.span,
+            &self.st,
+            status,
+            op,
+            outcome,
+            dataset.as_deref(),
+            elapsed,
+            report,
+        );
         if self.st.access_log {
             access_event(
                 &self.span,
@@ -434,6 +451,7 @@ pub fn log_query_text(text: &str) {
             .map_or(text, |(i, _)| &text[..i]);
         tracing::debug!(target: "sparkles::query", query_len = text.len(), query = cut);
     }
+    crate::otel::query_text(text);
 }
 
 // -------------------------------------------------------------------- metrics ------
@@ -484,7 +502,7 @@ impl Histogram {
 #[derive(Default)]
 struct OpMetrics {
     seen: AtomicBool,
-    outcomes: [AtomicU64; 6],
+    outcomes: [AtomicU64; 7],
     duration: Histogram,
     response_bytes: AtomicU64,
 }
@@ -495,6 +513,7 @@ pub struct DsMetrics {
     ops: [OpMetrics; 8],
     result_rows: AtomicU64,
     budget: [AtomicU64; 3],
+    rate_limited: [AtomicU64; 4],
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -571,6 +590,9 @@ impl Metrics {
         {
             ds.budget[budget_index(k)].fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(c) = r.limit_class {
+            ds.rate_limited[c.index()].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Count the bytes of a streamed response, known only once the stream ends.
@@ -582,6 +604,12 @@ impl Metrics {
         ds.ops[op.index()]
             .response_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The `dataset` label of a request to `dataset` (see [`Metrics::series`]).
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub fn dataset_label(&self, dataset: Option<&str>) -> String {
+        self.series(dataset).0
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
@@ -834,6 +862,25 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
+    if st.rate_limit.is_some() {
+        family(
+            &mut o,
+            "sparkles_rate_limited_total",
+            "counter",
+            "Requests refused by a rate or concurrency limit, by limit class.",
+        );
+        for (ds, m) in &series {
+            let ds = escape_label(ds);
+            for c in crate::ratelimit::Class::ALL {
+                let _ = writeln!(
+                    o,
+                    "sparkles_rate_limited_total{{dataset=\"{ds}\",class=\"{}\"}} {}",
+                    c.as_str(),
+                    m.rate_limited[c.index()].load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
 
     type Field = fn(&DsGauges) -> u64;
     let per_dataset: [(&str, &str, &str, Field); 11] = [
@@ -1001,6 +1048,13 @@ pub fn metrics_json(st: &AppState) -> J {
             json!({
                 "resultRows": m.result_rows.load(Ordering::Relaxed),
                 "budgetExceeded": budget,
+                "rateLimited": crate::ratelimit::Class::ALL
+                    .iter()
+                    .map(|c| {
+                        let n = m.rate_limited[c.index()].load(Ordering::Relaxed);
+                        (c.as_str().to_string(), J::from(n))
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
             }),
         );
     }
@@ -1016,6 +1070,7 @@ pub fn metrics_json(st: &AppState) -> J {
                 "diskBytes": g.disk_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
+                "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
                 "blockCache": {
                     "bytes": g.cache_bytes,
                     "capacityBytes": g.cache_capacity,

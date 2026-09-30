@@ -151,19 +151,22 @@ where
             (Some(tx), result) => {
                 let disconnected = tx.is_closed();
                 let error = result.err();
-                if let Some(e) = &error
-                    && !disconnected
-                {
-                    // an error item aborts the response: the client sees a truncated
-                    // transfer rather than a complete-looking one
-                    let _ = tx.blocking_send(Err(io::Error::other(e.to_string())));
-                }
+                let abort = error
+                    .as_ref()
+                    .filter(|_| !disconnected)
+                    .map(|e| e.to_string());
+                // reported before the client can see the end of the body
                 on_stream_end(StreamEnd {
                     bytes,
                     serialize_ms,
                     error,
                     disconnected,
                 });
+                if let Some(msg) = abort {
+                    // an error item aborts the response: the client sees a truncated
+                    // transfer rather than a complete-looking one
+                    let _ = tx.blocking_send(Err(io::Error::other(msg)));
+                }
             }
         }
     });

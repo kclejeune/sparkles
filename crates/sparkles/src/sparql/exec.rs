@@ -2474,15 +2474,42 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| Error::Service(e.to_string()))?;
-    let resp = client
-        .post(url.as_str())
-        .header(
-            "Accept",
-            "application/sparql-results+json, application/sparql-results+xml;q=0.8",
-        )
-        .form(&[("query", query)])
-        .send()
-        .map_err(|e| Error::Service(e.to_string()))?;
+    // the host of the endpoint (no user info, no port)
+    let host = oxiri::Iri::parse(url.as_str())
+        .ok()
+        .and_then(|i| {
+            let a = i.authority()?;
+            let a = a.rsplit('@').next().unwrap_or(a);
+            Some(match a.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
+                None => a.split(':').next().unwrap_or(a).to_string(),
+            })
+        })
+        .unwrap_or_default();
+    // a client span: its context is what the outbound headers hook propagates
+    let span = tracing::info_span!(
+        "sparql.service",
+        otel.kind = "client",
+        http.request.method = "POST",
+        server.address = %host,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let resp = crate::outbound::apply(
+        client
+            .post(url.as_str())
+            .header(
+                "Accept",
+                "application/sparql-results+json, application/sparql-results+xml;q=0.8",
+            )
+            .form(&[("query", query)]),
+    )
+    .send()
+    .map_err(|e| Error::Service(e.to_string()))?;
+    span.record(
+        "http.response.status_code",
+        i64::from(resp.status().as_u16()),
+    );
     if !resp.status().is_success() {
         return Err(Error::Service(format!(
             "{} returned {}",
