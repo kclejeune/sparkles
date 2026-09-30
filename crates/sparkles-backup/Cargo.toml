@@ -22,7 +22,13 @@ croner.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# statvfs (free space before a restore) and gethostname (lock holders)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+# test wrappers around object stores (the `ObjectStore` trait is an `async_trait`)
+async-trait = "0.1"
 tempfile.workspace = true
 
 [features]
