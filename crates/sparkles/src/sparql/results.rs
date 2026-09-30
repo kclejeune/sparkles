@@ -154,9 +154,11 @@ impl<W: Write> LimitedWriter<W> {
     }
 }
 
-impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let end = self.written.saturating_add(buf.len() as u64);
+impl<W: Write> LimitedWriter<W> {
+    /// Admit `len` more bytes: the size limit, and the cancellation flag every 64 KiB.
+    #[inline]
+    fn admit(&mut self, len: usize) -> std::io::Result<()> {
+        let end = self.written.saturating_add(len as u64);
         if let Some(l) = self.limit
             && end > l
         {
@@ -174,9 +176,27 @@ impl<W: Write> Write for LimitedWriter<W> {
                 return Err(std::io::Error::other("query cancelled"));
             }
         }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.admit(buf.len())?;
         let n = self.inner.write(buf)?;
         self.written += n as u64;
         Ok(n)
+    }
+
+    // serializers write many small pieces: hand them on whole, so a `Vec` appends them
+    // without the generic retry loop
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.admit(buf.len())?;
+        self.inner.write_all(buf)?;
+        self.written += buf.len() as u64;
+        Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
