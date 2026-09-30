@@ -357,6 +357,33 @@ pub struct ForkedFrom {
     pub seq: u64,
 }
 
+/// Where a restored dataset came from (`restoredFrom` of `dataset.json` and of the
+/// server's dataset info): the backup repository and backup, and the source dataset id
+/// and commit (`seq`) the backup captured.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredFrom {
+    /// the repository's name on the server (or CLI configuration) that restored it
+    pub repository: String,
+    /// the backup's name in that repository
+    pub backup: String,
+    pub dataset_id: uuid::Uuid,
+    pub seq: u64,
+}
+
+/// Give a closed database directory `root` a new dataset id: rewrite `dataset.json`
+/// (`origin: "restore"`, `forkedFrom: forked_from`, a new `created`), the `datasetId`
+/// of the current `gen-NNNN/commit.json`, and the `commits.bin` header (the UUID and the
+/// header CRC). Commit metadata and sequence numbers are kept, so the next commit is
+/// `forked_from.seq + 1` under `new_id`. WAL records carry no dataset id and are left
+/// alone. Every rewritten file is replaced atomically and synced.
+///
+/// Used by restores whose identity rule mints a new id; the directory must not be open.
+pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
+    let _ = (root, new_id, forked_from);
+    Err(Error::unsupported("reidentify is not implemented yet"))
+}
+
 /// `forkedFrom` of `<root>/dataset.json`, if the database is a clone.
 pub(crate) fn read_forked_from(root: &Path) -> Result<Option<ForkedFrom>> {
     match std::fs::read(root.join("dataset.json")) {
