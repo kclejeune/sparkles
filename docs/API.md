@@ -29,13 +29,14 @@ addressed as `/{ds}`. JSON responses use `application/json`.
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
+| POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — prefixes seen during loading plus well-known ones. |
 
 ```ts
 type DatasetInfo = {
   name: string;            // "ds"
   type: "persistent" | "mem";
-  endpoints: { query: string; update: string; gsp: string; upload: string };
+  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string /* absent when built without the `shacl` feature */ };
   quads: number;           // approximate total (base + delta)
   reasoning: null | { profile: string; inferred: number; at: string };
 };
@@ -51,7 +52,8 @@ type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[]; // top 100
   classes: { iri: string; instances: number }[];      // top 100 by rdf:type
   diskBytes: number;
-  cache: { entries: number; bytes: number; hits: number; misses: number };
+  cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
+  resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
 };
 
 type Task = {
@@ -69,6 +71,7 @@ type Task = {
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
+| POST       | `/{ds}/shacl`         | SHACL validation (Fuseki `/{ds}/shacl`); see [SHACL validation](#shacl-validation). |
 
 Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
@@ -82,6 +85,61 @@ Query parameters beyond the standard protocol:
 * `timeout=<seconds>` — query timeout (default 60 s).
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
+* `nocache=true` — bypass the query result cache: nothing is read from or stored in it
+  (for benchmarking; `explain` accepts it too). The server-wide budget is set with
+  `sparkles serve --result-cache-mb N` (default 512, `0` disables the cache); the cache is
+  keyed by snapshot version, so updates invalidate it, and `POST /$/cache/clear/{ds}`
+  empties it.
+
+## SHACL validation
+
+`POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against
+the shapes graph in the request body (Fuseki semantics):
+
+* **Body**: the shapes graph. `Content-Type` selects the syntax: `application/n-triples`,
+  `application/rdf+xml`, `application/ld+json`, `application/trig`, `application/n-quads`
+  (all graphs of a quad format are merged); Turtle for `text/turtle` and for any other or
+  absent content type (e.g. curl's default `application/x-www-form-urlencoded`).
+* **`graph`**: `default` (the default; the dataset's default graph, i.e. the union of all
+  graphs with `--union-default-graph`), `union` (all graphs, `urn:x-arq:UnionGraph`), or a
+  graph IRI (`404` if the graph does not exist). The Jena special IRIs
+  `urn:x-arq:DefaultGraph` / `urn:x-arq:UnionGraph` are accepted as well.
+* **`reasoning=true|false`**: when the dataset has materialized inferences, validation runs
+  over data ∪ `urn:x-sparkles:inferred` unless `reasoning=false`; with `false` the inferred
+  graph is also left out of `graph=union`.
+* **`timeout=<seconds>`**: as for queries (server default otherwise); `408` on timeout.
+* Supports SHACL Core and SHACL-SPARQL. Parse errors in the shapes graph → `400`.
+
+The response is the validation report (`200` whether or not the data conforms),
+negotiated via `Accept` or `format=`:
+
+| Accept / `format=` | Body |
+|---|---|
+| `text/turtle` / `ttl` (default) | `sh:ValidationReport` in Turtle |
+| `application/n-triples` / `nt`, `application/ld+json` / `jsonld`, `application/rdf+xml` / `rdfxml` | the same report triples |
+| `application/json` / `json` | compact JSON (below) |
+| `format=text` | human-readable summary (one line per result) |
+
+```ts
+type ShaclReport = {
+  conforms: boolean;
+  results: {
+    focusNode: Term;
+    resultPath: Term | { type: "path"; value: string /* SPARQL property path */ } | null;
+    value: Term | null;
+    sourceShape: Term;
+    sourceConstraintComponent: Term;   // e.g. { type: "uri", value: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }
+    sourceConstraint?: Term;           // SHACL-SPARQL constraints
+    severity: Term;                    // sh:Violation | sh:Warning | sh:Info
+    messages: string[];                // sh:resultMessage texts
+  }[];
+};
+```
+
+The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph default|union|IRI]
+[--format ttl|json|text|nt|jsonld|rdfxml] [--no-inferences]` (or `--data FILE…` to validate
+files in memory); like Jena's `shacl validate` it exits with status 1 when the data does not
+conform.
 
 ## `application/x-sparkles+json` (UI result format)
 

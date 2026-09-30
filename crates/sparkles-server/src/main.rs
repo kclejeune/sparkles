@@ -1,9 +1,11 @@
 //! `sparkles` — Fuseki-compatible server and Jena-style command line tools
 //! (`serve` ≈ fuseki-server, `load` ≈ tdb2.tdbloader, `query` ≈ tdb2.tdbquery / arq,
 //! `update` ≈ tdb2.tdbupdate, `dump` ≈ tdb2.tdbdump, `compact`, `backup`, `stats`,
-//! `infer` ≈ riot --infer).
+//! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
 mod http;
+#[cfg(feature = "shacl")]
+mod shacl;
 mod state;
 mod ui;
 
@@ -28,6 +30,9 @@ struct Cli {
     /// Block cache size in MiB
     #[arg(long, global = true, default_value_t = 1024)]
     cache_mb: u64,
+    /// Query result cache size in MiB (0 disables it)
+    #[arg(long, global = true, default_value_t = 512)]
+    result_cache_mb: u64,
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
@@ -138,11 +143,37 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
     },
+    /// Validate a database (or data files) against a SHACL shapes graph; exits with
+    /// status 1 when the data does not conform
+    Shacl {
+        /// Database directory
+        #[arg(long)]
+        loc: Option<PathBuf>,
+        /// Data files to validate (loaded into memory)
+        #[arg(long)]
+        data: Vec<PathBuf>,
+        /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ...; `.gz` allowed)
+        #[arg(long)]
+        shapes: PathBuf,
+        /// Data graph: `default`, `union` (all graphs) or a graph IRI
+        #[arg(long, default_value = "default")]
+        graph: String,
+        /// Report format: ttl, json, text (also nt, jsonld, rdfxml)
+        #[arg(long, default_value = "ttl")]
+        format: String,
+        /// Leave materialized inferences (`urn:x-sparkles:inferred`) out of the data graph
+        #[arg(long)]
+        no_inferences: bool,
+        /// Timeout in seconds
+        #[arg(long)]
+        timeout: Option<f64>,
+    },
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
+        result_cache_bytes: cli.result_cache_mb << 20,
         union_default_graph: cli.union_default_graph,
         ..Default::default()
     }
@@ -254,20 +285,7 @@ fn main() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no query given"),
             };
-            let store = match loc {
-                Some(l) => Store::open(&l, opts)?,
-                None => {
-                    let s = Store::in_memory(opts);
-                    let sources = data
-                        .iter()
-                        .map(|f| Source::from_path(f, None))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if !sources.is_empty() {
-                        s.load(&sources)?;
-                    }
-                    s
-                }
-            };
+            let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
                 allow_service: true,
@@ -436,7 +454,84 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(not(feature = "shacl"))]
+        Cmd::Shacl { .. } => bail!("built without the `shacl` feature"),
+        #[cfg(feature = "shacl")]
+        Cmd::Shacl {
+            loc,
+            data,
+            shapes,
+            graph,
+            format,
+            no_inferences,
+            timeout,
+        } => {
+            let fmt = shacl::ReportFormat::from_name(&format)
+                .with_context(|| format!("unknown report format '{format}'"))?;
+            let shapes = read_shapes(&shapes)?;
+            let store = open_or_load(loc, &data, opts)?;
+            let graph = shacl::DataGraph::parse(&graph)?;
+            let snap = store.snapshot();
+            if let shacl::DataGraph::Named(iri) = &graph
+                && !shacl::graph_exists(&snap, iri)
+            {
+                bail!("no such graph: <{iri}>");
+            }
+            let inferred =
+                shacl::graph_exists(&snap, http::INFERRED_GRAPH).then_some(http::INFERRED_GRAPH);
+            let mut vopts = shacl::validate_options(&snap, &graph, inferred, !no_inferences)?;
+            vopts.timeout = timeout.map(Duration::from_secs_f64);
+            let report = sparkles_shacl::validate(&snap, &shapes, &vopts)?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(&shacl::write_report(&report, fmt)?)?;
+            if fmt == shacl::ReportFormat::Json {
+                writeln!(out)?;
+            }
+            out.flush()?;
+            if !report.conforms {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
+}
+
+/// A database directory, or the given files loaded into an in-memory store.
+fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> Result<Store> {
+    Ok(match loc {
+        Some(l) => Store::open(&l, opts)?,
+        None => {
+            let s = Store::in_memory(opts);
+            let sources = data
+                .iter()
+                .map(|f| Source::from_path(f, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !sources.is_empty() {
+                s.load(&sources)?;
+            }
+            s
+        }
+    })
+}
+
+#[cfg(feature = "shacl")]
+fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
+    use std::io::Read;
+    let (format, gz) =
+        sparkles::io::format_for_path(path).unwrap_or((oxrdfio::RdfFormat::Turtle, false));
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = if gz {
+        let mut s = String::new();
+        flate2::read::MultiGzDecoder::new(&raw[..]).read_to_string(&mut s)?;
+        s
+    } else {
+        String::from_utf8(raw).with_context(|| format!("{} is not UTF-8", path.display()))?
+    };
+    let base = std::path::absolute(path)
+        .ok()
+        .map(|p| format!("file://{}", p.display()));
+    sparkles_shacl::Shapes::parse(&text, format, base.as_deref())
+        .with_context(|| format!("reading shapes from {}", path.display()))
 }
 
 fn print_plan(p: &sparkles::sparql::PlanInfo, depth: usize) {

@@ -41,6 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task))
         .route("/$/prefixes/{ds}", get(prefixes))
+        .route("/$/cache/clear/{ds}", post(clear_cache))
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))
@@ -49,6 +50,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/get", get(gsp).head(gsp))
         .route("/{ds}/upload", post(upload))
         .route("/{ds}/explain", get(explain).post(explain))
+        .route("/{ds}/shacl", post(shacl))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(cors)
@@ -287,16 +289,29 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> RdfFormat {
         })
 }
 
-fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
-    let timeout = params
+fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "" | "true" | "1" | "yes" | "on"
+    )
+}
+
+fn timeout_param(st: &AppState, params: &Params) -> Duration {
+    params
         .get("timeout")
         .and_then(|t| t.parse::<f64>().ok())
+        .filter(|t| t.is_finite() && *t > 0.0)
         .map(Duration::from_secs_f64)
-        .unwrap_or(st.default_timeout);
+        .unwrap_or(st.default_timeout)
+}
+
+fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
+    let timeout = timeout_param(st, params);
     let reasoning =
         params.get("reasoning").is_none_or(|v| v != "false") && ds.reasoning.read().is_some();
     QueryOptions {
         timeout: Some(timeout),
+        no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
         allow_service: st.allow_service,
@@ -751,15 +766,21 @@ async fn ping() -> impl IntoResponse {
 
 fn dataset_info(ds: &Dataset) -> J {
     let n = &ds.name;
+    #[allow(unused_mut)]
+    let mut endpoints = json!({
+        "query": format!("/{n}/sparql"),
+        "update": format!("/{n}/update"),
+        "gsp": format!("/{n}/data"),
+        "upload": format!("/{n}/upload"),
+    });
+    #[cfg(feature = "shacl")]
+    {
+        endpoints["shacl"] = format!("/{n}/shacl").into();
+    }
     json!({
         "name": n,
         "type": ds.kind,
-        "endpoints": {
-            "query": format!("/{n}/sparql"),
-            "update": format!("/{n}/update"),
-            "gsp": format!("/{n}/data"),
-            "upload": format!("/{n}/upload"),
-        },
+        "endpoints": endpoints,
         "quads": ds.store.snapshot().len(),
         "reasoning": *ds.reasoning.read(),
     })
@@ -923,6 +944,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             .map(|&(c, n)| json!({ "iri": term(c).unwrap_or_default(), "instances": n }))
             .collect();
         let cache = ds.store.cache();
+        let rcache = ds.store.result_cache();
         Ok(Json(json!({
             "name": ds.name,
             "quads": snap.len(),
@@ -941,10 +963,26 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
                 "hits": cache.hits(),
                 "misses": cache.misses(),
             },
+            "resultCache": {
+                "enabled": rcache.enabled(),
+                "entries": rcache.entries(),
+                "bytes": rcache.bytes(),
+                "hits": rcache.hits(),
+                "misses": rcache.misses(),
+            },
         }))
         .into_response())
     })
     .await
+}
+
+/// `POST /$/cache/clear/{ds}` (extension): drop the dataset's cached query results.
+async fn clear_cache(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    let c = ds.store.result_cache();
+    let (entries, bytes) = (c.entries(), c.bytes());
+    c.clear();
+    Ok(Json(json!({ "cleared": entries, "bytes": bytes })))
 }
 
 async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
@@ -1092,6 +1130,100 @@ async fn get_task(State(st): St, Path(id): Path<String>) -> ApiResult<Json<J>> {
         .map(|t| Json(serde_json::to_value(t).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
+
+// ------------------------------------------------------------------- SHACL ------
+
+/// Fuseki's SHACL service: `POST /{ds}/shacl?graph=default|union|<iri>` with the
+/// shapes graph as the body; answers with the validation report.
+#[cfg(feature = "shacl")]
+async fn shacl(
+    State(st): St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    use crate::shacl::{DataGraph, ReportFormat};
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let ct = content_type(&headers);
+    // Turtle unless the content type names another RDF syntax (curl's default
+    // `application/x-www-form-urlencoded` included; `text/plain` too, as Turtle is a
+    // superset of N-Triples)
+    let format = match ct.as_str() {
+        "text/plain" => RdfFormat::Turtle,
+        ct => sparkles::io::format_for_media_type(ct).unwrap_or(RdfFormat::Turtle),
+    };
+    let graph = DataGraph::parse(params.get("graph").unwrap_or("default"))
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let rfmt = match params.get("format") {
+        Some(f) => ReportFormat::from_name(f).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown report format '{f}'"),
+            )
+        })?,
+        None => {
+            let accept = headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("*/*");
+            negotiate(accept, &ReportFormat::OFFERS)
+                .and_then(|i| ReportFormat::from_name(ReportFormat::OFFERS[i]))
+                .unwrap_or(ReportFormat::Rdf(RdfFormat::Turtle))
+        }
+    };
+    let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
+    let has_inferred = ds.reasoning.read().is_some();
+    let timeout = timeout_param(&st, &params);
+    blocking(move || {
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
+        let shapes = sparkles_shacl::Shapes::parse(text, format, None)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        let snap = ds.store.snapshot();
+        if let DataGraph::Named(iri) = &graph
+            && !crate::shacl::graph_exists(&snap, iri)
+        {
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                format!("no such graph: <{iri}>"),
+            ));
+        }
+        let inferred = has_inferred.then_some(INFERRED_GRAPH);
+        let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
+        opts.timeout = Some(timeout);
+        let t = std::time::Instant::now();
+        let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
+            let msg = format!("{e:#}");
+            match e.downcast::<Error>() {
+                Ok(e) => ApiError::from(e),
+                Err(_) if msg.contains("timed out") => err(StatusCode::REQUEST_TIMEOUT, msg),
+                Err(_) => err(StatusCode::BAD_REQUEST, msg),
+            }
+        })?;
+        tracing::debug!(
+            "SHACL validation of /{} in {:?}: {} results",
+            ds.name,
+            t.elapsed(),
+            report.results.len()
+        );
+        let buf = crate::shacl::write_report(&report, rfmt)?;
+        Ok(([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response())
+    })
+    .await
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn shacl() -> ApiResult {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `shacl` feature",
+    ))
+}
+
+#[cfg(test)]
+mod router_tests;
 
 #[cfg(test)]
 mod tests {
