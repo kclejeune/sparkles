@@ -145,6 +145,9 @@ export type Backup = BackupSummary & {
   derived: { text: null | { rebuildOnRestore: true } };
 };
 
+/** `restoredFrom` of a dataset made by a restore (in `DatasetInfo`). */
+export type RestoredFrom = { repository: string; backup: string; datasetId: string; seq: number };
+
 export type DatasetBackups = {
   dataset: string;
   /** The live dataset's id; null when no dataset of that name is served. */
@@ -177,6 +180,11 @@ export type VerifyReport = {
   requests: { list: number; head: number; get: number };
   millis: number;
 };
+
+/** What a verify dialog checks: a whole repository or one backup. */
+export type VerifyTarget =
+  | { kind: 'repository'; repository: string }
+  | { kind: 'backup'; backup: BackupSummary };
 
 export type Retention = { expireAfter: string | null; minCount: number; maxCount: number | null };
 
