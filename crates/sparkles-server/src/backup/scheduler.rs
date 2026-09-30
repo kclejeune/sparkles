@@ -1,7 +1,7 @@
 //! The policy scheduler: one thread that sleeps until the earliest `nextRun` (at most
 //! 60 s, so clock changes are noticed), starts one `backup-policy` task per due and
 //! enabled policy (an overlapping run is recorded `skipped`), runs catch-up 60 s after
-//! startup, and ticks F06 history collection (`Store::try_collect_history`) hourly.
+//! startup, and ticks history collection (`Store::try_collect_history`) hourly.
 //! Time comes from a [`Clock`], so tests drive it.
 
 use crate::state::AppState;
