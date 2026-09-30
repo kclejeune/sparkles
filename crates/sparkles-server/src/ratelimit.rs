@@ -911,13 +911,20 @@ fn rate_headers(h: &mut HeaderMap, p: &Policy, remaining: u64, reset: u64) {
     }
 }
 
-fn reject(p: &Policy, status: StatusCode, retry: u64, reason: &str, remaining: u64) -> Response {
+fn reject(
+    p: &Policy,
+    status: StatusCode,
+    retry: u64,
+    reason: &'static str,
+    remaining: u64,
+) -> Response {
     let class = p.class.as_str();
     let msg = if status == StatusCode::TOO_MANY_REQUESTS {
         format!("too many {class} requests: retry in {retry} s")
     } else {
         format!("too many concurrent {class} requests: retry in {retry} s")
     };
+    crate::otel::rate_limited(class, reason);
     let mut resp = (
         status,
         [(header::RETRY_AFTER, HeaderValue::from(retry))],

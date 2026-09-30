@@ -74,6 +74,10 @@ let
   ]
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
+  ++ lib.optional cfg.otel.enable "--otel"
+  ++ lib.optional cfg.otel.logs "--otel-logs"
+  ++ lib.optional cfg.otel.queryText "--otel-query-text"
+  ++ lib.optional cfg.otel.planSpans "--otel-plan-spans"
   ++ lib.optionals (rateLimits != null) [
     "--rate-limit-config"
     rateLimitsFile
@@ -231,6 +235,43 @@ in
       description = "`RUST_LOG` filter for the service.";
     };
 
+    otel = {
+      enable = mkEnableOption "OpenTelemetry export of traces and metrics over OTLP";
+
+      endpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "http://127.0.0.1:4318";
+        description = "Collector address (`OTEL_EXPORTER_OTLP_ENDPOINT`); `null`: the OTLP default.";
+      };
+
+      protocol = mkOption {
+        type = types.enum [
+          "http/protobuf"
+          "grpc"
+        ];
+        default = "http/protobuf";
+        description = "OTLP transport (`OTEL_EXPORTER_OTLP_PROTOCOL`).";
+      };
+
+      logs = mkEnableOption "export of log events over OTLP";
+
+      queryText = mkEnableOption "query text and plan descriptions in spans (they may hold data)";
+
+      planSpans = mkEnableOption "one span per executed plan operator";
+
+      environment = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        example = {
+          OTEL_TRACES_SAMPLER = "parentbased_traceidratio";
+          OTEL_TRACES_SAMPLER_ARG = "0.1";
+          OTEL_RESOURCE_ATTRIBUTES = "deployment.environment.name=prod";
+        };
+        description = "Further `OTEL_*` variables for the service.";
+      };
+    };
+
     rateLimits = mkOption {
       type = types.nullOr json.type;
       default = null;
@@ -342,7 +383,18 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
-      environment.RUST_LOG = cfg.logLevel;
+      environment = {
+        RUST_LOG = cfg.logLevel;
+      }
+      // lib.optionalAttrs cfg.otel.enable (
+        {
+          OTEL_EXPORTER_OTLP_PROTOCOL = cfg.otel.protocol;
+        }
+        // lib.optionalAttrs (cfg.otel.endpoint != null) {
+          OTEL_EXPORTER_OTLP_ENDPOINT = cfg.otel.endpoint;
+        }
+        // cfg.otel.environment
+      );
       reloadTriggers = lib.optional (
         rateLimits != null
       ) config.environment.etc."sparkles/rate-limits.json".source;

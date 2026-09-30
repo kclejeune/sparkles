@@ -2049,7 +2049,29 @@ impl WriteTxn<'_> {
 
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
     /// without a bulk batch) creates no commit: its receipt carries the unchanged head.
-    pub fn commit(mut self) -> Result<Receipt> {
+    pub fn commit(self) -> Result<Receipt> {
+        let span = tracing::info_span!(
+            target: "sparkles::commit",
+            "commit",
+            kind = self.kind.name(),
+            seq = tracing::field::Empty,
+            inserted = tracing::field::Empty,
+            deleted = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let r = self.commit_inner();
+        if let Ok(r) = &r
+            && r.committed
+        {
+            // as i64: exporters render u64 fields as strings
+            span.record("seq", r.commit.seq as i64);
+            span.record("inserted", r.commit.inserted as i64);
+            span.record("deleted", r.commit.deleted as i64);
+        }
+        r
+    }
+
+    fn commit_inner(mut self) -> Result<Receipt> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }

@@ -536,12 +536,13 @@ impl AppState {
             }
         }
         let state = self.clone();
+        let span = crate::otel::task_span(kind, &id, dataset);
         std::thread::spawn(move || {
             let handle = TaskHandle {
                 state: state.clone(),
                 id: id.clone(),
             };
-            let r = work(&handle);
+            let r = span.in_scope(|| work(&handle));
             let mut tasks = state.tasks.lock();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
                 t.finished_at = Some(now());

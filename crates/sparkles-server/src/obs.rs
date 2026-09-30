@@ -289,26 +289,24 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let span = tracing::info_span!(
-        "request",
-        request_id = %id,
-        method = %req.method(),
-        route = route.as_deref().unwrap_or("-"),
-    );
+    let span = crate::otel::request_span(&id, req.method(), route.as_deref());
+    let otel = crate::otel::on_request(&span, &req, route.as_deref(), &id);
     req.extensions_mut().insert(RequestSpan(span.clone()));
     let op = route_op(route.as_deref(), &req);
-    let pending = Pending::new(
+    let mut pending = Pending::new(
         st,
         span,
         op,
         ds_param(route.as_deref(), req.uri()),
         quiet(route.as_deref()),
     );
+    pending.otel = otel;
     let mut resp = next.run(req).await;
     let report = resp
         .extensions_mut()
         .remove::<RequestReport>()
         .unwrap_or_default();
+    crate::otel::response_headers(&pending.otel, resp.headers_mut());
     pending.complete(resp.status().as_u16(), &report);
     resp.headers_mut().insert(X_REQUEST_ID.clone(), id_value);
     resp
@@ -324,6 +322,7 @@ struct Pending {
     quiet: bool,
     start: Instant,
     done: bool,
+    otel: crate::otel::Req,
 }
 
 impl Pending {
@@ -339,6 +338,7 @@ impl Pending {
             quiet,
             start: Instant::now(),
             done: false,
+            otel: Default::default(),
         }
     }
 
@@ -360,6 +360,17 @@ impl Pending {
                 .metrics
                 .record(dataset.as_deref(), op, outcome, elapsed, report);
         }
+        crate::otel::on_response(
+            &self.otel,
+            &self.span,
+            &self.st,
+            status,
+            op,
+            outcome,
+            dataset.as_deref(),
+            elapsed,
+            report,
+        );
         if self.st.access_log {
             access_event(
                 &self.span,
@@ -440,6 +451,7 @@ pub fn log_query_text(text: &str) {
             .map_or(text, |(i, _)| &text[..i]);
         tracing::debug!(target: "sparkles::query", query_len = text.len(), query = cut);
     }
+    crate::otel::query_text(text);
 }
 
 // -------------------------------------------------------------------- metrics ------
@@ -592,6 +604,12 @@ impl Metrics {
         ds.ops[op.index()]
             .response_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The `dataset` label of a request to `dataset` (see [`Metrics::series`]).
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub fn dataset_label(&self, dataset: Option<&str>) -> String {
+        self.series(dataset).0
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).

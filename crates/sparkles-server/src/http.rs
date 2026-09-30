@@ -36,6 +36,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::RETRY_AFTER,
         header::HeaderName::from_static("ratelimit"),
         header::HeaderName::from_static("ratelimit-policy"),
+        header::HeaderName::from_static("traceresponse"),
     ]);
     let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
@@ -218,10 +219,13 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
 }
 
+/// Run `f` on a blocking thread, inside the request's span (so engine events carry the
+/// request id and engine spans are its children).
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
-    tokio::task::spawn_blocking(f)
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(f))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
@@ -480,6 +484,7 @@ async fn query_endpoint(
     let prefixes = ds.store.prefixes();
     blocking(move || {
         let t = std::time::Instant::now();
+        let t0 = crate::otel::start();
         let snap = ds.store.snapshot();
         let seq = snap.commit;
         let r = sparkles::sparql::query(snap, &query, &opts)?;
@@ -530,6 +535,7 @@ async fn query_endpoint(
             }
         };
         let serialize_ms = ts.elapsed().as_secs_f64() * 1000.0;
+        crate::otel::query_done(t0, &r, serialize_ms);
         tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
         let buf = w.into_inner();
         let report = RequestReport {
@@ -692,6 +698,7 @@ fn write_response(
     receipt: &sparkles::commit::Receipt,
     wanted: bool,
 ) -> Response {
+    crate::otel::commit(receipt);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
         if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
@@ -861,12 +868,14 @@ async fn update_endpoint(
     };
     let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
+        let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,
             &update,
             &opts,
             sparkles::commit::CommitKind::Update,
         )?;
+        crate::otel::update_done(t0, &stats);
         let receipt = stats.commit.expect("update receipts");
         let report = RequestReport {
             operation: Some(Op::Update),
@@ -1984,6 +1993,7 @@ async fn shacl(
         let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
         opts.timeout = Some(timeout);
         let t = std::time::Instant::now();
+        let _validate = tracing::info_span!("shacl.validate").entered();
         let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
             let msg = format!("{e:#}");
             match e.downcast::<Error>() {

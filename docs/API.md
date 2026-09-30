@@ -112,6 +112,84 @@ type MetricsSnapshot = {
 };
 ```
 
+### OpenTelemetry
+
+`sparkles serve` exports traces, metrics and (optionally) logs over OTLP. It is off by
+default: nothing is exported and no connection is opened unless `--otel` is given or the
+environment asks for it (`OTEL_EXPORTER_OTLP_ENDPOINT` or a signal-specific endpoint, or
+`OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER=otlp`).
+`OTEL_SDK_DISABLED=true` turns it off again. Builds without the `otel` cargo feature (on by
+default) have none of it.
+
+| Variable | Meaning |
+|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | collector address (default `http://localhost:4318`, or `:4317` for gRPC) |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `…_{TRACES,METRICS,LOGS}_PROTOCOL` | `http/protobuf` (default) or `grpc` (plain-text gRPC; use `http/protobuf` for an `https://` collector) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` (and per signal) | as specified by OpenTelemetry (no compression support is built in) |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | resource; `service.name` defaults to `sparkles` |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | default `parentbased_always_on` |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp` (the default once enabled) or `none` |
+| `OTEL_LOGS_EXPORTER` | `otlp` or `none` (the default: logs are opt-in, see below) |
+| `OTEL_METRIC_EXPORT_INTERVAL` | milliseconds between metric exports (default 60000) |
+| `OTEL_BSP_*` | batch span processor settings |
+
+Flags of `serve`: `--otel` (enable), `--otel-logs` (export log events too),
+`--otel-query-text` (record query and update text, which may hold data, in
+`db.query.text`, cut to 2048 characters, and plan operator descriptions), and
+`--otel-plan-spans` (one span per executed plan operator). Spans and log records are sent
+in batches; on SIGTERM / SIGINT the server finishes its requests, then flushes the
+exporters for at most 5 seconds. The resource carries `service.name`, `service.version`,
+`service.instance.id` (a UUID per process), `host.name` and `process.pid`.
+
+**Traces.** Each request is a server span named after its route (`GET /{ds}/sparql`),
+continuing the trace of an incoming W3C `traceparent` / `tracestate`. Attributes:
+`http.request.method`, `http.route`, `http.response.status_code`, `url.scheme`,
+`url.path` (never the query string), `server.address` / `server.port` (from `Host`),
+`client.address` (the peer), `user_agent.original`, `sparkles.request_id`,
+`db.system.name` = `sparkles`, `db.namespace` (the dataset), `db.operation.name` (the
+operation of the access log: `query`, `update`, `gsp`, …), `sparkles.sparql.kind`
+(`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`), `sparkles.outcome`,
+`db.response.returned_rows`, `http.response.body.size`, `sparkles.memory.peak_bytes`,
+and for writes `sparkles.commit.seq`. 5xx responses set the span status to error with
+`error.type`. Children:
+
+* `sparql.parse`, `sparql.plan`, `sparql.execute` (with `db.response.returned_rows`) and
+  `sparql.serialize` for queries; `sparql.parse` and `sparql.execute` for updates. They
+  are synthesized after the request from the recorded timings, so the executor itself is
+  not instrumented.
+* With `--otel-plan-spans`, the executed operator tree under `sparql.execute`: one span
+  per operator (at most 256) with `sparkles.operator`, `sparkles.rows`,
+  `sparkles.rows.estimated`, `sparkles.cost.estimated` and `sparkles.cached`. Durations
+  are the recorded ones; children are laid out one after another from their parent's
+  start, so their offsets are approximate.
+* `commit` (`seq`, `kind`, `inserted`, `deleted`) for every commit, `sparql.service` (a
+  client span) for each SERVICE call, and `shacl.validate`.
+* Refusals by a rate limit add a `rate_limited` event and `sparkles.rate_limit.class`.
+
+Background tasks (compaction, backups, clones, reasoning, full-text rebuilds) are root
+spans `task {kind}` linked to the request that started them. SERVICE and `LOAD <url>`
+requests carry `traceparent` (and `tracestate`), so a federated endpoint continues the
+trace. A sampled request's response carries `traceresponse: 00-{trace-id}-{span-id}-01`
+(W3C Trace Context Level 2, exposed through CORS), and its log lines carry `trace_id`
+and `span_id` in the request span.
+
+**Metrics.** `http.server.request.duration` (histogram, seconds, the buckets of
+`sparkles_request_duration_seconds`) with `http.request.method`, `http.route`,
+`http.response.status_code`, `url.scheme`, `db.namespace` (the capped `dataset` label),
+`db.operation.name` and, for 5xx, `error.type`. The Prometheus registry is exported as
+observable instruments read at collection time, so nothing is counted twice and
+`/$/metrics` is unchanged: `sparkles.requests` (`dataset`, `operation`, `outcome`),
+`sparkles.response.size`, `sparkles.requests.active`, `sparkles.result.rows`,
+`sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
+`sparkles.delta.quads`, `sparkles.wal.size`, `sparkles.disk.size`,
+`sparkles.block_cache.{size,capacity,hits,misses}`,
+`sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.ready`,
+`process.uptime` and `process.memory.usage`.
+
+**Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
+`RUST_LOG` (the access log included) is also exported as an OTLP log record with the
+trace and span id of its request.
+
 ### Rate limiting
 
 Off by default. `sparkles serve --rate-limit SPEC` (repeatable) and/or
