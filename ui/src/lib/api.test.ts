@@ -268,3 +268,32 @@ describe('commits and full-text admin', () => {
     ).toBe(4);
   });
 });
+
+describe('CSRF', () => {
+  afterEach(() =>
+    api.setAuthHooks({ csrf: () => undefined, unauthorized: () => {}, ready: async () => {} }),
+  );
+
+  it('an unsafe request made before the caller is known waits for its CSRF token', async () => {
+    let token: string | undefined;
+    let loaded!: () => void;
+    const whoami = new Promise<void>((r) => (loaded = r));
+    api.setAuthHooks({ csrf: () => token, ready: () => whoami });
+    const calls = stubFetch(() => jsonResponse({ head: { vars: [] }, results: { bindings: [] } }));
+
+    const q = api.query('ds', 'SELECT * WHERE { ?s ?p ?o }');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls).toHaveLength(0);
+    token = 'csrf-1';
+    loaded();
+    await q;
+    expect(new Headers(calls[0].init.headers).get('X-Sparkles-CSRF')).toBe('csrf-1');
+  });
+
+  it('safe requests do not wait', async () => {
+    api.setAuthHooks({ ready: () => new Promise(() => {}) });
+    const calls = stubFetch(() => new Response('2026-01-01T00:00:00Z'));
+    await api.ping();
+    expect(calls).toHaveLength(1);
+  });
+});

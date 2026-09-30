@@ -101,7 +101,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | OpenTelemetry (`otel` cargo feature, off at run time unless `--otel` or `OTEL_*` enable it): OTLP traces with W3C `traceparent` in and out (SERVICE, LOAD), HTTP/database semantic-convention attributes, query phase and operator-tree spans synthesized from recorded timings, commit and background-task spans; metrics (`http.server.request.duration` plus the Prometheus registry, bridged); optional OTLP logs with trace correlation | ✅ |
 | Rate limiting: per-client GCRA buckets and concurrency caps per request class (`auth`, `query`, `update`, `admin`) with per-dataset overrides, trusted-proxy client addresses, `429`/`503` with `Retry-After` and `RateLimit` headers, bounded client tracking, SIGHUP reload; off by default | ✅ |
 | Authentication and per-dataset access control (`serve --auth-config`, off by default): levels `read` < `write` < `admin` by dataset name or pattern plus `metrics` / `federate` / `server-admin`, deny by default, hidden datasets answer `404`; HTTP Basic users (argon2id), scoped, expiring, revocable API tokens (`Authorization: Bearer spk_…`, hashed at rest, never above their owner), OIDC sign-in for the UI (native, authorization code + PKCE), trusted forward-auth proxy headers from configured CIDRs or a Unix socket, group-to-role mapping; CSRF and CORS rules for cookies; `sparkles auth login` (browser loopback or device code) and remote `query` / `update` / `load --server`; see [docs/API.md](docs/API.md#authentication-and-access-control) | ✅ |
-| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations), commit history and write receipts, full-text search (index admin panel, ranked `text:query` search in Explore), vector similarity ("Similar" in the explorer, compact vector literals); embedded in the server binary; Vitest unit tests, and a mock server for UI development | ✅ |
+| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations), commit history and write receipts, full-text search (index admin panel, ranked `text:query` search in Explore), vector similarity ("Similar" in the explorer, compact vector literals); embedded in the server binary; Vitest unit tests, Playwright end-to-end smoke tests against a real server (sign-in with a password and an API token, query, explore, Similar, text search, history), and a mock server for UI development | ✅ |
 
 ## Performance
 
@@ -517,6 +517,7 @@ mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
 mise run ui:test      # UI unit tests (Vitest)
+mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
 mise run ci           # fmt:check + lint + test + ui:test
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
@@ -529,6 +530,14 @@ Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run w
 they run `cargo fmt`, oxfmt on `ui/` (the UI's formatter, a devDependency), `nix fmt` (nixfmt,
 from the flake) on `*.nix`, and shfmt and shellcheck on shell scripts. `mise run hooks:install` installs the
 hook once per clone; `mise run hooks:run` runs every hook over the whole tree.
+
+`mise run ui:e2e` builds the UI and a debug server, starts `sparkles serve` on a free port of
+127.0.0.1 with a temporary data directory, a small dataset and an auth configuration (one user,
+one API token), runs the Playwright tests in `ui/tests/e2e` in headless Chromium and stops the
+server. `SPARKLES_BIN=path/to/sparkles` tests another binary; extra arguments go to
+`playwright test` (`mise run ui:e2e -- -g Similar`). The flake's dev shell provides a Chromium
+matching the pinned `@playwright/test` (`nix develop -c mise run ui:e2e`); elsewhere the task
+downloads one with `playwright install chromium`. It is not part of `mise run ci`.
 
 ### Nix
 

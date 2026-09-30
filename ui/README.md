@@ -54,9 +54,27 @@ changes the port; `MOCK_LATENCY=300 pnpm mock` adds latency to every response;
 ```sh
 pnpm check     # svelte-check, must report 0 errors
 pnpm test      # Vitest unit tests for the pure modules in src/lib (*.test.ts)
+pnpm e2e       # Playwright end-to-end tests (tests/e2e) against a real server, see below
 pnpm build     # writes build/ (index.html + /ui/_app/… assets)
 pnpm preview   # serves build/ at http://localhost:4173/ui/ with the same proxy
 ```
+
+## End-to-end tests
+
+`tests/e2e` holds Playwright smoke tests of the UI against a real `sparkles serve`:
+`global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) on a free port of
+127.0.0.1 with a temporary data directory and an auth configuration (user `alice` with a
+password, a static server-admin API token), loads a small dataset (`data.ts`: labels,
+comments for full-text search, `spk:vector` embeddings for Similar) in two commits, enables
+full-text search and signs `alice` in; the teardown stops the server and deletes the
+directory (`SPARKLES_E2E_KEEP=1` keeps it, with `server.log`). A debug binary reads `build/`
+from disk, so run `pnpm build` first. The tests cover signing in with a password and with a
+token minted on the tokens page, Bearer tokens on the SPARQL endpoint, the query page,
+Explore, Similar, text search and the dataset history.
+
+`@playwright/test` is pinned to the flake's `playwright-driver` version, whose Chromium the
+dev shell provides (`PLAYWRIGHT_BROWSERS_PATH`); without Nix, `pnpm exec playwright install
+chromium` downloads one. `mise run ui:e2e` does all of this.
 
 ## Serving from the Rust server
 

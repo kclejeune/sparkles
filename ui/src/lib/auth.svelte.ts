@@ -31,6 +31,7 @@ class AuthStore {
     setAuthHooks({
       csrf: () => this.who?.csrfToken,
       unauthorized: () => this.toLogin(),
+      ready: () => this.ensure(),
     });
   }
 

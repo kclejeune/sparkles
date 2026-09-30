@@ -10,6 +10,12 @@ const config = {
     adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html', strict: false }),
     paths: { base: '/ui', relative: false },
     alias: { $components: 'src/lib/components' },
+    // type-check the Playwright configuration too (tests/ is already included)
+    typescript: {
+      config: (tsconfig) => {
+        tsconfig.include.push('../playwright.config.ts');
+      },
+    },
   },
 };
 

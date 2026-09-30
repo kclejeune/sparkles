@@ -18,6 +18,11 @@ stdenvNoCC.mkDerivation (finalAttrs: {
         (lib.fileset.maybeMissing ../ui/node_modules)
         (lib.fileset.maybeMissing ../ui/build)
         (lib.fileset.maybeMissing ../ui/.svelte-kit)
+        # the Playwright tests and their output are not part of the build
+        (lib.fileset.maybeMissing ../ui/tests)
+        (lib.fileset.maybeMissing ../ui/playwright.config.ts)
+        (lib.fileset.maybeMissing ../ui/test-results)
+        (lib.fileset.maybeMissing ../ui/playwright-report)
       ]
     );
   };
@@ -32,7 +37,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     inherit (finalAttrs) pname version src;
     pnpm = pnpm_10;
     fetcherVersion = 4;
-    hash = "sha256-cJsR2mKj9v7+9ELcbpWu/UV+p1Mpxl7QC/HrQzxUv5Y=";
+    hash = "sha256-SeBw8YHV6QGSzMfKisvJi2x1gGDL5yWbVAu6o5QBi98=";
   };
 
   buildPhase = ''
