@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
 mod alloc;
+mod check_cmd;
 mod clone;
 mod http;
 mod obs;
@@ -222,6 +223,22 @@ enum Cmd {
     Stats {
         #[arg(long)]
         loc: PathBuf,
+    },
+    /// Verify a database without modifying it (safe next to a running server); exits
+    /// 0 when clean, 1 on errors, 2 on warnings only
+    Check {
+        /// Database directory
+        #[arg(long, required_unless_present = "data", conflicts_with = "data")]
+        loc: Option<PathBuf>,
+        /// Server data directory: check every database in its `databases/`
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Metadata only: no block decoding, no per-key vocabulary or checksum pass
+        #[arg(long)]
+        quick: bool,
     },
     /// List the database's commits (works while a server holds the database)
     Log {
@@ -853,6 +870,12 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Check {
+            loc,
+            data,
+            format,
+            quick,
+        } => check_cmd::run(loc, data, &format, quick),
         Cmd::Stats { loc } => {
             let store = Store::open(&loc, opts)?;
             let s = store.snapshot();

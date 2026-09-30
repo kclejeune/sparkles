@@ -59,6 +59,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | Backups (gzipped N-Quads) | ✅ |
+| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
 ### SPARQL (ARQ equivalent)
@@ -82,7 +83,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`, `schema`, `clone`), operating on the database directory directly | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`, `schema`, `clone`, `check`), operating on the database directory directly | ✅ |
 | Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`): same quads and blank-node ids, new dataset id with `forkedFrom`, inferences copied or dropped | ✅ |
 | Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
@@ -423,12 +424,46 @@ sparkles backup  --loc db --out backups/
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
+sparkles check   --loc db                     # verify the files, read-only (--quick, --format json)
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
+
+### Checking a database
+
+`sparkles check --loc db` verifies a database directory without modifying it: it takes
+no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
+run next to a server that holds the database (`--data DIR` checks every database of a
+server data directory). Each check prints one line, `ok`, `warning` or `error`, with the
+file, offset, block, row, commit or id of every problem below it; `--format json`
+prints the same report as JSON. The exit status is **0** when everything is clean,
+**1** when any check found an error, and **2** when there are warnings only.
+
+| Check | What it verifies |
+|---|---|
+| `layout` | `CURRENT` names an existing generation; `dataset.json`, the generation's `commit.json` (same dataset id) and `prefixes.json` parse; leftovers of interrupted work (`*.tmp`, `text.new`/`text.old`, old or unfinished `gen-NNNN`, a set-aside catalog) are warnings |
+| `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count |
+| `vocabulary` | the front-coded vocabulary decodes, its keys strictly increase, its size matches `meta.json`, and every vocabulary id in the permutations is below it |
+| `delta-vocabulary` | the update vocabulary is well formed and holds no duplicate (a torn tail is a warning) |
+| `perm.spo` … `perm.gspo` | block metadata is contiguous and sorted and fits the file; the row count matches `meta.json`; every block decodes to its row count, its first and last keys match the metadata, keys strictly increase within and across blocks, and every id is valid for its position |
+| `permutations` | the 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads |
+| `wal` | records are well formed; every commit record's checksum matches (a damaged final transaction is a warning: open truncates it); commit numbers continue from the generation's base commit; ids resolve |
+| `catalog` | `commits.bin` record checksums and continuity, its dataset id, and agreement with the WAL; a lagging catalog, or damage open can rebuild from the WAL, is a warning, lost history before the generation an error |
+| `text` | `text.json` parses; the index opens read-only, every committed segment file exists and matches its checksum; its commit against the WAL (behind is a warning: caught up or rebuilt on open) |
+| `reasoning` | `reasoning.json` parses and names an existing commit |
+
+Errors are what `Store::open` refuses, what loses acknowledged data or history, or what
+queries would read wrongly; warnings are states open handles by itself. A server writing
+meanwhile can cause transient warnings (an in-flight transaction looks like a torn
+tail), never errors. `--quick` reads metadata only: block metadata instead of every
+block, the first key of each vocabulary block, segment files' presence instead of
+their checksums. On the 10.5M-quad benchmark database a full check takes about 0.3 s
+and a quick one 20 ms (16 cores, warm page cache). The same check is a library call:
+`sparkles::check::check(root, &CheckOptions::default())` returns a serializable
+`CheckReport`.
 
 ### mise tasks
 
