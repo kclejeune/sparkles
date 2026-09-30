@@ -76,6 +76,34 @@ pub struct AppState {
     pub allow_service: bool,
 }
 
+/// Reasoning status is kept inside the database directory (`reasoning.json`) so it
+/// survives restarts however the database is attached (registry, `--loc`, CLI `infer`).
+pub fn read_reasoning_file(root: &Path) -> Option<ReasoningInfo> {
+    serde_json::from_slice(&std::fs::read(root.join("reasoning.json")).ok()?).ok()
+}
+
+pub fn write_reasoning_file(root: &Path, info: Option<&ReasoningInfo>) -> Result<()> {
+    let path = root.join("reasoning.json");
+    match info {
+        Some(i) => std::fs::write(&path, serde_json::to_vec_pretty(i)?)?,
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+impl Dataset {
+    /// Update the reasoning status in memory and in the database directory.
+    pub fn set_reasoning(&self, info: Option<ReasoningInfo>) -> Result<()> {
+        if let Some(root) = self.store.root() {
+            write_reasoning_file(root, info.as_ref())?;
+        }
+        *self.reasoning.write() = info;
+        Ok(())
+    }
+}
+
 pub fn now() -> String {
     sparkles::builder::now_rfc3339()
 }
@@ -116,7 +144,10 @@ impl AppState {
                 .with_context(|| format!("reading {}", reg_path.display()))?;
             for e in reg.datasets {
                 let ds = state.open_dataset(&e.name, e.kind, None)?;
-                *ds.reasoning.write() = e.reasoning;
+                // older registries kept the reasoning status only here
+                if ds.reasoning.read().is_none() {
+                    *ds.reasoning.write() = e.reasoning;
+                }
                 state.datasets.write().insert(e.name.clone(), ds);
                 tracing::info!("opened dataset /{} ({:?})", e.name, e.kind);
             }
@@ -135,11 +166,12 @@ impl AppState {
                     .with_context(|| format!("opening database {}", dir.display()))?
             }
         };
+        let reasoning = store.root().and_then(read_reasoning_file);
         Ok(Arc::new(Dataset {
             name: name.to_string(),
             kind,
             store,
-            reasoning: RwLock::new(None),
+            reasoning: RwLock::new(reasoning),
             ephemeral: loc.is_some(),
         }))
     }

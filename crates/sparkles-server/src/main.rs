@@ -431,6 +431,7 @@ fn main() -> Result<()> {
             let store = Store::open(&loc, opts)?;
             if clear {
                 let n = sparkles_reasoner::clear(&store)?;
+                state::write_reasoning_file(&loc, None)?;
                 eprintln!("removed {n} inferred triples");
                 return Ok(());
             }
@@ -440,7 +441,17 @@ fn main() -> Result<()> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("unknown profile '{profile}'"))?,
             };
+            let profile_name = profile.name().to_string();
             let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
+            // lets `sparkles serve` pick the inferences up for this database
+            state::write_reasoning_file(
+                &loc,
+                Some(&state::ReasoningInfo {
+                    profile: profile_name,
+                    inferred: r.inferred,
+                    at: state::now(),
+                }),
+            )?;
             eprintln!(
                 "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
                 r.inferred,

@@ -1064,11 +1064,11 @@ async fn reason(
             ..Default::default()
         };
         let report = sparkles_reasoner::materialize(&ds.store, &profile, &opts)?;
-        *ds.reasoning.write() = Some(ReasoningInfo {
+        ds.set_reasoning(Some(ReasoningInfo {
             profile: profile_name.clone(),
             inferred: report.inferred,
             at: now(),
-        });
+        }))?;
         st2.save_registry()?;
         Ok(format!(
             "{} inferred triples in {} ms ({} iterations){}",
@@ -1094,7 +1094,7 @@ async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
     let st2 = st.clone();
     blocking(move || {
         let n = sparkles_reasoner::clear(&ds.store)?;
-        *ds.reasoning.write() = None;
+        ds.set_reasoning(None)?;
         st2.save_registry()?;
         Ok(Json(json!({ "removed": n })).into_response())
     })
