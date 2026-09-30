@@ -162,8 +162,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         state.clone(),
         crate::auth::middleware,
     ))
-    // outside the auth layer: an address that failed to authenticate too often is refused
-    // before any credential is checked, and every failure is charged to it
+    // outside the auth layer: names the client, and charges its failed credential checks
+    // to it (an address that failed too often has its password checks refused)
     .layer(axum::middleware::from_fn_with_state(
         state.rate_limit.clone(),
         crate::ratelimit::admit,

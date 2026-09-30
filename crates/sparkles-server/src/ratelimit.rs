@@ -1590,7 +1590,7 @@ impl ClientKey {
     }
 }
 
-/// Whether an [`ClientKey::Ip`] value is an IPv4 address (mapped into IPv6).
+/// Whether a [`ClientKey::Ip`] value is an IPv4 address (mapped into IPv6).
 fn is_mapped_v4(a: u128) -> bool {
     a >> 32 == 0xffff
 }

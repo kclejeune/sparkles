@@ -101,7 +101,9 @@ With rate limits configured (or authentication on), `sparkles_rate_limited_total
 `outcome="rate_limited"` appears in `sparkles_requests_total`. The size of each limiter's
 client state is in `sparkles_rate_limit_keys{limiter}`, `sparkles_rate_limit_max_keys{limiter}`,
 `sparkles_rate_limit_evictions_total{limiter}` and `sparkles_rate_limit_penalties{limiter}`
-(`limiter` is `requests`, or `auth` for the auth layer's own limits).
+(`limiter` is `requests`, or `auth` for the auth layer's own limits), and
+`sparkles_rate_limit_untrusted_forwarded_total{limiter}` counts requests whose
+`X-Forwarded-For` or `Forwarded` came from a peer that is not a trusted proxy (ignored).
 
 ```ts
 type MetricsSnapshot = {
