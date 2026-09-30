@@ -42,7 +42,7 @@ WORK=$(cd "$WORK" && pwd)
 cd "$WORK"
 
 nixbin() { # nixbin <pkg> <bin>
-  if command -v "$2" >/dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
+  if command -v "$2" > /dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
 }
 ENGINES=${ENGINES:-sparkles jena qlever fluree oxigraph}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
@@ -63,23 +63,31 @@ if has fluree && [ -z "${FLUREE:-}" ]; then
     "Linux aarch64") FT=aarch64-unknown-linux-gnu ;;
     "Darwin arm64") FT=aarch64-apple-darwin ;;
     "Darwin x86_64") FT=x86_64-apple-darwin ;;
-    *) echo "no Fluree release binary for $(uname -sm); set FLUREE" >&2; exit 1 ;;
+    *)
+      echo "no Fluree release binary for $(uname -sm); set FLUREE" >&2
+      exit 1
+      ;;
   esac
-  FDIR="fluree-$FLUREE_VERSION"; FLUREE="$WORK/$FDIR/fluree-db-cli-$FT/fluree"
+  FDIR="fluree-$FLUREE_VERSION"
+  FLUREE="$WORK/$FDIR/fluree-db-cli-$FT/fluree"
   if [ ! -x "$FLUREE" ]; then
     mkdir -p "$FDIR"
     FURL="https://github.com/fluree/db/releases/download/v$FLUREE_VERSION/fluree-db-cli-$FT.tar.xz"
     curl -sfL "$FURL" -o "$FDIR/fluree.tar.xz"
     want=$(curl -sfL "$FURL.sha256" | cut -d' ' -f1)
-    got=$(sha256sum "$FDIR/fluree.tar.xz" 2>/dev/null || shasum -a 256 "$FDIR/fluree.tar.xz"); got=${got%% *}
-    [ "$want" = "$got" ] || { echo "Fluree checksum mismatch ($got != $want)" >&2; exit 1; }
+    got=$(sha256sum "$FDIR/fluree.tar.xz" 2> /dev/null || shasum -a 256 "$FDIR/fluree.tar.xz")
+    got=${got%% *}
+    [ "$want" = "$got" ] || {
+      echo "Fluree checksum mismatch ($got != $want)" >&2
+      exit 1
+    }
     tar xJf "$FDIR/fluree.tar.xz" -C "$FDIR"
   fi
 fi
 
 # merge <new.json> <dest.json>: replace/add hyperfine results by command name
 merge() {
-  python3 - "$1" "$2" <<'EOF'
+  python3 - "$1" "$2" << 'EOF'
 import json, os, sys
 new, dest = sys.argv[1], sys.argv[2]
 n = json.load(open(new))
@@ -92,7 +100,7 @@ EOF
 }
 # setj <file> <key> <engine>=<value>…: merge values into a JSON object (rows, RSS)
 setj() {
-  python3 - "$@" <<'EOF'
+  python3 - "$@" << 'EOF'
 import json, os, sys
 f, key, kvs = sys.argv[1], sys.argv[2], sys.argv[3:]
 d = json.load(open(f)) if os.path.exists(f) else {}
@@ -131,85 +139,121 @@ if [ -z "${SKIP_LOAD:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------- servers
-SPORT=3931; JPORT=3933; QPORT=3932; FPORT=3934; OPORT=3935
+SPORT=3931
+JPORT=3933
+QPORT=3932
+FPORT=3934
+OPORT=3935
 PIDS=()
 # on exit, also stop whatever listens on a selected engine's port: `fuseki-server` is a
 # wrapper script whose JVM outlives it
 stop_all() {
-  [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null
+  [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2> /dev/null
   for p in "${PORT[@]}"; do
-    pid=$(ss -ltnp 2>/dev/null | grep ":$p " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    pid=$(ss -ltnp 2> /dev/null | grep ":$p " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    [ -n "$pid" ] && kill "$pid" 2> /dev/null
   done
   true
 }
 trap stop_all EXIT
-wait_for() { for _ in $(seq 1 240); do curl -sf "$1" >/dev/null 2>&1 && return 0; sleep 0.5; done; echo "timeout waiting for $1" >&2; exit 1; }
+wait_for() {
+  for _ in $(seq 1 240); do
+    curl -sf "$1" > /dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "timeout waiting for $1" >&2
+  exit 1
+}
 # per engine: result name, query endpoint, update command (printf template taking the
 # update file under queries/), port (for RSS)
 declare -A NAME URL UPDATE PORT
 if has sparkles; then
   # shellcheck disable=SC2086 # SPARKLES_ARGS is a list of flags
   "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="${SPARKLES_DB:-$WORK/sparkles.db}" --port $SPORT --timeout 600 $SPARKLES_ARGS > sparkles.log 2>&1 &
-  SPID=$!; PIDS+=($SPID); wait_for "localhost:$SPORT/\$/ping"
-  NAME[sparkles]=sparkles; URL[sparkles]=localhost:$SPORT/bench/sparql; PORT[sparkles]=$SPORT
+  SPID=$!
+  PIDS+=("$SPID")
+  wait_for "localhost:$SPORT/\$/ping"
+  NAME[sparkles]=sparkles
+  URL[sparkles]=localhost:$SPORT/bench/sparql
+  PORT[sparkles]=$SPORT
   UPDATE[sparkles]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$SPORT/bench/update"
 fi
 if has jena; then
   JVM_ARGS="-Xmx8G" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
-  PIDS+=($!); wait_for "localhost:$JPORT/\$/ping"
-  NAME[jena]=jena-fuseki; URL[jena]=localhost:$JPORT/bench/sparql; PORT[jena]=$JPORT
+  PIDS+=($!)
+  wait_for "localhost:$JPORT/\$/ping"
+  NAME[jena]=jena-fuseki
+  URL[jena]=localhost:$JPORT/bench/sparql
+  PORT[jena]=$JPORT
   UPDATE[jena]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$JPORT/bench/update"
 fi
 if has qlever; then
   (cd qlever-index && exec "$QSERVER" -i bench -p $QPORT -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
-  PIDS+=($!); wait_for "localhost:$QPORT/?cmd=stats"
-  NAME[qlever]=qlever; URL[qlever]=localhost:$QPORT/; PORT[qlever]=$QPORT
+  PIDS+=($!)
+  wait_for "localhost:$QPORT/?cmd=stats"
+  NAME[qlever]=qlever
+  URL[qlever]=localhost:$QPORT/
+  PORT[qlever]=$QPORT
   UPDATE[qlever]="curl -sf -o /dev/null --data-urlencode update@queries/%s --data-urlencode access-token=bench localhost:$QPORT/"
 fi
 if has fluree; then
   # property-path traversal is capped at 1M visited nodes by default (knows-reach at 10M)
   (cd fluree && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=600000 \
     exec "$FLUREE" server run --listen-addr 127.0.0.1:$FPORT --storage-path "$WORK/fluree/.fluree/storage" --log-level warn > ../fluree.log 2>&1) &
-  PIDS+=($!); wait_for "localhost:$FPORT/health"
-  NAME[fluree]=fluree; URL[fluree]=localhost:$FPORT/v1/fluree/query/bench:main; PORT[fluree]=$FPORT
+  PIDS+=($!)
+  wait_for "localhost:$FPORT/health"
+  NAME[fluree]=fluree
+  URL[fluree]=localhost:$FPORT/v1/fluree/query/bench:main
+  PORT[fluree]=$FPORT
   UPDATE[fluree]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$FPORT/v1/fluree/update/bench:main"
 fi
 if has oxigraph; then
   "$OXIGRAPH" serve --location "$WORK/oxigraph.db" --bind 127.0.0.1:$OPORT --timeout-s 600 > oxigraph.log 2>&1 &
-  PIDS+=($!); wait_for "localhost:$OPORT/query?query=ASK%7B%7D"
-  NAME[oxigraph]=oxigraph; URL[oxigraph]=localhost:$OPORT/query; PORT[oxigraph]=$OPORT
+  PIDS+=($!)
+  wait_for "localhost:$OPORT/query?query=ASK%7B%7D"
+  NAME[oxigraph]=oxigraph
+  URL[oxigraph]=localhost:$OPORT/query
+  PORT[oxigraph]=$OPORT
   UPDATE[oxigraph]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$OPORT/update"
 fi
+# the update command of engine $1 for the update file $2 (UPDATE[] values are printf
+# templates taking the file name)
+upd() {
+  # shellcheck disable=SC2059
+  printf "${UPDATE[$1]}" "$2"
+}
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
 
 # ---------------------------------------------------------------------------- queries
 P='PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> '
 declare -a NAMES
-add() { NAMES+=("$1"); printf '%s%s' "$P" "$2" > "queries/$1.rq"; }
+add() {
+  NAMES+=("$1")
+  printf '%s%s' "$P" "$2" > "queries/$1.rq"
+}
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
-add count-all      'SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }'
-add types-grouped  'SELECT ?t (COUNT(?s) AS ?c) WHERE { ?s a ?t } GROUP BY ?t ORDER BY DESC(?c)'
-add star-join      'SELECT ?p ?n ?a ?o WHERE { ?p a ex:Researcher ; foaf:name ?n ; foaf:age ?a ; ex:worksFor ?o . ?o ex:city "Kyoto" }'
-add two-hop-count  'SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }'
-add range-topk     'SELECT ?p ?s WHERE { ?p ex:salary ?s FILTER(?s > 150000) } ORDER BY DESC(?s) LIMIT 10'
+add count-all 'SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }'
+add types-grouped 'SELECT ?t (COUNT(?s) AS ?c) WHERE { ?s a ?t } GROUP BY ?t ORDER BY DESC(?c)'
+add star-join 'SELECT ?p ?n ?a ?o WHERE { ?p a ex:Researcher ; foaf:name ?n ; foaf:age ?a ; ex:worksFor ?o . ?o ex:city "Kyoto" }'
+add two-hop-count 'SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }'
+add range-topk 'SELECT ?p ?s WHERE { ?p ex:salary ?s FILTER(?s > 150000) } ORDER BY DESC(?s) LIMIT 10'
 add optional-count 'SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:Student OPTIONAL { ?p ex:worksFor ?o } }'
-add contains       'SELECT (COUNT(*) AS ?c) WHERE { ?p foaf:name ?n FILTER(CONTAINS(?n, "Ada")) }'
-add group-avg      'SELECT ?o (AVG(?a) AS ?avg) (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 10'
-add path-plus      'SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/doc/1> ex:cites+ ?d }'
-add distinct-obj   'SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s foaf:knows ?o }'
-add export-500k    'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 500000'
+add contains 'SELECT (COUNT(*) AS ?c) WHERE { ?p foaf:name ?n FILTER(CONTAINS(?n, "Ada")) }'
+add group-avg 'SELECT ?o (AVG(?a) AS ?avg) (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 10'
+add path-plus 'SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/doc/1> ex:cites+ ?d }'
+add distinct-obj 'SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s foaf:knows ?o }'
+add export-500k 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 500000'
 # extended shapes: known strengths of the other engines and stress cases
 add predicate-counts 'SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p'
-add order-by-full  'SELECT ?p ?n WHERE { ?p foaf:name ?n } ORDER BY ?n'
+add order-by-full 'SELECT ?p ?n WHERE { ?p foaf:name ?n } ORDER BY ?n'
 add optional-chain 'SELECT ?p ?o ?c WHERE { ?p a ex:Student OPTIONAL { ?p ex:advisor ?a . ?a ex:worksFor ?o OPTIONAL { ?o ex:city ?c } } }'
-add minus          'SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:Researcher MINUS { ?p ex:authorOf ?d } }'
-add subquery-agg   'SELECT ?o ?n WHERE { { SELECT ?o (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o } GROUP BY ?o } FILTER(?n > 55) }'
-add regex-iri      'SELECT (COUNT(*) AS ?c) WHERE { ?s foaf:name ?o FILTER(REGEX(STR(?s), "person/1[0-9]{3}$")) }'
-add knows-reach    'SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/person/0> foaf:knows* ?x }'
-add distinct-join  'SELECT DISTINCT ?o WHERE { ?a foaf:knows ?b . ?b ex:worksFor ?o }'
-add lang-filter    'SELECT (COUNT(*) AS ?c) WHERE { ?d ex:title ?t FILTER(LANGMATCHES(LANG(?t), "en")) }'
+add minus 'SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:Researcher MINUS { ?p ex:authorOf ?d } }'
+add subquery-agg 'SELECT ?o ?n WHERE { { SELECT ?o (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o } GROUP BY ?o } FILTER(?n > 55) }'
+add regex-iri 'SELECT (COUNT(*) AS ?c) WHERE { ?s foaf:name ?o FILTER(REGEX(STR(?s), "person/1[0-9]{3}$")) }'
+add knows-reach 'SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/person/0> foaf:knows* ?x }'
+add distinct-join 'SELECT DISTINCT ?o WHERE { ?a foaf:knows ?b . ?b ex:worksFor ?o }'
+add lang-filter 'SELECT (COUNT(*) AS ?c) WHERE { ?d ex:title ?t FILTER(LANGMATCHES(LANG(?t), "en")) }'
 
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
@@ -220,97 +264,116 @@ T='GRAPH <http://example.org/bench/g> { <http://example.org/bench/s> <http://exa
 printf 'INSERT DATA { %s }' "$T" > queries/_update.ru
 printf 'DELETE DATA { %s }' "$T" > queries/_delete.ru
 printf 'ASK { %s }' "$T" > queries/_ask.rq
-for e in $ENGINES; do eval "$(printf "${UPDATE[$e]}" _delete.ru)" || true; done
+for e in $ENGINES; do eval "$(upd "$e" _delete.ru)" || true; done
 
 # answer check: every engine's answer to every query is fingerprinted (row count, exact
 # RDF terms, numeric values) into results/answers.json; the summary compares engines. An
 # engine that errors (HTTP failure) is reported as "error" instead of a time. LIMIT
 # without ORDER BY may legitimately return different solutions: row counts only.
 COUNT_ONLY="export-500k"
-echo; printf '%-16s' rows; for e in $ENGINES; do printf ' %12s' "${NAME[$e]}"; done; echo
+echo
+printf '%-16s' rows
+for e in $ENGINES; do printf ' %12s' "${NAME[$e]}"; done
+echo
 for n in "${NAMES[@]}"; do
   selected "$n" || continue
-  flag=(); [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
+  flag=()
+  [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
   printf '%-16s' "$n"
   for e in $ENGINES; do
     r=$(python3 "$ROOT/scripts/bench-answers.py" "${URL[$e]}" "queries/$n.rq" results/answers.json "$n" "${NAME[$e]}" "${flag[@]}")
     printf ' %12s' "$r"
-  done; echo
+  done
+  echo
 done
 
 if [ -z "${ANSWERS_ONLY:-}" ]; then
-# clears QLever's result cache before every run (a no-op without QLever)
-CLEAR="true"; has qlever && CLEAR="curl -sf -o /dev/null 'localhost:$QPORT/?cmd=clear-cache&access-token=bench'"
-for n in "${NAMES[@]}"; do
-  selected "$n" || continue
-  [ -n "${SKIP_QUERIES:-}" ] && [ -f "results/$n.json" ] && continue
-  echo; echo "== $n"
-  qcmd() { q "${URL[$1]}" "$n"; }
-  mapfile -d '' ARGS < <(engine_args qcmd)
-  hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
-    "${ARGS[@]}" --export-json "results/$n.new.json"
-  merge "results/$n.new.json" "results/$n.json"
-done
+  # clears QLever's result cache before every run (a no-op without QLever)
+  CLEAR="true"
+  has qlever && CLEAR="curl -sf -o /dev/null 'localhost:$QPORT/?cmd=clear-cache&access-token=bench'"
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    [ -n "${SKIP_QUERIES:-}" ] && [ -f "results/$n.json" ] && continue
+    echo
+    echo "== $n"
+    qcmd() { q "${URL[$1]}" "$n"; }
+    mapfile -d '' ARGS < <(engine_args qcmd)
+    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
+      "${ARGS[@]}" --export-json "results/$n.new.json"
+    merge "results/$n.new.json" "results/$n.json"
+  done
 
-# ------------------------------------------------------------------------ update latency
-# a single-triple INSERT DATA of a triple that is not present: an untimed --prepare deletes
-# it before every run, so every timed request performs a real insertion. It goes into a
-# named graph so it never shows up in the default-graph queries above. Durability is each
-# engine's default: Sparkles fsyncs its WAL, TDB2 commits durably, QLever keeps updates
-# in memory only, Fluree commits to its log, and Oxigraph commits a RocksDB transaction
-# (see docs/BENCHMARKS.md).
-ask() { curl -sf --max-time 30 -H 'Accept: application/sparql-results+json' --data-urlencode query@queries/_ask.rq "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boolean"])' 2>/dev/null || echo error; }
-echo; echo "== update-latency"
-ARGS=()
-for e in $ENGINES; do
-  # the mutation must be observable, or the engine's timings would measure a no-op
-  eval "$(printf "${UPDATE[$e]}" _delete.ru)"; a=$(ask "${URL[$e]}")
-  eval "$(printf "${UPDATE[$e]}" _update.ru)"; b=$(ask "${URL[$e]}")
-  if [ "$a" != False ] || [ "$b" != True ]; then
-    echo "${NAME[$e]}: insert/delete not observable (before=$a after=$b); skipping its update timing" >&2
-    continue
+  # ------------------------------------------------------------------------ update latency
+  # a single-triple INSERT DATA of a triple that is not present: an untimed --prepare deletes
+  # it before every run, so every timed request performs a real insertion. It goes into a
+  # named graph so it never shows up in the default-graph queries above. Durability is each
+  # engine's default: Sparkles fsyncs its WAL, TDB2 commits durably, QLever keeps updates
+  # in memory only, Fluree commits to its log, and Oxigraph commits a RocksDB transaction
+  # (see docs/BENCHMARKS.md).
+  ask() { curl -sf --max-time 30 -H 'Accept: application/sparql-results+json' --data-urlencode query@queries/_ask.rq "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boolean"])' 2> /dev/null || echo error; }
+  echo
+  echo "== update-latency"
+  ARGS=()
+  for e in $ENGINES; do
+    # the mutation must be observable, or the engine's timings would measure a no-op
+    eval "$(upd "$e" _delete.ru)"
+    a=$(ask "${URL[$e]}")
+    eval "$(upd "$e" _update.ru)"
+    b=$(ask "${URL[$e]}")
+    if [ "$a" != False ] || [ "$b" != True ]; then
+      echo "${NAME[$e]}: insert/delete not observable (before=$a after=$b); skipping its update timing" >&2
+      continue
+    fi
+    ARGS+=(--prepare "$(upd "$e" _delete.ru)" --command-name "${NAME[$e]}" "$(upd "$e" _update.ru)")
+  done
+  if [ ${#ARGS[@]} -gt 0 ]; then
+    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+      "${ARGS[@]}" --export-json results/update-latency.new.json
+    merge results/update-latency.new.json results/update-latency.json
   fi
-  ARGS+=(--prepare "$(printf "${UPDATE[$e]}" _delete.ru)" --command-name "${NAME[$e]}" "$(printf "${UPDATE[$e]}" _update.ru)")
-done
-if [ ${#ARGS[@]} -gt 0 ]; then
-  hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
-    "${ARGS[@]}" --export-json results/update-latency.new.json
-  merge results/update-latency.new.json results/update-latency.json
-fi
-for e in $ENGINES; do eval "$(printf "${UPDATE[$e]}" _delete.ru)" || true; done
+  for e in $ENGINES; do eval "$(upd "$e" _delete.ru)" || true; done
 
-# ------------------------------------------------------------------- concurrent throughput
-# 160 star-join requests from 16 parallel clients (all engines without result caches, so
-# every request executes the query)
-CONC=${CONC:-16}; NREQ=${NREQ:-160}
-par() { echo "seq $NREQ | xargs -P $CONC -I{} $(q "$1" star-join)"; }
-echo; echo "== throughput ($NREQ requests, $CONC clients)"
-pcmd() { par "${URL[$1]}"; }
-mapfile -d '' ARGS < <(engine_args pcmd)
-hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$CLEAR" \
-  "${ARGS[@]}" --export-json results/throughput.new.json
-merge results/throughput.new.json results/throughput.json
+  # ------------------------------------------------------------------- concurrent throughput
+  # 160 star-join requests from 16 parallel clients (all engines without result caches, so
+  # every request executes the query)
+  CONC=${CONC:-16}
+  NREQ=${NREQ:-160}
+  par() { echo "seq $NREQ | xargs -P $CONC -I{} $(q "$1" star-join)"; }
+  echo
+  echo "== throughput ($NREQ requests, $CONC clients)"
+  pcmd() { par "${URL[$1]}"; }
+  mapfile -d '' ARGS < <(engine_args pcmd)
+  hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$CLEAR" \
+    "${ARGS[@]}" --export-json results/throughput.new.json
+  merge results/throughput.new.json results/throughput.json
 
-# --------------------------------------------------------------------------- memory (RSS)
-rss() { local pid; pid=$(ss -ltnp 2>/dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1); \
-  awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$pid/status" 2>/dev/null || echo "?"; }
-sleep 2 # idle servers may hand free memory back (Sparkles does after 1 s)
-kv=(); for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss "${PORT[$e]}")"); done
-setj results/rss.json "" "${kv[@]}"
-echo; echo "RSS (MiB) after the run: $(cat results/rss.json)"
+  # --------------------------------------------------------------------------- memory (RSS)
+  rss() {
+    local pid
+    pid=$(ss -ltnp 2> /dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$pid/status" 2> /dev/null || echo "?"
+  }
+  sleep 2 # idle servers may hand free memory back (Sparkles does after 1 s)
+  kv=()
+  for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss "${PORT[$e]}")"); done
+  setj results/rss.json "" "${kv[@]}"
+  echo
+  echo "RSS (MiB) after the run: $(cat results/rss.json)"
 
-# Sparkles memory probe (scripts/rss-probe.sh): a fresh server, every query once, then
-# 3 x 160 concurrent star-join requests; RSS at each step, block-cache bytes and peak RSS
-if has sparkles && [ -z "${SKIP_PROBE:-}" ]; then
-  echo; echo "== memory probe"
-  # the probe opens the database itself: stop this run's Sparkles server first
-  kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null || true
-  SPARKLES="$SPARKLES" "$ROOT/scripts/rss-probe.sh" "$WORK"
-fi
+  # Sparkles memory probe (scripts/rss-probe.sh): a fresh server, every query once, then
+  # 3 x 160 concurrent star-join requests; RSS at each step, block-cache bytes and peak RSS
+  if has sparkles && [ -z "${SKIP_PROBE:-}" ]; then
+    echo
+    echo "== memory probe"
+    # the probe opens the database itself: stop this run's Sparkles server first
+    kill "$SPID" 2> /dev/null
+    wait "$SPID" 2> /dev/null || true
+    SPARKLES="$SPARKLES" "$ROOT/scripts/rss-probe.sh" "$WORK"
+  fi
 fi # ANSWERS_ONLY
 
 # ---------------------------------------------------------------------------- summary
-python3 - "$WORK/results" "${NAMES[@]}" <<'EOF'
+python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
 import json, sys, os
 d, names = sys.argv[1], sys.argv[2:]
 ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]

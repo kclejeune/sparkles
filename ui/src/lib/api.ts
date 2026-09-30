@@ -76,9 +76,23 @@ export type ReadyInfo = {
 };
 
 export type Operation =
-  'query' | 'update' | 'gsp' | 'upload' | 'shacl' | 'explain' | 'admin' | 'other';
+  | 'query'
+  | 'update'
+  | 'gsp'
+  | 'upload'
+  | 'shacl'
+  | 'explain'
+  | 'admin'
+  | 'other';
 export type Outcome =
-  'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget' | 'rate_limited' | 'denied';
+  | 'ok'
+  | 'client_error'
+  | 'error'
+  | 'timeout'
+  | 'cancelled'
+  | 'budget'
+  | 'rate_limited'
+  | 'denied';
 export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 

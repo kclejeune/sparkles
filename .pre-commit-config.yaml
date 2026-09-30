@@ -1,0 +1,45 @@
+# Git hooks, run by prek (https://github.com/j178/prek) or pre-commit on staged files.
+#   mise run hooks:install   # install the pre-commit hook (prek install)
+#   mise run hooks:run       # run every hook over all tracked files
+# Tools come from mise.toml (prek, shfmt, shellcheck, node), rust-toolchain.toml (rustfmt),
+# ui/package.json (oxfmt; needs `mise run ui:install`) and the flake (`nix fmt` = nixfmt).
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        # formats the whole workspace (a second or so); vendor/ is outside it
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        exclude: ^vendor/
+        pass_filenames: false
+
+      - id: oxfmt
+        name: oxfmt (ui)
+        # oxfmt runs from ui/node_modules so it can load the project's Svelte compiler;
+        # ui/.oxfmtrc.json applies to files under ui/ and ignores pnpm-lock.yaml
+        entry: mise x -- ui/node_modules/.bin/oxfmt --no-error-on-unmatched-pattern
+        language: system
+        files: ^ui/.*\.(js|mjs|cjs|ts|mts|cts|jsx|tsx|svelte|json|jsonc|json5|css|scss|less|html|vue|md|mdx|ya?ml|toml|graphql)$
+
+      - id: nixfmt
+        name: nixfmt
+        # the flake's `formatter` (pkgs.nixfmt), pinned by flake.lock
+        entry: nix fmt --
+        language: system
+        types: [nix]
+
+      - id: shfmt
+        name: shfmt
+        entry: mise x -- shfmt --write --indent 2 --case-indent --space-redirects
+        language: system
+        types: [shell]
+        exclude_types: [zsh]
+
+      - id: shellcheck
+        name: shellcheck
+        entry: mise x -- shellcheck
+        language: system
+        types: [shell]
+        exclude_types: [zsh]

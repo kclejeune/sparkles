@@ -39,7 +39,9 @@
   } = $props();
 
   type Loaded =
-    { kind: 'enabled'; status: api.TextStatus } | { kind: 'disabled' } | { kind: 'unsupported' };
+    | { kind: 'enabled'; status: api.TextStatus }
+    | { kind: 'disabled' }
+    | { kind: 'unsupported' };
 
   let loaded = $state<Loaded | null>(null);
   let error = $state<string | null>(null);

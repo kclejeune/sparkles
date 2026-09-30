@@ -507,13 +507,13 @@ and a quick one 20 ms (16 cores, warm page cache). The same check is a library c
 
 ### mise tasks
 
-[`mise.toml`](mise.toml) pins Node, pnpm and hyperfine; Rust comes from `rust-toolchain.toml`.
+[`mise.toml`](mise.toml) pins Node, pnpm, hyperfine, prek, shfmt and shellcheck; Rust comes from `rust-toolchain.toml`.
 It also defines the everyday tasks (`mise tasks` lists them all):
 
 ```sh
 mise run build        # UI + release binary
 mise run serve        # build, then serve ./data on :3030
-mise run fmt          # cargo fmt + Prettier     (fmt:check for CI)
+mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
 mise run ui:test      # UI unit tests (Vitest)
@@ -522,6 +522,12 @@ mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 ```
+
+Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with
+[prek](https://github.com/j178/prek) (plain `pre-commit` reads the same file). On staged files
+they run `cargo fmt`, oxfmt on `ui/` (the UI's formatter, a devDependency), `nix fmt` (nixfmt,
+from the flake) on `*.nix`, and shfmt and shellcheck on shell scripts. `mise run hooks:install` installs the
+hook once per clone; `mise run hooks:run` runs every hook over the whole tree.
 
 ### Nix
 

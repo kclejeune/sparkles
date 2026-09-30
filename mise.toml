@@ -5,6 +5,13 @@
 node = "24"
 pnpm = "10.34.5"
 hyperfine = "1.20"
+# Git hooks (.pre-commit-config.yaml) and the shell formatter and linter they run
+# (shellcheck is GPL-3.0; a development tool only, not linked into Sparkles). The UI formatter
+# (oxfmt) is a devDependency in ui/package.json so it can load the project's Svelte compiler;
+# nixfmt comes from the flake (`nix fmt`).
+prek = "0.5.4"
+shfmt = "3.14.1"
+shellcheck = "0.11.0"
 
 # ------------------------------------------------------------------------------ UI ----
 
@@ -48,16 +55,28 @@ dir = "ui"
 run = "pnpm test"
 
 [tasks."ui:fmt"]
-description = "Format the UI (Prettier)"
+description = "Format the UI (oxfmt)"
 depends = ["ui:install"]
 dir = "ui"
 run = "pnpm format"
 
 [tasks."ui:fmt:check"]
-description = "Check UI formatting"
+description = "Check UI formatting (oxfmt)"
 depends = ["ui:install"]
 dir = "ui"
 run = "pnpm format:check"
+
+# ------------------------------------------------------------------------- git hooks ----
+
+[tasks."hooks:install"]
+description = "Install the pre-commit hook (prek; see .pre-commit-config.yaml)"
+depends = ["ui:install"]
+run = "prek install"
+
+[tasks."hooks:run"]
+description = "Run every pre-commit hook over all tracked files"
+depends = ["ui:install"]
+run = "prek run --all-files"
 
 # ----------------------------------------------------------------- format / lint / test ----
 

@@ -27,7 +27,8 @@ mkdir -p results
 declare -A OUT
 if [ -n "${LOAD:-}" ]; then
   rm -rf probe-load.db
-  read -r secs peak < <(python3 - "$SPARKLES" <<'EOF'
+  read -r secs peak < <(
+    python3 - "$SPARKLES" << 'EOF'
 import resource, subprocess, sys, time
 t = time.monotonic()
 subprocess.run([sys.argv[1], "load", "--loc", "probe-load.db", "data.nt"], check=True,
@@ -35,21 +36,29 @@ subprocess.run([sys.argv[1], "load", "--loc", "probe-load.db", "data.nt"], check
 # ru_maxrss is in KiB on Linux
 print(f"{time.monotonic() - t:.2f}", resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024)
 EOF
-)
+  )
   rm -rf probe-load.db
-  OUT[load_s]=$secs; OUT[load_peak_mib]=$peak
+  OUT[load_s]=$secs
+  OUT[load_peak_mib]=$peak
   echo "load: ${secs}s, peak RSS ${peak} MiB"
 fi
 
-if ss -ltn | grep -q ":$PORT "; then echo "port $PORT is in use" >&2; exit 1; fi
+if ss -ltn | grep -q ":$PORT "; then
+  echo "port $PORT is in use" >&2
+  exit 1
+fi
 rm -rf probe-server
 # shellcheck disable=SC2086 # SERVE_ARGS holds extra `serve` flags
 "$SPARKLES" --result-cache-mb 0 serve --data probe-server --loc bench="$WORK/sparkles.db" --port "$PORT" ${SERVE_ARGS:-} > probe-server.log 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null || true; rm -rf "$WORK/probe-server"' EXIT
 for _ in $(seq 240); do
-  curl -sf "localhost:$PORT/\$/ping" >/dev/null && break
-  kill -0 "$PID" 2>/dev/null || { echo "server exited:" >&2; cat probe-server.log >&2; exit 1; }
+  curl -sf "localhost:$PORT/\$/ping" > /dev/null && break
+  kill -0 "$PID" 2> /dev/null || {
+    echo "server exited:" >&2
+    cat probe-server.log >&2
+    exit 1
+  }
   sleep 0.5
 done
 rss() { awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$PID/status"; }
@@ -64,17 +73,21 @@ done
 # RSS is read after IDLE seconds without requests: what a container limit sees between
 # bursts (the server returns free heap memory to the OS once it is idle)
 IDLE=${IDLE:-2}
-sleep "$IDLE"; OUT[after_queries_mib]=$(rss)
+sleep "$IDLE"
+OUT[after_queries_mib]=$(rss)
 for round in 1 2 3; do
-  export -f q; export PORT
+  export -f q
+  export PORT
   seq 160 | xargs -P 16 -I{} bash -c 'q queries/star-join.rq'
-  sleep "$IDLE"; OUT[after_round${round}_mib]=$(rss)
+  sleep "$IDLE"
+  OUT[after_round${round}_mib]=$(rss)
 done
 OUT[peak_mib]=$(hwm)
 OUT[block_cache_mib]=$(curl -sf "localhost:$PORT/\$/stats/bench" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cache"]["bytes"] >> 20)')
 
-args=(); for k in "${!OUT[@]}"; do args+=("$k=${OUT[$k]}"); done
-python3 - results/rss-probe.json "$NAME" "${args[@]}" <<'EOF'
+args=()
+for k in "${!OUT[@]}"; do args+=("$k=${OUT[$k]}"); done
+python3 - results/rss-probe.json "$NAME" "${args[@]}" << 'EOF'
 import json, os, sys
 f, name, kvs = sys.argv[1], sys.argv[2], sys.argv[3:]
 d = json.load(open(f)) if os.path.exists(f) else {}
