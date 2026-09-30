@@ -213,6 +213,40 @@ export function reduceSupers(supers: Map<string, string[]>): Map<string, string[
 }
 
 /**
+ * Roots of the class tree: classes without superclasses (most subclasses first, then by
+ * label or IRI), followed by one representative of every group of classes that is not
+ * reachable from those roots. Classes on a subClassOf cycle (A ⊑ B ⊑ A, or A ⊑ A) all have
+ * superclasses, so a cycle with no ordinary root above it would otherwise never be drawn.
+ * Expects `subs` to be the inverse of `supers`.
+ */
+export function hierarchyRoots(classes: Map<string, ClassInfo>): string[] {
+  const name = (c: ClassInfo) => (c.label ?? c.iri).toLowerCase();
+  const byRank = (a: ClassInfo, b: ClassInfo) =>
+    b.subs.length - a.subs.length || name(a).localeCompare(name(b));
+  const roots = [...classes.values()]
+    .filter((c) => c.supers.length === 0)
+    .sort(byRank)
+    .map((c) => c.iri);
+  const reached = new Set<string>();
+  const visit = (iri: string) => {
+    const stack = [iri];
+    while (stack.length) {
+      const x = stack.pop()!;
+      if (reached.has(x)) continue;
+      reached.add(x);
+      stack.push(...(classes.get(x)?.subs ?? []));
+    }
+  };
+  roots.forEach(visit);
+  for (const c of [...classes.values()].sort(byRank)) {
+    if (reached.has(c.iri)) continue;
+    roots.push(c.iri);
+    visit(c.iri);
+  }
+  return roots;
+}
+
+/**
  * Ontology browser data. The hierarchy and property declarations come from asserted
  * triples only (`reasoning=false`): materialized RDFS/OWL inferences would add the
  * transitive closure of rdfs:subClassOf plus rdfs:Resource / owl:Thing everywhere.
@@ -298,32 +332,8 @@ SELECT ?o ?label ?version ?comment WHERE {
     const c = r.c && classes.get(v(r.c)!);
     if (c) c.instances = Number(v(r.n) ?? 0);
   }
+  const roots = hierarchyRoots(classes);
   const name = (c: ClassInfo) => (c.label ?? c.iri).toLowerCase();
-  const byRank = (a: ClassInfo, b: ClassInfo) =>
-    b.subs.length - a.subs.length || name(a).localeCompare(name(b));
-  const roots = [...classes.values()]
-    .filter((c) => c.supers.length === 0)
-    .sort(byRank)
-    .map((c) => c.iri);
-  // Classes on a subClassOf cycle (A ⊑ B ⊑ A, or A ⊑ A) all have superclasses, so a
-  // cycle with no ordinary root above it would be unreachable: promote one member of
-  // each such group to a root.
-  const reached = new Set<string>();
-  const visit = (iri: string) => {
-    const stack = [iri];
-    while (stack.length) {
-      const x = stack.pop()!;
-      if (reached.has(x)) continue;
-      reached.add(x);
-      stack.push(...(classes.get(x)?.subs ?? []));
-    }
-  };
-  roots.forEach(visit);
-  for (const c of [...classes.values()].sort(byRank)) {
-    if (reached.has(c.iri)) continue;
-    roots.push(c.iri);
-    visit(c.iri);
-  }
   for (const c of classes.values())
     c.subs.sort((a, b) => name(classes.get(a)!).localeCompare(name(classes.get(b)!)));
 

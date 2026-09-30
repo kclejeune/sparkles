@@ -41,6 +41,12 @@ depends = ["ui:install"]
 dir = "ui"
 run = "pnpm check"
 
+[tasks."ui:test"]
+description = "UI unit tests (Vitest)"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm test"
+
 [tasks."ui:fmt"]
 description = "Format the UI (Prettier)"
 depends = ["ui:install"]
@@ -88,8 +94,8 @@ description = "W3C SHACL Core + SHACL-SPARQL conformance"
 run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, tests"
-depends = ["fmt:check", "lint", "test"]
+description = "Everything CI should run: formatting, lints, Rust and UI tests"
+depends = ["fmt:check", "lint", "test", "ui:test"]
 
 # -------------------------------------------------------------------------- build / run ----
 

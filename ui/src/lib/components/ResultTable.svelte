@@ -2,6 +2,7 @@
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import { displayIri, displayTerm, toSparql, type PrefixMap } from '$lib/rdf';
+  import { sortedOrder, type SortSpec } from '$lib/table';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
 
@@ -23,7 +24,7 @@
   let scroller: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let viewportH = $state(400);
-  let sort = $state<{ col: number; dir: 1 | -1 } | null>(null);
+  let sort = $state<SortSpec | null>(null);
   let widths = $state<number[]>([]);
 
   // Reset sort/widths whenever the result set changes.
@@ -53,39 +54,7 @@
     });
   });
 
-  const NUMERIC =
-    /#(integer|decimal|double|float|long|int|short|byte|nonNegativeInteger|positiveInteger|unsignedInt|unsignedLong)$/;
-
-  function sortKey(t: Term | null): number | string | null {
-    if (!t) return null;
-    if (t.type === 'literal' && t.datatype && NUMERIC.test(t.datatype)) {
-      const n = Number(t.value);
-      if (!Number.isNaN(n)) return n;
-    }
-    return t.type === 'uri'
-      ? displayTerm(t, prefixes)
-      : t.type === 'triple'
-        ? toSparql(t)
-        : t.value;
-  }
-
-  const order = $derived.by(() => {
-    const idx = Array.from({ length: rows.length }, (_, i) => i);
-    if (!sort) return idx;
-    const { col, dir } = sort;
-    const keys = rows.map((r) => sortKey(r[col] ?? null));
-    const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-    idx.sort((a, b) => {
-      const ka = keys[a];
-      const kb = keys[b];
-      if (ka === kb) return a - b;
-      if (ka == null) return 1;
-      if (kb == null) return -1;
-      if (typeof ka === 'number' && typeof kb === 'number') return (ka - kb) * dir;
-      return coll.compare(String(ka), String(kb)) * dir;
-    });
-    return idx;
-  });
+  const order = $derived(sortedOrder(rows, sort, prefixes));
 
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
   const end = $derived(

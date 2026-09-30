@@ -7,7 +7,8 @@
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { triplesToGraph, type Triple } from '$lib/graph';
-  import { addMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
+  import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
+  import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
   import GraphView from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
@@ -133,23 +134,13 @@
   }
 
   // Latest Run/Explain per tab: a superseded execution must not touch the tab's outcome.
-  const latestRun: Record<string, number> = {};
-  let runSeq = 0;
-
-  /** Start an execution for a tab; the returned check is false once a newer one starts. */
-  function claim(tabId: string): () => boolean {
-    const id = ++runSeq;
-    latestRun[tabId] = id;
-    return () => latestRun[tabId] === id;
-  }
+  const runs = new LatestRun();
+  const claim = (tabId: string) => runs.claim(tabId);
 
   /** Add missing prefixes to the captured tab's text (only if the user has not edited it
    * in the meantime) and return the text to execute. */
-  function withPrefixes(tab: QTab, text: string, dsName: string): string {
-    const fixed = addMissingPrefixes(text, app.prefixes(dsName));
-    if (fixed !== text && tab.query === text) tab.query = fixed;
-    return fixed;
-  }
+  const withPrefixes = (tab: QTab, text: string, dsName: string) =>
+    applyMissingPrefixes(tab, text, app.prefixes(dsName));
 
   async function run() {
     const tabId = activeId;

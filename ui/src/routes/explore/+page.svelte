@@ -10,6 +10,7 @@
   import { fmtCompact, fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
   import { displayIri, RDF_TYPE, termKey } from '$lib/rdf';
+  import { Generation } from '$lib/supersede';
   import ClassTree from '$components/ClassTree.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
@@ -44,10 +45,10 @@
   let detailCache = $state<Record<string, ex.Details | { error: string }>>({});
   // Bumped whenever the graph is reset (refocus, clear, dataset switch): responses to
   // requests started for an older graph are discarded instead of mutating the new one.
-  let graphGen = 1;
+  const graphGen = new Generation();
 
   function resetGraph() {
-    graphGen++;
+    graphGen.bump();
     nodes = {};
     edges = {};
     expanding = {};
@@ -117,8 +118,8 @@
   async function expand(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
-    const gen = graphGen;
-    const stale = () => gen !== graphGen || nodes[id] !== n;
+    const gen = graphGen.current;
+    const stale = () => !graphGen.isCurrent(gen) || nodes[id] !== n;
     if (nodeCount > MAX_NODES) {
       toasts.push(
         'error',
@@ -189,14 +190,14 @@
   async function loadDetails(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || detailCache[id]) return;
-    const gen = graphGen;
+    const gen = graphGen.current;
     let d: ex.Details | { error: string };
     try {
       d = await ex.details(ds, n.iri);
     } catch (e) {
       d = { error: api.errorMessage(e) };
     }
-    if (gen === graphGen && nodes[id] === n) detailCache[id] = d;
+    if (graphGen.isCurrent(gen) && nodes[id] === n) detailCache[id] = d;
   }
 
   function removeNode(id: string) {

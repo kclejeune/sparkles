@@ -406,7 +406,8 @@ mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + Prettier     (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
-mise run ci           # fmt:check + lint + test
+mise run ui:test      # UI unit tests (Vitest)
+mise run ci           # fmt:check + lint + test + ui:test
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl

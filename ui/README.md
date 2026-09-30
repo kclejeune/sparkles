@@ -48,6 +48,7 @@ port; `MOCK_LATENCY=300 pnpm mock` adds latency to every response.
 
 ```sh
 pnpm check     # svelte-check, must report 0 errors
+pnpm test      # Vitest unit tests for the pure modules in src/lib (*.test.ts)
 pnpm build     # writes build/ (index.html + /ui/_app/… assets)
 pnpm preview   # serves build/ at http://localhost:4173/ui/ with the same proxy
 ```

@@ -175,6 +175,21 @@ export function addMissingPrefixes(q: string, known: PrefixMap): string {
   return lines.length ? lines.join('\n') + '\n' + q : q;
 }
 
+/**
+ * Add missing prefixes to `text`, the value `target.query` had when an execution started
+ * (captured before any await), and write the result back only if the user has not edited
+ * `target` since. Returns the text to execute.
+ */
+export function applyMissingPrefixes(
+  target: { query: string },
+  text: string,
+  known: PrefixMap,
+): string {
+  const fixed = addMissingPrefixes(text, known);
+  if (fixed !== text && target.query === text) target.query = fixed;
+  return fixed;
+}
+
 /** Build a PREFIX header for generated queries. */
 export function prefixHeader(prefixes: PrefixMap, only?: string[]): string {
   const names = only ?? Object.keys(prefixes);
