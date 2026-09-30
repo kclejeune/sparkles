@@ -341,6 +341,7 @@ async fn inferences_follow_the_reasoning_parameter() {
         profile: "rdfs".into(),
         inferred: 2,
         at: crate::state::now(),
+        ..Default::default()
     });
     let j = ok(&s.app, "/$/schema/t").await;
     assert_eq!(j["selection"]["reasoning"], true);

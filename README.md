@@ -82,9 +82,12 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`, `schema`), operating on the database directory directly | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`, `schema`, `clone`), operating on the database directory directly | ✅ |
+| Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`): same quads and blank-node ids, new dataset id with `forkedFrom`, inferences copied or dropped | ✅ |
 | Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
+| Inference freshness: the commit inferences were made at, `stale` / `commitsSince` in `GET /$/reason/{ds}`, dataset info, `/$/stats` and a `Sparkles-Inferences` header; re-run of the recorded profile; opt-in automatic re-runs (`serve --auto-reason`) | ✅ |
+| Inconsistency diagnostics: 7 checks from the OWL 2 RL rules with a `false` conclusion (`owl:Nothing` members, disjoint classes, sameAs/differentFrom, functional-property literals, …), `GET /$/reason/{ds}/diagnostics`, `sparkles infer --check`; a subset, never a consistency proof | ✅ |
 | SHACL Core + SHACL-SPARQL validation (`sparkles-shacl`): W3C suite **98/98** Core, **20/20** SPARQL; parallel, index-backed | ✅ |
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
@@ -146,7 +149,7 @@ feature gaps are:
 | Full-text search | jena-text (Lucene), `text:query` | `text:query` subset over string literals (Tantivy, BM25), updated in the commit path; no highlighting, per-language stemming or entity-style multi-field documents yet |
 | Spatial | GeoSPARQL (`geof:` functions, spatial index) | ✗ none |
 | Shape languages | ShEx (jena-shex) | ✗ SHACL only |
-| Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); must be re-run after updates; no inconsistency detection (`owl:Nothing`, `disjointWith`) |
+| Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
 | SPARQL extensions | property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, full `afn:`/`fn:` library | ✗ none of the extensions; common `fn:`/`afn:`/`math:` functions only |
 | SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
@@ -303,7 +306,7 @@ See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the head-to-head numbers.
 | `GROUP_CONCAT` always returns a simple literal | Spec behaviour; Jena keeps a common language tag. |
 | Triple terms are vocabulary entries with a canonical nested key (blank nodes inside them keep store identity); patterns with variables inside `<<( … )>>` bind a hidden variable and are decomposed by a `TripleTerm` operator | Keeps the 64-bit id model and all permutations unchanged; key order puts triple terms between literals and IRIs, so term-kind checks stay O(1). |
 | Effective boolean value of ill-typed boolean/numeric literals is an error | SPARQL 1.2 §17.2.2 (SPARQL 1.1 said `false`). |
-| Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates. Backward (LP) rules are not supported. |
+| Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates: the reasoning status records the commit it was made at, so stale inferences are reported (and can be re-run automatically with `serve --auto-reason`). Backward (LP) rules are not supported. |
 | `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
@@ -415,9 +418,12 @@ sparkles update  --loc db 'INSERT DATA {...}'
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
 sparkles backup  --loc db --out backups/
+sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
+sparkles infer   --loc db --status            # are the inferences up to date?
+sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.

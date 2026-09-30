@@ -65,6 +65,7 @@ function info(ds) {
     },
     quads: ds.store.size,
     reasoning: ds.reasoning,
+    ...(ds.origin ? { origin: ds.origin } : {}),
   };
 }
 
@@ -1156,6 +1157,29 @@ const server = http.createServer(async (req, res) => {
             break;
           }
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          if (extra === 'clone' && req.method === 'POST') {
+            const p = await params(req, url);
+            const target = String(p.get('name') ?? '');
+            if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(target))
+              return fail(res, 400, `invalid dataset name '${target}'`);
+            if (datasets.has(target)) return fail(res, 409, `dataset /${target} already exists`);
+            const task = startTask('clone', ds, () => {
+              const c = makeDataset(target, 'persistent');
+              for (const q of ds.store.match()) c.store.add(q);
+              c.baseQuads = c.store.size;
+              c.reasoning = p.get('inferences') === 'drop' ? null : ds.reasoning;
+              c.origin = {
+                originFormat: 1,
+                clonedAt: new Date().toISOString(),
+                source: { name: ds.name, version: 0, generation: 'gen-0001', quads: ds.store.size },
+                forkedFrom: { id: '00000000-0000-4000-8000-000000000000', seq: 0 },
+                inferences: c.reasoning ? 'copy' : 'drop',
+              };
+              return `cloned /${ds.name} at commit 0 (${c.store.size} quads) into /${target}`;
+            });
+            task.target = target;
+            return send(res, 202, task);
+          }
           if (req.method === 'GET') return send(res, 200, info(ds));
           if (req.method === 'DELETE') {
             datasets.delete(name);
@@ -1211,6 +1235,38 @@ const server = http.createServer(async (req, res) => {
           );
         case 'reason': {
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          if (req.method === 'GET' && extra === 'diagnostics')
+            return send(res, 200, {
+              diagnosticsFormat: 1,
+              dataset: ds.name,
+              commit: 0,
+              computedAt: new Date().toISOString(),
+              scope: {
+                graph: 'default',
+                inferences: { included: !!ds.reasoning, stale: false, commitsSince: 0 },
+                closure: url.searchParams.get('closure') ?? 'subclass',
+              },
+              status: 'none-found',
+              note: "Checks a fixed subset of OWL 2 RL inconsistency rules; 'none-found' does not establish OWL consistency.",
+              checks: [],
+              findings: [],
+            });
+          if (req.method === 'GET')
+            return send(
+              res,
+              200,
+              ds.reasoning
+                ? {
+                    ...ds.reasoning,
+                    commit: 0,
+                    head: 0,
+                    stale: false,
+                    commitsSince: 0,
+                    auto: { enabled: false },
+                    warnings: [],
+                  }
+                : { reasoning: null, head: 0 },
+            );
           if (req.method === 'DELETE') {
             ds.store.update('DROP SILENT GRAPH <urn:sparkles:inferred>');
             ds.reasoning = null;
@@ -1240,6 +1296,9 @@ const server = http.createServer(async (req, res) => {
                   profile,
                   inferred: inferredCount(ds),
                   at: new Date().toISOString(),
+                  commit: 0,
+                  stale: false,
+                  commitsSince: 0,
                 };
                 return `Inferred ${ds.reasoning.inferred} triples (${profile})`;
               },

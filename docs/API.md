@@ -14,7 +14,7 @@ addressed as `/{ds}`. JSON responses use `application/json`.
 | GET    | `/$/ping`     | Plain-text timestamp. Liveness check: `200` whenever the process serves HTTP. |
 | GET    | `/$/ready`    | Readiness: `200` when ready, else `503`; the body is always `ReadyInfo`. `Cache-Control: no-store`. |
 | GET    | `/$/ready/{ds}` | The same for one dataset (`datasets` has one entry); `404` if the dataset is unknown. |
-| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "datasets": [DatasetInfo], "limits": Limits }` |
+| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits }` |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`), see [Metrics](#metrics). `?format=json` returns a JSON snapshot of the same counters (`MetricsSnapshot`) for the UI. `404` when started with `--no-metrics`. |
 
 ```ts
@@ -115,13 +115,16 @@ type MetricsSnapshot = {
 | POST   | `/$/datasets`                | Create. Form or JSON body: `dbName`, `dbType` = `persistent` \| `mem`. `201` on success, `409` if exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | DELETE | `/$/datasets/{ds}`           | Remove dataset (and its files). |
+| POST   | `/$/datasets/{ds}/clone`     | Copy the dataset into a new persistent dataset. See [Clone](#clone). `202` with a `Task`. |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations; see [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
 | POST   | `/$/backup/{ds}`             | Write gzipped N-Quads dump to `<data>/backups/`. Returns `Task`. |
-| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`. Returns `Task`. |
+| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
+| GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
+| GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
@@ -134,7 +137,14 @@ type DatasetInfo = {
   type: "persistent" | "mem";
   endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string /* absent when built without the `shacl` feature */ };
   quads: number;           // approximate total (base + delta)
-  reasoning: null | { profile: string; inferred: number; at: string };
+  reasoning: null | {
+    profile: string; inferred: number; at: string;
+    commit: number | null;       // commit the inferences were materialized at
+    stale: boolean | null;       // null: unknown (see ReasoningStatus)
+    commitsSince: number | null;
+  };
+  forkedFrom?: { id: string; seq: number };   // clones: source dataset id and copied commit
+  origin?: DatasetOrigin;                     // clones: origin.json (see Clone)
 };
 
 type DatasetStats = {
@@ -150,11 +160,13 @@ type DatasetStats = {
   diskBytes: number;
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
+  reasoning: ReasoningStatus | null;
 };
 
 type Task = {
-  id: string; kind: "compact" | "backup" | "reason" | "load";
-  dataset: string; state: "running" | "done" | "failed";
+  id: string; kind: "compact" | "backup" | "reason" | "load" | "clone";
+  dataset: string; target?: string /* the dataset a clone creates */;
+  state: "running" | "done" | "failed";
   startedAt: string; finishedAt?: string; message?: string; progress?: number /*0..1*/;
 };
 ```
@@ -266,6 +278,47 @@ The CLI equivalent prints the complete report without pagination:
 [--max-entries N]` (or `--data FILE…`). `json` is the `SchemaSummary` with every item and
 `next: null`; `text` prints one line per class and per predicate. It exits with status 2
 when the timeout or the entry cap is exceeded. In Rust, `sparkles::schema::discover`.
+
+### Clone
+
+`POST /$/datasets/{ds}/clone` copies one consistent snapshot of `{ds}` into a new,
+independent persistent dataset, for trying updates, reasoning or loads without touching
+the original. Parameters come from the query string, a form body or a JSON body:
+
+| Param | Required | Meaning |
+|---|---|---|
+| `name` | yes | name of the new dataset |
+| `inferences` | no, default `copy` | `copy`: the inferred graph and the reasoning status; `drop`: neither |
+
+The copy has every quad of every graph (blank-node graph names and triple terms
+included), the same blank-node ids (`_:b<hex>` labels), the prefixes, and a freshly
+compacted index. It is a new lineage: a new dataset id and a root commit `0`, with the
+source's id and the copied commit kept as `forkedFrom`. Commit history, the WAL and
+caches are not copied. With `inferences=copy`, inferences that were fresh at the copied
+commit are fresh in the clone; stale ones stay stale (`staleReason: "inherited from
+source at clone time"`), unknown ones stay unknown. Source updates continue during the
+clone and are not included.
+
+Responses: `202` with `Task` (`kind: "clone"`, `target`) and `Location:
+/$/datasets/{name}`; `400` for a missing or invalid `name`, a bad `inferences`, or
+`type=mem` (in-memory clones are not supported yet); `403` on a read-only server;
+`404` for an unknown source; `409` when `name` is registered, being created by another
+task (`POST /$/datasets` with that name also gets `409` meanwhile), or
+`<data>/databases/{name}` exists without being a registered dataset. The dataset appears
+(and is persisted in `config.json`) only when the task is `done`. A failed task leaves
+no directory and releases the name; unfinished clones are removed at startup.
+
+```ts
+type DatasetOrigin = {            // origin.json in the clone's directory
+  originFormat: 1; clonedAt: string;
+  source: { name: string; path?: string; version: number; generation: string; quads: number };
+  forkedFrom: { id: string; seq: number };
+  inferences: "copy" | "drop";
+};
+```
+
+`sparkles clone --loc SRC --to DST [--inferences copy|drop]` does the same offline
+(`DST` must not exist or be empty; `SRC` must be a database, and not open in a server).
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
@@ -444,6 +497,106 @@ as written; one that does not parse is stored but never matched.
   and deletes, so results always match its data. A process-wide budget (default 4 GiB)
   caps the packed vectors; beyond it a search returns `507`. A variable query vector
   gives `501`.
+
+## Reasoning status and diagnostics
+
+Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
+A materialization records the commit it wrote (or, when it changed nothing, the head it
+read) and the dataset id. Any later commit makes the inferences **stale**, including
+commits that only touch named graphs the reasoner does not read. Compaction and restarts
+do not. A status written by an older version, or recorded for another dataset id, has
+unknown freshness (`stale: null`).
+
+```ts
+type ReasoningStatus = {
+  profile: string;             // "rdfs" | "rdfs-simple" | "owl-rl" | "rules"
+  inferred: number;
+  at: string;                  // when the run finished
+  commit: number | null;       // commit the inferences were materialized at; null = unknown
+  head: number;                // current head commit
+  stale: boolean | null;       // null = unknown
+  commitsSince: number | null; // head − commit; null when unknown or not comparable
+  staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
+  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
+  warnings: string[];          // the last run's warnings
+};
+```
+
+**Header.** A query or SHACL validation that includes the inferred graph while the
+inferences are not fresh (at the snapshot it read) carries
+`Sparkles-Inferences: stale; commits-since=3`, `stale` (count unknown) or `unknown`.
+Fresh inferences send no header. The body is unchanged. The header is exposed to
+cross-origin clients.
+
+**Automatic re-runs** are off by default. `sparkles serve --auto-reason SECS
+[--auto-reason-max-delay SECS]` re-runs the recorded profile once a dataset with stale
+inferences has had no commit for `SECS` seconds, or at the latest after the maximum
+delay (default 12 × `SECS`) while writes continue. Such tasks' messages start with
+`auto:`. After a failed run, the next attempt waits for the next commit. Runs never
+start for unknown freshness, nor on `--read-only` servers. Each run is a full
+recomputation that holds the dataset's writer lock, so updates wait while it runs.
+
+**Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks from the
+OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3), each one SPARQL query
+over the default graph (plus the inferences when included). Those rules are sound, so
+every finding is a genuine inconsistency. Finding nothing does **not** establish OWL
+consistency.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `checks` | all | comma-separated check ids |
+| `limit` | 100 (1–10000) | findings per check |
+| `reasoning` | `true` if inferences exist | include `urn:x-sparkles:inferred` |
+| `closure` | `subclass` | `subclass`: type tests follow `rdfs:subClassOf*`; `none`: stated types only |
+| `timeout` | server query timeout | for the whole report |
+
+| Check | Rules | Severity | Query |
+|---|---|---|---|
+| `nothing-member` | `cls-nothing2` (+`cax-sco`) | inconsistency | [nothing-member.rq](../crates/sparkles-reasoner/diagnostics/nothing-member.rq) |
+| `disjoint-classes` | `cax-dw` | inconsistency | [disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/disjoint-classes.rq) |
+| `all-disjoint-classes` | `cax-adc` | inconsistency | [all-disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-classes.rq) |
+| `same-different` | `eq-diff1` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [same-different.rq](../crates/sparkles-reasoner/diagnostics/same-different.rq) |
+| `functional-literal-conflict` | `prp-fp`, `dt-diff`, `eq-diff1` | inconsistency | [functional-literal-conflict.rq](../crates/sparkles-reasoner/diagnostics/functional-literal-conflict.rq) |
+| `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
+| `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
+
+There is no unique name assumption: two IRIs count as different individuals only through
+`owl:differentFrom`. Literal values of a functional property are compared with SPARQL
+`!=`, restricted to numbers, strings, language-tagged strings and booleans, so a pair it
+cannot compare is never reported. With inferences included, each finding is re-checked
+with the same bindings over the asserted data alone: `basis` is `asserted` when that
+holds and `uses-inferences` otherwise (with stale inferences, only `asserted` findings
+are certain for the current data).
+
+```ts
+type DiagnosticsReport = {
+  diagnosticsFormat: 1;
+  dataset: string; commit: number /* snapshot checked */; computedAt: string;
+  scope: { graph: "default";
+           inferences: { included: boolean; profile?: string; stale?: boolean | null; commitsSince?: number | null };
+           closure: "subclass" | "none" };
+  status: "violations-found" | "none-found" | "incomplete";
+  note: string;                         // the report never claims consistency
+  checks: { id: string; rules: string[]; severity: "inconsistency" | "warning";
+            status: "violations" | "none" | "truncated" | "timeout" | "error";
+            findings: number; millis: number; error?: string }[];
+  findings: { check: string; rule: string; severity: "inconsistency" | "warning";
+              focus: Term; evidence: Record<string, Term | Term[]>;
+              basis: "asserted" | "uses-inferences"; message: string }[];
+};
+```
+
+`status` is `violations-found` when an inconsistency check has findings, else
+`incomplete` when a check timed out or failed, else `none-found`; warnings never count.
+A timeout marks the remaining checks `timeout` (no `408`). Errors: `400` for an unknown
+check id or a bad `limit`/`closure`, `404` for an unknown dataset, `501` without the
+`reasoning` feature. Diagnostics are read-only and also work on `--read-only` servers.
+
+CLI: `sparkles infer --loc DB --status` prints the status; `sparkles infer --loc DB
+--check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none]
+[--format text|json]` runs the checks (after materializing, when `--profile` or
+`--rules` is given) and exits with 0 (`none-found`), 1 (`violations-found`) or 2
+(`incomplete` or an error). `sparkles stats` shows a `reasoning` line.
 
 ## SHACL validation
 

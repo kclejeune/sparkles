@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+mod clone;
+#[cfg(feature = "reasoning")]
+mod reasoning;
+
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .
@@ -380,11 +384,11 @@ async fn shacl_with_inferences() {
     )
     .unwrap();
     assert!(rep.inferred > 0);
-    *ds.reasoning.write() = Some(crate::state::ReasoningInfo {
-        profile: "rdfs".into(),
-        inferred: rep.inferred,
-        at: crate::state::now(),
-    });
+    *ds.reasoning.write() = Some(crate::reasoning::recorded(
+        &sparkles_reasoner::Profile::Rdfs,
+        &rep,
+        &ds.store,
+    ));
 
     // data ∪ inferred by default
     for q in ["", "?graph=default", "?reasoning=true", "?graph=union"] {

@@ -2528,6 +2528,7 @@ dependencies = [
  "rayon",
  "regex",
  "rustc-hash",
+ "serde_json",
  "sparkles",
  "tempfile",
  "thiserror",
