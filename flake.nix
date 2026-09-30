@@ -95,6 +95,17 @@
           };
 
           devShells.default = pkgs.mkShell {
+            # Chromium for the Playwright UI tests (`mise run ui:e2e`). @playwright/test in
+            # ui/package.json is pinned to this nixpkgs' playwright-driver version so that the
+            # browser revisions match. Elsewhere `mise run ui:e2e` downloads its own.
+            env = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+              PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
+                withFirefox = false;
+                withWebkit = false;
+                withFfmpeg = false;
+              };
+              PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+            };
             packages = [
               (toolchain.override {
                 extensions = [

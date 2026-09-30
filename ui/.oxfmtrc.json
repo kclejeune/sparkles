@@ -7,5 +7,12 @@
   "printWidth": 100,
   "sortPackageJson": false,
   "svelte": {},
-  "ignorePatterns": ["build/", ".svelte-kit/", "node_modules/", "pnpm-lock.yaml"]
+  "ignorePatterns": [
+    "build/",
+    ".svelte-kit/",
+    "node_modules/",
+    "pnpm-lock.yaml",
+    "test-results/",
+    "playwright-report/"
+  ]
 }

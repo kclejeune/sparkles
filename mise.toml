@@ -54,6 +54,28 @@ depends = ["ui:install"]
 dir = "ui"
 run = "pnpm test"
 
+[tasks."ui:e2e:browsers"]
+description = "Chromium for the UI end-to-end tests: the flake's (`nix develop`) or a Playwright download"
+depends = ["ui:install"]
+dir = "ui"
+run = '''
+if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then exit 0; fi
+if [ -e /etc/NIXOS ]; then
+  echo "Playwright's browser downloads do not run on NixOS: use 'nix develop -c mise run ui:e2e'" >&2
+  exit 1
+fi
+pnpm exec playwright install chromium
+'''
+
+[tasks."ui:e2e"]
+description = "UI end-to-end tests (Playwright) against a real `sparkles serve` (debug build; SPARKLES_BIN=… for another); extra args go to `playwright test`"
+depends = ["ui:build", "ui:e2e:browsers"]
+dir = "ui"
+run = '''
+[ -n "${SPARKLES_BIN:-}" ] || cargo build -p sparkles-server
+pnpm e2e
+'''
+
 [tasks."ui:fmt"]
 description = "Format the UI (oxfmt)"
 depends = ["ui:install"]
