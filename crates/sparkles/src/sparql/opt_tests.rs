@@ -722,3 +722,80 @@ fn scans_decode_only_the_columns_they_read() {
         );
     }
 }
+
+// ------------------------------------------------------------ memory budget ------
+
+/// Every optimized operator checks the memory budget: a query needs exactly its
+/// reported peak (it runs under a budget of the peak and fails one byte below it), and
+/// the optimized operator is the one that ran.
+#[test]
+fn optimized_operators_obey_the_memory_budget() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..4000 {
+        ttl.push_str(&format!(
+            "ex:p{i} ex:v {} ; ex:org ex:o{} ; ex:knows ex:p{} .\n",
+            (i * 37) % 4001,
+            i % 23,
+            (i * 7 + 1) % 4000
+        ));
+    }
+    // a wide frontier for the path sweep
+    for i in 0..200 {
+        ttl.push_str(&format!("ex:root ex:k ex:h{i} . ex:h{i} ex:k ex:m{i} .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let budget = |limit: Option<u64>| QueryOptions {
+        max_memory_bytes: limit,
+        no_cache: true,
+        ..Default::default()
+    };
+    for (q, op) in [
+        (
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 3900) }",
+            "IndexRangeScan",
+        ),
+        (
+            "SELECT ?o (COUNT(*) AS ?n) (MAX(?v) AS ?m) WHERE { ?p ex:org ?o ; ex:v ?v } GROUP BY ?o",
+            "desc:[incremental]",
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?a ex:knows ?b . ?b ex:knows ?c }",
+            "CountJoinFromRuns",
+        ),
+        (
+            "SELECT ?x WHERE { ex:root ex:k* ?x }",
+            "desc:frontier levels expanded by index sweeps",
+        ),
+        (
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 5",
+            "desc:numeric prefilter",
+        ),
+        (
+            "SELECT * WHERE { ?a ex:org ?o . ?b ex:org ?o }",
+            "MergeJoin",
+        ),
+    ] {
+        let text = format!("{PREFIXES}{q}");
+        let full = query(s.snapshot(), &text, &budget(None)).unwrap();
+        let taken = match op.strip_prefix("desc:") {
+            Some(d) => has_desc(&full.plan, d),
+            None => has_op(&full.plan, op),
+        };
+        assert!(taken, "{q}: plan lacks {op}: {:#?}", full.plan);
+        let peak = full.mem_peak_bytes;
+        assert!(peak > 0, "{q}");
+        let exact =
+            query(s.snapshot(), &text, &budget(Some(peak))).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(solutions(&exact), solutions(&full), "{q}");
+        assert_eq!(exact.mem_peak_bytes, peak, "{q}");
+        match query(s.snapshot(), &text, &budget(Some(peak - 1))) {
+            Err(crate::Error::BudgetExceeded(b)) => {
+                assert_eq!(b.kind, crate::BudgetKind::Memory, "{q}");
+                assert_eq!(b.limit, peak - 1, "{q}");
+                assert!(b.requested >= peak, "{q}");
+            }
+            r => panic!("{q}: {:?}", r.map(|r| r.len())),
+        }
+    }
+}

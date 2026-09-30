@@ -84,7 +84,7 @@ impl From<Error> for ApiError {
             Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
-            Error::MemoryLimit(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

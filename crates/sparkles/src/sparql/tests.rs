@@ -986,7 +986,13 @@ fn join_expansion_respects_the_row_budget() {
         &opts,
     );
     assert!(
-        matches!(r, Err(crate::error::Error::MemoryLimit(_))),
+        matches!(
+            r,
+            Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Rows,
+                ..
+            }))
+        ),
         "{:?}",
         r.err()
     );
@@ -1154,8 +1160,122 @@ fn cached_results_obey_the_row_budget() {
     };
     let r = query(s.snapshot(), text, &limited);
     assert!(
-        matches!(r, Err(crate::error::Error::MemoryLimit(_))),
+        matches!(
+            r,
+            Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Rows,
+                ..
+            }))
+        ),
         "{:?}",
         r.err()
     );
+}
+
+#[test]
+fn memory_budget_fails_the_query_and_releases_its_charges() {
+    use crate::error::{BudgetKind, Error};
+    let s = store();
+    let snap = s.snapshot();
+    let o = QueryOptions {
+        max_memory_bytes: Some(1024),
+        ..Default::default()
+    };
+    match query(snap.clone(), "SELECT * { ?a ?b ?c . ?d ?e ?f }", &o) {
+        Err(Error::BudgetExceeded(b)) => {
+            assert_eq!((b.kind, b.limit), (BudgetKind::Memory, 1024));
+            assert!(b.requested > 1024);
+            let msg = Error::BudgetExceeded(b).to_string();
+            assert!(
+                msg.starts_with("query exceeds its memory budget: needs about "),
+                "{msg}"
+            );
+            assert!(msg.ends_with("limit 1.0 KiB"), "{msg}");
+        }
+        r => panic!("{:?}", r.map(|r| r.len())),
+    }
+    // a small query under the same budget runs
+    let r = query(snap.clone(), "SELECT * { ?s ?p ?o } LIMIT 1", &o).unwrap();
+    assert_eq!(r.len(), 1);
+    // charges are per context: nothing leaked into later queries
+    let r = query(snap, "SELECT * { ?s ?p ?o }", &QueryOptions::default()).unwrap();
+    let n = r.len() as u64;
+    assert!(
+        r.mem_peak_bytes >= n * 3 * 8,
+        "{} for {n} rows",
+        r.mem_peak_bytes
+    );
+}
+
+#[test]
+fn memory_budget_applies_to_cached_results_and_updates() {
+    use crate::error::{BudgetKind, Error};
+    let s = cached_store(DATA, RdfFormat::Turtle);
+    let text = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }";
+    let full = q(&s, text);
+    assert!(has_cached(&q(&s, text).plan));
+    let o = QueryOptions {
+        max_memory_bytes: Some(full.mem_peak_bytes / 2),
+        ..Default::default()
+    };
+    assert!(matches!(
+        query(s.snapshot(), text, &o),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
+    // the WHERE clause of an update fails before anything is written
+    let before = s.snapshot().len();
+    let o = QueryOptions {
+        max_memory_bytes: Some(1024),
+        ..Default::default()
+    };
+    let r = update::update(
+        &s,
+        "INSERT { ?a <urn:x> ?d } WHERE { ?a ?b ?c . ?d ?e ?f }",
+        &o,
+    );
+    assert!(
+        matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        r.map(|s| s.inserted)
+    );
+    assert_eq!(s.snapshot().len(), before);
+    let st = update::update(
+        &s,
+        "INSERT { ?a <urn:x> 1 } WHERE { ?a a <http://xmlns.com/foaf/0.1/Person> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(st.inserted, 3);
+    assert!(st.mem_peak_bytes >= 3 * 8);
+}
+
+#[test]
+fn limited_writer_enforces_the_result_size() {
+    use crate::error::{BudgetKind, Error};
+    use results::{LimitedWriter, SolutionsFormat};
+    let s = store();
+    let r = q(&s, "SELECT * { ?s ?p ?o }");
+    let mut buf = Vec::new();
+    results::write_solutions(&r, SolutionsFormat::Tsv, &mut buf, None).unwrap();
+    let size = buf.len() as u64;
+    // exactly the size fits
+    let mut w = LimitedWriter::new(Vec::new(), Some(size), None);
+    results::write_solutions(&r, SolutionsFormat::Tsv, &mut w, None).unwrap();
+    assert_eq!(w.written(), size);
+    // one byte less does not
+    let mut w = LimitedWriter::new(Vec::new(), Some(size - 1), None);
+    let e = results::write_solutions(&r, SolutionsFormat::Tsv, &mut w, None).unwrap_err();
+    match w.classify(e) {
+        Error::BudgetExceeded(b) => {
+            assert_eq!((b.kind, b.limit), (BudgetKind::ResultBytes, size - 1));
+            assert!(b.requested > size - 1);
+        }
+        e => panic!("{e}"),
+    }
+    // a cancelled request stops writing
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut w = LimitedWriter::new(Vec::new(), None, Some(cancel));
+    let big = vec![b'x'; 128 << 10];
+    let e = std::io::Write::write_all(&mut w, &big).unwrap_err();
+    assert!(matches!(w.classify(Error::Io(e)), Error::Cancelled));
 }

@@ -75,6 +75,11 @@ impl Table {
         self.len * self.width() * 8
     }
 
+    /// Estimated memory for the query memory budget: the ids plus a fixed overhead.
+    pub fn mem_bytes(&self) -> u64 {
+        super::ctx::table_bytes(self.len, self.width()) + 64
+    }
+
     /// Map from variable id to column (indexed by var id).
     pub fn var_map(&self, nvars: usize) -> Vec<Option<usize>> {
         let mut m =

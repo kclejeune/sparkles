@@ -38,6 +38,9 @@ pub struct QueryOptions {
     pub named_graph_uris: Vec<String>,
     pub base_iri: Option<String>,
     pub max_rows: Option<usize>,
+    /// Budget for the estimated memory of intermediate results (`None`: unlimited);
+    /// exceeding it fails with [`Error::BudgetExceeded`].
+    pub max_memory_bytes: Option<u64>,
     pub allow_service: bool,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Graphs merged into the store's default graph when the query does not specify a
@@ -83,6 +86,8 @@ pub struct QueryResult {
     pub triples: Vec<Triple>,
     pub plan: PlanInfo,
     pub timing: Timing,
+    /// Peak estimated memory of intermediate results (see [`QueryOptions::max_memory_bytes`]).
+    pub mem_peak_bytes: u64,
     pub ctx: Arc<Ctx>,
 }
 
@@ -188,6 +193,9 @@ fn make_ctx(
     }
     if let Some(m) = opts.max_rows {
         ctx.max_rows = m;
+    }
+    if let Some(m) = opts.max_memory_bytes {
+        ctx.mem_limit = m;
     }
     ctx.allow_service = opts.allow_service;
     ctx.use_cache = !opts.no_cache;
@@ -360,6 +368,7 @@ pub fn execute_query(
         triples: Vec::new(),
         plan,
         timing: Timing::default(),
+        mem_peak_bytes: 0,
         ctx: ctx.clone(),
     };
     match parsed {
@@ -399,6 +408,7 @@ pub fn execute_query(
         serialize_ms: 0.0,
         total_ms: parse_ms + t1.elapsed().as_secs_f64() * 1000.0,
     };
+    result.mem_peak_bytes = ctx.mem_peak();
     Ok(result)
 }
 
