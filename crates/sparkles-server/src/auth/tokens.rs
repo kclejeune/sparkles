@@ -154,13 +154,28 @@ impl TokenStore {
     }
 
     /// Store a new record (expired records are pruned on the way).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&self, rec: TokenRecord, now: i64) -> Result<()> {
+        self.insert_within(rec, now, usize::MAX).map(|_| ())
+    }
+
+    /// Store a new record unless its owner already has `max` unexpired tokens; `false`:
+    /// not stored.
+    pub fn insert_within(&self, rec: TokenRecord, now: i64, max: usize) -> Result<bool> {
         let digest = super::config::parse_token_hash(&rec.hash).context("token hash")?;
         let mut inner = self.inner.lock();
         prune(&mut inner, now);
+        let owned = inner
+            .by_id
+            .values()
+            .filter(|t| t.owner.kind == rec.owner.kind && t.owner.name == rec.owner.name)
+            .count();
+        if owned >= max {
+            return Ok(false);
+        }
         inner.by_digest.insert(digest, rec.id.clone());
         inner.by_id.insert(rec.id.clone(), rec);
-        self.save(&mut inner)
+        self.save(&mut inner).map(|_| true)
     }
 
     /// Remove tokens, and the tokens they minted. Returns how many were removed.

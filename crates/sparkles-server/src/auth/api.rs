@@ -226,8 +226,8 @@ pub async fn whoami(
     r
 }
 
-/// The auth layer's own limits (device logins, failed code lookups), for the metrics;
-/// `None` without auth.
+/// The auth layer's own limits (token mints, device logins, failed code lookups), for
+/// the metrics; `None` without auth.
 pub fn throttle(st: &AppState) -> Option<&crate::ratelimit::RateLimiter> {
     #[cfg(feature = "auth")]
     if let Some(a) = &st.auth {
@@ -237,9 +237,9 @@ pub fn throttle(st: &AppState) -> Option<&crate::ratelimit::RateLimiter> {
     None
 }
 
-/// Rate-limit key: a signed-in principal is limited as itself (across addresses);
-/// anonymous callers, the open local mode, and the `auth` class (logins) are limited by
-/// client address.
+/// Rate-limit key: a signed-in principal is limited as its owner (across addresses and
+/// credentials, [`Principal::rate_key`]); anonymous callers, the open local mode, and the
+/// `auth` class (logins) are limited by client address.
 pub struct PrincipalKeyer;
 
 impl crate::ratelimit::ClientKeyer for PrincipalKeyer {
@@ -253,7 +253,7 @@ impl crate::ratelimit::ClientKeyer for PrincipalKeyer {
             Some(p)
                 if class != crate::ratelimit::Class::Auth && !p.is_local() && !p.is_anonymous() =>
             {
-                crate::ratelimit::ClientKey::principal(&p.id())
+                crate::ratelimit::ClientKey::principal(&p.rate_key())
             }
             _ => crate::ratelimit::PeerKeyer.key(class, req, trusted),
         }

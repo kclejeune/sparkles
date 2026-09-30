@@ -2,7 +2,7 @@
 //! CLI grants (device codes, loopback codes and the token endpoint).
 
 use super::grants::{Issued, Poll};
-use super::policy::{DEVICE, DEVICE_CODE, Failure, MINT_VIA, Policy};
+use super::policy::{DEVICE, DEVICE_CODE, Failure, MINT, MINT_VIA, Policy};
 use super::routes::json_error;
 use super::session::Method;
 use super::store::rfc3339;
@@ -639,6 +639,9 @@ fn mint(
         Kind::Token => p.info.token_id.clone(),
         _ => None,
     };
+    // per owner, whichever credential mints: a rate, and a cap on unexpired tokens
+    auth.throttle
+        .acquire(MINT, ClientKey::principal(&owner.log_name()), 1)?;
     let token = Zeroizing::new(super::policy::new_token());
     let rec = TokenRecord {
         id: super::tokens::new_id(),
@@ -653,12 +656,27 @@ fn mint(
         client,
         last_used: None,
     };
-    if let Err(e) = auth.tokens.insert(rec.clone(), now) {
-        tracing::error!("cannot store the token: {e:#}");
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot store the token",
-        ));
+    match auth
+        .tokens
+        .insert_within(rec.clone(), now, policy.max_tokens_per_owner)
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "at most {} active tokens per owner: revoke unused tokens first",
+                    policy.max_tokens_per_owner
+                ),
+            ));
+        }
+        Err(e) => {
+            tracing::error!("cannot store the token: {e:#}");
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot store the token",
+            ));
+        }
     }
     if let Some(i) = MINT_VIA.iter().position(|v| *v == via) {
         auth.metrics.minted[i].fetch_add(1, Ordering::Relaxed);

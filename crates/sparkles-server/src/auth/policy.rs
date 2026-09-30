@@ -30,8 +30,9 @@ const PERMIT_WAIT: Duration = Duration::from_secs(5);
 /// once (`busy`) instead of queueing without bound.
 const QUEUE_PER_PERMIT: usize = 4;
 
-/// Named limits of [`Auth::throttle`]: device logins started per client address, failed
-/// user-code lookups per session.
+/// Named limits of [`Auth::throttle`]: tokens minted per owner, device logins started per
+/// client address, failed user-code lookups per session.
+pub const MINT: &str = "mint";
 pub const DEVICE: &str = "device";
 pub const DEVICE_CODE: &str = "device-code";
 /// Clients the throttle tracks at most.
@@ -49,14 +50,16 @@ fn per_minute(count: u32, burst: u32) -> crate::ratelimit::Limit {
     }
 }
 
-/// The throttle's limits under `policy`: 20 device logins per address, then two a minute
-/// (the pending grants of one address stay far below the server's cap); 20 unknown user
-/// codes per session, then two a minute.
-fn throttle_config(_: &Policy) -> crate::ratelimit::Config {
+/// The throttle's limits under `policy`: its mint rate; 20 device logins per address,
+/// then two a minute (the pending grants of one address stay far below the server's cap);
+/// 20 unknown user codes per session, then two a minute.
+fn throttle_config(policy: &Policy) -> crate::ratelimit::Config {
     let mut c = crate::ratelimit::Config {
         max_keys: Some(THROTTLE_KEYS),
         ..Default::default()
     };
+    c.named
+        .insert(MINT, (policy.mint_rate.clone(), "tokens minted"));
     c.named
         .insert(DEVICE, (per_minute(2, 20), "device logins started"));
     c.named
@@ -101,6 +104,10 @@ pub struct Policy {
     external: External,
     pub default_ttl: i64,
     pub max_ttl: i64,
+    /// unexpired minted tokens per owner at most
+    pub max_tokens_per_owner: usize,
+    /// tokens an owner may mint
+    pub mint_rate: crate::ratelimit::Limit,
     pub session_ttl: i64,
     pub oidc: Option<config::OidcCfg>,
     pub proxy: Option<ProxySettings>,
@@ -218,6 +225,8 @@ impl Policy {
             external,
             default_ttl: config::parse_duration(&cfg.tokens_policy.default_ttl)?,
             max_ttl: config::parse_duration(&cfg.tokens_policy.max_ttl)?,
+            max_tokens_per_owner: cfg.tokens_policy.max_active_per_owner,
+            mint_rate: config::parse_mint_rate(&cfg.tokens_policy.mint_rate)?,
             session_ttl: config::parse_duration(&cfg.session.ttl)?,
             oidc: cfg.oidc.clone(),
             proxy: cfg.proxy.as_ref().map(ProxySettings::from_config),
@@ -431,7 +440,7 @@ pub struct Auth {
     policy: ArcSwap<Policy>,
     creds: Mutex<Creds>,
     argon: Argon,
-    /// the auth layer's own limits ([`DEVICE`], [`DEVICE_CODE`]) on the
+    /// the auth layer's own limits ([`MINT`], [`DEVICE`], [`DEVICE_CODE`]) on the
     /// server's rate-limit machinery
     pub throttle: crate::ratelimit::RateLimiter,
     hmac_key: Vec<u8>,

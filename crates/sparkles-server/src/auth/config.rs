@@ -95,6 +95,12 @@ pub struct TokensPolicyCfg {
     pub default_ttl: String,
     #[serde(default = "max_ttl")]
     pub max_ttl: String,
+    /// unexpired minted tokens per owner at most
+    #[serde(default = "max_active_per_owner")]
+    pub max_active_per_owner: usize,
+    /// tokens an owner may mint: `N/s|min|h|d[,burst=N]`, or `off`
+    #[serde(default = "mint_rate")]
+    pub mint_rate: String,
 }
 
 impl Default for TokensPolicyCfg {
@@ -102,8 +108,27 @@ impl Default for TokensPolicyCfg {
         TokensPolicyCfg {
             default_ttl: default_ttl(),
             max_ttl: max_ttl(),
+            max_active_per_owner: max_active_per_owner(),
+            mint_rate: mint_rate(),
         }
     }
+}
+
+fn max_active_per_owner() -> usize {
+    100
+}
+fn mint_rate() -> String {
+    "60/h".into()
+}
+
+/// `tokens_policy.mint_rate`: a rate with an optional burst, or `off`.
+pub fn parse_mint_rate(s: &str) -> Result<crate::ratelimit::Limit> {
+    let l = crate::ratelimit::Limit::parse(s)
+        .map_err(|e| anyhow::anyhow!("tokens_policy.mint_rate: {e}"))?;
+    if l.concurrency.is_some() || l.client_concurrency.is_some() || l.failure_cost.is_some() {
+        bail!("tokens_policy.mint_rate: expected N/s, N/min, N/h or N/d [,burst=N] or off");
+    }
+    Ok(l)
 }
 
 fn default_ttl() -> String {
@@ -507,6 +532,10 @@ impl FileConfig {
         if max < dflt {
             bail!("tokens_policy.max_ttl must be at least default_ttl");
         }
+        if self.tokens_policy.max_active_per_owner == 0 {
+            bail!("tokens_policy.max_active_per_owner must be at least 1");
+        }
+        parse_mint_rate(&self.tokens_policy.mint_rate)?;
         parse_duration(&self.session.ttl).context("session.ttl")?;
         let ext = &self.external;
         for r in ext

@@ -1,6 +1,7 @@
 //! The limits around authentication: failures per address before any password is
-//! hashed, bounded password work, and device logins per address.
+//! hashed, bounded password work, and quotas per token owner.
 
+use super::tokens::mint_as;
 use super::*;
 use crate::ratelimit::{RateLimiter, Sources};
 
@@ -258,6 +259,79 @@ async fn concurrent_guesses_from_one_address_stop_at_its_budget() {
         metric(&s.app, "sparkles_auth_password_verifications_total").await,
         3
     );
+}
+
+#[tokio::test]
+async fn the_tokens_of_one_owner_share_its_quota() {
+    let s = limited(Fixture::default(), &["query=3/min"]);
+    let mut tokens = Vec::new();
+    for name in ["a", "b"] {
+        let body = format!(r#"{{"name":"{name}","datasets":{{"wiki":"read"}}}}"#);
+        let r = mint_as(&s.app, &[("authorization", &b("bob"))], &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        tokens.push(bearer(r.json()["token"].as_str().unwrap()));
+    }
+    // three queries a minute for bob, whichever of his credentials and addresses
+    let bob = [&tokens[0], &tokens[1], &b("bob")];
+    for (i, auth) in bob.iter().enumerate() {
+        let r = ask_from(&s, &format!("192.0.2.{}", i + 1), auth).await;
+        assert_eq!(r.status, StatusCode::OK, "{i}");
+    }
+    for (i, auth) in bob.iter().enumerate() {
+        let r = ask_from(&s, &format!("192.0.2.{}", i + 1), auth).await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{i}");
+        assert_eq!(r.json()["limitClass"], "query");
+    }
+    // his session too
+    let (cookie, _) = password_session(&s, "bob").await;
+    let wiki = format!("/wiki{ASK}");
+    let r = call(&s.app, "GET", &wiki, &[("cookie", &cookie)], "").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // a static token of the configuration, and other users, have their own budgets
+    assert_eq!(
+        ask_from(&s, "192.0.2.1", &bearer(&t_etl())).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        ask_from(&s, "192.0.2.1", &b("alice")).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn owners_have_a_token_cap_and_a_mint_rate() {
+    let s = build(Fixture {
+        extra: "[tokens_policy]\nmax_active_per_owner = 2\nmint_rate = \"4/h\"\n".into(),
+        ..Default::default()
+    });
+    let bob = [("authorization", b("bob"))];
+    let bob: Vec<(&str, &str)> = bob.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mint = |name: &'static str| {
+        let (app, bob) = (&s.app, &bob);
+        async move { mint_as(app, bob, &format!(r#"{{"name":"{name}"}}"#)).await }
+    };
+    let a = mint("a").await;
+    assert_eq!(a.status, StatusCode::CREATED);
+    assert_eq!(mint("b").await.status, StatusCode::CREATED);
+    let r = mint("c").await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(r.text().contains("at most 2 active tokens"), "{}", r.text());
+    // revoking makes room
+    let id = a.json()["id"].as_str().unwrap().to_string();
+    let r = call(&s.app, "DELETE", &format!("/$/auth/tokens/{id}"), &bob, "").await;
+    assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(mint("d").await.status, StatusCode::CREATED);
+    // four mints an hour (the refused one counted)
+    let r = mint("e").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.header("ratelimit-policy"), "\"mint\";q=4;w=3600");
+    assert_eq!(r.json()["reason"], "mint");
+    // per owner: alice is not affected
+    let alice = [("authorization", b("alice"))];
+    let alice: Vec<(&str, &str)> = alice.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = mint_as(&s.app, &alice, r#"{"name":"x"}"#).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    assert!(metric_sum(&s.app, &["sparkles_rate_limit_keys{limiter=\"auth\"}"]).await >= 2);
 }
 
 #[tokio::test]
