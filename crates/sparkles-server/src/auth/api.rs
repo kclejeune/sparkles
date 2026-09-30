@@ -122,6 +122,32 @@ pub fn load(
     }
 }
 
+/// The startup warning of trusted proxy headers from a local peer (loopback or the Unix
+/// socket) when the server knows no host name of its own (`--public-host`,
+/// `server.public_url`): requests that carry them with any other `Host` than an IP
+/// address or `localhost` are refused (`421`), which is what a proxy that passes its
+/// public name on sends.
+pub fn proxy_host_warning(st: &AppState, public_hosts: bool) -> Option<String> {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        let policy = a.policy();
+        let local = policy.proxy.as_ref().is_some_and(|p| p.trusted.local());
+        if local && !public_hosts && policy.public_url.is_none() {
+            return Some(
+                "trusted proxy headers are accepted from a loopback address or the Unix \
+                 socket, and the server knows no host name of its own: such requests are \
+                 refused (421) unless their Host is an IP address or localhost, so that a \
+                 web page that rebinds its DNS name to the server cannot send them. Pass \
+                 the name the proxy is reached by with --public-host (or set \
+                 server.public_url)"
+                    .to_string(),
+            );
+        }
+    }
+    let _ = (st, public_hosts);
+    None
+}
+
 /// The `/$/whoami` and `/$/auth/*` routes (without auth, `/$/auth/config` says so and
 /// the other `/$/auth/*` routes do not exist).
 pub fn routes() -> axum::Router<Arc<AppState>> {

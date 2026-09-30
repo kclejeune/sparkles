@@ -514,7 +514,9 @@ enum Cmd {
         /// A host name clients reach the server by without --auth-config, such as a
         /// reverse proxy's (repeatable). An open server answers only IP addresses,
         /// localhost, --host and these names, and refuses any other `Host` with 421,
-        /// which stops web pages that rebind their DNS name to it
+        /// which stops web pages that rebind their DNS name to it; with auth, the same
+        /// holds for requests carrying trusted proxy headers from loopback or the Unix
+        /// socket
         #[arg(long, value_name = "NAME")]
         public_host: Vec<String>,
     },
@@ -1276,6 +1278,9 @@ fn run() -> Result<()> {
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
+            if let Some(w) = auth::proxy_host_warning(&st, !public_host.is_empty()) {
+                tracing::warn!("{w}");
+            }
             #[cfg(feature = "backup")]
             {
                 st.backup = Some(Arc::new(backup::BackupState::new(

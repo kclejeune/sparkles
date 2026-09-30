@@ -311,6 +311,48 @@ fn host_of(req: &Request) -> Option<&str> {
     }
 }
 
+/// With trusted proxy headers accepted from a local peer (a loopback address or the Unix
+/// socket), a request that carries them must name a `Host` the server is known by: an IP
+/// address, `localhost`, `--host`, a `--public-host` name or the host of
+/// `server.public_url`. Otherwise a web page that rebinds its DNS name to the server (or
+/// to the proxy in front of it) could send its own `Remote-User`; `421`.
+#[cfg(feature = "auth")]
+fn local_proxy_gate(
+    st: &AppState,
+    policy: &super::policy::Policy,
+    peer: Option<&super::Peer>,
+    req: &Request,
+) -> Option<Response> {
+    let px = policy.proxy.as_ref()?;
+    let local = match peer? {
+        super::Peer::Unix => true,
+        super::Peer::Tcp(a) => a.ip().to_canonical().is_loopback(),
+    };
+    if !local || !px.has_headers(req.headers()) || !px.trusted.trusts(peer) {
+        return None;
+    }
+    let host = host_of(req)?;
+    let public = policy
+        .public_url
+        .as_deref()
+        .and_then(|u| reqwest::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_string));
+    let known = st.hosts.allows(host)
+        || public.is_some_and(|p| {
+            crate::exposure::Hosts::new("unix", &[p]).is_ok_and(|h| h.allows(host))
+        });
+    (!known).then(|| {
+        json_error(
+            StatusCode::MISDIRECTED_REQUEST,
+            &format!(
+                "this server does not take proxy identity headers for host '{host}' (it \
+                 answers IP addresses, localhost, --host and --public-host names, and the \
+                 host of server.public_url)"
+            ),
+        )
+    })
+}
+
 /// Without auth every caller is the local principal, so the only thing between a web
 /// page and the server's data is the browser: refuse a `Host` the server is not known
 /// by (DNS rebinding, `421`), and the requests the origin gate refuses with auth
@@ -573,6 +615,20 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<axum::extract::ConnectInfo<super::Peer>>()
         .map(|c| c.0);
+    // identity headers from a local proxy (loopback or the Unix socket) can also come
+    // from a web page that rebinds its DNS name to the server: they need a known `Host`
+    if let Some(r) = local_proxy_gate(st, &policy, peer.as_ref(), &req) {
+        count(Denied::Forbidden);
+        return with_report(
+            r,
+            AuthReport {
+                principal: None,
+                scheme: Some("proxy"),
+                denied: Some(Denied::Forbidden),
+                error: None,
+            },
+        );
+    }
     let admission = req
         .extensions()
         .get::<crate::ratelimit::Admission>()

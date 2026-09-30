@@ -155,3 +155,50 @@ fn proxy_configuration_errors_and_warnings() {
         FileConfig::parse(&format!("{base}\n[proxy]\ntrusted = [\"127.0.0.1\"]\n")).unwrap_err();
     assert!(e.to_string().contains("user_header"), "{e}");
 }
+
+#[tokio::test]
+async fn local_proxy_headers_need_a_known_host() {
+    let f = Fixture {
+        extra: PROXY.into(),
+        public_url: "https://sparql.example.org",
+        ..Default::default()
+    };
+    let s = build(f.clone());
+    let who = |peer: Peer, host: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let mut h = DAVE.to_vec();
+            h.push(("host", host));
+            call_from(&app, peer, "GET", "/$/whoami", &h, "").await
+        }
+    };
+    // a page that rebinds its name to the server sends its own Host: refused
+    let r = who(trusted(), "evil.example").await;
+    assert_eq!(r.status, StatusCode::MISDIRECTED_REQUEST, "{}", r.text());
+    let r = who(Peer::Unix, "evil.example:80").await;
+    assert_eq!(r.status, StatusCode::MISDIRECTED_REQUEST);
+    // the public URL's host, IP addresses and localhost are known
+    for host in [
+        "sparql.example.org",
+        "SPARQL.example.org:443",
+        "127.0.0.1:3030",
+        "localhost:3030",
+        "[::1]",
+    ] {
+        let r = who(trusted(), host).await;
+        assert_eq!(r.status, StatusCode::OK, "{host}");
+        assert_eq!(r.json()["principal"]["kind"], "proxy", "{host}");
+    }
+    // without identity headers any Host is answered, as with auth before
+    let h = [("host", "evil.example")];
+    let r = call_from(&s.app, trusted(), "GET", "/$/whoami", &h, "").await;
+    assert_eq!(r.status, StatusCode::OK);
+    // the startup warning: no host name of its own (no public URL, no --public-host)
+    assert!(crate::auth::proxy_host_warning(&s.state, false).is_none());
+    let without = config_text(&f).replace("public_url = \"https://sparql.example.org\"", "");
+    std::fs::write(&s.config, without).unwrap();
+    s.auth().reload().unwrap();
+    let w = crate::auth::proxy_host_warning(&s.state, false).unwrap();
+    assert!(w.contains("--public-host"), "{w}");
+    assert!(crate::auth::proxy_host_warning(&s.state, true).is_none());
+}

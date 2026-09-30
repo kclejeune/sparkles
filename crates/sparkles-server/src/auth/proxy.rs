@@ -56,6 +56,16 @@ impl TrustedProxies {
         t
     }
 
+    /// Whether a local peer (a loopback address or the Unix socket) is trusted.
+    #[cfg(feature = "auth")]
+    pub fn local(&self) -> bool {
+        self.unix
+            || self.nets.iter().any(|n| {
+                n.contains(&IpAddr::from([127, 0, 0, 1]))
+                    || n.contains(&IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]))
+            })
+    }
+
     pub fn trusts(&self, peer: Option<&Peer>) -> bool {
         match peer {
             Some(Peer::Unix) => self.unix,

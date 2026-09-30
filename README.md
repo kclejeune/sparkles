@@ -461,7 +461,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 |---|---|---|
 | `--host ADDR` | `127.0.0.1` | listen address; a non-loopback address needs `--auth-config` or `--allow-open-network` |
 | `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
-| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config` other names than IP addresses, `localhost` and `--host` are refused with `421` |
+| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config` other names than IP addresses, `localhost` and `--host` are refused with `421`, and with it so are requests carrying trusted proxy headers from loopback or the Unix socket |
 | `--cors-origin ORIGIN` | none | a browser origin (`https://yasgui.example`) whose pages may call the API cross-origin, without credentials (repeatable; with `--auth-config`, added to `cors.origins`); without auth such a page may do everything the server allows |
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |

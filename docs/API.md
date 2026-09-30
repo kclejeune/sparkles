@@ -1505,6 +1505,13 @@ the safest; `tailscale serve` connects from 127.0.0.1. Let `/$/auth/config`,
 the proxy unauthenticated so the CLI can sign in, or give the CLI a separate route.
 An `Authorization` header wins over proxy headers. Do not combine a proxy's own Basic
 authentication with Sparkles auth: the proxy would forward its `Authorization` header.
+When a local peer is trusted (a loopback address or `unix`), a request that carries
+identity headers must name a known `Host`: an IP address, `localhost`, `--host`, a
+`--public-host` name or the host of `server.public_url`; any other is refused with `421`,
+so that a web page that rebinds its own DNS name to the server (or to the proxy in
+front of it) cannot send its own `Remote-User`. Pass the name the proxy is reached by
+with `--public-host` or `server.public_url` (the server warns at startup when it knows
+none; the NixOS module passes its virtual host).
 
 Credentials travel as bearer secrets: terminate TLS in front of the server (the server
 warns when auth is on and it listens beyond loopback).
