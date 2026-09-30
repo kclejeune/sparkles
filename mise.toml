@@ -126,7 +126,7 @@ run = ["cargo clean", "rm -rf ui/build ui/.svelte-kit"]
 # ---------------------------------------------------------------------------- benchmarks ----
 
 [tasks.bench]
-description = "Sparkles vs Jena/Fuseki vs QLever (hyperfine over HTTP; Jena/QLever from nixpkgs if not on PATH)"
+description = "Sparkles vs Jena/Fuseki vs QLever vs Fluree (hyperfine over HTTP; results merge per engine)"
 depends = ["build"]
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
@@ -135,9 +135,11 @@ flag "--runs <n>" default="10" help="measured runs per query"
 flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--skip-queries" help="reuse per-query results; re-run updates / throughput / memory"
+flag "--engines <list>" default="sparkles jena qlever fluree" help="engines to (re-)measure; others' results are kept"
+flag "--queries <list>" help="only these queries (default: all 20)"
 '''
 run = '''
-RUNS="$usage_runs" WARMUP="$usage_warmup" \
+RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
 scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
