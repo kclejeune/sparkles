@@ -10,7 +10,7 @@
   import { fmtCompact, fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
   import { displayIri, RDF_TYPE, termKey } from '$lib/rdf';
-  import { Generation } from '$lib/supersede';
+  import { Generation, LatestRun } from '$lib/supersede';
   import ClassTree from '$components/ClassTree.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
@@ -28,6 +28,7 @@
 
   const RDFS_COMMENT = 'http://www.w3.org/2000/01/rdf-schema#comment';
   const MAX_NODES = 1500;
+  const INFERRED_GRAPH = 'urn:x-sparkles:inferred';
 
   const ds = $derived(app.current);
   const prefixes = $derived(app.prefixes(ds));
@@ -337,12 +338,18 @@
   // --- starting points ------------------------------------------------------------
 
   let starters = $state<{ iri: string; instances: number }[]>([]);
+  /** Named graphs of the dataset (schema graph selector). */
+  let namedGraphs = $state<string[]>([]);
   async function loadStarters(name: string) {
     try {
       const s = await api.datasetStats(name);
       starters = s.classes.slice(0, 10);
+      namedGraphs = s.graphs
+        .map((g) => g.name)
+        .filter((g): g is string => !!g && g !== INFERRED_GRAPH);
     } catch {
       starters = [];
+      namedGraphs = [];
     }
   }
 
@@ -369,12 +376,26 @@
   let classFilter = $state('');
   let propFilter = $state('');
   let schemaView = $state<'classes' | 'properties'>('classes');
+  /** Graph whose triples are counted: `default`, `union` or a graph IRI. */
+  let schemaGraph = $state('default');
+  /** Count materialized inferences (only offered when the dataset has them). */
+  let schemaInferences = $state(true);
+  let showBuiltinProps = $state(false);
+  const hasInferences = $derived(!!app.datasets.find((d) => d.name === ds)?.reasoning);
+  // A newer load (reload, other graph, dataset switch) supersedes an older one.
+  const schemaRuns = new LatestRun();
 
   async function loadSchema(name: string) {
+    const owns = schemaRuns.claim('schema');
     schemaLoading = true;
     schemaErr = null;
     try {
-      schema = await ex.loadSchema(name);
+      const s = await ex.loadSchema(name, {
+        graph: schemaGraph,
+        reasoning: hasInferences ? schemaInferences : undefined,
+      });
+      if (!owns()) return;
+      schema = s;
       schemaFor = name;
       // Open the first two levels by default.
       const open = new Set<string>();
@@ -384,10 +405,15 @@
       }
       openClasses = open;
     } catch (e) {
-      schemaErr = api.errorMessage(e);
+      if (owns()) schemaErr = api.errorMessage(e);
     } finally {
-      schemaLoading = false;
+      if (owns()) schemaLoading = false;
     }
+  }
+
+  function setSchemaGraph(g: string) {
+    schemaGraph = g;
+    if (ds) void loadSchema(ds);
   }
 
   function toggleClass(iri: string) {
@@ -423,12 +449,13 @@
   const propMatches = $derived.by(() => {
     if (!schema) return [];
     const f = propFilter.trim().toLowerCase();
-    return f
-      ? schema.properties.filter(
-          (p) => (p.label ?? '').toLowerCase().includes(f) || p.iri.toLowerCase().includes(f),
-        )
-      : schema.properties;
+    return schema.properties.filter(
+      (p) =>
+        (showBuiltinProps || !p.builtin) &&
+        (!f || (p.label ?? '').toLowerCase().includes(f) || p.iri.toLowerCase().includes(f)),
+    );
   });
+  const builtinProps = $derived(schema ? schema.properties.filter((p) => p.builtin).length : 0);
   const cls = $derived(selectedClass && schema ? schema.classes.get(selectedClass) : undefined);
   const clsProps = $derived.by(() => {
     if (!cls || !schema) return { domain: [], range: [] };
@@ -460,6 +487,8 @@
         focusId = null;
         selectedId = null;
         schema = null;
+        schemaFor = null;
+        schemaGraph = 'default';
         selectedClass = null;
         syncUrl(null);
       }
@@ -766,13 +795,45 @@
     <!-- schema -->
     <div class="split">
       <div class="schema-main">
-        {#if schema?.ontology}
-          <div class="ontology">
+        <div class="ontology">
+          {#if schema?.ontology}
             <strong>{schema.ontology.label ?? shortLabel(schema.ontology.iri, prefixes)}</strong>
             {#if schema.ontology.version}<span class="badge">v{schema.ontology.version}</span>{/if}
             <span class="mono faint">{schema.ontology.iri}</span>
-          </div>
-        {/if}
+          {/if}
+          {#if schema}
+            <span
+              class="faint small"
+              title="Every count is exact at this snapshot of the data (triples {fmtInt(
+                schema.totals.triples,
+              )})">{ex.snapshotLine(schema.snapshot)}</span
+            >
+          {/if}
+          <span class="spacer"></span>
+          <label class="row small">
+            <span class="faint">Graph</span>
+            <select
+              class="select sm"
+              value={schemaGraph}
+              onchange={(e) => setSchemaGraph(e.currentTarget.value)}
+            >
+              <option value="default">default graph</option>
+              <option value="union">all graphs (union)</option>
+              {#each namedGraphs as g (g)}<option value={g}>{displayIri(g, prefixes)}</option
+                >{/each}
+            </select>
+          </label>
+          {#if hasInferences}
+            <label class="row small" title="Count materialized inferences (reasoning=)">
+              <input
+                type="checkbox"
+                bind:checked={schemaInferences}
+                onchange={() => ds && loadSchema(ds)}
+              />
+              <span>include inferences</span>
+            </label>
+          {/if}
+        </div>
         <div class="schema-tools">
           <div class="tabs" role="tablist">
             <button
@@ -789,13 +850,23 @@
               aria-selected={schemaView === 'properties'}
               onclick={() => (schemaView = 'properties')}
             >
-              Properties <span class="count">{schema ? schema.properties.length : ''}</span>
+              Properties <span class="count"
+                >{schema
+                  ? schema.properties.length - (showBuiltinProps ? 0 : builtinProps)
+                  : ''}</span
+              >
             </button>
           </div>
           <span class="spacer"></span>
           {#if schemaView === 'classes'}
             <input class="input sm" placeholder="Filter classes" bind:value={classFilter} />
           {:else}
+            {#if builtinProps}
+              <label class="row small" title="rdf:, rdfs:, owl:, xsd: and sh: predicates">
+                <input type="checkbox" bind:checked={showBuiltinProps} />
+                <span>built-in ({builtinProps})</span>
+              </label>
+            {/if}
             <input class="input sm" placeholder="Filter properties" bind:value={propFilter} />
           {/if}
           <button
@@ -845,18 +916,71 @@
               {/if}
             {:else}
               <table class="data plist">
-                <thead><tr><th>Property</th><th>Kind</th><th>Domain</th><th>Range</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th>Property</th>
+                    <th class="num" title="Distinct triples in the selected graphs">Triples</th>
+                    <th class="num" title="Distinct subjects / distinct objects">Subj. / obj.</th>
+                    <th>Objects</th>
+                    <th>Kind</th>
+                    <th>Domain</th>
+                    <th>Range</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {#each propMatches as p (p.iri)}
+                    {@const o = p.observed}
                     <tr>
                       <td title={p.iri}>
                         <div class="pname">{p.label ?? shortLabel(p.iri, prefixes)}</div>
                         <div class="mono faint small">{displayIri(p.iri, prefixes)}</div>
                       </td>
-                      <td
-                        >{#each p.kinds as k (k)}<span class="badge">{kindName(k)}</span>
-                        {/each}</td
+                      <td class="num">{o.triples ? fmtInt(o.triples) : '—'}</td>
+                      <td class="num small"
+                        >{o.triples
+                          ? `${fmtCompact(o.distinctSubjects)} / ${fmtCompact(o.distinctObjects)}`
+                          : ''}</td
                       >
+                      <td class="objects">
+                        {#if o.triples}
+                          {@const segs = ex.objectSegments(o)}
+                          <div class="mix" aria-hidden="true">
+                            {#each segs as sg, i (i)}<span
+                                class="seg {sg.kind}"
+                                style:width="{Math.max(sg.share * 100, 2)}%"
+                              ></span>{/each}
+                          </div>
+                          <div class="mix-legend">
+                            {#each segs as sg, i (i)}
+                              <span
+                                class="mix-item"
+                                title="{fmtInt(sg.triples)} triples ({Math.round(sg.share * 100)}%)"
+                                ><span class="dot {sg.kind}"></span>{sg.datatype
+                                  ? shortLabel(sg.datatype, prefixes)
+                                  : sg.kind}</span
+                              >
+                              {#each sg.languages.slice(0, 6) as l (l)}<span class="lang">@{l}</span
+                                >{/each}
+                              {#if sg.languages.length > 6}<span class="faint small"
+                                  >+{sg.languages.length - 6}</span
+                                >{/if}
+                            {/each}
+                          </div>
+                        {:else}
+                          <span class="faint small">not used in this graph</span>
+                        {/if}
+                      </td>
+                      <td>
+                        {#each p.kinds.filter((k) => k !== ex.OWL_FUNCTIONAL) as k (k)}<span
+                            class="badge">{kindName(k)}</span
+                          >
+                        {/each}
+                        {#each ex.cardinalityChips(p) as c (c.kind)}<span
+                            class="badge {c.kind === 'observed' ? 'measure' : 'iri'}"
+                            title={c.title}>{c.text}</span
+                          >
+                        {/each}
+                      </td>
                       <td>
                         {#each p.domains as d (d)}
                           <button class="cls-link" onclick={() => revealClass(d)} title={d}
@@ -879,7 +1003,7 @@
                       </td>
                     </tr>
                   {:else}
-                    <tr><td colspan="4" class="faint">No properties match.</td></tr>
+                    <tr><td colspan="7" class="faint">No properties match.</td></tr>
                   {/each}
                 </tbody>
               </table>
@@ -914,12 +1038,41 @@
               <dt>Declared</dt>
               <dd>{cls.declared ? 'yes' : 'no, only used'}</dd>
             </dl>
-            <h3 class="sub">Superclasses</h3>
+            <h3 class="sub">Superclasses <span class="faint small">asserted</span></h3>
             <div class="chips left">
-              {#each cls.supers as s (s)}<button class="cls-link" onclick={() => revealClass(s)}
-                  >{classLabel(s)}</button
+              {#each cls.assertedSupers as s (s)}<button
+                  class="cls-link"
+                  onclick={() => revealClass(s)}
+                  title={s}>{classLabel(s)}</button
                 >{:else}<span class="faint">None (root class)</span>{/each}
             </div>
+            {#if cls.cycle.length}
+              <p class="faint small">
+                <Icon name="cycle" size={12} /> On a subClassOf cycle with {cls.cycle
+                  .map(classLabel)
+                  .join(', ')}
+              </p>
+            {/if}
+            {#if cls.equivalents.length}
+              <h3 class="sub">Equivalent classes</h3>
+              <div class="chips left">
+                {#each cls.equivalents as s (s)}<button
+                    class="cls-link"
+                    onclick={() => revealClass(s)}
+                    title={s}>{classLabel(s)}</button
+                  >{/each}
+              </div>
+            {/if}
+            {#if cls.disjoint.length}
+              <h3 class="sub">Disjoint with</h3>
+              <div class="chips left">
+                {#each cls.disjoint as s (s)}<button
+                    class="cls-link"
+                    onclick={() => revealClass(s)}
+                    title={s}>{classLabel(s)}</button
+                  >{/each}
+              </div>
+            {/if}
             <h3 class="sub">Subclasses</h3>
             <div class="chips left">
               {#each cls.subs as s (s)}<button class="cls-link" onclick={() => revealClass(s)}
@@ -1298,6 +1451,70 @@
   }
   .plist td {
     vertical-align: top;
+  }
+  .plist .num {
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .objects {
+    min-width: 160px;
+  }
+  .mix {
+    display: flex;
+    height: 6px;
+    margin-top: 4px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--surface-3);
+  }
+  .seg.iri,
+  .dot.iri {
+    background: var(--iri);
+  }
+  .seg.literal,
+  .dot.literal {
+    background: var(--literal);
+  }
+  .seg.blank,
+  .dot.blank,
+  .seg.triple,
+  .dot.triple {
+    background: var(--bnode);
+  }
+  .seg + .seg {
+    border-left: 1px solid var(--surface);
+  }
+  .mix-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    margin-top: 3px;
+    font-size: 11px;
+  }
+  .mix-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+  .lang {
+    font-family: var(--font-mono);
+    color: var(--literal);
+  }
+  /* an observation of the current data, not a declared constraint */
+  .badge.measure {
+    background: transparent;
+    border: 1px dashed var(--text-3);
+    color: var(--text-2);
+    font-weight: 500;
+  }
+  .ontology .spacer {
+    flex: 1;
   }
   .pname {
     font-weight: 500;

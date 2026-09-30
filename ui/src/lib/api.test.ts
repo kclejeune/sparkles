@@ -93,9 +93,101 @@ describe('query', () => {
     expect(await api.update('ds', 'INSERT DATA {}')).toBeNull();
   });
 
+  it('rejects invalid JSON from a JSON endpoint (schema)', async () => {
+    stubFetch(() => new Response('{nope'));
+    const e = await api.schemaSummary('ds').catch((x) => x);
+    expect(e.message).toBe('Server returned invalid JSON');
+  });
+
   it('rejects invalid JSON from a JSON endpoint', async () => {
     stubFetch(() => new Response('{nope'));
     const e = await api.serverInfo().catch((x) => x);
     expect(e.message).toBe('Server returned invalid JSON');
+  });
+});
+
+describe('schema', () => {
+  /** A fake schema server: `items` classes in pages of `limit`; `version` can change. */
+  function fakeSchema(items: string[], limit: number) {
+    const state = { version: 1, served: new Set<number>([]) };
+    const page = (after: number, v: number) => {
+      const slice = items.slice(after, after + limit);
+      const end = after + slice.length;
+      return {
+        items: slice.map((iri) => ({ iri })),
+        total: items.length,
+        next: end < items.length ? `${v}:${end}` : null,
+      };
+    };
+    const calls = stubFetch((url) => {
+      const u = new URL(url, 'http://x');
+      const cursor = u.searchParams.get('cursor');
+      if (!cursor) {
+        state.served.add(state.version);
+        return jsonResponse({
+          schemaFormat: 1,
+          snapshot: { version: state.version },
+          classes: page(0, state.version),
+          predicates: { items: [{ iri: 'p' }], total: 1, next: null },
+        });
+      }
+      const [v, after] = cursor.split(':').map(Number);
+      if (v !== state.version) return jsonResponse({ error: 'snapshot changed' }, 409);
+      return jsonResponse(page(after, v));
+    });
+    return { state, calls };
+  }
+
+  it('follows next until the lists are complete', async () => {
+    const items = Array.from({ length: 7 }, (_, i) => `c${i}`);
+    const { calls } = fakeSchema(items, 3);
+    const s = await api.schema('my ds', { graph: 'union', reasoning: false, limit: 3 });
+    expect(s.classes.items.map((c) => c.iri)).toEqual(items);
+    expect(s.classes.next).toBeNull();
+    expect(s.predicates.items).toHaveLength(1);
+    expect(calls.map((c) => c.url)).toEqual([
+      '/$/schema/my%20ds?graph=union&reasoning=false&limit=3',
+      '/$/schema/my%20ds/classes?graph=union&reasoning=false&limit=3&cursor=1%3A3',
+      '/$/schema/my%20ds/classes?graph=union&reasoning=false&limit=3&cursor=1%3A6',
+    ]);
+  });
+
+  // The snapshot changes between pages and the server no longer holds the old report:
+  // start over rather than mixing pages of two snapshots.
+  it('restarts from the first page on 409', async () => {
+    const { state } = fakeSchema(['a', 'b', 'c'], 2);
+    const fake = globalThis.fetch;
+    let n = 0;
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      const r = await fake(url, init);
+      if (n++ === 0) state.version = 2; // a write lands after the first page
+      return r;
+    });
+    const s = await api.schema('ds');
+    expect(s.snapshot.version).toBe(2);
+    expect(s.classes.items.map((c) => c.iri)).toEqual(['a', 'b', 'c']);
+    expect([...state.served]).toEqual([1, 2]);
+  });
+
+  it('gives up after the allowed attempts', async () => {
+    stubFetch((url) =>
+      url.includes('cursor')
+        ? jsonResponse({ error: 'snapshot changed' }, 409)
+        : jsonResponse({
+            snapshot: { version: 1 },
+            classes: { items: [], total: 1, next: 'x' },
+            predicates: { items: [], total: 0, next: null },
+          }),
+    );
+    const e = await api.schema('ds', {}, 2).catch((x) => x);
+    expect(e).toBeInstanceOf(api.ApiError);
+    expect(e.status).toBe(409);
+  });
+
+  it('does not retry other errors', async () => {
+    const calls = stubFetch(() => jsonResponse({ error: 'no such graph' }, 404));
+    const e = await api.schema('ds', { graph: 'http://ex.org/g' }).catch((x) => x);
+    expect(e.status).toBe(404);
+    expect(calls).toHaveLength(1);
   });
 });

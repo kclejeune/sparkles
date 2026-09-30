@@ -86,7 +86,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
-| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser (built against a mock; server integration pending) | 🚧 |
+| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations); Vitest unit tests (built against a mock; server integration pending) | 🚧 |
 
 ## Performance
 

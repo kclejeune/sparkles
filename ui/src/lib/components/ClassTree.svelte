@@ -57,6 +57,17 @@
             <span class="name">{c.label ?? shortLabel(iri, prefixes)}</span>
             {#if c.label}<span class="iri">{shortLabel(iri, prefixes)}</span>{/if}
           </button>
+          {#if c.cycle.length}<span
+              class="cycle"
+              title="On a subClassOf cycle with {c.cycle
+                .map((x) => schema.classes.get(x)?.label ?? shortLabel(x, prefixes))
+                .join(', ')}"><Icon name="cycle" size={12} /></span
+            >{/if}
+          {#if !c.declared && !c.builtin}<span
+              class="tag"
+              title="Used (as a type or in a subClassOf axiom) but not declared as rdfs:Class, owl:Class or rdfs:Datatype"
+              >undeclared</span
+            >{/if}
           {#if kids.length}<span class="kids faint" title="{kids.length} subclasses"
               >{kids.length}</span
             >{/if}
@@ -155,6 +166,19 @@
   }
   .kids {
     font-size: var(--fs-xs);
+  }
+  .cycle {
+    display: inline-flex;
+    color: var(--warn);
+    flex: none;
+  }
+  .tag {
+    flex: none;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 10px;
+    color: var(--text-3);
   }
   .count {
     min-width: 34px;

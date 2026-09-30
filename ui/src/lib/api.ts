@@ -223,6 +223,160 @@ export async function prefixes(ds: string): Promise<Record<string, string>> {
   return body?.prefixes ?? {};
 }
 
+// --- schema discovery ---------------------------------------------------------
+
+/** A plain or language-tagged literal (labels, comments). */
+export type Lit = { value: string; lang?: string };
+export type KindCount = { triples: number; distinct: number };
+
+export type SchemaClass = {
+  iri: string;
+  /** rdf:, rdfs:, owl:, xsd: or sh: namespace */
+  builtin: boolean;
+  /** Distinct subjects typed with the class in the selected graphs. */
+  observed: { instances: number };
+  declared: {
+    types: string[];
+    superClasses: string[];
+    equivalentClasses: string[];
+    disjointWith: string[];
+    labels: Lit[];
+    comments: Lit[];
+  };
+};
+
+export type LiteralGroup = {
+  datatype: string;
+  triples: number;
+  distinct: number;
+  languages?: { lang: string; direction?: 'ltr' | 'rtl'; triples: number }[];
+};
+
+export type SchemaPredicate = {
+  iri: string;
+  builtin: boolean;
+  /** Exact counts at the report's snapshot: measurements, not constraints. */
+  observed: {
+    triples: number;
+    distinctSubjects: number;
+    distinctObjects: number;
+    maxPerSubject: number;
+    subjectsWithMultiple: number;
+    objects: {
+      iri?: KindCount;
+      blank?: KindCount;
+      tripleTerm?: KindCount;
+      literals: LiteralGroup[];
+    };
+  };
+  declared: {
+    types: string[];
+    domains: string[];
+    ranges: string[];
+    superProperties: string[];
+    inverseOf: string[];
+    labels: Lit[];
+    comments: Lit[];
+  };
+};
+
+export type Page<T> = { items: T[]; total: number; next: string | null };
+
+export type SchemaSummary = {
+  schemaFormat: 1;
+  dataset: string;
+  snapshot: { version: number; generation: string; computedAt: string };
+  selection: {
+    graph: string;
+    declaredGraph: string;
+    reasoning: boolean;
+    declared: 'asserted' | 'all';
+  };
+  totals: {
+    triples: number;
+    classes: number;
+    predicates: number;
+    anonymousTypeTargets: number;
+    anonymousClassExpressions: number;
+  };
+  ontology: { iri: string; labels: Lit[]; versionInfo: Lit[]; comments: Lit[] }[];
+  hierarchy: { roots: string[]; cycles: string[][] };
+  classes: Page<SchemaClass>;
+  predicates: Page<SchemaPredicate>;
+};
+
+export type SchemaOptions = {
+  /** `default`, `union` or a graph IRI. */
+  graph?: string;
+  /** Graph read for declarations (server default: the same as `graph`). */
+  declaredGraph?: string;
+  /** Count materialized inferences (server default: yes, when present). */
+  reasoning?: boolean;
+  declared?: 'asserted' | 'all';
+  /** Page size (1–10000). */
+  limit?: number;
+  timeout?: number;
+  signal?: AbortSignal;
+};
+
+function schemaParams(opts: SchemaOptions, cursor?: string): string {
+  const p = new URLSearchParams();
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.declaredGraph) p.set('declaredGraph', opts.declaredGraph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.declared) p.set('declared', opts.declared);
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.timeout != null) p.set('timeout', String(opts.timeout));
+  if (cursor) p.set('cursor', cursor);
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
+
+/** `GET /$/schema/{ds}`: the report with the first page of classes and predicates. */
+export const schemaSummary = (ds: string, opts: SchemaOptions = {}) =>
+  json<SchemaSummary>(`/$/schema/${enc(ds)}${schemaParams(opts)}`, { signal: opts.signal });
+
+/** One page of `GET /$/schema/{ds}/classes|predicates` after `cursor`. */
+export function schemaPage<K extends 'classes' | 'predicates'>(
+  ds: string,
+  list: K,
+  cursor: string,
+  opts: SchemaOptions = {},
+): Promise<Page<K extends 'classes' ? SchemaClass : SchemaPredicate>> {
+  return json(`/$/schema/${enc(ds)}/${list}${schemaParams(opts, cursor)}`, {
+    signal: opts.signal,
+  });
+}
+
+/**
+ * The complete schema report: the summary with every page of both lists appended
+ * (`next` is null in the result). All pages come from the snapshot of the first one;
+ * when the server answers 409 (the snapshot changed and its report is gone) the listing
+ * restarts from the first page, at most `attempts` times in all.
+ */
+export async function schema(
+  ds: string,
+  opts: SchemaOptions = {},
+  attempts = 3,
+): Promise<SchemaSummary> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const summary = await schemaSummary(ds, opts);
+      for (const list of ['classes', 'predicates'] as const) {
+        const page = summary[list] as Page<SchemaClass | SchemaPredicate>;
+        while (page.next) {
+          const more = await schemaPage(ds, list, page.next, opts);
+          page.items.push(...more.items);
+          page.next = more.next;
+        }
+      }
+      return summary;
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 409) || attempt >= attempts) throw e;
+    }
+  }
+}
+
 // --- SPARQL -------------------------------------------------------------------
 
 export type QueryOptions = {
