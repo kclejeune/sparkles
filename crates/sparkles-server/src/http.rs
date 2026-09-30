@@ -557,7 +557,10 @@ async fn dataset_root(
 ) -> ApiResult {
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
-    if method == Method::POST && ct == "application/x-www-form-urlencoded" {
+    // the auth layer granted a form POST read access, since only its body tells a query
+    // from an update: every other operation is re-checked here
+    let form = method == Method::POST && ct == "application/x-www-form-urlencoded";
+    if form {
         params.extend_form(&body);
     }
     if params.has("query") || ct == "application/sparql-query" {
@@ -571,15 +574,24 @@ async fn dataset_root(
                 "use POST for SPARQL Update",
             ));
         }
-        // a form body is only seen here: the auth layer checked read
-        if !p.can(&name, Level::Write) {
-            dataset(&st, &name)?;
-            let msg = format!("write access to /{name} required");
-            return Ok(crate::auth::forbidden(&p, &msg));
+        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+            return Ok(denied);
         }
         return update_endpoint(st, Path(name), p, uri, headers, body).await;
     }
-    gsp(st, Path(name), method, uri, headers, body.into()).await
+    if form {
+        // neither a query nor an update: refused as the write any other POST body would
+        // be, and never taken for an RDF payload
+        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+            return Ok(denied);
+        }
+        dataset(&st, &name)?;
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "missing 'query' or 'update' parameter",
+        ));
+    }
+    gsp(st, Path(name), p, method, uri, headers, body.into()).await
 }
 
 async fn query_endpoint(
@@ -1392,11 +1404,18 @@ async fn graph_body(
 async fn gsp(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> ApiResult {
+    // every write needs write access, whichever route (or fallthrough) led here
+    if !matches!(method, Method::GET | Method::HEAD)
+        && let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write)
+    {
+        return Ok(denied);
+    }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let target = gsp_target(&params);

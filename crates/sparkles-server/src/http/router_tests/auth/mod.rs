@@ -686,6 +686,197 @@ async fn form_post_is_rechecked() {
     assert_eq!(w.status, StatusCode::OK, "{}", w.text());
 }
 
+/// A static token that reads `team-a` and `public` and nothing else.
+fn reader_fixture() -> Fixture {
+    Fixture {
+        extra: format!(
+            "[[tokens]]\nname = \"reader\"\nhash = \"{}\"\ndatasets = {{ \"team-a\" = \"read\", public = \"read\" }}\n",
+            token_hash(&tok('R'))
+        ),
+        ..Default::default()
+    }
+}
+
+const FORM: &str = "application/x-www-form-urlencoded";
+const TRIPLE: &str = "<urn:s> <urn:p> <urn:o> .";
+
+#[tokio::test]
+async fn form_body_without_an_operation_is_not_an_upload() {
+    let s = build(reader_fixture());
+    let reader = bearer(&tok('R'));
+    let post = |uri: &'static str, auth: Option<String>, ct: &'static str| {
+        let app = s.app.clone();
+        async move {
+            let mut h = vec![("content-type", ct.to_string())];
+            h.extend(auth.map(|a| ("authorization", a)));
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            call(&app, "POST", uri, &h, TRIPLE).await
+        }
+    };
+    let before = head(&s.state, "team-a");
+    // a read-only caller gets the answer of any other write: 403, same body and headers
+    let form = post("/team-a?format=turtle", Some(reader.clone()), FORM).await;
+    let turtle = post("/team-a?format=turtle", Some(reader.clone()), "text/turtle").await;
+    assert_eq!(form.status, StatusCode::FORBIDDEN, "{}", form.text());
+    assert_eq!(form.err(), turtle.err());
+    assert_eq!(form.err()["error"], "write access to /team-a required");
+    assert_eq!(form.all("www-authenticate"), turtle.all("www-authenticate"));
+    for g in [
+        "/team-a?format=turtle&default",
+        "/team-a?format=nt&graph=urn:g",
+    ] {
+        let r = post(g, Some(reader.clone()), FORM).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{g}: {}", r.text());
+    }
+    assert_eq!(head(&s.state, "team-a"), before);
+    assert_eq!(s.state.get("team-a").unwrap().store.snapshot().len(), 1);
+    // without any access the dataset stays hidden; anonymous callers are asked to sign in
+    let hidden = post("/secret?format=turtle", Some(reader.clone()), FORM).await;
+    let hidden_turtle = post("/secret?format=turtle", Some(reader.clone()), "text/turtle").await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden.err(), hidden_turtle.err());
+    let anon = post("/public?format=turtle", None, FORM).await;
+    let anon_turtle = post("/public?format=turtle", None, "text/turtle").await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(anon.err(), anon_turtle.err());
+    assert_eq!(
+        anon.all("www-authenticate"),
+        anon_turtle.all("www-authenticate")
+    );
+    // a caller who may write gets a plain 400: a form body is never RDF
+    let etl = post("/wiki?format=turtle", Some(bearer(&t_etl())), FORM).await;
+    assert_eq!(etl.status, StatusCode::BAD_REQUEST, "{}", etl.text());
+    assert_eq!(etl.err()["error"], "missing 'query' or 'update' parameter");
+    assert_eq!(s.state.get("wiki").unwrap().store.snapshot().len(), 1);
+    // a form query still needs only read, a form update write
+    let h = [("authorization", reader.as_str()), ("content-type", FORM)];
+    let q = call(&s.app, "POST", "/team-a", &h, "query=ASK%7B%7D").await;
+    assert_eq!(q.status, StatusCode::OK, "{}", q.text());
+    let u = call(&s.app, "POST", "/team-a", &h, "update=CLEAR%20ALL").await;
+    assert_eq!(u.status, StatusCode::FORBIDDEN, "{}", u.text());
+    assert_eq!(u.err(), turtle.err());
+    assert_eq!(head(&s.state, "team-a"), before);
+    let m = get_as(&s.app, "/$/metrics", Some(&bearer(&t_prom())))
+        .await
+        .text();
+    assert!(
+        m.contains("sparkles_auth_denied_total{kind=\"forbidden\"} 5"),
+        "{m}"
+    );
+}
+
+/// A read-only caller cannot change a dataset through any route, method, content type,
+/// graph selector or body of the SPARQL and Graph Store endpoints.
+#[tokio::test]
+async fn read_access_never_writes() {
+    let s = build(reader_fixture());
+    let reader = bearer(&tok('R'));
+    let ds = s.state.get("team-a").unwrap();
+    let state = || {
+        (
+            ds.store.head_commit().seq,
+            ds.store.snapshot().len(),
+            ds.store.prefixes(),
+        )
+    };
+    let before = state();
+    let paths = [
+        "",
+        "/data",
+        "/sparql",
+        "/query",
+        "/update",
+        "/upload",
+        "/get",
+        "/prefixes",
+        "/explain",
+        "/shacl",
+    ];
+    let methods = ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"];
+    let queries = [
+        "",
+        "?format=turtle",
+        "?default",
+        "?graph=urn:g",
+        "?graph=default&format=nt",
+        "?query=ASK%7B%7D&format=turtle",
+        "?update=INSERT%20DATA%20%7B%3Ca%3Aa%3E%20%3Ca%3Ab%3E%20%3Ca%3Ac%3E%7D",
+        "?prefix=x&uri=urn:x",
+    ];
+    let form_update = "update=INSERT%20DATA%20%7B%3Ca%3Aa%3E%20%3Ca%3Ab%3E%20%3Ca%3Ac%3E%7D";
+    let bodies: &[(&str, &[&str])] = &[
+        ("", &[TRIPLE]),
+        (
+            FORM,
+            &[TRIPLE, form_update, "prefix=x&uri=urn:x", "default="],
+        ),
+        ("text/turtle", &[TRIPLE]),
+        (
+            "application/n-quads",
+            &["<urn:s> <urn:p> <urn:o> <urn:g> ."],
+        ),
+        ("application/sparql-update", &[INSERT]),
+        ("application/sparql-query", &[TRIPLE]),
+        ("application/json", &[r#"{"prefix":"x","uri":"urn:x"}"#]),
+        ("multipart/form-data; boundary=X", &[TRIPLE]),
+    ];
+    let mut n = 0;
+    for path in paths {
+        for method in methods {
+            for q in queries {
+                for (ct, bs) in bodies {
+                    for body in *bs {
+                        let uri = format!("/team-a{path}{q}");
+                        let mut h = vec![("authorization", reader.as_str())];
+                        if !ct.is_empty() {
+                            h.push(("content-type", ct));
+                        }
+                        let r = call(&s.app, method, &uri, &h, body).await;
+                        let what = format!("{method} {uri} ({ct}): {}", r.status);
+                        assert!(r.status != StatusCode::INTERNAL_SERVER_ERROR, "{what}");
+                        assert!(
+                            !r.status.is_success() || matches!(method, "GET" | "HEAD" | "POST"),
+                            "{what}"
+                        );
+                        assert_eq!(state(), before, "{what}");
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(n > 3000);
+    // the same writes by a writer do go through (the table is not vacuous)
+    let etl = bearer(&t_etl());
+    let w = |m: &'static str, uri: &'static str, ct: &'static str| {
+        let (app, etl) = (s.app.clone(), etl.clone());
+        async move {
+            let h = [("authorization", etl.as_str()), ("content-type", ct)];
+            call(&app, m, uri, &h, TRIPLE).await.status
+        }
+    };
+    assert_eq!(
+        w("PUT", "/wiki/data?default", "text/turtle").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        w("POST", "/wiki?graph=urn:g", "text/turtle").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        w("POST", "/wiki", "application/n-triples").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        w("DELETE", "/wiki?graph=urn:g", "").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        w("POST", "/wiki/upload", "text/turtle").await,
+        StatusCode::OK
+    );
+}
+
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

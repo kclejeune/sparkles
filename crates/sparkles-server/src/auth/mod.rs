@@ -46,7 +46,7 @@ pub use api::{
     spawn_reload_on_sighup,
 };
 pub use proxy::Peer;
-pub use routes::{AuthReport, Denied, forbidden, middleware};
+pub use routes::{AuthReport, Denied, dataset_denial, forbidden, middleware};
 #[cfg(test)]
 pub use routes::{ROUTES, need};
 

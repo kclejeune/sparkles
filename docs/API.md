@@ -503,6 +503,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 | Method     | Path                  | Description |
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol (`query=` param, `application/sparql-query` body, or form). `default-graph-uri` / `named-graph-uri` supported. |
+| any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`) and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`: with neither it is refused (`400`, or the authorization error of a write for a caller without write access), never read as RDF. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
