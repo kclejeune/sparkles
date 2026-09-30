@@ -1852,3 +1852,90 @@ async fn e2e_permissions_and_lineage() {
     let t = run_as(&s, "alice", "/$/backups/wiki/local/w1/restore", json!({})).await;
     assert_eq!(t.state, "done", "{:?}", t.message);
 }
+
+#[cfg(feature = "auth")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dataset_admins_see_no_absolute_paths() {
+    let s = server(Opts {
+        auth: true,
+        ..Default::default()
+    });
+    let app = &s.app;
+    // a repository whose directory cannot be created: its errors name the path
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("file"), b"x").unwrap();
+    let path = tmp.path().join("file").join("repo");
+    let r = call(
+        app,
+        "POST",
+        "/$/repositories?verify=false",
+        Some("alice"),
+        json!({"name": "gone", "type": "fs", "path": path}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let secret = tmp.path().display().to_string();
+    let r = call(
+        app,
+        "GET",
+        "/$/backups/wiki/gone/b1",
+        Some("alice"),
+        J::Null,
+    )
+    .await;
+    expect(&r, StatusCode::BAD_GATEWAY, "repository-unavailable");
+    assert!(
+        r.body["error"].as_str().unwrap().contains(&secret),
+        "{}",
+        r.body
+    );
+    let r = call(
+        app,
+        "GET",
+        "/$/backups/wiki/gone/b1",
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    expect(&r, StatusCode::BAD_GATEWAY, "repository-unavailable");
+    let msg = r.body["error"].as_str().unwrap();
+    assert!(!msg.contains(&secret) && msg.contains("…/repo"), "{msg}");
+    // and in task details
+    let id = s.st.next_task_id();
+    let root = format!("{secret}/file/repo");
+    let t = s.st.start_task_opts(
+        id.clone(),
+        "backup-verify",
+        "wiki",
+        Some("b1"),
+        false,
+        move |h| {
+            h.set_detail(json!({"check": {"root": root}}));
+            Ok("done".into())
+        },
+    );
+    wait_task(&s.st, &t.id).await;
+    let r = call(
+        app,
+        "GET",
+        &format!("/$/tasks/{id}"),
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    assert_eq!(r.body["detail"]["check"]["root"], "…/repo", "{}", r.body);
+    let r = call(
+        app,
+        "GET",
+        &format!("/$/tasks/{id}"),
+        Some("alice"),
+        J::Null,
+    )
+    .await;
+    assert!(
+        r.body["detail"]["check"]["root"]
+            .as_str()
+            .unwrap()
+            .contains(&secret)
+    );
+}

@@ -45,7 +45,6 @@ use std::path::Path;
 
 /// The file header `sparkles repo add` and `repo remove` write (they rewrite the file
 /// through a serde round trip).
-#[cfg_attr(not(test), allow(dead_code))] // `sparkles repo add`
 pub const HEADER: &str = "# Sparkles backup repositories and policies. Written by `sparkles repo add` and\n# `sparkles repo remove`, which do not keep comments. No secrets here: credentials\n# come from the environment or from files.\n";
 
 /// The whole file.
@@ -215,7 +214,6 @@ impl RepoToml {
     }
 
     /// The table of an API configuration (its name is the table key).
-    #[cfg_attr(not(test), allow(dead_code))] // `sparkles repo add`
     pub fn from_config(c: &RepoConfig) -> RepoToml {
         RepoToml {
             kind: c.kind,
@@ -318,7 +316,7 @@ impl PolicyToml {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // `sparkles repo add`
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_config(p: &PolicyConfig) -> PolicyToml {
         PolicyToml {
             repository: p.repository.clone(),
@@ -379,7 +377,6 @@ impl ConfigFile {
     }
 
     /// The file's text: [`HEADER`] and the TOML.
-    #[cfg_attr(not(test), allow(dead_code))] // `sparkles repo add`
     pub fn to_text(&self) -> Result<String> {
         Ok(format!("{HEADER}\n{}", toml::to_string_pretty(self)?))
     }

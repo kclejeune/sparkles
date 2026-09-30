@@ -67,20 +67,47 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/$/repositories/{repo}/locks/{id}",
             axum::routing::delete(break_lock),
         )
-        .route("/$/backups/{ds}", get(dataset_backups).post(create_backup))
-        .route(
-            "/$/backups/{ds}/{repo}/{backup}",
-            get(get_backup).delete(delete_backup),
-        )
-        .route(
-            "/$/backups/{ds}/{repo}/{backup}/restore",
-            post(restore_backup),
-        )
-        .route(
-            "/$/backups/{ds}/{repo}/{backup}/verify",
-            post(verify_backup),
+        .merge(
+            Router::new()
+                .route("/$/backups/{ds}", get(dataset_backups).post(create_backup))
+                .route(
+                    "/$/backups/{ds}/{repo}/{backup}",
+                    get(get_backup).delete(delete_backup),
+                )
+                .route(
+                    "/$/backups/{ds}/{repo}/{backup}/restore",
+                    post(restore_backup),
+                )
+                .route(
+                    "/$/backups/{ds}/{repo}/{backup}/verify",
+                    post(verify_backup),
+                )
+                .route_layer(axum::middleware::from_fn(paths_for_caller)),
         )
         .merge(super::policies::routes())
+}
+
+/// The per-dataset routes answer callers without `server-admin` (dataset admins and
+/// readers) with the absolute paths in error messages cut to their last component:
+/// where a repository lives is the server admin's business.
+async fn paths_for_caller(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let admin = req
+        .extensions()
+        .get::<Principal>()
+        .is_none_or(|p| p.has(ServerPerm::ServerAdmin));
+    let mut resp = next.run(req).await;
+    if admin {
+        return resp;
+    }
+    match resp.extensions_mut().remove::<crate::http::ErrorJson>() {
+        Some(crate::http::ErrorJson(mut body)) => {
+            crate::http::redact_json_paths(&mut body);
+            let mut r = (resp.status(), Json(body.clone())).into_response();
+            r.extensions_mut().insert(crate::http::ErrorJson(body));
+            r
+        }
+        None => resp,
+    }
 }
 
 /// A backup error as an HTTP response (`{error, code, …}` with its status).

@@ -2739,21 +2739,35 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
     p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
 }
 
-/// A task as `p` sees it: without `server-admin`, absolute paths in its message are cut
-/// to their last component (`backup written to …/wiki_2026-01-01.nq.gz`).
+/// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
+/// the strings of its `detail` are cut to their last component (`backup written to
+/// …/wiki_2026-01-01.nq.gz`).
 fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
     let mut t = t.clone();
-    if !p.has(crate::auth::ServerPerm::ServerAdmin)
-        && let Some(m) = &t.message
-    {
-        t.message = Some(redact_paths(m));
+    if !p.has(crate::auth::ServerPerm::ServerAdmin) {
+        if let Some(m) = &t.message {
+            t.message = Some(redact_paths(m));
+        }
+        if let Some(d) = &mut t.detail {
+            redact_json_paths(d);
+        }
     }
     t
 }
 
+/// [`redact_paths`] on every string of a JSON value.
+pub(crate) fn redact_json_paths(v: &mut J) {
+    match v {
+        J::String(s) => *s = redact_paths(s),
+        J::Array(a) => a.iter_mut().for_each(redact_json_paths),
+        J::Object(o) => o.values_mut().for_each(redact_json_paths),
+        _ => {}
+    }
+}
+
 /// `msg` with every absolute path (a word starting with `/` and holding another `/`)
 /// cut to `…/` and its last component.
-fn redact_paths(msg: &str) -> String {
+pub(crate) fn redact_paths(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     while let Some(i) = rest.find('/') {

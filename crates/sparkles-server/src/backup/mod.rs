@@ -24,8 +24,6 @@ pub mod ops;
 pub mod policies;
 pub mod recover;
 pub mod registry;
-// the scheduler's clock is used once it schedules
-#[allow(dead_code)]
 pub mod scheduler;
 pub mod swap;
 #[cfg(test)]
@@ -479,7 +477,6 @@ impl BackupState {
 
     /// The backups of repository `repo` that a restore or verification uses now
     /// (retention keeps them until its next evaluation).
-    #[cfg_attr(not(test), allow(dead_code))] // policy retention
     pub fn busy_backups(&self, repo: &str) -> BTreeSet<String> {
         self.claims
             .lock()
@@ -779,7 +776,6 @@ pub const DATA_LOCK: &str = "sparkles-server.lock";
 
 /// Whether a server holds the data directory's lock now (for offline commands that
 /// write into it).
-#[cfg_attr(not(test), allow(dead_code))] // `sparkles backup restore --data`
 pub fn data_dir_in_use(data_dir: &Path) -> bool {
     match std::fs::File::open(data_dir.join(DATA_LOCK)) {
         Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
