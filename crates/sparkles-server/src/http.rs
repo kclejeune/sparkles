@@ -1299,6 +1299,7 @@ async fn update_endpoint(
     let mut opts = QueryOptions {
         allow_service: st.allow_service,
         outbound: st.outbound.clone(),
+        file_loads: st.file_loads.clone(),
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
@@ -1673,14 +1674,7 @@ async fn graph_body(
     let snap = snap.without_cache_fill();
     let prefixes = ds.store.prefixes();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
-        let mut ser = RdfSerializer::from_format(fmt);
-        if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-            for (p, ns) in prefixes {
-                if let Ok(s) = ser.clone().with_prefix(p, ns) {
-                    ser = s;
-                }
-            }
-        }
+        let ser = sparkles::io::with_prefixes(RdfSerializer::from_format(fmt), prefixes);
         let mut s = ser.for_writer(w);
         let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
         let mut n = 0u64;

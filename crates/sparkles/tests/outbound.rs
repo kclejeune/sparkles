@@ -1,7 +1,7 @@
 //! The outbound policy on the real request paths (SERVICE, LOAD) against a local HTTP
 //! server: refused destinations are never contacted, names connect to the addresses
-//! the policy checked, every redirect hop is checked, and slow or oversized responses
-//! fail.
+//! the policy checked, every redirect hop is checked, slow or oversized responses fail,
+//! and the requests of one SPARQL request share one budget.
 
 use sparkles::Error;
 use sparkles::outbound::{Allow, OutboundPolicy, Resolver};
@@ -258,29 +258,44 @@ fn names_connect_to_the_checked_addresses() {
         1
     );
     assert_eq!(s.conns(), 1);
+    // the refusal names the host, not what it resolved to
     let m = refusal(service(&url("svc.test"), false, policy(false, &[])));
-    assert!(
-        m.contains("svc.test resolves to 127.0.0.1, a loopback address"),
-        "{m}"
+    assert_eq!(
+        m,
+        format!(
+            "SERVICE <{}>: svc.test is refused by the outbound policy",
+            url("svc.test")
+        )
     );
+    assert!(!m.contains("127.0.0.1"), "{m}");
     // one disallowed address refuses the name
     let m = refusal(service(&url("mixed.test"), false, policy(false, &[])));
-    assert!(m.contains("127.0.0.1, a loopback address"), "{m}");
+    assert!(m.contains("mixed.test is refused"), "{m}");
     let m = refusal(service(
         &url("mixed-public-first.test"),
         false,
         policy(false, &[]),
     ));
-    assert!(m.contains("10.0.0.1, a private address"), "{m}");
+    assert!(m.contains("refused") && !m.contains("10.0.0.1"), "{m}");
     let m = refusal(service(
         &url("mixed.test"),
         false,
         policy(false, &["127.0.0.0/8"]),
     ));
     assert!(m.contains("not in the outbound allowlist"), "{m}");
-    // an allowlisted name may resolve to a private address
+    // an allowlisted name reaches a private address the allowlist covers, not others
+    refusal(service(
+        &url("svc.test"),
+        false,
+        policy(false, &["svc.test"]),
+    ));
     assert_eq!(
-        service(&url("svc.test"), false, policy(false, &["svc.test"])).unwrap(),
+        service(
+            &url("svc.test"),
+            false,
+            policy(false, &["svc.test", "127.0.0.1"])
+        )
+        .unwrap(),
         1
     );
     let m = refusal(service(
@@ -309,7 +324,7 @@ fn every_redirect_hop_is_checked() {
     let policy = OutboundPolicy {
         allow: vec!["good.test".parse().unwrap()],
         resolver: fake(&[("good.test", &["127.0.0.1"]), ("evil.test", &["127.0.0.1"])]),
-        ..Default::default()
+        ..private_ok()
     };
     let url = |p: &str| format!("http://good.test:{}{p}", s.port);
     assert_eq!(service(&url("/hop"), false, policy.clone()).unwrap(), 1);
@@ -348,6 +363,14 @@ fn oversized_responses_fail() {
     let body = big.clone();
     let s = Server::start(move |path| {
         match path {
+        // data for LOAD, streamed
+        "/streamed.nt" => vec![
+            Step::Write(
+                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/n-triples\r\n\r\n"
+                    .to_vec(),
+            ),
+            Step::Write(ntriples(256 << 10, "s").into_bytes()),
+        ],
         "/declared" => reply(
             "200 OK",
             &[("content-type", "application/sparql-results+json")],
@@ -375,7 +398,7 @@ fn oversized_responses_fail() {
         );
         assert!(service(&s.url(path), false, private_ok()).unwrap() == 10_000);
     }
-    let (r, _) = load(&s.url("/streamed.ttl"), small);
+    let (r, _) = load(&s.url("/streamed.nt"), small);
     assert!(failure(r).contains("larger than the outbound limit"));
 
     // compressed data is held to the ceiling once decompressed
@@ -453,4 +476,257 @@ fn slow_responses_time_out() {
     );
     assert!(sparkles::sparql::query(store.snapshot(), &q, &opts).is_err());
     assert!(t.elapsed() < Duration::from_secs(3));
+}
+
+/// N-Triples of about `bytes` bytes.
+fn ntriples(bytes: usize, tag: &str) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while s.len() < bytes {
+        s.push_str(&format!("<urn:{tag}{i}> <urn:p> \"{i:0>40}\" .\n"));
+        i += 1;
+    }
+    s
+}
+
+/// A server answering `/d{i}.nt` with 0.6 MiB of N-Triples, with a length (`/declared`)
+/// or streamed without one.
+fn data_server() -> Server {
+    Server::start(|path| {
+        let tag = path.trim_start_matches('/').replace(['/', '.'], "_");
+        let nt = ntriples(600 << 10, &tag);
+        if path.starts_with("/declared") {
+            reply(
+                "200 OK",
+                &[("content-type", "application/n-triples")],
+                nt.as_bytes(),
+            )
+        } else {
+            vec![
+                Step::Write(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/n-triples\r\n\r\n"
+                        .to_vec(),
+                ),
+                Step::Write(nt.into_bytes()),
+            ]
+        }
+    })
+}
+
+fn budget_of(r: sparkles::Result<impl std::fmt::Debug>) -> sparkles::Budget {
+    match r {
+        Err(Error::BudgetExceeded(b)) => b,
+        other => panic!("expected a spent budget, got {other:?}"),
+    }
+}
+
+/// The LOADs of one update share one byte budget: past it the update fails and commits
+/// nothing, however the responses are delimited.
+#[test]
+fn loads_of_one_update_share_a_budget() {
+    let s = data_server();
+    let policy = OutboundPolicy {
+        max_request_bytes: 1 << 20,
+        ..private_ok()
+    };
+    for kind in ["declared", "streamed"] {
+        let store = Store::in_memory(StoreOptions::default());
+        let opts = QueryOptions {
+            outbound: policy.clone(),
+            ..Default::default()
+        };
+        let u: String = (1..=3)
+            .map(|i| {
+                format!(
+                    "LOAD <{}> INTO GRAPH <urn:g{i}> ;\n",
+                    s.url(&format!("/{kind}/d{i}.nt"))
+                )
+            })
+            .collect();
+        let before = s.conns();
+        let b = budget_of(sparkles::sparql::update::update(&store, &u, &opts));
+        assert_eq!(b.kind, sparkles::BudgetKind::OutboundBytes, "{kind}");
+        assert_eq!(b.limit, 1 << 20);
+        let msg = Error::BudgetExceeded(b).to_string();
+        assert!(msg.contains("exceed their total of 1.0 MiB"), "{msg}");
+        // the third LOAD never started
+        assert_eq!(s.conns() - before, 2, "{kind}");
+        assert_eq!(store.snapshot().len(), 0, "{kind}");
+        // SILENT does not hide it
+        let silent = u.replace("LOAD", "LOAD SILENT");
+        budget_of(sparkles::sparql::update::update(&store, &silent, &opts));
+        assert_eq!(store.snapshot().len(), 0, "{kind}");
+        // one of them fits
+        let one = u.lines().next().unwrap().trim_end_matches(" ;");
+        sparkles::sparql::update::update(&store, one, &opts).unwrap();
+        assert!(!store.snapshot().is_empty());
+    }
+}
+
+/// A compressed LOAD counts its decompressed bytes in the budget.
+#[test]
+fn compressed_loads_count_decompressed_bytes() {
+    let nt = ntriples(600 << 10, "z");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz.write_all(nt.as_bytes()).unwrap();
+    let gz = gz.finish().unwrap();
+    assert!(gz.len() < 200 << 10);
+    let s =
+        Server::start(move |_| reply("200 OK", &[("content-type", "application/n-triples")], &gz));
+    let opts = QueryOptions {
+        outbound: OutboundPolicy {
+            max_request_bytes: 1 << 20,
+            ..private_ok()
+        },
+        ..Default::default()
+    };
+    let store = Store::in_memory(StoreOptions::default());
+    let u = format!(
+        "LOAD <{0}> INTO GRAPH <urn:a> ; LOAD <{0}> INTO GRAPH <urn:b>",
+        s.url("/d.nt.gz")
+    );
+    let b = budget_of(sparkles::sparql::update::update(&store, &u, &opts));
+    assert_eq!(b.kind, sparkles::BudgetKind::OutboundBytes);
+    assert_eq!(store.snapshot().len(), 0);
+    let one = format!("LOAD <{}>", s.url("/d.nt.gz"));
+    sparkles::sparql::update::update(&store, &one, &opts).unwrap();
+}
+
+/// The SERVICE calls of one query share the budget too.
+#[test]
+fn service_calls_of_one_query_share_a_budget() {
+    let row = r#"{"x":{"type":"literal","value":"0123456789012345678901234567890123456789"}}"#;
+    let body = format!(
+        r#"{{"head":{{"vars":["x"]}},"results":{{"bindings":[{}]}}}}"#,
+        vec![row; 5_500].join(",")
+    );
+    assert!(body.len() > 400 << 10 && body.len() < 512 << 10);
+    let s = Server::start(move |_| {
+        reply(
+            "200 OK",
+            &[("content-type", "application/sparql-results+json")],
+            body.as_bytes(),
+        )
+    });
+    let opts = QueryOptions {
+        allow_service: true,
+        outbound: OutboundPolicy {
+            max_request_bytes: 1 << 20,
+            ..private_ok()
+        },
+        ..Default::default()
+    };
+    let store = Store::in_memory(StoreOptions::default());
+    let q = |n: usize| {
+        let calls: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    "{{ SERVICE <{}> {{ ?x ?p ?o }} }}",
+                    s.url(&format!("/s{i}"))
+                )
+            })
+            .collect();
+        format!("SELECT ?x WHERE {{ {} }}", calls.join(" UNION "))
+    };
+    assert_eq!(
+        sparkles::sparql::query(store.snapshot(), &q(2), &opts)
+            .unwrap()
+            .len(),
+        11_000
+    );
+    let b = budget_of(sparkles::sparql::query(store.snapshot(), &q(3), &opts).map(|r| r.len()));
+    assert_eq!(b.kind, sparkles::BudgetKind::OutboundBytes);
+    // SILENT does not hide it
+    let silent = q(3).replace("SERVICE", "SERVICE SILENT");
+    budget_of(sparkles::sparql::query(store.snapshot(), &silent, &opts).map(|r| r.len()));
+}
+
+/// The time of the requests adds up: past the total, the next one gets what is left.
+#[test]
+fn loads_of_one_update_share_a_time_budget() {
+    // headers at once, then the triple after 600 ms
+    let s = Server::start(|_| {
+        vec![
+            Step::Write(
+                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/n-triples\r\n\r\n"
+                    .to_vec(),
+            ),
+            Step::Sleep(Duration::from_millis(600)),
+            Step::Write(b"<urn:a> <urn:p> <urn:b> .\n".to_vec()),
+        ]
+    });
+    let opts = QueryOptions {
+        outbound: OutboundPolicy {
+            request_timeout: Duration::from_secs(1),
+            ..private_ok()
+        },
+        ..Default::default()
+    };
+    let store = Store::in_memory(StoreOptions::default());
+    let u = format!(
+        "LOAD <{0}> INTO GRAPH <urn:a> ; LOAD <{0}> INTO GRAPH <urn:b>",
+        s.url("/d.nt")
+    );
+    let t = Instant::now();
+    let r = sparkles::sparql::update::update(&store, &u, &opts);
+    let m = failure(r);
+    assert!(m.contains("took longer than their total of 1 s"), "{m}");
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(store.snapshot().len(), 0);
+    // one alone fits
+    sparkles::sparql::update::update(&store, &format!("LOAD <{}>", s.url("/d.nt")), &opts).unwrap();
+}
+
+/// A LOAD is parsed as it streams in: a syntax error after valid data fails the update
+/// with nothing written, and `LOAD SILENT` keeps none of the data before the error.
+#[test]
+fn a_broken_load_leaves_nothing() {
+    let s = Server::start(|_| {
+        let mut nt = ntriples(64 << 10, "ok");
+        nt.push_str("<urn:broken \n");
+        reply(
+            "200 OK",
+            &[("content-type", "application/n-triples")],
+            nt.as_bytes(),
+        )
+    });
+    let store = Store::in_memory(StoreOptions::default());
+    let opts = QueryOptions {
+        outbound: private_ok(),
+        ..Default::default()
+    };
+    let r = sparkles::sparql::update::update(&store, &format!("LOAD <{}>", s.url("/d.nt")), &opts);
+    assert!(matches!(r, Err(Error::RdfParse(_))), "{r:?}");
+    assert_eq!(store.snapshot().len(), 0);
+    let u = format!(
+        "INSERT DATA {{ <urn:x> <urn:y> <urn:z> }} ; LOAD SILENT <{}>",
+        s.url("/d.nt")
+    );
+    sparkles::sparql::update::update(&store, &u, &opts).unwrap();
+    assert_eq!(store.snapshot().len(), 1);
+}
+
+/// Connection errors reach the caller without their details (OS errors, addresses);
+/// the log has them.
+#[test]
+fn connection_errors_are_generic() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let url = format!("http://127.0.0.1:{port}/sparql");
+    let m = failure(service(&url, false, private_ok()));
+    assert_eq!(m, format!("SERVICE error: <{url}>: cannot connect"));
+    let (r, _) = load(&format!("http://127.0.0.1:{port}/d.ttl"), private_ok());
+    assert!(failure(r).ends_with(": cannot connect"));
+    // a name that does not resolve says so, and no more
+    let p = OutboundPolicy {
+        resolver: fake(&[]),
+        ..private_ok()
+    };
+    let m = failure(service("http://nowhere.test/sparql", false, p));
+    assert!(m.ends_with("cannot resolve nowhere.test"), "{m}");
 }

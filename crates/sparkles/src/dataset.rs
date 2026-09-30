@@ -345,17 +345,10 @@ impl Dataset {
     pub fn dump(&self, w: impl Write, format: RdfFormat) -> Result<u64> {
         let snap = self.store.snapshot();
         let quads_format = format.supports_datasets();
-        let mut ser = oxrdfio::RdfSerializer::from_format(format);
-        if matches!(
-            format,
-            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml
-        ) {
-            for (p, ns) in self.store.prefixes() {
-                if let Ok(s) = ser.clone().with_prefix(p, ns) {
-                    ser = s;
-                }
-            }
-        }
+        let ser = crate::io::with_prefixes(
+            oxrdfio::RdfSerializer::from_format(format),
+            self.store.prefixes(),
+        );
         let mut out = ser.for_writer(w);
         let mut n = 0;
         snap.for_each_quad(|q| {

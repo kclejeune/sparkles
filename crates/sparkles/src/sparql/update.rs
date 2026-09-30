@@ -1,16 +1,17 @@
 //! SPARQL 1.1 Update (ARQ `modify` equivalent). All operations of a request run in a
 //! single write transaction and see the effects of the previous operations.
 
+use super::FileLoads;
 use super::ctx::Ctx;
 use super::plan::{ActiveGraph, Planner};
 use super::{QueryOptions, Timing};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::Perm;
-use crate::io::Source;
-use crate::outbound::Failure;
+use crate::outbound::RequestBudget;
 use crate::store::{Store, WriteTxn};
 use oxrdf::{BlankNode, NamedNode, Term};
+use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use spargebra::algebra::{GraphTarget, QueryDataset};
@@ -18,6 +19,8 @@ use spargebra::term::{
     GraphName, GraphNamePattern, GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern,
 };
 use spargebra::{GraphUpdateOperation, SparqlParser};
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,6 +75,7 @@ pub fn update_as(
         opts,
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
+        budget: RequestBudget::new(&opts.outbound),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
@@ -102,11 +106,14 @@ pub fn update_as(
 }
 
 /// Limits and context shared by every operation of one update request: one deadline for
-/// the whole request, its cancellation flag, row and memory budgets, and the parsed BASE.
+/// the whole request, its cancellation flag, row, memory and outbound budgets, and the
+/// parsed BASE.
 struct Request<'a> {
     opts: &'a QueryOptions,
     deadline: Option<Instant>,
     base: Option<oxiri::Iri<String>>,
+    /// what the LOADs and SERVICE calls of every operation spend
+    budget: Arc<RequestBudget>,
 }
 
 impl Request<'_> {
@@ -141,6 +148,7 @@ impl Request<'_> {
         ctx.allow_service = self.opts.allow_service;
         ctx.forbid_service = self.opts.forbid_service;
         ctx.outbound = self.opts.outbound.clone();
+        ctx.outbound_budget = self.budget.clone();
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }
@@ -371,9 +379,17 @@ fn run_op(
             source,
             destination,
         } => {
-            let r = load(txn, source, destination, stats, req.opts);
-            // SILENT hides failures of the source, not a refusal
-            if matches!(r, Err(Error::NotPermitted(_))) || (r.is_err() && !silent) {
+            let r = load(txn, source, destination, *silent, stats, req);
+            // SILENT hides failures of the source, not a refusal, a spent budget or the
+            // end of the request
+            if matches!(
+                r,
+                Err(Error::NotPermitted(_)
+                    | Error::BudgetExceeded(_)
+                    | Error::Timeout
+                    | Error::Cancelled)
+            ) || (r.is_err() && !silent)
+            {
                 return r;
             }
         }
@@ -465,65 +481,184 @@ fn load(
     txn: &mut WriteTxn<'_>,
     source: &NamedNode,
     dest: &GraphName,
+    silent: bool,
     stats: &mut UpdateStats,
-    opts: &QueryOptions,
+    req: &Request<'_>,
 ) -> Result<()> {
+    let opts = req.opts;
     let url = source.as_str();
+    let into = Into {
+        graph: match dest {
+            GraphName::NamedNode(n) => Some(n.clone()),
+            GraphName::DefaultGraph => None,
+        },
+        base: url,
+        silent,
+    };
     if url.starts_with("file:") {
         if opts.forbid_file_load {
             return Err(Error::NotPermitted(
                 "LOAD <file:…> requires server-admin".into(),
             ));
         }
-    } else if opts.forbid_remote_load {
+        let path = file_path(url, &opts.file_loads)?;
+        let (format, _) = crate::io::format_for_path(&path).ok_or_else(|| {
+            Error::invalid(format!("cannot determine RDF format of {}", path.display()))
+        })?;
+        let mut f = std::fs::File::open(&path)?;
+        let name = path.display().to_string();
+        let (codec, head) = crate::io::sniff_codec(&mut f, Some(&path), &name)?;
+        let r = codec.reader(std::io::Cursor::new(head).chain(f), None)?;
+        return insert_parsed(txn, r, format, &name, &into, stats, req);
+    }
+    if opts.forbid_remote_load {
         return Err(Error::NotPermitted(
             "LOAD <http…> requires the federate permission".into(),
         ));
     }
-    let graph = match dest {
-        GraphName::NamedNode(n) => Some(n.clone()),
-        GraphName::DefaultGraph => None,
-    };
-    let src = if let Some(path) = url.strip_prefix("file://") {
-        let mut s = Source::from_path(std::path::Path::new(path), graph)?;
-        s.base = Some(url.to_string());
-        s
-    } else {
-        let policy = &opts.outbound;
-        let failed = |f: Failure| match f {
-            Failure::Refused(m) => Error::NotPermitted(format!("LOAD <{url}>: {m}")),
-            Failure::Failed(m) => Error::invalid(format!("LOAD {url}: {m}")),
-        };
-        let resp = policy
-            .send(url, policy.timeout, |client, u| {
-                client.get(u).header(
-                    "Accept",
-                    "text/turtle, application/n-triples, application/n-quads, application/trig, \
-                     application/rdf+xml, application/ld+json;q=0.9",
-                )
+    let policy = &opts.outbound;
+    // within the update's deadline too
+    let timeout = req.deadline.map_or(policy.timeout, |d| {
+        d.saturating_duration_since(Instant::now())
+    });
+    let resp = policy
+        .send(&req.budget, url, timeout, |client, u| {
+            client.get(u).header(
+                "Accept",
+                "text/turtle, application/n-triples, application/n-quads, application/trig, \
+                 application/rdf+xml, application/ld+json;q=0.9",
+            )
+        })
+        .map_err(|f| {
+            f.into_error(&format!("LOAD <{url}>"), |m| {
+                Error::invalid(format!("LOAD {url}: {m}"))
             })
-            .map_err(failed)?;
-        if !resp.status.is_success() {
-            return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
-        }
-        let ct = resp.content_type;
-        let format = crate::io::format_for_media_type(&ct)
-            .or_else(|| crate::io::format_for_path(std::path::Path::new(url)).map(|f| f.0))
-            .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
-        let body = resp.body.bytes().map_err(failed)?;
-        let mut s = Source::from_bytes(body, format, graph);
-        s.base = Some(url.to_string());
-        // compressed data is held to the same ceiling once decompressed
-        s.max_decompressed = Some(policy.max_response_bytes);
-        s
+        })?;
+    if !resp.status.is_success() {
+        return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
+    }
+    let ct = resp.content_type;
+    let url_path = std::path::Path::new(url);
+    let format = crate::io::format_for_media_type(&ct)
+        .or_else(|| crate::io::format_for_path(url_path).map(|f| f.0))
+        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
+    let mut body = resp.body;
+    let (codec, head) =
+        crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;
+    // compressed data counts in the request's budget once decompressed, and is held to
+    // the response ceiling then too
+    let (body, count) = if codec == crate::codec::Codec::None {
+        (body, None)
+    } else {
+        let (body, budget) = body.uncounted();
+        (body, Some(budget))
     };
-    let (quads, _) = crate::io::parse_to_vec(&src)?;
+    let r = codec.reader(
+        std::io::Cursor::new(head).chain(body),
+        Some(policy.max_response_bytes),
+    )?;
+    let r: Box<dyn Read> = match count {
+        Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
+        None => r,
+    };
+    insert_parsed(txn, r, format, url, &into, stats, req).map_err(|e| read_error(url, e))
+}
+
+/// Where the quads of a `LOAD` go.
+struct Into<'a> {
+    graph: Option<NamedNode>,
+    base: &'a str,
+    /// insert the quads once all of them parsed: a failed `LOAD SILENT` leaves nothing
+    /// behind (a failed `LOAD` fails the whole request)
+    silent: bool,
+}
+
+/// Parse `r` as it streams in and insert its quads.
+fn insert_parsed(
+    txn: &mut WriteTxn<'_>,
+    r: impl Read,
+    format: RdfFormat,
+    name: &str,
+    into: &Into<'_>,
+    stats: &mut UpdateStats,
+    req: &Request<'_>,
+) -> Result<()> {
+    let mut parser = RdfParser::from_format(format)
+        .with_base_iri(into.base)
+        .map_err(|e| Error::invalid(e.to_string()))?;
+    if let Some(g) = &into.graph {
+        parser = parser.with_default_graph(oxrdf::GraphName::NamedNode(g.clone()));
+    }
     let mut labels = std::collections::HashMap::new();
-    for q in &quads {
-        let ids = txn.encode_quad(q, &mut labels)?;
+    let mut held = Vec::new();
+    for (i, q) in parser.for_reader(r).enumerate() {
+        if i % 4096 == 4095 {
+            req.check()?;
+        }
+        let q = q.map_err(|e| match e {
+            RdfParseError::Io(e) => crate::codec::io_error(e),
+            RdfParseError::Syntax(e) => Error::RdfParse(format!("{name}: {e}")),
+        })?;
+        let ids = txn.encode_quad(&q, &mut labels)?;
+        if into.silent {
+            held.push(ids);
+        } else if txn.insert(ids)? {
+            stats.inserted += 1;
+        }
+    }
+    for ids in held {
         if txn.insert(ids)? {
             stats.inserted += 1;
         }
     }
     Ok(())
+}
+
+/// A failed read of a `LOAD <http…>` body: the body's own words (a timeout, the size
+/// ceiling, a broken connection) with the URL.
+fn read_error(url: &str, e: Error) -> Error {
+    match e {
+        Error::Io(e) => Error::invalid(format!("LOAD {url}: {e}")),
+        e => e,
+    }
+}
+
+/// The local path of a `LOAD <file:…>` URL, if `files` lets it be read.
+fn file_path(url: &str, files: &FileLoads) -> Result<PathBuf> {
+    let parsed = reqwest::Url::parse(url)
+        .ok()
+        .filter(|u| u.scheme() == "file")
+        .and_then(|u| u.to_file_path().ok());
+    let dir = match files {
+        // any path, relative ones (`file://data.ttl`) included
+        FileLoads::Anywhere => {
+            return Ok(
+                parsed.unwrap_or_else(|| PathBuf::from(url.strip_prefix("file://").unwrap_or(url)))
+            );
+        }
+        FileLoads::Disabled => {
+            return Err(Error::NotPermitted(
+                "LOAD <file:…> is not enabled: no load directory is configured".into(),
+            ));
+        }
+        FileLoads::Under(dir) => dir,
+    };
+    let outside = || Error::NotPermitted(format!("LOAD <{url}>: not a file in the load directory"));
+    // (the URL parser already resolved `..` segments)
+    let path = parsed.ok_or_else(outside)?;
+    match std::fs::canonicalize(&path) {
+        // with symbolic links resolved, inside the directory, and a regular file (a FIFO
+        // would block the reader)
+        Ok(real)
+            if real.starts_with(dir) && std::fs::metadata(&real).is_ok_and(|m| m.is_file()) =>
+        {
+            Ok(real)
+        }
+        // a missing file is told apart only inside the directory, so that files
+        // elsewhere cannot be probed
+        Err(_) if path.starts_with(dir) => {
+            Err(Error::invalid(format!("LOAD <{url}>: no such file")))
+        }
+        _ => Err(outside()),
+    }
 }
