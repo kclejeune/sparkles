@@ -21,5 +21,5 @@ use crate::state::AppState;
 /// Append the backup metric families to a Prometheus exposition (called by
 /// `obs::render_prometheus`). Writes nothing without `AppState::backup`.
 pub fn render(st: &AppState, out: &mut String) {
-    let _ = (st, out);
+    super::policies::render_metrics(st, out);
 }
