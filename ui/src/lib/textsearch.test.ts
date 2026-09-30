@@ -61,6 +61,13 @@ describe('buildTextQuery', () => {
     );
   });
 
+  it('searches the named graphs too on request', () => {
+    const q = buildTextQuery('fox', { limit: 5, namedGraphs: true });
+    const call = '(?s ?score ?literal ?graph ?predicate) text:query ("fox" 5) .';
+    expect(q).toContain(`{ ${call} }\n  UNION\n  { GRAPH ?g { ${call} } }`);
+    expect(q).toContain('LIMIT 5');
+  });
+
   it('keeps the limit positive and whole', () => {
     expect(buildTextQuery('x', { limit: 0 })).toContain('("x" 1)');
     expect(buildTextQuery('x', { limit: 7.9 })).toContain('("x" 7)');

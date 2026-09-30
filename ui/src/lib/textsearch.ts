@@ -63,6 +63,11 @@ export type TextSearchOptions = {
   lang?: string;
   /** Hits to return (the search's own top-n, before any join). */
   limit?: number;
+  /**
+   * Search the named graphs as well as the default graph (the search runs within the
+   * active graph, so named graphs need their own `GRAPH ?g` call).
+   */
+  namedGraphs?: boolean;
 };
 
 /** A ranked `text:query` SELECT returning subject, score, literal, graph and predicate. */
@@ -74,9 +79,15 @@ export function buildTextQuery(text: string, opts: TextSearchOptions = {}): stri
     String(limit),
     ...(opts.lang?.trim() ? [sparqlLiteral(`lang:${opts.lang.trim()}`)] : []),
   ];
+  const call = `(?s ?score ?literal ?graph ?predicate) text:query (${args.join(' ')}) .`;
+  const where = opts.namedGraphs
+    ? `  { ${call} }
+  UNION
+  { GRAPH ?g { ${call} } }`
+    : `  ${call}`;
   return `PREFIX text: <${TEXT_NS}>
 SELECT ?s ?score ?literal ?graph ?predicate WHERE {
-  (?s ?score ?literal ?graph ?predicate) text:query (${args.join(' ')}) .
+${where}
 }
 ORDER BY DESC(?score)
 LIMIT ${limit}`;
