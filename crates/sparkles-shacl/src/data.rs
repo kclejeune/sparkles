@@ -21,6 +21,8 @@ pub(crate) enum GraphSel {
     All,
     /// these graph ids (sorted)
     Set(Vec<u64>),
+    /// every graph but these (sorted)
+    AllExcept(Vec<u64>),
 }
 
 impl GraphSel {
@@ -29,14 +31,21 @@ impl GraphSel {
         match self {
             GraphSel::All => true,
             GraphSel::Set(gs) => gs.len() == 1 && gs[0] == g || gs.binary_search(&g).is_ok(),
+            GraphSel::AllExcept(ex) => ex.binary_search(&g).is_err(),
         }
     }
 
-    pub fn ids(&self) -> Option<Vec<Id>> {
-        match self {
-            GraphSel::All => None,
-            GraphSel::Set(gs) => Some(gs.iter().map(|&g| Id(g)).collect()),
-        }
+    /// The graph ids, listing every graph of `snap` for `All` / `AllExcept`.
+    pub fn ids(&self, snap: &Snapshot) -> Result<Vec<Id>> {
+        Ok(match self {
+            GraphSel::Set(gs) => gs.iter().map(|&g| Id(g)).collect(),
+            _ => {
+                let mut all = vec![Id::DEFAULT_GRAPH];
+                all.extend(snap.graph_ids()?);
+                all.retain(|g| self.accepts(g.0));
+                all
+            }
+        })
     }
 }
 
@@ -66,8 +75,16 @@ impl DataGraph {
         snap: Arc<Snapshot>,
         data_graph: Option<&str>,
         extra: &[String],
+        exclude: &[String],
         shapes: &Shapes,
     ) -> Result<(DataGraph, Vec<Id>)> {
+        let mut excluded: Vec<u64> = exclude
+            .iter()
+            .filter_map(|g| graph_id(&snap, g))
+            .map(|g| g.0)
+            .collect();
+        excluded.sort_unstable();
+        excluded.dedup();
         let sel = match data_graph {
             Some(UNION_GRAPH_IRI) => GraphSel::All,
             None if snap.union_default_graph => GraphSel::All,
@@ -82,8 +99,13 @@ impl DataGraph {
                 gs.extend(extra.iter().filter_map(|g| graph_id(&snap, g)).map(|g| g.0));
                 gs.sort_unstable();
                 gs.dedup();
+                gs.retain(|g| excluded.binary_search(g).is_err());
                 GraphSel::Set(gs)
             }
+        };
+        let sel = match sel {
+            GraphSel::All if !excluded.is_empty() => GraphSel::AllExcept(excluded),
+            s => s,
         };
         let mut d = DataGraph {
             rdf_type: Id::UNDEF,

@@ -252,6 +252,23 @@ impl Shapes {
         Ok(shapes)
     }
 
+    /// Read and merge several graphs of the store into one shapes graph (a graph that
+    /// does not exist contributes nothing). `$shapesGraph` names the first.
+    pub fn from_store_graphs(
+        snap: &sparkles::store::Snapshot,
+        graphs: &[String],
+    ) -> Result<Shapes> {
+        let mut g = oxrdf::Graph::new();
+        for iri in graphs {
+            if let Ok(part) = crate::data::read_graph(snap, Some(iri)) {
+                g.extend(part.iter());
+            }
+        }
+        let mut shapes = Parser::new(&g).parse(true)?;
+        shapes.source_graph = graphs.first().cloned();
+        Ok(shapes)
+    }
+
     /// All shapes (node and property shapes, including nested ones).
     pub fn shapes(&self) -> &[Shape] {
         &self.shapes

@@ -27,6 +27,9 @@ pub struct ValidateOptions {
     /// Further graphs merged into the data graph (e.g. the reasoner's
     /// `urn:x-sparkles:inferred`). Graphs that do not exist are ignored.
     pub extra_graphs: Vec<String>,
+    /// Graphs never part of the data graph, even when it is the union of all graphs
+    /// (e.g. the shapes graphs of write-time validation).
+    pub exclude_graphs: Vec<String>,
     /// Validate focus nodes in parallel (rayon).
     pub parallel: bool,
     pub timeout: Option<Duration>,
@@ -38,6 +41,7 @@ impl Default for ValidateOptions {
         ValidateOptions {
             data_graph: None,
             extra_graphs: Vec::new(),
+            exclude_graphs: Vec::new(),
             parallel: true,
             timeout: None,
             cancel: None,
@@ -55,6 +59,7 @@ pub fn validate(
         snap.clone(),
         opts.data_graph.as_deref(),
         &opts.extra_graphs,
+        &opts.exclude_graphs,
         shapes,
     )?;
     let engine = Engine::new(shapes, &data, ids, opts)?;
@@ -73,6 +78,7 @@ pub fn validate_node(
         snap.clone(),
         opts.data_graph.as_deref(),
         &opts.extra_graphs,
+        &opts.exclude_graphs,
         shapes,
     )?;
     let focus = data.resolve(node, shapes.bnodes_in_store);

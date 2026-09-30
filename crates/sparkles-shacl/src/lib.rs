@@ -28,6 +28,7 @@
 //! ```
 
 mod data;
+pub mod guard;
 pub mod path;
 pub mod report;
 pub mod shapes;

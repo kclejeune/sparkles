@@ -435,14 +435,7 @@ impl Engine<'_> {
         if let Some(c) = &self.cancel {
             ctx.cancel = c.clone();
         }
-        match self.data.sel.ids() {
-            Some(ids) => ctx.dataset.default = Some(ids),
-            None => {
-                let mut all = vec![Id::DEFAULT_GRAPH];
-                all.extend(self.data.snap.graph_ids()?);
-                ctx.dataset.default = Some(all);
-            }
-        }
+        ctx.dataset.default = Some(self.data.sel.ids(&self.data.snap)?);
         let pattern = match q {
             Query::Ask { pattern, .. } => GraphPattern::Slice {
                 inner: Box::new(pattern.clone()),

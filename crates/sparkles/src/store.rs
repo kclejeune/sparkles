@@ -2334,6 +2334,16 @@ impl Store {
         if let Some(cfg) = text_cfg {
             write_atomic(&dir.join("text.json"), &cfg)?;
         }
+        // write-time validation stays configured; the clone judges its first write in full
+        if let Some(root) = &self.root {
+            for f in ["validation.json", "validation-shapes.ttl"] {
+                match std::fs::read(root.join(f)) {
+                    Ok(b) => write_atomic(&dir.join(f), &b)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         // CURRENT last: the commit point of the new database
         write_atomic(&dir.join("CURRENT"), name.as_bytes())?;
         sync_dir(dir)?;

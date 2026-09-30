@@ -3,11 +3,10 @@
 
 use anyhow::{Context, Result};
 use oxrdfio::{RdfFormat, RdfSerializer};
-use serde_json::{Value as J, json};
+use serde_json::Value as J;
 use sparkles::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
-use sparkles::sparql::results::term_json;
 use sparkles::store::Snapshot;
-use sparkles_shacl::{PropertyPath, ValidateOptions, ValidationReport};
+use sparkles_shacl::{ValidateOptions, ValidationReport};
 
 /// The data graph selected by Fuseki's `graph` parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,34 +145,7 @@ pub fn write_report(report: &ValidationReport, fmt: ReportFormat) -> Result<Vec<
     })
 }
 
-/// Compact JSON form of a report; terms are SPARQL-JSON term objects, a complex
-/// result path is `{"type": "path", "value": "<SPARQL property path>"}`.
+/// Compact JSON form of a report (see [`sparkles_shacl::report::to_json`]).
 pub fn report_json(report: &ValidationReport) -> J {
-    let results: Vec<J> = report
-        .results
-        .iter()
-        .map(|r| {
-            let mut o = json!({
-                "focusNode": term_json(&r.focus_node),
-                "resultPath": r.result_path.as_ref().map(path_json),
-                "value": r.value.as_ref().map(term_json),
-                "sourceShape": term_json(&r.source_shape),
-                "sourceConstraintComponent": term_json(&r.source_constraint_component.clone().into()),
-                "severity": term_json(&r.severity.clone().into()),
-                "messages": r.messages.iter().map(|m| m.value()).collect::<Vec<_>>(),
-            });
-            if let Some(c) = &r.source_constraint {
-                o["sourceConstraint"] = term_json(c);
-            }
-            o
-        })
-        .collect();
-    json!({ "conforms": report.conforms, "results": results })
-}
-
-fn path_json(p: &PropertyPath) -> J {
-    match p {
-        PropertyPath::Predicate(n) => term_json(&n.clone().into()),
-        p => json!({ "type": "path", "value": p.to_string() }),
-    }
+    sparkles_shacl::report::to_json(report)
 }

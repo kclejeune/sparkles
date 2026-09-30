@@ -232,3 +232,35 @@ impl fmt::Display for ValidationReport {
         Ok(())
     }
 }
+
+/// Compact JSON form of one result: terms are SPARQL-JSON term objects, and a complex
+/// result path is `{"type": "path", "value": "<SPARQL property path>"}`.
+pub fn result_json(r: &ValidationResult) -> serde_json::Value {
+    use serde_json::json;
+    use sparkles::sparql::results::term_json;
+    let path = |p: &PropertyPath| match p {
+        PropertyPath::Predicate(n) => term_json(&n.clone().into()),
+        p => json!({ "type": "path", "value": p.to_string() }),
+    };
+    let mut o = json!({
+        "focusNode": term_json(&r.focus_node),
+        "resultPath": r.result_path.as_ref().map(path),
+        "value": r.value.as_ref().map(term_json),
+        "sourceShape": term_json(&r.source_shape),
+        "sourceConstraintComponent": term_json(&r.source_constraint_component.clone().into()),
+        "severity": term_json(&r.severity.clone().into()),
+        "messages": r.messages.iter().map(|m| m.value()).collect::<Vec<_>>(),
+    });
+    if let Some(c) = &r.source_constraint {
+        o["sourceConstraint"] = term_json(c);
+    }
+    o
+}
+
+/// Compact JSON form of a report: `{conforms, results}`.
+pub fn to_json(report: &ValidationReport) -> serde_json::Value {
+    serde_json::json!({
+        "conforms": report.conforms,
+        "results": report.results.iter().map(result_json).collect::<Vec<_>>(),
+    })
+}
