@@ -90,9 +90,12 @@ then with all eight outcomes (`denied`: refused by the auth layer). Health check
 are not counted. Deleting a dataset removes its series. Each dataset has its own block and
 result cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
 
-With rate limits configured, `sparkles_rate_limited_total{dataset,class}` (counter)
-counts refused requests per limit class, and `outcome="rate_limited"` appears in
-`sparkles_requests_total`.
+With rate limits configured (or authentication on), `sparkles_rate_limited_total{dataset,class}`
+(counter) counts refused requests per limit class (`preauth` included), and
+`outcome="rate_limited"` appears in `sparkles_requests_total`. The size of each limiter's
+client state is in `sparkles_rate_limit_keys{limiter}`, `sparkles_rate_limit_max_keys{limiter}`,
+`sparkles_rate_limit_evictions_total{limiter}` and `sparkles_rate_limit_penalties{limiter}`
+(`limiter` is `requests`, or `auth` for the auth layer's own limits).
 
 ```ts
 type MetricsSnapshot = {
@@ -113,7 +116,7 @@ type MetricsSnapshot = {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; resultRows: number;
     budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
-    rateLimited: Record<"auth" | "query" | "update" | "admin", number> | null;
+    rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
   }[];
@@ -200,8 +203,9 @@ trace and span id of its request.
 
 ### Rate limiting
 
-Off by default. `sparkles serve --rate-limit SPEC` (repeatable) and/or
-`--rate-limit-config FILE` limit each request class per client:
+Off by default, except for failed authentications when authentication is on (see
+[Before authentication](#before-authentication-preauth)). `sparkles serve --rate-limit SPEC`
+(repeatable) and/or `--rate-limit-config FILE` limit each request class per client:
 
 | Class | Requests |
 |-------|----------|
@@ -209,6 +213,7 @@ Off by default. `sparkles serve --rate-limit SPEC` (repeatable) and/or
 | `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
+| `preauth` | every request, before authentication: authentication failures per client address (no per-dataset form) |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
 
@@ -232,12 +237,15 @@ sparkles serve --rate-limit auth=10/min,burst=5,failure-cost=3 \
 
 `auth=10/min,burst=5` (with `failure-cost=3`) is a reasonable strict default for
 authentication endpoints. The configuration file is JSON; the flags apply on top of it,
-and `SIGHUP` re-reads it (client counters start afresh; a bad file keeps the running
-configuration):
+and `SIGHUP` re-reads it. A reload keeps the client state of every limit whose name
+(`query`, `query@public`, …) stays: debts are not forgiven, and the requests already in
+flight count against the new concurrency caps, so a lower cap admits nothing new until
+they drop below it. A bad file keeps the running configuration.
 
 ```json
 {
   "classes": {
+    "preauth": { "rate": "30/min", "burst": 60 },
     "auth":  { "rate": "10/min", "burst": 5, "failureCost": 3 },
     "query": { "rate": "100/s", "burst": 200, "concurrency": 64, "clientConcurrency": 8 }
   },
@@ -250,10 +258,24 @@ configuration):
 **Clients.** A client is its peer address (an IPv6 client by its /64). Behind a reverse
 proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`): for
 requests from a trusted address the client is the rightmost untrusted hop of `Forwarded`
-(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. At most
-`maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of new
-addresses evicts other rarely seen clients, never one with requests in flight. Clients
-whose bucket has refilled are dropped every minute.
+(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. With
+authentication, a signed-in caller is counted as its owner instead (see
+[Authentication](#authentication-and-access-control)), except in `preauth` and `auth`.
+
+Limits by address are only as good as the address: they need a peer address that clients
+cannot choose. List only proxies that overwrite (or append to) the forwarding headers
+they receive, never a network that clients can send from; and behind a proxy that is not
+listed, every client has the proxy's address and shares one budget (with `preauth`, one
+client's failed logins then refuse everybody's requests for a while).
+
+At most `maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of
+new addresses evicts other rarely seen clients, never one with requests in flight. An
+evicted client that still owed time is remembered in a penalty cache an eighth that size,
+so churning the cache does not forgive its debt. `maxKeys` is a security setting: a
+value far below the number of active clients lets a flood of addresses evict (and a
+flood larger than the penalty cache forget) clients; watch
+`sparkles_rate_limit_evictions_total`. Clients whose bucket has refilled are dropped every
+minute.
 
 **Algorithm.** GCRA (the virtual-scheduling form of a token bucket): a client may send
 `burst` requests at once, then one every `period / N`.
@@ -269,7 +291,8 @@ requests. A request holds its concurrency slot until its response body has been 
   "limitClass": "query", "reason": "rate", "retryAfterSeconds": 2 }
 ```
 
-`reason` is `rate`, `concurrency` or `client-concurrency`. Responses of a class with a
+`reason` is `rate`, `concurrency` or `client-concurrency` (`failures` for `preauth`; `mint`,
+`device` or `device-code` for the auth layer's own limits). Responses of a class with a
 rate carry the headers of draft-ietf-httpapi-ratelimit-headers-11:
 `RateLimit-Policy: "query";q=100;w=1` (the configured rate: `q` requests per `w`
 seconds; the policy name is `CLASS` or `CLASS@DATASET`) and `RateLimit: "query";r=57;t=1`
@@ -279,6 +302,27 @@ seconds; the policy name is `CLASS` or `CLASS@DATASET`) and `RateLimit: "query";
 **Observability.** Refused requests are logged with `outcome=rate_limited` and counted
 in `sparkles_requests_total{outcome="rate_limited"}` and
 `sparkles_rate_limited_total{dataset,class}`.
+
+#### Before authentication (`preauth`)
+
+A first stage runs before any credential is checked, so that password guessing and the
+hashing it costs are bounded per client address. Every address has a budget of
+authentication failures: a `401` or `403`, a refusal of the auth layer (a hidden
+dataset's `404`, a cross-origin or CSRF refusal), an invalid session cookie, or a busy
+password check. Each costs `failure-cost` (default 1); successful requests cost nothing,
+and an address without failures leaves no state behind. An address that has spent its
+budget is refused with `429` (`"limitClass": "preauth"`, `"reason": "failures"`) until it
+refills, whatever it sends and before any password is hashed. A password check (HTTP
+Basic, a UI password login) takes the cost of a failure before it starts and gives it
+back when the password is right, so concurrent guesses from one address cannot all start
+hashing. Responses to failures carry the stage's `RateLimit-Policy` and `RateLimit`.
+Requests without a peer address (over `--unix-socket`) are not counted: they would all
+share one budget.
+
+With `--auth-config` it is on by default at `30/min,burst=60` (60 failures at once, then
+one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` or
+`classes.preauth` changes it (no per-dataset form and no concurrency caps);
+`preauth=off` turns it off.
 
 ## Datasets (admin)
 
@@ -1304,6 +1348,8 @@ server = ["metrics"]
 [tokens_policy]
 default_ttl = "30d"
 max_ttl = "90d"
+max_active_per_owner = 100                   # unexpired minted tokens per owner
+mint_rate = "60/h"                           # per owner: N/s|min|h|d[,burst=N] or "off"
 
 [oidc]
 issuer = "https://auth.example.org"
@@ -1363,9 +1409,22 @@ FILE`, `sparkles auth login|logout|status`, `sparkles auth token create|list|rev
 and use the stored token (`$XDG_CONFIG_HOME/sparkles/credentials.toml`, 0600) or
 `SPARKLES_TOKEN`.
 
-**Rate limits** (`--rate-limit`) count a signed-in principal as one client across
-addresses; anonymous callers and the `auth` class (logins, CLI grants) are counted per
-client address.
+**Rate limits.** Authentication failures are limited per client address before any
+credential is checked (`preauth`, on by default; see [Rate limiting](#rate-limiting)).
+The `--rate-limit` classes count a signed-in caller as its owner, across addresses and
+credentials: bob's Basic requests, sessions and minted tokens share one budget (a token
+minted by a token belongs to the same owner), while each static `[[tokens]]` entry is a
+client of its own. Anonymous callers and the `auth` class (logins, CLI grants) are counted
+per client address.
+
+The auth layer has limits of its own, which answer `429` with `"limitClass": "auth"`:
+tokens minted per owner (`tokens_policy.mint_rate`, default `60/h`; `reason` `mint`),
+device logins started per address (20, then two a minute, with `preauth` on; `device`) and
+unknown user codes per session (20, then two a minute; `device-code`). An owner has at
+most `tokens_policy.max_active_per_owner` unexpired tokens (default 100); minting another
+answers `409` until one is revoked or expires. At most max(1, cores / 2) argon2 password
+verifications run at once and four per permit wait (up to five seconds); a check beyond
+that is refused at once with `503` and `Retry-After: 1`.
 
 **Metrics.** `sparkles_auth_failures_total{scheme,reason}`,
 `sparkles_auth_denied_total{kind}` (`unauthenticated`, `forbidden`, `hidden`,
@@ -1373,6 +1432,7 @@ client address.
 `sparkles_auth_tokens_minted_total{via}`, `sparkles_auth_tokens_revoked_total`,
 `sparkles_auth_tokens_active`, `sparkles_auth_sessions_active`,
 `sparkles_auth_device_grants_pending`, `sparkles_auth_password_verifications_total`,
+`sparkles_auth_password_verifications_running`, `sparkles_auth_password_verifications_waiting`,
 `sparkles_auth_untrusted_proxy_headers_total`, `sparkles_auth_reloads_total{result}`, and
 the policy sizes `sparkles_auth_policy_{users,tokens,roles}`. Audit events (logins,
 logouts, minted and revoked tokens, device approvals, reloads) are logged at INFO under
