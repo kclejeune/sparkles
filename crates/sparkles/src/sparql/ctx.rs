@@ -121,6 +121,11 @@ impl Ctx {
         n as VarId
     }
 
+    /// Is `name` a variable of this query (without creating it)?
+    pub fn has_var(&self, name: &str) -> bool {
+        self.var_names.read().iter().any(|n| n == name)
+    }
+
     pub fn var_name(&self, v: VarId) -> String {
         self.var_names.read()[v as usize].clone()
     }

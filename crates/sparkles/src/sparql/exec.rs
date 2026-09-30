@@ -79,6 +79,10 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         None
     };
     if let Some(k) = &key {
+        static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DEBUG.get_or_init(|| std::env::var_os("SPARKLES_DEBUG_CACHE").is_some()) {
+            eprintln!("CACHEKEY {} :: {}", n.operator(), k.key);
+        }
         let start = Instant::now();
         if let Some(t) = results.get(k, ctx) {
             let mut info = describe(ctx, n);

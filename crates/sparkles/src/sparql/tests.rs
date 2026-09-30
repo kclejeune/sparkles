@@ -136,6 +136,63 @@ fn result_cache_reuses_subtrees() {
     assert_ne!(strs(&a), strs(&c));
 }
 
+#[test]
+fn result_cache_hits_for_aggregates() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    // spargebra names aggregate variables randomly on every parse
+    let text =
+        "SELECT ?t (COUNT(?p) AS ?c) (MAX(?n) AS ?m) WHERE { ?p a ?t ; foaf:name ?n } GROUP BY ?t";
+    let a = q(&s, text);
+    let b = q(&s, text);
+    assert_eq!(strs(&a), strs(&b));
+    fn op_cached(p: &PlanInfo, op: &str) -> bool {
+        (p.operator == op && p.cached) || p.children.iter().any(|c| op_cached(c, op))
+    }
+    assert!(
+        op_cached(&b.plan, "GroupBy")
+            || op_cached(&b.plan, "Bind")
+            || op_cached(&b.plan, "Project"),
+        "the aggregation itself should come from the cache"
+    );
+}
+
+#[test]
+fn result_cache_keeps_hex_like_iris_apart() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    let a = "0123456789abcdef0123456789abcdef";
+    let b = "fedcba9876543210fedcba9876543210";
+    let data = format!(
+        "<http://x/s> <http://x/p> <http://x/?{a}> .\n<http://x/t> <http://x/p> <http://x/?{b}> .\n"
+    );
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    for (iri, subject) in [(a, "s"), (b, "t"), (a, "s")] {
+        let r = q(
+            &s,
+            &format!(
+                "SELECT ?s (COUNT(*) AS ?n) WHERE {{ ?s <http://x/p> <http://x/?{iri}> }} GROUP BY ?s"
+            ),
+        );
+        assert_eq!(strs(&r), [format!("{subject} 1")]);
+    }
+}
+
 fn has_cached(p: &PlanInfo) -> bool {
     p.cached || p.children.iter().any(has_cached)
 }

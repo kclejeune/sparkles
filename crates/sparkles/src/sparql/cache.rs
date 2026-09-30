@@ -63,13 +63,13 @@ impl ResultCache {
         self.cache.is_some()
     }
 
-    pub fn get(&self, key: &str, ctx: &Ctx) -> Option<Table> {
+    pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> Option<Table> {
         let c = self.cache.as_ref()?;
-        match c.get(key) {
+        match c.get(&key.key) {
             Some(e) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                let vars: Vec<VarId> = e.vars.iter().map(|n| ctx.var(n)).collect();
-                let sorted: Vec<VarId> = e.sorted.iter().map(|n| ctx.var(n)).collect();
+                let vars: Vec<VarId> = e.vars.iter().map(|n| ctx.var(key.resolve(n))).collect();
+                let sorted: Vec<VarId> = e.sorted.iter().map(|n| ctx.var(key.resolve(n))).collect();
                 Some(Table {
                     vars,
                     cols: (*e.cols).clone(),
@@ -85,7 +85,7 @@ impl ResultCache {
     }
 
     /// Cache a result unless it holds query-local terms or is too large.
-    pub fn put(&self, key: String, t: &Table, ctx: &Ctx) {
+    pub fn put(&self, key: CacheKey, t: &Table, ctx: &Ctx) {
         let Some(c) = &self.cache else { return };
         let bytes = (t.len() * t.width() * 8) as u64;
         if bytes > self.max_entry_bytes {
@@ -98,11 +98,12 @@ impl ResultCache {
         if local {
             return;
         }
+        let store = |v: &VarId| key.canonical(&ctx.var_name(*v));
         c.insert(
-            key,
+            key.key.clone(),
             Arc::new(Entry {
-                vars: t.vars.iter().map(|v| ctx.var_name(*v)).collect(),
-                sorted: t.sorted.iter().map(|v| ctx.var_name(*v)).collect(),
+                vars: t.vars.iter().map(store).collect(),
+                sorted: t.sorted.iter().map(store).collect(),
                 cols: Arc::new(t.cols.clone()),
                 len: t.len(),
             }),
@@ -160,8 +161,68 @@ pub(crate) fn deterministic(e: &Expr) -> bool {
     }
 }
 
+/// A cache key plus the generated variable names it abstracts over.
+///
+/// Generated variables (spargebra's random 32-hex names for aggregates and anonymous
+/// patterns, the planner's hidden `" _N"` / blank-node variables) differ on every parse;
+/// they are replaced by positional placeholders so identical queries share entries.
+pub struct CacheKey {
+    pub key: String,
+    anon: Vec<String>,
+}
+
+impl CacheKey {
+    fn canonical(&self, name: &str) -> String {
+        match self.anon.iter().position(|a| a == name) {
+            Some(i) => format!("\u{a7}{i}"),
+            None => name.to_string(),
+        }
+    }
+    fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
+        match name
+            .strip_prefix('\u{a7}')
+            .and_then(|i| i.parse::<usize>().ok())
+        {
+            Some(i) => &self.anon[i],
+            None => name,
+        }
+    }
+}
+
+fn anon_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // `?` + a generated variable name, not followed by further name characters
+    RE.get_or_init(|| {
+        regex::Regex::new(r"\?([0-9a-f]{32}| _\d+| bn\d+_[A-Za-z0-9_.-]+)([^A-Za-z0-9_]|$)")
+            .unwrap()
+    })
+}
+
 /// Canonical cache key of a subtree, or `None` if it must not be cached.
-pub fn key(n: &Node, ctx: &Ctx) -> Option<String> {
+pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
+    let raw = raw_key(n, ctx)?;
+    let mut anon: Vec<String> = Vec::new();
+    let key = anon_regex()
+        .replace_all(&raw, |c: &regex::Captures<'_>| {
+            let tok = c[1].to_string();
+            // only rename actual variables of this query (never IRI / literal text)
+            if !ctx.has_var(&tok) {
+                return c[0].to_string();
+            }
+            let i = match anon.iter().position(|a| *a == tok) {
+                Some(i) => i,
+                None => {
+                    anon.push(tok);
+                    anon.len() - 1
+                }
+            };
+            format!("?\u{a7}{i}{}", &c[2])
+        })
+        .into_owned();
+    Some(CacheKey { key, anon })
+}
+
+fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     let mut s = String::with_capacity(256);
     let ds = &ctx.dataset;
     let _ = write!(
@@ -175,7 +236,7 @@ pub fn key(n: &Node, ctx: &Ctx) -> Option<String> {
 fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
     let names = |vs: &[VarId]| {
         vs.iter()
-            .map(|v| ctx.var_name(*v))
+            .map(|v| format!("?{}", ctx.var_name(*v)))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -214,7 +275,7 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             for (v, a) in aggs {
                 let _ = write!(
                     s,
-                    "{}={:?}/{}/{};",
+                    "?{}={:?}/{}/{};",
                     ctx.var_name(*v),
                     a.func,
                     a.distinct,
