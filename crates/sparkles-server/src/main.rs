@@ -135,6 +135,25 @@ enum Cmd {
         #[arg(long)]
         loc: PathBuf,
     },
+    /// List the database's commits (works while a server holds the database)
+    Log {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// only commits before this seq (newest first)
+        #[arg(long, conflicts_with = "after")]
+        before: Option<u64>,
+        /// only commits after this seq (oldest first)
+        #[arg(long)]
+        after: Option<u64>,
+        /// one commit: N, commit:N or head
+        #[arg(long, conflicts_with_all = ["before", "after"])]
+        at: Option<String>,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Materialize inferences (rdfs, rdfs-simple, owl-rl or a Jena rules file)
     Infer {
         #[arg(long)]
@@ -181,6 +200,80 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         union_default_graph: cli.union_default_graph,
         ..Default::default()
     }
+}
+
+/// `sparkles log`: read `dataset.json` and `commits.bin` without taking the database lock.
+fn print_log(
+    loc: &std::path::Path,
+    limit: usize,
+    before: Option<u64>,
+    after: Option<u64>,
+    at: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let Some((id, all)) = sparkles::commit::read_catalog(&loc.join("commits.bin"))? else {
+        bail!(
+            "{} has no commit catalog (not a database, or not opened by this version yet)",
+            loc.display()
+        );
+    };
+    let head = all.last().map_or(0, |c| c.seq);
+    let first = all.first().map_or(0, |c| c.seq);
+    let pick: Vec<_> = if let Some(at) = at {
+        let seq = match at {
+            "head" => head,
+            s => s
+                .strip_prefix("commit:")
+                .unwrap_or(s)
+                .parse()
+                .with_context(|| format!("invalid commit reference '{s}'"))?,
+        };
+        all.iter().filter(|c| c.seq == seq).copied().collect()
+    } else if let Some(a) = after {
+        all.iter()
+            .filter(|c| c.seq > a)
+            .take(limit)
+            .copied()
+            .collect()
+    } else {
+        let b = before.unwrap_or(u64::MAX);
+        all.iter()
+            .rev()
+            .filter(|c| c.seq < b)
+            .take(limit)
+            .copied()
+            .collect()
+    };
+    if format == "json" {
+        let doc = serde_json::json!({
+            "datasetId": id,
+            "head": head,
+            "firstRetained": first,
+            "complete": true,
+            "commits": pick,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+    println!("dataset {id}  head {head}");
+    println!(
+        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation",
+        "seq", "timestamp", "kind", "+inserted", "-deleted", "quads"
+    );
+    for c in pick {
+        let approx = if c.exact { "" } else { "~" };
+        println!(
+            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {}",
+            c.seq,
+            c.timestamp(),
+            c.kind.name(),
+            format!("{}{approx}", c.inserted),
+            format!("{}{approx}", c.deleted),
+            c.quads,
+            c.generation_name()
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -265,14 +358,15 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>, _>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
-            store.load(&sources)?;
+            let r = store.load_as(&sources, sparkles::commit::CommitKind::Load)?;
             let after = store.snapshot().len();
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
-                "loaded {} quads in {:.2}s ({:.0} quads/s); database now has {after} quads",
+                "loaded {} quads in {:.2}s ({:.0} quads/s); database now has {after} quads; commit {}",
                 after - before,
                 secs,
-                (after - before) as f64 / secs.max(1e-9)
+                (after - before) as f64 / secs.max(1e-9),
+                r.commit.seq
             );
             Ok(())
         }
@@ -352,12 +446,25 @@ fn main() -> Result<()> {
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
+            let commit = match s.commit {
+                Some(r) if r.committed => format!("commit {}", r.commit.seq),
+                Some(r) => format!("no change · head {}", r.commit.seq),
+                None => String::new(),
+            };
             eprintln!(
-                "inserted {} · deleted {} · {:.2} ms",
+                "inserted {} · deleted {} · {commit} · {:.2} ms",
                 s.inserted, s.deleted, s.timing.total_ms
             );
             Ok(())
         }
+        Cmd::Log {
+            loc,
+            limit,
+            before,
+            after,
+            at,
+            format,
+        } => print_log(&loc, limit, before, after, at.as_deref(), &format),
         Cmd::Dump { loc } => {
             let store = Store::open(&loc, opts)?;
             let out = std::io::BufWriter::new(std::io::stdout().lock());

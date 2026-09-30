@@ -91,6 +91,56 @@ Query parameters beyond the standard protocol:
   keyed by snapshot version, so updates invalidate it, and `POST /$/cache/clear/{ds}`
   empties it.
 
+## Commits
+
+Every dataset has a **dataset id** (a UUID created with it) and a gap-free **commit
+sequence**. Each write that changes data (update, Graph Store PUT/POST/DELETE, upload,
+load, reasoning) gets the next `seq`. A write with no net effect, such as inserting a
+quad that is already present, creates no commit. Commit 0 is the root. Compaction keeps
+the head. Ids survive restarts and are durable exactly when the data is.
+
+**Headers.** Every successful query, update, Graph Store and explain response carries:
+
+```
+Sparkles-Commit: 42                 (the commit a read saw, or a write produced)
+Sparkles-Dataset-Id: 3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa
+```
+
+Both are exposed to cross-origin clients. The `application/x-sparkles+json` result
+format also has `meta.commit` and `meta.datasetId`.
+
+**Receipts.** Write responses keep their Fuseki-compatible bodies by default. With
+`Accept: application/x-sparkles+json` or `receipt=true`, the body (same status; `200`
+instead of `204` for Graph Store DELETE) adds:
+
+```ts
+type Receipt = {
+  dataset: string; datasetId: string;
+  committed: boolean;            // false: no net change, `commit` is the unchanged head
+  commit: Commit;
+};
+type Commit = {
+  seq: number; parent: number | null; ref: string;   // "commit:42"
+  timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
+  kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
+      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "unknown";
+  inserted: number; deleted: number;   // net change relative to the parent
+  quads: number;                        // dataset size after the commit
+  generation: string;                   // index generation it was made in
+  bulk: boolean;                        // made by rebuilding the index
+  exact: boolean;                       // false: a bulk commit that also deleted
+};
+```
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/$/commits/{ds}` | Newest commits first: `?limit=` (default 50, max 1000), `?before=<seq>` pages backwards, `?after=<seq>` lists oldest first after `seq`. Returns `{dataset, datasetId, head, firstRetained, complete, commits: Commit[], next: string \| null}`. |
+| GET | `/$/commits/{ds}/{ref}` | One commit; `ref` is `42`, `commit:42` or `head`. `404` beyond the head, `410` if no longer retained. |
+
+`GET /$/datasets[/{ds}]` entries gain `id`, `head` and `modified` (the head's timestamp).
+`sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
+lists commits without taking the database lock, so it works next to a running server.
+
 ## SHACL validation
 
 `POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against
@@ -183,4 +233,6 @@ type PlanNode = {
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number }`
-with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `500` otherwise.
+with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `503` when
+a write-ahead log write failed (writes are refused until restart; reads continue), `500`
+otherwise.

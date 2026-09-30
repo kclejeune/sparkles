@@ -56,6 +56,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | External sort for inputs larger than the memory budget | ✅ |
 | Planner statistics (per predicate counts, distinct S/O, classes, graphs) | ✅ |
 | MVCC snapshots, single writer (MR+SW), WAL with crash-safe replay | ✅ |
+| Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | Backups (gzipped N-Quads) | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
@@ -179,7 +180,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 
 | Area | Fluree has | Sparkles |
 |---|---|---|
-| History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | ✗ MVCC snapshots only; no history after compaction |
+| History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog (metadata only); no time travel or history queries yet, and no data history after compaction |
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | ✗ none (run behind a proxy) |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL and the Rust API only; JSON-LD as an RDF format only |
 | Search | BM25 full-text, vector (HNSW), geospatial | ✗ |
@@ -390,6 +391,7 @@ sparkles compact --loc db                     # merge updates into a new generat
 sparkles dump    --loc db > dump.nq
 sparkles backup  --loc db --out backups/
 sparkles stats   --loc db
+sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
 ```
 

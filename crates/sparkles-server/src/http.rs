@@ -25,7 +25,10 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 type St = State<Arc<AppState>>;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let cors = tower_http::cors::CorsLayer::very_permissive();
+    let cors = tower_http::cors::CorsLayer::very_permissive().expose_headers([
+        header::HeaderName::from_static(SPARKLES_COMMIT),
+        header::HeaderName::from_static(SPARKLES_DATASET_ID),
+    ]);
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
@@ -43,6 +46,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/tasks/{id}", get(get_task))
         .route("/$/prefixes/{ds}", get(prefixes))
         .route("/$/cache/clear/{ds}", post(clear_cache))
+        .route("/$/commits/{ds}", get(list_commits))
+        .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))
@@ -85,6 +90,7 @@ impl From<Error> for ApiError {
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::MemoryLimit(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Error::Poisoned => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -388,7 +394,9 @@ async fn query_endpoint(
     let prefixes = ds.store.prefixes();
     blocking(move || {
         let t = std::time::Instant::now();
-        let r = sparkles::sparql::query(ds.store.snapshot(), &query, &opts)?;
+        let snap = ds.store.snapshot();
+        let seq = snap.commit;
+        let r = sparkles::sparql::query(snap, &query, &opts)?;
         let mut buf = Vec::new();
         let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
         let ct: String = match r.kind {
@@ -404,6 +412,10 @@ async fn query_endpoint(
                     timing.insert("serializeMs".into(), ser_ms.into());
                     timing.insert("totalMs".into(), (total + ser_ms).into());
                 }
+                if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
+                    meta.insert("commit".into(), seq.into());
+                    meta.insert("datasetId".into(), ds.store.dataset_id().to_string().into());
+                }
                 serde_json::to_writer(&mut buf, &doc)
                     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 SolutionsFormat::Sparkles.media_type().into()
@@ -418,7 +430,11 @@ async fn query_endpoint(
             }
         };
         tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-        Ok(([(header::CONTENT_TYPE, ct)], buf).into_response())
+        Ok(with_commit(
+            ([(header::CONTENT_TYPE, ct)], buf).into_response(),
+            &ds,
+            seq,
+        ))
     })
     .await
 }
@@ -427,6 +443,173 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
     h.get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
+}
+
+// ------------------------------------------------------------------ commits ------
+
+/// Response header: the commit (`seq`) a response reflects.
+const SPARKLES_COMMIT: &str = "sparkles-commit";
+/// Response header: the dataset id that commit belongs to.
+const SPARKLES_DATASET_ID: &str = "sparkles-dataset-id";
+
+/// Add the commit headers to a response.
+fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
+    let h = r.headers_mut();
+    h.insert(SPARKLES_COMMIT, seq.into());
+    if let Ok(v) = header::HeaderValue::from_str(&ds.store.dataset_id().to_string()) {
+        h.insert(SPARKLES_DATASET_ID, v);
+    }
+    r
+}
+
+/// The client asked for a commit receipt: `receipt=true`, or an `Accept` that names the
+/// Sparkles media type (`*/*` does not count).
+fn receipt_wanted(params: &Params, headers: &HeaderMap) -> bool {
+    params.get("receipt").is_some_and(truthy) || params_wants_sparkles(headers)
+}
+
+/// A write response: `body` as JSON, plus the receipt members when asked for (as the
+/// Sparkles media type), plus the commit headers.
+fn write_response(
+    ds: &Dataset,
+    status: StatusCode,
+    body: Option<J>,
+    receipt: &sparkles::commit::Receipt,
+    wanted: bool,
+) -> Response {
+    let r = if wanted {
+        let mut doc = body.unwrap_or_else(|| json!({}));
+        if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
+            m.insert("dataset".into(), ds.name.clone().into());
+            m.extend(rm);
+        }
+        let status = if status == StatusCode::NO_CONTENT {
+            StatusCode::OK
+        } else {
+            status
+        };
+        (
+            status,
+            [(header::CONTENT_TYPE, SolutionsFormat::Sparkles.media_type())],
+            doc.to_string(),
+        )
+            .into_response()
+    } else {
+        match body {
+            Some(b) => (status, Json(b)).into_response(),
+            None => status.into_response(),
+        }
+    };
+    with_commit(r, ds, receipt.commit.seq)
+}
+
+/// Parse `N`, `commit:N` or `head` (resolved by the caller).
+fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
+    if s == "head" {
+        return Some(None);
+    }
+    s.strip_prefix("commit:")
+        .unwrap_or(s)
+        .parse()
+        .ok()
+        .map(Some)
+}
+
+async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult<Json<J>> {
+    use sparkles::commit::CommitRange;
+    let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let num = |k: &str| -> ApiResult<Option<u64>> {
+        params
+            .get(k)
+            .map(|v| {
+                v.parse::<u64>().map_err(|_| {
+                    err(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid commit range: {k}={v}"),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let limit = num("limit")?.unwrap_or(50);
+    if limit == 0 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid commit range: limit=0",
+        ));
+    }
+    let limit = limit.min(1000) as usize;
+    let range = match (num("before")?, num("after")?) {
+        (Some(_), Some(_)) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "invalid commit range: use either before or after",
+            ));
+        }
+        (Some(b), None) => CommitRange::Before(b),
+        (None, Some(a)) => CommitRange::After(a),
+        (None, None) => CommitRange::Latest,
+    };
+    let head = ds.store.head_commit();
+    let page = ds.store.commits(range, limit);
+    let next = match (range, page.commits.last()) {
+        (CommitRange::After(_), Some(last)) if last.seq < head.seq => Some(format!(
+            "/$/commits/{name}?after={}&limit={limit}",
+            last.seq
+        )),
+        (CommitRange::Latest | CommitRange::Before(_), Some(last))
+            if last.seq > page.first_retained =>
+        {
+            Some(format!(
+                "/$/commits/{name}?before={}&limit={limit}",
+                last.seq
+            ))
+        }
+        _ => None,
+    };
+    Ok(Json(json!({
+        "dataset": name,
+        "datasetId": ds.store.dataset_id(),
+        "head": head.seq,
+        "firstRetained": page.first_retained,
+        "complete": page.complete,
+        "commits": page.commits,
+        "next": next,
+    })))
+}
+
+async fn get_commit(
+    State(st): St,
+    Path((name, reference)): Path<(String, String)>,
+) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    let head = ds.store.head_commit();
+    let seq = parse_commit_ref(&reference)
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid commit reference '{reference}'"),
+            )
+        })?
+        .unwrap_or(head.seq);
+    if seq > head.seq {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no commit {seq} in dataset {name} (head is {})", head.seq),
+        ));
+    }
+    let c = ds.store.commit(seq).ok_or_else(|| {
+        err(
+            StatusCode::GONE,
+            format!("commit metadata before {} is no longer retained", seq + 1),
+        )
+    })?;
+    Ok(Json(json!({
+        "dataset": name,
+        "datasetId": ds.store.dataset_id(),
+        "commit": c,
+    })))
 }
 
 async fn update_endpoint(
@@ -457,9 +640,23 @@ async fn update_endpoint(
         allow_service: st.allow_service,
         ..Default::default()
     };
+    let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
-        let stats = sparkles::sparql::update::update(&ds.store, &update, &opts)?;
-        Ok(Json(serde_json::to_value(stats).unwrap()).into_response())
+        let stats = sparkles::sparql::update::update_as(
+            &ds.store,
+            &update,
+            &opts,
+            sparkles::commit::CommitKind::Update,
+        )?;
+        let receipt = stats.commit.expect("update receipts");
+        let body = serde_json::to_value(&stats).unwrap();
+        Ok(write_response(
+            &ds,
+            StatusCode::OK,
+            Some(body),
+            &receipt,
+            wanted,
+        ))
     })
     .await
 }
@@ -485,8 +682,14 @@ async fn explain(
     };
     let opts = query_options(&st, &ds, &params);
     blocking(move || {
-        let (algebra, plan) = sparkles::sparql::explain(ds.store.snapshot(), &query, &opts)?;
-        Ok(Json(json!({ "algebra": algebra, "plan": plan })).into_response())
+        let snap = ds.store.snapshot();
+        let seq = snap.commit;
+        let (algebra, plan) = sparkles::sparql::explain(snap, &query, &opts)?;
+        Ok(with_commit(
+            Json(json!({ "algebra": algebra, "plan": plan })).into_response(),
+            &ds,
+            seq,
+        ))
     })
     .await
 }
@@ -531,6 +734,7 @@ async fn gsp(
             let head = method == Method::HEAD;
             blocking(move || {
                 let snap = ds.store.snapshot();
+                let seq = snap.commit;
                 let prefixes = ds.store.prefixes();
                 let g = match &target {
                     Target::Default => Some(Id::DEFAULT_GRAPH),
@@ -571,7 +775,11 @@ async fn gsp(
                     }
                     w.finish().map_err(Error::Io)?;
                 }
-                Ok(([(header::CONTENT_TYPE, results::rdf_media_type(fmt))], buf).into_response())
+                Ok(with_commit(
+                    ([(header::CONTENT_TYPE, results::rdf_media_type(fmt))], buf).into_response(),
+                    &ds,
+                    seq,
+                ))
             })
             .await
         }
@@ -589,6 +797,7 @@ async fn gsp(
                     )
                 })?;
             let replace = method == Method::PUT;
+            let wanted = receipt_wanted(&params, &headers);
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -598,29 +807,26 @@ async fn gsp(
                     _ => None,
                 };
                 let src = Source::from_bytes(body.to_vec(), format, graph.clone());
-                let count = if replace {
+                use sparkles::commit::CommitKind;
+                let (count, receipt) = if replace {
                     // parse first, then clear and insert atomically
                     let t = match graph {
                         Some(g) => ReplaceTarget::Named(g),
                         None if matches!(target, Target::Dataset) => ReplaceTarget::All,
                         None => ReplaceTarget::Default,
                     };
-                    ds.store.replace(t, &[src])?
+                    ds.store.replace_as(t, &[src], CommitKind::GspPut)?
                 } else {
-                    let before = ds.store.snapshot().len();
-                    ds.store.load(&[src])?;
-                    ds.store.snapshot().len().saturating_sub(before)
+                    let r = ds.store.load_as(&[src], CommitKind::GspPost)?;
+                    (if r.committed { r.commit.inserted } else { 0 }, r)
                 };
                 let status = if replace {
                     StatusCode::OK
                 } else {
                     StatusCode::CREATED
                 };
-                Ok((
-                    status,
-                    Json(json!({ "count": count, "tripleCount": count, "quadCount": count })),
-                )
-                    .into_response())
+                let body = json!({ "count": count, "tripleCount": count, "quadCount": count });
+                Ok(write_response(&ds, status, Some(body), &receipt, wanted))
             })
             .await
         }
@@ -628,6 +834,7 @@ async fn gsp(
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
             }
+            let wanted = receipt_wanted(&params, &headers);
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let clear = match &target {
@@ -646,8 +853,20 @@ async fn gsp(
                     }
                     Target::Dataset => "CLEAR ALL".to_string(),
                 };
-                sparkles::sparql::update::update(&ds.store, &clear, &QueryOptions::default())?;
-                Ok(StatusCode::NO_CONTENT.into_response())
+                let stats = sparkles::sparql::update::update_as(
+                    &ds.store,
+                    &clear,
+                    &QueryOptions::default(),
+                    sparkles::commit::CommitKind::GspDelete,
+                )?;
+                let receipt = stats.commit.expect("update receipts");
+                Ok(write_response(
+                    &ds,
+                    StatusCode::NO_CONTENT,
+                    None,
+                    &receipt,
+                    wanted,
+                ))
             })
             .await
         }
@@ -667,6 +886,7 @@ async fn upload(
     }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    let wanted = receipt_wanted(&params, &headers);
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -750,14 +970,23 @@ async fn upload(
             .iter()
             .map(|p| Source::from_path(p, g.clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let before = ds.store.snapshot().len();
-        ds.store.load(&sources)?;
-        let count = ds.store.snapshot().len().saturating_sub(before);
+        let receipt = ds
+            .store
+            .load_as(&sources, sparkles::commit::CommitKind::Upload)?;
+        let count = if receipt.committed {
+            receipt.commit.inserted
+        } else {
+            0
+        };
         drop(tmp);
-        Ok(
-            Json(json!({ "count": count, "tripleCount": count, "quadCount": count }))
-                .into_response(),
-        )
+        let body = json!({ "count": count, "tripleCount": count, "quadCount": count });
+        Ok(write_response(
+            &ds,
+            StatusCode::OK,
+            Some(body),
+            &receipt,
+            wanted,
+        ))
     })
     .await
 }
@@ -781,12 +1010,16 @@ fn dataset_info(ds: &Dataset) -> J {
     {
         endpoints["shacl"] = format!("/{n}/shacl").into();
     }
+    let head = ds.store.head_commit();
     json!({
         "name": n,
         "type": ds.kind,
         "endpoints": endpoints,
         "quads": ds.store.snapshot().len(),
         "reasoning": *ds.reasoning.read(),
+        "id": ds.store.dataset_id(),
+        "head": head.seq,
+        "modified": head.timestamp(),
     })
 }
 

@@ -588,3 +588,241 @@ fn concurrent_dataset_management_is_serialized() {
     let names: Vec<String> = reopened.datasets.read().keys().cloned().collect();
     assert_eq!(names.len(), 31, "{names:?}");
 }
+
+// ------------------------------------------------------------------ commits ------
+
+/// Send a request and return the response with its headers.
+async fn send_h(app: &Router, req: Request<Body>) -> (Resp, axum::http::HeaderMap) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let headers = res.headers().clone();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    (
+        Resp {
+            status,
+            content_type,
+            body,
+        },
+        headers,
+    )
+}
+
+fn commit_header(h: &axum::http::HeaderMap) -> u64 {
+    h.get("sparkles-commit")
+        .expect("Sparkles-Commit header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn sparql_update(
+    app: &Router,
+    text: &str,
+    accept: Option<&str>,
+) -> (Resp, axum::http::HeaderMap) {
+    let mut req =
+        Request::post("/ds/update").header(header::CONTENT_TYPE, "application/sparql-update");
+    if let Some(a) = accept {
+        req = req.header(header::ACCEPT, a);
+    }
+    send_h(app, req.body(Body::from(text.to_string())).unwrap()).await
+}
+
+#[tokio::test]
+async fn writes_return_commits_and_reads_name_them() {
+    let s = server();
+    // the fixture's bulk load into the empty in-memory dataset was commit 1
+    let list = send(
+        &s.app,
+        Request::get("/$/commits/ds").body(Body::empty()).unwrap(),
+    )
+    .await
+    .json();
+    assert_eq!(list["head"], 1);
+    assert_eq!(list["commits"][0]["kind"], "load");
+    assert_eq!(list["commits"][0]["bulk"], true);
+    assert_eq!(list["commits"][1]["kind"], "create");
+    assert_eq!(list["commits"][1]["parent"], J::Null);
+    let id = list["datasetId"].as_str().unwrap().to_string();
+
+    // a receipt when asked for
+    let (r, h) = sparql_update(
+        &s.app,
+        "INSERT DATA { <urn:a> <urn:p> 1 . <urn:b> <urn:p> 2 }",
+        Some("application/x-sparkles+json"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(commit_header(&h), 2);
+    assert_eq!(h["sparkles-dataset-id"], id.as_str());
+    let j = r.json();
+    assert_eq!(
+        (j["inserted"].as_u64(), j["operations"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(j["committed"], true);
+    assert_eq!(j["dataset"], "ds");
+    assert_eq!(j["commit"]["seq"], 2);
+    assert_eq!(j["commit"]["parent"], 1);
+    assert_eq!(j["commit"]["kind"], "update");
+    assert_eq!(j["commit"]["inserted"], 2);
+
+    // the default body is unchanged
+    let (r, h) = sparql_update(&s.app, "INSERT DATA { <urn:c> <urn:p> 3 }", None).await;
+    assert_eq!(r.content_type, "application/json");
+    let mut keys: Vec<String> = r.json().as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["deleted", "inserted", "operations", "timing"]);
+    assert_eq!(commit_header(&h), 3);
+
+    // no change: no commit
+    let (r, h) = sparql_update(
+        &s.app,
+        "INSERT DATA { <urn:a> <urn:p> 1 }",
+        Some("application/x-sparkles+json"),
+    )
+    .await;
+    assert_eq!(r.json()["committed"], false);
+    assert_eq!(r.json()["commit"]["seq"], 3);
+    assert_eq!(commit_header(&h), 3);
+
+    // Graph Store Protocol
+    let (r, h) = send_h(
+        &s.app,
+        Request::put("/ds/data?graph=urn:g&receipt=true")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<urn:s> <urn:p> 1, 2, 3 ."))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["count"], 3);
+    assert_eq!(j["commit"]["kind"], "gsp-put");
+    assert_eq!(j["commit"]["seq"], 4);
+    assert_eq!(commit_header(&h), 4);
+    let (r, h) = send_h(
+        &s.app,
+        Request::delete("/ds/data?graph=urn:g")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(commit_header(&h), 5);
+    assert_eq!(
+        s.state.get("ds").unwrap().store.head_commit().kind.name(),
+        "gsp-delete"
+    );
+
+    // reads carry the commit they were evaluated against
+    let (_, h) = send_h(
+        &s.app,
+        Request::get("/ds/sparql?query=ASK%7B%7D")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(commit_header(&h), 5);
+    assert_eq!(h["sparkles-dataset-id"], id.as_str());
+    let (_, h) = send_h(
+        &s.app,
+        Request::get("/ds/sparql?query=ASK%7B%7D")
+            .header(header::ORIGIN, "http://elsewhere.example")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let exposed = h[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+        .to_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(
+        exposed.contains("sparkles-commit") && exposed.contains("sparkles-dataset-id"),
+        "{exposed}"
+    );
+
+    // dataset info
+    let info = send(
+        &s.app,
+        Request::get("/$/datasets/ds").body(Body::empty()).unwrap(),
+    )
+    .await
+    .json();
+    assert_eq!(info["head"], 5);
+    assert_eq!(info["id"], id.as_str());
+}
+
+#[tokio::test]
+async fn the_commit_catalog_pages_and_rejects_bad_ranges() {
+    let s = server();
+    for i in 0..7 {
+        sparql_update(
+            &s.app,
+            &format!("INSERT DATA {{ <urn:x{i}> <urn:p> {i} }}"),
+            None,
+        )
+        .await;
+    }
+    // head is 8 (root 0, fixture load 1, then 2..8)
+    let get = |q: &str| {
+        Request::get(format!("/$/commits/ds{q}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let seqs = |j: &J| -> Vec<u64> {
+        j["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["seq"].as_u64().unwrap())
+            .collect()
+    };
+    let j = send(&s.app, get("?limit=3")).await.json();
+    assert_eq!(seqs(&j), [8, 7, 6]);
+    assert_eq!(j["next"], "/$/commits/ds?before=6&limit=3");
+    assert_eq!(
+        seqs(&send(&s.app, get("?before=6&limit=3")).await.json()),
+        [5, 4, 3]
+    );
+    assert_eq!(
+        seqs(&send(&s.app, get("?after=5&limit=2")).await.json()),
+        [6, 7]
+    );
+    let last = send(&s.app, get("?before=2&limit=5")).await.json();
+    assert_eq!(seqs(&last), [1, 0]);
+    assert_eq!(last["next"], J::Null);
+    for bad in ["?before=x", "?before=3&after=1", "?limit=0"] {
+        assert_eq!(
+            send(&s.app, get(bad)).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    let nope = Request::get("/$/commits/nope").body(Body::empty()).unwrap();
+    assert_eq!(send(&s.app, nope).await.status, StatusCode::NOT_FOUND);
+    let r = send(&s.app, get("/99")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(
+        r.text().contains("no commit 99 in dataset ds (head is 8)"),
+        "{}",
+        r.text()
+    );
+    assert_eq!(
+        send(&s.app, get("/commit:2")).await.json()["commit"]["seq"],
+        2
+    );
+    assert_eq!(send(&s.app, get("/head")).await.json()["commit"]["seq"], 8);
+    assert_eq!(
+        send(&s.app, get("/x")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
