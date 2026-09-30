@@ -405,6 +405,80 @@ type Commit = {
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
 lists commits without taking the database lock, so it works next to a running server.
 
+## Point-in-time reads and snapshots
+
+Every commit since the dataset's last compaction or bulk commit can be read, at no extra
+cost: its state is the current index generation plus a prefix of its write-ahead log.
+Older commits stay readable while a **named snapshot** or the **retention window** keeps
+the generation that holds them (compaction and bulk commits then keep that generation
+instead of deleting it). Only persistent datasets have history.
+
+**Selector** (`at`, in the query string or a form body) on `/{ds}/sparql`, `/{ds}/query`,
+`/{ds}?query=`, `/{ds}/explain` and Graph Store `GET`/`HEAD`:
+
+| `at` | State |
+|---|---|
+| `head` (or absent) | the live state |
+| `42`, `commit:42` | right after commit 42 |
+| `time:2026-09-30T14:03:11.482Z` | the last commit at or before that instant (any RFC 3339 offset; a `+` that arrives as a space is accepted) |
+| `snapshot:NAME` | the commit a named snapshot pins |
+
+Responses add `Sparkles-At` (the selector, canonical form) and `Sparkles-Head`; for a
+past state also `Memento-Datetime` (the commit's time) and `Link: <…>; rel="original"`
+(RFC 7089). `Sparkles-Commit` is the commit read. Freshness of inferences
+(`Sparkles-Inferences`) is reported for the live state only. `text:query` works at the
+head only (`501` at a past commit); vector search works at any commit. Writes with `at`
+(even `at=head`) are refused with `400` and `code: "at-on-write"`.
+
+Errors (with a `code`): `400 invalid-at`; `404` for a commit beyond the head, an unknown
+snapshot, or a time before history; `410 history-gone` for a commit whose data is no
+longer kept, with the readable ranges:
+
+```json
+{ "error": "commit 12 is no longer reconstructable; the oldest reconstructable commit is 40",
+  "code": "history-gone", "commit": 12, "head": 57, "oldestReconstructable": 40,
+  "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
+```
+
+`501 history-unsupported` for in-memory datasets. Materializing a past state is bounded by
+`--history-cache-mb` (default 1024, `507` beyond it) and the request timeout; results are
+cached, one materialization at a time.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
+| POST | `/$/snapshots/{ds}` | Pin `{ name, at?: selector (default head), note? }` (JSON, form or query). `201` + `Location`; `200` if the name already pins that commit; `409` if it pins another one, or with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8); `410` if the commit is no longer readable |
+| GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
+| DELETE | `/$/snapshots/{ds}/{name}` | `204`; generations only it kept are removed |
+| GET | `/$/history/{ds}` | `HistoryStatus` |
+| PUT | `/$/history/{ds}` | Set the retention window `{ keepCommits?: number \| null, keepAge?: "7d" \| seconds \| null }` and return `HistoryStatus` |
+
+```ts
+type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
+  created: string; note: string | null; generation: string | null; reconstructable: boolean };
+type HistoryStatus = { dataset: string; datasetId: string; head: number;
+  oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
+  bytes: number;   // disk of kept non-current generations
+  generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
+                 current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
+  retention: { keepCommits: number | null; keepAge: string | null };
+  snapshots: number;
+  cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
+```
+
+A pin at the head costs nothing (the next generation starts at that commit); a pin inside
+a generation keeps the whole generation, so its other commits stay readable too. Removing
+a generation renames it to `gen-NNNN.deleting` first, so an interrupted removal is
+finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable`,
+`reconstructable`, and per commit `reconstructable` and `snapshots`.
+
+CLI: `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT]`,
+`snapshot list|history --loc DB [--format json]`, `snapshot delete --loc DB NAME`,
+`snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--off]`, and
+`sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL`. These open the
+database, so stop a server that holds it or use the HTTP API. In Rust:
+`Store::snapshot_at`, `create_snapshot`, `set_retention`, `history`.
+
 ## Full-text search
 
 Datasets can index their string and language-tagged literals for ranked (BM25) search,

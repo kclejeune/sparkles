@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod history;
 mod schema;
 mod stream;
 
@@ -34,6 +35,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(SPARKLES_DATASET_ID),
         crate::obs::X_REQUEST_ID.clone(),
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        header::HeaderName::from_static(history::SPARKLES_AT),
+        header::HeaderName::from_static(history::SPARKLES_HEAD),
+        header::HeaderName::from_static("memento-datetime"),
+        header::LINK,
     ]);
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
@@ -81,6 +86,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/shacl", post(shacl))
         .route("/$/vector/{ds}", get(vector_status))
         .route("/{ds}/prefixes", any(dataset_prefixes))
+        .route(
+            "/$/snapshots/{ds}",
+            get(history::list_snapshots).post(history::create_snapshot),
+        )
+        .route(
+            "/$/snapshots/{ds}/{name}",
+            get(history::get_snapshot).delete(history::delete_snapshot),
+        )
+        .route(
+            "/$/history/{ds}",
+            get(history::get_history).put(history::put_history),
+        )
         .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
@@ -172,10 +189,19 @@ impl From<Error> for ApiError {
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
+            Error::NotFound(_) => StatusCode::NOT_FOUND,
+            Error::HistoryGone(_) => StatusCode::GONE,
+            Error::HistoryUnsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
             Error::SparqlSyntax(_) => syntax_error_body(&msg),
+            Error::HistoryGone(g) => history::gone_body(&g),
+            Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
+            Error::Conflict(_) if msg.starts_with("history-limit") => {
+                json!({ "error": msg, "code": "history-limit" })
+            }
             Error::BudgetExceeded(b) => json!({
                 "error": msg,
                 "budget": b.kind,
@@ -498,15 +524,16 @@ async fn query_endpoint(
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let prefixes = ds.store.prefixes();
     let with_extra = !opts.default_graph_extra.is_empty();
-    let (r, seq) = blocking({
+    let at = history::at_param(&params)?;
+    let (r, seq, resolved) = blocking({
         let ds = ds.clone();
         move || {
             let t = std::time::Instant::now();
-            let snap = ds.store.snapshot();
+            let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
             let r = sparkles::sparql::query(snap, &query, &opts)?;
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((r, seq))
+            Ok((r, seq, resolved))
         }
     })
     .await?;
@@ -589,7 +616,13 @@ async fn query_endpoint(
         &ds,
         seq,
     );
-    Ok(report.attach(with_inferences(resp, &ds, with_extra, seq)))
+    let resp = history::history_headers(resp, resolved.as_ref(), &uri);
+    // freshness is reported for the live state only
+    let resp = match &resolved {
+        Some(r) if r.historical => resp,
+        _ => with_inferences(resp, &ds, with_extra, seq),
+    };
+    Ok(report.attach(resp))
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).
@@ -863,13 +896,16 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
         }
         _ => None,
     };
+    let (oldest, reconstructable, commits) = history::commit_list_extras(&ds, &page.commits);
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
         "head": head.seq,
         "firstRetained": page.first_retained,
         "complete": page.complete,
-        "commits": page.commits,
+        "oldestReconstructable": oldest,
+        "reconstructable": reconstructable,
+        "commits": commits,
         "next": next,
     })))
 }
@@ -928,6 +964,7 @@ async fn update_endpoint(
         }
         _ => params.get("update").unwrap_or_default().to_string(),
     };
+    history::reject_at(&params)?;
     if update.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "missing 'update' parameter"));
     }
@@ -986,15 +1023,17 @@ async fn explain(
         params.get("query").unwrap_or_default().to_string()
     };
     let opts = query_options(&st, &ds, &params);
+    let at = history::at_param(&params)?;
     blocking(move || {
-        let snap = ds.store.snapshot();
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let seq = snap.commit;
         let (algebra, plan) = sparkles::sparql::explain(snap, &query, &opts)?;
-        Ok(with_commit(
+        let resp = with_commit(
             Json(json!({ "algebra": algebra, "plan": plan })).into_response(),
             &ds,
             seq,
-        ))
+        );
+        Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await
 }
@@ -1194,10 +1233,12 @@ async fn gsp(
             let fmt = rdf_format(&params, &headers, quads);
             let head = method == Method::HEAD;
             // resolve the graph (or 404) before the response starts
-            let (snap, g) = blocking({
+            let at = history::at_param(&params)?;
+            let opts = query_options(&st, &ds, &params);
+            let (snap, g, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
-                    let snap = ds.store.snapshot();
+                    let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
                     let g = match &target {
                         Target::Default => Some(Id::DEFAULT_GRAPH),
                         Target::Named(iri) => Some(
@@ -1209,7 +1250,7 @@ async fn gsp(
                         ),
                         Target::Dataset => None,
                     };
-                    Ok((snap, g))
+                    Ok((snap, g, resolved))
                 }
             })
             .await?;
@@ -1229,12 +1270,14 @@ async fn gsp(
                 }
                 (ct, body).into_response()
             };
-            Ok(report.attach(with_commit(resp, &ds, seq)))
+            let resp = with_commit(resp, &ds, seq);
+            Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
         }
         Method::PUT | Method::POST => {
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
             }
+            history::reject_at(&params)?;
             let ct = content_type(&headers);
             let format = sparkles::io::format_for_media_type(&ct)
                 .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
@@ -1289,6 +1332,7 @@ async fn gsp(
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
             }
+            history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -1341,6 +1385,7 @@ async fn upload(
     }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
@@ -2198,6 +2243,8 @@ async fn shacl() -> ApiResult {
     ))
 }
 
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod obs_tests;
 #[cfg(test)]

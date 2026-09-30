@@ -57,6 +57,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Planner statistics (per predicate counts, distinct S/O, classes, graphs) | ✅ |
 | MVCC snapshots, single writer (MR+SW), WAL with crash-safe replay | ✅ |
 | Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
+| Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | Backups (gzipped N-Quads) | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
@@ -188,7 +189,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 
 | Area | Fluree has | Sparkles |
 |---|---|---|
-| History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog (metadata only); no time travel or history queries yet, and no data history after compaction |
+| History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog; point-in-time reads of every commit since the last compaction, and of older ones kept by named snapshots or a retention window; no history queries across commits, diffs, branches or merges yet |
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | ✗ none (run behind a proxy) |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL and the Rust API only; JSON-LD as an RDF format only |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |

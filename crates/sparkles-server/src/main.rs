@@ -40,11 +40,234 @@ struct Cli {
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
+    /// Memory for materialized past states (point-in-time reads), in MiB
+    #[arg(long, global = true, default_value_t = 1024)]
+    history_cache_mb: u64,
+    /// Old index generations named snapshots may keep per dataset
+    #[arg(long, global = true, default_value_t = 8)]
+    history_max_generations: usize,
+    /// Named snapshots per dataset
+    #[arg(long, global = true, default_value_t = 256)]
+    max_snapshots: usize,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Pin a commit under a name (default: the head)
+    Create {
+        #[arg(long)]
+        loc: PathBuf,
+        name: String,
+        /// N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List named snapshots
+    List {
+        #[arg(long)]
+        loc: PathBuf,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Remove a named snapshot (and the history only it kept)
+    Delete {
+        #[arg(long)]
+        loc: PathBuf,
+        name: String,
+    },
+    /// Retained generations and readable commits
+    History {
+        #[arg(long)]
+        loc: PathBuf,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Keep the recent past readable: the last N commits and/or a duration (90s, 30m, 12h, 7d)
+    Retain {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long)]
+        keep_commits: Option<u64>,
+        #[arg(long)]
+        keep_age: Option<String>,
+        /// turn retention off
+        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age"])]
+        off: bool,
+    },
+}
+
+/// `90s`, `30m`, `12h`, `7d`, `2w`, or plain seconds, to milliseconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?}"))?;
+    let secs = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => bail!("invalid duration {s:?}: use s, m, h, d or w"),
+    };
+    Ok(n * secs * 1000)
+}
+
+fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
+    use sparkles::history::{At, Retention};
+    match cmd {
+        SnapshotCmd::Create {
+            loc,
+            name,
+            at,
+            note,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let at: At = at.as_deref().unwrap_or("head").parse()?;
+            let (s, created) = store.create_snapshot(&name, &at, note)?;
+            println!(
+                "{} → commit {}{}",
+                s.name,
+                s.seq,
+                if created { "" } else { " (already pinned)" }
+            );
+        }
+        SnapshotCmd::List { loc, format } => {
+            let store = Store::open(&loc, opts)?;
+            let snaps = store.snapshots();
+            if format == "json" {
+                let j: Vec<serde_json::Value> = snaps
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name, "seq": s.seq, "commit": s.commit,
+                            "created": sparkles::commit::rfc3339_ms(s.created_ms),
+                            "note": s.note, "generation": s.generation,
+                            "reconstructable": s.reconstructable,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&j)?);
+            } else {
+                println!(
+                    "{:<16} {:>8}  {:<24}  {:<10}  note",
+                    "snapshot", "commit", "timestamp", "generation"
+                );
+                for s in snaps {
+                    println!(
+                        "{:<16} {:>8}  {:<24}  {:<10}  {}{}",
+                        s.name,
+                        s.seq,
+                        s.commit.map(|c| c.timestamp()).unwrap_or_default(),
+                        s.generation.unwrap_or_else(|| "-".into()),
+                        s.note.unwrap_or_default(),
+                        if s.reconstructable {
+                            ""
+                        } else {
+                            "  (not reconstructable)"
+                        }
+                    );
+                }
+            }
+        }
+        SnapshotCmd::Delete { loc, name } => {
+            let store = Store::open(&loc, opts)?;
+            if !store.delete_snapshot(&name)? {
+                bail!("no snapshot '{name}'");
+            }
+            println!("deleted {name}");
+        }
+        SnapshotCmd::History { loc, format } => {
+            let store = Store::open(&loc, opts)?;
+            print_history(&store.history(), &format)?;
+        }
+        SnapshotCmd::Retain {
+            loc,
+            keep_commits,
+            keep_age,
+            off,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let r = if off {
+                Retention::default()
+            } else {
+                Retention {
+                    keep_commits,
+                    keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                }
+            };
+            print_history(&store.set_retention(r)?, "text")?;
+        }
+    }
+    Ok(())
+}
+
+fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<()> {
+    if format == "json" {
+        let j = serde_json::json!({
+            "head": h.head,
+            "reconstructable": h.reconstructable.iter().map(|(a, b)| serde_json::json!({"from": a, "to": b})).collect::<Vec<_>>(),
+            "bytes": h.bytes,
+            "generations": h.generations.iter().map(|g| serde_json::json!({
+                "name": g.name, "baseSeq": g.base_seq, "endSeq": g.end_seq, "bytes": g.bytes,
+                "current": g.current, "heldBy": g.held_by.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "retention": h.retention,
+            "snapshots": h.snapshots,
+        });
+        println!("{}", serde_json::to_string_pretty(&j)?);
+        return Ok(());
+    }
+    let ranges: Vec<String> = h
+        .reconstructable
+        .iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}..{b}")
+            }
+        })
+        .collect();
+    println!("head {}   readable commits: {}", h.head, ranges.join(", "));
+    for g in &h.generations {
+        let held: Vec<String> = g.held_by.iter().map(|x| x.to_string()).collect();
+        println!(
+            "  {}  commits {}..{}  {}  {}",
+            g.name,
+            g.base_seq,
+            g.end_seq,
+            if g.current {
+                "current".to_string()
+            } else {
+                format!("{} MiB", g.bytes >> 20)
+            },
+            held.join(", ")
+        );
+    }
+    let r = &h.retention;
+    println!(
+        "retention: {}",
+        match (r.keep_commits, r.keep_age_ms) {
+            (None, None) => "off".to_string(),
+            (c, a) => format!(
+                "{}{}",
+                c.map(|c| format!("last {c} commits ")).unwrap_or_default(),
+                a.map(|a| format!("last {}s", a / 1000)).unwrap_or_default()
+            ),
+        }
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -174,6 +397,9 @@ enum Cmd {
         time: bool,
         #[arg(long)]
         timeout: Option<f64>,
+        /// Query a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME (needs --loc)
+        #[arg(long)]
+        at: Option<String>,
         /// Budget for the estimated memory of intermediate results, in MiB (0: unlimited)
         #[arg(long, default_value_t = 0)]
         memory_mb: u64,
@@ -192,6 +418,14 @@ enum Cmd {
     Dump {
         #[arg(long)]
         loc: PathBuf,
+        /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Named snapshots (pins that keep a commit readable) and history retention
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
     },
     /// Merge updates into a freshly built index generation
     Compact {
@@ -344,6 +578,9 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
         union_default_graph: cli.union_default_graph,
+        history_cache_bytes: cli.history_cache_mb << 20,
+        history_max_generations: cli.history_max_generations,
+        max_snapshots: cli.max_snapshots,
         ..Default::default()
     }
 }
@@ -682,6 +919,7 @@ fn main() -> Result<()> {
             explain,
             time,
             timeout,
+            at,
             memory_mb,
             text,
         } => {
@@ -698,13 +936,22 @@ fn main() -> Result<()> {
                 prefixes: store.prefixes().into_iter().collect(),
                 ..Default::default()
             };
+            let snap = match at {
+                Some(a) => {
+                    let a: sparkles::history::At = a.parse()?;
+                    let (snap, r) = store.snapshot_at(&a, &Default::default())?;
+                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
+                    snap
+                }
+                None => store.snapshot(),
+            };
             if explain {
-                let (sse, plan) = sparkles::sparql::explain(store.snapshot(), &q, &qopts)?;
+                let (sse, plan) = sparkles::sparql::explain(snap, &q, &qopts)?;
                 println!("{sse}\n");
                 print_plan(&plan, 0);
                 return Ok(());
             }
-            let r = sparkles::sparql::query(store.snapshot(), &q, &qopts)?;
+            let r = sparkles::sparql::query(snap, &q, &qopts)?;
             let out = std::io::stdout();
             let mut out = out.lock();
             match r.kind {
@@ -787,12 +1034,23 @@ fn main() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump { loc } => {
+        Cmd::Dump { loc, at } => {
             let store = Store::open(&loc, opts)?;
             let out = std::io::BufWriter::new(std::io::stdout().lock());
-            store.dump_nquads(out)?;
+            match at {
+                Some(a) => {
+                    let a: sparkles::history::At = a.parse()?;
+                    let r = store.resolve(&a)?;
+                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
+                    store.dump_nquads_at(&a, out)?;
+                }
+                None => {
+                    store.dump_nquads(out)?;
+                }
+            }
             Ok(())
         }
+        Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
