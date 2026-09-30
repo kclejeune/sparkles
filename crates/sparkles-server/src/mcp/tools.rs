@@ -395,6 +395,7 @@ impl Tools<'_> {
             max_rows: Some(self.server.state.limits.max_rows),
             max_memory_bytes: self.cfg().query_memory_bytes,
             allow_service: self.cfg().allow_service,
+            outbound: self.server.state.outbound.clone(),
             cancel: Some(self.call.cancel.clone()),
             default_graph_extra: if reasoning {
                 vec![INFERRED_GRAPH.to_string()]

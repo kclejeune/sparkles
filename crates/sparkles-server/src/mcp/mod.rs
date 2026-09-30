@@ -59,6 +59,8 @@ pub struct McpArgs {
     /// data anywhere)
     #[arg(long)]
     pub allow_service: bool,
+    #[command(flatten)]
+    pub outbound: crate::outbound::OutboundArgs,
     /// Largest query timeout a call may request, in seconds (calls default to 30)
     #[arg(long, value_name = "SECS", default_value_t = 60.0)]
     pub timeout: f64,
@@ -306,6 +308,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
     // the process never writes: no write tool is offered
     st.read_only = true;
     st.allow_service = args.allow_service;
+    st.outbound = args.outbound.policy()?;
     st.schema_max_entries = args.schema_max_entries;
     let memory = (args.query_memory_mb > 0).then_some(args.query_memory_mb << 20);
     st.limits = crate::state::Limits {

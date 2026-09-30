@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::io::Source;
+use crate::outbound::Failure;
 use crate::store::{Store, WriteTxn};
 use oxrdf::{BlankNode, NamedNode, Term};
 use rustc_hash::FxHashMap;
@@ -130,6 +131,7 @@ impl Request<'_> {
         }
         ctx.allow_service = self.opts.allow_service;
         ctx.forbid_service = self.opts.forbid_service;
+        ctx.outbound = self.opts.outbound.clone();
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }
@@ -478,26 +480,32 @@ fn load(
         s.base = Some(url.to_string());
         s
     } else {
-        let resp = crate::outbound::apply(reqwest::blocking::Client::new()
-            .get(url)
-            .header("Accept", "text/turtle, application/n-triples, application/n-quads, application/trig, application/rdf+xml, application/ld+json;q=0.9"))
-            .send()
-            .map_err(|e| Error::invalid(format!("LOAD {url}: {e}")))?;
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let policy = &opts.outbound;
+        let failed = |f: Failure| match f {
+            Failure::Refused(m) => Error::NotPermitted(format!("LOAD <{url}>: {m}")),
+            Failure::Failed(m) => Error::invalid(format!("LOAD {url}: {m}")),
+        };
+        let resp = policy
+            .send(url, policy.timeout, |client, u| {
+                client.get(u).header(
+                    "Accept",
+                    "text/turtle, application/n-triples, application/n-quads, application/trig, \
+                     application/rdf+xml, application/ld+json;q=0.9",
+                )
+            })
+            .map_err(failed)?;
+        if !resp.status.is_success() {
+            return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
+        }
+        let ct = resp.content_type;
         let format = crate::io::format_for_media_type(&ct)
             .or_else(|| crate::io::format_for_path(std::path::Path::new(url)).map(|f| f.0))
             .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
-        let body = resp
-            .bytes()
-            .map_err(|e| Error::invalid(e.to_string()))?
-            .to_vec();
+        let body = resp.body.bytes().map_err(failed)?;
         let mut s = Source::from_bytes(body, format, graph);
         s.base = Some(url.to_string());
+        // compressed data is held to the same ceiling once decompressed
+        s.max_decompressed = Some(policy.max_response_bytes);
         s
     };
     let (quads, _) = crate::io::parse_to_vec(&src)?;

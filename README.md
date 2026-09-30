@@ -73,7 +73,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Property paths (index-backed BFS for `p*`/`p+`/`p?`, bound-side traversal from join input) | ✅ |
 | Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | ✅ |
 | SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
-| SERVICE (federated query, SILENT) | ✅ |
+| SERVICE (federated query, SILENT), under an outbound network policy: public destinations only by default, allowlists, DNS pinning, checked redirects, timeouts, response ceiling | ✅ |
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit, graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
@@ -445,6 +445,11 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--rate-limit SPEC` | off (`preauth=30/min,burst=60` with `--auth-config`) | limit a request class per client, e.g. `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5`; `preauth=…` limits authentication failures per address before credentials are checked (repeatable; see `docs/API.md`, Rate limiting) |
 | `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP; `--rate-limit` applies on top |
 | `--rate-limit-trusted-proxy CIDR` | | proxy whose `Forwarded` / `X-Forwarded-For` names the client (repeatable); limits by address need a peer address clients cannot choose, so list only proxies that overwrite these headers |
+| `--no-service` | | refuse `SERVICE` for everyone |
+| `--outbound-allow-private` | off | let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)) |
+| `--outbound-allow HOST_OR_CIDR` | | contact only these destinations (repeatable) |
+| `--outbound-timeout S` | `60` | total time of one outbound request, until the end of its response |
+| `--outbound-max-mb N` | `256` | largest outbound response, decompressed |
 
 Over-budget requests fail with `507` and a JSON body naming the budget; the query stops as
 soon as its client disconnects. `sparkles query --memory-mb N` applies the memory budget
@@ -471,6 +476,47 @@ sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (e
 ```
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
+
+### Outbound requests (SERVICE and LOAD)
+
+`SERVICE <url>` and `LOAD <http…>` make the server open connections, so they follow a
+network policy (with authentication on, they also need the `federate` permission):
+
+* only `http` and `https` URLs;
+* the host is resolved once and the connection goes to exactly the addresses that were
+  checked, so DNS rebinding cannot swap in another address; if any address a name
+  resolves to is refused, the name is refused;
+* by default only public addresses are contacted. Refused: loopback (`127.0.0.0/8`,
+  `::1`), private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64.0.0/10`),
+  link-local (`169.254.0.0/16` with the `169.254.169.254` metadata service, `fe80::/10`),
+  unique-local (`fc00::/7`), multicast, broadcast, unspecified, documentation,
+  benchmarking and reserved ranges, and the IPv4-mapped, IPv4-compatible, NAT64 and 6to4
+  IPv6 forms of those;
+* every redirect hop is checked the same way (at most 5 hops);
+* a 10 s connect timeout, a total timeout (`--outbound-timeout`, default 60 s, and never
+  past the query's own timeout), and a response ceiling counted as the body streams in and,
+  for a compressed `LOAD`, after decompression (`--outbound-max-mb`, default 256).
+
+A refused destination fails with `403` before any connection is made, and `SILENT` does
+not hide it (it hides failures of the remote side, such as timeouts). Proxy environment
+variables (`HTTP_PROXY`, …) are ignored for these requests.
+
+`--outbound-allow-private` opens loopback, private, shared and unique-local addresses, for
+example a local Fuseki during development:
+
+```sh
+sparkles serve --data ./data --outbound-allow-private
+# SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }
+```
+
+Link-local addresses, the metadata service among them, stay refused. In production,
+prefer an allowlist: with `--outbound-allow` (repeatable) only the listed destinations are
+contacted. An entry is a host name (`--outbound-allow localhost`), which may resolve to
+any address; `*.example.org`, the subdomains of a name, on public addresses only; or an
+address or CIDR network (`--outbound-allow 10.20.0.0/16`), any address in it. `sparkles
+mcp` takes the same flags. Library users set `QueryOptions::outbound`
+(`sparkles::outbound::OutboundPolicy`, same defaults); the default refusal of non-public
+addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
 
 ### Checking a database
 
@@ -659,7 +705,8 @@ minutes).
 Every call runs under the query timeout (30 s by default, `--timeout` is the maximum),
 a memory budget (`--query-memory-mb`, default 2048) and the intermediate-row cap, at
 most `--max-concurrent` (4) at a time. SERVICE is off unless `--allow-service`: a
-prompt-injected model could otherwise send data to any URL. `--disable-tool NAME`
+prompt-injected model could otherwise send data to any URL; allowed, it follows the
+[outbound policy](#outbound-requests-service-and-load). `--disable-tool NAME`
 removes a tool. A database held by a running `sparkles serve` is refused (the lock);
 only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 

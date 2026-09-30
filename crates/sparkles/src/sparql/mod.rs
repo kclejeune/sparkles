@@ -52,6 +52,10 @@ pub struct QueryOptions {
     pub forbid_remote_load: bool,
     /// Refuse `LOAD <file:…>` with [`Error::NotPermitted`].
     pub forbid_file_load: bool,
+    /// Where SERVICE and `LOAD <http…>` may connect, with their timeouts and response
+    /// ceiling (the default refuses loopback, private and link-local destinations); a
+    /// refused destination fails with [`Error::NotPermitted`].
+    pub outbound: crate::outbound::OutboundPolicy,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Graphs merged into the store's default graph when the query does not specify a
     /// dataset (used for the materialized-inference overlay).
@@ -209,6 +213,7 @@ fn make_ctx(
     }
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;
+    ctx.outbound = opts.outbound.clone();
     ctx.use_cache = !opts.no_cache;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
