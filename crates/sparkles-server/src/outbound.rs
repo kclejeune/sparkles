@@ -1,4 +1,9 @@
 //! `--outbound-*` flags: where SERVICE and `LOAD <http…>` may connect.
+//!
+//! `serve` and `mcp` refuse loopback and private destinations unless
+//! `--outbound-allow-private`; the local `query` and `update`, run by the operator on
+//! their own machine, allow them unless `--outbound-block-private`. Link-local
+//! addresses (the cloud metadata service) need `--outbound-allow` either way.
 
 use anyhow::{Result, bail};
 use sparkles::outbound::{Allow, OutboundPolicy};
@@ -7,10 +12,14 @@ use std::time::Duration;
 #[derive(clap::Args, Clone, Debug)]
 pub struct OutboundArgs {
     /// Let SERVICE and LOAD reach loopback, private (RFC 1918), shared (100.64.0.0/10)
-    /// and unique-local (fc00::/7) addresses; link-local ones (169.254.169.254) need
-    /// --outbound-allow
-    #[arg(long)]
+    /// and unique-local (fc00::/7) addresses (the default of the local query and
+    /// update); link-local ones (169.254.169.254) need --outbound-allow
+    #[arg(long, conflicts_with = "outbound_block_private")]
     pub outbound_allow_private: bool,
+    /// Refuse loopback, private, shared and unique-local destinations (the default of
+    /// serve and mcp)
+    #[arg(long)]
+    pub outbound_block_private: bool,
     /// Contact only these destinations (repeatable): a host name (any address),
     /// *.domain (public addresses), or an address or CIDR network (any address)
     #[arg(long, value_name = "HOST_OR_CIDR")]
@@ -24,7 +33,19 @@ pub struct OutboundArgs {
 }
 
 impl OutboundArgs {
+    /// The policy of a server (`serve`, `mcp`): private destinations are refused
+    /// unless `--outbound-allow-private`.
     pub fn policy(&self) -> Result<OutboundPolicy> {
+        self.policy_with(!sparkles::outbound::BLOCK_PRIVATE_BY_DEFAULT)
+    }
+
+    /// The policy of the local `query` and `update`: private destinations are allowed
+    /// unless `--outbound-block-private`.
+    pub fn local_policy(&self) -> Result<OutboundPolicy> {
+        self.policy_with(true)
+    }
+
+    fn policy_with(&self, allow_private: bool) -> Result<OutboundPolicy> {
         if !(self.outbound_timeout.is_finite() && self.outbound_timeout > 0.0) {
             bail!("--outbound-timeout must be a positive number of seconds");
         }
@@ -41,7 +62,8 @@ impl OutboundArgs {
             .collect::<Result<Vec<_>>>()?;
         let timeout = Duration::from_secs_f64(self.outbound_timeout);
         Ok(OutboundPolicy {
-            allow_private: self.outbound_allow_private,
+            allow_private: (allow_private || self.outbound_allow_private)
+                && !self.outbound_block_private,
             allow,
             timeout,
             connect_timeout: timeout.min(sparkles::outbound::DEFAULT_CONNECT_TIMEOUT),
@@ -96,8 +118,47 @@ mod tests {
         assert_eq!(p.max_response_bytes, 16 << 20);
         assert!(p.check_url("http://10.1.2.3:3030/ds/sparql").is_ok());
         assert!(policy(&["--outbound-allow", "http://x/"]).is_err());
+        assert!(!policy(&["--outbound-block-private"]).unwrap().allow_private);
+        assert!(policy(&["--outbound-allow-private", "--outbound-block-private"]).is_err());
         assert!(policy(&["--outbound-timeout", "0"]).is_err());
         assert!(policy(&["--outbound-max-mb", "0"]).is_err());
+    }
+
+    fn local_policy(args: &[&str]) -> Result<OutboundPolicy> {
+        let cli = Cli::try_parse_from(std::iter::once("sparkles").chain(args.iter().copied()))?;
+        cli.outbound.local_policy()
+    }
+
+    #[test]
+    fn local_commands_allow_private_destinations() {
+        let p = local_policy(&[]).unwrap();
+        assert!(p.allow_private);
+        for url in [
+            "http://127.0.0.1:3030/ds/sparql",
+            "http://10.1.2.3/",
+            "http://100.64.0.1/",
+            "http://[fd00::1]/",
+        ] {
+            assert!(p.check_url(url).is_ok(), "{url}");
+        }
+        // link-local addresses (the cloud metadata service) stay refused
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+        ] {
+            assert!(p.check_url(url).is_err(), "{url}");
+        }
+        assert!(
+            local_policy(&["--outbound-allow-private"])
+                .unwrap()
+                .allow_private
+        );
+        let strict = local_policy(&["--outbound-block-private"]).unwrap();
+        assert!(!strict.allow_private);
+        assert!(strict.check_url("http://127.0.0.1/").is_err());
+        // an allowlist entry still opens a destination
+        let p = local_policy(&["--outbound-allow", "169.254.169.254"]).unwrap();
+        assert!(p.check_url("http://169.254.169.254/").is_ok());
     }
 
     /// The server's queries and updates go through its policy: loopback is refused by

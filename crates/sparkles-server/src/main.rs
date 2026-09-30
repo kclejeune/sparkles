@@ -582,6 +582,9 @@ enum Cmd {
         /// Allow plain http to a --server other than localhost
         #[arg(long)]
         insecure_http: bool,
+        // where SERVICE may connect in a local run (a --server applies its own policy)
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Run a SPARQL update against a database
     Update {
@@ -599,6 +602,9 @@ enum Cmd {
         /// Allow plain http to a --server other than localhost
         #[arg(long)]
         insecure_http: bool,
+        // where SERVICE and LOAD may connect in a local run (a --server applies its own)
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Write the database as N-Quads, to stdout or a file
     Dump {
@@ -1459,6 +1465,7 @@ fn run() -> Result<()> {
             server,
             dataset,
             insecure_http,
+            outbound,
         } => {
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
@@ -1480,11 +1487,13 @@ fn run() -> Result<()> {
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             }
+            let outbound = outbound.local_policy()?;
             let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
                 max_memory_bytes: (memory_mb > 0).then_some(memory_mb << 20),
                 allow_service: true,
+                outbound,
                 prefixes: store.prefixes().into_iter().collect(),
                 ..Default::default()
             };
@@ -1545,6 +1554,7 @@ fn run() -> Result<()> {
             server,
             dataset,
             insecure_http,
+            outbound,
         } => {
             let u = match (update, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
@@ -1558,10 +1568,12 @@ fn run() -> Result<()> {
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             };
+            let outbound = outbound.local_policy()?;
             let store = open_for_write(&loc, opts, no_validate)?;
             let qopts = QueryOptions {
                 prefixes: store.prefixes().into_iter().collect(),
                 allow_service: true,
+                outbound,
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;

@@ -73,7 +73,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Property paths (index-backed BFS for `p*`/`p+`/`p?`, bound-side traversal from join input) | ✅ |
 | Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | ✅ |
 | SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
-| SERVICE (federated query, SILENT), under an outbound network policy: public destinations only by default, allowlists, DNS pinning, checked redirects, timeouts, response ceiling | ✅ |
+| SERVICE (federated query, SILENT), under an outbound network policy: public destinations only by default on a server (the local `query` and `update` also reach private ones), allowlists, DNS pinning, checked redirects, timeouts, response ceiling | ✅ |
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit, graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
@@ -466,6 +466,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--rate-limit-trusted-proxy CIDR` | | proxy whose `Forwarded` / `X-Forwarded-For` names the client (repeatable); limits by address need a peer address clients cannot choose, so list only proxies that overwrite these headers |
 | `--no-service` | | refuse `SERVICE` for everyone |
 | `--outbound-allow-private` | off | let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)) |
+| `--outbound-block-private` | | refuse those addresses: already the default of `serve` and `mcp`, an opt-in for the local `query` and `update` (which allow them by default) |
 | `--outbound-allow HOST_OR_CIDR` | | contact only these destinations (repeatable) |
 | `--outbound-timeout S` | `60` | total time of one outbound request, until the end of its response |
 | `--outbound-max-mb N` | `256` | largest outbound response, decompressed |
@@ -480,7 +481,7 @@ Command line tools (Jena `tdb2.*` / `arq` equivalents):
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
-sparkles update  --loc db 'INSERT DATA {...}'
+sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
@@ -499,7 +500,9 @@ sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (e
 ### Outbound requests (SERVICE and LOAD)
 
 `SERVICE <url>` and `LOAD <http…>` make the server open connections, so they follow a
-network policy (with authentication on, they also need the `federate` permission):
+network policy (with authentication on, they also need the `federate` permission). The
+local `sparkles query` and `sparkles update` follow it too, with a different default
+(below):
 
 * only `http` and `https` URLs;
 * the host is resolved once and the connection goes to exactly the addresses that were
@@ -536,6 +539,22 @@ address or CIDR network (`--outbound-allow 10.20.0.0/16`), any address in it. `s
 mcp` takes the same flags. Library users set `QueryOptions::outbound`
 (`sparkles::outbound::OutboundPolicy`, same defaults); the default refusal of non-public
 addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
+
+**Local commands.** `sparkles query` and `sparkles update` without `--server` run on the
+operator's own machine, so they allow loopback, private, shared and unique-local
+destinations by default, as `--outbound-allow-private` does for a server: a SERVICE call
+to a local Fuseki or a `LOAD` from an intranet host needs no flag. Link-local addresses (the
+metadata service) stay refused. They take the same `--outbound-*` flags;
+`--outbound-block-private` restores the strict default of `serve` and `mcp`, e.g. for a
+query from an untrusted source:
+
+```sh
+sparkles query --data local.ttl 'SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }'
+sparkles query --data local.ttl --outbound-block-private --query untrusted.rq
+```
+
+With `--server`, the request runs on that server under its own policy, and these flags
+do not apply.
 
 ### Checking a database
 
