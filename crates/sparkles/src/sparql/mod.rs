@@ -45,6 +45,10 @@ pub struct QueryOptions {
     pub default_graph_extra: Vec<String>,
     /// Bypass the result cache (read and write).
     pub no_cache: bool,
+    /// Pre-bound variables (Jena `QueryExec.substitution`): every occurrence of the
+    /// variable is replaced by the term; projected variables report the bound value.
+    /// Blank nodes produced by this store (`_:b…` labels) resolve to their stored node.
+    pub initial_bindings: Vec<(String, Term)>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
 }
@@ -315,6 +319,13 @@ pub fn execute_query(
     let (pattern, dataset, base) = split(parsed);
     let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
     let mut planner = Planner::new(&ctx);
+    let mut bound: Vec<(table::VarId, Id)> = Vec::new();
+    for (name, term) in &opts.initial_bindings {
+        let v = ctx.var(name.trim_start_matches(['?', '$']));
+        let id = ctx.intern_term(term);
+        planner.subst.insert(v, id);
+        bound.push((v, id));
+    }
     let (kind, pattern) = match parsed {
         Query::Select { .. } => (QueryKind::Select, pattern.clone()),
         Query::Ask { .. } => (
@@ -357,6 +368,12 @@ pub fn execute_query(
             };
             result.vars = vars.iter().map(|v| ctx.var_name(*v)).collect();
             result.table = table.project(&vars);
+            // substituted variables report their bound value
+            for (v, id) in &bound {
+                if let Some(c) = result.table.col_of(*v) {
+                    result.table.cols[c].iter_mut().for_each(|x| *x = *id);
+                }
+            }
         }
         Query::Ask { .. } => result.boolean = !table.is_empty(),
         Query::Construct { template, .. } => {

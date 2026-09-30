@@ -141,6 +141,32 @@ fn has_cached(p: &PlanInfo) -> bool {
 }
 
 #[test]
+fn initial_bindings() {
+    let s = store();
+    let opts = QueryOptions {
+        initial_bindings: vec![(
+            "p".into(),
+            Term::NamedNode(oxrdf::NamedNode::new_unchecked("http://ex.org/bob")),
+        )],
+        ..Default::default()
+    };
+    let r = query(
+        s.snapshot(),
+        "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?p ?n WHERE { ?p foaf:name ?n }",
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(strs(&r), ["bob Bob"]);
+    let r = query(
+        s.snapshot(),
+        "ASK { ?p <http://xmlns.com/foaf/0.1/knows> <http://ex.org/alice> }",
+        &opts,
+    )
+    .unwrap();
+    assert!(!r.boolean);
+}
+
+#[test]
 fn bgp_join() {
     let s = store();
     let r = q(
