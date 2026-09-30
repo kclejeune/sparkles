@@ -4,7 +4,6 @@
 use super::adapter::Adapter;
 use super::*;
 use crate::state::{AppState, DbType};
-use rmcp::ServiceExt;
 use serde_json::json;
 use sparkles::io::{RdfFormat, Source};
 use tokio::io::{
@@ -78,11 +77,7 @@ impl Client {
         let (client, srv) = tokio::io::duplex(1 << 22);
         let (sr, sw) = tokio::io::split(srv);
         let adapter = Adapter::new(server);
-        tokio::spawn(async move {
-            if let Ok(running) = adapter.serve((sr, sw)).await {
-                let _ = running.waiting().await;
-            }
-        });
+        tokio::spawn(super::adapter::serve(adapter, sr, sw));
         let (r, w) = tokio::io::split(client);
         Client {
             w,
@@ -1323,4 +1318,38 @@ ex:note ex:emb "[0,1]"^^spk:vector .
         .unwrap();
     assert_eq!(emb["vector"], true);
     assert_eq!(emb["objects"], json!(["spk:vector 3"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stray_first_messages() {
+    let mut c = Client::start(fixture_server());
+    // a notification before any request, and a modern request without its _meta: the
+    // session restarts, and nothing sent after them is lost
+    c.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
+    c.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}))
+        .await;
+    c.send(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "server/discover", "params": {"_meta": m()}}),
+    )
+    .await;
+    let r = c.recv().await;
+    assert_eq!(r["id"], 1);
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let r = c.recv().await;
+    assert_eq!(r["id"], 2);
+    assert_eq!(r["result"]["supportedVersions"][0], "2026-07-28");
+    // tools/call with arguments that are not an object
+    let r = c
+        .request(
+            3,
+            "tools/call",
+            json!({"_meta": m(), "name": "list_datasets", "arguments": 5}),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    // unparsable input is ignored
+    c.w.write_all(b"this is not json\n").await.unwrap();
+    let r = c.request(4, "tools/list", json!({"_meta": m()})).await;
+    assert!(r["result"]["tools"].is_array());
 }
