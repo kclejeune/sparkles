@@ -35,6 +35,7 @@ impl PropertyPath {
         match node {
             Term::NamedNode(n) => return Ok(PropertyPath::Predicate(n.clone())),
             Term::Literal(_) => bail!("a literal is not a property path: {node}"),
+            Term::Triple(_) => bail!("a triple term is not a property path: {node}"),
             Term::BlankNode(_) => {}
         }
         if g.has(node, rdf::FIRST) {

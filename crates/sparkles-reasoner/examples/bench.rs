@@ -22,7 +22,11 @@ fn main() {
         let store = Store::in_memory(StoreOptions::default());
         let t = Instant::now();
         store
-            .load(&[Source::from_bytes(data.clone().into_bytes(), RdfFormat::NTriples, None)])
+            .load(&[Source::from_bytes(
+                data.clone().into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
             .unwrap();
         let loaded = store.snapshot().len();
         let load_ms = t.elapsed().as_millis();
@@ -41,7 +45,11 @@ fn main() {
         );
         let t = Instant::now();
         let r2 = materialize(&store, &profile, &ReasonOptions::default()).unwrap();
-        println!("{:<12} re-materialize (no changes): {} ms", "", t.elapsed().as_millis());
+        println!(
+            "{:<12} re-materialize (no changes): {} ms",
+            "",
+            t.elapsed().as_millis()
+        );
         assert_eq!(r.inferred, r2.inferred);
     }
 }
@@ -82,17 +90,29 @@ fn generate(n: usize) -> String {
             t(&format!("{EX}p{p}"), SUBPROP, &format!("<{EX}p{}>", p % 10));
         }
         if p % 3 == 0 {
-            t(&format!("{EX}p{p}"), DOMAIN, &format!("<{EX}C{}>", classes[p % classes.len()]));
+            t(
+                &format!("{EX}p{p}"),
+                DOMAIN,
+                &format!("<{EX}C{}>", classes[p % classes.len()]),
+            );
         }
         if p % 4 == 0 {
-            t(&format!("{EX}p{p}"), RANGE, &format!("<{EX}C{}>", classes[(p * 7) % classes.len()]));
+            t(
+                &format!("{EX}p{p}"),
+                RANGE,
+                &format!("<{EX}C{}>", classes[(p * 7) % classes.len()]),
+            );
         }
     }
     // instances: each has a leaf type, 3 object properties and 1 literal
     let inst = n / 5;
     for i in 0..inst {
         let s = format!("{EX}i{i}");
-        t(&s, RDF_TYPE, &format!("<{EX}C{}>", leaves[i % leaves.len()]));
+        t(
+            &s,
+            RDF_TYPE,
+            &format!("<{EX}C{}>", leaves[i % leaves.len()]),
+        );
         for k in 0..3 {
             let p = (i * 7 + k * 13) % 40;
             let o = (i * 31 + k * 17 + 1) % inst;

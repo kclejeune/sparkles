@@ -17,7 +17,9 @@ mod graph;
 pub mod parser;
 mod terms;
 
-pub use parser::{BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules};
+pub use parser::{
+    BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
+};
 
 use anyhow::Context as _;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
@@ -93,7 +95,9 @@ impl FromStr for Profile {
         match s.trim().to_ascii_lowercase().as_str() {
             "rdfs" | "rdfs-full" => Ok(Profile::Rdfs),
             "rdfs-simple" | "rdfssimple" | "simple" => Ok(Profile::RdfsSimple),
-            "owl-rl" | "owlrl" | "owl" | "owl-mini" | "owlmini" | "owl-micro" | "owlmicro" => Ok(Profile::OwlRl),
+            "owl-rl" | "owlrl" | "owl" | "owl-mini" | "owlmini" | "owl-micro" | "owlmicro" => {
+                Ok(Profile::OwlRl)
+            }
             _ => Err(UnknownProfile(s.to_string())),
         }
     }
@@ -117,7 +121,12 @@ pub struct ReasonOptions {
 
 impl Default for ReasonOptions {
     fn default() -> Self {
-        ReasonOptions { max_iterations: 10_000, max_inferred: 50_000_000, cancel: None, progress: None }
+        ReasonOptions {
+            max_iterations: 10_000,
+            max_inferred: 50_000_000,
+            cancel: None,
+            progress: None,
+        }
     }
 }
 
@@ -179,8 +188,14 @@ fn load_default_graph(snap: &Snapshot) -> anyhow::Result<graph::Graph> {
     Ok(g)
 }
 
-fn derive(snap: Arc<Snapshot>, profile: &Profile, opts: &ReasonOptions) -> anyhow::Result<Derivation> {
-    let rules = profile.rules().with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
+fn derive(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    opts: &ReasonOptions,
+) -> anyhow::Result<Derivation> {
+    let rules = profile
+        .rules()
+        .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
     progress(opts, 0.0, "loading default graph");
     let mut g = load_default_graph(&snap)?;
     let terms = Terms::new(snap);
@@ -223,7 +238,11 @@ impl Derivation {
 ///
 /// The store's writer lock is held for the whole run, so the entailments are exactly
 /// those of the committed default graph at the start.
-pub fn materialize(store: &Store, profile: &Profile, opts: &ReasonOptions) -> anyhow::Result<ReasonReport> {
+pub fn materialize(
+    store: &Store,
+    profile: &Profile,
+    opts: &ReasonOptions,
+) -> anyhow::Result<ReasonReport> {
     let t0 = Instant::now();
     let mut txn = store.write();
     let snap = txn.base().clone();
@@ -234,7 +253,11 @@ pub fn materialize(store: &Store, profile: &Profile, opts: &ReasonOptions) -> an
     // existing inferred graph
     let old_graph = snap.lookup_iri(INFERRED_GRAPH);
     let old: Vec<[Id; 4]> = match old_graph {
-        Some(g) => snap.scan_keys(Perm::Gspo, &[g.0])?.iter().map(|k| Perm::Gspo.to_quad(k)).collect(),
+        Some(g) => snap
+            .scan_keys(Perm::Gspo, &[g.0])?
+            .iter()
+            .map(|k| Perm::Gspo.to_quad(k))
+            .collect(),
         None => Vec::new(),
     };
 
@@ -294,7 +317,11 @@ pub fn materialize(store: &Store, profile: &Profile, opts: &ReasonOptions) -> an
             .filter(|t| !old_set.contains(*t))
             .map(|t| [t[0], t[1], t[2], g])
             .collect();
-        if opts.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        if opts
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
             anyhow::bail!("reasoning cancelled");
         }
         // large batches are merged into a rebuilt index generation on commit
@@ -342,7 +369,11 @@ pub fn clear(store: &Store) -> anyhow::Result<u64> {
 /// Run the rules over a snapshot's default graph and return the derived triples that
 /// are valid RDF, without writing anything (dry run / testing). Blank nodes created by
 /// `makeTemp` / `makeSkolem` get labels `r<hex>`.
-pub fn infer(snap: Arc<Snapshot>, profile: &Profile, opts: &ReasonOptions) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
+pub fn infer(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    opts: &ReasonOptions,
+) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
     let d = derive(snap, profile, opts)?;
     let mut out = Vec::new();
@@ -350,14 +381,15 @@ pub fn infer(snap: Arc<Snapshot>, profile: &Profile, opts: &ReasonOptions) -> an
         if !d.valid(t) {
             continue;
         }
-        let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (d.terms.term(t[0]), d.terms.term(t[1]), d.terms.term(t[2]))
+        let (Some(s), Some(Term::NamedNode(p)), Some(o)) =
+            (d.terms.term(t[0]), d.terms.term(t[1]), d.terms.term(t[2]))
         else {
             continue;
         };
         let s = match s {
             Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
             Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
-            Term::Literal(_) => continue,
+            Term::Literal(_) | Term::Triple(_) => continue,
         };
         out.push(Triple::new(s, p, o));
     }

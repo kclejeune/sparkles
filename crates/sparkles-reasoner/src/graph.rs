@@ -58,7 +58,11 @@ impl<'a> Cands<'a> {
 
 #[inline]
 fn restrict(list: &[u32], lo: u32, hi: u32) -> &[u32] {
-    let a = if lo == 0 { 0 } else { list.partition_point(|&x| x < lo) };
+    let a = if lo == 0 {
+        0
+    } else {
+        list.partition_point(|&x| x < lo)
+    };
     let b = list.partition_point(|&x| x < hi);
     &list[a..b.max(a)]
 }
@@ -100,7 +104,16 @@ impl Graph {
         }
         let base = start as u32;
         let rows = || new.iter().enumerate().map(|(k, t)| (base + k as u32, t));
-        let Graph { by_p, by_ps, by_po, distinct_s, distinct_o, by_s, by_o, .. } = self;
+        let Graph {
+            by_p,
+            by_ps,
+            by_po,
+            distinct_s,
+            distinct_o,
+            by_s,
+            by_o,
+            ..
+        } = self;
         rayon::scope(|sc| {
             sc.spawn(|_| {
                 for (i, t) in rows() {
@@ -170,7 +183,14 @@ impl Graph {
 
     /// Candidates for a pattern with the given bound positions, restricted to rows
     /// `[lo, hi)`. The result may be a superset (callers re-check every component).
-    pub fn cands(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>, lo: u32, hi: u32) -> Cands<'_> {
+    pub fn cands(
+        &self,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        lo: u32,
+        hi: u32,
+    ) -> Cands<'_> {
         if lo >= hi {
             return Cands::EMPTY;
         }
@@ -217,11 +237,17 @@ impl Graph {
     }
 
     pub fn distinct_subjects(&self) -> usize {
-        self.by_s.as_ref().map_or(self.triples.len() / 4, |m| m.len()).max(1)
+        self.by_s
+            .as_ref()
+            .map_or(self.triples.len() / 4, |m| m.len())
+            .max(1)
     }
 
     pub fn distinct_objects(&self) -> usize {
-        self.by_o.as_ref().map_or(self.triples.len() / 4, |m| m.len()).max(1)
+        self.by_o
+            .as_ref()
+            .map_or(self.triples.len() / 4, |m| m.len())
+            .max(1)
     }
 
     /// The objects of `(s p ?)` among rows `< hi`.
@@ -280,7 +306,14 @@ mod tests {
     fn lists() {
         let (first, rest, nil) = (100, 101, 102);
         let mut g = Graph::default();
-        g.add_batch([[1, first, 7], [1, rest, 2], [2, first, 8], [2, rest, nil], [5, first, 9], [5, rest, 5]]);
+        g.add_batch([
+            [1, first, 7],
+            [1, rest, 2],
+            [2, first, 8],
+            [2, rest, nil],
+            [5, first, 9],
+            [5, rest, 5],
+        ]);
         assert_eq!(g.list(1, first, rest, nil, g.len()), Some(vec![7, 8]));
         assert_eq!(g.list(nil, first, rest, nil, g.len()), Some(vec![]));
         assert_eq!(g.list(5, first, rest, nil, g.len()), None, "cycle");

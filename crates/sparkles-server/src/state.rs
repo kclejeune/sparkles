@@ -85,12 +85,18 @@ pub fn valid_name(name: &str) -> bool {
         && name.len() <= 64
         && name != "ui"
         && name != "$"
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && !name.starts_with('.')
 }
 
 impl AppState {
-    pub fn new(data_dir: &Path, store_opts: StoreOptions, default_timeout: std::time::Duration) -> Result<AppState> {
+    pub fn new(
+        data_dir: &Path,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+    ) -> Result<AppState> {
         std::fs::create_dir_all(data_dir.join("databases"))?;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
@@ -122,7 +128,9 @@ impl AppState {
         let store = match kind {
             DbType::Mem => Store::in_memory(self.store_opts.clone()),
             DbType::Persistent => {
-                let dir = loc.map(Path::to_path_buf).unwrap_or_else(|| self.data_dir.join("databases").join(name));
+                let dir = loc
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.data_dir.join("databases").join(name));
                 Store::open(&dir, self.store_opts.clone())
                     .with_context(|| format!("opening database {}", dir.display()))?
             }
@@ -206,8 +214,16 @@ impl AppState {
 
     // ----------------------------------------------------------------- tasks ------
 
-    pub fn start_task(self: &Arc<Self>, kind: &str, dataset: &str, work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static) -> Task {
-        let id = self.task_counter.fetch_add(1, Ordering::Relaxed).to_string();
+    pub fn start_task(
+        self: &Arc<Self>,
+        kind: &str,
+        dataset: &str,
+        work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
+    ) -> Task {
+        let id = self
+            .task_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
         let task = Task {
             id: id.clone(),
             kind: kind.to_string(),
@@ -228,7 +244,10 @@ impl AppState {
         }
         let state = self.clone();
         std::thread::spawn(move || {
-            let handle = TaskHandle { state: state.clone(), id: id.clone() };
+            let handle = TaskHandle {
+                state: state.clone(),
+                id: id.clone(),
+            };
             let r = work(&handle);
             let mut tasks = state.tasks.lock();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {

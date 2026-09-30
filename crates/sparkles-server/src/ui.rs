@@ -18,7 +18,10 @@ fn file(path: &str) -> Option<Response> {
     };
     Some(
         (
-            [(header::CONTENT_TYPE, mime.as_ref().to_string()), (header::CACHE_CONTROL, cache.to_string())],
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, cache.to_string()),
+            ],
             f.data.into_owned(),
         )
             .into_response(),

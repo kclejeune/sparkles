@@ -90,15 +90,19 @@ impl BuiltinKind {
 
     pub fn check_arity(self, n: usize) -> Result<(), String> {
         let ok = match self {
-            Equal | NotEqual | LessThan | GreaterThan | Le | Ge | IsDType | NotDType | ListMember
-            | ListContains | ListNotContains | ListLength | AddOne => n == 2,
+            Equal | NotEqual | LessThan | GreaterThan | Le | Ge | IsDType | NotDType
+            | ListMember | ListContains | ListNotContains | ListLength | AddOne => n == 2,
             Sum | Difference | Product | Quotient | Min | Max | ListEntry | ListForAll => n == 3,
             IsLiteral | NotLiteral | IsBNode | NotBNode | IsFunctor | NotFunctor | Now => n == 1,
             NoValue => n == 2 || n == 3,
             StrConcat | UriConcat | MakeTemp | MakeSkolem => n >= 1,
             Regex => n >= 2,
         };
-        if ok { Ok(()) } else { Err(format!("wrong number of arguments ({n})")) }
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("wrong number of arguments ({n})"))
+        }
     }
 
     pub fn input_positions(self, n: usize) -> Vec<usize> {
@@ -237,7 +241,10 @@ fn is_dtype(t: &Terms, v: u64, dt: u64) -> bool {
     // derived / compatible XSD types: the lexical form must be valid for the target
     // type and the value spaces must be related (integer family ⊂ decimal)
     let src = Value::from_literal(&l);
-    let target = Value::from_literal(&Literal::new_typed_literal(l.value(), NamedNode::new_unchecked(d)));
+    let target = Value::from_literal(&Literal::new_typed_literal(
+        l.value(),
+        NamedNode::new_unchecked(d),
+    ));
     match (&src, &target) {
         (Value::Integer(_), Value::Integer(_)) | (Value::Integer(_), Value::Decimal(_)) => {
             integer_in_range(l.value(), d)
@@ -288,8 +295,14 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         NotEqual => !same_value(t, a(0), a(1)),
         LessThan => compare(t, a(0), a(1)) == Some(Ordering::Less),
         GreaterThan => compare(t, a(0), a(1)) == Some(Ordering::Greater),
-        Le => matches!(compare(t, a(0), a(1)), Some(Ordering::Less | Ordering::Equal)),
-        Ge => matches!(compare(t, a(0), a(1)), Some(Ordering::Greater | Ordering::Equal)),
+        Le => matches!(
+            compare(t, a(0), a(1)),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+        Ge => matches!(
+            compare(t, a(0), a(1)),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
         IsLiteral => t.kind(a(0)) == Kind::Literal,
         NotLiteral => t.kind(a(0)) != Kind::Literal,
         IsBNode => t.kind(a(0)) == Kind::BNode,
@@ -304,21 +317,24 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let c = ev.g.cands(s, p, o, 0, ev.end);
             !(0..c.len()).any(|i| {
                 let tr = ev.g.triples[c.get(i) as usize];
-                s.is_none_or(|x| x == tr[0]) && p.is_none_or(|x| x == tr[1]) && o.is_none_or(|x| x == tr[2])
+                s.is_none_or(|x| x == tr[0])
+                    && p.is_none_or(|x| x == tr[1])
+                    && o.is_none_or(|x| x == tr[2])
             })
         }
         ListContains | ListNotContains => {
-            let found = ev
-                .g
-                .list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end)
-                .is_some_and(|ms| ms.iter().any(|&m| same_value(t, m, a(1))));
+            let found =
+                ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end)
+                    .is_some_and(|ms| ms.iter().any(|&m| same_value(t, m, a(1))));
             found == (bi.kind == ListContains)
         }
         ListForAll => {
             let (s, p) = (a(1), a(2));
-            ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end).is_some_and(|ms| {
-                ms.iter().all(|&m| ev.g.position(&[s, p, m]).is_some_and(|i| i < ev.end))
-            })
+            ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end)
+                .is_some_and(|ms| {
+                    ms.iter()
+                        .all(|&m| ev.g.position(&[s, p, m]).is_some_and(|i| i < ev.end))
+                })
         }
         // ---- binders / generators
         Sum | Difference | Product | Quotient => {
@@ -376,9 +392,17 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
                     None => return,
                 },
             };
-            let Some(caps) = re.captures(&text) else { return };
+            let Some(caps) = re.captures(&text) else {
+                return;
+            };
             let groups: Vec<u64> = (1..bi.args.len() - 1)
-                .map(|g| string_id(t, caps.get(g).map_or(String::new(), |m| m.as_str().to_string())))
+                .map(|g| {
+                    string_id(
+                        t,
+                        caps.get(g)
+                            .map_or(String::new(), |m| m.as_str().to_string()),
+                    )
+                })
                 .collect();
             bind_all(ev, &bi.args[2..], &groups, k, b);
             return;
@@ -399,7 +423,9 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             return;
         }
         ListMember => {
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else { return };
+            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+                return;
+            };
             let mut seen = rustc_hash::FxHashSet::default();
             for m in ms {
                 if seen.insert(m) {
@@ -409,15 +435,21 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             return;
         }
         ListLength => {
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else { return };
+            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+                return;
+            };
             let n = sparkles::id::Id::from_i64(ms.len() as i64).unwrap().0;
             ev.bind_and_continue(bi.args[1], n, k, b);
             return;
         }
         ListEntry => {
-            let Some(Value::Integer(i)) = num(t, a(1)) else { return };
+            let Some(Value::Integer(i)) = num(t, a(1)) else {
+                return;
+            };
             let i: i64 = i.into();
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else { return };
+            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+                return;
+            };
             if let Some(&m) = usize::try_from(i).ok().and_then(|i| ms.get(i)) {
                 ev.bind_and_continue(bi.args[2], m, k, b);
             }

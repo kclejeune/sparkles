@@ -57,7 +57,12 @@ impl Terms {
             rdf_nil: 0,
             now: 0,
         };
-        let rdf = |l: &str| Term::NamedNode(NamedNode::new_unchecked(format!("{}{l}", crate::parser::RDF_NS)));
+        let rdf = |l: &str| {
+            Term::NamedNode(NamedNode::new_unchecked(format!(
+                "{}{l}",
+                crate::parser::RDF_NS
+            )))
+        };
         t.rdf_first = t.id_for(&rdf("first"));
         t.rdf_rest = t.id_for(&rdf("rest"));
         t.rdf_nil = t.id_for(&rdf("nil"));
@@ -123,7 +128,14 @@ impl Terms {
 
     pub fn local(&self, id: u64) -> Option<LocalTerm> {
         let i = Id(id);
-        (i.tag() == Tag::Local).then(|| self.locals.read().unwrap().terms.get(i.payload() as usize).cloned())?
+        (i.tag() == Tag::Local).then(|| {
+            self.locals
+                .read()
+                .unwrap()
+                .terms
+                .get(i.payload() as usize)
+                .cloned()
+        })?
     }
 
     pub fn kind(&self, id: u64) -> Kind {
@@ -162,7 +174,9 @@ impl Terms {
         if i.tag() == Tag::Local {
             return Some(match self.local(id)? {
                 LocalTerm::Key(k) => id::key_to_term(&k),
-                LocalTerm::BNode => Term::BlankNode(BlankNode::new_unchecked(format!("r{:x}", i.payload()))),
+                LocalTerm::BNode => {
+                    Term::BlankNode(BlankNode::new_unchecked(format!("r{:x}", i.payload())))
+                }
             });
         }
         self.snap.term(i)
@@ -178,6 +192,7 @@ impl Terms {
             Term::NamedNode(n) => n.into_string(),
             Term::BlankNode(b) => b.into_string(),
             Term::Literal(l) => l.value().to_string(),
+            Term::Triple(t) => t.to_string(),
         })
     }
 

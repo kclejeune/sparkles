@@ -64,14 +64,22 @@ struct FlatRule {
 /// `B1, B2 -> H` (and the same for nested forward rules).
 fn flatten(r: &Rule, prefix: &[Clause], name: String, out: &mut Vec<FlatRule>) {
     let mut body = prefix.to_vec();
-    body.extend(r.body.iter().filter(|c| !matches!(c, Clause::Rule(_))).cloned());
+    body.extend(
+        r.body
+            .iter()
+            .filter(|c| !matches!(c, Clause::Rule(_)))
+            .cloned(),
+    );
     let mut head = Vec::new();
     let mut nested = 0;
     for c in &r.head {
         match c {
             Clause::Rule(inner) => {
                 nested += 1;
-                let n = inner.name.clone().unwrap_or_else(|| format!("{name}/{nested}"));
+                let n = inner
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{name}/{nested}"));
                 flatten(inner, &body, n, out);
             }
             c => head.push(c.clone()),
@@ -103,7 +111,10 @@ pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>)
             continue;
         }
         if r.body.iter().any(|c| matches!(c, Clause::Rule(_))) {
-            warnings.push(format!("rule '{}': nested rule in a body; skipped", r.label()));
+            warnings.push(format!(
+                "rule '{}': nested rule in a body; skipped",
+                r.label()
+            ));
             continue;
         }
         flatten(r, &[], r.label(), &mut flat);
@@ -119,7 +130,11 @@ pub(crate) fn compile(rules: &[Rule], terms: &Terms, warnings: &mut Vec<String>)
     out
 }
 
-fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Result<Option<CRule>, String> {
+fn compile_one(
+    f: &FlatRule,
+    terms: &Terms,
+    warnings: &mut Vec<String>,
+) -> Result<Option<CRule>, String> {
     let mut vars: FxHashMap<String, usize> = FxHashMap::default();
     let mut var = |v: &str| -> usize {
         let n = vars.len();
@@ -131,7 +146,9 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
             Node::Const(t) => Slot::Const(terms.id_for(t)),
             Node::Any => Slot::Any,
             Node::Functor(name, _) => {
-                return Err(format!("functor term '{name}(…)' is not supported by forward materialization"));
+                return Err(format!(
+                    "functor term '{name}(…)' is not supported by forward materialization"
+                ));
             }
         })
     };
@@ -165,7 +182,8 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
                     }
                     return Err(format!("unknown or unsupported builtin '{}'", b.name));
                 };
-                kind.check_arity(b.args.len()).map_err(|e| format!("{}: {e}", b.name))?;
+                kind.check_arity(b.args.len())
+                    .map_err(|e| format!("{}: {e}", b.name))?;
                 let mut args = Vec::new();
                 for (i, a) in b.args.iter().enumerate() {
                     // noValue: variables not bound at this position act as wildcards
@@ -177,7 +195,10 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
                         continue;
                     }
                     let s = slot(a, &mut var)?;
-                    if s == Slot::Any && kind.input_positions(b.args.len()).contains(&i) && kind != BuiltinKind::NoValue {
+                    if s == Slot::Any
+                        && kind.input_positions(b.args.len()).contains(&i)
+                        && kind != BuiltinKind::NoValue
+                    {
                         return Err(format!("wildcard as input of builtin '{}'", b.name));
                     }
                     args.push(s);
@@ -206,12 +227,19 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
                     }
                 }
                 let regex = match (kind, b.args.get(1)) {
-                    (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => {
-                        Some(anchored_regex(l.value()).ok_or_else(|| format!("invalid regex '{}'", l.value()))?)
-                    }
+                    (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => Some(
+                        anchored_regex(l.value())
+                            .ok_or_else(|| format!("invalid regex '{}'", l.value()))?,
+                    ),
                     _ => None,
                 };
-                builtins.push(CBuiltin { kind, args, inputs, outputs, regex });
+                builtins.push(CBuiltin {
+                    kind,
+                    args,
+                    inputs,
+                    outputs,
+                    regex,
+                });
             }
             Clause::Rule(_) => unreachable!("flattened"),
         }
@@ -230,14 +258,21 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
             }
             Clause::Builtin(b) => match HeadAction::from_name(&b.name) {
                 Some(Ok(action)) => {
-                    let args = b.args.iter().map(|a| slot(a, &mut var)).collect::<Result<Vec<_>, _>>()?;
+                    let args = b
+                        .args
+                        .iter()
+                        .map(|a| slot(a, &mut var))
+                        .collect::<Result<Vec<_>, _>>()?;
                     if args.len() != 3 {
                         return Err(format!("{} expects 3 arguments", b.name));
                     }
                     head.push(CHead::Action(action, args));
                 }
                 Some(Err(())) => {
-                    warnings.push(format!("rule '{}': head builtin '{}' ignored", f.name, b.name));
+                    warnings.push(format!(
+                        "rule '{}': head builtin '{}' ignored",
+                        f.name, b.name
+                    ));
                 }
                 None => {
                     warnings.push(format!(
@@ -253,7 +288,13 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
         return Ok(None);
     }
     let nvars = vars.len();
-    let rule = CRule { name: f.name.clone(), nvars, atoms, builtins, head };
+    let rule = CRule {
+        name: f.name.clone(),
+        nvars,
+        atoms,
+        builtins,
+        head,
+    };
     // every head variable must be bound by the body
     let mut bound_vars = vec![false; nvars];
     for a in &rule.atoms {
@@ -277,7 +318,11 @@ fn compile_one(f: &FlatRule, terms: &Terms, warnings: &mut Vec<String>) -> Resul
             if let Slot::Var(v) = s
                 && !bound_vars[v]
             {
-                let name = vars.iter().find(|(_, i)| **i == v).map(|(n, _)| n.clone()).unwrap_or_default();
+                let name = vars
+                    .iter()
+                    .find(|(_, i)| **i == v)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_default();
                 return Err(format!("head variable ?{name} is not bound by the body"));
             }
         }
@@ -368,13 +413,21 @@ pub(crate) fn plan(rule: &CRule, ranges: &[(u32, u32)], g: Option<&Graph>) -> Op
                 bound[v] = true;
             }
         }
-        steps.push(Step::Atom { atom: i, lo: ranges[i].0, hi: ranges[i].1 });
+        steps.push(Step::Atom {
+            atom: i,
+            lo: ranges[i].0,
+            hi: ranges[i].1,
+        });
     }
     bi_left.is_empty().then_some(steps)
 }
 
 fn estimate(a: &Atom, bound: &[bool], (lo, hi): (u32, u32), g: Option<&Graph>) -> f64 {
-    let (sb, pb, ob) = (slot_bound(a.s, bound), slot_bound(a.p, bound), slot_bound(a.o, bound));
+    let (sb, pb, ob) = (
+        slot_bound(a.s, bound),
+        slot_bound(a.p, bound),
+        slot_bound(a.o, bound),
+    );
     let Some(g) = g else {
         // no statistics: prefer bound positions
         return 3.0 - (sb as u8 + pb as u8 + ob as u8) as f64;
@@ -482,7 +535,8 @@ impl<'a> Eval<'a> {
     fn aborted(&mut self) -> bool {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks & 0x3FF == 0
-            && (self.abort.load(Ordering::Relaxed) || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
+            && (self.abort.load(Ordering::Relaxed)
+                || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)))
         {
             return true;
         }
@@ -501,7 +555,10 @@ impl<'a> Eval<'a> {
                 let a = &self.rule.atoms[atom];
                 let cands = match first {
                     Some(c) => c,
-                    None => self.g.cands(self.opt(a.s, b), self.opt(a.p, b), self.opt(a.o, b), lo, hi),
+                    None => {
+                        self.g
+                            .cands(self.opt(a.s, b), self.opt(a.p, b), self.opt(a.o, b), lo, hi)
+                    }
                 };
                 let (as_, ap, ao) = (a.s, a.p, a.o);
                 for j in 0..cands.len() {
@@ -536,7 +593,10 @@ impl<'a> Eval<'a> {
             }
             s => {
                 let cur = self.val(s, b);
-                if s == Slot::Any || cur == value || crate::builtins::same_value(self.terms, cur, value) {
+                if s == Slot::Any
+                    || cur == value
+                    || crate::builtins::same_value(self.terms, cur, value)
+                {
                     self.run(k + 1, b, None);
                 }
             }
@@ -597,10 +657,20 @@ pub(crate) struct Outcome {
 const CHUNK: usize = 2048;
 
 /// Run the rules to a fixpoint. Derived triples are appended to `g`.
-pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits) -> anyhow::Result<Outcome> {
+pub(crate) fn run(
+    g: &mut Graph,
+    rules: &[CRule],
+    terms: &Terms,
+    limits: &Limits,
+) -> anyhow::Result<Outcome> {
     let base_len = g.len();
     let abort = AtomicBool::new(false);
-    let cancelled = || limits.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+    let cancelled = || {
+        limits
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    };
     let mut iteration = 0usize;
     let (mut ds, mut de) = (0u32, base_len);
     loop {
@@ -616,7 +686,14 @@ pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits
         }
         if let Some(p) = &limits.progress {
             let f = 0.1 + 0.7 * (1.0 - 1.0 / (iteration as f32 + 1.0));
-            p(f, &format!("iteration {} ({} derived)", iteration + 1, g.len() - base_len));
+            p(
+                f,
+                &format!(
+                    "iteration {} ({} derived)",
+                    iteration + 1,
+                    g.len() - base_len
+                ),
+            );
         }
         // ---- plans for this iteration
         let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
@@ -698,7 +775,9 @@ pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits
             }
         }
         let produced = AtomicUsize::new(0);
-        let budget = limits.max_inferred.saturating_sub((gr.len() - base_len) as usize);
+        let budget = limits
+            .max_inferred
+            .saturating_sub((gr.len() - base_len) as usize);
         let max_out = budget.saturating_mul(4).saturating_add(1 << 20);
         let results: Vec<(usize, Vec<Triple>)> = work
             .par_iter()
@@ -730,17 +809,29 @@ pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits
             for (ri, out) in &results {
                 *per.entry(*ri).or_default() += out.len();
             }
-            per.into_iter().max_by_key(|x| x.1).map_or(String::new(), |(ri, n)| {
-                format!(" (rule '{}' produced {n} candidate triples in iteration {})", rules[ri].name, iteration + 1)
-            })
+            per.into_iter()
+                .max_by_key(|x| x.1)
+                .map_or(String::new(), |(ri, n)| {
+                    format!(
+                        " (rule '{}' produced {n} candidate triples in iteration {})",
+                        rules[ri].name,
+                        iteration + 1
+                    )
+                })
         };
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
         }
         if produced.load(Ordering::Relaxed) > max_out {
-            anyhow::bail!("reasoning exceeded the limit of {} inferred triples{}", limits.max_inferred, top_rule());
+            anyhow::bail!(
+                "reasoning exceeded the limit of {} inferred triples{}",
+                limits.max_inferred,
+                top_rule()
+            );
         }
-        let overflow = if (g.len() - base_len) as usize + produced.load(Ordering::Relaxed) > limits.max_inferred {
+        let overflow = if (g.len() - base_len) as usize + produced.load(Ordering::Relaxed)
+            > limits.max_inferred
+        {
             top_rule()
         } else {
             String::new()
@@ -752,7 +843,10 @@ pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits
         let new = g.len() - before;
         tracing::debug!(iteration, new, "reasoner iteration");
         if (g.len() - base_len) as usize > limits.max_inferred {
-            anyhow::bail!("reasoning exceeded the limit of {} inferred triples{overflow}", limits.max_inferred);
+            anyhow::bail!(
+                "reasoning exceeded the limit of {} inferred triples{overflow}",
+                limits.max_inferred
+            );
         }
         if new == 0 {
             break;
@@ -760,5 +854,8 @@ pub(crate) fn run(g: &mut Graph, rules: &[CRule], terms: &Terms, limits: &Limits
         ds = de;
         de = g.len();
     }
-    Ok(Outcome { iterations: iteration, base_len })
+    Ok(Outcome {
+        iterations: iteration,
+        base_len,
+    })
 }

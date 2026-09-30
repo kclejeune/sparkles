@@ -43,6 +43,7 @@ fn short(t: &Term) -> String {
         Term::NamedNode(n) => n.as_str().rsplit(['/', '#']).next().unwrap().to_string(),
         Term::Literal(l) => l.value().to_string(),
         Term::BlankNode(_) => "_".into(),
+        Term::Triple(t) => t.to_string(),
     }
 }
 

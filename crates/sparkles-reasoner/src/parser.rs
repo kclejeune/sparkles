@@ -114,10 +114,17 @@ impl fmt::Display for Node {
             Node::Var(v) => write!(f, "?{v}"),
             Node::Any => f.write_str("_"),
             Node::Const(Term::NamedNode(n)) => {
-                for (p, ns) in [("rdf", RDF_NS), ("rdfs", RDFS_NS), ("owl", OWL_NS), ("xsd", XSD_NS)] {
+                for (p, ns) in [
+                    ("rdf", RDF_NS),
+                    ("rdfs", RDFS_NS),
+                    ("owl", OWL_NS),
+                    ("xsd", XSD_NS),
+                ] {
                     if let Some(local) = n.as_str().strip_prefix(ns)
                         && !local.is_empty()
-                        && local.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        && local
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                     {
                         return write!(f, "{p}:{local}");
                     }
@@ -131,7 +138,11 @@ impl fmt::Display for Node {
                 } else if l.datatype() == xsd::STRING {
                     write!(f, "'{lex}'")
                 } else {
-                    write!(f, "'{lex}'^^{}", Node::Const(Term::NamedNode(l.datatype().into_owned())))
+                    write!(
+                        f,
+                        "'{lex}'^^{}",
+                        Node::Const(Term::NamedNode(l.datatype().into_owned()))
+                    )
                 }
             }
             Node::Const(t) => write!(f, "{t}"),
@@ -165,7 +176,12 @@ impl fmt::Display for Rule {
         if let Some(n) = &self.name {
             write!(f, "{n}: ")?;
         }
-        let join = |cs: &[Clause]| cs.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+        let join = |cs: &[Clause]| {
+            cs.iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         match self.direction {
             Direction::Forward => write!(f, "{} -> {}", join(&self.body), join(&self.head))?,
             Direction::Backward => write!(f, "{} <- {}", join(&self.head), join(&self.body))?,
@@ -224,7 +240,11 @@ struct Token {
 }
 
 fn err(line: usize, column: usize, message: impl Into<String>) -> RuleParseError {
-    RuleParseError { line, column, message: message.into() }
+    RuleParseError {
+        line,
+        column,
+        message: message.into(),
+    }
 }
 
 fn is_word_end(c: char) -> bool {
@@ -256,7 +276,13 @@ fn lex(text: &str) -> Result<Vec<Token>, RuleParseError> {
             continue;
         }
         let (tl, tc) = (line, col);
-        let push = |toks: &mut Vec<Token>, tok: Tok| toks.push(Token { tok, line: tl, col: tc });
+        let push = |toks: &mut Vec<Token>, tok: Tok| {
+            toks.push(Token {
+                tok,
+                line: tl,
+                col: tc,
+            })
+        };
         // comments
         if c == '#' || (c == '/' && chars.get(i + 1) == Some(&'/')) {
             while i < chars.len() && chars[i] != '\n' {
@@ -313,7 +339,13 @@ fn lex(text: &str) -> Result<Vec<Token>, RuleParseError> {
                 let mut lex = String::new();
                 loop {
                     match chars.get(i) {
-                        None => return Err(err(tl, tc, format!("unterminated string literal (missing {q})"))),
+                        None => {
+                            return Err(err(
+                                tl,
+                                tc,
+                                format!("unterminated string literal (missing {q})"),
+                            ));
+                        }
                         Some(&ch) if ch == q => {
                             bump!();
                             break;
@@ -465,7 +497,9 @@ impl Parser {
     fn parse_all(&mut self, out: &mut Vec<Rule>) -> Result<(), RuleParseError> {
         loop {
             self.skip_commas();
-            let Some(t) = self.peek().cloned() else { return Ok(()) };
+            let Some(t) = self.peek().cloned() else {
+                return Ok(());
+            };
             match &t.tok {
                 Tok::Directive(d) => {
                     self.pos += 1;
@@ -473,7 +507,13 @@ impl Parser {
                         "@prefix" => self.parse_prefix(&t)?,
                         "@include" => self.parse_include(&t, out)?,
                         other => {
-                            return Err(err(t.line, t.col, format!("unknown directive '{other}' (expected @prefix or @include)")));
+                            return Err(err(
+                                t.line,
+                                t.col,
+                                format!(
+                                    "unknown directive '{other}' (expected @prefix or @include)"
+                                ),
+                            ));
                         }
                     }
                 }
@@ -492,7 +532,11 @@ impl Parser {
     fn parse_prefix(&mut self, at: &Token) -> Result<(), RuleParseError> {
         let t = self.next()?;
         let Tok::Word(w) = &t.tok else {
-            return Err(err(t.line, t.col, format!("expected a prefix name after @prefix, found {}", t.tok)));
+            return Err(err(
+                t.line,
+                t.col,
+                format!("expected a prefix name after @prefix, found {}", t.tok),
+            ));
         };
         let name = w.strip_suffix(':').unwrap_or(w).to_string();
         if name.contains(':') {
@@ -500,7 +544,11 @@ impl Parser {
         }
         let t = self.next()?;
         let Tok::Iri(iri) = &t.tok else {
-            return Err(err(t.line, t.col, format!("expected <namespace IRI> in @prefix, found {}", t.tok)));
+            return Err(err(
+                t.line,
+                t.col,
+                format!("expected <namespace IRI> in @prefix, found {}", t.tok),
+            ));
         };
         self.prefixes.insert(name, iri.clone());
         if self.peek_tok() == Some(&Tok::Dot) {
@@ -514,7 +562,13 @@ impl Parser {
         let t = self.next()?;
         let name = match &t.tok {
             Tok::Iri(i) | Tok::Word(i) => i.clone(),
-            _ => return Err(err(t.line, t.col, format!("expected <name> after @include, found {}", t.tok))),
+            _ => {
+                return Err(err(
+                    t.line,
+                    t.col,
+                    format!("expected <name> after @include, found {}", t.tok),
+                ));
+            }
         };
         if self.peek_tok() == Some(&Tok::Dot) {
             self.pos += 1;
@@ -522,12 +576,16 @@ impl Parser {
         let text = match name.to_ascii_lowercase().as_str() {
             "rdfs" => RDFS_RULES,
             "rdfs-simple" | "rdfssimple" => RDFS_SIMPLE_RULES,
-            "owl" | "owl-rl" | "owlrl" | "owlmini" | "owlmicro" | "owl-mini" | "owl-micro" => OWL_RL_RULES,
+            "owl" | "owl-rl" | "owlrl" | "owlmini" | "owlmicro" | "owl-mini" | "owl-micro" => {
+                OWL_RL_RULES
+            }
             _ => {
                 return Err(err(
                     at.line,
                     at.col,
-                    format!("cannot @include <{name}>: only the built-in rule sets rdfs, rdfs-simple, owl, owl-rl, owlmini and owlmicro can be included"),
+                    format!(
+                        "cannot @include <{name}>: only the built-in rule sets rdfs, rdfs-simple, owl, owl-rl, owlmini and owlmicro can be included"
+                    ),
                 ));
             }
         };
@@ -541,8 +599,13 @@ impl Parser {
             eof: (0, 0),
             depth: self.depth + 1,
         };
-        sub.parse_all(out)
-            .map_err(|e| err(at.line, at.col, format!("in included rule set <{name}>: {e}")))
+        sub.parse_all(out).map_err(|e| {
+            err(
+                at.line,
+                at.col,
+                format!("in included rule set <{name}>: {e}"),
+            )
+        })
     }
 
     fn parse_rule(&mut self, nested: bool) -> Result<Rule, RuleParseError> {
@@ -574,7 +637,11 @@ impl Parser {
                         Some(n) => format!("rule '{n}'"),
                         None => "rule".to_string(),
                     };
-                    return Err(err(l, c, format!("{what} starting at line {line} has no '->' or '<-'")));
+                    return Err(err(
+                        l,
+                        c,
+                        format!("{what} starting at line {line} has no '->' or '<-'"),
+                    ));
                 }
                 _ => left.push(self.parse_clause()?),
             }
@@ -598,7 +665,13 @@ impl Parser {
                 }
                 Some(Tok::Dot) => {
                     let (l, c) = self.here();
-                    return Err(err(l, c, format!("expected ']' to close the rule opened at line {line}, column {col}")));
+                    return Err(err(
+                        l,
+                        c,
+                        format!(
+                            "expected ']' to close the rule opened at line {line}, column {col}"
+                        ),
+                    ));
                 }
                 None if !bracketed && !nested => break,
                 None => {
@@ -606,7 +679,11 @@ impl Parser {
                 }
                 Some(Tok::Arrow) | Some(Tok::BackArrow) => {
                     let (l, c) = self.here();
-                    return Err(err(l, c, "a rule may contain only one '->' or '<-' (did you forget ']' or '.'?)"));
+                    return Err(err(
+                        l,
+                        c,
+                        "a rule may contain only one '->' or '<-' (did you forget ']' or '.'?)",
+                    ));
                 }
                 _ => right.push(self.parse_clause()?),
             }
@@ -615,29 +692,54 @@ impl Parser {
             Direction::Forward => (left, right),
             Direction::Backward => (right, left),
         };
-        Ok(Rule { name, body, head, direction: arrow, line })
+        Ok(Rule {
+            name,
+            body,
+            head,
+            direction: arrow,
+            line,
+        })
     }
 
     fn parse_clause(&mut self) -> Result<Clause, RuleParseError> {
-        let t = self.peek().cloned().ok_or_else(|| err(self.eof.0, self.eof.1, "unexpected end of input"))?;
+        let t = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| err(self.eof.0, self.eof.1, "unexpected end of input"))?;
         match &t.tok {
             Tok::LParen => {
                 let nodes = self.parse_node_list()?;
                 if nodes.len() != 3 {
-                    return Err(err(t.line, t.col, format!("triple pattern with {} nodes (expected 3)", nodes.len())));
+                    return Err(err(
+                        t.line,
+                        t.col,
+                        format!("triple pattern with {} nodes (expected 3)", nodes.len()),
+                    ));
                 }
                 let mut it = nodes.into_iter();
                 let (s, p, o) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
                 if matches!(s, Node::Functor(..)) {
-                    return Err(err(t.line, t.col, "functors are not allowed in the subject position of a pattern"));
+                    return Err(err(
+                        t.line,
+                        t.col,
+                        "functors are not allowed in the subject position of a pattern",
+                    ));
                 }
                 if matches!(p, Node::Functor(..)) {
-                    return Err(err(t.line, t.col, "functors are not allowed in the predicate position of a pattern"));
+                    return Err(err(
+                        t.line,
+                        t.col,
+                        "functors are not allowed in the predicate position of a pattern",
+                    ));
                 }
                 if let Node::Const(Term::Literal(_)) = p {
                     return Err(err(t.line, t.col, "a literal cannot be a predicate"));
                 }
-                Ok(Clause::Triple(TriplePattern { subject: s, predicate: p, object: o }))
+                Ok(Clause::Triple(TriplePattern {
+                    subject: s,
+                    predicate: p,
+                    object: o,
+                }))
             }
             Tok::LBrack => Ok(Clause::Rule(Box::new(self.parse_rule(true)?))),
             Tok::Word(w) if !w.starts_with('?') => {
@@ -646,16 +748,23 @@ impl Parser {
                     return Err(err(
                         t.line,
                         t.col,
-                        format!("expected '(' after builtin name '{w}' (clauses are triple patterns '(s p o)', builtins 'name(args)' or nested rules '[...]')"),
+                        format!(
+                            "expected '(' after builtin name '{w}' (clauses are triple patterns '(s p o)', builtins 'name(args)' or nested rules '[...]')"
+                        ),
                     ));
                 }
                 let args = self.parse_node_list()?;
-                Ok(Clause::Builtin(BuiltinCall { name: w.clone(), args }))
+                Ok(Clause::Builtin(BuiltinCall {
+                    name: w.clone(),
+                    args,
+                }))
             }
             other => Err(err(
                 t.line,
                 t.col,
-                format!("expected a triple pattern '(s p o)', a builtin call or a nested rule, found {other}"),
+                format!(
+                    "expected a triple pattern '(s p o)', a builtin call or a nested rule, found {other}"
+                ),
             )),
         }
     }
@@ -663,7 +772,11 @@ impl Parser {
     fn parse_node_list(&mut self) -> Result<Vec<Node>, RuleParseError> {
         let open = self.next()?;
         if open.tok != Tok::LParen {
-            return Err(err(open.line, open.col, format!("expected '(', found {}", open.tok)));
+            return Err(err(
+                open.line,
+                open.col,
+                format!("expected '(', found {}", open.tok),
+            ));
         }
         let mut nodes = Vec::new();
         loop {
@@ -673,8 +786,20 @@ impl Parser {
                 .map_err(|_| err(open.line, open.col, "unterminated '(' (missing ')')"))?;
             match t.tok {
                 Tok::RParen => return Ok(nodes),
-                Tok::LParen | Tok::LBrack | Tok::RBrack | Tok::Arrow | Tok::BackArrow | Tok::Dot => {
-                    return Err(err(t.line, t.col, format!("unexpected {} inside '(…)' opened at line {}, column {} (missing ')'?)", t.tok, open.line, open.col)));
+                Tok::LParen
+                | Tok::LBrack
+                | Tok::RBrack
+                | Tok::Arrow
+                | Tok::BackArrow
+                | Tok::Dot => {
+                    return Err(err(
+                        t.line,
+                        t.col,
+                        format!(
+                            "unexpected {} inside '(…)' opened at line {}, column {} (missing ')'?)",
+                            t.tok, open.line, open.col
+                        ),
+                    ));
                 }
                 _ => nodes.push(self.parse_node(t)?),
             }
@@ -688,10 +813,19 @@ impl Parser {
         if let Some(ns) = self.prefixes.get(prefix) {
             return Ok(Some(format!("{ns}{local}")));
         }
-        if matches!(prefix, "http" | "https" | "urn" | "file" | "ftp" | "mailto" | "tag") {
+        if matches!(
+            prefix,
+            "http" | "https" | "urn" | "file" | "ftp" | "mailto" | "tag"
+        ) {
             return Ok(Some(word.to_string()));
         }
-        Err(err(t.line, t.col, format!("unknown prefix '{prefix}:' in '{word}' (declare it with @prefix {prefix}: <…> .)")))
+        Err(err(
+            t.line,
+            t.col,
+            format!(
+                "unknown prefix '{prefix}:' in '{word}' (declare it with @prefix {prefix}: <…> .)"
+            ),
+        ))
     }
 
     fn iri(&self, iri: &str, t: &Token) -> Result<NamedNode, RuleParseError> {
@@ -703,14 +837,20 @@ impl Parser {
             Tok::Iri(i) => Ok(Node::Const(Term::NamedNode(self.iri(i, &t)?))),
             Tok::Lit { lex, lang, dt } => {
                 let lit = if let Some(l) = lang {
-                    Literal::new_language_tagged_literal(lex.clone(), l.clone())
-                        .map_err(|e| err(t.line, t.col, format!("invalid language tag '{l}': {e}")))?
+                    Literal::new_language_tagged_literal(lex.clone(), l.clone()).map_err(|e| {
+                        err(t.line, t.col, format!("invalid language tag '{l}': {e}"))
+                    })?
                 } else if let Some((d, is_iri)) = dt {
                     let iri = if *is_iri {
                         d.clone()
                     } else {
-                        self.expand(d, &t)?
-                            .ok_or_else(|| err(t.line, t.col, format!("datatype '{d}' must be a prefixed name or <IRI>")))?
+                        self.expand(d, &t)?.ok_or_else(|| {
+                            err(
+                                t.line,
+                                t.col,
+                                format!("datatype '{d}' must be a prefixed name or <IRI>"),
+                            )
+                        })?
                     };
                     Literal::new_typed_literal(lex.clone(), self.iri(&iri, &t)?)
                 } else {
@@ -729,14 +869,18 @@ impl Parser {
                     return Ok(Node::Any);
                 }
                 if let Some(label) = w.strip_prefix("_:") {
-                    let b = BlankNode::new(label)
-                        .map_err(|e| err(t.line, t.col, format!("invalid blank node '{w}': {e}")))?;
+                    let b = BlankNode::new(label).map_err(|e| {
+                        err(t.line, t.col, format!("invalid blank node '{w}': {e}"))
+                    })?;
                     return Ok(Node::Const(Term::BlankNode(b)));
                 }
                 let first = w.chars().next().unwrap_or(' ');
                 let second = w.chars().nth(1);
-                if first.is_ascii_digit() || (matches!(first, '-' | '+') && second.is_some_and(|c| c.is_ascii_digit())) {
-                    return parse_number(w).ok_or_else(|| err(t.line, t.col, format!("invalid number '{w}'")));
+                if first.is_ascii_digit()
+                    || (matches!(first, '-' | '+') && second.is_some_and(|c| c.is_ascii_digit()))
+                {
+                    return parse_number(w)
+                        .ok_or_else(|| err(t.line, t.col, format!("invalid number '{w}'")));
                 }
                 if self.peek_tok() == Some(&Tok::LParen) && !w.contains(':') {
                     let args = self.parse_node_list()?;
@@ -747,7 +891,9 @@ impl Parser {
                     None => Err(err(
                         t.line,
                         t.col,
-                        format!("unexpected '{w}': expected ?variable, <IRI>, prefix:name, 'literal', number or _"),
+                        format!(
+                            "unexpected '{w}': expected ?variable, <IRI>, prefix:name, 'literal', number or _"
+                        ),
                     )),
                 }
             }
@@ -772,10 +918,16 @@ fn parse_number(w: &str) -> Option<Node> {
 }
 
 pub(crate) fn default_prefixes() -> HashMap<String, String> {
-    [("rdf", RDF_NS), ("rdfs", RDFS_NS), ("owl", OWL_NS), ("xsd", XSD_NS), ("rb", RB_NS)]
-        .into_iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
+    [
+        ("rdf", RDF_NS),
+        ("rdfs", RDFS_NS),
+        ("owl", OWL_NS),
+        ("xsd", XSD_NS),
+        ("rb", RB_NS),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect()
 }
 
 /// Parse Jena rule text into rules (including `@include`d built-in rule sets).
@@ -783,9 +935,18 @@ pub fn parse_rules(text: &str) -> Result<Vec<Rule>, RuleParseError> {
     let toks = lex(text)?;
     let eof = {
         let lines: Vec<&str> = text.split('\n').collect();
-        (lines.len().max(1), lines.last().map_or(0, |l| l.chars().count()) + 1)
+        (
+            lines.len().max(1),
+            lines.last().map_or(0, |l| l.chars().count()) + 1,
+        )
     };
-    let mut p = Parser { toks, pos: 0, prefixes: default_prefixes(), eof, depth: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        prefixes: default_prefixes(),
+        eof,
+        depth: 0,
+    };
     let mut out = Vec::new();
     p.parse_all(&mut out)?;
     Ok(out)
@@ -845,21 +1006,53 @@ mod tests {
         assert_eq!(rules.len(), 6);
         assert!(rules[0].name.is_none());
         assert!(rules[2].body.is_empty());
-        let Clause::Triple(t) = &rules[2].head[0] else { panic!() };
+        let Clause::Triple(t) = &rules[2].head[0] else {
+            panic!()
+        };
         assert_eq!(
             t.object,
-            Node::Const(Term::Literal(Literal::new_language_tagged_literal_unchecked("hi", "en")))
+            Node::Const(Term::Literal(
+                Literal::new_language_tagged_literal_unchecked("hi", "en")
+            ))
         );
-        let Clause::Triple(t) = &rules[3].head[0] else { panic!() };
-        assert_eq!(t.object, Node::Const(Term::Literal(Literal::new_typed_literal("1", xsd::INT))));
-        let Clause::Triple(t) = &rules[4].head[0] else { panic!() };
-        assert_eq!(t.object, Node::Const(Term::Literal(Literal::new_typed_literal("42", xsd::INTEGER))));
-        let Clause::Triple(t) = &rules[4].head[1] else { panic!() };
-        assert_eq!(t.object, Node::Const(Term::Literal(Literal::new_typed_literal("-1.5", xsd::DOUBLE))));
-        let Clause::Triple(t) = &rules[5].body[0] else { panic!() };
+        let Clause::Triple(t) = &rules[3].head[0] else {
+            panic!()
+        };
+        assert_eq!(
+            t.object,
+            Node::Const(Term::Literal(Literal::new_typed_literal("1", xsd::INT)))
+        );
+        let Clause::Triple(t) = &rules[4].head[0] else {
+            panic!()
+        };
+        assert_eq!(
+            t.object,
+            Node::Const(Term::Literal(Literal::new_typed_literal(
+                "42",
+                xsd::INTEGER
+            )))
+        );
+        let Clause::Triple(t) = &rules[4].head[1] else {
+            panic!()
+        };
+        assert_eq!(
+            t.object,
+            Node::Const(Term::Literal(Literal::new_typed_literal(
+                "-1.5",
+                xsd::DOUBLE
+            )))
+        );
+        let Clause::Triple(t) = &rules[5].body[0] else {
+            panic!()
+        };
         assert_eq!(t.predicate, Node::Any);
-        let Clause::Triple(t) = &rules[5].body[1] else { panic!() };
-        assert_eq!(t.object, Node::Const(Term::Literal(Literal::new_simple_literal("x\"y"))));
+        let Clause::Triple(t) = &rules[5].body[1] else {
+            panic!()
+        };
+        assert_eq!(
+            t.object,
+            Node::Const(Term::Literal(Literal::new_simple_literal("x\"y")))
+        );
     }
 
     #[test]
@@ -872,7 +1065,9 @@ mod tests {
         assert_eq!(rules[0].direction, Direction::Backward);
         assert_eq!(rules[0].head.len(), 1);
         assert_eq!(rules[0].body.len(), 2);
-        let Clause::Rule(n) = &rules[1].head[0] else { panic!() };
+        let Clause::Rule(n) = &rules[1].head[0] else {
+            panic!()
+        };
         assert_eq!(n.name.as_deref(), Some("sym"));
         assert_eq!(n.direction, Direction::Backward);
         // display roundtrip
@@ -883,14 +1078,21 @@ mod tests {
 
     #[test]
     fn functor_terms() {
-        let rules = parse_rules("[(?C owl:onProperty ?P) -> (?C owl:equivalentClass some(?P, ?D))]").unwrap();
-        let Clause::Triple(t) = &rules[0].head[0] else { panic!() };
+        let rules =
+            parse_rules("[(?C owl:onProperty ?P) -> (?C owl:equivalentClass some(?P, ?D))]")
+                .unwrap();
+        let Clause::Triple(t) = &rules[0].head[0] else {
+            panic!()
+        };
         assert!(matches!(&t.object, Node::Functor(n, a) if n == "some" && a.len() == 2));
     }
 
     #[test]
     fn include_builtin_sets() {
-        let rules = parse_rules("@include <rdfs>.\n[x: (?a <http://ex.org/p> ?b) -> (?b <http://ex.org/p> ?a)]").unwrap();
+        let rules = parse_rules(
+            "@include <rdfs>.\n[x: (?a <http://ex.org/p> ?b) -> (?b <http://ex.org/p> ?a)]",
+        )
+        .unwrap();
         assert!(rules.len() > 10);
         assert_eq!(rules.last().unwrap().name.as_deref(), Some("x"));
     }
@@ -923,7 +1125,10 @@ mod tests {
         let e = parse_rules("[r: (?a <http://x/p> ?b) foo -> (?a <http://x/p> ?b)]").unwrap_err();
         assert!(e.message.contains("builtin name 'foo'"), "{e}");
 
-        let e = parse_rules("[r: (?a <http://x/p> ?b) -> (?a <http://x/p> ?b) -> (?b <http://x/p> ?a)]").unwrap_err();
+        let e = parse_rules(
+            "[r: (?a <http://x/p> ?b) -> (?a <http://x/p> ?b) -> (?b <http://x/p> ?a)]",
+        )
+        .unwrap_err();
         assert!(e.message.contains("only one"), "{e}");
 
         let e = parse_rules("@frobnicate <x> .").unwrap_err();

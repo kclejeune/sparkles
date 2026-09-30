@@ -15,8 +15,12 @@ const PREFIXES: &str = "@prefix ex: <http://ex.org/> .
 
 fn store(ttl: &str) -> Store {
     let s = Store::in_memory(StoreOptions::default());
-    s.load(&[Source::from_bytes(format!("{PREFIXES}{ttl}").into_bytes(), RdfFormat::Turtle, None)])
-        .unwrap();
+    s.load(&[Source::from_bytes(
+        format!("{PREFIXES}{ttl}").into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
     s
 }
 
@@ -28,12 +32,22 @@ fn qopts(reasoning: bool) -> QueryOptions {
     QueryOptions {
         prefixes: vec![
             ("ex".into(), "http://ex.org/".into()),
-            ("rdf".into(), "http://www.w3.org/1999/02/22-rdf-syntax-ns#".into()),
-            ("rdfs".into(), "http://www.w3.org/2000/01/rdf-schema#".into()),
+            (
+                "rdf".into(),
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#".into(),
+            ),
+            (
+                "rdfs".into(),
+                "http://www.w3.org/2000/01/rdf-schema#".into(),
+            ),
             ("owl".into(), "http://www.w3.org/2002/07/owl#".into()),
             ("xsd".into(), "http://www.w3.org/2001/XMLSchema#".into()),
         ],
-        default_graph_extra: if reasoning { vec![INFERRED_GRAPH.into()] } else { vec![] },
+        default_graph_extra: if reasoning {
+            vec![INFERRED_GRAPH.into()]
+        } else {
+            vec![]
+        },
         ..Default::default()
     }
 }
@@ -41,7 +55,9 @@ fn qopts(reasoning: bool) -> QueryOptions {
 /// ASK against default graph ∪ inferred graph.
 fn ask(s: &Store, pattern: &str) -> bool {
     let q = format!("ASK {{ {pattern} }}");
-    query(s.snapshot(), &q, &qopts(true)).unwrap_or_else(|e| panic!("{q}: {e}")).boolean
+    query(s.snapshot(), &q, &qopts(true))
+        .unwrap_or_else(|e| panic!("{q}: {e}"))
+        .boolean
 }
 
 /// Sorted, compact rendering of SELECT results (local names / lexical forms).
@@ -53,7 +69,9 @@ fn select(s: &Store, q: &str, reasoning: bool) -> Vec<String> {
         .map(|row| {
             row.into_iter()
                 .map(|t| match t {
-                    Some(Term::NamedNode(n)) => n.as_str().rsplit(['/', '#']).next().unwrap().to_string(),
+                    Some(Term::NamedNode(n)) => {
+                        n.as_str().rsplit(['/', '#']).next().unwrap().to_string()
+                    }
                     Some(Term::Literal(l)) => l.value().to_string(),
                     Some(t) => t.to_string(),
                     None => "UNDEF".into(),
@@ -113,15 +131,29 @@ fn rdfs_simple_ontology() {
         ],
     );
     // no RDFS axioms / resource typing at the simple level
-    assert_not_entails(&s, &["ex:alice a rdfs:Resource", "ex:teaches a rdf:Property", "ex:carol a ex:Person"]);
+    assert_not_entails(
+        &s,
+        &[
+            "ex:alice a rdfs:Resource",
+            "ex:teaches a rdf:Property",
+            "ex:carol a ex:Person",
+        ],
+    );
     // inferences live in the inferred graph only
     let types = "SELECT ?t WHERE { ex:alice a ?t }";
     assert_eq!(select(&s, types, false), ["Student"]);
-    assert_eq!(select(&s, types, true), ["Agent", "Person", "Student", "Thing"]);
+    assert_eq!(
+        select(&s, types, true),
+        ["Agent", "Person", "Student", "Thing"]
+    );
     // derived triples never duplicate asserted ones
     let dup = format!("ASK {{ ?s ?p ?o . GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}");
     assert!(!query(s.snapshot(), &dup, &qopts(false)).unwrap().boolean);
-    let n = select(&s, &format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}"), false);
+    let n = select(
+        &s,
+        &format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}"),
+        false,
+    );
     assert_eq!(n, [r.inferred.to_string()]);
 }
 
@@ -133,7 +165,11 @@ fn rdfs_full() {
     let r = run(&s, Profile::Rdfs);
     assert!(r.iterations >= 2);
     // literal-subject triples (e.g. "Alice" a rdfs:Resource) are not written
-    assert!(r.warnings.iter().any(|w| w.contains("generalized")), "{:?}", r.warnings);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("generalized")),
+        "{:?}",
+        r.warnings
+    );
     assert_entails(
         &s,
         &[
@@ -180,7 +216,10 @@ fn w3c_rdfs_entailment_cases() {
         Case {
             name: "rdfs5 subPropertyOf transitive",
             data: "ex:p rdfs:subPropertyOf ex:q . ex:q rdfs:subPropertyOf ex:r . ex:r rdfs:subPropertyOf ex:s .",
-            entailed: &["ex:p rdfs:subPropertyOf ex:r, ex:s", "ex:q rdfs:subPropertyOf ex:s"],
+            entailed: &[
+                "ex:p rdfs:subPropertyOf ex:r, ex:s",
+                "ex:q rdfs:subPropertyOf ex:s",
+            ],
             not_entailed: &["ex:s rdfs:subPropertyOf ex:p"],
         },
         Case {
@@ -234,13 +273,20 @@ fn w3c_rdfs_entailment_cases() {
         Case {
             name: "rdfs12 container membership",
             data: "ex:bag rdf:_3 ex:z .",
-            entailed: &["ex:bag rdfs:member ex:z", "rdf:_3 rdfs:subPropertyOf rdfs:member"],
+            entailed: &[
+                "ex:bag rdfs:member ex:z",
+                "rdf:_3 rdfs:subPropertyOf rdfs:member",
+            ],
             not_entailed: &[],
         },
         Case {
             name: "cycle in subClassOf",
             data: "ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:A . ex:x a ex:A .",
-            entailed: &["ex:x a ex:B", "ex:A rdfs:subClassOf ex:A", "ex:B rdfs:subClassOf ex:B"],
+            entailed: &[
+                "ex:x a ex:B",
+                "ex:A rdfs:subClassOf ex:A",
+                "ex:B rdfs:subClassOf ex:B",
+            ],
             not_entailed: &[],
         },
     ];
@@ -307,7 +353,11 @@ fn owl_rl_properties() {
     );
     assert_not_entails(
         &s,
-        &["ex:d ex:ancestorOf ex:a", "ex:alice owl:sameAs ex:alice", "ex:bob ex:hasParent ex:bob"],
+        &[
+            "ex:d ex:ancestorOf ex:a",
+            "ex:alice owl:sameAs ex:alice",
+            "ex:bob ex:hasParent ex:bob",
+        ],
     );
 }
 
@@ -374,7 +424,14 @@ fn owl_rl_classes() {
             "ex:annie owl:sameAs ex:ann",
         ],
     );
-    assert_not_entails(&s, &["ex:cat a ex:Parent", "ex:zoe a ex:Mother", "ex:ann a ex:Pet"]);
+    assert_not_entails(
+        &s,
+        &[
+            "ex:cat a ex:Parent",
+            "ex:zoe a ex:Mother",
+            "ex:ann a ex:Pet",
+        ],
+    );
 }
 
 #[test]
@@ -390,7 +447,11 @@ fn owl_sameas_clique_is_bounded() {
     }
     let s = store(&ttl);
     let r = run(&s, Profile::OwlRl);
-    let n = select(&s, "SELECT (COUNT(*) AS ?n) WHERE { ?x owl:sameAs ?y }", true);
+    let n = select(
+        &s,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?x owl:sameAs ?y }",
+        true,
+    );
     assert_eq!(n, ["870"]);
     assert!(ask(&s, "ex:a0 ex:p9 ex:v29"));
     assert!(ask(&s, "ex:a29 ex:p0 ex:v0"));
@@ -444,8 +505,18 @@ fn custom_rules_with_builtins() {
     "#;
     let r = run(&s, Profile::Rules(rules.into()));
     assert_eq!(r.profile, "rules");
-    assert!(r.warnings.iter().any(|w| w.contains("'bw'") && w.contains("backward")), "{:?}", r.warnings);
-    assert!(r.warnings.iter().any(|w| w.contains("print")), "{:?}", r.warnings);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("'bw'") && w.contains("backward")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("print")),
+        "{:?}",
+        r.warnings
+    );
     assert_eq!(r.rules, 17);
     assert_entails(
         &s,
@@ -483,7 +554,10 @@ fn custom_rules_with_builtins() {
         ],
     );
     // makeSkolem is deterministic: one blank node for the one (child, parent) pair
-    assert_eq!(select(&s, "SELECT (COUNT(*) AS ?n) WHERE { ?c ex:link ?x }", true), ["1"]);
+    assert_eq!(
+        select(&s, "SELECT (COUNT(*) AS ?n) WHERE { ?c ex:link ?x }", true),
+        ["1"]
+    );
 }
 
 #[test]
@@ -509,24 +583,37 @@ fn custom_rules_equal_by_value_and_skip_unsupported() {
 #[test]
 fn parse_errors_are_reported() {
     let s = store("ex:a ex:p ex:b .");
-    let e = materialize(&s, &Profile::Rules("[r: (?a ex:p ?b) -> (?b ex:p ?a)]".into()), &ReasonOptions::default())
-        .unwrap_err();
+    let e = materialize(
+        &s,
+        &Profile::Rules("[r: (?a ex:p ?b) -> (?b ex:p ?a)]".into()),
+        &ReasonOptions::default(),
+    )
+    .unwrap_err();
     let msg = format!("{e:#}");
-    assert!(msg.contains("line 1") && msg.contains("unknown prefix"), "{msg}");
+    assert!(
+        msg.contains("line 1") && msg.contains("unknown prefix"),
+        "{msg}"
+    );
 }
 
 // ------------------------------------------------------ lifecycle & limits ---
 
 #[test]
 fn rematerialize_updates_and_clear() {
-    let s = store("ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C . ex:x a ex:A . ex:y a ex:B .");
+    let s = store(
+        "ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C . ex:x a ex:A . ex:y a ex:B .",
+    );
     let r1 = run(&s, Profile::RdfsSimple);
     assert_eq!(r1.inferred, 4); // A⊑C, x:B, x:C, y:C
     let v1 = s.snapshot().version;
     // idempotent: same content, nothing written
     let r2 = run(&s, Profile::RdfsSimple);
     assert_eq!(r2.inferred, 4);
-    assert_eq!(s.snapshot().version, v1, "no-op rematerialization should not commit");
+    assert_eq!(
+        s.snapshot().version,
+        v1,
+        "no-op rematerialization should not commit"
+    );
     // remove a base triple: stale inferences disappear
     sparkles::sparql::update::update(
         &s,
@@ -550,14 +637,39 @@ fn rematerialize_updates_and_clear() {
 
 #[test]
 fn limits_and_cancellation() {
-    let s = store("ex:p a owl:TransitiveProperty . ex:a0 ex:p ex:a1 . ex:a1 ex:p ex:a2 . ex:a2 ex:p ex:a3 . ex:a3 ex:p ex:a4 .");
-    let e = materialize(&s, &Profile::OwlRl, &ReasonOptions { max_inferred: 3, ..Default::default() }).unwrap_err();
+    let s = store(
+        "ex:p a owl:TransitiveProperty . ex:a0 ex:p ex:a1 . ex:a1 ex:p ex:a2 . ex:a2 ex:p ex:a3 . ex:a3 ex:p ex:a4 .",
+    );
+    let e = materialize(
+        &s,
+        &Profile::OwlRl,
+        &ReasonOptions {
+            max_inferred: 3,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("limit"), "{e}");
-    let e = materialize(&s, &Profile::OwlRl, &ReasonOptions { max_iterations: 1, ..Default::default() }).unwrap_err();
+    let e = materialize(
+        &s,
+        &Profile::OwlRl,
+        &ReasonOptions {
+            max_iterations: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("fixpoint"), "{e}");
     let cancel = Arc::new(AtomicBool::new(true));
-    let e = materialize(&s, &Profile::OwlRl, &ReasonOptions { cancel: Some(cancel), ..Default::default() })
-        .unwrap_err();
+    let e = materialize(
+        &s,
+        &Profile::OwlRl,
+        &ReasonOptions {
+            cancel: Some(cancel),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("cancelled"), "{e}");
     // nothing was written by the failed runs
     assert!(!ask(&s, "ex:a0 ex:p ex:a2"));
@@ -565,7 +677,9 @@ fn limits_and_cancellation() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let c2 = calls.clone();
     let opts = ReasonOptions {
-        progress: Some(Arc::new(move |f, m: &str| c2.lock().unwrap().push((f, m.to_string())))),
+        progress: Some(Arc::new(move |f, m: &str| {
+            c2.lock().unwrap().push((f, m.to_string()))
+        })),
         ..Default::default()
     };
     materialize(&s, &Profile::OwlRl, &opts).unwrap();
@@ -579,7 +693,10 @@ fn limits_and_cancellation() {
 #[test]
 fn profile_from_str() {
     assert_eq!("rdfs".parse::<Profile>().unwrap(), Profile::Rdfs);
-    assert_eq!("RDFS-simple".parse::<Profile>().unwrap(), Profile::RdfsSimple);
+    assert_eq!(
+        "RDFS-simple".parse::<Profile>().unwrap(),
+        Profile::RdfsSimple
+    );
     assert_eq!("owl-rl".parse::<Profile>().unwrap(), Profile::OwlRl);
     assert_eq!("owl".parse::<Profile>().unwrap(), Profile::OwlRl);
     assert!("owl-dl".parse::<Profile>().is_err());
@@ -588,7 +705,14 @@ fn profile_from_str() {
         let s = store("ex:a ex:p ex:b .");
         let r = run(&s, p.clone());
         assert!(r.warnings.is_empty(), "{p}: {:?}", r.warnings);
-        assert_eq!(r.rules, p.rules().unwrap().iter().filter(|r| !r.body.is_empty() || !r.head.is_empty()).count());
+        assert_eq!(
+            r.rules,
+            p.rules()
+                .unwrap()
+                .iter()
+                .filter(|r| !r.body.is_empty() || !r.head.is_empty())
+                .count()
+        );
     }
 }
 
@@ -604,7 +728,9 @@ fn end_to_end_sparql_over_default_and_inferred() {
     // default graph ∪ inferred graph via QueryOptions::default_graph_extra
     assert_eq!(select(&s, q, true), ["alice", "bob"]);
     // the same via an explicit UNION
-    let u = format!("SELECT ?x WHERE {{ {{ ?x a ex:Person }} UNION {{ GRAPH <{INFERRED_GRAPH}> {{ ?x a ex:Person }} }} }}");
+    let u = format!(
+        "SELECT ?x WHERE {{ {{ ?x a ex:Person }} UNION {{ GRAPH <{INFERRED_GRAPH}> {{ ?x a ex:Person }} }} }}"
+    );
     assert_eq!(select(&s, &u, false), ["alice", "bob"]);
     // and via protocol default-graph-uri with Jena's special default graph IRI
     let opts = QueryOptions {
@@ -624,8 +750,12 @@ fn persistent_store_roundtrip() {
     let root = dir.path().join("db");
     {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
-        s.load(&[Source::from_bytes(format!("{PREFIXES}{ONTOLOGY}").into_bytes(), RdfFormat::Turtle, None)])
-            .unwrap();
+        s.load(&[Source::from_bytes(
+            format!("{PREFIXES}{ONTOLOGY}").into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
         run(&s, Profile::OwlRl);
         assert!(ask(&s, "ex:alice a ex:Thing"));
     }
@@ -645,9 +775,13 @@ fn semi_naive_matches_direct_closure() {
     let mut edges = std::collections::BTreeSet::new();
     let mut x = 12345u64;
     for _ in 0..90 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let a = (x >> 33) % n;
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let b = (x >> 33) % n;
         edges.insert((a, b));
     }
@@ -667,7 +801,10 @@ fn semi_naive_matches_direct_closure() {
         }
         closure.extend(add);
     }
-    let ttl: String = edges.iter().map(|(a, b)| format!("ex:n{a} ex:p ex:n{b} .\n")).collect();
+    let ttl: String = edges
+        .iter()
+        .map(|(a, b)| format!("ex:n{a} ex:p ex:n{b} .\n"))
+        .collect();
     for rules in [
         "@prefix ex: <http://ex.org/>. [t: (?a ex:p ?b) (?b ex:p ?c) -> (?a ex:p ?c)]",
         "@prefix ex: <http://ex.org/>. [t: (?a ex:p ?b) (?b ex:p ?c) (?c ex:p ?d) -> (?a ex:p ?d)] [t2: (?a ex:p ?b) (?b ex:p ?c) -> (?a ex:p ?c)]",

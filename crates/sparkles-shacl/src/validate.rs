@@ -422,7 +422,7 @@ impl<'a> Engine<'a> {
         Ok(match self.term(id)? {
             Term::NamedNode(n) => Some(n.into_string()),
             Term::Literal(l) => Some(l.value().to_string()),
-            Term::BlankNode(_) => None,
+            Term::BlankNode(_) | Term::Triple(_) => None,
         })
     }
 

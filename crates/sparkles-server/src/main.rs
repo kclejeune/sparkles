@@ -19,7 +19,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "sparkles", version, about = "High-performance RDF/SPARQL database (Jena/Fuseki compatible)")]
+#[command(
+    name = "sparkles",
+    version,
+    about = "High-performance RDF/SPARQL database (Jena/Fuseki compatible)"
+)]
 struct Cli {
     /// Block cache size in MiB
     #[arg(long, global = true, default_value_t = 1024)]
@@ -148,16 +152,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // progress logging for long-running commands, quiet output for query tools
     let default_filter = match cli.cmd {
-        Cmd::Serve { .. } | Cmd::Load { .. } | Cmd::Compact { .. } => "sparkles=info,sparkles_server=info,tower_http=warn",
+        Cmd::Serve { .. } | Cmd::Load { .. } | Cmd::Compact { .. } => {
+            "sparkles=info,sparkles_server=info,tower_http=warn"
+        }
         _ => "warn",
     };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
+        )
         .with_writer(std::io::stderr)
         .init();
     let opts = store_opts(&cli);
     match cli.cmd {
-        Cmd::Serve { data, host, port, mem, loc, timeout, read_only, no_service } => {
+        Cmd::Serve {
+            data,
+            host,
+            port,
+            mem,
+            loc,
+            timeout,
+            read_only,
+            no_service,
+        } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
             st.allow_service = !no_service;
@@ -167,15 +185,28 @@ fn main() -> Result<()> {
             }
             for l in loc {
                 let (name, path) = l.split_once('=').context("--loc expects NAME=PATH")?;
-                st.attach(name.trim_start_matches('/'), state::DbType::Persistent, Some(std::path::Path::new(path)))?;
+                st.attach(
+                    name.trim_start_matches('/'),
+                    state::DbType::Persistent,
+                    Some(std::path::Path::new(path)),
+                )?;
             }
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
             rt.block_on(async move {
                 let addr = format!("{host}:{port}");
-                let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
-                tracing::info!("Sparkles {} listening on http://{addr}/ (UI at /ui/)", env!("CARGO_PKG_VERSION"));
+                let listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("binding {addr}"))?;
+                tracing::info!(
+                    "Sparkles {} listening on http://{addr}/ (UI at /ui/)",
+                    env!("CARGO_PKG_VERSION")
+                );
                 for name in st.datasets.read().keys() {
-                    tracing::info!("  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data");
+                    tracing::info!(
+                        "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
+                    );
                 }
                 axum::serve(listener, http::router(st))
                     .with_graceful_shutdown(async {
@@ -191,7 +222,10 @@ fn main() -> Result<()> {
             }
             let store = Store::open(&loc, opts)?;
             let g = graph.map(oxrdf::NamedNode::new).transpose()?;
-            let sources = files.iter().map(|f| Source::from_path(f, g.clone())).collect::<Result<Vec<_>, _>>()?;
+            let sources = files
+                .iter()
+                .map(|f| Source::from_path(f, g.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
             store.load(&sources)?;
@@ -205,7 +239,16 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Query { loc, data, query, results: fmt, explain, time, timeout, text } => {
+        Cmd::Query {
+            loc,
+            data,
+            query,
+            results: fmt,
+            explain,
+            time,
+            timeout,
+            text,
+        } => {
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
@@ -215,7 +258,10 @@ fn main() -> Result<()> {
                 Some(l) => Store::open(&l, opts)?,
                 None => {
                     let s = Store::in_memory(opts);
-                    let sources = data.iter().map(|f| Source::from_path(f, None)).collect::<Result<Vec<_>, _>>()?;
+                    let sources = data
+                        .iter()
+                        .map(|f| Source::from_path(f, None))
+                        .collect::<Result<Vec<_>, _>>()?;
                     if !sources.is_empty() {
                         s.load(&sources)?;
                     }
@@ -238,15 +284,26 @@ fn main() -> Result<()> {
             let out = std::io::stdout();
             let mut out = out.lock();
             match r.kind {
-                QueryKind::Select | QueryKind::Ask if fmt == "text" => print_table(&r, &store, &mut out)?,
+                QueryKind::Select | QueryKind::Ask if fmt == "text" => {
+                    print_table(&r, &store, &mut out)?
+                }
                 QueryKind::Select | QueryKind::Ask => {
                     let f = SolutionsFormat::from_name(&fmt).context("unknown result format")?;
                     results::write_solutions(&r, f, &mut out, None)?;
                     writeln!(out)?;
                 }
                 _ => {
-                    let f = if fmt == "text" { Some(oxrdfio::RdfFormat::Turtle) } else { results::rdf_format_from_name(&fmt) };
-                    results::write_graph(&r, f.context("unknown RDF format")?, &store.prefixes(), &mut out)?;
+                    let f = if fmt == "text" {
+                        Some(oxrdfio::RdfFormat::Turtle)
+                    } else {
+                        results::rdf_format_from_name(&fmt)
+                    };
+                    results::write_graph(
+                        &r,
+                        f.context("unknown RDF format")?,
+                        &store.prefixes(),
+                        &mut out,
+                    )?;
                 }
             }
             if time {
@@ -271,7 +328,10 @@ fn main() -> Result<()> {
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
-            eprintln!("inserted {} · deleted {} · {:.2} ms", s.inserted, s.deleted, s.timing.total_ms);
+            eprintln!(
+                "inserted {} · deleted {} · {:.2} ms",
+                s.inserted, s.deleted, s.timing.total_ms
+            );
             Ok(())
         }
         Cmd::Dump { loc } => {
@@ -284,12 +344,19 @@ fn main() -> Result<()> {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
             store.compact()?;
-            eprintln!("compacted into {} in {:.2}s", store.snapshot().generation.name, t.elapsed().as_secs_f64());
+            eprintln!(
+                "compacted into {} in {:.2}s",
+                store.snapshot().generation.name,
+                t.elapsed().as_secs_f64()
+            );
             Ok(())
         }
         Cmd::Backup { loc, out } => {
             let store = Store::open(&loc, opts)?;
-            let name = loc.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "db".into());
+            let name = loc
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "db".into());
             let p = store.backup(&out, &name)?;
             eprintln!("backup written to {}", p.display());
             Ok(())
@@ -301,26 +368,48 @@ fn main() -> Result<()> {
             println!("generation      {}", g.name);
             println!("quads           {}", s.len());
             println!("  base          {}", g.meta.quads);
-            println!("  delta +/-     {} / {}", s.delta.inserts(), s.delta.deletes());
-            println!("terms           {} (+{} delta)", g.vocab.len(), g.dvocab.len());
+            println!(
+                "  delta +/-     {} / {}",
+                s.delta.inserts(),
+                s.delta.deletes()
+            );
+            println!(
+                "terms           {} (+{} delta)",
+                g.vocab.len(),
+                g.dvocab.len()
+            );
             println!("subjects        {}", g.stats.distinct_subjects);
             println!("predicates      {}", g.stats.distinct_predicates);
             println!("objects         {}", g.stats.distinct_objects);
             println!("named graphs    {}", s.graph_ids()?.len());
-            println!("disk            {:.1} MiB", store.disk_bytes() as f64 / (1 << 20) as f64);
+            println!(
+                "disk            {:.1} MiB",
+                store.disk_bytes() as f64 / (1 << 20) as f64
+            );
             let mut preds = g.stats.predicates.clone();
-            preds.sort_by(|a, b| b.count.cmp(&a.count));
+            preds.sort_by_key(|p| std::cmp::Reverse(p.count));
             println!("\ntop predicates:");
             for p in preds.iter().take(20) {
-                let name = s.term(sparkles::id::Id(p.p)).map(|t| t.to_string()).unwrap_or_default();
-                println!("  {:>12}  {name}  (S {}, O {})", p.count, p.distinct_subjects, p.distinct_objects);
+                let name = s
+                    .term(sparkles::id::Id(p.p))
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  {:>12}  {name}  (S {}, O {})",
+                    p.count, p.distinct_subjects, p.distinct_objects
+                );
             }
             Ok(())
         }
         #[cfg(not(feature = "reasoning"))]
         Cmd::Infer { .. } => bail!("built without the `reasoning` feature"),
         #[cfg(feature = "reasoning")]
-        Cmd::Infer { loc, profile, rules, clear } => {
+        Cmd::Infer {
+            loc,
+            profile,
+            rules,
+            clear,
+        } => {
             let store = Store::open(&loc, opts)?;
             if clear {
                 let n = sparkles_reasoner::clear(&store)?;
@@ -329,12 +418,18 @@ fn main() -> Result<()> {
             }
             let profile = match rules {
                 Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
-                None => profile.parse().map_err(|_| anyhow::anyhow!("unknown profile '{profile}'"))?,
+                None => profile
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("unknown profile '{profile}'"))?,
             };
             let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
             eprintln!(
                 "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
-                r.inferred, r.rules, r.iterations, r.millis, sparkles_reasoner::INFERRED_GRAPH
+                r.inferred,
+                r.rules,
+                r.iterations,
+                r.millis,
+                sparkles_reasoner::INFERRED_GRAPH
             );
             for w in r.warnings {
                 eprintln!("warning: {w}");
@@ -374,7 +469,11 @@ fn print_plan_stderr(p: &sparkles::sparql::PlanInfo, depth: usize) {
 }
 
 /// Jena-style text table (`ResultSetFormatter.out`).
-fn print_table(r: &sparkles::sparql::QueryResult, store: &Store, out: &mut impl Write) -> Result<()> {
+fn print_table(
+    r: &sparkles::sparql::QueryResult,
+    store: &Store,
+    out: &mut impl Write,
+) -> Result<()> {
     if r.kind == QueryKind::Ask {
         writeln!(out, "{}", if r.boolean { "yes" } else { "no" })?;
         return Ok(());
@@ -386,7 +485,8 @@ fn print_table(r: &sparkles::sparql::QueryResult, store: &Store, out: &mut impl 
             Some(oxrdf::Term::NamedNode(n)) => {
                 for (p, ns) in &prefixes {
                     if let Some(l) = n.as_str().strip_prefix(ns.as_str())
-                        && l.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        && l.chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                     {
                         return format!("{p}:{l}");
                     }
@@ -396,20 +496,37 @@ fn print_table(r: &sparkles::sparql::QueryResult, store: &Store, out: &mut impl 
             Some(t) => t.to_string(),
         }
     };
-    let rows: Vec<Vec<String>> = r.rows().into_iter().map(|row| row.into_iter().map(show).collect()).collect();
+    let rows: Vec<Vec<String>> = r
+        .rows()
+        .into_iter()
+        .map(|row| row.into_iter().map(show).collect())
+        .collect();
     let mut widths: Vec<usize> = r.vars.iter().map(|v| v.chars().count() + 1).collect();
     for row in &rows {
         for (i, c) in row.iter().enumerate() {
             widths[i] = widths[i].max(c.chars().count());
         }
     }
-    let line: String = widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("-");
+    let line: String = widths
+        .iter()
+        .map(|w| "-".repeat(w + 2))
+        .collect::<Vec<_>>()
+        .join("-");
     writeln!(out, "-{line}-")?;
-    let hdr: Vec<String> = r.vars.iter().enumerate().map(|(i, v)| format!(" {:w$} ", format!("?{v}"), w = widths[i])).collect();
+    let hdr: Vec<String> = r
+        .vars
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!(" {:w$} ", format!("?{v}"), w = widths[i]))
+        .collect();
     writeln!(out, "|{}|", hdr.join("|"))?;
     writeln!(out, "={}=", "=".repeat(line.chars().count()))?;
     for row in &rows {
-        let cells: Vec<String> = row.iter().enumerate().map(|(i, c)| format!(" {:w$} ", c, w = widths[i])).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" {:w$} ", c, w = widths[i]))
+            .collect();
         writeln!(out, "|{}|", cells.join("|"))?;
     }
     writeln!(out, "-{line}-")?;

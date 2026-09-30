@@ -1,8 +1,8 @@
 //! HTTP layer: SPARQL 1.1 Protocol, Graph Store Protocol, Fuseki `/$/` admin API.
 
-use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
 #[cfg(feature = "reasoning")]
 use crate::state::ReasoningInfo;
+use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
@@ -74,7 +74,9 @@ impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
         let msg = e.to_string();
         let status = match &e {
-            Error::SparqlSyntax(_) | Error::Invalid(_) | Error::RdfParse(_) => StatusCode::BAD_REQUEST,
+            Error::SparqlSyntax(_) | Error::Invalid(_) | Error::RdfParse(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
@@ -82,7 +84,11 @@ impl From<Error> for ApiError {
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = if let Error::SparqlSyntax(_) = e { syntax_error_body(&msg) } else { json!({ "error": msg }) };
+        let body = if let Error::SparqlSyntax(_) = e {
+            syntax_error_body(&msg)
+        } else {
+            json!({ "error": msg })
+        };
         ApiError(status, body)
     }
 }
@@ -92,18 +98,28 @@ impl From<Error> for ApiError {
 /// tokens can run to several hundred characters, so `error` gets a short summary and
 /// the full text goes to `detail`.
 fn syntax_error_body(msg: &str) -> J {
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)error at (\d+):(\d+):\s*(.*)").unwrap());
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?s)error at (\d+):(\d+):\s*(.*)").unwrap()
+    });
     const MAX: usize = 160;
     let Some(c) = RE.captures(msg) else {
         return json!({ "error": msg });
     };
-    let (line, column) = (c[1].parse::<u64>().unwrap_or(0), c[2].parse::<u64>().unwrap_or(0));
+    let (line, column) = (
+        c[1].parse::<u64>().unwrap_or(0),
+        c[2].parse::<u64>().unwrap_or(0),
+    );
     let rest = c[3].trim();
     let mut summary = format!("SPARQL syntax error at line {line}, column {column}: {rest}");
     let mut body = json!({ "line": line, "column": column });
     if summary.chars().count() > MAX {
-        summary = summary.chars().take(MAX).collect::<String>().trim_end().to_string() + "…";
+        summary = summary
+            .chars()
+            .take(MAX)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+            + "…";
         body["detail"] = msg.into();
     }
     body["error"] = summary.into();
@@ -126,7 +142,9 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> ApiResult<T> + Send + 'static) -> ApiResult<T> {
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -155,7 +173,11 @@ impl Params {
         self.0.iter().any(|(a, _)| a == k)
     }
     fn all(&self, k: &str) -> Vec<String> {
-        self.0.iter().filter(|(a, _)| a == k).map(|(_, v)| v.clone()).collect()
+        self.0
+            .iter()
+            .filter(|(a, _)| a == k)
+            .map(|(_, v)| v.clone())
+            .collect()
     }
 }
 
@@ -194,7 +216,9 @@ fn negotiate(accept: &str, offers: &[&str]) -> Option<usize> {
                 continue;
             };
             let cand = (q, spec, i);
-            if best.is_none_or(|b| (cand.0, cand.1) > (b.0, b.1) || ((cand.0, cand.1) == (b.0, b.1) && cand.2 < b.2)) {
+            if best.is_none_or(|b| {
+                (cand.0, cand.1) > (b.0, b.1) || ((cand.0, cand.1) == (b.0, b.1) && cand.2 < b.2)
+            }) {
                 best = Some(cand);
             }
         }
@@ -206,7 +230,10 @@ fn solutions_format(params: &Params, headers: &HeaderMap) -> SolutionsFormat {
     if let Some(f) = params.get("format").and_then(SolutionsFormat::from_name) {
         return f;
     }
-    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("*/*");
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*/*");
     const OFFERS: [&str; 7] = [
         "application/sparql-results+json",
         "application/x-sparkles+json",
@@ -229,9 +256,17 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> RdfFormat {
     if let Some(f) = params.get("format").and_then(results::rdf_format_from_name) {
         return f;
     }
-    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).unwrap_or("*/*");
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*/*");
     let offers: &[&str] = if quads {
-        &["application/trig", "application/n-quads", "application/ld+json", "text/plain"]
+        &[
+            "application/trig",
+            "application/n-quads",
+            "application/ld+json",
+            "text/plain",
+        ]
     } else {
         &[
             "text/turtle",
@@ -245,7 +280,11 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> RdfFormat {
     };
     negotiate(accept, offers)
         .and_then(|i| results::rdf_format_from_name(offers[i]))
-        .unwrap_or(if quads { RdfFormat::TriG } else { RdfFormat::Turtle })
+        .unwrap_or(if quads {
+            RdfFormat::TriG
+        } else {
+            RdfFormat::Turtle
+        })
 }
 
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
@@ -254,20 +293,32 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         .and_then(|t| t.parse::<f64>().ok())
         .map(Duration::from_secs_f64)
         .unwrap_or(st.default_timeout);
-    let reasoning = params.get("reasoning").is_none_or(|v| v != "false") && ds.reasoning.read().is_some();
+    let reasoning =
+        params.get("reasoning").is_none_or(|v| v != "false") && ds.reasoning.read().is_some();
     QueryOptions {
         timeout: Some(timeout),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
         allow_service: st.allow_service,
-        default_graph_extra: if reasoning { vec![INFERRED_GRAPH.to_string()] } else { Vec::new() },
+        default_graph_extra: if reasoning {
+            vec![INFERRED_GRAPH.to_string()]
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     }
 }
 
 // ------------------------------------------------------------------ SPARQL ------
 
-async fn dataset_root(st: St, Path(name): Path<String>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn dataset_root(
+    st: St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
     if method == Method::POST && ct == "application/x-www-form-urlencoded" {
@@ -282,7 +333,14 @@ async fn dataset_root(st: St, Path(name): Path<String>, method: Method, uri: Uri
     gsp(st, Path(name), method, uri, headers, body).await
 }
 
-async fn query_endpoint(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn query_endpoint(
+    State(st): St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
@@ -292,12 +350,17 @@ async fn query_endpoint(State(st): St, Path(name): Path<String>, method: Method,
             params.extend_form(&body);
             params.get("query").unwrap_or_default().to_string()
         }
-        (Method::GET | Method::HEAD | Method::POST, _) => params.get("query").unwrap_or_default().to_string(),
+        (Method::GET | Method::HEAD | Method::POST, _) => {
+            params.get("query").unwrap_or_default().to_string()
+        }
         _ => return Err(err(StatusCode::METHOD_NOT_ALLOWED, "use GET or POST")),
     };
     if query.trim().is_empty() {
         if params.has("update") {
-            return Err(err(StatusCode::BAD_REQUEST, "SPARQL Update must be sent to the update endpoint"));
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "SPARQL Update must be sent to the update endpoint",
+            ));
         }
         return Err(err(StatusCode::BAD_REQUEST, "missing 'query' parameter"));
     }
@@ -312,7 +375,9 @@ async fn query_endpoint(State(st): St, Path(name): Path<String>, method: Method,
         let mut buf = Vec::new();
         let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
         let ct: String = match r.kind {
-            _ if sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers)) => {
+            _ if sfmt == SolutionsFormat::Sparkles
+                && (!is_graph || params_wants_sparkles(&headers)) =>
+            {
                 // Build the document once, then patch the serialization time into it.
                 let ts = std::time::Instant::now();
                 let mut doc = results::sparkles_json(&r, send);
@@ -322,7 +387,8 @@ async fn query_endpoint(State(st): St, Path(name): Path<String>, method: Method,
                     timing.insert("serializeMs".into(), ser_ms.into());
                     timing.insert("totalMs".into(), (total + ser_ms).into());
                 }
-                serde_json::to_writer(&mut buf, &doc).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                serde_json::to_writer(&mut buf, &doc)
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 SolutionsFormat::Sparkles.media_type().into()
             }
             QueryKind::Select | QueryKind::Ask => {
@@ -346,7 +412,13 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
 }
 
-async fn update_endpoint(State(st): St, Path(name): Path<String>, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn update_endpoint(
+    State(st): St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -375,7 +447,14 @@ async fn update_endpoint(State(st): St, Path(name): Path<String>, uri: Uri, head
     .await
 }
 
-async fn explain(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn explain(
+    State(st): St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
     let ct = content_type(&headers);
@@ -417,7 +496,14 @@ fn gsp_target(params: &Params) -> Target {
     }
 }
 
-async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn gsp(
+    State(st): St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let target = gsp_target(&params);
@@ -434,7 +520,9 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
                     Target::Named(iri) => Some(
                         snap.lookup_iri(iri)
                             .filter(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0)
-                            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>")))?,
+                            .ok_or_else(|| {
+                                err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>"))
+                            })?,
                     ),
                     Target::Dataset => None,
                 };
@@ -453,7 +541,12 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
                     for k in snap.scan_keys(Perm::Gspo, &prefix)? {
                         if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)) {
                             if g.is_some() {
-                                w.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object)).map_err(Error::Io)?;
+                                w.serialize_triple(oxrdf::TripleRef::new(
+                                    &q.subject,
+                                    &q.predicate,
+                                    &q.object,
+                                ))
+                                .map_err(Error::Io)?;
                             } else {
                                 w.serialize_quad(&q).map_err(Error::Io)?;
                             }
@@ -472,12 +565,18 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
             let ct = content_type(&headers);
             let format = sparkles::io::format_for_media_type(&ct)
                 .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
-                .ok_or_else(|| err(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("unsupported content type '{ct}'")))?;
+                .ok_or_else(|| {
+                    err(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        format!("unsupported content type '{ct}'"),
+                    )
+                })?;
             let replace = method == Method::PUT;
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
-                        oxrdf::NamedNode::new(iri.clone()).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
+                        oxrdf::NamedNode::new(iri.clone())
+                            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
                     ),
                     _ => None,
                 };
@@ -493,8 +592,16 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
                 let src = Source::from_bytes(body.to_vec(), format, graph);
                 ds.store.load(&[src])?;
                 let count = ds.store.snapshot().len().saturating_sub(before);
-                let status = if replace { StatusCode::OK } else { StatusCode::CREATED };
-                Ok((status, Json(json!({ "count": count, "tripleCount": count, "quadCount": count }))).into_response())
+                let status = if replace {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                };
+                Ok((
+                    status,
+                    Json(json!({ "count": count, "tripleCount": count, "quadCount": count })),
+                )
+                    .into_response())
             })
             .await
         }
@@ -511,7 +618,10 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
                             .lookup_iri(iri)
                             .is_some_and(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0);
                         if !exists {
-                            return Err(err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>")));
+                            return Err(err(
+                                StatusCode::NOT_FOUND,
+                                format!("no such graph: <{iri}>"),
+                            ));
                         }
                         format!("CLEAR GRAPH <{iri}>")
                     }
@@ -526,7 +636,13 @@ async fn gsp(State(st): St, Path(name): Path<String>, method: Method, uri: Uri, 
     }
 }
 
-async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri: Uri, request: axum::extract::Request) -> ApiResult {
+async fn upload(
+    State(st): St,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+    request: axum::extract::Request,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
@@ -544,10 +660,17 @@ async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri
         let mut mp = Multipart::from_request(request, &())
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        while let Some(field) = mp.next_field().await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        while let Some(field) = mp
+            .next_field()
+            .await
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
+        {
             match field.name() {
                 Some("graph") => {
-                    let g = field.text().await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    let g = field
+                        .text()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
                     if !g.trim().is_empty() {
                         graph = Some(g.trim().to_string());
                     }
@@ -558,17 +681,25 @@ async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "upload.ttl".into());
-                    let data = field.bytes().await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    let data = field
+                        .bytes()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
                     let path = tmp.path().join(format!("{}-{fname}", files.len()));
-                    std::fs::write(&path, &data).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    std::fs::write(&path, &data)
+                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                     files.push(path);
                 }
             }
         }
     } else {
         // plain body: format from content type
-        let format = sparkles::io::format_for_media_type(&ct)
-            .ok_or_else(|| err(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("unsupported content type '{ct}'")))?;
+        let format = sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
+            err(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported content type '{ct}'"),
+            )
+        })?;
         let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -581,7 +712,8 @@ async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri
             _ => "ttl",
         };
         let path = tmp.path().join(format!("body.{ext}"));
-        std::fs::write(&path, &bytes).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        std::fs::write(&path, &bytes)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         files.push(path);
     }
     if files.is_empty() {
@@ -589,7 +721,10 @@ async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri
     }
     blocking(move || {
         let g = match graph {
-            Some(g) => Some(oxrdf::NamedNode::new(g).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?),
+            Some(g) => Some(
+                oxrdf::NamedNode::new(g)
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
+            ),
             None => None,
         };
         let sources = files
@@ -600,7 +735,10 @@ async fn upload(State(st): St, Path(name): Path<String>, headers: HeaderMap, uri
         ds.store.load(&sources)?;
         let count = ds.store.snapshot().len().saturating_sub(before);
         drop(tmp);
-        Ok(Json(json!({ "count": count, "tripleCount": count, "quadCount": count })).into_response())
+        Ok(
+            Json(json!({ "count": count, "tripleCount": count, "quadCount": count }))
+                .into_response(),
+        )
     })
     .await
 }
@@ -628,7 +766,12 @@ fn dataset_info(ds: &Dataset) -> J {
 }
 
 async fn server_info(State(st): St) -> Json<J> {
-    let datasets: Vec<J> = st.datasets.read().values().map(|d| dataset_info(d)).collect();
+    let datasets: Vec<J> = st
+        .datasets
+        .read()
+        .values()
+        .map(|d| dataset_info(d))
+        .collect();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "startedAt": st.started_at,
@@ -638,7 +781,12 @@ async fn server_info(State(st): St) -> Json<J> {
 }
 
 async fn list_datasets(State(st): St) -> Json<J> {
-    let datasets: Vec<J> = st.datasets.read().values().map(|d| dataset_info(d)).collect();
+    let datasets: Vec<J> = st
+        .datasets
+        .read()
+        .values()
+        .map(|d| dataset_info(d))
+        .collect();
     Json(json!({ "datasets": datasets }))
 }
 
@@ -653,7 +801,8 @@ async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes
     }
     let mut params = Params::from_query(&uri);
     let (name, kind) = if content_type(&headers) == "application/json" {
-        let v: J = serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let v: J = serde_json::from_slice(&body)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         (
             v["dbName"].as_str().unwrap_or_default().to_string(),
             v["dbType"].as_str().unwrap_or("persistent").to_string(),
@@ -669,16 +818,26 @@ async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes
     let kind = match kind.as_str() {
         "mem" => DbType::Mem,
         "persistent" | "tdb" | "tdb2" => DbType::Persistent,
-        other => return Err(err(StatusCode::BAD_REQUEST, format!("unknown dbType '{other}'"))),
+        other => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown dbType '{other}'"),
+            ));
+        }
     };
     if !crate::state::valid_name(&name) {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            format!("invalid dataset name '{name}': use letters, digits, '_', '-' or '.' (max 64 characters)"),
+            format!(
+                "invalid dataset name '{name}': use letters, digits, '_', '-' or '.' (max 64 characters)"
+            ),
         ));
     }
     if st.get(&name).is_some() {
-        return Err(err(StatusCode::CONFLICT, format!("dataset /{name} already exists")));
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("dataset /{name} already exists"),
+        ));
     }
     let st2 = st.clone();
     let ds = blocking(move || Ok(st2.create(&name, kind)?)).await?;
@@ -703,15 +862,21 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
     blocking(move || {
         let snap = ds.store.snapshot();
         let gen_ = &snap.generation;
-        let term = |id: u64| snap.term(Id(id)).map(|t| match t {
-            oxrdf::Term::NamedNode(n) => n.into_string(),
-            t => t.to_string(),
-        });
+        let term = |id: u64| {
+            snap.term(Id(id)).map(|t| match t {
+                oxrdf::Term::NamedNode(n) => n.into_string(),
+                t => t.to_string(),
+            })
+        };
         // graphs
         let mut graphs = Vec::new();
         for g in snap.distinct_first(Perm::Gspo)? {
             let n = snap.count(Perm::Gspo, &[g])?;
-            let name = if g == Id::DEFAULT_GRAPH.0 { J::Null } else { term(g).map_or(J::Null, J::String) };
+            let name = if g == Id::DEFAULT_GRAPH.0 {
+                J::Null
+            } else {
+                term(g).map_or(J::Null, J::String)
+            };
             graphs.push(json!({ "name": name, "quads": n }));
             if graphs.len() >= 1000 {
                 break;
@@ -725,7 +890,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
                 break;
             }
         }
-        preds.sort_by(|a, b| b.1.cmp(&a.1));
+        preds.sort_by_key(|p| std::cmp::Reverse(p.1));
         let predicates: Vec<J> = preds
             .iter()
             .take(100)
@@ -751,7 +916,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             }
             m.into_iter().collect()
         };
-        classes.sort_by(|a, b| b.1.cmp(&a.1));
+        classes.sort_by_key(|c| std::cmp::Reverse(c.1));
         let classes: Vec<J> = classes
             .iter()
             .take(100)
@@ -794,7 +959,10 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
     let task = st.start_task("compact", &name, move |h| {
         h.progress(0.1, "rebuilding index");
         ds.store.compact()?;
-        Ok(format!("compacted to {}", ds.store.snapshot().generation.name))
+        Ok(format!(
+            "compacted to {}",
+            ds.store.snapshot().generation.name
+        ))
     });
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
@@ -811,13 +979,20 @@ async fn backup(State(st): St, Path(name): Path<String>) -> ApiResult {
 }
 
 #[cfg(feature = "reasoning")]
-async fn reason(State(st): St, Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> ApiResult {
+async fn reason(
+    State(st): St,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &name)?;
-    let (profile_name, rules) = if content_type(&headers) == "application/json" && !body.is_empty() {
-        let v: J = serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let (profile_name, rules) = if content_type(&headers) == "application/json" && !body.is_empty()
+    {
+        let v: J = serde_json::from_slice(&body)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         (
             v["profile"].as_str().unwrap_or("rdfs").to_string(),
             v["rules"].as_str().map(str::to_string),
@@ -825,19 +1000,26 @@ async fn reason(State(st): St, Path(name): Path<String>, headers: HeaderMap, bod
     } else {
         let mut p = Params::default();
         p.extend_form(&body);
-        (p.get("profile").unwrap_or("rdfs").to_string(), p.get("rules").map(str::to_string))
+        (
+            p.get("profile").unwrap_or("rdfs").to_string(),
+            p.get("rules").map(str::to_string),
+        )
     };
     let profile: sparkles_reasoner::Profile = if profile_name == "rules" {
         sparkles_reasoner::Profile::Rules(rules.unwrap_or_default())
     } else {
-        profile_name
-            .parse()
-            .map_err(|_| err(StatusCode::BAD_REQUEST, format!("unknown profile '{profile_name}'")))?
+        profile_name.parse().map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown profile '{profile_name}'"),
+            )
+        })?
     };
     let st2 = st.clone();
     let task = st.start_task("reason", &name, move |h| {
         let h2 = h.clone();
-        let progress: Arc<dyn Fn(f32, &str) + Send + Sync> = Arc::new(move |p, msg: &str| h2.progress(p, msg));
+        let progress: sparkles_reasoner::ProgressFn =
+            Arc::new(move |p, msg: &str| h2.progress(p, msg));
         h.progress(0.05, "loading triples");
         let opts = sparkles_reasoner::ReasonOptions {
             progress: Some(progress),
@@ -855,7 +1037,11 @@ async fn reason(State(st): St, Path(name): Path<String>, headers: HeaderMap, bod
             report.inferred,
             report.millis,
             report.iterations,
-            if report.warnings.is_empty() { String::new() } else { format!("; warnings: {}", report.warnings.join("; ")) }
+            if report.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("; warnings: {}", report.warnings.join("; "))
+            }
         ))
     });
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
@@ -879,12 +1065,18 @@ async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
 
 #[cfg(not(feature = "reasoning"))]
 async fn reason() -> ApiResult {
-    Err(err(StatusCode::NOT_IMPLEMENTED, "built without the `reasoning` feature"))
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `reasoning` feature",
+    ))
 }
 
 #[cfg(not(feature = "reasoning"))]
 async fn unreason() -> ApiResult {
-    Err(err(StatusCode::NOT_IMPLEMENTED, "built without the `reasoning` feature"))
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `reasoning` feature",
+    ))
 }
 
 async fn list_tasks(State(st): St) -> Json<J> {
@@ -910,25 +1102,41 @@ mod tests {
         let b = syntax_error_body("SPARQL syntax error: error at 3:2: expected OPTIONAL");
         assert_eq!(b["line"], 3);
         assert_eq!(b["column"], 2);
-        assert_eq!(b["error"], "SPARQL syntax error at line 3, column 2: expected OPTIONAL");
+        assert_eq!(
+            b["error"],
+            "SPARQL syntax error at line 3, column 2: expected OPTIONAL"
+        );
         assert!(b.get("detail").is_none());
 
-        let long = format!("SPARQL syntax error: error at 1:41: expected one of {}", "\"x\", ".repeat(100));
+        let long = format!(
+            "SPARQL syntax error: error at 1:41: expected one of {}",
+            "\"x\", ".repeat(100)
+        );
         let b = syntax_error_body(&long);
         assert_eq!(b["line"], 1);
         assert!(b["error"].as_str().unwrap().ends_with('…'));
         assert!(b["error"].as_str().unwrap().chars().count() <= 161);
         assert_eq!(b["detail"], long.as_str());
 
-        assert_eq!(syntax_error_body("something else")["error"], "something else");
+        assert_eq!(
+            syntax_error_body("something else")["error"],
+            "something else"
+        );
     }
 
     #[test]
     fn content_negotiation() {
-        let offers = ["application/sparql-results+json", "text/csv", "application/sparql-results+xml"];
+        let offers = [
+            "application/sparql-results+json",
+            "text/csv",
+            "application/sparql-results+xml",
+        ];
         assert_eq!(negotiate("text/csv", &offers), Some(1));
         assert_eq!(negotiate("*/*", &offers), Some(0));
-        assert_eq!(negotiate("text/csv;q=0.5, application/sparql-results+xml", &offers), Some(2));
+        assert_eq!(
+            negotiate("text/csv;q=0.5, application/sparql-results+xml", &offers),
+            Some(2)
+        );
         assert_eq!(negotiate("text/*", &offers), Some(1));
         assert_eq!(negotiate("image/png", &offers), None);
     }
