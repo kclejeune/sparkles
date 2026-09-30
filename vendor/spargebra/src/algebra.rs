@@ -703,7 +703,16 @@ impl fmt::Display for GraphPattern {
                 right,
                 expression,
             } => {
-                if let Some(expr) = expression {
+                // A Filter on the right-hand side gets its own group: written directly in
+                // the OPTIONAL group it would parse back as the LeftJoin expression
+                // (SPARQL 1.1 §18.2.2.6), which has a different scope.
+                if matches!(right.as_ref(), Self::Filter { .. }) {
+                    if let Some(expr) = expression {
+                        write!(f, "{left} OPTIONAL {{ {{ {right} }} FILTER({expr}) }}")
+                    } else {
+                        write!(f, "{left} OPTIONAL {{ {{ {right} }} }}")
+                    }
+                } else if let Some(expr) = expression {
                     write!(f, "{left} OPTIONAL {{ {right} FILTER({expr}) }}")
                 } else {
                     write!(f, "{left} OPTIONAL {{ {right} }}")
