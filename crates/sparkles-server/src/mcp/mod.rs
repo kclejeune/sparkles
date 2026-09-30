@@ -12,6 +12,7 @@ mod errors;
 mod pins;
 mod render;
 mod schemas;
+mod search;
 mod tools;
 
 #[cfg(test)]
@@ -49,6 +50,11 @@ pub struct McpArgs {
     /// Name of the in-memory dataset of --data
     #[arg(long, default_value = "data")]
     pub name: String,
+    /// Index the --data dataset for full-text search (`search_text`). Databases given
+    /// with --loc keep the index they have (`sparkles text-index`).
+    #[cfg(feature = "text")]
+    #[arg(long, conflicts_with = "loc")]
+    pub text: bool,
     /// Allow federated SERVICE calls in queries (off: a prompt-injected model could send
     /// data anywhere)
     #[arg(long)]
@@ -288,10 +294,10 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         bail!("--max-concurrent must be at least 1");
     }
     for t in &args.disable_tool {
-        if !schemas::ALL_TOOLS.contains(&t.as_str()) {
+        if !schemas::all_tools().contains(&t.as_str()) {
             bail!(
                 "--disable-tool: unknown tool '{t}' (tools: {})",
-                schemas::ALL_TOOLS.join(", ")
+                schemas::all_tools().join(", ")
             );
         }
     }
@@ -337,6 +343,11 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
             .map(|f| Source::from_path(f, None))
             .collect::<Result<Vec<_>, _>>()?;
         ds.store.load(&sources)?;
+        #[cfg(feature = "text")]
+        if args.text {
+            ds.store
+                .enable_text(sparkles::text::TextConfig::default())?;
+        }
     }
     let cfg = McpConfig {
         max_rows: args.mcp_max_rows,

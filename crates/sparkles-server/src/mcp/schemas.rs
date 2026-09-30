@@ -6,14 +6,21 @@ use super::McpConfig;
 use serde_json::{Value, json};
 
 /// Every tool this build knows, in `tools/list` order.
-pub const ALL_TOOLS: [&str; 6] = [
-    "list_datasets",
-    "describe_schema",
-    "sparql_query",
-    "explain_query",
-    "describe_resource",
-    "list_commits",
-];
+pub fn all_tools() -> Vec<&'static str> {
+    let mut v = vec![
+        "list_datasets",
+        "describe_schema",
+        "sparql_query",
+        "explain_query",
+        "describe_resource",
+        "list_commits",
+    ];
+    if cfg!(feature = "text") {
+        v.push("search_text");
+    }
+    v.push("similar_entities");
+    v
+}
 
 pub struct ToolDef {
     pub name: &'static str,
@@ -203,5 +210,49 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "next":{"type":["object","null"],"properties":{"before":{"type":"integer"}}}}}),
             ),
         ),
+        read(
+            "search_text",
+            "Full-text search",
+            "Ranked (BM25) keyword search over the indexed literals of a dataset. Query syntax: terms, \"phrases\", AND/OR, +required, -excluded. Only for datasets with textSearch=true in list_datasets.",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds(),
+                "query": {"type":"string","minLength":1,"maxLength":1000},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20},
+                "lang": {"type":"string"},
+                "limit": {"type":"integer","minimum":1,"maximum":200,"default":20},
+                "withTypes": {"type":"boolean","default":true},
+                "reasoning": rs(), "atCommit": at()}}),
+            Some(json!({"type":"object","required":["dataset","commit","hits","limited","prefixes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},
+                "hits":{"type":"array","items":{"type":"object","required":["s","score"],"properties":{
+                    "s":{"type":"string"},"score":{"type":["number","null"]},"text":{"type":"string"},
+                    "p":{"type":"string"},"label":{"type":"string"},"types":strings()}}},
+                "limited":{"type":"boolean"},
+                "prefixes":prefixes()}})),
+        ),
+        read(
+            "similar_entities",
+            "Find similar entities",
+            "Exact nearest-neighbour search over stored embedding literals (datatype spk:vector) of one predicate. Give an entity (use its stored vector) or a vector. Embedding predicates are marked vector=true in describe_schema. This tool does not create embeddings.",
+            json!({"type":"object","additionalProperties":false,"required":["predicate"],"properties":{
+                "dataset": ds(),
+                "predicate": {"type":"string","description":"Embedding predicate IRI"},
+                "entity": {"type":"string","description":"IRI whose single vector under `predicate` is the query"},
+                "vector": {"type":"array","items":{"type":"number"},"minItems":1,"maxItems":16384},
+                "k": {"type":"integer","minimum":1,"maximum":100,"default":10},
+                "metric": {"enum":["cosine","dot","euclidean"],"default":"cosine"},
+                "excludeSelf": {"type":"boolean","default":true},
+                "withLabels": {"type":"boolean","default":true},
+                "reasoning": rs(), "atCommit": at()}}),
+            Some(json!({"type":"object","required":["dataset","commit","metric","higherIsBetter","hits","prefixes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},
+                "metric":{"enum":["cosine","dot","euclidean"]},"higherIsBetter":{"type":"boolean"},
+                "hits":{"type":"array","items":{"type":"object","required":["iri","score"],"properties":{
+                    "iri":{"type":"string"},"score":{"type":["number","null"]},"label":{"type":"string"}}}},
+                "prefixes":prefixes()}})),
+        ),
     ]
+    .into_iter()
+    .filter(|t| all_tools().contains(&t.name))
+    .collect()
 }

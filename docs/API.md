@@ -757,13 +757,14 @@ section documents it here because it exposes the same engine.
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-service] [--timeout SECS] [--query-memory-mb N] [--max-rows N]
              [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
-             [--disable-tool NAME]... [--schema-max-entries N]
+             [--disable-tool NAME]... [--schema-max-entries N] [--text]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--loc [NAME=]PATH` | | a database directory (repeatable); the name defaults to the directory's name |
 | `--data FILE…`, `--name` | `data` | RDF files loaded into one in-memory dataset |
+| `--text` | off | index the `--data` dataset for `search_text` (a `--loc` database keeps the index it has, see `sparkles text-index`) |
 | `--timeout SECS` | `60` | largest `timeoutSeconds` a call may ask for (calls default to 30) |
 | `--query-memory-mb N` | `2048` | memory budget of every call's queries (`0`: unlimited) |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
@@ -805,6 +806,8 @@ open-world when SERVICE is allowed). Common arguments:
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`; `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. Warnings: `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows), `service-disabled` |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, prefixes}`; each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others |
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
+| `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`, `text` being the matched literal (escaped, ≤ 300 characters) and `types` at most 3. Only in builds with the `text` feature; a dataset without an index (`textSearch: false`) gives `text-disabled` |
+| `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: exact `spk:vectorSearch` over the stored `spk:vector` literals (it never computes embeddings). `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
@@ -866,6 +869,8 @@ A failed call is a result with `isError: true`, one text block `"<message>\nHint
 | `unknown-commit` | 404 / 410 | `atCommit` in the future / no longer held |
 | `stale-cursor` | 409 / 400 | a schema cursor whose snapshot is gone / a malformed cursor |
 | `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors |
+| `text-disabled` | 400 | `search_text` on a dataset without a full-text index |
+| `no-vectors` | 400 | `similar_entities`: no vectors under the predicate, a dimension mismatch, or an entity without a vector |
 | `text-unavailable`, `write-failed`, `unsupported` | 503, 503, 501 | as over HTTP |
 | `internal` | 500 | anything else ("internal error (request id …)", logged at ERROR) |
 

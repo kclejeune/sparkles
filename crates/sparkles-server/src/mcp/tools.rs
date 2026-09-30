@@ -44,23 +44,32 @@ pub fn run(
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
         "list_commits" => t.list_commits(args),
+        #[cfg(feature = "text")]
+        "search_text" => t.search_text(args),
+        "similar_entities" => t.similar_entities(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }
 
-struct Tools<'a> {
-    server: &'a McpServer,
-    call: &'a Call,
+pub(super) struct Tools<'a> {
+    pub(super) server: &'a McpServer,
+    pub(super) call: &'a Call,
 }
 
 /// Arguments as a typed struct; schema violations are `bad-argument`.
-fn parse<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, ToolError> {
+pub(super) fn parse<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, ToolError> {
     serde_json::from_value(Value::Object(args))
         .map_err(|e| ToolError::bad_argument(format!("invalid arguments: {e}")))
 }
 
 /// `name` within `min..=max` (default `default`).
-fn bounded(name: &str, v: Option<u64>, default: u64, min: u64, max: u64) -> Result<u64, ToolError> {
+pub(super) fn bounded(
+    name: &str,
+    v: Option<u64>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ToolError> {
     let v = v.unwrap_or(default);
     if v < min {
         return Err(ToolError::bad_argument(format!("{name} must be ≥ {min}")));
@@ -84,7 +93,7 @@ fn query_text(q: &str) -> Result<(), ToolError> {
 }
 
 /// The remaining time until `deadline` (`Error::Timeout` once it has passed).
-fn remaining(deadline: Instant) -> Result<Duration, Error> {
+pub(super) fn remaining(deadline: Instant) -> Result<Duration, Error> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|d| !d.is_zero())
@@ -93,7 +102,7 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
 
 /// The prefixes of a dataset: the well-known ones (as `/$/prefixes/{ds}`) and those
 /// seen at load or set on the dataset, which win.
-fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
+pub(super) fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
     let mut p = sparkles::io::standard_prefixes();
     p.extend(ds.store.prefixes());
     p
@@ -105,7 +114,7 @@ fn prefix_vec(p: &BTreeMap<String, String>) -> Vec<(String, String)> {
 
 /// An IRI argument: `<iri>`, a full IRI, a prefixed name, or (when allowed) a blank node
 /// label of this store (`_:b…`).
-fn parse_iri(
+pub(super) fn parse_iri(
     s: &str,
     prefixes: &BTreeMap<String, String>,
     allow_bnode: bool,
@@ -338,11 +347,15 @@ struct ListCommitsArgs {
 }
 
 impl Tools<'_> {
-    fn cfg(&self) -> &super::McpConfig {
+    pub(super) fn cfg(&self) -> &super::McpConfig {
         self.server.cfg()
     }
 
-    fn ctx<'n>(&'n self, prefix_names: &'n [&'n str], timeout_secs: f64) -> ErrorContext<'n> {
+    pub(super) fn ctx<'n>(
+        &'n self,
+        prefix_names: &'n [&'n str],
+        timeout_secs: f64,
+    ) -> ErrorContext<'n> {
         ErrorContext {
             timeout_secs,
             max_timeout_secs: self.cfg().max_timeout.as_secs_f64(),
@@ -351,7 +364,7 @@ impl Tools<'_> {
         }
     }
 
-    fn timeout(&self, secs: Option<f64>) -> Result<Duration, ToolError> {
+    pub(super) fn timeout(&self, secs: Option<f64>) -> Result<Duration, ToolError> {
         let max = self.cfg().max_timeout;
         match secs {
             None => Ok(self.cfg().default_timeout()),
@@ -367,11 +380,11 @@ impl Tools<'_> {
 
     /// Whether a call reads the materialized inferences (as the HTTP `reasoning`
     /// parameter: when the dataset has them and the argument is not false).
-    fn reasoning(ds: &Dataset, arg: Option<bool>) -> bool {
+    pub(super) fn reasoning(ds: &Dataset, arg: Option<bool>) -> bool {
         arg != Some(false) && ds.reasoning.read().is_some()
     }
 
-    fn query_options(
+    pub(super) fn query_options(
         &self,
         reasoning: bool,
         deadline: Instant,
@@ -975,16 +988,7 @@ impl Tools<'_> {
             let own = q.own_labels().map_err(|e| ctx.engine(e))?;
             labels.insert(resource.to_string(), own);
         }
-        let label_of = |t: &Term| -> Option<String> {
-            let key = match t {
-                Term::NamedNode(n) => n.as_str().to_string(),
-                Term::BlankNode(_) => t.to_string(),
-                _ => return None,
-            };
-            let v = labels.get(&key)?;
-            let refs: Vec<(usize, &Literal)> = v.iter().map(|(r, l)| (*r, l)).collect();
-            render::choose_ranked(&refs, &lang)
-        };
+        let label_of = |t: &Term| label_of(&labels, t, &lang);
         let mut out = json!({
             "dataset": ds.name,
             "commit": snap.commit,
@@ -1391,67 +1395,94 @@ impl Queries<'_> {
             .collect())
     }
 
-    fn label_values() -> String {
-        render::LABEL_PREDICATES
-            .iter()
-            .map(|p| format!("<{p}>"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn rank(p: &Term) -> Option<usize> {
-        match p {
-            Term::NamedNode(n) => render::LABEL_PREDICATES
-                .iter()
-                .position(|x| *x == n.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Label candidates of IRIs, keyed by IRI: `(predicate rank, literal)`.
-    fn labels(&self, iris: &[&NamedNode]) -> Result<HashMap<String, Vec<(usize, Literal)>>, Error> {
-        let mut out: HashMap<String, Vec<(usize, Literal)>> = HashMap::new();
-        let unique: BTreeSet<&str> = iris.iter().map(|n| n.as_str()).collect();
-        if unique.is_empty() {
-            return Ok(out);
-        }
-        // IRIs are serialized by oxrdf (validated, `<…>`), never copied from input text
-        let values: Vec<String> = unique
-            .iter()
-            .map(|i| NamedNode::new_unchecked(*i).to_string())
-            .collect();
-        let q = format!(
-            "SELECT ?x ?lp ?l WHERE {{ VALUES ?lp {{ {} }} VALUES ?x {{ {} }} ?x ?lp ?l }} LIMIT 10000",
-            Self::label_values(),
-            values.join(" ")
-        );
-        let mut opts = self.opts.clone();
-        opts.timeout = Some(remaining(self.deadline)?);
-        for row in sparql::query(self.snap.clone(), &q, &opts)?.rows() {
-            if let [Some(Term::NamedNode(x)), Some(p), Some(Term::Literal(l))] = row.as_slice()
-                && let Some(rank) = Self::rank(p)
-            {
-                out.entry(x.as_str().to_string())
-                    .or_default()
-                    .push((rank, l.clone()));
-            }
-        }
-        Ok(out)
+    /// Label candidates of IRIs, keyed by IRI.
+    fn labels(&self, iris: &[&NamedNode]) -> Result<Labels, Error> {
+        labels_of(self.snap, &self.opts, self.deadline, iris)
     }
 
     /// Label candidates of the resource itself (for a blank node).
     fn own_labels(&self) -> Result<Vec<(usize, Literal)>, Error> {
         let q = format!(
             "SELECT ?lp ?l WHERE {{ VALUES ?lp {{ {} }} ?r ?lp ?l }} LIMIT 1000",
-            Self::label_values()
+            label_values()
         );
         Ok(self
             .select(&q, Vec::new())?
             .into_iter()
             .filter_map(|row| match row.as_slice() {
-                [Some(p), Some(Term::Literal(l))] => Self::rank(p).map(|r| (r, l.clone())),
+                [Some(p), Some(Term::Literal(l))] => label_rank(p).map(|r| (r, l.clone())),
                 _ => None,
             })
             .collect())
     }
+}
+
+/// The label predicates as a `VALUES` list.
+fn label_values() -> String {
+    render::LABEL_PREDICATES
+        .iter()
+        .map(|p| format!("<{p}>"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn label_rank(p: &Term) -> Option<usize> {
+    match p {
+        Term::NamedNode(n) => render::LABEL_PREDICATES
+            .iter()
+            .position(|x| *x == n.as_str()),
+        _ => None,
+    }
+}
+
+/// Label candidates keyed by IRI (or blank node label): `(predicate rank, literal)`.
+pub(super) type Labels = HashMap<String, Vec<(usize, Literal)>>;
+
+/// The label candidates of `iris`, in one `VALUES` query.
+pub(super) fn labels_of(
+    snap: &Arc<Snapshot>,
+    opts: &QueryOptions,
+    deadline: Instant,
+    iris: &[&NamedNode],
+) -> Result<Labels, Error> {
+    let mut out = Labels::new();
+    let unique: BTreeSet<&str> = iris.iter().map(|n| n.as_str()).collect();
+    if unique.is_empty() {
+        return Ok(out);
+    }
+    // IRIs are serialized by oxrdf (validated, `<…>`), never copied from input text
+    let values: Vec<String> = unique
+        .iter()
+        .map(|i| NamedNode::new_unchecked(*i).to_string())
+        .collect();
+    let q = format!(
+        "SELECT ?x ?lp ?l WHERE {{ VALUES ?lp {{ {} }} VALUES ?x {{ {} }} ?x ?lp ?l }} LIMIT 10000",
+        label_values(),
+        values.join(" ")
+    );
+    let mut opts = opts.clone();
+    opts.timeout = Some(remaining(deadline)?);
+    opts.initial_bindings = Vec::new();
+    for row in sparql::query(snap.clone(), &q, &opts)?.rows() {
+        if let [Some(Term::NamedNode(x)), Some(p), Some(Term::Literal(l))] = row.as_slice()
+            && let Some(rank) = label_rank(p)
+        {
+            out.entry(x.as_str().to_string())
+                .or_default()
+                .push((rank, l.clone()));
+        }
+    }
+    Ok(out)
+}
+
+/// The chosen label of `t` (§ labels: first predicate with a label, preferred language).
+pub(super) fn label_of(labels: &Labels, t: &Term, lang: &str) -> Option<String> {
+    let key = match t {
+        Term::NamedNode(n) => n.as_str().to_string(),
+        Term::BlankNode(_) => t.to_string(),
+        _ => return None,
+    };
+    let v = labels.get(&key)?;
+    let refs: Vec<(usize, &Literal)> = v.iter().map(|(r, l)| (*r, l)).collect();
+    render::choose_ranked(&refs, lang)
 }
