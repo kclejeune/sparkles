@@ -65,6 +65,7 @@ function info(ds) {
     },
     quads: ds.store.size,
     reasoning: ds.reasoning,
+    ...(ds.origin ? { origin: ds.origin } : {}),
   };
 }
 
@@ -669,6 +670,29 @@ const server = http.createServer(async (req, res) => {
             break;
           }
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          if (extra === 'clone' && req.method === 'POST') {
+            const p = await params(req, url);
+            const target = String(p.get('name') ?? '');
+            if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(target))
+              return fail(res, 400, `invalid dataset name '${target}'`);
+            if (datasets.has(target)) return fail(res, 409, `dataset /${target} already exists`);
+            const task = startTask('clone', ds, () => {
+              const c = makeDataset(target, 'persistent');
+              for (const q of ds.store.match()) c.store.add(q);
+              c.baseQuads = c.store.size;
+              c.reasoning = p.get('inferences') === 'drop' ? null : ds.reasoning;
+              c.origin = {
+                originFormat: 1,
+                clonedAt: new Date().toISOString(),
+                source: { name: ds.name, version: 0, generation: 'gen-0001', quads: ds.store.size },
+                forkedFrom: { id: '00000000-0000-4000-8000-000000000000', seq: 0 },
+                inferences: c.reasoning ? 'copy' : 'drop',
+              };
+              return `cloned /${ds.name} at commit 0 (${c.store.size} quads) into /${target}`;
+            });
+            task.target = target;
+            return send(res, 202, task);
+          }
           if (req.method === 'GET') return send(res, 200, info(ds));
           if (req.method === 'DELETE') {
             datasets.delete(name);

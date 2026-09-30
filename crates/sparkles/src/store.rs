@@ -11,7 +11,9 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
-use crate::commit::{self, Catalog, CommitInfo, CommitKind, CommitPage, CommitRange, Receipt};
+use crate::commit::{
+    self, Catalog, CommitInfo, CommitKind, CommitPage, CommitRange, ForkedFrom, Receipt,
+};
 use crate::error::{Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::index::{Block, BlockCache, Key, Perm, PermIndex, pad};
@@ -28,6 +30,7 @@ use std::io::{BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Immutable base index generation.
 pub struct Generation {
@@ -1225,36 +1228,7 @@ impl Store {
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = w.next_bnode;
         let builder = Builder::new(&dir, bopts)?;
-        if !snap.is_empty() || !extra_quads.is_empty() {
-            let scope = builder.new_scope();
-            let mut enc = builder.encoder(scope);
-            let mut keys: [Vec<u8>; 4] = Default::default();
-            let mut push = |q: &[Id; 4]| -> Result<()> {
-                for (i, id) in q.iter().enumerate() {
-                    keys[i].clear();
-                    if matches!(id.tag(), Tag::Vocab | Tag::Delta) {
-                        keys[i].extend_from_slice(
-                            &snap
-                                .key(*id)
-                                .ok_or_else(|| Error::Corrupt(format!("dangling id {id:?}")))?,
-                        );
-                    }
-                }
-                let slot = |i: usize| {
-                    if keys[i].is_empty() {
-                        Slot::Id(q[i])
-                    } else {
-                        Slot::Key(&keys[i])
-                    }
-                };
-                enc.push_slots([slot(0), slot(1), slot(2), slot(3)])
-            };
-            snap.for_each_quad(&mut push)?;
-            for q in extra_quads {
-                push(q)?;
-            }
-            enc.flush()?;
-        }
+        write_snapshot(&builder, snap, |_| Ok(true), extra_quads)?;
         for s in extra {
             builder.add_source(s)?;
         }
@@ -1334,6 +1308,143 @@ impl Store {
         Ok((meta.quads.saturating_sub(before), receipt))
     }
 
+    /// Build a new, independent database in `dir` (absent or empty) from one consistent
+    /// snapshot of this store: every quad (except those in `opts.exclude_graphs`) in a
+    /// freshly built generation `gen-0001` with an empty delta, the prefixes, and a new
+    /// dataset id whose root commit records this store's id and the snapshot's commit as
+    /// `forkedFrom`. Blank nodes keep their ids (`_:b<hex>` labels), and the blank-node
+    /// counter is carried over, so new blank nodes never collide with copied ones.
+    ///
+    /// The writer lock is held only to capture the snapshot; this store is never written.
+    /// On any error `dir` is left as it was found (removed, or emptied).
+    pub fn clone_to(&self, dir: &Path, opts: &CloneOptions) -> Result<CloneReport> {
+        let t0 = std::time::Instant::now();
+        let existed = dir.exists();
+        if existed && std::fs::read_dir(dir)?.next().is_some() {
+            return Err(Error::Invalid(format!(
+                "{} exists and is not empty",
+                dir.display()
+            )));
+        }
+        // the snapshot and the blank-node counter together: no commit falls in between
+        let (snap, next_bnode) = {
+            let w = self.writer.lock();
+            (self.snapshot(), w.next_bnode)
+        };
+        std::fs::create_dir_all(dir)?;
+        let mut guard = CleanDir {
+            dir,
+            remove: !existed,
+            armed: true,
+        };
+        let excluded: std::collections::HashSet<u64> = opts
+            .exclude_graphs
+            .iter()
+            .filter_map(|g| snap.lookup_iri(g.as_str()))
+            .map(|g| g.0)
+            .collect();
+        let report = |f: f32, msg: &str| {
+            if let Some(p) = &opts.progress {
+                p(f, msg);
+            }
+        };
+        let name = "gen-0001";
+        let gdir = dir.join(name);
+        let mut bopts = self.opts.build.clone();
+        bopts.first_bnode = next_bnode;
+        let builder = Builder::new(&gdir, bopts)?;
+        let total = snap.len().max(1);
+        let (mut seen, mut graphs, mut last_graph) = (0u64, 0u64, None);
+        report(0.0, "copying quads");
+        write_snapshot(
+            &builder,
+            &snap,
+            |q| {
+                seen += 1;
+                if seen % 65_536 == 0 {
+                    if opts
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Relaxed))
+                    {
+                        return Err(Error::Cancelled);
+                    }
+                    report(0.7 * seen as f32 / total as f32, "copying quads");
+                }
+                if excluded.contains(&q[3].0) {
+                    return Ok(false);
+                }
+                if last_graph != Some(q[3]) {
+                    graphs += 1;
+                    last_graph = Some(q[3]);
+                }
+                Ok(true)
+            },
+            &[],
+        )?;
+        report(0.7, "building indexes");
+        let prefixes = self.prefixes();
+        builder.add_prefixes(prefixes.clone());
+        let meta = builder.finish()?;
+        // a new lineage: its own id and root commit, forked from the snapshot
+        let id = uuid::Uuid::new_v4();
+        let now = commit::now_ms();
+        let root = CommitInfo {
+            seq: 0,
+            timestamp_ms: now,
+            kind: CommitKind::Create,
+            inserted: meta.quads,
+            deleted: 0,
+            quads: meta.quads,
+            generation: 1,
+            bulk: true,
+            exact: true,
+            reconstructed: false,
+        };
+        let forked_from = ForkedFrom {
+            id: self.dataset_id,
+            seq: snap.commit,
+        };
+        write_synced(
+            &gdir.join("commit.json"),
+            &commit::gen_commit_bytes(id, "clone", &root),
+        )?;
+        File::create(gdir.join("wal.log"))?.sync_all()?;
+        sync_dir(&gdir)?;
+        write_atomic(
+            &dir.join("dataset.json"),
+            &commit::clone_dataset_file_bytes(id, now, forked_from),
+        )?;
+        Catalog::create(&dir.join("commits.bin"), id, root)?;
+        if !prefixes.is_empty() {
+            write_atomic(
+                &dir.join("prefixes.json"),
+                &serde_json::to_vec_pretty(&prefixes).unwrap(),
+            )?;
+        }
+        // CURRENT last: the commit point of the new database
+        write_atomic(&dir.join("CURRENT"), name.as_bytes())?;
+        sync_dir(dir)?;
+        guard.armed = false;
+        report(1.0, "done");
+        Ok(CloneReport {
+            dataset_id: id,
+            forked_from,
+            version: snap.version,
+            generation: snap.generation.name.clone(),
+            source_quads: snap.len(),
+            quads: meta.quads,
+            graphs,
+            millis: t0.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to).
+    pub fn forked_from(&self) -> Option<ForkedFrom> {
+        let root = self.root.as_ref()?;
+        commit::read_forked_from(root).ok().flatten()
+    }
+
     /// Write all quads as N-Quads to `w`.
     pub fn dump_nquads(&self, w: impl Write) -> Result<u64> {
         let snap = self.snapshot();
@@ -1365,6 +1476,109 @@ impl Store {
         match &self.root {
             Some(r) => dir_size(r),
             None => 0,
+        }
+    }
+}
+
+/// Push the quads of `snap` for which `keep` returns true, then `extra` (store ids of
+/// `snap`), into `builder`. Vocabulary ids are passed as their keys; inline and
+/// blank-node ids pass through unchanged, which keeps blank-node identity. Triple-term
+/// keys embed their blank-node payloads, so blank nodes inside them keep it too.
+fn write_snapshot(
+    builder: &Builder,
+    snap: &Snapshot,
+    mut keep: impl FnMut(&[Id; 4]) -> Result<bool>,
+    extra: &[[Id; 4]],
+) -> Result<()> {
+    if snap.is_empty() && extra.is_empty() {
+        return Ok(());
+    }
+    let scope = builder.new_scope();
+    let mut enc = builder.encoder(scope);
+    let mut keys: [Vec<u8>; 4] = Default::default();
+    let mut push = |q: &[Id; 4]| -> Result<()> {
+        for (i, id) in q.iter().enumerate() {
+            keys[i].clear();
+            if matches!(id.tag(), Tag::Vocab | Tag::Delta) {
+                keys[i].extend_from_slice(
+                    &snap
+                        .key(*id)
+                        .ok_or_else(|| Error::Corrupt(format!("dangling id {id:?}")))?,
+                );
+            }
+        }
+        let slot = |i: usize| {
+            if keys[i].is_empty() {
+                Slot::Id(q[i])
+            } else {
+                Slot::Key(&keys[i])
+            }
+        };
+        enc.push_slots([slot(0), slot(1), slot(2), slot(3)])
+    };
+    snap.for_each_quad(|q| if keep(q)? { push(q) } else { Ok(()) })?;
+    for q in extra {
+        push(q)?;
+    }
+    enc.flush()
+}
+
+/// What [`Store::clone_to`] leaves out, and how it reports progress.
+#[derive(Clone, Default)]
+pub struct CloneOptions {
+    /// graphs to leave out (e.g. the materialized inferences)
+    pub exclude_graphs: Vec<NamedNode>,
+    /// set to `true` to cancel (checked every 65536 quads)
+    pub cancel: Option<Arc<AtomicBool>>,
+    pub progress: Option<ProgressFn>,
+}
+
+/// Progress callback: (fraction done in `[0, 1]`, message).
+pub type ProgressFn = Arc<dyn Fn(f32, &str) + Send + Sync>;
+
+/// Outcome of [`Store::clone_to`].
+#[derive(Clone, Debug)]
+pub struct CloneReport {
+    /// the new database's dataset id
+    pub dataset_id: uuid::Uuid,
+    /// this store's id and the commit of the copied snapshot
+    pub forked_from: ForkedFrom,
+    /// snapshot version and generation of the source
+    pub version: u64,
+    pub generation: String,
+    /// quads in the source snapshot
+    pub source_quads: u64,
+    /// quads in the clone (fewer when graphs were excluded)
+    pub quads: u64,
+    /// graphs in the clone, the default graph included when it has quads
+    pub graphs: u64,
+    pub millis: u64,
+}
+
+/// Removes (or empties) a directory on drop unless disarmed.
+struct CleanDir<'a> {
+    dir: &'a Path,
+    /// remove the directory itself (it did not exist before)
+    remove: bool,
+    armed: bool,
+}
+
+impl Drop for CleanDir<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.remove {
+            let _ = std::fs::remove_dir_all(self.dir);
+        } else if let Ok(rd) = std::fs::read_dir(self.dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let _ = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+            }
         }
     }
 }

@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
 mod alloc;
+mod clone;
 mod http;
 mod reasoning;
 #[cfg(feature = "shacl")]
@@ -138,6 +139,19 @@ enum Cmd {
         loc: PathBuf,
         #[arg(long, default_value = "./backups")]
         out: PathBuf,
+    },
+    /// Copy a database into a new, independent one (same data and blank nodes, new
+    /// dataset id)
+    Clone {
+        /// Source database directory
+        #[arg(long)]
+        loc: PathBuf,
+        /// Destination directory (must not exist, or be empty)
+        #[arg(long)]
+        to: PathBuf,
+        /// `copy` the materialized inferences and reasoning status, or `drop` them
+        #[arg(long, default_value = "copy")]
+        inferences: String,
     },
     /// Print database statistics
     Stats {
@@ -551,6 +565,45 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "db".into());
             let p = store.backup(&out, &name)?;
             eprintln!("backup written to {}", p.display());
+            Ok(())
+        }
+        Cmd::Clone {
+            loc,
+            to,
+            inferences,
+        } => {
+            let inferences = clone::Inferences::parse(&inferences).with_context(|| {
+                format!("--inferences must be copy or drop, not '{inferences}'")
+            })?;
+            if !loc.join("CURRENT").exists() {
+                bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
+            }
+            if to.exists() && std::fs::read_dir(&to)?.next().is_some() {
+                bail!("{} exists and is not empty", to.display());
+            }
+            let store = Store::open(&loc, opts)?;
+            let t = Instant::now();
+            let mut tmp = to.as_os_str().to_owned();
+            tmp.push(format!(".clone-tmp-{}", std::process::id()));
+            let r = clone::clone_into(
+                &store,
+                &loc.display().to_string(),
+                state::read_reasoning_file(&loc),
+                std::path::Path::new(&tmp),
+                &to,
+                inferences,
+                None,
+            )?;
+            eprintln!(
+                "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",
+                loc.display(),
+                r.forked_from.seq,
+                r.quads,
+                r.graphs,
+                if r.graphs == 1 { "" } else { "s" },
+                to.display(),
+                t.elapsed().as_secs_f64()
+            );
             Ok(())
         }
         Cmd::Stats { loc } => {

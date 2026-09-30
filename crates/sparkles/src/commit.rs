@@ -284,6 +284,50 @@ struct DatasetFile {
     id: uuid::Uuid,
     created: String,
     origin: String,
+    /// the dataset and commit a clone was made from
+    #[serde(
+        default,
+        rename = "forkedFrom",
+        skip_serializing_if = "Option::is_none"
+    )]
+    forked_from: Option<ForkedFrom>,
+}
+
+/// Where a cloned dataset came from: the source's dataset id and the commit (`seq`) of
+/// the snapshot it copied. The clone is a new lineage with its own commit sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkedFrom {
+    pub id: uuid::Uuid,
+    pub seq: u64,
+}
+
+/// `forkedFrom` of `<root>/dataset.json`, if the database is a clone.
+pub(crate) fn read_forked_from(root: &Path) -> Result<Option<ForkedFrom>> {
+    match std::fs::read(root.join("dataset.json")) {
+        Ok(b) => {
+            let f: DatasetFile = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
+            Ok(f.forked_from)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `dataset.json` of a clone.
+pub(crate) fn clone_dataset_file_bytes(
+    id: uuid::Uuid,
+    created_ms: i64,
+    from: ForkedFrom,
+) -> Vec<u8> {
+    serde_json::to_vec_pretty(&DatasetFile {
+        format: 1,
+        id,
+        created: rfc3339_ms(created_ms),
+        origin: "clone".to_string(),
+        forked_from: Some(from),
+    })
+    .unwrap()
 }
 
 /// `<root>/dataset.json`: the dataset id, if the database has one yet.
@@ -305,6 +349,7 @@ pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) 
         id,
         created: rfc3339_ms(created_ms),
         origin: origin.to_string(),
+        forked_from: None,
     })
     .unwrap()
 }
@@ -317,7 +362,7 @@ struct GenCommitFile {
     format: u32,
     dataset_id: uuid::Uuid,
     base_seq: u64,
-    /// `create`, `baseline`, `bulk` or `compaction`
+    /// `create`, `baseline`, `bulk`, `compaction` or `clone`
     origin: String,
     commit: CommitJson,
 }

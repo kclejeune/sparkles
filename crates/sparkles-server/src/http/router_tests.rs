@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+mod clone;
 #[cfg(feature = "reasoning")]
 mod reasoning;
 

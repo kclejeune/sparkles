@@ -37,6 +37,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/server", get(server_info))
         .route("/$/datasets", get(list_datasets).post(create_dataset))
         .route("/$/datasets/{ds}", get(get_dataset).delete(delete_dataset))
+        .route("/$/datasets/{ds}/clone", post(clone_dataset))
         .route("/$/stats/{ds}", get(stats))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
@@ -1020,7 +1021,7 @@ fn dataset_info(ds: &Dataset) -> J {
         endpoints["shacl"] = format!("/{n}/shacl").into();
     }
     let head = ds.store.head_commit();
-    json!({
+    let mut info = json!({
         "name": n,
         "type": ds.kind,
         "endpoints": endpoints,
@@ -1029,7 +1030,15 @@ fn dataset_info(ds: &Dataset) -> J {
         "id": ds.store.dataset_id(),
         "head": head.seq,
         "modified": head.timestamp(),
-    })
+    });
+    // a clone: where it was forked from
+    if let Some(f) = ds.store.forked_from() {
+        info["forkedFrom"] = json!(f);
+    }
+    if let Some(o) = ds.store.root().and_then(crate::clone::read_origin) {
+        info["origin"] = o;
+    }
+    info
 }
 
 async fn server_info(State(st): St) -> Json<J> {
@@ -1107,9 +1116,101 @@ async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes
             format!("dataset /{name} already exists"),
         ));
     }
+    if let Some(t) = st.reserved_by(&name) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("dataset /{name} is being created by task {t}"),
+        ));
+    }
     let st2 = st.clone();
     let ds = blocking(move || Ok(st2.create(&name, kind)?)).await?;
     Ok((StatusCode::CREATED, Json(dataset_info(&ds))).into_response())
+}
+
+/// `POST /$/datasets/{ds}/clone?name=NEW[&inferences=copy|drop]` (query, form or JSON
+/// body): copy one snapshot of the dataset into a new persistent dataset, as a task.
+async fn clone_dataset(
+    State(st): St,
+    Path(source): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let src = dataset(&st, &source)?;
+    let mut params = Params::from_query(&uri);
+    let (name, inferences, kind) =
+        if content_type(&headers) == "application/json" && !body.is_empty() {
+            let v: J = serde_json::from_slice(&body)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let get = |k: &str| v[k].as_str().or_else(|| params.get(k)).map(str::to_string);
+            (get("name"), get("inferences"), get("type"))
+        } else {
+            params.extend_form(&body);
+            let get = |k: &str| params.get(k).map(str::to_string);
+            (get("name"), get("inferences"), get("type"))
+        };
+    let name = name.unwrap_or_default().trim_start_matches('/').to_string();
+    if !crate::state::valid_name(&name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid dataset name '{name}'"),
+        ));
+    }
+    if kind.as_deref().is_some_and(|k| k == "mem") {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "clone into an in-memory dataset is not supported yet",
+        ));
+    }
+    let inferences = match inferences.as_deref() {
+        None => crate::clone::Inferences::Copy,
+        Some(i) => crate::clone::Inferences::parse(i).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("inferences must be copy or drop, not '{i}'"),
+            )
+        })?,
+    };
+    let id = st.next_task_id();
+    let reservation = st
+        .reserve(&name, &id)
+        .map_err(|m| err(StatusCode::CONFLICT, m))?;
+    let databases = st.data_dir.join("databases");
+    let tmp = databases.join(format!(".clone-{name}-{id}"));
+    let dst = databases.join(&name);
+    let st2 = st.clone();
+    let target = name.clone();
+    let task = st.start_task_as(id, "clone", &source, Some(&name), move |h| {
+        let h2 = h.clone();
+        let progress: sparkles::store::ProgressFn =
+            Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
+        let reasoning = src.reasoning.read().clone();
+        let rep = crate::clone::clone_into(
+            &src.store,
+            &src.name,
+            reasoning,
+            &tmp,
+            &dst,
+            inferences,
+            Some(progress),
+        )?;
+        h.progress(0.97, "registering");
+        st2.adopt(reservation)?;
+        Ok(format!(
+            "cloned /{} at commit {} ({} quads) into /{target}",
+            src.name, rep.forked_from.seq, rep.quads
+        ))
+    });
+    let location = format!("/$/datasets/{name}");
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, location)],
+        Json(task),
+    )
+        .into_response())
 }
 
 async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {

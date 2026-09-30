@@ -18,6 +18,10 @@ export type DatasetInfo = {
     stale?: boolean | null;
     commitsSince?: number | null;
   };
+  /** Clones: the source dataset id and commit this dataset was copied from. */
+  forkedFrom?: { id: string; seq: number };
+  /** Clones: the source and when the copy was made (`origin.json`). */
+  origin?: DatasetOrigin;
 };
 
 export type ServerInfo = {
@@ -48,11 +52,13 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
 };
 
-export type TaskKind = 'compact' | 'backup' | 'reason' | 'load';
+export type TaskKind = 'compact' | 'backup' | 'reason' | 'load' | 'clone';
 export type Task = {
   id: string;
   kind: TaskKind;
   dataset: string;
+  /** The dataset a task creates (clone). */
+  target?: string;
   state: 'running' | 'done' | 'failed';
   startedAt: string;
   finishedAt?: string;
@@ -584,3 +590,17 @@ export function diagnostics(ds: string, opts: DiagnosticsOptions = {}): Promise<
     signal: opts.signal,
   });
 }
+
+// --- clone ------------------------------------------------------------------------
+
+export type DatasetOrigin = {
+  originFormat: 1;
+  clonedAt: string;
+  source: { name: string; path?: string; version: number; generation: string; quads: number };
+  forkedFrom: { id: string; seq: number };
+  inferences: 'copy' | 'drop';
+};
+
+/** Copy one snapshot of `ds` into the new persistent dataset `name` (a task). */
+export const cloneDataset = (ds: string, name: string, inferences: 'copy' | 'drop' = 'copy') =>
+  json<Task>(`/$/datasets/${enc(ds)}/clone`, jsonBody({ name, inferences }));

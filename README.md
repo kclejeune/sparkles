@@ -80,7 +80,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`), operating on the database directory directly | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `clone`, `stats`, `infer`, `shacl`), operating on the database directory directly | ✅ |
+| Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`): same quads and blank-node ids, new dataset id with `forkedFrom`, inferences copied or dropped | ✅ |
 | Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
 | Inference freshness: the commit inferences were made at, `stale` / `commitsSince` in `GET /$/reason/{ds}`, dataset info, `/$/stats` and a `Sparkles-Inferences` header; re-run of the recorded profile; opt-in automatic re-runs (`serve --auto-reason`) | ✅ |
@@ -392,6 +393,7 @@ sparkles update  --loc db 'INSERT DATA {...}'
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
 sparkles backup  --loc db --out backups/
+sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles infer   --loc db --profile owl-rl    # materialize inferences

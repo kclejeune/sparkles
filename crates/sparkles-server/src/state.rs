@@ -104,6 +104,8 @@ pub struct AppState {
     pub allow_service: bool,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
+    /// dataset names being created by a task (clone), with the task id
+    reserved: Mutex<BTreeMap<String, String>>,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -146,7 +148,11 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    sync_dir(path.parent().unwrap_or(Path::new(".")))
+    sync_dir(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
 }
 
 /// Flush a directory's entries to stable storage (a no-op where directories cannot be
@@ -204,8 +210,17 @@ impl AppState {
             read_only: false,
             allow_service: true,
             auto_reason: None,
+            reserved: Mutex::new(BTreeMap::new()),
             manage: Mutex::new(()),
         };
+        // clones that were being built when the server stopped are never registered
+        for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
+            if e.file_name().to_string_lossy().starts_with(".clone-") {
+                tracing::info!("removing unfinished clone {}", e.path().display());
+                std::fs::remove_dir_all(e.path())
+                    .with_context(|| format!("removing {}", e.path().display()))?;
+            }
+        }
         let reg_path = data_dir.join("config.json");
         if reg_path.exists() {
             let reg: Registry = serde_json::from_slice(&std::fs::read(&reg_path)?)
@@ -291,6 +306,9 @@ impl AppState {
         if self.datasets.read().contains_key(name) {
             bail!("dataset '{name}' already exists");
         }
+        if let Some(t) = self.reserved_by(name) {
+            bail!("dataset /{name} is being created by task {t}");
+        }
         let ds = self.open_dataset(name, kind, None)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
         if let Err(e) = self.save_registry_locked() {
@@ -309,6 +327,9 @@ impl AppState {
         let _guard = self.manage.lock();
         if self.datasets.read().contains_key(name) {
             bail!("dataset '{name}' already exists");
+        }
+        if let Some(t) = self.reserved_by(name) {
+            bail!("dataset /{name} is being created by task {t}");
         }
         let ds = self.open_dataset(name, kind, loc)?;
         let ds = Arc::new(Dataset {
@@ -339,7 +360,67 @@ impl AppState {
         Ok(true)
     }
 
+    /// The task creating dataset `name`, if one is.
+    pub fn reserved_by(&self, name: &str) -> Option<String> {
+        self.reserved.lock().get(name).cloned()
+    }
+
+    /// Reserve the name of a dataset that task `task` will create. Fails (with the
+    /// message for a `409`) when the name is registered, reserved, or its directory
+    /// exists. The name is released when the reservation is dropped.
+    pub fn reserve(self: &Arc<Self>, name: &str, task: &str) -> Result<Reservation, String> {
+        let _guard = self.manage.lock();
+        if self.datasets.read().contains_key(name) {
+            return Err(format!("dataset /{name} already exists"));
+        }
+        let mut reserved = self.reserved.lock();
+        if let Some(t) = reserved.get(name) {
+            return Err(format!("dataset /{name} is being created by task {t}"));
+        }
+        if self.data_dir.join("databases").join(name).exists() {
+            return Err(format!(
+                "directory databases/{name} exists but is not a registered dataset; remove it first"
+            ));
+        }
+        reserved.insert(name.to_string(), task.to_string());
+        Ok(Reservation {
+            state: self.clone(),
+            name: name.to_string(),
+        })
+    }
+
+    /// Register the persistent database now in `databases/{name}` under a reserved name
+    /// and persist the registry. On failure the directory is removed.
+    pub fn adopt(&self, reservation: Reservation) -> Result<Arc<Dataset>> {
+        let name = reservation.name.clone();
+        let _guard = self.manage.lock();
+        let dir = self.data_dir.join("databases").join(&name);
+        let ds = match self.open_dataset(&name, DbType::Persistent, None) {
+            Ok(ds) => ds,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
+        self.datasets.write().insert(name.clone(), ds.clone());
+        if let Err(e) = self.save_registry_locked() {
+            self.datasets.write().remove(&name);
+            drop(ds);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        drop(reservation);
+        Ok(ds)
+    }
+
     // ----------------------------------------------------------------- tasks ------
+
+    /// A new task id (for a task started with [`start_task_as`](Self::start_task_as)).
+    pub fn next_task_id(&self) -> String {
+        self.task_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
+    }
 
     pub fn start_task(
         self: &Arc<Self>,
@@ -347,15 +428,24 @@ impl AppState {
         dataset: &str,
         work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
     ) -> Task {
-        let id = self
-            .task_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
+        self.start_task_as(self.next_task_id(), kind, dataset, None, work)
+    }
+
+    /// Start a task with an id from [`next_task_id`](Self::next_task_id); `target` is the
+    /// dataset it creates, if any.
+    pub fn start_task_as(
+        self: &Arc<Self>,
+        id: String,
+        kind: &str,
+        dataset: &str,
+        target: Option<&str>,
+        work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
+    ) -> Task {
         let task = Task {
             id: id.clone(),
             kind: kind.to_string(),
             dataset: dataset.to_string(),
-            target: None,
+            target: target.map(str::to_string),
             state: "running".into(),
             started_at: now(),
             finished_at: None,
@@ -394,6 +484,18 @@ impl AppState {
             }
         });
         task
+    }
+}
+
+/// A reserved dataset name (see [`AppState::reserve`]), released on drop.
+pub struct Reservation {
+    state: Arc<AppState>,
+    name: String,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.state.reserved.lock().remove(&self.name);
     }
 }
 

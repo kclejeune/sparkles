@@ -22,6 +22,7 @@ addressed as `/{ds}`. JSON responses use `application/json`.
 | POST   | `/$/datasets`                | Create. Form or JSON body: `dbName`, `dbType` = `persistent` \| `mem`. `201` on success, `409` if exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | DELETE | `/$/datasets/{ds}`           | Remove dataset (and its files). |
+| POST   | `/$/datasets/{ds}/clone`     | Copy the dataset into a new persistent dataset. See [Clone](#clone). `202` with a `Task`. |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
 | POST   | `/$/backup/{ds}`             | Write gzipped N-Quads dump to `<data>/backups/`. Returns `Task`. |
@@ -46,6 +47,8 @@ type DatasetInfo = {
     stale: boolean | null;       // null: unknown (see ReasoningStatus)
     commitsSince: number | null;
   };
+  forkedFrom?: { id: string; seq: number };   // clones: source dataset id and copied commit
+  origin?: DatasetOrigin;                     // clones: origin.json (see Clone)
 };
 
 type DatasetStats = {
@@ -65,11 +68,53 @@ type DatasetStats = {
 };
 
 type Task = {
-  id: string; kind: "compact" | "backup" | "reason" | "load";
-  dataset: string; state: "running" | "done" | "failed";
+  id: string; kind: "compact" | "backup" | "reason" | "load" | "clone";
+  dataset: string; target?: string /* the dataset a clone creates */;
+  state: "running" | "done" | "failed";
   startedAt: string; finishedAt?: string; message?: string; progress?: number /*0..1*/;
 };
 ```
+
+### Clone
+
+`POST /$/datasets/{ds}/clone` copies one consistent snapshot of `{ds}` into a new,
+independent persistent dataset, for trying updates, reasoning or loads without touching
+the original. Parameters come from the query string, a form body or a JSON body:
+
+| Param | Required | Meaning |
+|---|---|---|
+| `name` | yes | name of the new dataset |
+| `inferences` | no, default `copy` | `copy`: the inferred graph and the reasoning status; `drop`: neither |
+
+The copy has every quad of every graph (blank-node graph names and triple terms
+included), the same blank-node ids (`_:b<hex>` labels), the prefixes, and a freshly
+compacted index. It is a new lineage: a new dataset id and a root commit `0`, with the
+source's id and the copied commit kept as `forkedFrom`. Commit history, the WAL and
+caches are not copied. With `inferences=copy`, inferences that were fresh at the copied
+commit are fresh in the clone; stale ones stay stale (`staleReason: "inherited from
+source at clone time"`), unknown ones stay unknown. Source updates continue during the
+clone and are not included.
+
+Responses: `202` with `Task` (`kind: "clone"`, `target`) and `Location:
+/$/datasets/{name}`; `400` for a missing or invalid `name`, a bad `inferences`, or
+`type=mem` (in-memory clones are not supported yet); `403` on a read-only server;
+`404` for an unknown source; `409` when `name` is registered, being created by another
+task (`POST /$/datasets` with that name also gets `409` meanwhile), or
+`<data>/databases/{name}` exists without being a registered dataset. The dataset appears
+(and is persisted in `config.json`) only when the task is `done`. A failed task leaves
+no directory and releases the name; unfinished clones are removed at startup.
+
+```ts
+type DatasetOrigin = {            // origin.json in the clone's directory
+  originFormat: 1; clonedAt: string;
+  source: { name: string; path?: string; version: number; generation: string; quads: number };
+  forkedFrom: { id: string; seq: number };
+  inferences: "copy" | "drop";
+};
+```
+
+`sparkles clone --loc SRC --to DST [--inferences copy|drop]` does the same offline
+(`DST` must not exist or be empty; `SRC` must be a database, and not open in a server).
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 

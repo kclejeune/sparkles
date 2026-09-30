@@ -7,6 +7,7 @@
   import { fmtBytes, fmtCompact, fmtInt, fmtMs } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
   import { load, save } from '$lib/storage';
+  import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
@@ -22,6 +23,13 @@
   let loading = $state(false);
   let taskKick = $state(0);
   let deleteTarget = $state<string | null>(null);
+  let cloneOpen = $state(false);
+  /** The last clone of this dataset that finished, for an "Open" link. */
+  let cloned = $state<string | null>(null);
+  $effect(() => {
+    void name;
+    cloned = null;
+  });
 
   async function loadStats() {
     loading = true;
@@ -335,6 +343,20 @@ ex:PersonShape a sh:NodeShape ;
         {/if}
         <span class="mono faint">{info?.endpoints?.query ?? `/${name}/sparql`}</span>
       </div>
+      {#if info?.origin}
+        {@const o = info.origin}
+        <div class="faint origin">
+          cloned from
+          {#if app.datasets.some((d) => d.name === o.source.name)}<a
+              class="mono"
+              href={resolve('/datasets/[name]', { name: o.source.name })}>/{o.source.name}</a
+            >{:else}<span class="mono">{o.source.name}</span>{/if}
+          at commit {o.forkedFrom.seq}, {new Date(o.clonedAt).toLocaleString()}{o.inferences ===
+          'drop'
+            ? ', without inferences'
+            : ''}
+        </div>
+      {/if}
     </div>
     <span class="spacer"></span>
     <button class="btn" onclick={refreshAll} disabled={loading}>
@@ -348,10 +370,31 @@ ex:PersonShape a sh:NodeShape ;
       }}><Icon name="query" size={14} /> Query</button
     >
     <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
+    <button
+      class="btn"
+      onclick={() => (cloneOpen = true)}
+      disabled={readOnly || !info}
+      title={readOnly
+        ? 'The server is read-only'
+        : 'Copy this dataset into a new, independent dataset'}
+      ><Icon name="copy" size={14} /> Clone</button
+    >
     <button class="btn danger" onclick={() => (deleteTarget = name)}
       ><Icon name="trash" size={14} /> Delete</button
     >
   </header>
+
+  {#if cloned}
+    <div class="cloned row">
+      <Icon name="check" size={14} />
+      <span>Cloned into <span class="mono">/{cloned}</span>.</span>
+      <a class="btn sm" href={resolve('/datasets/[name]', { name: cloned })}>Open</a>
+      <span class="spacer"></span>
+      <button class="btn ghost icon sm" aria-label="Dismiss" onclick={() => (cloned = null)}
+        ><Icon name="x" size={12} /></button
+      >
+    </div>
+  {/if}
 
   {#if statsError}
     <div class="error-box">
@@ -851,7 +894,10 @@ ex:PersonShape a sh:NodeShape ;
               refreshKey={taskKick}
               ondone={(t) => {
                 if (t.state === 'failed') toasts.push('error', `${t.kind} failed`, t.message);
-                else toasts.push('success', `${t.kind} finished`, t.message);
+                else if (t.kind === 'clone' && t.target) {
+                  toasts.push('success', `Cloned into /${t.target}`, t.message);
+                  cloned = t.target;
+                } else toasts.push('success', `${t.kind} finished`, t.message);
                 refreshAll();
               }}
             />
@@ -865,6 +911,12 @@ ex:PersonShape a sh:NodeShape ;
 </div>
 
 <DatasetDialogs bind:deleteTarget ondeleted={() => goto(resolve('/datasets'))} />
+<CloneDialog
+  bind:open={cloneOpen}
+  source={name}
+  hasInferences={!!info?.reasoning}
+  onstarted={() => taskKick++}
+/>
 
 <style>
   .page {
@@ -900,6 +952,16 @@ ex:PersonShape a sh:NodeShape ;
     letter-spacing: -0.03em;
   }
   .meta {
+    font-size: var(--fs-sm);
+  }
+  .origin {
+    font-size: var(--fs-sm);
+  }
+  .cloned {
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent);
+    background: var(--ok-soft);
+    border-radius: var(--r);
     font-size: var(--fs-sm);
   }
   a.btn {
