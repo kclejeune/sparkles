@@ -16,6 +16,10 @@ pub enum Need {
     Public,
     /// any caller, anonymous included
     Caller,
+    /// any principal except anonymous
+    Authed,
+    /// a session or proxy principal (a person in a browser)
+    Interactive,
     /// that level on the route's `{ds}`
     Dataset(Level),
     Server(ServerPerm),
@@ -31,7 +35,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/ui/", &["GET"]),
     ("/ui/{*path}", &["GET"]),
     ("/$/ping", &["GET", "POST"]),
-    ("/$/auth/whoami", &["GET"]),
+    ("/$/whoami", &["GET"]),
     ("/$/server", &["GET"]),
     ("/$/metrics", &["GET"]),
     ("/$/ready", &["GET"]),
@@ -55,6 +59,19 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/text/{ds}/rebuild", &["POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
+    ("/$/auth/config", &["GET"]),
+    ("/$/auth/login", &["POST"]),
+    ("/$/auth/logout", &["POST"]),
+    ("/$/auth/oidc/login", &["GET"]),
+    ("/$/auth/oidc/callback", &["GET"]),
+    ("/$/auth/tokens", &["GET", "POST", "DELETE"]),
+    ("/$/auth/tokens/{id}", &["DELETE"]),
+    ("/$/auth/device", &["POST"]),
+    ("/$/auth/device/{user_code}", &["GET"]),
+    ("/$/auth/device/{user_code}/approve", &["POST"]),
+    ("/$/auth/device/{user_code}/deny", &["POST"]),
+    ("/$/auth/cli/authorize", &["POST"]),
+    ("/$/auth/token", &["POST"]),
     ("/{ds}", &["*"]),
     ("/{ds}/sparql", &["*"]),
     ("/{ds}/query", &["*"]),
@@ -65,6 +82,12 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/explain", &["GET", "POST"]),
     ("/{ds}/shacl", &["POST"]),
 ];
+
+/// Routes of the CLI grants: they identify the client by a device code or a PKCE
+/// verifier, never by cookies, so they need no CSRF token.
+fn cli_grant_route(route: &str) -> bool {
+    matches!(route, "/$/auth/device" | "/$/auth/token")
+}
 
 fn safe(m: &Method) -> bool {
     matches!(*m, Method::GET | Method::HEAD | Method::OPTIONS)
@@ -92,7 +115,20 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
     use Need::*;
     let get = matches!(*method, Method::GET | Method::HEAD);
     Some(match route {
-        "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/auth/whoami" => Public,
+        "/" | "/ui" | "/ui/" | "/ui/{*path}" | "/$/ping" | "/$/ready" | "/$/whoami" => Public,
+        "/$/auth/config"
+        | "/$/auth/login"
+        | "/$/auth/oidc/login"
+        | "/$/auth/oidc/callback"
+        | "/$/auth/device"
+        | "/$/auth/token" => Public,
+        "/$/auth/logout" => Caller,
+        "/$/auth/tokens" if *method == Method::DELETE => Server(ServerPerm::ServerAdmin),
+        "/$/auth/tokens" | "/$/auth/tokens/{id}" => Authed,
+        "/$/auth/device/{user_code}"
+        | "/$/auth/device/{user_code}/approve"
+        | "/$/auth/device/{user_code}/deny"
+        | "/$/auth/cli/authorize" => Interactive,
         "/$/server" | "/$/tasks" | "/$/tasks/{id}" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
         "/$/datasets" if get => Caller,
@@ -139,24 +175,16 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
                 Dataset(Write)
             }
         }
-        r if r.starts_with("/$/auth/") => super_auth_need(r)?,
         _ => return None,
     })
 }
 
-/// Needs of the `/$/auth/…` routes (token management and login flows).
-fn super_auth_need(route: &str) -> Option<Need> {
-    AUTH_ROUTES
-        .iter()
-        .find(|(r, _, _)| *r == route)
-        .map(|(_, _, n)| *n)
-}
-
-/// `/$/auth/…` routes: template, methods, need.
-pub const AUTH_ROUTES: &[(&str, &[&str], Need)] = &[];
-
-/// The request's own origin, from `X-Forwarded-Proto` (if any) and `Host`.
-fn same_origin(origin: &str, h: &HeaderMap) -> bool {
+/// The origin of `public_url`, or else the request's own (`X-Forwarded-Proto` or either
+/// scheme, and `Host`).
+fn own_origin(origin: &str, h: &HeaderMap, public_url: Option<&str>) -> bool {
+    if let Some(u) = public_url {
+        return origin.eq_ignore_ascii_case(u.trim_end_matches('/'));
+    }
     let Some(host) = h.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -183,14 +211,16 @@ fn same_origin(origin: &str, h: &HeaderMap) -> bool {
 }
 
 /// OWASP's origin verification with standard headers: a cross-site `Sec-Fetch-Site`, or
-/// an `Origin` that is neither the request's own nor an allowed CORS origin.
-fn cross_origin(h: &HeaderMap, allowed: &[String]) -> bool {
+/// an `Origin` that is neither the server's own nor an allowed CORS origin.
+fn cross_origin(h: &HeaderMap, allowed: &[String], public_url: Option<&str>) -> bool {
     if h.get("sec-fetch-site").is_some_and(|v| v == "cross-site") {
         return true;
     }
     match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         None => false,
-        Some(o) => !same_origin(o, h) && !allowed.iter().any(|a| a.eq_ignore_ascii_case(o)),
+        Some(o) => {
+            !own_origin(o, h, public_url) && !allowed.iter().any(|a| a.eq_ignore_ascii_case(o))
+        }
     }
 }
 
@@ -201,14 +231,18 @@ pub enum Denied {
     Forbidden,
     Hidden,
     CrossOrigin,
+    Csrf,
+    NotInteractive,
 }
 
 impl Denied {
-    pub const ALL: [Denied; 4] = [
+    pub const ALL: [Denied; 6] = [
         Denied::Unauthenticated,
         Denied::Forbidden,
         Denied::Hidden,
         Denied::CrossOrigin,
+        Denied::Csrf,
+        Denied::NotInteractive,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -217,6 +251,8 @@ impl Denied {
             Denied::Forbidden => "forbidden",
             Denied::Hidden => "hidden",
             Denied::CrossOrigin => "cross_origin",
+            Denied::Csrf => "csrf",
+            Denied::NotInteractive => "not_interactive",
         }
     }
 }
@@ -226,19 +262,25 @@ impl Denied {
 pub struct AuthReport {
     /// log name of the principal (`None`: auth disabled, or authentication failed)
     pub principal: Option<String>,
+    /// `none`, `basic`, `bearer`, `session` or `proxy`
     pub scheme: Option<&'static str>,
     pub denied: Option<Denied>,
-    /// `invalid`, `expired`, `malformed` or `busy`
+    /// `invalid`, `expired`, `malformed`, `busy`, `not_allowed`
     pub error: Option<&'static str>,
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
+pub fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(json!({ "error": msg }))).into_response()
 }
 
-/// `WWW-Authenticate` challenges of a 401. `Basic` is left out for script fetches, so
-/// browsers do not show their login dialog over the UI.
-fn challenges(realm: &str, h: &HeaderMap, bearer_error: Option<&str>) -> Vec<HeaderValue> {
+/// `WWW-Authenticate` challenges of a 401. `Basic` is left out for script fetches (no
+/// browser login dialog over the UI) and when no user can sign in with a password.
+fn challenges(
+    realm: &str,
+    h: &HeaderMap,
+    bearer_error: Option<&str>,
+    basic: bool,
+) -> Vec<HeaderValue> {
     let mut out = Vec::new();
     let bearer = match bearer_error {
         None => format!("Bearer realm=\"{realm}\""),
@@ -251,7 +293,7 @@ fn challenges(realm: &str, h: &HeaderMap, bearer_error: Option<&str>) -> Vec<Hea
         .get("sec-fetch-mode")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|m| matches!(m, "cors" | "same-origin" | "no-cors"));
-    if !script {
+    if basic && !script {
         out.extend(
             HeaderValue::from_str(&format!("Basic realm=\"{realm}\", charset=\"UTF-8\"")).ok(),
         );
@@ -259,9 +301,15 @@ fn challenges(realm: &str, h: &HeaderMap, bearer_error: Option<&str>) -> Vec<Hea
     out
 }
 
-fn unauthorized(realm: &str, h: &HeaderMap, msg: &str, bearer_error: Option<&str>) -> Response {
+fn unauthorized(
+    realm: &str,
+    h: &HeaderMap,
+    msg: &str,
+    bearer_error: Option<&str>,
+    basic: bool,
+) -> Response {
     let mut r = json_error(StatusCode::UNAUTHORIZED, msg);
-    for c in challenges(realm, h, bearer_error) {
+    for c in challenges(realm, h, bearer_error, basic) {
         r.headers_mut().append(header::WWW_AUTHENTICATE, c);
     }
     r
@@ -272,23 +320,28 @@ fn with_report(mut r: Response, report: AuthReport) -> Response {
     r
 }
 
-/// A 403 from a handler (the form-POST re-check, the clone target check).
+/// A 403 (from the middleware, or a handler's own check).
 pub fn forbidden(p: &Principal, msg: &str) -> Response {
+    forbidden_as(p, msg, Denied::Forbidden)
+}
+
+fn forbidden_as(p: &Principal, msg: &str, kind: Denied) -> Response {
     let mut r = json_error(StatusCode::FORBIDDEN, msg);
     if p.scheme == Scheme::Bearer
         && let Ok(v) = HeaderValue::from_str("Bearer error=\"insufficient_scope\"")
     {
         r.headers_mut().insert(header::WWW_AUTHENTICATE, v);
     }
-    with_report(
-        r,
-        AuthReport {
-            principal: p.log_name(),
-            scheme: Some(p.scheme.as_str()),
-            denied: Some(Denied::Forbidden),
-            error: None,
-        },
-    )
+    with_report(r, report_of(p, Some(kind)))
+}
+
+fn report_of(p: &Principal, denied: Option<Denied>) -> AuthReport {
+    AuthReport {
+        principal: p.log_name(),
+        scheme: Some(p.scheme.as_str()),
+        denied,
+        error: None,
+    }
 }
 
 /// The `{ds}` segment of the request path.
@@ -301,6 +354,9 @@ fn ds_of(route: &str, uri: &Uri) -> Option<String> {
             .into_owned(),
     )
 }
+
+/// The CSRF header of ambient principals.
+pub const CSRF_HEADER: &str = "x-sparkles-csrf";
 
 /// Authenticate, then authorize against the route table (see the module docs).
 pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
@@ -327,27 +383,28 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     };
     let policy = auth.policy();
     let realm = policy.realm.as_str();
-    let deny = |kind: Denied, r: Response, p: Option<&Principal>| {
+    let basic = policy.has_users();
+    let span = tracing::Span::current();
+    let count = |kind: Denied| {
         auth.metrics.denied[Denied::ALL.iter().position(|d| *d == kind).unwrap_or(0)]
             .fetch_add(1, Ordering::Relaxed);
-        with_report(
-            r,
-            AuthReport {
-                principal: p.and_then(Principal::log_name),
-                scheme: p.map(|p| p.scheme.as_str()),
-                denied: Some(kind),
-                error: None,
-            },
-        )
+    };
+    let deny = |kind: Denied, r: Response, p: &Principal| {
+        count(kind);
+        with_report(r, report_of(p, Some(kind)))
     };
 
-    // 1. authenticate
-    let p = match auth.authenticate(req.headers()).await {
-        Ok(p) => p,
+    // 1. peer, 2. authenticate
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<super::Peer>>()
+        .map(|c| c.0);
+    let authed = match auth.authenticate(req.headers(), peer.as_ref()).await {
+        Ok(a) => a,
         Err(e) => {
             auth.count_failure(e);
-            let span = tracing::Span::current();
             span.record("principal", "-");
+            span.record("auth", e.scheme);
             let r = match e.failure {
                 Failure::Busy => {
                     let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
@@ -355,61 +412,126 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
                     r
                 }
-                Failure::Expired => {
-                    unauthorized(realm, req.headers(), "token expired", Some("token expired"))
+                Failure::NotAllowed => {
+                    if matches!(
+                        need(&route, req.method(), req.uri(), req.headers()),
+                        Some(Need::Public)
+                    ) {
+                        // public routes stay reachable (the UI shell, health, login)
+                        let a = auth.anonymous_principal();
+                        span.record("principal", "anonymous");
+                        req.extensions_mut().insert(a);
+                        return next.run(req).await;
+                    }
+                    count(Denied::Forbidden);
+                    json_error(StatusCode::FORBIDDEN, "user not allowed")
                 }
+                Failure::Expired => unauthorized(
+                    realm,
+                    req.headers(),
+                    "token expired",
+                    Some("token expired"),
+                    basic,
+                ),
                 _ => unauthorized(
                     realm,
                     req.headers(),
                     "invalid credentials",
                     Some("invalid credentials"),
+                    basic,
                 ),
             };
             return with_report(
                 r,
                 AuthReport {
                     principal: None,
-                    scheme: Some(e.scheme.as_str()),
+                    scheme: Some(e.scheme),
                     denied: None,
                     error: Some(e.failure.as_str()),
                 },
             );
         }
     };
+    let p = authed.principal;
+    let clear = authed.clear_cookie.then(|| {
+        auth.cookie_mode(req.headers())
+            .set(super::SESSION_COOKIE, "", 0)
+    });
+    let finish = |mut r: Response| {
+        if let Some(c) = &clear {
+            r.headers_mut().append(header::SET_COOKIE, c.clone());
+        }
+        r
+    };
     if let Some(n) = p.log_name() {
-        tracing::Span::current().record("principal", n.as_str());
+        span.record("principal", n.as_str());
     }
+    span.record("auth", p.scheme.as_str());
 
-    // 2. what the route needs
+    // what the route needs
     let method = req.method().clone();
     let need = need(&route, &method, req.uri(), req.headers())
         .unwrap_or(Need::Server(ServerPerm::ServerAdmin));
 
-    // 3. CSRF gate
+    // 3. CSRF gates: (a) the origin, (b) the synchronizer token of ambient principals
     let gated = !safe(&method)
         || matches!(
             need,
             Need::Dataset(Level::Write | Level::Admin) | Need::Server(ServerPerm::ServerAdmin)
         );
-    if gated && cross_origin(req.headers(), &policy.cors_origins) {
-        return deny(
-            Denied::CrossOrigin,
-            json_error(StatusCode::FORBIDDEN, "cross-origin request refused"),
-            Some(&p),
-        );
+    if gated
+        && cross_origin(
+            req.headers(),
+            &policy.cors_origins,
+            policy.public_url.as_deref(),
+        )
+    {
+        let r = json_error(StatusCode::FORBIDDEN, "cross-origin request refused");
+        return finish(deny(Denied::CrossOrigin, r, &p));
+    }
+    if !safe(&method) && p.is_ambient() && !cli_grant_route(&route) {
+        let sent = req
+            .headers()
+            .get(CSRF_HEADER)
+            .map(|v| v.as_bytes())
+            .unwrap_or_default();
+        let want = p.info.csrf.as_deref().unwrap_or("");
+        if want.is_empty() || !super::crypto::ct_eq(sent, want.as_bytes()) {
+            let r = json_error(StatusCode::FORBIDDEN, "CSRF token missing or invalid");
+            return finish(deny(Denied::Csrf, r, &p));
+        }
     }
 
-    // 4./5. decide
-    let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None);
+    // 4.–6. decide
+    let unauth = |h: &HeaderMap| unauthorized(realm, h, "authentication required", None, basic);
     match need {
         Need::Public | Need::Caller => {}
+        Need::Authed => {
+            if p.is_anonymous() {
+                return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
+            }
+        }
+        Need::Interactive => {
+            if p.is_anonymous() {
+                return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
+            }
+            if !p.is_interactive() {
+                count(Denied::NotInteractive);
+                return finish(forbidden_as(
+                    &p,
+                    "this action requires signing in to the web UI",
+                    Denied::NotInteractive,
+                ));
+            }
+        }
         Need::Server(perm) => {
             if !p.has(perm) {
                 if p.is_anonymous() {
-                    return deny(Denied::Unauthenticated, unauth(req.headers()), Some(&p));
+                    return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
                 }
+                count(Denied::Forbidden);
                 let msg = format!("{} permission required", perm.as_str());
-                return deny(Denied::Forbidden, forbidden(&p, &msg), Some(&p));
+                return finish(forbidden(&p, &msg));
             }
         }
         Need::Dataset(lvl) => {
@@ -417,30 +539,23 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             let have = p.level(&ds);
             if have.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
-                    return deny(Denied::Unauthenticated, unauth(req.headers()), Some(&p));
+                    return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
                 }
                 if have.is_none() || st.get(&ds).is_none() {
                     // the same body as the handlers' own 404
                     let msg = format!("no such dataset: /{ds}");
-                    return deny(
-                        Denied::Hidden,
-                        json_error(StatusCode::NOT_FOUND, &msg),
-                        Some(&p),
-                    );
+                    let r = json_error(StatusCode::NOT_FOUND, &msg);
+                    return finish(deny(Denied::Hidden, r, &p));
                 }
+                count(Denied::Forbidden);
                 let msg = format!("{} access to /{ds} required", lvl.as_str());
-                return deny(Denied::Forbidden, forbidden(&p, &msg), Some(&p));
+                return finish(forbidden(&p, &msg));
             }
         }
     }
 
-    // 6. pass
-    let report = AuthReport {
-        principal: p.log_name(),
-        scheme: Some(p.scheme.as_str()),
-        denied: None,
-        error: None,
-    };
+    // pass
+    let report = report_of(&p, None);
     req.extensions_mut().insert(p);
     let mut resp = next.run(req).await;
     if route.starts_with("/$/") && !resp.headers().contains_key(header::CACHE_CONTROL) {
@@ -448,14 +563,14 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     // a handler's own denial (re-check, target check) keeps its report
-    if !resp
-        .extensions()
-        .get::<AuthReport>()
-        .is_some_and(|r| r.denied.is_some())
-    {
-        resp.extensions_mut().insert(report);
+    let denied = resp.extensions().get::<AuthReport>().and_then(|r| r.denied);
+    match denied {
+        Some(kind) => count(kind),
+        None => {
+            resp.extensions_mut().insert(report);
+        }
     }
-    resp
+    finish(resp)
 }
 
 #[cfg(test)]
@@ -503,34 +618,32 @@ mod tests {
     #[test]
     fn origins() {
         let allowed = vec!["https://yasgui.example".to_string()];
-        assert!(!cross_origin(&h(&[("host", "a:3030")]), &allowed));
+        let x = |pairs: &[(&str, &str)]| cross_origin(&h(pairs), &allowed, None);
+        assert!(!x(&[("host", "a:3030")]));
+        assert!(!x(&[("host", "a:3030"), ("origin", "http://a:3030")]));
+        assert!(x(&[("host", "a:3030"), ("origin", "https://evil.example")]));
+        assert!(!x(&[
+            ("host", "a:3030"),
+            ("origin", "https://yasgui.example")
+        ]));
+        assert!(x(&[
+            ("host", "a"),
+            ("origin", "http://a"),
+            ("x-forwarded-proto", "https")
+        ]));
+        assert!(x(&[("host", "a:3030"), ("sec-fetch-site", "cross-site")]));
+        assert!(!x(&[("host", "a:3030"), ("sec-fetch-site", "same-origin")]));
+        // with a public URL, Host does not matter
+        let pu = Some("https://sparql.example.org");
         assert!(!cross_origin(
+            &h(&[("host", "evil"), ("origin", "https://sparql.example.org")]),
+            &allowed,
+            pu
+        ));
+        assert!(cross_origin(
             &h(&[("host", "a:3030"), ("origin", "http://a:3030")]),
-            &allowed
-        ));
-        assert!(cross_origin(
-            &h(&[("host", "a:3030"), ("origin", "https://evil.example")]),
-            &allowed
-        ));
-        assert!(!cross_origin(
-            &h(&[("host", "a:3030"), ("origin", "https://yasgui.example")]),
-            &allowed
-        ));
-        assert!(cross_origin(
-            &h(&[
-                ("host", "a"),
-                ("origin", "http://a"),
-                ("x-forwarded-proto", "https")
-            ]),
-            &allowed
-        ));
-        assert!(cross_origin(
-            &h(&[("host", "a:3030"), ("sec-fetch-site", "cross-site")]),
-            &allowed
-        ));
-        assert!(!cross_origin(
-            &h(&[("host", "a:3030"), ("sec-fetch-site", "same-origin")]),
-            &allowed
+            &allowed,
+            pu
         ));
     }
 }

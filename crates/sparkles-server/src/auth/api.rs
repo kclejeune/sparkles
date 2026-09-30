@@ -56,7 +56,7 @@ pub fn restrict(opts: &mut sparkles::sparql::QueryOptions, p: &Principal) {
 pub fn server_json(st: &AppState) -> J {
     match &st.auth {
         #[cfg(feature = "auth")]
-        Some(_) => json!({ "enabled": true, "schemes": ["Bearer", "Basic"] }),
+        Some(_) => json!({ "enabled": true }),
         _ => json!({ "enabled": false }),
     }
 }
@@ -65,6 +65,7 @@ pub fn server_json(st: &AppState) -> J {
 /// server before it binds) and log its warnings.
 pub fn load(
     path: Option<&std::path::Path>,
+    data_dir: &std::path::Path,
     host: &str,
 ) -> anyhow::Result<Option<Arc<super::Auth>>> {
     let Some(path) = path else {
@@ -72,27 +73,58 @@ pub fn load(
     };
     #[cfg(feature = "auth")]
     {
-        let (auth, warnings) = super::Auth::load(path)?;
+        let (auth, warnings) = super::Auth::open(path, data_dir)?;
         for w in warnings {
             tracing::warn!("auth configuration: {w}");
         }
-        let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost" | "[::1]");
+        let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost" | "[::1]" | "unix");
         if !loopback {
             tracing::warn!(
                 "credentials are accepted over plain HTTP on {host}; terminate TLS in front of the server"
             );
+            if auth.policy().proxy.is_some() {
+                tracing::warn!(
+                    "trusted-header auth is enabled and the server listens on {host}: any host in proxy.trusted can impersonate any user; make sure only the proxy can reach this port"
+                );
+            }
         }
         tracing::info!("authentication enabled ({})", path.display());
         Ok(Some(Arc::new(auth)))
     }
     #[cfg(not(feature = "auth"))]
     {
-        let _ = host;
+        let _ = (host, data_dir);
         anyhow::bail!(
             "--auth-config {}: built without authentication (cargo feature \"auth\")",
             path.display()
         )
     }
+}
+
+/// The `/$/whoami` and `/$/auth/*` routes (without auth, `/$/auth/config` says so and
+/// the other `/$/auth/*` routes do not exist).
+pub fn routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::get;
+    let r = axum::Router::new().route("/$/whoami", get(whoami));
+    #[cfg(feature = "auth")]
+    return r.merge(super::handlers::routes());
+    #[cfg(not(feature = "auth"))]
+    r.route(
+        "/$/auth/config",
+        get(|| async { axum::Json(json!({ "enabled": false })) }),
+    )
+}
+
+/// Write state kept in memory (token `lastUsed` times) at shutdown, and prune
+/// expired sessions hourly while running.
+pub fn flush(st: &AppState) {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth
+        && let Err(e) = a.tokens.flush()
+    {
+        tracing::warn!("cannot write the token store: {e:#}");
+    }
+    let _ = st;
 }
 
 /// Re-read the auth configuration on SIGHUP (Unix; the policy is swapped atomically,
@@ -106,6 +138,25 @@ pub fn spawn_reload_on_sighup(st: &Arc<AppState>) {
                 tracing::warn!("cannot listen for SIGHUP: auth reload disabled");
                 return;
             };
+            let prune_auth = auth.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    t.tick().await;
+                    let now = prune_auth.now();
+                    if let Err(e) = prune_auth.sessions.prune(now) {
+                        tracing::warn!("cannot prune sessions: {e:#}");
+                    }
+                }
+            });
+            // discovery at startup: a provider that is down only delays logins
+            if let Some(c) = auth.oidc.client() {
+                tokio::spawn(async move {
+                    if let Err(e) = c.metadata().await {
+                        tracing::warn!("OIDC discovery failed (logins retry it): {e:#}");
+                    }
+                });
+            }
             while hup.recv().await.is_some() {
                 match auth.reload() {
                     Ok(warnings) => {
@@ -135,7 +186,8 @@ pub fn render_metrics(st: &AppState, o: &mut String) {
 pub async fn whoami(
     State(st): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-) -> axum::Json<J> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let mut datasets = Map::new();
     for name in st.datasets.read().keys() {
         let lvl = if p.is_local() {
@@ -152,10 +204,24 @@ pub async fn whoami(
         principal["name"] = p.name.to_string().into();
     }
     let server: Vec<&str> = p.server_perms().iter().map(|s| s.as_str()).collect();
-    axum::Json(json!({
+    #[allow(unused_mut)]
+    let mut doc = json!({
         "authEnabled": st.auth.is_some(),
         "principal": principal,
+        "method": p.scheme.as_str(),
         "server": server,
         "datasets": datasets,
-    }))
+        "canMintTokens": false,
+        "logout": false,
+    });
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        super::handlers::whoami_details(a, &p, &mut doc);
+    }
+    let mut r = axum::Json(doc).into_response();
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    r
 }

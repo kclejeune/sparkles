@@ -38,6 +38,7 @@ base64 = "0.23"
 mimalloc = { version = "0.1.52", optional = true }
 libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
 rayon.workspace = true
+ipnet = "2"
 arc-swap.workspace = true
 chrono.workspace = true
 # authentication (feature `auth`)
@@ -47,6 +48,8 @@ getrandom = { version = "0.3", optional = true }
 argon2 = { version = "0.6", optional = true }
 toml = { version = "1", optional = true }
 zeroize = { version = "1", optional = true }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
+reqwest = { workspace = true, optional = true }
 rpassword = { version = "7", optional = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
@@ -54,6 +57,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# signs the ID tokens of the mock OIDC provider in tests (already in the tree via rustls)
+aws-lc-rs = "1"
 
 [features]
 default = ["reasoning", "shacl", "mimalloc", "text", "auth"]
@@ -72,6 +77,8 @@ auth = [
     "dep:toml",
     "dep:zeroize",
     "dep:rpassword",
+    "dep:jsonwebtoken",
+    "dep:reqwest",
 ]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead

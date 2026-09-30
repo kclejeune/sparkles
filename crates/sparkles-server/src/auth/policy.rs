@@ -1,16 +1,22 @@
-//! The loaded policy and authentication of requests.
+//! The loaded policy, the auth state of the server, and authentication of requests.
 
 use super::config::{self, FileConfig};
-use super::{Grants, Kind, Level, Principal, Scheme, ServerPerm, crypto};
+use super::proxy::{Peer, ProxySettings};
+use super::session::{CookieMode, Keys, Method, SessionStore};
+use super::tokens::{TokenRecord, TokenStore};
+use super::{
+    Access, Grants, Identity, Kind, Level, Principal, PrincipalInfo, Scheme, ServerPerm, crypto,
+    store,
+};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use axum::http::{HeaderMap, header};
 use base64::Engine;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -20,24 +26,46 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// How long a password verification may wait for a permit before `busy`.
 const PERMIT_WAIT: Duration = Duration::from_secs(5);
 
-/// A configured token: expiry (Unix seconds) and principal.
-struct TokenEntry {
+/// A static token from the configuration.
+struct StaticToken {
+    id: String,
     expires: Option<i64>,
-    principal: Principal,
+    grants: Grants,
 }
 
 struct UserEntry {
-    /// argon2id PHC string; `None` for users without a password (OIDC / proxy only)
-    password: Option<String>,
-    principal: Principal,
+    /// argon2id PHC string
+    password: String,
+    grants: Grants,
+}
+
+/// Admission and role mapping of OIDC and proxy identities.
+#[derive(Default)]
+struct External {
+    allowed_users: HashSet<String>,
+    allowed_groups: HashSet<String>,
+    default_roles: Vec<String>,
+    group_roles: BTreeMap<String, Vec<String>>,
+    user_roles: BTreeMap<String, Vec<String>>,
 }
 
 /// One validated configuration, swapped as a whole on reload.
 pub struct Policy {
     pub realm: String,
-    anonymous: Principal,
+    /// `server.public_url` without a trailing slash
+    pub public_url: Option<String>,
+    anonymous: Grants,
     users: HashMap<String, UserEntry>,
-    tokens: HashMap<[u8; 32], TokenEntry>,
+    static_tokens: HashMap<[u8; 32], StaticToken>,
+    /// id, name, expiry and grants summary of each static token, for listings
+    pub static_list: Vec<(String, String, Option<i64>, String)>,
+    roles: HashMap<String, Grants>,
+    external: External,
+    pub default_ttl: i64,
+    pub max_ttl: i64,
+    pub session_ttl: i64,
+    pub oidc: Option<config::OidcCfg>,
+    pub proxy: Option<ProxySettings>,
     pub cors_origins: Vec<String>,
     /// verified in place of the hash of an unknown user, so timing reveals no names
     dummy_hash: String,
@@ -45,7 +73,7 @@ pub struct Policy {
 }
 
 fn grants_of(
-    datasets: &std::collections::BTreeMap<String, Level>,
+    datasets: &BTreeMap<String, Level>,
     server: &[ServerPerm],
     roles: &[String],
     role_grants: &HashMap<String, Grants>,
@@ -67,6 +95,16 @@ fn grants_of(
     g
 }
 
+fn summarize(g: &Grants) -> String {
+    let mut parts: Vec<String> = g
+        .datasets
+        .iter()
+        .map(|(k, v)| format!("{k}={}", v.as_str()))
+        .collect();
+    parts.extend(g.server.iter().map(|s| s.as_str().to_string()));
+    parts.join(", ")
+}
+
 impl Policy {
     pub fn build(cfg: &FileConfig) -> Result<Policy> {
         let roles: HashMap<String, Grants> = cfg
@@ -79,61 +117,116 @@ impl Policy {
                 )
             })
             .collect();
-        let anonymous = Principal::new(
-            Kind::Anonymous,
-            "anonymous",
-            Scheme::None,
-            Arc::new(grants_of(
-                &cfg.anonymous.datasets,
-                &cfg.anonymous.server,
-                &[],
-                &roles,
-            )),
-        );
+        let anonymous = grants_of(&cfg.anonymous.datasets, &cfg.anonymous.server, &[], &roles);
         let mut users = HashMap::new();
         for u in &cfg.users {
-            let g = grants_of(&u.datasets, &u.server, &u.roles, &roles);
             users.insert(
                 u.name.clone(),
                 UserEntry {
                     password: u.password.clone(),
-                    principal: Principal::new(Kind::User, &u.name, Scheme::Basic, Arc::new(g)),
+                    grants: grants_of(&u.datasets, &u.server, &u.roles, &roles),
                 },
             );
         }
-        let mut tokens = HashMap::new();
+        let mut static_tokens = HashMap::new();
+        let mut static_list = Vec::new();
         for t in &cfg.tokens {
-            let g = grants_of(&t.datasets, &t.server, &t.roles, &roles);
+            let grants = grants_of(&t.datasets, &t.server, &t.roles, &roles);
             let digest = config::parse_token_hash(&t.hash).context("token hash")?;
-            tokens.insert(
+            let expires = t
+                .expires
+                .as_deref()
+                .map(config::parse_rfc3339)
+                .transpose()?;
+            let id = format!("cfg-{}", t.name);
+            static_list.push((id.clone(), t.name.clone(), expires, summarize(&grants)));
+            static_tokens.insert(
                 digest,
-                TokenEntry {
-                    expires: t
-                        .expires
-                        .as_deref()
-                        .map(config::parse_rfc3339)
-                        .transpose()?,
-                    principal: Principal::new(Kind::Token, &t.name, Scheme::Bearer, Arc::new(g)),
+                StaticToken {
+                    id,
+                    expires,
+                    grants,
                 },
             );
         }
+        let e = &cfg.external;
+        let external = External {
+            allowed_users: e.allowed_users.iter().cloned().collect(),
+            allowed_groups: e.allowed_groups.iter().cloned().collect(),
+            default_roles: e.default_roles.clone(),
+            group_roles: e.group_roles.clone(),
+            user_roles: e.user_roles.clone(),
+        };
         // the dummy uses the parameters of a configured password, so an unknown name
         // costs as much as a known one
         let (m, t, p) = cfg
             .users
             .iter()
-            .find_map(|u| u.password.as_deref().and_then(config::argon2id_params))
+            .find_map(|u| config::argon2id_params(&u.password))
             .unwrap_or((config::OWASP_M, config::OWASP_T, config::OWASP_P));
         let dummy_hash = hash_password_with(&crypto::random_token(24), m, t, p)?;
         Ok(Policy {
             realm: cfg.realm.clone(),
+            public_url: cfg
+                .server
+                .public_url
+                .as_ref()
+                .map(|u| u.trim_end_matches('/').to_string()),
             anonymous,
             users,
-            tokens,
+            static_tokens,
+            static_list,
+            roles,
+            external,
+            default_ttl: config::parse_duration(&cfg.tokens_policy.default_ttl)?,
+            max_ttl: config::parse_duration(&cfg.tokens_policy.max_ttl)?,
+            session_ttl: config::parse_duration(&cfg.session.ttl)?,
+            oidc: cfg.oidc.clone(),
+            proxy: cfg.proxy.as_ref().map(ProxySettings::from_config),
             cors_origins: cfg.cors.origins.clone(),
             dummy_hash,
             counts: (cfg.users.len(), cfg.tokens.len(), cfg.roles.len()),
         })
+    }
+
+    pub fn has_users(&self) -> bool {
+        !self.users.is_empty()
+    }
+
+    /// Admission of an OIDC or proxy identity: with both lists empty everyone is
+    /// admitted; otherwise the name or one of the groups must be listed.
+    pub fn admitted(&self, name: &str, groups: &[String]) -> bool {
+        let x = &self.external;
+        (x.allowed_users.is_empty() && x.allowed_groups.is_empty())
+            || x.allowed_users.contains(name)
+            || groups.iter().any(|g| x.allowed_groups.contains(g))
+    }
+
+    /// The grants of an identity under this policy; `None` when it no longer exists or
+    /// is no longer admitted.
+    pub fn identity_grants(&self, who: &Identity) -> Option<Grants> {
+        match who.kind {
+            Kind::User => self.users.get(&who.name).map(|u| u.grants.clone()),
+            Kind::Oidc | Kind::Proxy => {
+                if !self.admitted(&who.name, &who.groups) {
+                    return None;
+                }
+                let x = &self.external;
+                let mut roles: Vec<&String> = x.default_roles.iter().collect();
+                for g in &who.groups {
+                    roles.extend(x.group_roles.get(g).into_iter().flatten());
+                }
+                roles.extend(x.user_roles.get(&who.name).into_iter().flatten());
+                let mut grants = Grants::default();
+                for r in roles {
+                    if let Some(rg) = self.roles.get(r) {
+                        grants.extend(rg);
+                    }
+                }
+                Some(grants)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -159,7 +252,7 @@ fn verify_password(password: &[u8], phc: &str) -> bool {
         .is_ok()
 }
 
-/// A well-formed static token: `spk_` + 43 base64url characters.
+/// A well-formed token: `spk_` + 43 base64url characters.
 pub fn well_formed_token(t: &str) -> bool {
     t.len() == 47
         && t.starts_with("spk_")
@@ -185,14 +278,20 @@ pub enum Failure {
     Invalid,
     Expired,
     Busy,
+    State,
+    Idp,
+    NotAllowed,
 }
 
 impl Failure {
-    pub const ALL: [Failure; 4] = [
+    pub const ALL: [Failure; 7] = [
         Failure::Malformed,
         Failure::Invalid,
         Failure::Expired,
         Failure::Busy,
+        Failure::State,
+        Failure::Idp,
+        Failure::NotAllowed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -201,31 +300,49 @@ impl Failure {
             Failure::Invalid => "invalid",
             Failure::Expired => "expired",
             Failure::Busy => "busy",
+            Failure::State => "state",
+            Failure::Idp => "idp",
+            Failure::NotAllowed => "not_allowed",
         }
     }
 }
 
-/// A failed authentication: the scheme tried and why it failed.
+/// Metric label `scheme` of failures.
+pub const FAILURE_SCHEMES: [&str; 5] = ["basic", "bearer", "session", "oidc", "proxy"];
+
+/// A failed authentication: the scheme tried (`FAILURE_SCHEMES`) and why it failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthError {
-    pub scheme: Scheme,
+    pub scheme: &'static str,
     pub failure: Failure,
+}
+
+/// The result of authenticating a request.
+pub struct Authenticated {
+    pub principal: Principal,
+    /// the request carried an invalid session cookie: the response clears it
+    pub clear_cookie: bool,
 }
 
 /// Counters of the auth layer (closed label sets; no principal label).
 #[derive(Default)]
 pub struct AuthMetrics {
-    /// `[scheme][reason]`, scheme: basic, bearer
-    pub failures: [[AtomicU64; 4]; 2],
-    /// unauthenticated, forbidden, hidden, cross_origin
-    pub denied: [AtomicU64; 4],
+    /// `[scheme][reason]` (`FAILURE_SCHEMES` × `Failure::ALL`)
+    pub failures: [[AtomicU64; 7]; 5],
+    /// `routes::Denied::ALL`
+    pub denied: [AtomicU64; 6],
+    /// `[method][result]`: oidc, password, token × ok, denied, error
+    pub logins: [[AtomicU64; 3]; 3],
+    /// api, ui, cli-loopback, cli-device
+    pub minted: [AtomicU64; 4],
+    pub revoked: AtomicU64,
     pub password_verifications: AtomicU64,
+    pub untrusted_proxy_headers: AtomicU64,
     /// ok, error
     pub reloads: [AtomicU64; 2],
 }
 
-/// A password verification in progress, shared by concurrent requests.
-type Inflight = Arc<tokio::sync::OnceCell<Option<Principal>>>;
+pub const MINT_VIA: [&str; 4] = ["api", "ui", "cli-loopback", "cli-device"];
 
 /// Verified Basic credentials and verifications in progress, keyed by
 /// `HMAC(k, user ‖ 0 ‖ password)`; one lock, so a request never misses both.
@@ -235,41 +352,83 @@ struct Creds {
     inflight: HashMap<[u8; 32], Inflight>,
 }
 
-/// The auth state of a server: the current policy and the password machinery.
+/// A password verification in progress, shared by concurrent requests.
+type Inflight = Arc<tokio::sync::OnceCell<Option<Principal>>>;
+
+/// The auth state of a server: the current policy, the token and session stores, the
+/// login flows in progress and the password machinery.
 pub struct Auth {
     path: Option<PathBuf>,
     policy: ArcSwap<Policy>,
     creds: Mutex<Creds>,
     argon: tokio::sync::Semaphore,
     hmac_key: Vec<u8>,
+    pub tokens: TokenStore,
+    pub sessions: SessionStore,
+    pub keys: Keys,
+    pub oidc: super::oidc::OidcState,
+    pub cli: super::grants::CliGrants,
     pub metrics: AuthMetrics,
+    /// seconds added to the clock (tests)
+    clock_offset: AtomicI64,
+    untrusted_warned: Mutex<Option<Instant>>,
 }
 
 impl Auth {
-    /// Load and validate `path`; returns the warnings to log.
-    pub fn load(path: &Path) -> Result<(Auth, Vec<String>)> {
+    /// Load and validate `path`, and open the stores under `<data>/auth/`; returns the
+    /// warnings to log.
+    pub fn open(path: &Path, data_dir: &Path) -> Result<(Auth, Vec<String>)> {
         let (cfg, warnings) = FileConfig::load(path)?;
-        let mut auth = Auth::from_config(&cfg)?;
+        let mut auth = Auth::from_config(&cfg, data_dir)?;
         auth.path = Some(path.to_path_buf());
         Ok((auth, warnings))
     }
 
-    pub fn from_config(cfg: &FileConfig) -> Result<Auth> {
+    pub fn from_config(cfg: &FileConfig, data_dir: &Path) -> Result<Auth> {
+        let dir = data_dir.join("auth");
+        store::private_dir(&dir)?;
+        let key_file = cfg
+            .session
+            .key_file
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.join("session.key"));
         let permits = std::thread::available_parallelism()
             .map_or(1, |n| n.get() / 2)
             .max(1);
+        let policy = Policy::build(cfg)?;
+        let now = store::unix_now();
+        let oidc = super::oidc::OidcState::new(&policy)?;
         Ok(Auth {
             path: None,
-            policy: ArcSwap::from_pointee(Policy::build(cfg)?),
+            policy: ArcSwap::from_pointee(policy),
             creds: Mutex::new(Creds::default()),
             argon: tokio::sync::Semaphore::new(permits),
             hmac_key: crypto::random_bytes(32),
+            tokens: TokenStore::open(dir.join("tokens.json"))?,
+            sessions: SessionStore::open(dir.join("sessions.json"), now)?,
+            keys: Keys::load_or_create(&key_file)?,
+            oidc,
+            cli: super::grants::CliGrants::default(),
             metrics: AuthMetrics::default(),
+            clock_offset: AtomicI64::new(0),
+            untrusted_warned: Mutex::new(None),
         })
     }
 
     pub fn policy(&self) -> Arc<Policy> {
         self.policy.load_full()
+    }
+
+    /// Unix seconds (with the test clock offset).
+    pub fn now(&self) -> i64 {
+        store::unix_now() + self.clock_offset.load(Ordering::Relaxed)
+    }
+
+    /// Move the clock forward (tests).
+    #[cfg(test)]
+    pub fn advance(&self, secs: i64) {
+        self.clock_offset.fetch_add(secs, Ordering::Relaxed);
     }
 
     /// Re-read the configuration file. On error the old policy stays.
@@ -281,100 +440,23 @@ impl Auth {
                 .context("no configuration file to reload")?;
             let (cfg, warnings) = FileConfig::load(path)?;
             let p = Policy::build(&cfg)?;
+            self.oidc.reconfigure(&p)?;
             self.policy.store(Arc::new(p));
             self.creds.lock().cache.clear();
             Ok(warnings)
         })();
         self.metrics.reloads[usize::from(r.is_err())].fetch_add(1, Ordering::Relaxed);
+        if r.is_ok() {
+            tracing::info!(target: "sparkles::audit", event = "auth_reloaded");
+        }
         r
     }
 
-    /// The `sparkles_auth_*` metric families (Prometheus text format).
-    pub fn render_metrics(&self, o: &mut String) {
-        use std::fmt::Write;
-        let family = |o: &mut String, name: &str, kind: &str, help: &str| {
-            let _ = writeln!(o, "# HELP {name} {help}");
-            let _ = writeln!(o, "# TYPE {name} {kind}");
-        };
-        let m = &self.metrics;
-        family(
-            o,
-            "sparkles_auth_failures_total",
-            "counter",
-            "Failed authentications by scheme and reason.",
-        );
-        for (si, scheme) in ["basic", "bearer"].iter().enumerate() {
-            for (ri, reason) in Failure::ALL.iter().enumerate() {
-                let _ = writeln!(
-                    o,
-                    "sparkles_auth_failures_total{{scheme=\"{scheme}\",reason=\"{}\"}} {}",
-                    reason.as_str(),
-                    m.failures[si][ri].load(Ordering::Relaxed)
-                );
-            }
-        }
-        family(
-            o,
-            "sparkles_auth_denied_total",
-            "counter",
-            "Requests refused by the auth layer by kind.",
-        );
-        for (i, kind) in super::Denied::ALL.iter().enumerate() {
-            let _ = writeln!(
-                o,
-                "sparkles_auth_denied_total{{kind=\"{}\"}} {}",
-                kind.as_str(),
-                m.denied[i].load(Ordering::Relaxed)
-            );
-        }
-        family(
-            o,
-            "sparkles_auth_password_verifications_total",
-            "counter",
-            "argon2 password verifications (cache hits excluded).",
-        );
-        let _ = writeln!(
-            o,
-            "sparkles_auth_password_verifications_total {}",
-            m.password_verifications.load(Ordering::Relaxed)
-        );
-        family(
-            o,
-            "sparkles_auth_reloads_total",
-            "counter",
-            "Auth configuration reloads by result.",
-        );
-        for (i, r) in ["ok", "error"].iter().enumerate() {
-            let _ = writeln!(
-                o,
-                "sparkles_auth_reloads_total{{result=\"{r}\"}} {}",
-                m.reloads[i].load(Ordering::Relaxed)
-            );
-        }
-        let (users, tokens, roles) = self.policy.load().counts;
-        for (name, help, v) in [
-            ("sparkles_auth_policy_users", "Configured users.", users),
-            (
-                "sparkles_auth_policy_tokens",
-                "Configured API tokens.",
-                tokens,
-            ),
-            ("sparkles_auth_policy_roles", "Configured roles.", roles),
-        ] {
-            family(o, name, "gauge", help);
-            let _ = writeln!(o, "{name} {v}");
-        }
-    }
-
-    pub fn anonymous(&self) -> Principal {
-        self.policy.load().anonymous.clone()
-    }
-
     pub fn count_failure(&self, e: AuthError) {
-        let s = match e.scheme {
-            Scheme::Basic => 0,
-            _ => 1,
-        };
+        let s = FAILURE_SCHEMES
+            .iter()
+            .position(|x| *x == e.scheme)
+            .unwrap_or(1);
         let r = Failure::ALL
             .iter()
             .position(|f| *f == e.failure)
@@ -382,65 +464,282 @@ impl Auth {
         self.metrics.failures[s][r].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Authenticate from the `Authorization` header; none is anonymous. Invalid
-    /// credentials are an error, never anonymous.
-    pub async fn authenticate(&self, h: &HeaderMap) -> Result<Principal, AuthError> {
-        let Some(v) = h.get(header::AUTHORIZATION) else {
-            return Ok(self.anonymous());
+    pub fn count_login(&self, method: Method, result: &str) {
+        let m = match method {
+            Method::Oidc => 0,
+            Method::Password => 1,
+            Method::Token => 2,
         };
+        let r = match result {
+            "ok" => 0,
+            "denied" => 1,
+            _ => 2,
+        };
+        self.metrics.logins[m][r].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cookie attributes for this request: `Secure` and `__Host-` when the public URL,
+    /// or else the proxy's `X-Forwarded-Proto`, says https.
+    pub fn cookie_mode(&self, h: &HeaderMap) -> CookieMode {
+        let secure = match &self.policy.load().public_url {
+            Some(u) => u.starts_with("https://"),
+            None => h
+                .get("x-forwarded-proto")
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"https")),
+        };
+        CookieMode { secure }
+    }
+
+    /// The anonymous principal of the current policy.
+    pub fn anonymous_principal(&self) -> Principal {
+        self.anonymous(&self.policy.load())
+    }
+
+    fn anonymous(&self, policy: &Policy) -> Principal {
+        Principal::new(
+            Kind::Anonymous,
+            "anonymous",
+            Scheme::None,
+            Access::of(policy.anonymous.clone()),
+        )
+    }
+
+    /// The first applicable source wins: `Authorization`, the session cookie, trusted
+    /// proxy headers, anonymous. Invalid `Authorization` is an error, never anonymous;
+    /// an invalid session cookie is ignored (and cleared).
+    pub async fn authenticate(
+        &self,
+        h: &HeaderMap,
+        peer: Option<&Peer>,
+    ) -> Result<Authenticated, AuthError> {
+        let policy = self.policy.load_full();
+        let ok = |principal| Authenticated {
+            principal,
+            clear_cookie: false,
+        };
+        if let Some(v) = h.get(header::AUTHORIZATION) {
+            return self.authorization(&policy, v).await.map(ok);
+        }
+        let mut clear_cookie = false;
+        let mode = self.cookie_mode(h);
+        if let Some(c) = super::session::cookie(h, &mode.name(super::SESSION_COOKIE)) {
+            match self.session_principal(&policy, c) {
+                Some(p) => return Ok(ok(p)),
+                None => clear_cookie = true,
+            }
+        }
+        if let Some(px) = &policy.proxy
+            && px.has_headers(h)
+        {
+            if px.trusted.trusts(peer) {
+                if let Some((name, groups)) = px.identity(h) {
+                    return match self.proxy_principal(&policy, &name, groups) {
+                        Some(p) => Ok(Authenticated {
+                            principal: p,
+                            clear_cookie,
+                        }),
+                        None => Err(AuthError {
+                            scheme: "proxy",
+                            failure: Failure::NotAllowed,
+                        }),
+                    };
+                }
+            } else {
+                self.metrics
+                    .untrusted_proxy_headers
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut last = self.untrusted_warned.lock();
+                if last.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+                    *last = Some(Instant::now());
+                    let from = match peer {
+                        Some(Peer::Tcp(a)) => a.ip().to_string(),
+                        Some(Peer::Unix) => "the Unix socket".into(),
+                        None => "an unknown peer".into(),
+                    };
+                    tracing::warn!("ignored proxy identity headers from untrusted {from}");
+                }
+            }
+        }
+        Ok(Authenticated {
+            principal: self.anonymous(&policy),
+            clear_cookie,
+        })
+    }
+
+    async fn authorization(
+        &self,
+        policy: &Policy,
+        v: &axum::http::HeaderValue,
+    ) -> Result<Principal, AuthError> {
         let malformed = |scheme| AuthError {
             scheme,
             failure: Failure::Malformed,
         };
-        let v = v.to_str().map_err(|_| malformed(Scheme::Bearer))?;
+        let v = v.to_str().map_err(|_| malformed("bearer"))?;
         let (scheme, rest) = v.trim().split_once(' ').unwrap_or((v.trim(), ""));
         let rest = rest.trim();
         if scheme.eq_ignore_ascii_case("bearer") {
             if rest.is_empty() {
-                return Err(malformed(Scheme::Bearer));
+                return Err(malformed("bearer"));
             }
-            return self.token(rest, Scheme::Bearer);
+            return self.token_principal(policy, rest, Scheme::Bearer);
         }
         if !scheme.eq_ignore_ascii_case("basic") {
-            return Err(malformed(Scheme::Bearer));
+            return Err(malformed("bearer"));
         }
         let decoded = Zeroizing::new(
             base64::engine::general_purpose::STANDARD
                 .decode(rest)
-                .map_err(|_| malformed(Scheme::Basic))?,
+                .map_err(|_| malformed("basic"))?,
         );
-        let text = std::str::from_utf8(&decoded).map_err(|_| malformed(Scheme::Basic))?;
-        let (user, password) = text.split_once(':').ok_or(malformed(Scheme::Basic))?;
+        let text = std::str::from_utf8(&decoded).map_err(|_| malformed("basic"))?;
+        let (user, password) = text.split_once(':').ok_or(malformed("basic"))?;
         if password.starts_with("spk_") {
             // Basic-only clients carry a token as the password; the user is ignored
-            return self.token(password, Scheme::Basic);
+            return self.token_principal(policy, password, Scheme::Basic);
         }
-        self.password(user, password).await
+        self.password(policy, user, password).await
     }
 
-    fn token(&self, token: &str, scheme: Scheme) -> Result<Principal, AuthError> {
-        let err = |failure| AuthError { scheme, failure };
+    /// A static or minted token.
+    pub fn token_principal(
+        &self,
+        policy: &Policy,
+        token: &str,
+        scheme: Scheme,
+    ) -> Result<Principal, AuthError> {
+        let err = |failure| AuthError {
+            scheme: if scheme == Scheme::Basic {
+                "basic"
+            } else {
+                "bearer"
+            },
+            failure,
+        };
         if !well_formed_token(token) {
             return Err(err(Failure::Invalid));
         }
         let digest = crypto::sha256(token.as_bytes());
-        let policy = self.policy.load();
-        let e = policy.tokens.get(&digest).ok_or(err(Failure::Invalid))?;
-        if e.expires
-            .is_some_and(|x| x <= chrono::Utc::now().timestamp())
-        {
+        let now = self.now();
+        if let Some(t) = policy.static_tokens.get(&digest) {
+            if t.expires.is_some_and(|x| x <= now) {
+                return Err(err(Failure::Expired));
+            }
+            return Ok(
+                Principal::new(Kind::Token, &t.id, scheme, Access::of(t.grants.clone())).with_info(
+                    PrincipalInfo {
+                        token_id: Some(t.id.clone()),
+                        static_token: true,
+                        expires: t.expires,
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        let rec = self
+            .tokens
+            .by_digest(&digest)
+            .ok_or(err(Failure::Invalid))?;
+        if rec.expires_at() <= now {
             return Err(err(Failure::Expired));
         }
-        let mut p = e.principal.clone();
-        p.scheme = scheme;
-        Ok(p)
+        let access = self
+            .token_access(policy, &rec, now, 0)
+            .ok_or(err(Failure::Invalid))?;
+        self.tokens.touch(&rec.id, now);
+        Ok(minted(rec, scheme, access))
+    }
+
+    /// Effective permissions of a minted token: its scope ∩ its parent's (a chain), or
+    /// ∩ its owner's grants under the current policy. `None`: no longer valid.
+    pub fn token_access(
+        &self,
+        policy: &Policy,
+        rec: &TokenRecord,
+        now: i64,
+        depth: usize,
+    ) -> Option<Access> {
+        if depth >= super::tokens::MAX_CHAIN || rec.expires_at() <= now {
+            return None;
+        }
+        let mut access = match &rec.parent {
+            Some(pid) => {
+                let parent = self.tokens.get(pid)?;
+                self.token_access(policy, &parent, now, depth + 1)?
+            }
+            None => Access::of(policy.identity_grants(&rec.owner)?),
+        };
+        access.scopes.push(rec.scope.clone());
+        Some(access)
+    }
+
+    fn proxy_principal(
+        &self,
+        policy: &Policy,
+        name: &str,
+        groups: Vec<String>,
+    ) -> Option<Principal> {
+        let who = Identity {
+            kind: Kind::Proxy,
+            name: name.to_string(),
+            groups,
+            display_name: None,
+        };
+        let grants = policy.identity_grants(&who)?;
+        let csrf = self.keys.csrf(&format!("proxy:{name}"));
+        Some(
+            Principal::new(Kind::Proxy, name, Scheme::Proxy, Access::of(grants)).with_info(
+                PrincipalInfo {
+                    owner: Some(who),
+                    csrf: Some(csrf),
+                    ..Default::default()
+                },
+            ),
+        )
+    }
+
+    /// The principal of a signed session cookie; `None` for a bad signature, an
+    /// unknown or expired session, or an identity that lost its access.
+    fn session_principal(&self, policy: &Policy, signed: &str) -> Option<Principal> {
+        let raw = self.keys.verify(super::SESSION_COOKIE, signed)?;
+        let digest = crypto::sha256(raw.as_bytes());
+        let now = self.now();
+        let s = self.sessions.get(&digest, now)?;
+        let mut info = PrincipalInfo {
+            owner: Some(s.principal.clone()),
+            expires: Some(s.expires_at()),
+            csrf: Some(self.keys.csrf(raw)),
+            session: Some(digest),
+            ..Default::default()
+        };
+        let (kind, name, access) = match s.method {
+            Method::Token => {
+                let rec = self.tokens.get(s.token_id.as_deref()?)?;
+                let access = self.token_access(policy, &rec, now, 0)?;
+                info.owner = Some(rec.owner.clone());
+                info.token_id = Some(rec.id.clone());
+                info.expires = Some(s.expires_at().min(rec.expires_at()));
+                (Kind::Token, rec.id, access)
+            }
+            Method::Password | Method::Oidc => (
+                s.principal.kind,
+                s.principal.name.clone(),
+                Access::of(policy.identity_grants(&s.principal)?),
+            ),
+        };
+        Some(Principal::new(kind, &name, Scheme::Session, access).with_info(info))
     }
 
     /// Basic user and password: cache, then one argon2 verification (single-flight per
     /// credential for successes; a failure always costs each request a verification).
-    async fn password(&self, user: &str, password: &str) -> Result<Principal, AuthError> {
+    async fn password(
+        &self,
+        policy: &Policy,
+        user: &str,
+        password: &str,
+    ) -> Result<Principal, AuthError> {
         let err = |failure| AuthError {
-            scheme: Scheme::Basic,
+            scheme: "basic",
             failure,
         };
         let mut msg = Zeroizing::new(Vec::with_capacity(user.len() + password.len() + 1));
@@ -457,13 +756,28 @@ impl Auth {
             }
             c.inflight.entry(key).or_default().clone()
         };
-        let policy = self.policy.load_full();
         let (phc, principal) = match policy.users.get(user) {
-            Some(UserEntry {
-                password: Some(h),
-                principal,
-            }) => (h.clone(), Some(principal.clone())),
-            _ => (policy.dummy_hash.clone(), None),
+            Some(u) => (
+                u.password.clone(),
+                Some(
+                    Principal::new(
+                        Kind::User,
+                        user,
+                        Scheme::Basic,
+                        Access::of(u.grants.clone()),
+                    )
+                    .with_info(PrincipalInfo {
+                        owner: Some(Identity {
+                            kind: Kind::User,
+                            name: user.to_string(),
+                            groups: Vec::new(),
+                            display_name: None,
+                        }),
+                        ..Default::default()
+                    }),
+                ),
+            ),
+            None => (policy.dummy_hash.clone(), None),
         };
         let pw = Zeroizing::new(password.to_string());
         let ran = std::sync::atomic::AtomicBool::new(false);
@@ -501,6 +815,29 @@ impl Auth {
         result.ok_or(err(Failure::Invalid))
     }
 
+    /// Check a password for a UI login (no cache; one verification).
+    pub async fn check_password(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> Result<Option<Principal>, AuthError> {
+        let policy = self.policy.load_full();
+        let (phc, principal) = match policy.users.get(user) {
+            Some(u) => (
+                u.password.clone(),
+                Some(Principal::new(
+                    Kind::User,
+                    user,
+                    Scheme::Session,
+                    Access::of(u.grants.clone()),
+                )),
+            ),
+            None => (policy.dummy_hash.clone(), None),
+        };
+        self.verify(Zeroizing::new(password.to_string()), phc, principal)
+            .await
+    }
+
     /// One argon2 run under a permit: `Some(principal)` when the password matches.
     async fn verify(
         &self,
@@ -509,7 +846,7 @@ impl Auth {
         principal: Option<Principal>,
     ) -> Result<Option<Principal>, AuthError> {
         let busy = AuthError {
-            scheme: Scheme::Basic,
+            scheme: "basic",
             failure: Failure::Busy,
         };
         let _permit = tokio::time::timeout(PERMIT_WAIT, self.argon.acquire())
@@ -524,6 +861,160 @@ impl Auth {
             .unwrap_or(false);
         Ok(if ok { principal } else { None })
     }
+
+    /// The `sparkles_auth_*` metric families (Prometheus text format).
+    pub fn render_metrics(&self, o: &mut String) {
+        use std::fmt::Write;
+        let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+            let _ = writeln!(o, "# HELP {name} {help}");
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        };
+        let m = &self.metrics;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        family(
+            o,
+            "sparkles_auth_failures_total",
+            "counter",
+            "Failed authentications by scheme and reason.",
+        );
+        for (si, scheme) in FAILURE_SCHEMES.iter().enumerate() {
+            for (ri, reason) in Failure::ALL.iter().enumerate() {
+                let _ = writeln!(
+                    o,
+                    "sparkles_auth_failures_total{{scheme=\"{scheme}\",reason=\"{}\"}} {}",
+                    reason.as_str(),
+                    get(&m.failures[si][ri])
+                );
+            }
+        }
+        family(
+            o,
+            "sparkles_auth_denied_total",
+            "counter",
+            "Requests refused by the auth layer by kind.",
+        );
+        for (i, kind) in super::Denied::ALL.iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "sparkles_auth_denied_total{{kind=\"{}\"}} {}",
+                kind.as_str(),
+                get(&m.denied[i])
+            );
+        }
+        family(
+            o,
+            "sparkles_auth_logins_total",
+            "counter",
+            "UI logins by method and result.",
+        );
+        for (mi, method) in ["oidc", "password", "token"].iter().enumerate() {
+            for (ri, result) in ["ok", "denied", "error"].iter().enumerate() {
+                let _ = writeln!(
+                    o,
+                    "sparkles_auth_logins_total{{method=\"{method}\",result=\"{result}\"}} {}",
+                    get(&m.logins[mi][ri])
+                );
+            }
+        }
+        family(
+            o,
+            "sparkles_auth_tokens_minted_total",
+            "counter",
+            "API tokens minted by channel.",
+        );
+        for (i, via) in MINT_VIA.iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "sparkles_auth_tokens_minted_total{{via=\"{via}\"}} {}",
+                get(&m.minted[i])
+            );
+        }
+        let now = self.now();
+        let (users, tokens, roles) = self.policy.load().counts;
+        for (name, kind, help, v) in [
+            (
+                "sparkles_auth_tokens_revoked_total",
+                "counter",
+                "API tokens revoked.",
+                get(&m.revoked) as usize,
+            ),
+            (
+                "sparkles_auth_tokens_active",
+                "gauge",
+                "Unexpired minted API tokens.",
+                self.tokens.active(now),
+            ),
+            (
+                "sparkles_auth_sessions_active",
+                "gauge",
+                "Unexpired UI sessions.",
+                self.sessions.active(now),
+            ),
+            (
+                "sparkles_auth_device_grants_pending",
+                "gauge",
+                "Device-code logins waiting for approval.",
+                self.cli.pending(now),
+            ),
+            (
+                "sparkles_auth_password_verifications_total",
+                "counter",
+                "argon2 password verifications (cache hits excluded).",
+                get(&m.password_verifications) as usize,
+            ),
+            (
+                "sparkles_auth_untrusted_proxy_headers_total",
+                "counter",
+                "Requests with proxy identity headers from untrusted peers (ignored).",
+                get(&m.untrusted_proxy_headers) as usize,
+            ),
+            (
+                "sparkles_auth_policy_users",
+                "gauge",
+                "Configured users.",
+                users,
+            ),
+            (
+                "sparkles_auth_policy_tokens",
+                "gauge",
+                "Configured static API tokens.",
+                tokens,
+            ),
+            (
+                "sparkles_auth_policy_roles",
+                "gauge",
+                "Configured roles.",
+                roles,
+            ),
+        ] {
+            family(o, name, kind, help);
+            let _ = writeln!(o, "{name} {v}");
+        }
+        family(
+            o,
+            "sparkles_auth_reloads_total",
+            "counter",
+            "Auth configuration reloads by result.",
+        );
+        for (i, r) in ["ok", "error"].iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "sparkles_auth_reloads_total{{result=\"{r}\"}} {}",
+                get(&m.reloads[i])
+            );
+        }
+    }
+}
+
+/// The principal of a minted token.
+fn minted(rec: TokenRecord, scheme: Scheme, access: Access) -> Principal {
+    let exp = rec.expires_at();
+    Principal::new(Kind::Token, &rec.id, scheme, access).with_info(PrincipalInfo {
+        owner: Some(rec.owner),
+        token_id: Some(rec.id),
+        expires: Some(exp),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

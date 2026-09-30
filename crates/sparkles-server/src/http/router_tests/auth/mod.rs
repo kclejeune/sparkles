@@ -1,14 +1,21 @@
 //! Authentication and dataset-level authorization through the router.
 
 use super::*;
-use crate::auth::{Auth, hash_password_with, token_hash};
+use crate::auth::{Auth, Peer, hash_password_with, token_hash};
+use axum::extract::ConnectInfo;
 use axum::http::HeaderMap;
 use base64::Engine;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn tok(c: char) -> String {
+mod cli_grants;
+mod oidc;
+mod proxy;
+mod sessions;
+mod tokens;
+
+pub(super) fn tok(c: char) -> String {
     format!("spk_{}", c.to_string().repeat(43))
 }
 
@@ -22,20 +29,58 @@ fn t_old() -> String {
     tok('C')
 }
 
+/// Fixture options.
+#[derive(Clone)]
+pub(super) struct Fixture {
+    pub enabled: bool,
+    pub read_only: bool,
+    /// bob's `wiki = "write"` grant
+    pub bob_wiki: bool,
+    /// bob's `"team-*" = "read"` grant
+    pub bob_team: bool,
+    pub public_url: &'static str,
+    /// more TOML (`[oidc]`, `[proxy]`, …)
+    pub extra: String,
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        Fixture {
+            enabled: true,
+            read_only: false,
+            bob_wiki: true,
+            bob_team: true,
+            public_url: "http://localhost:3030",
+            extra: String::new(),
+        }
+    }
+}
+
 /// The fixture policy: anonymous reads `public`; alice is server-admin; bob writes
-/// `wiki` and reads `team-*`; carol administers `wiki` and `wiki-*`; three tokens.
-fn config_text(bob_wiki: bool) -> String {
+/// `wiki` and reads `team-*`; carol administers `wiki` and `wiki-*`; static tokens
+/// `etl` (writes wiki), `prometheus` (metrics) and `old` (expired); OIDC and proxy
+/// identities in group `sparkles` are admitted, and `kg-editors` write `wiki`.
+pub(super) fn config_text(f: &Fixture) -> String {
     let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
-    let bob_ds = if bob_wiki {
-        r#"{ wiki = "write", "team-*" = "read" }"#
-    } else {
-        r#"{ "team-*" = "read" }"#
-    };
+    let mut bob = Vec::new();
+    if f.bob_wiki {
+        bob.push(r#"wiki = "write""#);
+    }
+    if f.bob_team {
+        bob.push(r#""team-*" = "read""#);
+    }
     format!(
         r#"
 version = 1
+
+[server]
+public_url = "{public_url}"
+
 [anonymous]
 datasets = {{ public = "read" }}
+
+[roles.wiki-editors]
+datasets = {{ wiki = "write" }}
 
 [[users]]
 name = "alice"
@@ -44,8 +89,8 @@ server = ["server-admin"]
 
 [[users]]
 name = "bob"
-password = "{bob}"
-datasets = {bob_ds}
+password = "{bob_pw}"
+datasets = {{ {bob} }}
 
 [[users]]
 name = "carol"
@@ -68,34 +113,76 @@ hash = "{old}"
 datasets = {{ wiki = "read" }}
 expires = "2020-01-01T00:00:00Z"
 
+[external]
+allowed_groups = ["sparkles"]
+[external.group_roles]
+"kg-editors" = ["wiki-editors"]
+
 [cors]
 origins = ["https://yasgui.example"]
+{extra}
 "#,
+        public_url = f.public_url,
         alice = h("alice-pw"),
-        bob = h("bob-pw"),
+        bob_pw = h("bob-pw"),
+        bob = bob.join(", "),
         carol = h("carol-pw"),
         etl = token_hash(&t_etl()),
         prom = token_hash(&t_prom()),
         old = token_hash(&t_old()),
+        extra = f.extra,
     )
 }
 
-struct AuthServer {
-    _dir: tempfile::TempDir,
-    config: PathBuf,
-    state: Arc<AppState>,
-    app: Router,
+pub(super) struct AuthServer {
+    pub dir: tempfile::TempDir,
+    pub config: PathBuf,
+    pub state: Arc<AppState>,
+    pub app: Router,
+    pub fixture: Fixture,
 }
 
-fn auth_server_with(enabled: bool, read_only: bool) -> AuthServer {
-    let dir = tempfile::tempdir().unwrap();
-    let mut st =
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    st.read_only = read_only;
-    let config = dir.path().join("auth.toml");
-    std::fs::write(&config, config_text(true)).unwrap();
-    if enabled {
-        st.auth = Some(Arc::new(Auth::load(&config).unwrap().0));
+impl AuthServer {
+    pub fn auth(&self) -> Arc<Auth> {
+        self.state.auth.clone().unwrap()
+    }
+
+    /// Rewrite the configuration file.
+    pub fn write_config(&self, f: &Fixture) {
+        std::fs::write(&self.config, config_text(f)).unwrap();
+    }
+
+    /// A new server state from the same data directory and configuration (a restart).
+    pub fn restart(self) -> AuthServer {
+        let AuthServer {
+            dir,
+            config,
+            state,
+            fixture,
+            ..
+        } = self;
+        crate::auth::flush(&state);
+        drop(state);
+        let (state, app) = open_state(dir.path(), &config, &fixture);
+        AuthServer {
+            dir,
+            config,
+            state,
+            app,
+            fixture,
+        }
+    }
+}
+
+fn open_state(
+    dir: &std::path::Path,
+    config: &std::path::Path,
+    f: &Fixture,
+) -> (Arc<AppState>, Router) {
+    let mut st = AppState::new(dir, StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.read_only = f.read_only;
+    if f.enabled {
+        st.auth = Some(Arc::new(Auth::open(config, dir).unwrap().0));
     }
     let st = Arc::new(st);
     for name in ["wiki", "team-a", "secret", "public"] {
@@ -110,58 +197,105 @@ fn auth_server_with(enabled: bool, read_only: bool) -> AuthServer {
     }
     st.set_phase(crate::obs::Phase::Ready);
     let app = router(st.clone());
+    (st, app)
+}
+
+pub(super) fn build(f: Fixture) -> AuthServer {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("auth.toml");
+    std::fs::write(&config, config_text(&f)).unwrap();
+    let (state, app) = open_state(dir.path(), &config, &f);
     AuthServer {
-        _dir: dir,
+        dir,
         config,
-        state: st,
+        state,
         app,
+        fixture: f,
     }
 }
 
-fn auth_server() -> AuthServer {
+fn auth_server_with(enabled: bool, read_only: bool) -> AuthServer {
+    build(Fixture {
+        enabled,
+        read_only,
+        ..Default::default()
+    })
+}
+
+pub(super) fn auth_server() -> AuthServer {
     auth_server_with(true, false)
 }
 
-fn basic(user: &str, pw: &str) -> String {
+pub(super) fn basic(user: &str, pw: &str) -> String {
     format!(
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pw}"))
     )
 }
 
-fn b(user: &str) -> String {
+pub(super) fn b(user: &str) -> String {
     basic(user, &format!("{user}-pw"))
 }
 
-fn bearer(t: &str) -> String {
+pub(super) fn bearer(t: &str) -> String {
     format!("Bearer {t}")
 }
 
-struct R {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Vec<u8>,
+pub(super) struct R {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
 }
 
 impl R {
-    fn json(&self) -> J {
+    pub fn json(&self) -> J {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&self.body)))
     }
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
-    fn all(&self, name: &str) -> Vec<String> {
+    pub fn all(&self, name: &str) -> Vec<String> {
         self.headers
             .get_all(name)
             .iter()
             .map(|v| v.to_str().unwrap().to_string())
             .collect()
     }
+    pub fn header(&self, name: &str) -> String {
+        self.all(name).into_iter().next().unwrap_or_default()
+    }
+    /// The `name=value` of the `Set-Cookie` for cookie `name` or `__Host-name`
+    /// (without attributes).
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        self.set_cookie(name)
+            .map(|c| c.split(';').next().unwrap().to_string())
+    }
+    /// The whole `Set-Cookie` value for cookie `name` or `__Host-name`.
+    pub fn set_cookie(&self, name: &str) -> Option<String> {
+        self.all("set-cookie").into_iter().find(|c| {
+            c.starts_with(&format!("{name}=")) || c.starts_with(&format!("__Host-{name}="))
+        })
+    }
 }
 
-async fn call(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], body: &str) -> R {
-    let mut req = Request::builder().method(method).uri(uri);
+/// The peer of test requests unless stated: not a trusted proxy.
+pub(super) fn default_peer() -> Peer {
+    Peer::Tcp("127.0.0.2:1".parse().unwrap())
+}
+
+pub(super) async fn call_from(
+    app: &Router,
+    peer: Peer,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> R {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .extension(ConnectInfo(peer));
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -183,14 +317,24 @@ async fn call(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], b
     }
 }
 
-async fn get_as(app: &Router, uri: &str, auth: Option<&str>) -> R {
+pub(super) async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> R {
+    call_from(app, default_peer(), method, uri, headers, body).await
+}
+
+pub(super) async fn get_as(app: &Router, uri: &str, auth: Option<&str>) -> R {
     match auth {
         Some(a) => call(app, "GET", uri, &[("authorization", a)], "").await,
         None => call(app, "GET", uri, &[], "").await,
     }
 }
 
-async fn update_as(app: &Router, ds: &str, auth: &str, update: &str) -> R {
+pub(super) async fn update_as(app: &Router, ds: &str, auth: &str, update: &str) -> R {
     call(
         app,
         "POST",
@@ -204,13 +348,14 @@ async fn update_as(app: &Router, ds: &str, auth: &str, update: &str) -> R {
     .await
 }
 
-const ASK: &str = "/sparql?query=ASK%7B%7D";
+pub(super) const ASK: &str = "/sparql?query=ASK%7B%7D";
+pub(super) const INSERT: &str = "INSERT DATA { <a:a> <a:b> <a:c> }";
 
-fn head(st: &AppState, ds: &str) -> u64 {
+pub(super) fn head(st: &AppState, ds: &str) -> u64 {
     st.get(ds).unwrap().store.head_commit().seq
 }
 
-fn names(v: &J) -> Vec<String> {
+pub(super) fn names(v: &J) -> Vec<String> {
     let mut n: Vec<String> = v["datasets"]
         .as_array()
         .unwrap()
@@ -221,10 +366,49 @@ fn names(v: &J) -> Vec<String> {
     n
 }
 
-// ----------------------------------------------------------------------- A1 ------
+/// A UI session: `Cookie` value and CSRF token, from a password login as `user`.
+pub(super) async fn password_session(s: &AuthServer, user: &str) -> (String, String) {
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/auth/login",
+        &[
+            ("content-type", "application/json"),
+            ("origin", s.fixture.public_url),
+        ],
+        &format!(r#"{{"user":"{user}","password":"{user}-pw"}}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let cookie = r.cookie("sparkles_session").unwrap();
+    let csrf = csrf_of(&s.app, &cookie).await;
+    (cookie, csrf)
+}
+
+/// The whoami `csrfToken` of a session cookie.
+pub(super) async fn csrf_of(app: &Router, cookie: &str) -> String {
+    let who = call(app, "GET", "/$/whoami", &[("cookie", cookie)], "")
+        .await
+        .json();
+    who["csrfToken"].as_str().unwrap().to_string()
+}
+
+/// The value of an `sparkles_auth_*` or other metric line.
+pub(super) async fn metric(app: &Router, line_prefix: &str) -> u64 {
+    let m = get_as(app, "/$/metrics", Some(&bearer(&t_prom())))
+        .await
+        .text();
+    m.lines()
+        .find(|l| l.starts_with(line_prefix))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no metric {line_prefix} in\n{m}"))
+}
+
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a1_auth_disabled_is_unchanged() {
+async fn auth_disabled_is_unchanged() {
     let s = auth_server_with(false, false);
     let r = get_as(&s.app, &format!("/wiki{ASK}"), None).await;
     assert_eq!(r.status, StatusCode::OK);
@@ -232,7 +416,7 @@ async fn a1_auth_disabled_is_unchanged() {
     let d = get_as(&s.app, "/$/datasets", None).await.json();
     assert_eq!(names(&d).len(), 4);
     assert!(d["datasets"][0].get("access").is_none());
-    let w = get_as(&s.app, "/$/auth/whoami", None).await.json();
+    let w = get_as(&s.app, "/$/whoami", None).await.json();
     assert_eq!(w["authEnabled"], false);
     assert_eq!(w["principal"]["kind"], "local");
     assert_eq!(w["datasets"]["wiki"], "admin");
@@ -252,10 +436,10 @@ async fn a1_auth_disabled_is_unchanged() {
     assert_eq!(sv["auth"]["enabled"], false);
 }
 
-// ----------------------------------------------------------------------- A2 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a2_anonymous() {
+async fn anonymous() {
     let s = auth_server();
     let r = get_as(&s.app, &format!("/public{ASK}"), None).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
@@ -291,10 +475,10 @@ async fn a2_anonymous() {
     );
 }
 
-// ----------------------------------------------------------------------- A3 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a3_invalid_credentials_are_not_anonymous() {
+async fn invalid_credentials_are_not_anonymous() {
     let s = auth_server();
     let wrong = format!("spk_{}", "x".repeat(43));
     let r = get_as(&s.app, &format!("/public{ASK}"), Some(&bearer(&wrong))).await;
@@ -320,7 +504,7 @@ async fn a3_invalid_credentials_are_not_anonymous() {
     assert_eq!(malformed.status, StatusCode::UNAUTHORIZED);
     let other = get_as(&s.app, &format!("/public{ASK}"), Some("Digest x")).await;
     assert_eq!(other.status, StatusCode::UNAUTHORIZED);
-    // A14: failures are counted
+    // failures are counted
     let m = get_as(&s.app, "/$/metrics", Some(&bearer(&t_prom())))
         .await
         .text();
@@ -335,10 +519,10 @@ async fn a3_invalid_credentials_are_not_anonymous() {
     assert!(m.contains("outcome=\"denied\""), "{m}");
 }
 
-// ----------------------------------------------------------------------- A4 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a4_hidden_versus_forbidden() {
+async fn hidden_versus_forbidden() {
     let s = auth_server();
     let bob = b("bob");
     let ok = update_as(&s.app, "wiki", &bob, "INSERT DATA { <a:a> <a:b> <a:c> }").await;
@@ -394,10 +578,10 @@ async fn a4_hidden_versus_forbidden() {
     );
 }
 
-// ----------------------------------------------------------------------- A5 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a5_filtered_listings() {
+async fn filtered_listings() {
     let s = auth_server();
     let bob = get_as(&s.app, "/$/datasets", Some(&b("bob"))).await.json();
     assert_eq!(names(&bob), ["team-a", "wiki"]);
@@ -433,10 +617,10 @@ async fn a5_filtered_listings() {
     assert_eq!(one["access"], "write");
 }
 
-// ----------------------------------------------------------------------- A6 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a6_token_via_bearer_and_basic() {
+async fn token_via_bearer_and_basic() {
     let s = auth_server();
     for auth in [bearer(&t_etl()), basic("anything", &t_etl())] {
         let r = update_as(&s.app, "wiki", &auth, "INSERT DATA { <a:a> <a:b> <a:c> }").await;
@@ -457,10 +641,10 @@ async fn a6_token_via_bearer_and_basic() {
     assert!(r.all("www-authenticate")[0].contains("insufficient_scope"));
 }
 
-// ----------------------------------------------------------------------- A7 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a7_form_post_is_rechecked() {
+async fn form_post_is_rechecked() {
     let s = auth_server();
     let before = head(&s.state, "team-a");
     let form = [
@@ -495,10 +679,10 @@ async fn a7_form_post_is_rechecked() {
     assert_eq!(w.status, StatusCode::OK, "{}", w.text());
 }
 
-// ----------------------------------------------------------------------- A8 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a8_no_update_over_get() {
+async fn no_update_over_get() {
     for enabled in [true, false] {
         let s = auth_server_with(enabled, false);
         let before = head(&s.state, "wiki");
@@ -509,7 +693,7 @@ async fn a8_no_update_over_get() {
     }
 }
 
-// ----------------------------------------------------------------------- A9 ------
+// ---------------------------------------------------------------------------
 
 async fn wait_task(st: &AppState, id: &str) -> crate::state::Task {
     let t0 = std::time::Instant::now();
@@ -530,7 +714,7 @@ async fn wait_task(st: &AppState, id: &str) -> crate::state::Task {
 }
 
 #[tokio::test]
-async fn a9_admin_operations_and_clone_target() {
+async fn admin_operations_and_clone_target() {
     let s = auth_server();
     let post = |path: &'static str, who: &'static str| {
         let app = s.app.clone();
@@ -582,10 +766,10 @@ async fn a9_admin_operations_and_clone_target() {
     assert_eq!(bob.status, StatusCode::FORBIDDEN);
 }
 
-// ---------------------------------------------------------------------- A10 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a10_tasks_are_filtered() {
+async fn tasks_are_filtered() {
     let s = auth_server();
     let r = call(
         &s.app,
@@ -614,10 +798,10 @@ async fn a10_tasks_are_filtered() {
     assert!(anon.json().as_array().unwrap().is_empty());
 }
 
-// ---------------------------------------------------------------------- A11 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a11_server_routes() {
+async fn server_routes() {
     let s = auth_server();
     assert_eq!(
         get_as(&s.app, "/$/metrics", None).await.status,
@@ -644,7 +828,7 @@ async fn a11_server_routes() {
     assert_eq!(secret.status, StatusCode::NOT_FOUND);
 }
 
-// ---------------------------------------------------------------------- A12 ------
+// ---------------------------------------------------------------------------
 
 /// A local HTTP listener that counts connections and answers 500.
 fn counting_listener() -> (u16, Arc<AtomicUsize>) {
@@ -666,7 +850,7 @@ fn counting_listener() -> (u16, Arc<AtomicUsize>) {
 }
 
 #[tokio::test]
-async fn a12_service_and_load_need_permissions() {
+async fn service_and_load_need_permissions() {
     let s = auth_server();
     let (port, conns) = counting_listener();
     let q = format!("SELECT * {{ SERVICE <http://127.0.0.1:{port}/x> {{ ?s ?p ?o }} }}");
@@ -745,10 +929,10 @@ async fn shacl_sparql_constraints_cannot_reach_out() {
     assert_eq!(conns.load(Ordering::SeqCst), 0);
 }
 
-// ---------------------------------------------------------------------- A13 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a13_cors_and_csrf() {
+async fn cors_and_csrf() {
     let s = auth_server();
     let pre = |origin: &'static str| {
         let app = s.app.clone();
@@ -842,7 +1026,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
 }
 
 #[test]
-fn a13_logs_carry_principals_never_secrets() {
+fn logs_carry_principals_never_secrets() {
     let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     let buf = Buf::default();
     let subscriber = tracing_subscriber::fmt()
@@ -854,6 +1038,7 @@ fn a13_logs_carry_principals_never_secrets() {
         .finish();
     let s = auth_server();
     let hash = token_hash(&t_etl());
+    let mut secrets: Vec<String> = Vec::new();
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
         tokio::runtime::Builder::new_current_thread()
@@ -867,29 +1052,70 @@ fn a13_logs_carry_principals_never_secrets() {
                 get_as(&s.app, &format!("/wiki{ASK}"), Some(&bearer(&tok('Z')))).await;
                 get_as(&s.app, &format!("/secret{ASK}"), Some(&b("bob"))).await;
                 get_as(&s.app, &format!("/wiki{ASK}"), None).await;
+                // a session, a minted token, a device grant and a loopback exchange
+                let (cookie, csrf) = password_session(&s, "alice").await;
+                let v = cookie.split_once('=').unwrap().1;
+                secrets.push(v.rsplit_once('.').unwrap().0.to_string());
+                secrets.push(csrf.clone());
+                let m = tokens::mint_as(&s.app, &[("cookie", &cookie), ("x-sparkles-csrf", &csrf)], r#"{"name":"x"}"#).await;
+                secrets.push(m.json()["token"].as_str().unwrap().to_string());
+                let d = cli_grants::form(&s.app, "/$/auth/device", "label=l").await.json();
+                let dc = d["device_code"].as_str().unwrap().to_string();
+                cli_grants::form(&s.app, "/$/auth/token", &format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code={dc}")).await;
+                secrets.push(dc);
+                let verifier = crate::auth::crypto::random_token(32);
+                let challenge = crate::auth::crypto::pkce_challenge(&verifier);
+                let a = call(&s.app, "POST", "/$/auth/cli/authorize", &[("cookie", &cookie), ("x-sparkles-csrf", &csrf), ("content-type", "application/json")], &format!(r#"{{"port":50000,"state":"st","codeChallenge":"{challenge}"}}"#)).await.json();
+                let redirect = a["redirect"].as_str().unwrap().to_string();
+                let code = redirect.split("code=").nth(1).unwrap().split('&').next().unwrap().to_string();
+                let t = cli_grants::form(&s.app, "/$/auth/token", &format!("grant_type=authorization_code&code={code}&code_verifier={verifier}")).await.json();
+                secrets.push(t["access_token"].as_str().unwrap().to_string());
+                secrets.push(code);
+                secrets.push(verifier);
             });
     });
     let text = String::from_utf8(buf.0.lock().clone()).unwrap();
-    for secret in ["bob-pw", &t_etl(), &tok('Z'), &hash, "$argon2id$", "wrong"] {
+    for secret in [
+        "bob-pw",
+        "alice-pw",
+        &t_etl(),
+        &tok('Z'),
+        &hash,
+        "$argon2id$",
+        "wrong",
+        "spk_",
+        "sha256:",
+    ]
+    .into_iter()
+    .chain(secrets.iter().map(String::as_str))
+    {
         assert!(!text.contains(secret), "{secret} in the log:\n{text}");
     }
-    assert!(
-        !text.to_ascii_lowercase().contains("authorization"),
-        "{text}"
-    );
+    let lower = text.to_ascii_lowercase();
+    assert!(!lower.contains("authorization"), "{text}");
+    assert!(!lower.contains("cookie"), "{text}");
     let access: Vec<J> = text
         .lines()
         .filter(|l| l.contains(r#""target":"sparkles::access""#))
         .map(|l| serde_json::from_str(l).unwrap())
+        .take(6)
         .collect();
     assert_eq!(access.len(), 6, "{text}");
+    assert!(text.contains(r#""event":"token_minted""#), "{text}");
     let principals: Vec<&str> = access
         .iter()
         .map(|j| j["fields"]["principal"].as_str().unwrap_or(""))
         .collect();
     assert_eq!(
         principals,
-        ["user:bob", "-", "token:etl", "-", "user:bob", "anonymous"]
+        [
+            "user:bob",
+            "-",
+            "token:cfg-etl",
+            "-",
+            "user:bob",
+            "anonymous"
+        ]
     );
     assert_eq!(access[0]["span"]["principal"], "user:bob");
     assert_eq!(access[1]["fields"]["auth_error"], "invalid");
@@ -897,10 +1123,10 @@ fn a13_logs_carry_principals_never_secrets() {
     assert_eq!(access[4]["fields"]["status"], 404);
 }
 
-// ---------------------------------------------------------------------- A15 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a15_expired_token() {
+async fn expired_token() {
     let s = auth_server();
     let r = get_as(&s.app, &format!("/wiki{ASK}"), Some(&bearer(&t_old()))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
@@ -911,10 +1137,10 @@ async fn a15_expired_token() {
     assert!(m.contains("sparkles_auth_failures_total{scheme=\"bearer\",reason=\"expired\"} 1"));
 }
 
-// ---------------------------------------------------------------------- A16 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a16_reload() {
+async fn reload() {
     let s = auth_server();
     let auth = s.state.auth.clone().unwrap();
     assert_eq!(
@@ -923,7 +1149,10 @@ async fn a16_reload() {
             .status,
         StatusCode::OK
     );
-    std::fs::write(&s.config, config_text(false)).unwrap();
+    s.write_config(&Fixture {
+        bob_wiki: false,
+        ..Default::default()
+    });
     auth.reload().unwrap();
     assert_eq!(
         get_as(&s.app, &format!("/wiki{ASK}"), Some(&b("bob")))
@@ -933,7 +1162,7 @@ async fn a16_reload() {
     );
     std::fs::write(
         &s.config,
-        format!("{}\ndataset = {{}}\n", config_text(true)),
+        format!("dataset = {{}}\n{}", config_text(&Fixture::default())),
     )
     .unwrap();
     assert!(auth.reload().is_err());
@@ -957,10 +1186,10 @@ async fn a16_reload() {
     );
 }
 
-// ---------------------------------------------------------------------- A17 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a17_read_only_applies_after_auth() {
+async fn read_only_applies_after_auth() {
     let s = auth_server_with(true, true);
     let alice = call(
         &s.app,
@@ -976,47 +1205,60 @@ async fn a17_read_only_applies_after_auth() {
     assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
 }
 
-// ---------------------------------------------------------------------- A18 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a18_whoami() {
+async fn whoami_reports_permissions() {
     let s = auth_server();
-    let bob = get_as(&s.app, "/$/auth/whoami", Some(&b("bob")))
-        .await
-        .json();
+    let r = get_as(&s.app, "/$/whoami", Some(&b("bob"))).await;
+    assert_eq!(r.header("cache-control"), "no-store");
+    let bob = r.json();
+    assert_eq!(bob["authEnabled"], true);
     assert_eq!(
-        bob,
-        serde_json::json!({
-            "authEnabled": true,
-            "principal": { "kind": "user", "name": "bob" },
-            "server": [],
-            "datasets": { "team-a": "read", "wiki": "write" }
-        })
+        bob["principal"],
+        serde_json::json!({ "kind": "user", "name": "bob" })
     );
-    let anon = get_as(&s.app, "/$/auth/whoami", None).await.json();
+    assert_eq!(bob["method"], "basic");
+    assert_eq!(bob["server"], serde_json::json!([]));
+    assert_eq!(
+        bob["datasets"],
+        serde_json::json!({ "team-a": "read", "wiki": "write" })
+    );
+    assert_eq!(bob["canMintTokens"], true);
+    assert_eq!(bob["logout"], false);
+    // Basic is not ambient in the synchronizer sense: no CSRF token
+    assert!(bob.get("csrfToken").is_none());
+    let anon = get_as(&s.app, "/$/whoami", None).await.json();
     assert_eq!(
         anon["principal"],
         serde_json::json!({ "kind": "anonymous" })
     );
     assert_eq!(anon["datasets"], serde_json::json!({ "public": "read" }));
-    let bad = get_as(&s.app, "/$/auth/whoami", Some(&basic("bob", "x"))).await;
+    let bad = get_as(&s.app, "/$/whoami", Some(&basic("bob", "x"))).await;
     assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
-    let alice = get_as(&s.app, "/$/auth/whoami", Some(&b("alice")))
-        .await
-        .json();
+    let alice = get_as(&s.app, "/$/whoami", Some(&b("alice"))).await.json();
     assert_eq!(alice["server"], serde_json::json!(["server-admin"]));
 }
 
-// ---------------------------------------------------------------------- A19 ------
+// ---------------------------------------------------------------------------
 
 /// Every `.route(…)` of `router()` (and the auth routes) is in the route table, with a
 /// need for each method it serves.
 #[test]
-fn a19_route_coverage() {
-    let src = include_str!("../../http.rs");
-    let start = src.find("Router::new()").unwrap();
-    let end = start + src[start..].find(".layer(").unwrap();
-    let body = &src[start..end];
+fn route_coverage() {
+    // the routers: `http::router` up to its layers, and the auth routes
+    let routers = [
+        include_str!("../../../http.rs"),
+        include_str!("../../../auth/api.rs"),
+        include_str!("../../../auth/handlers.rs"),
+    ];
+    let mut body = String::new();
+    for src in routers {
+        let start = src.find("Router::new()").unwrap();
+        let rest = &src[start..];
+        let end = rest.find(".layer(").or_else(|| rest.find("\n}")).unwrap();
+        body.push_str(&rest[..end]);
+    }
     let method_re = regex::Regex::new(r"\b(get|post|put|delete|head|any)\(").unwrap();
     let mut found = 0;
     for chunk in body.split(".route(").skip(1) {
@@ -1047,7 +1289,7 @@ fn a19_route_coverage() {
         }
         found += 1;
     }
-    assert!(found > 30, "{found}");
+    assert!(found > 45, "{found}");
     // and nothing unknown slips through
     assert_eq!(
         crate::auth::need(
@@ -1060,10 +1302,10 @@ fn a19_route_coverage() {
     );
 }
 
-// ---------------------------------------------------------------------- A20 ------
+// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a20_login_cost_is_bounded() {
+async fn login_cost_is_bounded() {
     let s = auth_server();
     let auth = s.state.auth.clone().unwrap();
     let verifications = || auth.metrics.password_verifications.load(Ordering::Relaxed);
@@ -1098,10 +1340,10 @@ async fn a20_login_cost_is_bounded() {
     assert_eq!(verifications() - before, 50);
 }
 
-// ---------------------------------------------------------------------- A21 ------
+// ---------------------------------------------------------------------------
 
 #[test]
-fn a21_hashes_and_tokens() {
+fn hashes_and_tokens() {
     let h = crate::auth::hash_password("pw").unwrap();
     let re = regex::Regex::new(
         r"^\$argon2id\$v=19\$m=19456,t=2,p=1\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$",
@@ -1118,6 +1360,7 @@ fn a21_hashes_and_tokens() {
     assert!(
         crate::auth::load(
             Some(std::path::Path::new("/nonexistent/auth.toml")),
+            std::path::Path::new("/nonexistent"),
             "127.0.0.1"
         )
         .is_err()

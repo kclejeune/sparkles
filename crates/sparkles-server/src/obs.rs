@@ -294,6 +294,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         route = route.as_deref().unwrap_or("-"),
         // recorded by the auth layer
         principal = tracing::field::Empty,
+        auth = tracing::field::Empty,
     );
     req.extensions_mut().insert(RequestSpan(span.clone()));
     let op = route_op(route.as_deref(), &req);

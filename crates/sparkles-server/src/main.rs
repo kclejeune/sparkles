@@ -124,6 +124,10 @@ enum Cmd {
         /// (re-read on SIGHUP); without it the server is open
         #[arg(long, value_name = "FILE")]
         auth_config: Option<PathBuf>,
+        /// Listen on this Unix socket (mode 0660) instead of TCP; with auth, trusted
+        /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
+        #[arg(long, value_name = "PATH")]
+        unix_socket: Option<PathBuf>,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -573,9 +577,11 @@ fn main() -> Result<()> {
             auto_reason,
             auto_reason_max_delay,
             auth_config,
+            unix_socket,
         } => {
             // a bad auth configuration stops the server before anything else
-            let auth = auth::load(auth_config.as_deref(), &host)?;
+            let bound = if unix_socket.is_some() { "unix" } else { &host };
+            let auth = auth::load(auth_config.as_deref(), &data, bound)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.read_only = read_only;
@@ -635,11 +641,29 @@ fn main() -> Result<()> {
                 .build()?;
             rt.block_on(async move {
                 let addr = format!("{host}:{port}");
-                let listener = tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .with_context(|| format!("binding {addr}"))?;
+                let tcp = match &unix_socket {
+                    None => Some(
+                        tokio::net::TcpListener::bind(&addr)
+                            .await
+                            .with_context(|| format!("binding {addr}"))?,
+                    ),
+                    Some(_) => None,
+                };
+                #[cfg(unix)]
+                let unix = match &unix_socket {
+                    Some(path) => Some(bind_unix(path)?),
+                    None => None,
+                };
+                #[cfg(not(unix))]
+                if unix_socket.is_some() {
+                    bail!("--unix-socket needs a Unix platform");
+                }
+                let listening = match &unix_socket {
+                    Some(p) => format!("unix:{}", p.display()),
+                    None => format!("http://{addr}/"),
+                };
                 tracing::info!(
-                    "Sparkles {} listening on http://{addr}/ (UI at /ui/)",
+                    "Sparkles {} listening on {listening} (UI at /ui/)",
                     env!("CARGO_PKG_VERSION")
                 );
                 for name in st.datasets.read().keys() {
@@ -651,13 +675,28 @@ fn main() -> Result<()> {
                 st.set_phase(obs::Phase::Ready);
                 auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
-                axum::serve(listener, http::router(st))
-                    .with_graceful_shutdown(async move {
-                        shutdown_signal().await;
-                        st2.set_phase(obs::Phase::Draining);
-                        tracing::info!("shutting down: finishing requests in flight");
-                    })
-                    .await?;
+                let app = http::router(st.clone());
+                let shutdown = async move {
+                    shutdown_signal().await;
+                    st2.set_phase(obs::Phase::Draining);
+                    tracing::info!("shutting down: finishing requests in flight");
+                };
+                // the peer address feeds trusted-proxy checks
+                let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                #[cfg(unix)]
+                if let Some(l) = unix {
+                    axum::serve(l, service)
+                        .with_graceful_shutdown(shutdown)
+                        .await?;
+                    auth::flush(&st);
+                    return anyhow::Ok(());
+                }
+                if let Some(l) = tcp {
+                    axum::serve(l, service)
+                        .with_graceful_shutdown(shutdown)
+                        .await?;
+                }
+                auth::flush(&st);
                 anyhow::Ok(())
             })
         }
@@ -1263,6 +1302,23 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
 }
 
 /// SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+/// `serve --unix-socket`: remove a stale socket, bind, and allow owner and group
+/// (mode 0660).
+#[cfg(unix)]
+fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        if !m.file_type().is_socket() {
+            bail!("{} exists and is not a socket", path.display());
+        }
+        std::fs::remove_file(path)?;
+    }
+    let l = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(l)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

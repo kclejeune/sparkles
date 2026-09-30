@@ -20,9 +20,8 @@ pub struct GrantsCfg {
 #[serde(deny_unknown_fields)]
 pub struct UserCfg {
     pub name: String,
-    /// argon2id PHC string; absent for users who sign in only through OIDC or a proxy
-    #[serde(default)]
-    pub password: Option<String>,
+    /// argon2id PHC string (`sparkles auth hash`)
+    pub password: String,
     #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
@@ -35,7 +34,7 @@ impl std::fmt::Debug for UserCfg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UserCfg")
             .field("name", &self.name)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password", &"<redacted>")
             .field("roles", &self.roles)
             .field("datasets", &self.datasets)
             .field("server", &self.server)
@@ -80,12 +79,174 @@ pub struct CorsCfg {
     pub origins: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerCfg {
+    /// the server's external URL (`https://sparql.example.org`): the OIDC redirect URI,
+    /// cookie attributes and own origin
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokensPolicyCfg {
+    #[serde(default = "default_ttl")]
+    pub default_ttl: String,
+    #[serde(default = "max_ttl")]
+    pub max_ttl: String,
+}
+
+impl Default for TokensPolicyCfg {
+    fn default() -> Self {
+        TokensPolicyCfg {
+            default_ttl: default_ttl(),
+            max_ttl: max_ttl(),
+        }
+    }
+}
+
+fn default_ttl() -> String {
+    "30d".into()
+}
+fn max_ttl() -> String {
+    "90d".into()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcCfg {
+    pub issuer: String,
+    pub client_id: String,
+    /// a file holding the client secret; absent for a public client (PKCE only)
+    #[serde(default)]
+    pub client_secret_file: Option<String>,
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<String>,
+    /// `email`, `preferred_username` or `sub`
+    #[serde(default = "default_name_claim")]
+    pub name_claim: String,
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    #[serde(default = "default_display_name")]
+    pub display_name: String,
+    #[serde(default = "default_algorithms")]
+    pub algorithms: Vec<String>,
+}
+
+fn default_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_name_claim() -> String {
+    "email".into()
+}
+fn default_groups_claim() -> String {
+    "groups".into()
+}
+fn default_display_name() -> String {
+    "single sign-on".into()
+}
+fn default_algorithms() -> Vec<String> {
+    vec!["RS256".into(), "ES256".into()]
+}
+
+/// Admission and role mapping of OIDC and proxy identities.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalCfg {
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    #[serde(default)]
+    pub default_roles: Vec<String>,
+    #[serde(default)]
+    pub group_roles: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub user_roles: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCfg {
+    #[serde(default = "session_ttl")]
+    pub ttl: String,
+    /// default `<data>/auth/session.key`, created on first start
+    #[serde(default)]
+    pub key_file: Option<String>,
+}
+
+impl Default for SessionCfg {
+    fn default() -> Self {
+        SessionCfg {
+            ttl: session_ttl(),
+            key_file: None,
+        }
+    }
+}
+
+fn session_ttl() -> String {
+    "12h".into()
+}
+
+/// Trusted-header authentication behind a forward-auth proxy.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyCfg {
+    /// `oauth2-proxy`, `authelia`, `tailscale` or `cloudflare-access`
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// CIDRs of the proxy, and `unix` for the Unix socket
+    pub trusted: Vec<String>,
+    #[serde(default)]
+    pub user_header: Option<String>,
+    #[serde(default)]
+    pub email_header: Option<String>,
+    #[serde(default)]
+    pub groups_header: Option<String>,
+    #[serde(default = "default_separator")]
+    pub groups_separator: String,
+    /// `user` or `email`: which header names the principal
+    #[serde(default = "default_name_from")]
+    pub name_from: String,
+    #[serde(default)]
+    pub logout_url: Option<String>,
+}
+
+fn default_separator() -> String {
+    ",".into()
+}
+fn default_name_from() -> String {
+    "user".into()
+}
+
+/// Header names of a proxy preset: user, email, groups.
+pub fn proxy_preset(name: &str) -> Option<(&'static str, &'static str, Option<&'static str>)> {
+    Some(match name {
+        "oauth2-proxy" => (
+            "X-Forwarded-User",
+            "X-Forwarded-Email",
+            Some("X-Forwarded-Groups"),
+        ),
+        "authelia" => ("Remote-User", "Remote-Email", Some("Remote-Groups")),
+        "tailscale" => ("Tailscale-User-Login", "Tailscale-User-Login", None),
+        "cloudflare-access" => (
+            "Cf-Access-Authenticated-User-Email",
+            "Cf-Access-Authenticated-User-Email",
+            None,
+        ),
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub version: u32,
     #[serde(default = "default_realm")]
     pub realm: String,
+    #[serde(default)]
+    pub server: ServerCfg,
     #[serde(default)]
     pub anonymous: GrantsCfg,
     #[serde(default)]
@@ -94,6 +255,16 @@ pub struct FileConfig {
     pub users: Vec<UserCfg>,
     #[serde(default)]
     pub tokens: Vec<TokenCfg>,
+    #[serde(default)]
+    pub tokens_policy: TokensPolicyCfg,
+    #[serde(default)]
+    pub oidc: Option<OidcCfg>,
+    #[serde(default)]
+    pub external: ExternalCfg,
+    #[serde(default)]
+    pub session: SessionCfg,
+    #[serde(default)]
+    pub proxy: Option<ProxyCfg>,
     #[serde(default)]
     pub cors: CorsCfg,
 }
@@ -124,6 +295,40 @@ pub fn parse_rfc3339(s: &str) -> Result<i64> {
     Ok(chrono::DateTime::parse_from_rfc3339(s)
         .with_context(|| format!("invalid RFC 3339 timestamp '{s}'"))?
         .timestamp())
+}
+
+/// A duration `<n>s|m|h|d` in seconds.
+pub fn parse_duration(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("invalid duration '{s}' (expected <n>s, <n>m, <n>h or <n>d)"),
+    };
+    let n: i64 =
+        n.parse().ok().filter(|n| *n > 0).with_context(|| {
+            format!("invalid duration '{s}' (expected <n>s, <n>m, <n>h or <n>d)")
+        })?;
+    n.checked_mul(mult)
+        .with_context(|| format!("duration '{s}' is too long"))
+}
+
+/// A public URL: `http(s)://host[:port]` without a path; `http` only for loopback hosts.
+pub fn check_public_url(u: &str) -> Result<()> {
+    let url = reqwest::Url::parse(u)
+        .with_context(|| format!("server.public_url '{u}' is not an absolute URL"))?;
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || !url.username().is_empty() {
+        bail!("server.public_url '{u}' must be scheme://host[:port] without a path");
+    }
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => bail!("server.public_url must use https (http is allowed only for localhost)"),
+    }
 }
 
 /// `sha256:<64 lowercase hex>` → the digest.
@@ -247,9 +452,7 @@ impl FileConfig {
             if !names.insert(u.name.as_str()) {
                 bail!("duplicate user '{}'", u.name);
             }
-            if let Some(pw) = &u.password
-                && argon2id_params(pw).is_none()
-            {
+            if argon2id_params(&u.password).is_none() {
                 bail!(
                     "user {}: password must be an argon2id PHC string ($argon2id$…, see `sparkles auth hash`)",
                     u.name
@@ -295,6 +498,81 @@ impl FileConfig {
                 bail!("cors.origins: '{o}' is not scheme://host[:port]");
             }
         }
+        if let Some(u) = &self.server.public_url {
+            check_public_url(u)?;
+        }
+        let dflt =
+            parse_duration(&self.tokens_policy.default_ttl).context("tokens_policy.default_ttl")?;
+        let max = parse_duration(&self.tokens_policy.max_ttl).context("tokens_policy.max_ttl")?;
+        if max < dflt {
+            bail!("tokens_policy.max_ttl must be at least default_ttl");
+        }
+        parse_duration(&self.session.ttl).context("session.ttl")?;
+        let ext = &self.external;
+        for r in ext
+            .default_roles
+            .iter()
+            .chain(ext.group_roles.values().flatten())
+            .chain(ext.user_roles.values().flatten())
+        {
+            if !self.roles.contains_key(r) {
+                bail!("[external]: unknown role '{r}'");
+            }
+        }
+        if let Some(o) = &self.oidc {
+            if self.server.public_url.is_none() {
+                bail!("[oidc] requires server.public_url");
+            }
+            super::oidc::check_url("oidc.issuer", &o.issuer)?;
+            if o.client_id.is_empty() {
+                bail!("oidc.client_id is empty");
+            }
+            if !matches!(
+                o.name_claim.as_str(),
+                "email" | "preferred_username" | "sub"
+            ) {
+                bail!("oidc.name_claim must be email, preferred_username or sub");
+            }
+            if !o.scopes.iter().any(|s| s == "openid") {
+                bail!("oidc.scopes must include openid");
+            }
+            for a in &o.algorithms {
+                super::oidc::parse_algorithm(a)?;
+            }
+        }
+        if let Some(p) = &self.proxy {
+            if let Some(preset) = &p.preset
+                && proxy_preset(preset).is_none()
+            {
+                bail!(
+                    "proxy.preset '{preset}' is not one of oauth2-proxy, authelia, tailscale, cloudflare-access"
+                );
+            }
+            if p.user_header.is_none() && p.preset.is_none() {
+                bail!("[proxy] needs user_header or a preset");
+            }
+            if p.trusted.is_empty() {
+                bail!("proxy.trusted is empty");
+            }
+            for t in &p.trusted {
+                if t == "unix" {
+                    continue;
+                }
+                let net: ipnet::IpNet = t
+                    .parse()
+                    .or_else(|_| t.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|_| anyhow::anyhow!("proxy.trusted: '{t}' is not a CIDR"))?;
+                if net.prefix_len() == 0 {
+                    bail!("proxy.trusted: '{t}' would trust every address");
+                }
+            }
+            if !matches!(p.name_from.as_str(), "user" | "email") {
+                bail!("proxy.name_from must be user or email");
+            }
+            if p.groups_separator.is_empty() {
+                bail!("proxy.groups_separator is empty");
+            }
+        }
         Ok(())
     }
 
@@ -302,7 +580,7 @@ impl FileConfig {
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
         for u in &self.users {
-            if let Some((m, t, p)) = u.password.as_deref().and_then(argon2id_params)
+            if let Some((m, t, p)) = argon2id_params(&u.password)
                 && (m < OWASP_M || t < OWASP_T || p < OWASP_P)
             {
                 w.push(format!(
@@ -323,6 +601,33 @@ impl FileConfig {
             || !self.anonymous.server.is_empty()
         {
             w.push("anonymous holds write, admin or a server permission".into());
+        }
+        let ext = &self.external;
+        if (self.oidc.is_some() || self.proxy.is_some())
+            && ext.allowed_users.is_empty()
+            && ext.allowed_groups.is_empty()
+            && !ext.default_roles.is_empty()
+        {
+            w.push(format!(
+                "every account at the identity provider or proxy gets the roles {:?}",
+                ext.default_roles
+            ));
+        }
+        if let Some(p) = &self.proxy {
+            for t in &p.trusted {
+                if let Ok(net) = t.parse::<ipnet::IpNet>()
+                    && net.prefix_len() < net.max_prefix_len()
+                {
+                    let header = p.user_header.clone().unwrap_or_else(|| {
+                        p.preset
+                            .as_deref()
+                            .and_then(proxy_preset)
+                            .map_or("the user header", |x| x.0)
+                            .to_string()
+                    });
+                    w.push(format!("every host in {t} can set {header}"));
+                }
+            }
         }
         w
     }
@@ -404,12 +709,12 @@ origins = ["https://yasgui.example.org"]
         assert!(e.contains("line 4"), "{e}");
         let bad = |t: &str| FileConfig::parse(t).unwrap_err().to_string();
         assert!(bad("version = 2").contains("version"));
-        assert!(bad("version = 1\n[[users]]\nname = \"a:b\"").contains("user name"));
+        assert!(bad("version = 1\n[[users]]\nname = \"a:b\"\npassword = \"$argon2id$v=19$m=8,t=1,p=1$x$y\"").contains("user name"));
         assert!(
             bad("version = 1\n[[users]]\nname = \"a\"\npassword = \"plain\"").contains("argon2id")
         );
         assert!(
-            bad("version = 1\n[[users]]\nname = \"a\"\nroles = [\"nope\"]")
+            bad("version = 1\n[[users]]\nname = \"a\"\npassword = \"$argon2id$v=19$m=8,t=1,p=1$x$y\"\nroles = [\"nope\"]")
                 .contains("unknown role")
         );
         assert!(
