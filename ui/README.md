@@ -49,6 +49,17 @@ subset of the text syntax; the rest of the query is ignored); `foaf` has
 changes the port; `MOCK_LATENCY=300 pnpm mock` adds latency to every response;
 `MOCK_VECTOR_BUDGET=1000` makes vector searches exceed their budget (507).
 
+Backup repositories are mocked in `mock/backups.mjs`, statefully and in memory:
+repositories (`local`, the config-file `s3-main`, the read-only `dr-source` with backups
+of a `wiki` dataset this server does not have, the unreachable `minio-lab`), backups of
+`foaf` (one of an older lineage, one whose last verify failed), three policies with run
+history, stale locks and GC candidates. Backup, restore, verify, GC and policy tasks
+queue for two slots, progress over a few seconds and can be cancelled
+(`DELETE /$/tasks/{id}`). Restores create or replace mock datasets. A repository at
+`/mnt/offline/…` (or bucket `no-such-bucket`) fails its connection test and
+`/srv/not-a-repo` is `not-a-repository`. `MOCK_ROLE=dataset-admin pnpm mock` answers
+`/$/whoami` as a signed-in admin of `foaf` only, for the reduced Backups view.
+
 ## Check and build
 
 ```sh
