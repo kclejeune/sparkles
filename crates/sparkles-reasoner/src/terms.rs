@@ -14,7 +14,19 @@ pub(crate) enum Kind {
     Iri,
     BNode,
     Literal,
+    /// RDF 1.2 triple term: valid as an object only
+    Triple,
     Other,
+}
+
+/// Kind of a vocabulary key (`<iri`, `"literal`, `(triple`).
+fn key_kind(k: &[u8]) -> Kind {
+    match k.first() {
+        Some(b'<') => Kind::Iri,
+        Some(b'"') => Kind::Literal,
+        Some(b'(') => Kind::Triple,
+        _ => Kind::Other,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -148,21 +160,21 @@ impl Terms {
             Tag::BNode => Kind::BNode,
             Tag::Vocab => {
                 let p = i.payload();
+                let v = &self.snap.generation.vocab;
                 if p >= self.lit_range.0 && p < self.lit_range.1 {
                     Kind::Literal
-                } else {
+                } else if v.is_triple(p) {
+                    Kind::Triple
+                } else if v.is_iri(p) {
                     Kind::Iri
+                } else {
+                    Kind::Other
                 }
             }
-            Tag::Delta => match self.snap.key(i).as_deref().and_then(|k| k.first().copied()) {
-                Some(b'<') => Kind::Iri,
-                Some(b'"') => Kind::Literal,
-                _ => Kind::Other,
-            },
+            Tag::Delta => self.snap.key(i).map_or(Kind::Other, |k| key_kind(&k)),
             Tag::Local => match self.local(id) {
                 Some(LocalTerm::BNode) => Kind::BNode,
-                Some(LocalTerm::Key(k)) if k.first() == Some(&b'<') => Kind::Iri,
-                Some(LocalTerm::Key(_)) => Kind::Literal,
+                Some(LocalTerm::Key(k)) => key_kind(&k),
                 None => Kind::Other,
             },
             _ => Kind::Other,

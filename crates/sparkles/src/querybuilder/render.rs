@@ -395,6 +395,8 @@ impl Renderer {
                     row.len(),
                     vars.len()
                 ));
+                // the build fails with that error; don't render (or index) the row
+                continue;
             }
             let r: Vec<String> = row.iter().map(|c| self.node(c, Pos::Values)).collect();
             cells.push(r);

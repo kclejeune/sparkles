@@ -956,3 +956,24 @@ fn exec_updates() {
     );
     assert!(!names(&ds).is_empty());
 }
+
+#[test]
+fn invalid_values_rows_are_errors_not_panics() {
+    let empty: Vec<Vec<i32>> = vec![Vec::new()];
+    for q in [
+        // a single variable with an empty row
+        SelectBuilder::new().values_rows(["?x"], empty.clone()),
+        // an overlong row
+        SelectBuilder::new().values_rows(["?x"], [[1, 2]]),
+        // two variables, an empty row
+        SelectBuilder::new().values_rows(["?a", "?b"], empty),
+    ] {
+        assert!(q.build().is_err());
+    }
+    // valid single-variable rows, including UNDEF, still render
+    let ok = SelectBuilder::new()
+        .values_rows(["?x"], [[node(1)], [undef()]])
+        .build()
+        .unwrap();
+    assert!(ok.contains("VALUES ?x { 1 UNDEF }"), "{ok}");
+}

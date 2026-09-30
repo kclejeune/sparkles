@@ -114,16 +114,71 @@ fn messages(g: &G<'_>, node: &Term) -> Vec<Literal> {
         .collect()
 }
 
-/// Replace `$PATH` (not `?PATH`, which is a normal variable) with a SPARQL path.
+/// Replace the `$PATH` placeholder (not `?PATH`, which is a normal variable) with a
+/// SPARQL path. Only real tokens are replaced: the same text inside string literals,
+/// IRIs or comments is left alone.
 fn substitute_path(text: &str, path: Option<&PropertyPath>) -> String {
-    match path {
-        Some(p) => {
-            let re = regex::Regex::new(r"\$PATH\b").expect("valid regex");
-            re.replace_all(text, regex::NoExpand(&p.to_sparql()))
-                .into_owned()
+    let Some(p) = path else {
+        return text.to_string();
+    };
+    let replacement = p.to_sparql();
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    // `text[copied..i]` is pending verbatim output; every delimiter below is ASCII, so
+    // these byte offsets are always character boundaries
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'#' => {
+                i = b[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n)
+            }
+            q @ (b'"' | b'\'') => {
+                let long = b[i..].starts_with(&[q, q, q]);
+                let delim = if long { 3 } else { 1 };
+                let mut j = i + delim;
+                while j < b.len() {
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j..].starts_with(&[q, q, q][..delim]) {
+                        j += delim;
+                        break;
+                    } else if !long && b[j] == b'\n' {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                i = j.min(b.len());
+            }
+            // an IRI reference; `<` followed by whitespace is the comparison operator
+            b'<' => match b[i + 1..].iter().position(|&c| {
+                c == b'>'
+                    || c <= b' '
+                    || matches!(c, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`')
+            }) {
+                Some(n) if b[i + 1 + n] == b'>' => i += n + 2,
+                _ => i += 1,
+            },
+            b'$' if b[i + 1..].starts_with(b"PATH")
+                && !text[i + 5..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_') =>
+            {
+                out.push_str(&text[copied..i]);
+                out.push_str(&replacement);
+                i += 5;
+                copied = i;
+            }
+            _ => i += 1,
         }
-        None => text.to_string(),
     }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// Reject query forms that are incompatible with pre-binding (SHACL §5.2.1).
@@ -608,5 +663,34 @@ impl Engine<'_> {
                 out,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::substitute_path;
+    use crate::path::PropertyPath;
+    use oxrdf::NamedNode;
+
+    #[test]
+    fn path_placeholder_is_replaced_only_as_a_token() {
+        let p = PropertyPath::Predicate(NamedNode::new_unchecked("http://ex.org/p"));
+        let text = r#"SELECT $this WHERE {
+  $this $PATH ?v .   # $PATH in a comment
+  FILTER(STRLEN("$PATH") = 5 && ?v != '$PATH' && ?v != """a "$PATH" b""")
+  FILTER(?v != <http://ex.org/$PATH>) FILTER(?x<$PATH)
+  ?v $PATHS ?w . ?v ?PATH ?u .
+}"#;
+        let out = substitute_path(text, Some(&p));
+        assert_eq!(
+            out,
+            r#"SELECT $this WHERE {
+  $this <http://ex.org/p> ?v .   # $PATH in a comment
+  FILTER(STRLEN("$PATH") = 5 && ?v != '$PATH' && ?v != """a "$PATH" b""")
+  FILTER(?v != <http://ex.org/$PATH>) FILTER(?x<<http://ex.org/p>)
+  ?v $PATHS ?w . ?v ?PATH ?u .
+}"#
+        );
+        assert_eq!(substitute_path(text, None), text);
     }
 }

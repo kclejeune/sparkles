@@ -816,3 +816,34 @@ fn semi_naive_matches_direct_closure() {
         assert_eq!(total, [closure.len().to_string()]);
     }
 }
+
+/// A rule that moves an object into subject position must not turn an RDF 1.2 triple
+/// term into a subject, in `infer` (dry run) or `materialize` alike.
+#[test]
+fn triple_terms_never_become_subjects() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"<http://ex.org/a> <http://ex.org/p> <<( <http://ex.org/x> <http://ex.org/y> <http://ex.org/z> )>> .
+          <http://ex.org/b> <http://ex.org/p> <http://ex.org/c> ."
+            .to_vec(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let rules = Profile::Rules(
+        "[flip: (?s <http://ex.org/p> ?o) -> (?o <http://ex.org/q> ?s)]".to_string(),
+    );
+    let (derived, _) =
+        sparkles_reasoner::infer(s.snapshot(), &rules, &ReasonOptions::default()).unwrap();
+    let subjects: Vec<String> = derived.iter().map(|t| t.subject.to_string()).collect();
+    assert_eq!(subjects, ["<http://ex.org/c>"]);
+    let report = run(&s, rules);
+    assert_eq!(report.inferred, 1);
+    assert!(ask(
+        &s,
+        "<http://ex.org/c> <http://ex.org/q> <http://ex.org/b>"
+    ));
+    // everything materialized is exportable RDF
+    let mut buf = Vec::new();
+    assert_eq!(s.dump_nquads(&mut buf).unwrap(), s.snapshot().len());
+}
