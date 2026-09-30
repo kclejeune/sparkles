@@ -41,7 +41,7 @@ pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
 pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
 pub use sparkles::io::RdfFormat;
-pub use validate::{ValidateOptions, validate, validate_node};
+pub use validate::{TooManyResults, ValidateOptions, validate, validate_node};
 
 /// Lexical validity of an XSD literal (as used by `sh:datatype`).
 pub fn is_valid_literal(l: &oxrdf::Literal) -> bool {

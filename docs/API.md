@@ -290,7 +290,9 @@ minute.
 Over a concurrency cap: `503 Service Unavailable` with `Retry-After: 1`, immediately;
 requests are never queued, so a saturated server sheds load instead of holding waiting
 requests. A request holds its concurrency slot until its response body has been sent
-(streamed Graph Store GETs included). The body uses the error format:
+(streamed Graph Store GETs included) and the work it started has ended: a client that
+disconnects cancels its query or write, and the slot is free once that work has
+stopped. The body uses the error format:
 
 ```json
 { "error": "too many query requests: retry in 2 s",
@@ -343,15 +345,15 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations; see [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
-| POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
-| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it). Returns `Task`; its message gives the size and time. |
+| POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
+| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (clones, until the clone is in place): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (a queued task, a clone until it is in place, an N-Quads backup): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
@@ -403,6 +405,13 @@ type Task = {
   detail?: object;          // a typed result, for task kinds that have one
 };
 ```
+
+**Task slots.** At most `sparkles serve --max-tasks` (default 4; `0`: no limit) background
+tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) run at once; the
+others wait `queued`, in start order, and may be cancelled while they wait. Backup
+repository tasks (`backup-*` kinds) wait for their own `--backup-max-tasks` slots instead.
+Starting a task while 1000 already wait answers `503`. The task list keeps every queued
+and running task and the 200 most recent finished ones.
 
 ## Schema discovery
 
@@ -575,10 +584,13 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 Query parameters beyond the standard protocol:
 
 * `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`), capped
-  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates accept
-  it too, under the same cap (never below `--update-timeout`); without it they run under
-  `--update-timeout` (none by default). A timed-out update changes nothing. A `408` names
-  the timeout that applied in `timeoutSeconds`.
+  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates,
+  Graph Store `PUT`/`POST`/`DELETE` and uploads accept it too, under the same cap (never
+  below `--update-timeout`; for a Graph Store write or an upload it starts once the body
+  has been received); without it they run under `--update-timeout` (none by default). A
+  timed-out write changes nothing. A `408` names the timeout that applied in
+  `timeoutSeconds`. A write whose client disconnects is cancelled (also while it waits for
+  the dataset's writer lock) and commits nothing; a commit that already started completes.
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
 * `nocache=true` — bypass the query result cache: nothing is read from or stored in it
@@ -1000,6 +1012,11 @@ the shapes graph in the request body (Fuseki semantics):
   graph is also left out of `graph=union`.
 * **`timeout=<seconds>`**: as for queries (server default otherwise); `408` on timeout.
 * Supports SHACL Core and SHACL-SPARQL. Parse errors in the shapes graph → `400`.
+* **Budgets.** The report is bounded like a query result: `507` with `budget:
+  "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48 bytes each
+  (or in `--query-memory-mb` at an estimated 512 bytes each), or once its serialized form is
+  larger than `--max-result-mb`. Validations run in a pool of half the cores shared by all
+  `/{ds}/shacl` requests, and stop when their client disconnects.
 
 The response is the validation report (`200` whether or not the data conforms),
 negotiated via `Accept` or `format=`:
@@ -1088,8 +1105,9 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
 | `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
 | `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
-| `--max-upload-mb` | `65536` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
-| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory (0: no check) |
+| `--max-upload-mb` | `4096` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
+| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory, and a commit, rebuild, clone or N-Quads backup on the data directory's file system (0: no check) |
+| `--max-mem-dataset-mb` | `4096` | largest in-memory (`dbType=mem`) dataset; a commit that would grow one past it fails with `507` (0: none) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
@@ -1107,12 +1125,20 @@ refused before anything is read), so no more than the ceiling is held; past it t
 fails with `413`. A form POST to `/{ds}` may hold either operation, so it is read up to
 the larger of the query and update ceilings. Graph Store PUT/POST (also through `/{ds}`)
 and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead,
-up to `--max-upload-mb` (default 65536, i.e. 64 GiB; counted after HTTP decompression;
-`0`: unlimited), else `413`. Files compressed inside the body are capped separately by
+up to `--max-upload-mb` (default 4096, i.e. 4 GiB, the body limit of the bundled NixOS
+nginx virtual host; counted after HTTP decompression; `0`: unlimited), else `413`. Files compressed inside the body are capped separately by
 `--max-decompressed-mb` as they are parsed. Before a spooled body is written to the
 temporary directory (every 64 MiB), the server checks that the file system keeps
-`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`. Storage quotas per
-dataset do not exist yet.
+`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`.
+
+**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
+when it would leave less than `--min-free-disk-mb` free on the data directory's file
+system (measured with `statvfs`, cached for a second between small commits); a rebuild
+(large load, compaction) or clone checks it while it builds and stops, removing what it
+wrote, once the file system goes below it. Nothing is committed either way. An in-memory
+dataset (`dbType=mem`) holds at most `--max-mem-dataset-mb` (default 4096, estimated from
+its index files, delta and vocabulary): a commit that would grow it past that fails the
+same way; deletes always pass. Storage quotas per dataset do not exist yet.
 
 **Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
 `auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs

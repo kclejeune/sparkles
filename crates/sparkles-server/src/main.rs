@@ -443,12 +443,23 @@ enum Cmd {
         max_admin_body_mb: u64,
         /// Largest body of a Graph Store write or upload, in MiB, counted after HTTP
         /// decompression (0: unlimited)
-        #[arg(long, default_value_t = 65536)]
+        #[arg(long, default_value_t = 4096)]
         max_upload_mb: u64,
-        /// Refuse (507) to spool a request body to the temporary directory once that
-        /// would leave less than this much free disk space, in MiB (0: no check)
+        /// Refuse (507) to spool a request body to the temporary directory, and to commit
+        /// to a persistent dataset or write an N-Quads backup in the data directory,
+        /// once that would leave less than this much free disk space, in MiB (0: no
+        /// check)
         #[arg(long, default_value_t = 1024)]
         min_free_disk_mb: u64,
+        /// Largest size of an in-memory dataset, in MiB: a commit that would grow one
+        /// past it is refused with 507 (0: unlimited)
+        #[arg(long, default_value_t = 4096)]
+        max_mem_dataset_mb: u64,
+        /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
+        /// backups) that run at once; more wait, queued (0: no limit). Backup repository
+        /// tasks have their own --backup-max-tasks
+        #[arg(long, default_value_t = state::DEFAULT_MAX_TASKS)]
+        max_tasks: usize,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -1232,6 +1243,8 @@ fn run() -> Result<()> {
             max_admin_body_mb,
             max_upload_mb,
             min_free_disk_mb,
+            max_tasks,
+            max_mem_dataset_mb,
             auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -1267,6 +1280,10 @@ fn run() -> Result<()> {
                 bail!("--cors-origin '{o}': expected scheme://host[:port]");
             }
             let hosts = exposure::Hosts::new(bound, &public_host)?;
+            // commits keep the disk reserve; in-memory datasets stay within their limit
+            let mut opts = opts;
+            opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
+            opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.cors_origins = cors_origin;
@@ -1292,6 +1309,7 @@ fn run() -> Result<()> {
             sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            st.task_queue.set_max(max_tasks);
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
                 query_memory_bytes: mib(query_memory_mb),
