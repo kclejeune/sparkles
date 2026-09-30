@@ -6,6 +6,8 @@
 mod alloc;
 mod clone;
 mod http;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod obs;
 mod reasoning;
 #[cfg(feature = "shacl")]
@@ -123,6 +125,10 @@ enum Cmd {
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
     },
+    /// Serve databases or files to LLM agents over the Model Context Protocol (JSON-RPC
+    /// on stdin/stdout): read-only tools for schema discovery and bounded queries
+    #[cfg(feature = "mcp")]
+    Mcp(mcp::McpArgs),
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
         #[arg(long)]
@@ -650,6 +656,8 @@ fn main() -> Result<()> {
                 anyhow::Ok(())
             })
         }
+        #[cfg(feature = "mcp")]
+        Cmd::Mcp(args) => mcp::run(args, opts),
         Cmd::Load { loc, graph, files } => {
             if files.is_empty() {
                 bail!("no files given");

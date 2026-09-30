@@ -300,6 +300,33 @@ impl AppState {
         Ok(state)
     }
 
+    /// State without a data directory or registry, for embedded use (`sparkles mcp`):
+    /// datasets are only [`attach`](Self::attach)ed, and nothing is ever written besides
+    /// the datasets themselves.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn standalone(store_opts: StoreOptions, default_timeout: std::time::Duration) -> AppState {
+        AppState {
+            data_dir: PathBuf::new(),
+            datasets: RwLock::new(BTreeMap::new()),
+            tasks: Mutex::new(Vec::new()),
+            task_counter: AtomicU64::new(1),
+            started: Instant::now(),
+            started_at: now(),
+            store_opts,
+            default_timeout,
+            read_only: false,
+            allow_service: false,
+            schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            limits: Limits::default(),
+            access_log: false,
+            metrics: crate::obs::Metrics::new(false, 100),
+            phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
+            auto_reason: None,
+            reserved: Mutex::new(BTreeMap::new()),
+            manage: Mutex::new(()),
+        }
+    }
+
     fn open_dataset(&self, name: &str, kind: DbType, loc: Option<&Path>) -> Result<Arc<Dataset>> {
         let store = match kind {
             DbType::Mem => Store::in_memory(self.store_opts.clone()),
@@ -331,6 +358,10 @@ impl AppState {
     /// Write `config.json` durably (temporary file, sync, rename, directory sync). The
     /// caller holds `manage`, so the snapshot taken here is the newest one written.
     fn save_registry_locked(&self) -> Result<()> {
+        if self.data_dir.as_os_str().is_empty() {
+            // standalone state: no registry
+            return Ok(());
+        }
         let reg = Registry {
             datasets: self
                 .datasets
