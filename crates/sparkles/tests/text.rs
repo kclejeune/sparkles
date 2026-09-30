@@ -170,10 +170,11 @@ fn retrieval_semantics() {
         row[1].as_ref().unwrap().to_string(),
         "<urn:x-arq:DefaultGraph>"
     );
-    // EXPLAIN shows the operator
+    // EXPLAIN shows the operator (a query not run before: a result-cache hit at the root
+    // would hide the children)
     let r = query(
         s.snapshot(),
-        &format!("{P}SELECT ?s {{ ?s text:query \"fox\" }}"),
+        &format!("{P}SELECT ?s {{ ?s text:query \"quick\" }}"),
         &QueryOptions::default(),
     )
     .unwrap();

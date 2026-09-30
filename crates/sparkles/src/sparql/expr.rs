@@ -1286,7 +1286,10 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
 
 /// Is `iri` a supported extension function (fn:, math:, afn:)?
 pub fn is_extension(iri: &str) -> bool {
-    iri.starts_with(FN) || iri.starts_with(MATH) || iri.starts_with(AFN)
+    iri.starts_with(FN)
+        || iri.starts_with(MATH)
+        || iri.starts_with(AFN)
+        || iri.starts_with(crate::vector::NS)
 }
 
 fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
@@ -1362,6 +1365,31 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             }
             "not" => Ok(b(!a(0)?.ebv()?)),
             "boolean" => Ok(b(a(0)?.ebv()?)),
+            _ => Err(TypeError),
+        };
+    }
+    if let Some(l) = iri.strip_prefix(crate::vector::NS) {
+        use crate::vector::{self, Metric};
+        // a well-typed spk:vector literal, or a type error
+        let vec_arg = |i: usize| -> EvalResult<Vec<f32>> {
+            match &*a(i)? {
+                Value::Other { lex, dt } if &**dt == vector::DATATYPE => {
+                    vector::parse(lex).map_err(|_| TypeError)
+                }
+                _ => Err(TypeError),
+            }
+        };
+        let pair = |m: Metric| -> EvalResult<Val> {
+            let (x, y) = (vec_arg(0)?, vec_arg(1)?);
+            let s =
+                vector::score(m, &x, vector::norm(&x), &y, vector::norm(&y)).ok_or(TypeError)?;
+            d(s as f64)
+        };
+        return match l {
+            "cosine" => pair(Metric::Cosine),
+            "dot" => pair(Metric::Dot),
+            "euclidean" => pair(Metric::Euclidean),
+            "dimension" => Ok(Val::V(Value::Integer((vec_arg(0)?.len() as i64).into()))),
             _ => Err(TypeError),
         };
     }

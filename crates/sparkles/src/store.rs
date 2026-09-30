@@ -40,6 +40,8 @@ pub struct Generation {
     pub dvocab: DeltaVocab,
     /// keeps a temporary directory alive for in-memory stores with a bulk-built base
     _tmp: Option<tempfile::TempDir>,
+    /// packed vectors of the base index, built on first search
+    pub vectors: crate::vector::GenerationVectors,
 }
 
 impl Generation {
@@ -53,6 +55,7 @@ impl Generation {
             meta: IndexMeta::default(),
             dvocab,
             _tmp: None,
+            vectors: Default::default(),
         }
     }
 
@@ -86,6 +89,7 @@ impl Generation {
             meta,
             dvocab,
             _tmp: None,
+            vectors: Default::default(),
         })
     }
 

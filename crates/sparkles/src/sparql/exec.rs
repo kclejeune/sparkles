@@ -318,6 +318,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
+        Kind::VectorSearch(spec) => vector_search(ctx, spec, &n.vars)?,
         Kind::Service {
             endpoint,
             query,
@@ -2347,6 +2348,87 @@ fn path(
         None => out.project(vars),
     };
     Ok((t, sweeps.get()))
+}
+
+// ----------------------------------------------------------------- vectors ------
+
+/// Exact top-k vector search (`spk:vectorSearch`).
+fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> Result<Table> {
+    use super::plan::VectorQuery;
+    use crate::vector;
+    let mut t = Table::new(vars.to_vec());
+    let Some(pred) = spec.pred else {
+        return Ok(t);
+    };
+    let graph = |g: u64| spec.graph.accepts(g);
+    let query: Vec<f32> = match &spec.query {
+        VectorQuery::Vector(v) => v.to_vec(),
+        VectorQuery::Entity(e) => {
+            // the entity's vectors under the predicate, in the active graph
+            let mut found: Vec<Id> = Vec::new();
+            for k in ctx.snap.scan_keys(Perm::Pso, &[pred.0, e.0])? {
+                if graph(k[3]) && !found.contains(&Id(k[2])) {
+                    found.push(Id(k[2]));
+                }
+            }
+            match found.as_slice() {
+                [] => return Ok(t),
+                [o] => ctx
+                    .snap
+                    .key(*o)
+                    .and_then(|k| vector::from_key(&k))
+                    .ok_or_else(|| {
+                        Error::invalid("the entity's vector is not a valid spk:vector")
+                    })?,
+                many => {
+                    return Err(Error::invalid(format!(
+                        "entity {} has {} vectors for the predicate; pass a vector literal",
+                        ctx.term(*e).map_or("?".into(), |t| t.to_string()),
+                        many.len()
+                    )));
+                }
+            }
+        }
+    };
+    let q = vector::Search {
+        pred: pred.0,
+        query: &query,
+        k: spec.k,
+        metric: spec.metric,
+        graph: &graph,
+        dedup: spec.dedup,
+    };
+    let hits = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+    let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
+    let cs = match spec.subject {
+        PathEnd::Var(v) => col(Some(v)),
+        _ => None,
+    };
+    let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    let mut row = vec![Id::UNDEF; vars.len()];
+    for h in hits {
+        if let PathEnd::Const(s) = spec.subject
+            && s.0 != h.s
+        {
+            continue;
+        }
+        row.fill(Id::UNDEF);
+        if let Some(c) = cs {
+            row[c] = Id(h.s);
+        }
+        if let Some(c) = cscore {
+            row[c] = Id::from_f64(h.score as f64)
+                .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+        }
+        if let Some(c) = cvec {
+            row[c] = Id(h.o);
+        }
+        if let Some(c) = cg {
+            row[c] = Id(h.g);
+        }
+        t.push_row(&row);
+    }
+    Ok(t)
 }
 
 // ---------------------------------------------------------------- service ------

@@ -43,10 +43,32 @@ fn bad(msg: impl Into<String>) -> Error {
 /// Take the `text:query` calls out of `patterns`; returns the calls and the remaining
 /// triple patterns.
 pub fn extract(patterns: &[TriplePattern]) -> Result<(Vec<TextCall>, Vec<TriplePattern>)> {
-    let is_text = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == TEXT_QUERY);
-    if !patterns.iter().any(is_text) {
+    let (calls, rest) = take_calls(patterns, TEXT_QUERY, "text:query")?;
+    let calls = calls
+        .into_iter()
+        .map(|(s, o)| decode(s, o))
+        .collect::<Result<_>>()?;
+    Ok((calls, rest))
+}
+
+/// Take the triples whose predicate is the property function `iri` out of `patterns`,
+/// together with the `rdf:first`/`rdf:rest` triples of their list arguments. Returns each
+/// call's subject and object elements (a single element when the argument is not a
+/// list), and the remaining patterns.
+#[allow(clippy::type_complexity)]
+pub fn take_calls(
+    patterns: &[TriplePattern],
+    iri: &str,
+    name: &str,
+) -> Result<(
+    Vec<(Vec<TermPattern>, Vec<TermPattern>)>,
+    Vec<TriplePattern>,
+)> {
+    let is_call = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == iri);
+    if !patterns.iter().any(is_call) {
         return Ok((Vec::new(), patterns.to_vec()));
     }
+    let bad = |m: &str| Error::invalid(format!("{name}: {m}"));
     // list cells: blank node → (first, rest) triple indexes
     let mut first: FxHashMap<&BlankNode, Vec<usize>> = FxHashMap::default();
     let mut rest: FxHashMap<&BlankNode, Vec<usize>> = FxHashMap::default();
@@ -84,20 +106,20 @@ pub fn extract(patterns: &[TriplePattern]) -> Result<(Vec<TextCall>, Vec<TripleP
             items.push(patterns[*f].object.clone());
             match &patterns[*r].object {
                 TermPattern::NamedNode(n) if *n == rdf::NIL => return Ok(Some(items)),
-                TermPattern::BlankNode(next) if !items.is_empty() && items.len() < 64 => b = next,
+                TermPattern::BlankNode(next) if items.len() < 64 => b = next,
                 _ => return Err(bad("malformed argument list")),
             }
         }
     };
     let mut calls = Vec::new();
     for (i, t) in patterns.iter().enumerate() {
-        if !is_text(t) {
+        if !is_call(t) {
             continue;
         }
         used[i] = true;
         let subjects = list(&t.subject, &mut used)?.unwrap_or_else(|| vec![t.subject.clone()]);
         let args = list(&t.object, &mut used)?.unwrap_or_else(|| vec![t.object.clone()]);
-        calls.push(decode(subjects, args)?);
+        calls.push((subjects, args));
     }
     let rest = patterns
         .iter()

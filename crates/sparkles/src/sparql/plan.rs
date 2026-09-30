@@ -107,6 +107,31 @@ pub struct IdRange {
     pub exact: bool,
 }
 
+/// The query of a vector search.
+#[derive(Clone, Debug)]
+pub enum VectorQuery {
+    Vector(Arc<[f32]>),
+    /// an entity whose (single) vector under the predicate is the query
+    Entity(Id),
+}
+
+/// A `spk:vectorSearch` call planned as a leaf (exact top-k similarity search).
+#[derive(Clone, Debug)]
+pub struct VectorSpec {
+    /// the embedding predicate (`None`: not in the store, so no rows)
+    pub pred: Option<Id>,
+    pub query: VectorQuery,
+    pub k: usize,
+    pub metric: crate::vector::Metric,
+    pub subject: PathEnd,
+    pub score: Option<VarId>,
+    pub vector: Option<VarId>,
+    pub graph: GraphFilter,
+    pub graph_var: Option<VarId>,
+    /// merge rows with the same (s, vector) from different graphs (merged default graph)
+    pub dedup: bool,
+}
+
 /// A `text:query` call planned as a leaf (full-text search).
 #[derive(Clone, Debug)]
 pub struct TextSpec {
@@ -248,6 +273,8 @@ pub enum Kind {
     },
     /// full-text search (`text:query`)
     TextSearch(Box<TextSpec>),
+    /// exact vector similarity search (`spk:vectorSearch`)
+    VectorSearch(Box<VectorSpec>),
 }
 
 #[derive(Clone)]
@@ -355,6 +382,7 @@ impl Node {
             Kind::Path { .. } => "TransitivePath",
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
+            Kind::VectorSearch(_) => "VectorSearch",
         }
     }
 }
@@ -758,11 +786,19 @@ impl<'a> Planner<'a> {
         match gp {
             GP::Bgp { patterns } => {
                 let (calls, patterns) = super::textpf::extract(patterns)?;
+                let (vcalls, patterns) = super::textpf::take_calls(
+                    &patterns,
+                    crate::vector::VECTOR_SEARCH,
+                    "spk:vectorSearch",
+                )?;
                 for tp in &patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
                 }
                 for c in calls {
                     items.push(Item::Node(self.text_leaf(c, g)?));
+                }
+                for (subjects, args) in vcalls {
+                    items.push(Item::Node(self.vector_leaf(subjects, args, g)?));
                 }
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
@@ -879,6 +915,151 @@ impl<'a> Planner<'a> {
                 graph: g.clone(),
             })),
         }
+    }
+
+    /// A `spk:vectorSearch` call as a search leaf:
+    /// `(?s ?score ?vector) spk:vectorSearch (predicate query [k] ["metric:…"])`.
+    fn vector_leaf(
+        &self,
+        subjects: Vec<TermPattern>,
+        args: Vec<TermPattern>,
+        g: &ActiveGraph,
+    ) -> Result<Node> {
+        use crate::vector::{self, Metric};
+        let bad = |m: &str| Error::invalid(format!("spk:vectorSearch: {m}"));
+        let shape = || bad("expected (predicate query [k] [options])");
+        if subjects.is_empty() || subjects.len() > 3 {
+            return Err(bad(
+                "the subject is ?s, (?s), (?s ?score) or (?s ?score ?vector)",
+            ));
+        }
+        let mut slots = subjects.iter();
+        let subject = match self.term_pattern(slots.next().unwrap()) {
+            PT::V(v) => PathEnd::Var(v),
+            PT::C(id) => PathEnd::Const(id),
+        };
+        let mut var_slot = |name: &str| -> Result<Option<VarId>> {
+            match slots.next().map(|t| self.term_pattern(t)) {
+                None => Ok(None),
+                Some(PT::V(v)) => Ok(Some(v)),
+                Some(PT::C(_)) => Err(bad(&format!("{name} must be a variable"))),
+            }
+        };
+        let (score, vector_var) = (var_slot("the score")?, var_slot("the vector")?);
+        let mut args = args.into_iter();
+        let pred = match args.next() {
+            Some(TermPattern::NamedNode(p)) => self.ctx.snap.lookup_iri(p.as_str()),
+            _ => return Err(shape()),
+        };
+        let query = match args.next() {
+            Some(TermPattern::Literal(l)) if l.datatype().as_str() == vector::DATATYPE => {
+                let v = vector::parse(l.value()).map_err(Error::invalid)?;
+                VectorQuery::Vector(v.into())
+            }
+            Some(TermPattern::Literal(_)) => {
+                return Err(bad("the query must be an spk:vector literal or an entity"));
+            }
+            Some(t @ (TermPattern::NamedNode(_) | TermPattern::BlankNode(_))) => {
+                match self.term_pattern(&t) {
+                    PT::C(id) => VectorQuery::Entity(id),
+                    // a blank node in a pattern is a variable
+                    PT::V(_) => {
+                        return Err(Error::unsupported(
+                            "spk:vectorSearch: a variable query vector is not supported yet",
+                        ));
+                    }
+                }
+            }
+            Some(TermPattern::Variable(_)) => {
+                return Err(Error::unsupported(
+                    "spk:vectorSearch: a variable query vector is not supported yet",
+                ));
+            }
+            _ => return Err(shape()),
+        };
+        let mut k = 10;
+        let mut metric = Metric::Cosine;
+        for a in args {
+            let TermPattern::Literal(l) = a else {
+                return Err(shape());
+            };
+            if l.datatype() == oxrdf::vocab::xsd::STRING {
+                match l.value().split_once(':') {
+                    Some(("metric", m)) => {
+                        metric = Metric::parse(m)
+                            .ok_or_else(|| bad(&format!("unknown metric {m:?}")))?;
+                    }
+                    _ => return Err(bad(&format!("unknown option {:?}", l.value()))),
+                }
+            } else {
+                k = l
+                    .value()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| (1..=vector::MAX_K).contains(k))
+                    .ok_or_else(|| bad(&format!("k must be 1..={}", vector::MAX_K)))?;
+            }
+        }
+        let empty = |vars: Vec<VarId>| {
+            let mut vars = vars;
+            vars.sort_unstable();
+            vars.dedup();
+            Ok(Node::empty(vars))
+        };
+        let mut vars = Vec::new();
+        for v in [
+            match subject {
+                PathEnd::Var(v) => Some(v),
+                _ => None,
+            },
+            score,
+            vector_var,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+        }
+        let Some((graph, graph_var)) = self.graph_filter(g) else {
+            return empty(vars);
+        };
+        if let Some(gv) = graph_var
+            && !vars.contains(&gv)
+        {
+            vars.push(gv);
+        }
+        let dedup = graph_var.is_none() && graph.multi();
+        let desc = format!(
+            "{} ← {} {} k={}{}",
+            vars.iter()
+                .map(|v| format!("?{}", self.ctx.var_name(*v)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            pred.map_or("?".into(), |p| self.pt_str(&PT::C(p))),
+            metric.name(),
+            k,
+            match &query {
+                VectorQuery::Vector(v) => format!(" dim={}", v.len()),
+                VectorQuery::Entity(e) => format!(" like {}", self.pt_str(&PT::C(*e))),
+            }
+        );
+        let spec = VectorSpec {
+            pred,
+            query,
+            k,
+            metric,
+            subject,
+            score,
+            vector: vector_var,
+            graph,
+            graph_var,
+            dedup,
+        };
+        let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
+        n.cost = k as f64 * 16.0;
+        Ok(n)
     }
 
     /// A `text:query` call as a search leaf.

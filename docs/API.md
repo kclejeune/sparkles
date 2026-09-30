@@ -204,6 +204,42 @@ in the database directory (`text.json`, index in `text/`). CLI:
 `sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--rebuild | --status | --disable]`,
 and `sparkles serve --text NAME[=config.json]`.
 
+## Vector similarity
+
+Embeddings are ordinary literals of the datatype `<urn:x-sparkles:vector>`: a JSON array
+of 1–16384 finite numbers (`"[0.1, -0.2, 0.3]"^^spk:vector`, with
+`PREFIX spk: <urn:x-sparkles:>`), read as `f32`. Literals are stored and returned exactly
+as written; one that does not parse is stored but never matched.
+
+* **Functions** (type error on a malformed argument, a dimension mismatch, or a zero
+  vector with cosine): `spk:cosine(?a, ?b)`, `spk:dot(?a, ?b)`,
+  `spk:euclidean(?a, ?b)` (L2 distance) and `spk:dimension(?a)`.
+* **Exact top-k search:**
+
+  ```sparql
+  SELECT ?s ?score WHERE {
+    (?s ?score ?vector) spk:vectorSearch (ex:emb "[0.1, -0.2, 0.3]"^^spk:vector 10 "metric:cosine") .
+  } ORDER BY DESC(?score)
+  ```
+
+  * The first argument is the embedding predicate.
+  * The query is a vector literal, or an entity whose single vector under that
+    predicate is used.
+  * `k` defaults to 10 (at most 10000). `metric:` is `cosine` (default), `dot` or
+    `euclidean`.
+  * Higher scores are better, except for euclidean, where lower is better.
+  * The search covers the active graph, and `GRAPH ?g` binds each row's graph. The top
+    k are taken before any join, and ties break by term id.
+  * Only vectors of the query's dimension are compared. If the predicate has vectors
+    but none of that dimension, the result is a `400` naming the dimensions it has.
+  * Rows with the same subject and vector in several graphs of a merged default graph
+    count once.
+* **Implementation:** vectors are packed per predicate and dimension on first use and
+  cached per index generation. Every query overlays its snapshot's uncommitted inserts
+  and deletes, so results always match its data. A process-wide budget (default 4 GiB)
+  caps the packed vectors; beyond it a search returns `507`. A variable query vector
+  gives `501`.
+
 ## SHACL validation
 
 `POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against

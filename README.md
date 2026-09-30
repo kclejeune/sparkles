@@ -72,6 +72,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | ✅ |
 | SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
 | SERVICE (federated query, SILENT) | ✅ |
+| Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit, graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **479/482**, SPARQL 1.2 **265/269** (all 7 failures are `spargebra` parser limitations, see `tests/w3c-known-failures.txt`) | ✅ |
@@ -184,7 +185,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 | History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog (metadata only); no time travel or history queries yet, and no data history after compaction |
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | ✗ none (run behind a proxy) |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL and the Rust API only; JSON-LD as an RDF format only |
-| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`); no vector or geospatial search yet |
+| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |
 | Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk |
 | Reasoning | at query time (RDFS / OWL 2 QL rewriting, OWL 2 RL / Datalog with a fact budget) | materialized (RDFS, OWL 2 RL, Jena rules) |
 
