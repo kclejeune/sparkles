@@ -73,7 +73,16 @@ pub fn update_as(
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
     };
-    let mut txn = store.write_with(kind, opts.write.clone());
+    // the request's cancellation and deadline also end the wait for the writer lock
+    // and the write guard
+    let mut wopts = opts.write.clone();
+    if wopts.cancel.is_none() {
+        wopts.cancel = opts.cancel.clone();
+    }
+    if wopts.deadline.is_none() {
+        wopts.deadline = req.deadline;
+    }
+    let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
         run_op(&mut txn, op, &req, &mut stats, store)?;

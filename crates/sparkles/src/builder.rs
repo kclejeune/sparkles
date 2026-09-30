@@ -137,10 +137,18 @@ pub struct Builder {
     prefixes: Mutex<BTreeMap<String, String>>,
     input_quads: AtomicU64,
     progress: Option<ProgressFn>,
+    interrupt: Option<InterruptFn>,
 }
 
 /// Progress callback for long-running builds.
 pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Called every [`INTERRUPT_EVERY`] quads an encoder takes and between build phases: an
+/// error stops the build (a cancelled write, a deadline, too little disk space).
+pub type InterruptFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// Quads an encoder takes between two [`InterruptFn`] calls.
+pub const INTERRUPT_EVERY: u64 = 65_536;
 
 pub enum Slot<'a> {
     Id(Id),
@@ -163,12 +171,25 @@ impl Builder {
             prefixes: Mutex::new(BTreeMap::new()),
             input_quads: AtomicU64::new(0),
             progress: None,
+            interrupt: None,
         })
     }
 
     pub fn with_progress(mut self, f: ProgressFn) -> Self {
         self.progress = Some(f);
         self
+    }
+
+    pub fn with_interrupt(mut self, f: InterruptFn) -> Self {
+        self.interrupt = Some(f);
+        self
+    }
+
+    fn interrupted(&self) -> Result<()> {
+        match &self.interrupt {
+            Some(f) => f(),
+            None => Ok(()),
+        }
     }
 
     fn report(&self, msg: &str) {
@@ -202,6 +223,7 @@ impl Builder {
             keys: FxHashMap::default(),
             quads: Vec::new(),
             keybuf: Vec::with_capacity(128),
+            taken: 0,
         }
     }
 
@@ -252,10 +274,12 @@ impl Builder {
         ));
 
         // ---- 2. vocabulary merge -------------------------------------------------
+        self.interrupted()?;
         let terms = self.merge_vocab(&batches)?;
         self.report(&format!("vocabulary: {terms} terms"));
 
         // ---- 3. remap ------------------------------------------------------------
+        self.interrupted()?;
         let in_memory = total_in as usize <= self.opts.sort_mem_quads;
         let remapped: Vec<Vec<[u64; 4]>> = batches
             .par_iter()
@@ -295,6 +319,7 @@ impl Builder {
         let mut keys: Vec<Key> = Vec::new();
         let mut rows = 0;
         for perm in Perm::ALL {
+            self.interrupted()?;
             self.report(&format!("building permutation {}", perm.name()));
             let mut w = PermWriter::create(&self.dir, perm)?;
             let mut col = StatsCollector::new(perm, rdf_type);
@@ -488,6 +513,8 @@ pub struct Encoder<'b> {
     keys: FxHashMap<Box<[u8]>, u32>,
     quads: Vec<[u64; 4]>,
     keybuf: Vec<u8>,
+    /// quads taken, for the [`InterruptFn`] calls
+    taken: u64,
 }
 
 impl Encoder<'_> {
@@ -575,6 +602,10 @@ impl Encoder<'_> {
     }
 
     fn maybe_flush(&mut self) -> Result<()> {
+        self.taken += 1;
+        if self.taken.is_multiple_of(INTERRUPT_EVERY) {
+            self.b.interrupted()?;
+        }
         if self.quads.len() >= self.b.opts.batch_quads {
             self.flush()?;
         }
@@ -769,6 +800,48 @@ mod tests {
     use super::*;
     use crate::index::{BlockCache, PermIndex};
     use crate::io::{RdfFormat, Source};
+
+    #[test]
+    fn an_interrupt_stops_the_build() {
+        let mut nt = String::new();
+        for i in 0..INTERRUPT_EVERY + 10 {
+            nt.push_str(&format!(
+                "<http://ex.org/s{i}> <http://ex.org/p> \"{i}\" .\n"
+            ));
+        }
+        let src = Source::from_bytes(nt.into_bytes(), RdfFormat::NTriples, None);
+        let calls = Arc::new(AtomicU64::new(0));
+        let build = |stop_at: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = calls.clone();
+            let opts = BuildOptions {
+                threads: 1,
+                ..Default::default()
+            };
+            let b = Builder::new(dir.path(), opts)
+                .unwrap()
+                .with_interrupt(Arc::new(move || {
+                    if calls.fetch_add(1, Ordering::Relaxed) + 1 >= stop_at {
+                        return Err(Error::Cancelled);
+                    }
+                    Ok(())
+                }));
+            b.add_source(&src)?;
+            b.finish()
+        };
+        // while encoding
+        let r = build(1);
+        assert!(
+            matches!(r, Err(Error::Cancelled)),
+            "{:?}",
+            r.map(|m| m.quads)
+        );
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+        // between the phases of the build
+        assert!(matches!(build(3), Err(Error::Cancelled)));
+        calls.store(0, Ordering::Relaxed);
+        assert_eq!(build(u64::MAX).unwrap().quads, INTERRUPT_EVERY + 10);
+    }
 
     /// Tiny batch / sort budgets force many partial vocabularies and the external
     /// sorted-runs + k-way-merge path; the result must equal the in-memory build.

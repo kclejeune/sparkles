@@ -73,6 +73,42 @@ pub fn validate_options(
     Ok(opts)
 }
 
+/// The fewest bytes one result takes in any report format (the one-line text form).
+pub const MIN_RESULT_BYTES: u64 = 48;
+
+/// Estimated memory of one result while the report is built.
+const RESULT_MEMORY_BYTES: u64 = 512;
+
+/// The most results a `/{ds}/shacl` report may hold: what fits in the response budget
+/// (`--max-result-mb`) at [`MIN_RESULT_BYTES`] each, and in the memory budget
+/// (`--query-memory-mb`) at an estimated 512 bytes each.
+pub fn max_results(limits: &crate::state::Limits) -> Option<usize> {
+    let by_bytes = limits.max_result_bytes.map(|b| b / MIN_RESULT_BYTES);
+    let by_memory = limits.query_memory_bytes.map(|b| b / RESULT_MEMORY_BYTES);
+    let n = match (by_bytes, by_memory) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    Some(usize::try_from(n).unwrap_or(usize::MAX).max(1))
+}
+
+/// The thread pool of `/{ds}/shacl` validations: half the cores, shared by all
+/// requests, so validations never take every core from queries.
+pub fn pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    static POOL: std::sync::OnceLock<Option<std::sync::Arc<rayon::ThreadPool>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((n / 2).max(1))
+            .thread_name(|i| format!("shacl-{i}"))
+            .build()
+            .map(std::sync::Arc::new)
+            .ok()
+    })
+    .clone()
+}
+
 /// Does the named graph exist (hold at least one quad)?
 pub fn graph_exists(snap: &Snapshot, iri: &str) -> bool {
     snap.lookup_iri(iri)
