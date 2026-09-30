@@ -738,7 +738,14 @@ async fn dataset_backups(State(st): St, Path(ds): Path<String>, uri: Uri) -> Res
             b.registry.config(r)?;
             vec![r.clone()]
         }
-        None => b.registry.repos.read().keys().cloned().collect(),
+        None => b
+            .registry
+            .repos
+            .read()
+            .iter()
+            .filter(|(_, e)| !e.recently_unreachable())
+            .map(|(n, _)| n.clone())
+            .collect(),
     };
     let mut out = Vec::new();
     for name in names {

@@ -99,6 +99,16 @@ impl RepoEntry {
         self.status.checked = sparkles_backup::now_rfc3339();
         self.status.error = Some(error.to_string());
     }
+
+    /// Not opened, and found unreachable less than a minute ago (listings over every
+    /// repository skip it rather than wait for it again).
+    pub fn recently_unreachable(&self) -> bool {
+        self.opened.is_none()
+            && !self.status.reachable
+            && chrono::DateTime::parse_from_rfc3339(&self.status.checked).is_ok_and(|t| {
+                chrono::Utc::now().signed_duration_since(t) < chrono::TimeDelta::minutes(1)
+            })
+    }
 }
 
 /// A registered policy.
@@ -497,6 +507,9 @@ mod tests {
         e.mark_unreachable("boom");
         assert_eq!(e.status.error.as_deref(), Some("boom"));
         assert!(!e.status.reachable && !e.status.checked.is_empty());
+        assert!(e.recently_unreachable());
+        e.status.checked = "2020-01-01T00:00:00.000Z".into();
+        assert!(!e.recently_unreachable());
         let v = serde_json::to_value(e.view(vec!["p".into()])).unwrap();
         assert_eq!(v["policies"][0], "p");
         assert_eq!(v["status"]["reachable"], false);
