@@ -36,7 +36,7 @@ interactive querying.
 |---|---|---|
 | `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db |
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, forward chaining *(planned)* | jena-core `reasoner` |
-| `crates/sparkles-server` | axum HTTP server + `sparkles` CLI *(planned)* | jena-fuseki2, jena-cmds |
+| `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
 | `ui/` | SvelteKit management / query / graph-exploration UI *(in progress)* | jena-fuseki-ui |
 
 ## Status
@@ -69,13 +69,14 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
 | SERVICE (federated query, SILENT) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
-| W3C SPARQL test suite runner (manifests from the Jena checkout) | ⏳ |
+| W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **473/476** (3 known `spargebra` parser limitations, see `tests/w3c-known-failures.txt`) | ✅ |
 
 ### Server (Fuseki equivalent), reasoning, UI
 
 | Feature | Status |
 |---|---|
-| SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks) | ⏳ |
+| SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax | ⏳ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser (built against a mock; server integration pending) | 🚧 |
 
@@ -124,11 +125,45 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SPARQL parsing and algebra via `spargebra` instead of a port of ARQ's JavaCC grammar | The algebra matches SPARQL 1.1 §18. ARQ syntax extensions (LET, `apf:` property functions, custom aggregates) are not supported. |
 | Filter placement and equality substitution happen in the planner rather than as ARQ-style algebra transforms | Same effect as `TransformFilterPlacement` / `TransformFilterEquality`, with one less pass over the algebra. |
 | `REDUCED` is a no-op | Allowed by the spec. |
+| `GRAPH ?g { P }` binds `?g` as a scan column when `P` is a plain join group; otherwise `P` is evaluated per named graph and joined with `?g`, like Jena's `OpGraph` | The fast path covers the common case, and the fallback keeps SPARQL scoping exact (e.g. OPTIONAL or MINUS inside GRAPH). |
+| `GROUP_CONCAT` always returns a simple literal | Spec behaviour; Jena keeps a common language tag. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
-## Building
+## Building & running
 
 ```sh
-cargo test --workspace          # engine tests
+pnpm -C ui install && pnpm -C ui build        # optional: the UI is embedded at compile time
 cargo build --release
+./target/release/sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
+
+Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data` (GSP),
+`/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`
+(see `docs/API.md`). `--mem NAME` adds an in-memory dataset, `--loc NAME=PATH` serves an
+existing database.
+
+Command line tools (Jena `tdb2.*` / `arq` equivalents):
+
+```sh
+sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
+sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
+sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
+sparkles update  --loc db 'INSERT DATA {...}'
+sparkles compact --loc db                     # merge updates into a new generation
+sparkles dump    --loc db > dump.nq
+sparkles backup  --loc db --out backups/
+sparkles stats   --loc db
+sparkles infer   --loc db --profile owl-rl    # materialize inferences
+```
+
+`scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
+
+## Testing
+
+```sh
+cargo test --workspace
+```
+
+`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL 1.0 / 1.1 query and update suites that
+are vendored in the Apache Jena checkout (`../../apache/jena` next to this repository, or
+`SPARKLES_W3C_DIR`). Known failures are listed in `crates/sparkles/tests/w3c-known-failures.txt`.

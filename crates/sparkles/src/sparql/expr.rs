@@ -674,8 +674,17 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 Val::Id(ctx.fresh_bnode())
             } else {
                 let st = a0()?;
-                st.as_str().ok_or(TypeError)?;
-                Val::Id(ctx.fresh_bnode())
+                let st = st.as_str().ok_or(TypeError)?;
+                // same string → same blank node within one solution
+                // key: the solution's bindings, ignoring blank nodes minted by this query
+                let key: Vec<Id> = row
+                    .table
+                    .cols
+                    .iter()
+                    .map(|c| c[row.i])
+                    .filter(|id| !(id.tag() == crate::id::Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0))
+                    .collect();
+                Val::Id(ctx.bnode_for_row(key, st))
             }
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),

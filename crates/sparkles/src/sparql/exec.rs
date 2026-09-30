@@ -719,28 +719,15 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
         AggregateFunction::GroupConcat { separator } => {
             let sep = separator.as_deref().unwrap_or(" ");
             let mut parts = Vec::new();
-            let mut lang: Option<Option<std::sync::Arc<str>>> = None;
             for v in values() {
                 let Ok(s) = v.lexical() else { return Id::UNDEF };
-                let l = match &v {
-                    Value::Lang(_, l) => Some(l.clone()),
-                    _ => None,
-                };
-                lang = match lang {
-                    None => Some(l),
-                    Some(p) if p == l => Some(p),
-                    Some(_) => Some(None),
-                };
                 parts.push(s.to_string());
             }
             if vals.iter().any(|v| v.is_err()) {
                 return Id::UNDEF;
             }
-            let joined = parts.join(sep);
-            Some(match lang.flatten() {
-                Some(l) => Value::Lang(joined.into(), l),
-                None => Value::Str(joined.into()),
-            })
+            // SPARQL 1.1: the result is a simple literal (language tags are dropped)
+            Some(Value::Str(parts.join(sep).into()))
         }
         AggregateFunction::Custom(_) => None,
     };
@@ -818,6 +805,25 @@ impl Graph<'_> {
             self.ctx.check_rows(out.len())?;
         }
         Ok(out)
+    }
+
+    /// Does the term occur as subject or object in the active graph?
+    fn is_node(&self, x: u64) -> Result<bool> {
+        for perm in [Perm::Spo, Perm::Osp] {
+            let gc = perm.col_of(crate::index::G);
+            let mut found = false;
+            self.ctx.snap.scan(perm, &[x], |c| {
+                found = match c {
+                    Chunk::Block(b, s, e) => (s..e).any(|i| self.graph.accepts(b.cols[gc][i])),
+                    Chunk::Row(k) => self.graph.accepts(k[gc]),
+                };
+                Ok(!found)
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// All start nodes when both ends are unbound.
@@ -957,7 +963,13 @@ fn path(ctx: &Ctx, spec: &PathSpec, bound_from_left: bool, mut inputs: Vec<Table
                         s.sort_unstable();
                         s.dedup();
                         for x in s {
+                            // variable–variable paths range over graph nodes only: a
+                            // zero-length match needs the start term to occur in the graph
+                            let in_graph = spec.min > 0 || g.is_node(x)?;
                             for y in g.reach(x, forward)? {
+                                if y == x && spec.min == 0 && !in_graph {
+                                    continue;
+                                }
                                 if forward { push(x, y, &mut out) } else { push(y, x, &mut out) }
                             }
                         }

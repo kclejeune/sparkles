@@ -37,4 +37,7 @@ quick_cache = "0.7.0"
 tempfile = "3"
 
 [dev-dependencies]
+oxrdfio.workspace = true
+sparesults.workspace = true
+spargebra.workspace = true
 tempfile.workspace = true

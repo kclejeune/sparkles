@@ -544,6 +544,31 @@ impl<'a> Planner<'a> {
                 self.collect(left, g, items, filters)?;
                 self.collect(right, g, items, filters)?;
             }
+            GP::Graph { name, inner } if !self.simple_graph_group(name, inner) => {
+                // Per-graph evaluation (Jena OpGraph semantics): evaluate the inner pattern
+                // against each named graph with the graph variable unbound, then join
+                // with ?g = graph.
+                let NamedNodePattern::Variable(gv) = name else { unreachable!() };
+                let v = self.ctx.var(gv.as_str());
+                let accept = |gid: &Id| self.ctx.dataset.named.as_ref().is_none_or(|s| s.contains(gid));
+                let graphs: Vec<Id> = self.ctx.snap.graph_ids()?.into_iter().filter(accept).collect();
+                let mut branches = Vec::new();
+                for gid in graphs {
+                    let node = self.plan(inner, &ActiveGraph::Named(gid), Vec::new())?;
+                    if node.is_empty() {
+                        continue;
+                    }
+                    let mut t = Table::new(vec![v]);
+                    t.push_row(&[gid]);
+                    let bind = Node::leaf(Kind::Values(t), vec![v], 1.0, "graph".into());
+                    branches.push(join(node, bind, self.ctx));
+                }
+                let mut n = union(branches);
+                if n.vars.is_empty() && n.children.is_empty() {
+                    n = Node::empty(vec![v]);
+                }
+                items.push(Item::Node(n));
+            }
             GP::Graph { name, inner } => {
                 let g2 = match name {
                     NamedNodePattern::NamedNode(n) if n.as_str() == super::ctx::DEFAULT_GRAPH_IRI => {
@@ -560,6 +585,9 @@ impl<'a> Planner<'a> {
                 } else {
                     self.collect(inner, &g2, items, filters)?;
                 }
+                // GRAPH ?g / GRAPH <g> iterate over (existing) named graphs even when the
+                // inner pattern does not touch the data
+                items.push(Item::Node(self.graph_names(&g2)?));
             }
             other => items.push(Item::Node(self.plan(other, g, Vec::new())?)),
         }
@@ -597,6 +625,59 @@ impl<'a> Planner<'a> {
             ],
             graph: g.clone(),
         }
+    }
+
+    /// `GRAPH ?g { P }` can bind ?g as a scan column when P is a plain join group that
+    /// does not mention ?g itself.
+    fn simple_graph_group(&self, name: &NamedNodePattern, inner: &GraphPattern) -> bool {
+        let NamedNodePattern::Variable(v) = name else { return true };
+        fn plain(gp: &GraphPattern) -> bool {
+            match gp {
+                GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => true,
+                GraphPattern::Join { left, right } => plain(left) && plain(right),
+                GraphPattern::Filter { inner, expr } => plain(inner) && !has_exists(expr),
+                _ => false,
+            }
+        }
+        let mut names = Vec::new();
+        collect_pattern_vars(inner, &mut names);
+        plain(inner) && !names.iter().any(|n| n == v.as_str())
+    }
+
+    /// One row per named graph of the active dataset (bound to the graph variable), or
+    /// the unit table if a constant graph exists.
+    fn graph_names(&self, g: &ActiveGraph) -> Result<Node> {
+        let accept = |gid: Id| match &self.ctx.dataset.named {
+            Some(set) => set.contains(&gid),
+            None => true,
+        };
+        let exists = |gid: Id| -> Result<bool> {
+            Ok(accept(gid) && gid.tag() != Tag::Local && self.ctx.snap.count(Perm::Gspo, &[gid.0])? > 0)
+        };
+        Ok(match g {
+            ActiveGraph::Var(v) => match self.subst.get(v) {
+                Some(id) => {
+                    if exists(*id)? { Node::unit() } else { Node::empty(Vec::new()) }
+                }
+                None => {
+                    let mut t = Table::new(vec![*v]);
+                    for gid in self.ctx.snap.graph_ids()? {
+                        if accept(gid) {
+                            t.push_row(&[gid]);
+                        }
+                    }
+                    let est = t.len() as f64;
+                    let mut n = Node::leaf(Kind::Values(t), vec![*v], est, format!("{est} named graphs"));
+                    n.cost = est;
+                    n
+                }
+            },
+            ActiveGraph::Named(id) if *id == Id::DEFAULT_GRAPH => Node::unit(),
+            ActiveGraph::Named(id) => {
+                if exists(*id)? { Node::unit() } else { Node::empty(Vec::new()) }
+            }
+            _ => Node::unit(),
+        })
     }
 
     // --------------------------------------------------------- graph filters ------
@@ -1570,6 +1651,36 @@ fn flatten_alt<'g>(p: &'g PropertyPathExpression, out: &mut Vec<&'g PropertyPath
     } else {
         out.push(p);
     }
+}
+
+fn has_exists(e: &Expression) -> bool {
+    let mut found = false;
+    fn walk(e: &Expression, f: &mut bool) {
+        use Expression as E;
+        match e {
+            E::Exists(_) => *f = true,
+            E::Or(a, b) | E::And(a, b) | E::Equal(a, b) | E::SameTerm(a, b) | E::Greater(a, b)
+            | E::GreaterOrEqual(a, b) | E::Less(a, b) | E::LessOrEqual(a, b) | E::Add(a, b)
+            | E::Subtract(a, b) | E::Multiply(a, b) | E::Divide(a, b) => {
+                walk(a, f);
+                walk(b, f);
+            }
+            E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => walk(a, f),
+            E::In(a, l) => {
+                walk(a, f);
+                l.iter().for_each(|x| walk(x, f));
+            }
+            E::If(a, b, c) => {
+                walk(a, f);
+                walk(b, f);
+                walk(c, f);
+            }
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| walk(x, f)),
+            _ => {}
+        }
+    }
+    walk(e, &mut found);
+    found
 }
 
 /// `?x = <iri>` / `sameTerm(?x, c)` where the constant is an IRI (value = term equality).

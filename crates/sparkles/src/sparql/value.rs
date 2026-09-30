@@ -379,6 +379,8 @@ pub fn equals(a: &Value, b: &Value) -> EvalResult<bool> {
         (Str(x), Str(y)) => x == y,
         (Lang(x, lx), Lang(y, ly)) => x == y && lx.eq_ignore_ascii_case(ly),
         (Bool(x), Bool(y)) => x == y,
+        (Str(_), Lang(..)) | (Lang(..), Str(_)) => false,
+        (Lang(..), _) | (_, Lang(..)) => false,
         (Other { lex: l1, dt: d1 }, Other { lex: l2, dt: d2 }) => {
             if l1 == l2 && d1 == d2 {
                 true
@@ -387,9 +389,17 @@ pub fn equals(a: &Value, b: &Value) -> EvalResult<bool> {
             }
         }
         (Other { .. }, _) | (_, Other { .. }) => return Err(TypeError),
-        (Str(_), Lang(..)) | (Lang(..), Str(_)) => false,
         _ => match compare(a, b) {
-            Ok(o) => o == Some(Ordering::Equal),
+            Ok(Some(o)) => o == Ordering::Equal,
+            // NaN is unequal to everything; other incomparable values (e.g. dates with and
+            // without timezone) are indeterminate → error
+            Ok(None) => {
+                if a.is_numeric() {
+                    false
+                } else {
+                    return Err(TypeError);
+                }
+            }
             Err(_) => {
                 // different known literal types: not equal (per RDFterm-equal they are
                 // different terms of known datatypes)

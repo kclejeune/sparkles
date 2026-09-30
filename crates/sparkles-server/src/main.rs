@@ -145,14 +145,16 @@ fn store_opts(cli: &Cli) -> StoreOptions {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // progress logging for long-running commands, quiet output for query tools
+    let default_filter = match cli.cmd {
+        Cmd::Serve { .. } | Cmd::Load { .. } | Cmd::Compact { .. } => "sparkles=info,sparkles_server=info,tower_http=warn",
+        _ => "warn",
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sparkles=info,sparkles_server=info,tower_http=warn".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into()))
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
     let opts = store_opts(&cli);
     match cli.cmd {
         Cmd::Serve { data, host, port, mem, loc, timeout, read_only, no_service } => {

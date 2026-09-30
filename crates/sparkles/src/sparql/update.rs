@@ -115,9 +115,10 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
             let mut ctx = Ctx::new(snap);
             if let Some(QueryDataset { default, named }) = using {
                 ctx.dataset.default = Some(default.iter().map(|n| ctx.intern_term(&Term::NamedNode(n.clone()))).collect());
-                ctx.dataset.named = Some(
-                    named.iter().flatten().map(|n| ctx.intern_term(&Term::NamedNode(n.clone()))).collect(),
-                );
+                // WITH is encoded as USING without USING NAMED: named graphs stay visible
+                ctx.dataset.named = named
+                    .as_ref()
+                    .map(|n| n.iter().map(|n| ctx.intern_term(&Term::NamedNode(n.clone()))).collect());
             }
             ctx.allow_service = opts.allow_service;
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;

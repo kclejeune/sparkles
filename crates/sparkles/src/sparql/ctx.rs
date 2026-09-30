@@ -36,6 +36,7 @@ pub struct Ctx {
     local: RwLock<AppendVocab>,
     values: RwLock<FxHashMap<Id, Value>>,
     next_bnode: AtomicU64,
+    bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
     pub dataset: DatasetSpec,
@@ -54,6 +55,7 @@ impl Ctx {
             local: RwLock::new(AppendVocab::default()),
             values: RwLock::new(FxHashMap::default()),
             next_bnode: AtomicU64::new(0),
+            bnode_memo: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
@@ -166,6 +168,15 @@ impl Ctx {
 
     pub fn fresh_bnode(&self) -> Id {
         Id::bnode(Id::LOCAL_BNODE_BIT | self.next_bnode.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// `BNODE(str)`: one blank node per (solution, string).
+    pub fn bnode_for_row(&self, row: Vec<Id>, s: &str) -> Id {
+        *self
+            .bnode_memo
+            .lock()
+            .entry((row, s.to_string()))
+            .or_insert_with(|| self.fresh_bnode())
     }
 
     pub fn term(&self, id: Id) -> Option<Term> {
