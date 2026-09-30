@@ -65,3 +65,24 @@ Queries (prefixes omitted):
 * **Reasoning.** RDFS materialization over 1.0M triples (2.75M inferred) takes 3.9 s end
   to end. The derived triples are merged into a freshly built index generation rather
   than inserted into the delta one by one, which took 8.9 s.
+
+## Scale check: 10.5M triples
+
+`scripts/gen-data.py 1000000` gives 10,527,323 triples (1.12 GB of N-Triples).
+
+| bulk load (hyperfine, 1 run) | wall time | CPU (user) | index size |
+|---|---:|---:|---:|
+| **Sparkles** | **6.1 s** | 26.7 s | 286 MB |
+| QLever 0.5.48 | 9.1 s | 73.8 s | 277 MB |
+| Jena TDB2 6.2.0 (`tdb2.tdbloader`) | 42.6 s | 89.6 s | 1.4 GB |
+
+Sparkles' peak RSS during the load was 1.9 GB. The size includes all 7 permutations
+plus the vocabulary. Sample query times at this scale (CLI, in-process, no result cache):
+
+| query | exec |
+|---|---:|
+| two-hop `foaf:knows` join count (6.2M results) | 666 ms |
+| `GROUP BY ?o` + AVG/COUNT over `ex:worksFor` / `foaf:age` | 227 ms |
+| `FILTER(CONTAINS(?n, "Ada"))` over 1M names | 413 ms |
+| salary range filter + top-3 | 61 ms |
+| 4-pattern star join + date filter + city constant | 84 ms |
