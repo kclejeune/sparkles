@@ -63,10 +63,15 @@ impl ResultCache {
         self.cache.is_some()
     }
 
-    pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> Option<Table> {
-        let c = self.cache.as_ref()?;
-        match c.get(&key.key) {
+    /// Look up a cached result. The request's row budget applies before the columns are
+    /// copied, exactly as it would to recomputing the result.
+    pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> crate::error::Result<Option<Table>> {
+        let Some(c) = self.cache.as_ref() else {
+            return Ok(None);
+        };
+        Ok(match c.get(&key.key) {
             Some(e) => {
+                ctx.check_rows(e.len)?;
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 let vars: Vec<VarId> = e.vars.iter().map(|n| ctx.var(key.resolve(n))).collect();
                 let sorted: Vec<VarId> = e.sorted.iter().map(|n| ctx.var(key.resolve(n))).collect();
@@ -81,7 +86,7 @@ impl ResultCache {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
-        }
+        })
     }
 
     /// Cache a result unless it holds query-local terms or is too large.
@@ -293,9 +298,18 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         } => {
             let _ = write!(
                 s,
-                "{:?}{:?}{}{}{:?}{}",
-                spec.subj, spec.obj, spec.min, spec.max_one, spec.simple, bound_from_left
+                "{:?}{:?}{}{}{:?}{}{:?}",
+                spec.subj,
+                spec.obj,
+                spec.min,
+                spec.max_one,
+                spec.simple,
+                bound_from_left,
+                spec.graph
             );
+            if let Some(g) = spec.graph_var {
+                let _ = write!(s, " graph=?{}", ctx.var_name(g));
+            }
             true
         }
         _ => true,

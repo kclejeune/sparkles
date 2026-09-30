@@ -799,6 +799,51 @@ impl Store {
         }
     }
 
+    /// Replace a graph (or the whole dataset) with the contents of `sources` in one
+    /// transaction. The sources are parsed completely before anything changes, so a
+    /// parse error leaves the data untouched, and readers see either the old or the new
+    /// content, never the cleared graph. Returns the number of quads parsed.
+    pub fn replace(&self, target: ReplaceTarget, sources: &[Source]) -> Result<u64> {
+        let mut parsed = Vec::with_capacity(sources.len());
+        let mut prefixes = BTreeMap::new();
+        for s in sources {
+            let (quads, p) = crate::io::parse_to_vec(s)?;
+            prefixes.extend(p);
+            parsed.push(quads);
+        }
+        let mut txn = self.write();
+        let view = txn.view();
+        let graphs: Vec<Id> = match &target {
+            ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
+            ReplaceTarget::Named(n) => view
+                .lookup_term(&Term::NamedNode(n.clone()))
+                .into_iter()
+                .collect(),
+            ReplaceTarget::All => {
+                let mut v = view.graph_ids()?;
+                v.push(Id::DEFAULT_GRAPH);
+                v
+            }
+        };
+        for g in graphs {
+            for k in view.scan_keys(Perm::Gspo, &[g.0])? {
+                txn.delete(Perm::Gspo.to_quad(&k))?;
+            }
+        }
+        let mut ids = Vec::new();
+        for quads in &parsed {
+            let mut labels = std::collections::HashMap::new();
+            for q in quads {
+                ids.push(txn.encode_quad(q, &mut labels)?);
+            }
+        }
+        let n = ids.len() as u64;
+        txn.insert_bulk(ids)?;
+        txn.commit()?;
+        self.add_prefixes(prefixes)?;
+        Ok(n)
+    }
+
     /// Compact: merge base ⊕ delta into a new generation.
     pub fn compact(&self) -> Result<()> {
         self.rebuild(&[])?;
@@ -886,11 +931,16 @@ impl Store {
         gen_._tmp = tmp;
         w.next_bnode = w.next_bnode.max(meta.next_bnode);
         if let Some(root) = &self.root {
-            write_atomic(&root.join("CURRENT"), name.as_bytes())?;
+            // Publication order: the new generation's files and directory entries are
+            // durable (Builder::finish), its WAL file exists durably, then CURRENT
+            // switches durably, and only after that is the old generation removed.
             let wal = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(dir.join("wal.log"))?;
+            sync_dir(&dir)?;
+            sync_dir(root)?;
+            write_atomic(&root.join("CURRENT"), name.as_bytes())?;
             w.wal = Some(BufWriter::new(wal));
         }
         self.add_prefixes(meta.prefixes.clone())?;
@@ -964,14 +1014,30 @@ fn dir_size(p: &Path) -> u64 {
         .sum()
 }
 
+/// Replace `path` durably: write and sync a temporary file, rename it over `path`, then
+/// sync the directory so the rename itself survives a power loss.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
+    write_synced(&tmp, bytes)?;
     std::fs::rename(tmp, path)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+/// Write a file and flush its contents to stable storage.
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Flush a directory's entries (created, renamed or removed files) to stable storage.
+/// Directories cannot be opened for syncing on Windows, where this is a no-op.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -1003,14 +1069,16 @@ pub struct WriteTxn<'s> {
 }
 
 impl WriteTxn<'_> {
-    /// Snapshot view including this transaction's uncommitted changes.
+    /// Snapshot view including this transaction's uncommitted changes. It keeps the
+    /// committed version number but not its result cache: the data differs from that
+    /// version, so cached results must neither be read nor written through this view.
     pub fn view(&self) -> Snapshot {
         Snapshot {
             generation: self.base.generation.clone(),
             delta: self.delta.clone(),
             version: self.base.version,
             cache: self.base.cache.clone(),
-            results: self.base.results.clone(),
+            results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
             dvocab_len: self.base.generation.dvocab.len(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
@@ -1231,6 +1299,15 @@ impl WriteTxn<'_> {
         }));
         Ok(version)
     }
+}
+
+/// The graphs [`Store::replace`] clears before loading.
+#[derive(Clone, Debug)]
+pub enum ReplaceTarget {
+    Default,
+    Named(NamedNode),
+    /// every graph, default included
+    All,
 }
 
 /// Convenience helper for tests and the CLI.

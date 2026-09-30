@@ -857,3 +857,303 @@ fn filters_on_keys_match_row_evaluation() {
     .unwrap();
     check(&s);
 }
+
+// ---------------------------------------------------------------------------------------
+// regressions from the implementation review
+// ---------------------------------------------------------------------------------------
+
+fn cached_store(data: &str, format: RdfFormat) -> Store {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(data.as_bytes().to_vec(), format, None)])
+        .unwrap();
+    s
+}
+
+const PREFIXES: &str = "PREFIX ex: <http://ex.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> ";
+
+#[test]
+fn update_operations_do_not_share_cached_where_results() {
+    let s = cached_store(DATA, RdfFormat::Turtle);
+    let pattern = "?s foaf:knows ?o . ?s a foaf:Person";
+    // warm the committed cache with the join both WHERE clauses use
+    q(&s, &format!("SELECT ?s WHERE {{ {pattern} }}"));
+    update::update(
+        &s,
+        &format!(
+            "{PREFIXES} INSERT {{ ?s ex:first 1 }} WHERE {{ {pattern} }} ;
+             DELETE DATA {{ ex:bob foaf:knows ex:carol }} ;
+             INSERT {{ ?s ex:second 1 }} WHERE {{ {pattern} }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        strs(&q(&s, "SELECT ?s WHERE { ?s ex:first 1 }")),
+        ["alice", "bob"]
+    );
+    // the second WHERE runs after the delete: bob no longer knows anyone
+    assert_eq!(
+        strs(&q(&s, "SELECT ?s WHERE { ?s ex:second 1 }")),
+        ["alice"]
+    );
+    // and the committed state is what later queries see
+    assert_eq!(
+        strs(&q(&s, &format!("SELECT DISTINCT ?s WHERE {{ {pattern} }}"))),
+        ["alice"]
+    );
+}
+
+#[test]
+fn cached_paths_respect_the_graph() {
+    let s = cached_store(
+        "@prefix ex: <http://ex.org/> .
+         ex:g1 { ex:a ex:next ex:b . }
+         ex:g2 { ex:a ex:next ex:c . }",
+        RdfFormat::TriG,
+    );
+    for _ in 0..2 {
+        for (g, end) in [("g1", "b"), ("g2", "c")] {
+            let r = q(
+                &s,
+                &format!("SELECT ?x WHERE {{ GRAPH ex:{g} {{ ex:a ex:next+ ?x }} }}"),
+            );
+            assert_eq!(strs(&r), [end], "GRAPH ex:{g}");
+        }
+        let r = q(&s, "SELECT ?g ?x WHERE { GRAPH ?g { ex:a ex:next+ ?x } }");
+        assert_eq!(strs(&r), ["g1 b", "g2 c"]);
+    }
+}
+
+#[test]
+fn replace_is_atomic_and_leaves_data_on_parse_errors() {
+    use crate::store::ReplaceTarget;
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        TRIG.as_bytes().to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let g1 = oxrdf::NamedNode::new_unchecked("http://ex.org/g1");
+    let bad = Source::from_bytes(
+        b"<http://ex.org/n> <http://ex.org/p> 7 . this is not turtle".to_vec(),
+        RdfFormat::Turtle,
+        Some(g1.clone()),
+    );
+    assert!(s.replace(ReplaceTarget::Named(g1.clone()), &[bad]).is_err());
+    assert_eq!(
+        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
+        ["1", "2"]
+    );
+    let good = Source::from_bytes(
+        b"<http://ex.org/n> <http://ex.org/p> 7 .".to_vec(),
+        RdfFormat::Turtle,
+        Some(g1.clone()),
+    );
+    assert_eq!(s.replace(ReplaceTarget::Named(g1), &[good]).unwrap(), 1);
+    assert_eq!(
+        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
+        ["7"]
+    );
+    // other graphs are untouched
+    assert_eq!(
+        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g2 { ?s ex:p ?o } }")),
+        ["3", "4"]
+    );
+    assert_eq!(strs(&q(&s, "SELECT ?o WHERE { ?s ex:p ?o }")), ["9"]);
+}
+
+#[test]
+fn join_expansion_respects_the_row_budget() {
+    // 300 subjects share one object: the self-join on ?o is a 90,000-pair run
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..300 {
+        ttl.push_str(&format!("ex:s{i} ex:p ex:x .\n"));
+    }
+    let s = cached_store(&ttl, RdfFormat::Turtle);
+    let opts = QueryOptions {
+        max_rows: Some(1000),
+        ..Default::default()
+    };
+    let r = query(
+        s.snapshot(),
+        "SELECT * WHERE { ?a <http://ex.org/p> ?o . ?b <http://ex.org/p> ?o }",
+        &opts,
+    );
+    assert!(
+        matches!(r, Err(crate::error::Error::MemoryLimit(_))),
+        "{:?}",
+        r.err()
+    );
+}
+
+#[test]
+fn updates_store_only_valid_rdf() {
+    let s = store();
+    let opts = QueryOptions::default();
+    for u in [
+        // literal predicate, new to the store (delta vocabulary)
+        r#"INSERT { <urn:z> ?p <urn:o> } WHERE { VALUES ?p { "invalid predicate" } }"#,
+        // literal subject
+        r#"INSERT { ?s <urn:p> <urn:o> } WHERE { BIND("not a subject" AS ?s) }"#,
+        // triple term as subject
+        r#"INSERT { ?t <urn:p> <urn:o> } WHERE { BIND(<<( <urn:a> <urn:b> <urn:c> )>> AS ?t) }"#,
+        // literal graph name
+        r#"INSERT { GRAPH ?g { <urn:a> <urn:p> 1 } } WHERE { BIND("g" AS ?g) }"#,
+    ] {
+        let st = update::update(&s, u, &opts).unwrap();
+        assert_eq!(st.inserted, 0, "{u}");
+    }
+    let st = update::update(
+        &s,
+        "INSERT { <urn:z> ?p ?t } WHERE { VALUES ?p { <urn:p> } BIND(<<( <urn:a> <urn:b> <urn:c> )>> AS ?t) }",
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(st.inserted, 1);
+    // everything stored can be exported
+    let mut buf = Vec::new();
+    let n = s.dump_nquads(&mut buf).unwrap();
+    assert_eq!(n, s.snapshot().len());
+}
+
+#[test]
+fn filters_beyond_the_planner_mask_are_kept() {
+    let s = store();
+    for n in [63, 64, 65, 80] {
+        let mut text = String::from("SELECT ?p WHERE { ?p foaf:name ?n . ?p foaf:age ?a ");
+        for _ in 0..n - 1 {
+            text.push_str("FILTER(?a > 0) ");
+        }
+        // the last, restrictive filter must survive planning
+        text.push_str("FILTER(?a > 30) }");
+        assert_eq!(strs(&q(&s, &text)), ["carol"], "{n} filters");
+    }
+}
+
+#[test]
+fn initial_bindings_restrict_values() {
+    let s = store();
+    let one = Term::Literal(oxrdf::Literal::from(1i64));
+    let opts = QueryOptions {
+        initial_bindings: vec![("x".into(), one)],
+        ..Default::default()
+    };
+    let run = |text: &str| strs(&query(s.snapshot(), text, &opts).unwrap());
+    assert_eq!(run("SELECT ?x WHERE { VALUES ?x { 1 2 } }"), ["1"]);
+    assert_eq!(
+        run("SELECT ?x WHERE { VALUES ?x { 2 3 } }"),
+        Vec::<String>::new()
+    );
+    // UNDEF cells take the bound value; correlated columns keep their rows
+    assert_eq!(
+        run(
+            "SELECT ?x ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (UNDEF \"c\") (1 \"a\") } }"
+        ),
+        ["1 a", "1 a", "1 c"]
+    );
+}
+
+#[test]
+fn named_only_protocol_dataset_has_an_empty_default_graph() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        TRIG.as_bytes().to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let opts = QueryOptions {
+        named_graph_uris: vec!["http://ex.org/g1".into()],
+        ..Default::default()
+    };
+    let run = |text: &str| strs(&query(s.snapshot(), text, &opts).unwrap());
+    assert_eq!(
+        run("SELECT ?o WHERE { ?s <http://ex.org/p> ?o }"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        run("SELECT ?g ?o WHERE { GRAPH ?g { ?s <http://ex.org/p> ?o } }"),
+        ["g1 1", "g1 2"]
+    );
+    let opts = QueryOptions {
+        default_graph_uris: vec!["http://ex.org/g2".into()],
+        ..Default::default()
+    };
+    let r = query(
+        s.snapshot(),
+        "SELECT ?o WHERE { ?s <http://ex.org/p> ?o }",
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(strs(&r), ["3", "4"]);
+}
+
+#[test]
+fn cancelled_or_expired_updates_publish_nothing() {
+    let s = store();
+    let before = s.snapshot().len();
+    let cancelled = QueryOptions {
+        cancel: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        ))),
+        ..Default::default()
+    };
+    let r = update::update(&s, "INSERT DATA { <urn:a> <urn:b> <urn:c> }", &cancelled);
+    assert!(
+        matches!(r, Err(crate::error::Error::Cancelled)),
+        "{:?}",
+        r.err()
+    );
+    let expired = QueryOptions {
+        timeout: Some(std::time::Duration::ZERO),
+        ..Default::default()
+    };
+    let r = update::update(
+        &s,
+        "INSERT { ?s <urn:seen> 1 } WHERE { ?s ?p ?o }",
+        &expired,
+    );
+    assert!(
+        matches!(r, Err(crate::error::Error::Timeout)),
+        "{:?}",
+        r.err()
+    );
+    assert_eq!(s.snapshot().len(), before);
+}
+
+#[test]
+fn update_where_clauses_resolve_against_base() {
+    let s = store();
+    update::update(
+        &s,
+        r#"BASE <http://example.org/> INSERT { <urn:s> <urn:p> ?x } WHERE { BIND(IRI("relative") AS ?x) }"#,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(q(&s, "ASK { <urn:s> <urn:p> <http://example.org/relative> }").boolean);
+}
+
+#[test]
+fn cached_results_obey_the_row_budget() {
+    let s = cached_store(DATA, RdfFormat::Turtle);
+    let text = "SELECT ?p ?n WHERE { ?p foaf:knows ?o . ?o foaf:name ?n }";
+    let full = strs(&q(&s, text));
+    assert_eq!(full.len(), 3);
+    // the next run is served from the cache
+    assert!(has_cached(&q(&s, text).plan));
+    let limited = QueryOptions {
+        max_rows: Some(2),
+        prefixes: vec![("foaf".into(), "http://xmlns.com/foaf/0.1/".into())],
+        ..Default::default()
+    };
+    let r = query(s.snapshot(), text, &limited);
+    assert!(
+        matches!(r, Err(crate::error::Error::MemoryLimit(_))),
+        "{:?}",
+        r.err()
+    );
+}

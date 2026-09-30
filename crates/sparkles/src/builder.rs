@@ -311,7 +311,14 @@ impl Builder {
                     w.push(*k)?;
                 }
             } else {
+                // the merged runs can repeat a quad that occurs in several batches:
+                // drop repeats before both consumers, so statistics match the index
+                let mut last: Option<Key> = None;
                 self.external_sort(perm, &batches, |k| {
+                    if last == Some(k) {
+                        return Ok(());
+                    }
+                    last = Some(k);
                     col.push(&k);
                     w.push(k)
                 })?;
@@ -331,15 +338,16 @@ impl Builder {
             prefixes: std::mem::take(&mut *self.prefixes.lock()),
             created: now_rfc3339(),
         };
-        std::fs::write(
-            self.dir.join("stats.json"),
-            serde_json::to_vec(&stats).unwrap(),
+        crate::store::write_synced(
+            &self.dir.join("stats.json"),
+            &serde_json::to_vec(&stats).unwrap(),
         )?;
-        std::fs::write(
-            self.dir.join("meta.json"),
-            serde_json::to_vec_pretty(&meta).unwrap(),
+        crate::store::write_synced(
+            &self.dir.join("meta.json"),
+            &serde_json::to_vec_pretty(&meta).unwrap(),
         )?;
         let _ = std::fs::remove_dir_all(&self.tmp);
+        crate::store::sync_dir(&self.dir)?;
         self.report(&format!("index complete: {rows} quads, {terms} terms"));
         Ok(meta)
     }
@@ -820,6 +828,54 @@ mod tests {
         assert_eq!(small.0, big.0);
         assert_eq!(small.1, big.1);
         assert_eq!(small.2, big.2);
+    }
+
+    #[test]
+    fn external_sort_statistics_skip_duplicate_quads() {
+        // every quad appears three times, in different batches
+        let mut nt = String::new();
+        for _ in 0..3 {
+            for i in 0..40 {
+                nt.push_str(&format!(
+                    "<http://ex.org/s{i}> <http://ex.org/p{}> <http://ex.org/o{}> .\n\
+                     <http://ex.org/s{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/C{}> .\n",
+                    i % 3,
+                    i % 7,
+                    i % 2
+                ));
+            }
+        }
+        let stats = |opts: BuildOptions| {
+            let dir = tempfile::tempdir().unwrap();
+            let b = Builder::new(dir.path(), opts).unwrap();
+            b.add_source(&Source::from_bytes(
+                nt.as_bytes().to_vec(),
+                RdfFormat::NTriples,
+                None,
+            ))
+            .unwrap();
+            let meta = b.finish().unwrap();
+            let stats: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("stats.json")).unwrap())
+                    .unwrap();
+            (meta.quads, stats)
+        };
+        let (quads, external) = stats(BuildOptions {
+            batch_quads: 5,
+            sort_mem_quads: 20,
+            threads: 2,
+            first_bnode: 0,
+        });
+        let (_, in_memory) = stats(BuildOptions::default());
+        assert_eq!(quads, 80);
+        assert_eq!(external, in_memory);
+        let counted: u64 = external["predicates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, 80);
     }
 
     #[test]

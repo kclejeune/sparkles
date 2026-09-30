@@ -522,7 +522,20 @@ impl<'a> Planner<'a> {
                         .collect();
                     t.push_row(&ids);
                 }
-                // substitution: restrict to rows compatible with substituted values
+                // substituted variables (initial bindings, filter equalities): keep only
+                // compatible rows and fill their UNDEF cells with the bound value, so the
+                // table agrees with the substitution the rest of the plan assumes
+                for (c, v) in vars.iter().enumerate() {
+                    let Some(&bound) = self.subst.get(v) else {
+                        continue;
+                    };
+                    let keep: Vec<bool> = t.cols[c]
+                        .iter()
+                        .map(|id| id.is_undef() || *id == bound)
+                        .collect();
+                    t.filter_rows(&keep);
+                    t.cols[c].fill(bound);
+                }
                 let certain: Vec<VarId> = vars
                     .iter()
                     .enumerate()
@@ -1445,10 +1458,11 @@ impl<'a> Planner<'a> {
             .into_iter()
             .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost))
             .unwrap();
-        // remove applied filters
+        // remove applied filters; the mask covers only the first 64, which are the only
+        // ones apply_dp_filters places, so any later filter stays for the caller
         let mut i = 0;
         filters.retain(|_| {
-            let keep = fm & (1 << i) == 0;
+            let keep = i >= 64 || fm & (1u64 << i) == 0;
             i += 1;
             keep
         });

@@ -18,6 +18,31 @@ use std::time::Instant;
 
 const PAR_THRESHOLD: usize = 16_384;
 
+/// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
+/// the deadline between chunks: one clock read per chunk rather than per row, while an
+/// expensive expression still stops within one chunk of the deadline.
+fn map_rows<T: Send>(
+    ctx: &Ctx,
+    n: usize,
+    par: bool,
+    f: impl Fn(usize) -> T + Sync + Send,
+) -> Result<Vec<T>> {
+    let chunk = if par { 1 << 16 } else { 1 << 10 };
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0;
+    while start < n {
+        ctx.check()?;
+        let end = (start + chunk).min(n);
+        if par {
+            out.par_extend((start..end).into_par_iter().map(&f));
+        } else {
+            out.extend((start..end).map(&f));
+        }
+        start = end;
+    }
+    Ok(out)
+}
+
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,7 +109,7 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             eprintln!("CACHEKEY {} :: {}", n.operator(), k.key);
         }
         let start = Instant::now();
-        if let Some(t) = results.get(k, ctx) {
+        if let Some(t) = results.get(k, ctx)? {
             let mut info = describe(ctx, n);
             info.actual_rows = t.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -187,12 +212,12 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::Filter(exprs) => {
             let mut t = child(0, &mut infos)?;
-            apply_filter(ctx, &mut t, exprs);
+            apply_filter(ctx, &mut t, exprs)?;
             t
         }
         Kind::Extend(v, e) => {
             let mut t = child(0, &mut infos)?;
-            let col = compute_column(ctx, &t, e);
+            let col = compute_column(ctx, &t, e)?;
             t.vars.push(*v);
             t.cols.push(col);
             t
@@ -204,7 +229,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::OrderBy { keys, limit } => {
             let t = child(0, &mut infos)?;
-            order_by(ctx, t, keys, *limit)
+            order_by(ctx, t, keys, *limit)?
         }
         Kind::Project(vars) => child(0, &mut infos)?.project(vars),
         Kind::Distinct => distinct(child(0, &mut infos)?),
@@ -258,6 +283,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     } else {
         table.sorted = n.sorted.clone();
     }
+    ctx.check()?;
     ctx.check_rows(table.len())?;
     let info = PlanInfo {
         operator: n.operator().to_string(),
@@ -397,11 +423,11 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
 fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table) -> Result<Table> {
     Ok(match &n.kind {
         Kind::Filter(exprs) => {
-            apply_filter(ctx, &mut t, exprs);
+            apply_filter(ctx, &mut t, exprs)?;
             t
         }
         Kind::Extend(v, e) => {
-            let col = compute_column(ctx, &t, e);
+            let col = compute_column(ctx, &t, e)?;
             t.vars.push(*v);
             t.cols.push(col);
             t
@@ -690,7 +716,12 @@ fn join_pairs(
 ) -> Result<Vec<(u32, u32)>> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     if lay.shared.is_empty() {
+        // the product size is known up front: reject it before allocating anything
+        ctx.check_rows(l.len().saturating_mul(r.len()))?;
         for i in 0..l.len() {
+            if i % 1024 == 0 {
+                ctx.check()?;
+            }
             for j in 0..r.len() {
                 pairs.push((i as u32, j as u32));
             }
@@ -741,7 +772,18 @@ fn join_pairs(
                     let v = a[i];
                     let ie = i + a[i..].partition_point(|x| *x == v);
                     let je = j + b[j..].partition_point(|x| *x == v);
+                    // an equal-key run emits up to the product of its lengths: with a
+                    // single key that is exact, so an oversized run fails before it is
+                    // expanded; otherwise the budget is checked while expanding
+                    let run = (ie - i).saturating_mul(je - j);
+                    if lay.shared.len() == 1 {
+                        ctx.check_rows(pairs.len().saturating_add(run))?;
+                    }
                     for ii in i..ie {
+                        if (ii - i) % 1024 == 1023 {
+                            ctx.check()?;
+                            ctx.check_rows(pairs.len())?;
+                        }
                         for jj in j..je {
                             if lay.shared.len() == 1 || compatible(l, r, ii, jj, &lay.shared) {
                                 pairs.push((ii as u32, jj as u32));
@@ -784,6 +826,9 @@ fn join_pairs(
                 ctx.check_rows(pairs.len())?;
             }
             if let Some(m) = map.get(v) {
+                if m.len() > 1024 {
+                    ctx.check_rows(pairs.len().saturating_add(m.len()))?;
+                }
                 for &bi in m {
                     emit(bi as usize, pi, &mut pairs);
                 }
@@ -805,6 +850,9 @@ fn join_pairs(
             key.clear();
             key.extend(pcols.iter().map(|&c| pt.cols[c][pi]));
             if let Some(m) = map.get(&key) {
+                if m.len() > 1024 {
+                    ctx.check_rows(pairs.len().saturating_add(m.len()))?;
+                }
                 for &bi in m {
                     emit(bi as usize, pi, &mut pairs);
                 }
@@ -1054,22 +1102,23 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     Some(out)
 }
 
-fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) {
+fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<()> {
     let t0 = Instant::now();
-    let keep = match distinct_filter_mask(ctx, t, exprs) {
+    let keep = match distinct_filter_mask(ctx, t, exprs)? {
         Some(keep) => {
             tracing::debug!("filter evaluated per distinct value in {:?}", t0.elapsed());
             keep
         }
-        None => filter_mask(ctx, t, exprs),
+        None => filter_mask(ctx, t, exprs)?,
     };
     let sorted = t.sorted.clone();
     t.filter_rows(&keep);
     t.sorted = sorted;
+    Ok(())
 }
 
 /// Evaluate the filter row by row.
-fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Vec<bool> {
+fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!("decoded values in {:?}", t0.elapsed());
@@ -1084,13 +1133,10 @@ fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Vec<bool> {
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
-    let keep = if t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists()) {
-        (0..t.len()).into_par_iter().map(test).collect()
-    } else {
-        (0..t.len()).map(test).collect()
-    };
+    let par = t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists());
+    let keep = map_rows(ctx, t.len(), par, test)?;
     tracing::debug!("filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
-    keep
+    Ok(keep)
 }
 
 /// A deterministic filter that reads a single variable has the same outcome for every
@@ -1098,12 +1144,12 @@ fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Vec<bool> {
 /// row, instead of decoding and testing every row. Values of a column often repeat
 /// (names, labels, categories), and a column sorted on the variable yields its distinct
 /// ids as runs without sorting.
-fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Option<Vec<bool>> {
+fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
     if t.len() < 4096
         || !exprs.iter().any(super::expr::needs_values)
         || !exprs.iter().all(super::cache::deterministic)
     {
-        return None;
+        return Ok(None);
     }
     let mut vars = Vec::new();
     for e in exprs {
@@ -1112,9 +1158,12 @@ fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Option<Vec<bool
     vars.sort_unstable();
     vars.dedup();
     let &[v] = vars.as_slice() else {
-        return None;
+        return Ok(None);
     };
-    let col = &t.cols[t.col_of(v)?];
+    let Some(c) = t.col_of(v) else {
+        return Ok(None);
+    };
+    let col = &t.cols[c];
     let runs = t.sorted.first() == Some(&v);
     let mut uniq = col.clone();
     if !runs {
@@ -1122,18 +1171,19 @@ fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Option<Vec<bool
     }
     uniq.dedup();
     let (hit, uniq) = match super::keyfilter::KeyFilter::new(exprs, v) {
-        Some(kf) => (key_filter_mask(ctx, &kf, &uniq, v, exprs), uniq),
+        Some(kf) => (key_filter_mask(ctx, &kf, &uniq, v, exprs)?, uniq),
         // the general evaluator gains nothing when (nearly) every value is different
-        None if uniq.len() > col.len() / 4 * 3 => return None,
+        None if uniq.len() > col.len() / 4 * 3 => return Ok(None),
         None => {
             let mut values = Table::new(vec![v]);
             values.len = uniq.len();
             values.cols[0] = uniq;
-            let hit = filter_mask(ctx, &values, exprs);
+            let hit = filter_mask(ctx, &values, exprs)?;
             (hit, std::mem::take(&mut values.cols[0]))
         }
     };
-    Some(if runs {
+    ctx.check()?;
+    Ok(Some(if runs {
         // `uniq` lists the runs in column order
         let mut j = 0;
         col.iter()
@@ -1148,7 +1198,7 @@ fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Option<Vec<bool
         col.par_iter()
             .map(|id| hit[uniq.binary_search(id).unwrap()])
             .collect()
-    })
+    }))
 }
 
 /// Outcome of a key filter for sorted distinct ids: base-vocabulary terms are tested on
@@ -1161,13 +1211,14 @@ fn key_filter_mask(
     uniq: &[Id],
     v: VarId,
     exprs: &[Expr],
-) -> Vec<bool> {
+) -> Result<Vec<bool>> {
     use crate::id::Tag;
     let vocab = &ctx.snap.generation.vocab;
     let mut hit = vec![false; uniq.len()];
     // raw ids sort by tag first, so the vocabulary ids are one contiguous range
     let lo = uniq.partition_point(|id| id.tag() < Tag::Vocab);
     let hi = lo + uniq[lo..].partition_point(|id| id.tag() == Tag::Vocab);
+    ctx.check()?;
     hit[lo..hi]
         .par_chunks_mut(4096)
         .zip(uniq[lo..hi].par_chunks(4096))
@@ -1193,14 +1244,14 @@ fn key_filter_mask(
         }
     }
     if !rest_at.is_empty() {
-        for (i, h) in rest_at.into_iter().zip(filter_mask(ctx, &rest, exprs)) {
+        for (i, h) in rest_at.into_iter().zip(filter_mask(ctx, &rest, exprs)?) {
             hit[i] = h;
         }
     }
-    hit
+    Ok(hit)
 }
 
-fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
+fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
     let dec = decode_for(ctx, t, &[e]);
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
@@ -1216,19 +1267,15 @@ fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
-    if t.len() > PAR_THRESHOLD && !e.has_exists() {
-        (0..t.len()).into_par_iter().map(f).collect()
-    } else {
-        (0..t.len()).map(f).collect()
-    }
+    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && !e.has_exists(), f)
 }
 
-fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) -> Table {
+fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) -> Result<Table> {
     let dec = decode_for(ctx, &t, &keys.iter().map(|(e, _)| e).collect::<Vec<_>>());
     let map = t.var_map(ctx.nvars());
     let key_vals: Vec<Vec<Option<Value>>> = keys
         .iter()
-        .map(|(e, _)| {
+        .map(|(e, _)| -> Result<Vec<Option<Value>>> {
             let f = |i: usize| {
                 eval(
                     e,
@@ -1246,13 +1293,10 @@ fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) ->
                     Val::V(v) | Val::Dec(_, v) => Some(v),
                 })
             };
-            if t.len() > PAR_THRESHOLD {
-                (0..t.len()).into_par_iter().map(f).collect()
-            } else {
-                (0..t.len()).map(f).collect()
-            }
+            map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
         })
-        .collect();
+        .collect::<Result<_>>()?;
+    ctx.check()?;
     let cmp = |a: &usize, b: &usize| {
         for (k, (_, asc)) in keys.iter().enumerate() {
             let o = order_cmp(key_vals[k][*a].as_ref(), key_vals[k][*b].as_ref());
@@ -1274,7 +1318,8 @@ fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) ->
         }
         _ => idx.par_sort_by(cmp),
     }
-    t.take_rows(&idx)
+    ctx.check()?;
+    Ok(t.take_rows(&idx))
 }
 
 fn distinct(t: Table) -> Table {

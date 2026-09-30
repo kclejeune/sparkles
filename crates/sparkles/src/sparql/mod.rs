@@ -205,8 +205,12 @@ fn make_ctx(
         if !opts.named_graph_uris.is_empty() {
             ds.named = Some(resolve(&opts.named_graph_uris));
         }
+        // a protocol dataset replaces the store's: whichever part was not given is empty
         if (ds.default.is_some() || ds.union_default) && ds.named.is_none() {
             ds.named = Some(Vec::new());
+        }
+        if ds.named.is_some() && ds.default.is_none() && !ds.union_default {
+            ds.default = Some(Vec::new());
         }
     } else if let Some(d) = dataset {
         ds.default = Some(resolve(

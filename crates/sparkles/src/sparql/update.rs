@@ -49,10 +49,18 @@ pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats
         ..Default::default()
     };
     let t1 = Instant::now();
+    let req = Request {
+        opts,
+        deadline: opts.timeout.map(|t| t0 + t),
+        base: parsed.base_iri.clone(),
+    };
     let mut txn = store.write();
     for op in &parsed.operations {
-        run_op(&mut txn, op, opts, &mut stats, store)?;
+        req.check()?;
+        run_op(&mut txn, op, &req, &mut stats, store)?;
     }
+    // a request cancelled or timed out before this point publishes nothing
+    req.check()?;
     txn.commit()?;
     let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     stats.timing = Timing {
@@ -65,10 +73,50 @@ pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats
     Ok(stats)
 }
 
+/// Limits and context shared by every operation of one update request: one deadline for
+/// the whole request, its cancellation flag and row budget, and the parsed BASE.
+struct Request<'a> {
+    opts: &'a QueryOptions,
+    deadline: Option<Instant>,
+    base: Option<oxiri::Iri<String>>,
+}
+
+impl Request<'_> {
+    fn check(&self) -> Result<()> {
+        if self
+            .opts
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(Error::Cancelled);
+        }
+        if self.deadline.is_some_and(|d| Instant::now() > d) {
+            return Err(Error::Timeout);
+        }
+        Ok(())
+    }
+
+    /// Query context for a WHERE clause, under the request's limits.
+    fn ctx(&self, snap: Arc<crate::store::Snapshot>) -> Ctx {
+        let mut ctx = Ctx::new(snap);
+        ctx.deadline = self.deadline;
+        if let Some(c) = &self.opts.cancel {
+            ctx.cancel = c.clone();
+        }
+        if let Some(m) = self.opts.max_rows {
+            ctx.max_rows = m;
+        }
+        ctx.allow_service = self.opts.allow_service;
+        ctx.base_iri = self.base.clone();
+        ctx
+    }
+}
+
 fn run_op(
     txn: &mut WriteTxn<'_>,
     op: &GraphUpdateOperation,
-    opts: &QueryOptions,
+    req: &Request<'_>,
     stats: &mut UpdateStats,
     store: &Store,
 ) -> Result<()> {
@@ -85,6 +133,9 @@ fn run_op(
                         GraphName::NamedNode(n) => oxrdf::GraphName::NamedNode(n.clone()),
                     },
                 );
+                if stats.inserted % 4096 == 4095 {
+                    req.check()?;
+                }
                 let ids = txn.encode_quad(&quad, &mut labels)?;
                 if txn.insert(ids)? {
                     stats.inserted += 1;
@@ -119,7 +170,7 @@ fn run_op(
             pattern,
         } => {
             let snap = Arc::new(txn.view());
-            let mut ctx = Ctx::new(snap);
+            let mut ctx = req.ctx(snap);
             if let Some(QueryDataset { default, named }) = using {
                 ctx.dataset.default = Some(
                     default
@@ -134,7 +185,6 @@ fn run_op(
                         .collect()
                 });
             }
-            ctx.allow_service = opts.allow_service;
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;
             let map = table.var_map(ctx.nvars());
@@ -247,22 +297,33 @@ fn run_op(
                     let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) else {
                         continue;
                     };
-                    // well-formedness: subject not a literal, predicate an IRI
-                    let view = &ctx;
-                    if view.kind(s) == super::ctx::TermKind::Literal
-                        || view.kind(p) != super::ctx::TermKind::Iri && p.tag() != Tag::Delta
+                    // an instantiation that is not a valid RDF quad is skipped (SPARQL
+                    // 1.1 Update §3.1.3): subject an IRI or blank node, predicate an IRI,
+                    // graph an IRI. Kinds come from the stored keys, including terms this
+                    // transaction just added to the delta vocabulary.
+                    use super::ctx::TermKind;
+                    if !matches!(ctx.kind(s), TermKind::Iri | TermKind::BNode)
+                        || ctx.kind(p) != TermKind::Iri
+                        || g != Id::DEFAULT_GRAPH && ctx.kind(g) != TermKind::Iri
                     {
                         continue;
                     }
                     ins.push([s, p, o, g]);
                 }
             }
-            for q in dels {
+            req.check()?;
+            for (i, q) in dels.into_iter().enumerate() {
+                if i % 4096 == 4095 {
+                    req.check()?;
+                }
                 if txn.delete(q)? {
                     stats.deleted += 1;
                 }
             }
-            for q in ins {
+            for (i, q) in ins.into_iter().enumerate() {
+                if i % 4096 == 4095 {
+                    req.check()?;
+                }
                 if txn.insert(q)? {
                     stats.inserted += 1;
                 }
@@ -294,6 +355,7 @@ fn run_op(
                 }
             };
             for g in graphs {
+                req.check()?;
                 for k in view.scan_keys(Perm::Gspo, &[g.0])? {
                     if txn.delete(Perm::Gspo.to_quad(&k))? {
                         stats.deleted += 1;
