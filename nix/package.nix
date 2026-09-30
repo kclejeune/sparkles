@@ -20,6 +20,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../rust-toolchain.toml
       ../crates
+      ../vendor
     ];
   };
 

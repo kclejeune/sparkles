@@ -385,6 +385,22 @@ fn union_minus_values() {
     assert_eq!(strs(&r), ["alice Alice", "dave Dave"]);
 }
 
+/// `+ -` and `* /` are left-associative (SPARQL 1.1 §17.3); spargebra 0.4.7 parsed them
+/// right-associatively (patched in `vendor/spargebra`).
+#[test]
+fn arithmetic_is_left_associative() {
+    let s = store();
+    let r = q(
+        &s,
+        "SELECT (1 - 2 - 3 AS ?a) (10 - 2 + 3 AS ?b) (12 / 2 * 3 AS ?c) (8 / 4 / 2 AS ?d)
+                (1 + 2 * 3 - 4 AS ?e) (1 - (2 - 3) AS ?f) (-2 - -3 AS ?g) (2*3-1 AS ?h) {}",
+    );
+    assert_eq!(strs(&r), ["-4 11 18 1 3 2 1 5"]);
+    // variables and a negative literal without a space (`?x -1` is `?x - 1`)
+    let r = q(&s, "SELECT ?v { BIND(10 AS ?x) BIND(?x -1 -2 AS ?v) }");
+    assert_eq!(strs(&r), ["7"]);
+}
+
 #[test]
 fn aggregates() {
     let s = store();
