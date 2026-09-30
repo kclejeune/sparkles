@@ -37,7 +37,7 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
 
 ### Request ids and the access log
@@ -518,9 +518,11 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
 Query parameters beyond the standard protocol:
 
-* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`). Updates
-  accept it too; without it they run under `--update-timeout` (none by default). A timed-out
-  update changes nothing.
+* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`), capped
+  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates accept
+  it too, under the same cap (never below `--update-timeout`); without it they run under
+  `--update-timeout` (none by default). A timed-out update changes nothing. A `408` names
+  the timeout that applied in `timeoutSeconds`.
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
 * `nocache=true` — bypass the query result cache: nothing is read from or stored in it
@@ -1020,6 +1022,8 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
 | `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
 | `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
+| `--max-upload-mb` | `65536` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
+| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory (0: no check) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
@@ -1036,7 +1040,13 @@ bytes and is checked while the body is read (a declared `Content-Length` over it
 refused before anything is read), so no more than the ceiling is held; past it the request
 fails with `413`. A form POST to `/{ds}` may hold either operation, so it is read up to
 the larger of the query and update ceilings. Graph Store PUT/POST (also through `/{ds}`)
-and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead.
+and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead,
+up to `--max-upload-mb` (default 65536, i.e. 64 GiB; counted after HTTP decompression;
+`0`: unlimited), else `413`. Files compressed inside the body are capped separately by
+`--max-decompressed-mb` as they are parsed. Before a spooled body is written to the
+temporary directory (every 64 MiB), the server checks that the file system keeps
+`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`. Storage quotas per
+dataset do not exist yet.
 
 **Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
 `auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs
@@ -1075,7 +1085,8 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query response. Graph Store GET has no such budget and suits whole-dataset exports.
+  query or Graph Store GET response. A whole-dataset export larger than that needs a
+  higher budget (or `0`), or `sparkles dump` next to the server.
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)

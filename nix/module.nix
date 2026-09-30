@@ -219,7 +219,7 @@ in
     queryTimeout = mkOption {
       type = types.ints.positive;
       default = 60;
-      description = "Default query timeout in seconds (clients can lower it with `timeout=`).";
+      description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
     };
 
     readOnly = mkOption {

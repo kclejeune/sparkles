@@ -412,6 +412,12 @@
             <dd>{limits.updateTimeoutSeconds ? `${limits.updateTimeoutSeconds} s` : 'none'}</dd>
           </div>
         {/if}
+        {#if limits.maxTimeoutSeconds !== undefined}
+          <div>
+            <dt>Longest requested timeout</dt>
+            <dd>{limits.maxTimeoutSeconds ? `${limits.maxTimeoutSeconds} s` : 'unlimited'}</dd>
+          </div>
+        {/if}
         <div>
           <dt>Query memory</dt>
           <dd>{limit(limits.queryMemoryBytes)}</dd>

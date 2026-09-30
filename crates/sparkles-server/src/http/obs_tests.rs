@@ -412,9 +412,14 @@ async fn server_info_lists_the_limits() {
         serde_json::json!({
             "timeoutSeconds": 30.0,
             "updateTimeoutSeconds": 0.0,
+            "maxTimeoutSeconds": 1800.0,
             "queryMemoryBytes": 8u64 << 30,
             "maxResultBytes": 0,
             "maxRows": 200_000_000,
+            "maxQueryBodyBytes": 16u64 << 20,
+            "maxUpdateBodyBytes": 256u64 << 20,
+            "maxAdminBodyBytes": 16u64 << 20,
+            "maxUploadBytes": 64u64 << 30,
         })
     );
 }
@@ -521,17 +526,17 @@ async fn result_budget_fails_with_507() {
     // the Sparkles JSON format
     let r = get_with(&s.app, ALL, "accept", "application/x-sparkles+json").await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
-    // Graph Store GET streams, so the budget does not apply
+    // Graph Store GET too
     let r = get(&s.app, "/ds/data?default").await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    assert!(r.body.len() > 200);
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "result-bytes");
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
             &m,
             r#"sparkles_budget_exceeded_total{dataset="ds",budget="result-bytes"}"#
         ),
-        Some(2.0),
+        Some(3.0),
         "{m}"
     );
     // `send` limits what is serialized
@@ -547,7 +552,7 @@ async fn result_budget_fails_with_507() {
 
 #[tokio::test]
 async fn graph_store_get_streams_large_graphs() {
-    let s = server_with(|st| st.limits.max_result_bytes = Some(1024));
+    let s = server_with(|st| st.limits.max_result_bytes = None);
     let ds = s.state.get("ds").unwrap();
     // well past one 64 KiB chunk
     let nt: String = (0..5000)

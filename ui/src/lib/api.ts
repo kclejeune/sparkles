@@ -42,6 +42,8 @@ export type Limits = {
   timeoutSeconds: number;
   /** Absent on servers that predate it. */
   updateTimeoutSeconds?: number;
+  /** The largest `timeout` a request may ask for; absent on servers that predate it. */
+  maxTimeoutSeconds?: number;
   queryMemoryBytes: number;
   maxResultBytes: number;
   maxRows: number;

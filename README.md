@@ -341,6 +341,8 @@ result cache, and the web UI.
 | Effective boolean value of ill-typed boolean/numeric literals is an error | SPARQL 1.2 §17.2.2 (SPARQL 1.1 said `false`). |
 | Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates: the reasoning status records the commit it was made at, so stale inferences are reported (and can be re-run automatically with `serve --auto-reason`). Backward (LP) rules are not supported. |
 | `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
+| `serve` listens on `127.0.0.1` by default and refuses a non-loopback address without `--auth-config` unless `--allow-open-network` (or `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given (Fuseki listens on all interfaces) | Without authentication every caller may read, write and administer everything, so exposing that is an explicit choice; the override still logs a warning, as does a network listener without rate limits. |
+| A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0`: no cap) for queries and updates alike; the default query timeout stays 60 s | A request may ask for a longer timeout than the default, but not hold a worker indefinitely. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Using the library (no server)
@@ -440,13 +442,15 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
+| `--max-timeout S` | `1800` | largest `timeout=` a query or update may ask for (`0`: unlimited; never below `--timeout` / `--update-timeout`) |
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
-| `--max-result-mb N` | `1024` | budget for the body of a query response (`0`: unlimited); Graph Store GET streams and has none |
+| `--max-result-mb N` | `1024` | budget for the body of a query or Graph Store GET response (`0`: unlimited) |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
 | `--max-query-body-mb N` | `16` | largest SPARQL query body (also explain and `/shacl` shapes); `413` past it (`0`: unlimited) |
 | `--max-update-body-mb N` | `256` | largest SPARQL update body; bulk data goes through the Graph Store or `/upload` (`0`: unlimited) |
 | `--max-admin-body-mb N` | `16` | largest `/$/…` or prefix-change body (`0`: unlimited); `/$/auth/*` bodies are capped at 64 KiB |
-| `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
+| `--max-upload-mb N` | `65536` | largest Graph Store write or upload body, streamed to a temporary file and counted after HTTP decompression (`0`: unlimited) |
+| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free (`0`: no check) || `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |
 | `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |

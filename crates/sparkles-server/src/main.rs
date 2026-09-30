@@ -351,6 +351,10 @@ enum Cmd {
         /// Default query timeout in seconds
         #[arg(long, default_value_t = 60.0)]
         timeout: f64,
+        /// Largest `timeout` a query or update may ask for, in seconds (0: unlimited);
+        /// never below --timeout or --update-timeout
+        #[arg(long, default_value_t = 1800.0)]
+        max_timeout: f64,
         /// Reject updates, uploads and admin changes
         #[arg(long)]
         read_only: bool,
@@ -429,6 +433,14 @@ enum Cmd {
         /// (0: unlimited)
         #[arg(long, default_value_t = 16)]
         max_admin_body_mb: u64,
+        /// Largest body of a Graph Store write or upload, in MiB, counted after HTTP
+        /// decompression (0: unlimited)
+        #[arg(long, default_value_t = 65536)]
+        max_upload_mb: u64,
+        /// Refuse (507) to spool a request body to the temporary directory once that
+        /// would leave less than this much free disk space, in MiB (0: no check)
+        #[arg(long, default_value_t = 1024)]
+        min_free_disk_mb: u64,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -1093,6 +1105,7 @@ fn run() -> Result<()> {
             mem,
             loc,
             timeout,
+            max_timeout,
             read_only,
             no_service,
             idle_release_ms,
@@ -1116,6 +1129,8 @@ fn run() -> Result<()> {
             max_query_body_mb,
             max_update_body_mb,
             max_admin_body_mb,
+            max_upload_mb,
+            min_free_disk_mb,
             auth_config,
             unix_socket,
             allow_open_network,
@@ -1159,7 +1174,19 @@ fn run() -> Result<()> {
                 max_query_body_bytes: mib(max_query_body_mb),
                 max_update_body_bytes: mib(max_update_body_mb),
                 max_admin_body_bytes: mib(max_admin_body_mb),
+                max_upload_bytes: mib(max_upload_mb),
+                min_free_disk_bytes: mib(min_free_disk_mb),
+                max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
+                    .then(|| Duration::from_secs_f64(max_timeout)),
             };
+            if let Some(max) = st.limits.max_timeout
+                && (st.default_timeout > max || st.limits.update_timeout.is_some_and(|u| u > max))
+            {
+                tracing::warn!(
+                    "--max-timeout {}s is below --timeout or --update-timeout: requests may still ask for those",
+                    max.as_secs_f64()
+                );
+            }
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
                     bail!("--auto-reason: built without the `reasoning` feature");
