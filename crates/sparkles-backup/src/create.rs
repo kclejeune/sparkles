@@ -156,6 +156,26 @@ fn hash_segments(
     Ok((ids, whole.finish()))
 }
 
+/// The blob object of `plain` as a payload: an LZ4 frame if that saves at least 10 %,
+/// else the plaintext itself behind the header (without copying it).
+fn encode(plain: Bytes) -> PutPayload {
+    use std::io::Write;
+    let len = plain.len() as u64;
+    if !plain.is_empty() {
+        let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::with_capacity(plain.len() / 2));
+        // writing into a Vec cannot fail
+        if enc.write_all(&plain).is_ok()
+            && let Ok(frame) = enc.finish()
+            && frame.len() * 10 <= plain.len() * 9
+        {
+            let header = Bytes::copy_from_slice(&blob::header(blob::Codec::Lz4, len));
+            return PutPayload::from_iter([header, Bytes::from(frame)]);
+        }
+    }
+    let header = Bytes::copy_from_slice(&blob::header(blob::Codec::Raw, len));
+    PutPayload::from_iter([header, plain])
+}
+
 /// The `MB` of progress messages.
 fn mb(b: u64) -> String {
     let m = b as f64 / 1e6;
@@ -591,11 +611,10 @@ impl Repository {
             }
         }
         let p2 = plain.clone();
-        let encoded = blocking(move || Ok(blob::encode_with_id(&p2, id, true))).await?;
-        let stored = encoded.bytes.len() as u64;
+        let payload = blocking(move || Ok(encode(p2))).await?;
+        let stored = payload.content_length() as u64;
         self.upload.take(stored, ctl).await?;
         ctl.check()?;
-        let payload = PutPayload::from(encoded.bytes);
         if single {
             self.store.put(&key, payload).await?;
             return Ok(done(Some(stored), plain));
@@ -660,6 +679,27 @@ mod tests {
                 .unwrap_err()
                 .is_cancelled()
         );
+    }
+
+    #[test]
+    fn payloads_are_blob_objects() {
+        for plain in [
+            Bytes::from("ex:p ex:o . ".repeat(1000)),
+            Bytes::from(
+                (0..4096u32)
+                    .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                    .collect::<Vec<_>>(),
+            ),
+            Bytes::new(),
+        ] {
+            let id = blob::blob_id(&plain);
+            let stored: Vec<u8> = encode(plain.clone()).into_iter().flatten().collect();
+            assert_eq!(
+                blob::decode(&stored, &id, plain.len() as u64).unwrap(),
+                plain
+            );
+            assert_eq!(stored, blob::encode_with_id(&plain, id, true).bytes);
+        }
     }
 
     #[test]

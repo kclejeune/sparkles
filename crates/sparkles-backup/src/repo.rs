@@ -597,6 +597,10 @@ fn cloud_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
     ))
 }
 
+#[cfg_attr(
+    not(any(feature = "s3", feature = "gcs", feature = "azure")),
+    allow(dead_code)
+)]
 fn prefixed(store: Arc<dyn ObjectStore>, prefix: Option<&str>) -> Arc<dyn ObjectStore> {
     match prefix
         .map(|p| p.trim_matches('/'))
@@ -1345,6 +1349,8 @@ mod instrumented {
         inner: Arc<dyn ObjectStore>,
         stats: Arc<RequestStats>,
         attempts: u32,
+        /// when a retried request last got a WARN (seconds since the epoch)
+        warned: AtomicU64,
     }
 
     impl RepoStore {
@@ -1353,6 +1359,7 @@ mod instrumented {
                 inner,
                 stats,
                 attempts: attempts.max(1),
+                warned: AtomicU64::new(0),
             }
         }
 
@@ -1376,8 +1383,35 @@ mod instrumented {
                         tokio::time::sleep(BACKOFF * 2u32.pow(attempt - 1)).await;
                         attempt += 1;
                     }
-                    r => return r,
+                    r => {
+                        if attempt > 1 && r.is_ok() {
+                            self.warn_retried(op, attempt);
+                        }
+                        return r;
+                    }
                 }
+            }
+        }
+
+        /// A WARN for a request that succeeded after retries, at most once a minute.
+        fn warn_retried(&self, op: RequestOp, attempts: u32) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = self.warned.load(Ordering::Relaxed);
+            if now >= last + 60
+                && self
+                    .warned
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                tracing::warn!(
+                    target: "sparkles::backup",
+                    store = %self.inner,
+                    "a {} request succeeded after {attempts} attempts",
+                    op.as_str()
+                );
             }
         }
     }
