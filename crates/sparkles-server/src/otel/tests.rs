@@ -116,22 +116,34 @@ async fn call(app: &Router, req: HttpRequest<Body>) -> (StatusCode, HeaderMap, V
     (status, headers, body)
 }
 
-/// The finished spans of trace `t`, waiting briefly for spans that end on other threads.
-async fn spans_of(t: TraceId, at_least: usize) -> Vec<SpanData> {
-    for _ in 0..200 {
-        let v: Vec<SpanData> = pipeline()
-            .spans
-            .get_finished_spans()
-            .unwrap()
+/// What `f` finds among the finished spans, waiting (up to 10 s) for spans that end on
+/// other threads.
+async fn wait_for<T>(what: &str, mut f: impl FnMut(Vec<SpanData>) -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = f(pipeline().spans.get_finished_spans().unwrap()) {
+            return found;
+        }
+        assert!(std::time::Instant::now() < deadline, "no {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The finished spans of trace `t`, once its `requests` server spans (the children of
+/// the incoming `traceparent`) have ended. A span ends after its children, so a count
+/// of spans would not do: the phase and operator spans are all there while the server
+/// span may still be open.
+async fn spans_of(t: TraceId, requests: usize) -> Vec<SpanData> {
+    let parent = SpanId::from_hex(PARENT).unwrap();
+    wait_for(&format!("{requests} server spans in trace {t}"), |all| {
+        let v: Vec<SpanData> = all
             .into_iter()
             .filter(|s| s.span_context.trace_id() == t)
             .collect();
-        if v.len() >= at_least {
-            return v;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("trace {t}: fewer than {at_least} spans");
+        let ended = v.iter().filter(|s| s.parent_span_id == parent).count();
+        (ended >= requests).then_some(v)
+    })
+    .await
 }
 
 fn attr<'a>(s: &'a SpanData, key: &str) -> Option<&'a Value> {
@@ -177,7 +189,7 @@ async fn query_spans_follow_the_incoming_trace() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let spans = spans_of(t, 5).await;
+    let spans = spans_of(t, 1).await;
     let server = named(&spans, "GET /{ds}/sparql");
     assert_eq!(server.span_kind, SpanKind::Server);
     assert_eq!(server.parent_span_id, SpanId::from_hex(PARENT).unwrap());
@@ -297,7 +309,7 @@ async fn updates_record_their_commit() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let spans = spans_of(t, 4).await;
+    let spans = spans_of(t, 1).await;
     let server = named(&spans, "POST /{ds}/update");
     assert_eq!(attr_str(server, "db.operation.name"), "update");
     assert_eq!(
@@ -397,7 +409,7 @@ async fn service_calls_propagate_the_trace() {
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert!(String::from_utf8_lossy(&body).contains("remote"));
-    let spans = spans_of(t, 2).await;
+    let spans = spans_of(t, 1).await;
     let client = named(&spans, "sparql.service");
     assert_eq!(client.span_kind, SpanKind::Client);
     assert_eq!(attr_str(client, "server.address"), "127.0.0.1");
@@ -430,21 +442,11 @@ async fn background_tasks_are_linked_to_their_request() {
         .unwrap()
         .to_string();
     let request = named(&spans_of(t, 1).await, "POST /$/backup/{ds}").clone();
-    let task = 'found: {
-        for _ in 0..500 {
-            if let Some(task) = pipeline()
-                .spans
-                .get_finished_spans()
-                .unwrap()
-                .into_iter()
-                .find(|s| s.name == "task backup" && attr_str(s, "id") == id)
-            {
-                break 'found task;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("no task span");
-    };
+    let task = wait_for("task span", |all| {
+        all.into_iter()
+            .find(|s| s.name == "task backup" && attr_str(s, "id") == id)
+    })
+    .await;
     // a trace of its own, linked to the request that started it
     assert_ne!(task.span_context.trace_id(), t);
     assert!(
