@@ -121,6 +121,8 @@ pub struct AppState {
     pub access_log: bool,
     pub metrics: crate::obs::Metrics,
     phase: AtomicU8,
+    /// authentication and authorization (`serve --auth-config`); `None`: open
+    pub auth: Option<Arc<crate::auth::Auth>>,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// dataset names being created by a task (clone), with the task id
@@ -271,6 +273,7 @@ impl AppState {
             access_log: true,
             metrics: crate::obs::Metrics::new(true, 100),
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
+            auth: None,
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
             manage: Mutex::new(()),

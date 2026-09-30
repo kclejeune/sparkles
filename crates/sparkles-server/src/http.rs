@@ -1,9 +1,10 @@
 //! HTTP layer: SPARQL 1.1 Protocol, Graph Store Protocol, Fuseki `/$/` admin API.
 
+use crate::auth::{Level, Principal};
 use crate::obs::{CancelOnDrop, Op, Outcome, RequestReport};
 use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
@@ -28,18 +29,22 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 type St = State<Arc<AppState>>;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let cors = tower_http::cors::CorsLayer::very_permissive().expose_headers([
-        header::HeaderName::from_static(SPARKLES_COMMIT),
-        header::HeaderName::from_static(SPARKLES_DATASET_ID),
-        crate::obs::X_REQUEST_ID.clone(),
-        header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
-    ]);
+    let cors = crate::auth::cors_layer(
+        &state,
+        vec![
+            header::HeaderName::from_static(SPARKLES_COMMIT),
+            header::HeaderName::from_static(SPARKLES_DATASET_ID),
+            crate::obs::X_REQUEST_ID.clone(),
+            header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        ],
+    );
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui/", get(crate::ui::serve_index))
         .route("/ui/{*path}", get(crate::ui::serve))
         .route("/$/ping", get(ping).post(ping))
+        .route("/$/auth/whoami", get(crate::auth::whoami))
         .route("/$/server", get(server_info))
         .route("/$/metrics", get(crate::obs::metrics_endpoint))
         .route("/$/ready", get(crate::obs::ready_endpoint))
@@ -80,6 +85,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/shacl", post(shacl))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::middleware,
+        ))
         .layer(cors)
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
@@ -141,6 +150,7 @@ impl From<Error> for ApiError {
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
+            Error::NotPermitted(_) => StatusCode::FORBIDDEN,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
@@ -404,6 +414,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
 async fn dataset_root(
     st: St,
     Path(name): Path<String>,
+    p: Extension<Principal>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -415,10 +426,23 @@ async fn dataset_root(
         params.extend_form(&body);
     }
     if params.has("query") || ct == "application/sparql-query" {
-        return query_endpoint(st, Path(name), method, uri, headers, body).await;
+        return query_endpoint(st, Path(name), p, method, uri, headers, body).await;
     }
     if params.has("update") || ct == "application/sparql-update" {
-        return update_endpoint(st, Path(name), uri, headers, body).await;
+        // SPARQL 1.1 Protocol: updates only by POST
+        if method != Method::POST {
+            return Err(err(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "use POST for SPARQL Update",
+            ));
+        }
+        // a form body is only seen here: the auth layer checked read
+        if !p.can(&name, Level::Write) {
+            dataset(&st, &name)?;
+            let msg = format!("write access to /{name} required");
+            return Ok(crate::auth::forbidden(&p, &msg));
+        }
+        return update_endpoint(st, Path(name), p, uri, headers, body).await;
     }
     gsp(st, Path(name), method, uri, headers, body).await
 }
@@ -426,6 +450,7 @@ async fn dataset_root(
 async fn query_endpoint(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -456,6 +481,7 @@ async fn query_endpoint(
     }
     crate::obs::log_query_text(&query);
     let mut opts = query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let cancel = Arc::new(AtomicBool::new(false));
@@ -818,6 +844,7 @@ async fn get_commit(
 async fn update_endpoint(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -840,13 +867,14 @@ async fn update_endpoint(
         return Err(err(StatusCode::BAD_REQUEST, "missing 'update' parameter"));
     }
     crate::obs::log_query_text(&update);
-    let opts = QueryOptions {
+    let mut opts = QueryOptions {
         allow_service: st.allow_service,
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         ..Default::default()
     };
+    crate::auth::restrict(&mut opts, &p);
     let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
         let stats = sparkles::sparql::update::update_as(
@@ -877,6 +905,7 @@ async fn update_endpoint(
 async fn explain(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -893,7 +922,8 @@ async fn explain(
         }
         params.get("query").unwrap_or_default().to_string()
     };
-    let opts = query_options(&st, &ds, &params);
+    let mut opts = query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut opts, &p);
     blocking(move || {
         let snap = ds.store.snapshot();
         let seq = snap.commit;
@@ -1388,36 +1418,48 @@ fn dataset_info(ds: &Dataset) -> J {
     info
 }
 
-async fn server_info(State(st): St) -> Json<J> {
-    let datasets: Vec<J> = st
-        .datasets
-        .read()
-        .values()
-        .map(|d| dataset_info(d))
-        .collect();
+/// The `DatasetInfo` of every dataset the caller may read, with its `access` level
+/// when auth is enabled.
+fn visible_datasets(st: &AppState, p: &Principal) -> Vec<J> {
+    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    datasets
+        .iter()
+        .filter(|d| p.can(&d.name, Level::Read))
+        .map(|d| dataset_info_for(d, p))
+        .collect()
+}
+
+fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
+    let mut info = dataset_info(d);
+    if let Some(a) = p.access(&d.name) {
+        info["access"] = a.as_str().into();
+    }
+    info
+}
+
+async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "startedAt": st.started_at,
         "uptimeSeconds": uptime_secs(&st),
         "readOnly": st.read_only,
-        "datasets": datasets,
+        "datasets": visible_datasets(&st, &p),
         "limits": st.limits.json(st.default_timeout),
+        "auth": crate::auth::server_json(&st),
     }))
 }
 
-async fn list_datasets(State(st): St) -> Json<J> {
-    let datasets: Vec<J> = st
-        .datasets
-        .read()
-        .values()
-        .map(|d| dataset_info(d))
-        .collect();
-    Json(json!({ "datasets": datasets }))
+async fn list_datasets(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
+    Json(json!({ "datasets": visible_datasets(&st, &p) }))
 }
 
-async fn get_dataset(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+async fn get_dataset(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    Ok(Json(dataset_info(&ds)))
+    Ok(Json(dataset_info_for(&ds, &p)))
 }
 
 async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes) -> ApiResult {
@@ -1480,6 +1522,7 @@ async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes
 async fn clone_dataset(
     State(st): St,
     Path(source): Path<String>,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -1506,6 +1549,11 @@ async fn clone_dataset(
             StatusCode::BAD_REQUEST,
             format!("invalid dataset name '{name}'"),
         ));
+    }
+    // a clone may only create a dataset its caller could then manage
+    if p.level(&name) != Some(Level::Admin) {
+        let msg = format!("no admin access to the target name /{name}");
+        return Ok(crate::auth::forbidden(&p, &msg));
     }
     if kind.as_deref().is_some_and(|k| k == "mem") {
         return Err(err(
@@ -1566,11 +1614,15 @@ async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let st2 = st.clone();
-    let deleted = blocking(move || Ok(st2.delete(&name)?)).await?;
+    let n = name.clone();
+    let deleted = blocking(move || Ok(st2.delete(&n)?)).await?;
     if deleted {
         Ok(StatusCode::OK.into_response())
     } else {
-        Err(err(StatusCode::NOT_FOUND, "no such dataset"))
+        Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no such dataset: /{name}"),
+        ))
     }
 }
 
@@ -1895,16 +1947,29 @@ fn with_inferences(mut r: Response, ds: &Dataset, included: bool, seq: u64) -> R
     r
 }
 
-async fn list_tasks(State(st): St) -> Json<J> {
-    let tasks = st.tasks.lock().clone();
+async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
+    let tasks: Vec<_> = st
+        .tasks
+        .lock()
+        .iter()
+        .filter(|t| {
+            p.can(&t.dataset, Level::Read)
+                || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
+        })
+        .cloned()
+        .collect();
     Json(serde_json::to_value(tasks).unwrap())
 }
 
-async fn get_task(State(st): St, Path(id): Path<String>) -> ApiResult<Json<J>> {
+async fn get_task(
+    State(st): St,
+    Path(id): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
     st.tasks
         .lock()
         .iter()
-        .find(|t| t.id == id)
+        .find(|t| t.id == id && p.can(&t.dataset, Level::Read))
         .map(|t| Json(serde_json::to_value(t).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }

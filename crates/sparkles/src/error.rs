@@ -31,6 +31,10 @@ pub enum Error {
     /// The dataset's full-text index is not at the queried snapshot (stale or rebuilding).
     #[error("{0}")]
     TextUnavailable(String),
+    /// The caller lacks a permission the operation needs (outbound SERVICE or LOAD,
+    /// `LOAD <file:…>`); raised before any connection or file is opened.
+    #[error("{0}")]
+    NotPermitted(String),
 }
 
 /// Which budget a request exceeded.

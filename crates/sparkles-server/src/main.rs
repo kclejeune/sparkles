@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
 
 mod alloc;
+mod auth;
 mod clone;
 mod http;
 mod obs;
@@ -119,6 +120,16 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Enable authentication and per-dataset authorization from this TOML file
+        /// (re-read on SIGHUP); without it the server is open
+        #[arg(long, value_name = "FILE")]
+        auth_config: Option<PathBuf>,
+    },
+    /// Authentication: hashes, tokens, configuration checks
+    #[cfg(feature = "auth")]
+    Auth {
+        #[command(subcommand)]
+        cmd: auth::cli::AuthCmd,
     },
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
@@ -561,8 +572,12 @@ fn main() -> Result<()> {
             update_timeout,
             auto_reason,
             auto_reason_max_delay,
+            auth_config,
         } => {
+            // a bad auth configuration stops the server before anything else
+            let auth = auth::load(auth_config.as_deref(), &host)?;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            st.auth = auth;
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
@@ -634,6 +649,7 @@ fn main() -> Result<()> {
                 }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
+                auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
                 axum::serve(listener, http::router(st))
                     .with_graceful_shutdown(async move {
@@ -758,6 +774,8 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "auth")]
+        Cmd::Auth { cmd } => auth::cli::run(cmd),
         Cmd::TextIndex {
             loc,
             predicate,
