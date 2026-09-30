@@ -1514,9 +1514,8 @@ impl Store {
     fn maintain_text(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
         #[cfg(feature = "text")]
         if let Some(ti) = self.text.load_full() {
-            let touched: Vec<[Id; 4]> = log.iter().map(|(_, q)| *q).collect();
             let prev = snap.text.take();
-            snap.text = ti.apply_commit(snap, &touched, prev.as_ref());
+            snap.text = ti.apply_commit(snap, log, prev.as_ref());
         }
         #[cfg(not(feature = "text"))]
         let _ = (snap, log);

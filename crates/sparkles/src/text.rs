@@ -679,52 +679,90 @@ mod imp {
         doc: Option<TantivyDocument>,
     }
 
-    /// The document for a quad (`doc: None` when the quad is out of scope: then only its
-    /// key matters, for deletion).
-    fn document(snap: &Snapshot, f: &Fields, cfg: &TextConfig, q: &[Id; 4]) -> Option<Doc> {
-        if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
-            return None;
-        }
-        let o = snap.key(q[2])?;
-        let (lex, lang) = string_literal(&o)?;
-        let p = match snap.term(q[1])? {
-            oxrdf::Term::NamedNode(n) => n.into_string(),
-            _ => return None,
-        };
-        let s = term_key(snap, q[0])?;
-        let pk = crate::id::iri_key(&p);
-        let gk = if q[3] == Id::DEFAULT_GRAPH {
-            Vec::new()
-        } else {
-            term_key(snap, q[3])?
-        };
-        let key = doc_key([&s, &pk, &o, &gk]);
-        let g = graph_name(snap, q[3])?;
-        let in_scope = cfg.predicates.contains(&p)
-            && cfg.graphs.include.contains(&g)
-            && !cfg.graphs.exclude.contains(&g);
-        if !in_scope {
-            return Some(Doc { key, doc: None });
-        }
-        let mut d = TantivyDocument::default();
-        d.add_bytes(f.key, &key);
-        d.add_bytes(f.s, &s);
-        d.add_text(f.p, &p);
-        d.add_bytes(f.o, &o);
-        d.add_text(f.g, &g);
-        if let Some(tag) = lang {
-            let tag = tag.to_ascii_lowercase();
-            if let Some((primary, _)) = tag.split_once('-') {
-                d.add_text(f.lang, primary);
+    /// Entries a [`Terms`] memo holds before it starts over (graphs can be many).
+    const MEMO_MAX: usize = 1 << 16;
+
+    /// What documents need of predicates and graphs, decoded once per batch: the IRI (or
+    /// graph name), its key, and whether it is in scope.
+    #[derive(Default)]
+    struct Terms {
+        preds: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+        graphs: rustc_hash::FxHashMap<Id, Option<(String, Vec<u8>, bool)>>,
+    }
+
+    impl Terms {
+        /// The document for a quad (`doc: None` when the quad is out of scope: then only
+        /// its key matters, for deletion).
+        fn document(
+            &mut self,
+            snap: &Snapshot,
+            f: &Fields,
+            cfg: &TextConfig,
+            q: &[Id; 4],
+        ) -> Option<Doc> {
+            if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta) {
+                return None;
             }
-            d.add_text(f.lang, &tag);
+            let o = snap.key(q[2])?;
+            let (lex, lang) = string_literal(&o)?;
+            if self.preds.len() >= MEMO_MAX {
+                self.preds.clear();
+            }
+            if self.graphs.len() >= MEMO_MAX {
+                self.graphs.clear();
+            }
+            let (p, pk, p_in) = self
+                .preds
+                .entry(q[1])
+                .or_insert_with(|| match snap.term(q[1])? {
+                    oxrdf::Term::NamedNode(n) => {
+                        let p = n.into_string();
+                        let pk = crate::id::iri_key(&p);
+                        let p_in = cfg.predicates.contains(&p);
+                        Some((p, pk, p_in))
+                    }
+                    _ => None,
+                })
+                .as_ref()?;
+            let (g, gk, g_in) = self
+                .graphs
+                .entry(q[3])
+                .or_insert_with(|| {
+                    let gk = if q[3] == Id::DEFAULT_GRAPH {
+                        Vec::new()
+                    } else {
+                        term_key(snap, q[3])?
+                    };
+                    let g = graph_name(snap, q[3])?;
+                    let g_in = cfg.graphs.include.contains(&g) && !cfg.graphs.exclude.contains(&g);
+                    Some((g, gk, g_in))
+                })
+                .as_ref()?;
+            let s = term_key(snap, q[0])?;
+            let key = doc_key([&s, pk, &o, gk]);
+            if !(*p_in && *g_in) {
+                return Some(Doc { key, doc: None });
+            }
+            let mut d = TantivyDocument::default();
+            d.add_bytes(f.key, &key);
+            d.add_bytes(f.s, &s);
+            d.add_text(f.p, p);
+            d.add_bytes(f.o, &o);
+            d.add_text(f.g, g);
+            if let Some(tag) = lang {
+                let tag = tag.to_ascii_lowercase();
+                if let Some((primary, _)) = tag.split_once('-') {
+                    d.add_text(f.lang, primary);
+                }
+                d.add_text(f.lang, &tag);
+            }
+            let mut end = lex.len().min(cfg.max_text_bytes);
+            while !lex.is_char_boundary(end) {
+                end -= 1;
+            }
+            d.add_text(f.text, &lex[..end]);
+            Some(Doc { key, doc: Some(d) })
         }
-        let mut end = lex.len().min(cfg.max_text_bytes);
-        while !lex.is_char_boundary(end) {
-            end -= 1;
-        }
-        d.add_text(f.text, &lex[..end]);
-        Some(Doc { key, doc: Some(d) })
     }
 
     impl TextIndex {
@@ -777,7 +815,7 @@ mod imp {
                         return None;
                     }
                     for (_, qs) in wal.iter().filter(|(seq, _)| *seq > p.seq) {
-                        touched.extend_from_slice(qs);
+                        touched.extend(qs.iter().map(|q| (*q, true)));
                     }
                 }
                 let live = live_of(index, fields, &config, Some(dir), p.seq).ok()?;
@@ -838,19 +876,27 @@ mod imp {
             self.stale.lock().is_none()
         }
 
-        /// Apply a commit: `touched` are the quads the transaction changed and `snap` the
-        /// state after it (commit `snap.commit`). Returns the new view, or `None` (the
-        /// index is marked stale) on failure.
+        /// Apply a commit: `log` holds the transaction's effective inserts and deletes
+        /// (WAL records) and `snap` the state after it (commit `snap.commit`). Returns the
+        /// new view, or `None` (the index is marked stale) on failure.
         pub fn apply_commit(
             &self,
             snap: &Snapshot,
-            touched: &[[Id; 4]],
+            log: &[(u8, [Id; 4])],
             prev: Option<&Arc<TextView>>,
         ) -> Option<Arc<TextView>> {
             if !self.healthy() {
                 return prev.cloned();
             }
-            match self.apply(snap, touched) {
+            // a quad the transaction inserted first was absent before it: no document
+            // of it can exist yet
+            let mut first = rustc_hash::FxHashSet::default();
+            let touched: Vec<([Id; 4], bool)> = log
+                .iter()
+                .filter(|(_, q)| first.insert(*q))
+                .map(|(op, q)| (*q, *op != crate::store::WAL_INSERT))
+                .collect();
+            match self.apply(snap, &touched) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::error!("{e}; the full-text index is stale until it is rebuilt");
@@ -863,28 +909,37 @@ mod imp {
             }
         }
 
-        /// Bring the index to `snap` given the quads changed since its commit. Each touched
-        /// quad in scope is deleted and re-added if still present, so the result depends
-        /// only on the final state. The Tantivy commit is not synced: see `lazydir`.
-        fn apply(&self, snap: &Snapshot, touched: &[[Id; 4]]) -> Result<Arc<TextView>> {
+        /// Bring the index to `snap` given the quads changed since its commit, each with
+        /// whether a document of it may exist. Each touched quad in scope is deleted and
+        /// re-added if still present, so the result depends only on the final state. The
+        /// Tantivy commit is not synced: see `lazydir`.
+        fn apply(&self, snap: &Snapshot, touched: &[([Id; 4], bool)]) -> Result<Arc<TextView>> {
             let mut live = self.live.lock();
             let fields = live.shared.fields;
+            let mut terms = Terms::default();
             let mut changed = false;
             let mut seen = rustc_hash::FxHashSet::default();
-            for q in touched {
+            for (q, indexed) in touched {
                 if !seen.insert(*q) {
                     continue;
                 }
-                let Some(d) = document(snap, &fields, &self.config, q) else {
+                let Some(d) = terms.document(snap, &fields, &self.config, q) else {
                     continue;
                 };
-                live.writer()?
-                    .delete_term(Term::from_field_bytes(fields.key, &d.key));
-                changed = true;
+                // deleting is not free even when nothing matches (every commit with
+                // deletes opens each segment to apply them), so quads without a document
+                // are skipped: fresh ones, and those out of scope (the configuration is
+                // the index's)
+                if *indexed && d.doc.is_some() {
+                    live.writer()?
+                        .delete_term(Term::from_field_bytes(fields.key, &d.key));
+                    changed = true;
+                }
                 if let Some(doc) = d.doc
                     && snap.contains(q)?
                 {
                     live.writer()?.add_document(doc).map_err(text_err)?;
+                    changed = true;
                 }
             }
             live.applied = snap.commit;
@@ -955,8 +1010,10 @@ mod imp {
                 let mut writer: IndexWriter<TantivyDocument> = index
                     .writer_with_num_threads(threads, threads * (64 << 20))
                     .map_err(text_err)?;
+                let mut terms = Terms::default();
                 let mut add = |q: &[Id; 4]| -> Result<()> {
-                    if let Some(Doc { doc: Some(d), .. }) = document(snap, &fields, &self.config, q)
+                    if let Some(Doc { doc: Some(d), .. }) =
+                        terms.document(snap, &fields, &self.config, q)
                     {
                         writer.add_document(d).map_err(text_err)?;
                         docs += 1;

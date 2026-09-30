@@ -504,3 +504,70 @@ fn searches_count_toward_the_memory_budget() {
         "{e}"
     );
 }
+
+/// Rough write-path timing with full-text search on and off (not a benchmark: run it
+/// alone, optimized, with `--ignored --nocapture`).
+#[test]
+#[ignore]
+fn batch_insert_timing() {
+    let batch = |verb: &str| {
+        let mut u = format!("{verb} DATA {{ GRAPH <http://example.org/bench/g> {{\n");
+        for i in 0..1000 {
+            u.push_str(&format!("<http://example.org/bench/doc{i}> <http://example.org/title> \"Batch document {i} about graph databases and full text search\" .\n"));
+        }
+        u + "} }"
+    };
+    let (ins, del) = (batch("INSERT"), batch("DELETE"));
+    let mut base = String::new();
+    for i in 0..50_000 {
+        base.push_str(&format!(
+            "<http://example.org/n{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"number {i} walrus {}\" .\n",
+            i % 97
+        ));
+    }
+    for text in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        s.load(&[Source::from_bytes(
+            base.clone().into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        if text {
+            s.enable_text(TextConfig::default()).unwrap();
+        }
+        let o = QueryOptions::default();
+        let mut times = Vec::new();
+        for round in 0..30 {
+            let t = std::time::Instant::now();
+            sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+            let el = t.elapsed();
+            if round >= 5 {
+                times.push(el.as_secs_f64() * 1000.0);
+            }
+            sparkles::sparql::update::update(&s, &del, &o).unwrap();
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "text {}: insert 1k median {:.1} ms, min {:.1} ms, max {:.1} ms",
+            if text { "on" } else { "off" },
+            times[times.len() / 2],
+            times[0],
+            times[times.len() - 1]
+        );
+        if text {
+            let t = std::time::Instant::now();
+            sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+            let n = rows(
+                &s,
+                "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query \"batch\" } }",
+            );
+            eprintln!(
+                "insert 1k + search {:?}: {:.1} ms",
+                n,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
