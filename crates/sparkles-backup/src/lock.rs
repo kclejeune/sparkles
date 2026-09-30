@@ -641,6 +641,63 @@ mod tests {
         assert_eq!(e.code(), Code::RepositoryLocked);
     }
 
+    #[tokio::test]
+    #[ignore = "needs S2 (Source::from_closed_dir, Repository::create)"]
+    async fn a_create_holds_one_shared_lock_and_honours_exclusive_ones() {
+        use crate::{CreateOptions, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let mut repo = fixture::fs_repo(&root).await;
+        repo.env.lock_wait = Duration::from_secs(2);
+        let src = dir.path().join("src");
+        fixture::make_db(&src);
+        let locks = root.join("locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let planted = locks.join("x.json");
+        std::fs::write(&planted, plant(LockKind::Exclusive)).unwrap();
+
+        // the most lock objects besides the planted one seen during the create
+        let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (m2, l2) = (most.clone(), locks.clone());
+        let opts = |name: &str| CreateOptions {
+            name: name.into(),
+            dataset_name: "ds".into(),
+            ctl: Ctl {
+                progress: Some(Arc::new({
+                    let (m2, l2) = (m2.clone(), l2.clone());
+                    move |_, _: &str| {
+                        let n = std::fs::read_dir(&l2)
+                            .unwrap()
+                            .filter(|e| e.as_ref().unwrap().file_name() != "x.json")
+                            .count();
+                        m2.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let e = repo
+            .create(Source::from_closed_dir(&src).unwrap(), &opts("b1"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::RepositoryLocked);
+
+        let old = std::time::SystemTime::now() - Duration::from_secs(31 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&planted)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        repo.create(Source::from_closed_dir(&src).unwrap(), &opts("b1"))
+            .await
+            .unwrap();
+        assert_eq!(most.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // afterwards only the planted lock is left
+        assert_eq!(std::fs::read_dir(&locks).unwrap().count(), 1);
+    }
+
     #[test]
     fn staleness_and_jitter() {
         let now = Utc::now();

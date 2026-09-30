@@ -537,6 +537,24 @@ async fn verify_at_the_restore_level() {
 }
 
 #[tokio::test]
+#[ignore = "needs S2 (Repository::verify at the restore level calls verify_restore)"]
+async fn verify_at_the_restore_level_through_verify() {
+    let (dir, repo, _) = setup().await;
+    let o = VerifyOptions {
+        level: VerifyLevel::Restore,
+        tmp_dir: Some(dir.path().join("tmp")),
+        ..Default::default()
+    };
+    let v = repo.verify(&["b1".to_string()], &o).await.unwrap();
+    assert_eq!(
+        (v.level, v.status),
+        (VerifyLevel::Restore, VerifyStatus::Ok)
+    );
+    assert_eq!(v.backups[0].check.as_ref().unwrap()["status"], "ok");
+    assert!(entries(&dir.path().join("tmp")).is_empty());
+}
+
+#[tokio::test]
 async fn verify_reports_a_backup_that_does_not_restore_to_its_commit() {
     let (dir, repo, mut m) = setup().await;
     m.commit.quads += 1;
