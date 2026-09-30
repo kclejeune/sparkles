@@ -452,7 +452,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--max-update-body-mb N` | `256` | largest SPARQL update body; bulk data goes through the Graph Store or `/upload` (`0`: unlimited) |
 | `--max-admin-body-mb N` | `16` | largest `/$/…` or prefix-change body (`0`: unlimited); `/$/auth/*` bodies are capped at 64 KiB |
 | `--max-upload-mb N` | `65536` | largest Graph Store write or upload body, streamed to a temporary file and counted after HTTP decompression (`0`: unlimited) |
-| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free (`0`: no check) |
+| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free, or to write an N-Quads backup (`/$/backup`) once the data directory's would (`0`: no check) |
+| `--max-tasks N` | `4` | background tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) running at once; more wait `queued` (`0`: no limit) |
 | `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |

@@ -1,9 +1,11 @@
 //! The cost of a request: explicit write timeouts capped by `--max-timeout`, writes
-//! cancelled when their client disconnects, and concurrency permits held until the
-//! blocking work they admitted has ended.
+//! cancelled when their client disconnects, concurrency permits held until the
+//! blocking work they admitted has ended, bounded reports, and background task slots.
 
+use super::tasks::{spin, wait_done};
 use super::*;
 use crate::ratelimit::{Config, RateLimiter};
+use crate::state::task_state;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -321,4 +323,158 @@ async fn shacl_reports_are_bounded_by_the_result_budget() {
     let r = send(&s.app, validate("http://example.org/few")).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.text().contains("MaxCountConstraintComponent"));
+}
+
+fn task(st: &AppState, id: &str) -> crate::state::Task {
+    st.tasks
+        .lock()
+        .iter()
+        .find(|t| t.id == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("task {id} is not listed"))
+}
+
+async fn wait_state(st: &AppState, id: &str, state: &str) {
+    let t0 = Instant::now();
+    while task(st, id).state != state {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", task(st, id));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[tokio::test]
+async fn tasks_beyond_the_cap_wait_queued() {
+    let s = limited(&[], |st| st.task_queue.set_max(1));
+    let st = &s.state;
+    let stop = Arc::new(AtomicBool::new(false));
+    // not cancellable once it runs
+    let a = spin(st, "ds", false, stop.clone());
+    let b = spin(st, "ds", false, stop.clone());
+    let c = spin(st, "ds", false, stop.clone());
+    assert_eq!(task(st, &a).state, task_state::RUNNING);
+    let t = task(st, &b);
+    assert_eq!(t.state, task_state::QUEUED);
+    assert!(t.cancellable, "a queued task may always be cancelled");
+    assert_eq!(st.task_queue.counts(), (1, 2));
+    // a queued task that is cancelled never runs
+    let r = send(
+        &s.app,
+        Request::delete(format!("/$/tasks/{b}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(r.json()["state"], "cancelled");
+    assert_eq!(st.task_queue.counts(), (1, 1));
+    // the next one starts when the running one ends
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(wait_done(st, &a).await.state, task_state::DONE);
+    let t = wait_done(st, &c).await;
+    assert_eq!(t.state, task_state::DONE);
+    assert_eq!(task(st, &b).state, task_state::CANCELLED);
+    assert_eq!(st.task_queue.counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn the_task_list_never_drops_queued_or_running_tasks() {
+    let s = limited(&[], |_| {});
+    let st = &s.state;
+    let stop = Arc::new(AtomicBool::new(false));
+    let running = spin(st, "ds", true, stop.clone());
+    let mut last = String::new();
+    for _ in 0..250 {
+        last = st.next_task_id();
+        st.start_task_as(last.clone(), "test", "ds", None, |_| Ok("done".into()));
+    }
+    wait_done(st, &last).await;
+    let t0 = Instant::now();
+    while st.tasks.lock().iter().filter(|t| t.active()).count() > 1 {
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // one more start trims the finished ones past the limit, never the running one
+    let one = st.next_task_id();
+    st.start_task_as(one.clone(), "test", "ds", None, |_| Ok("done".into()));
+    wait_done(st, &one).await;
+    let tasks = st.tasks.lock().clone();
+    let finished = tasks.iter().filter(|t| !t.active()).count();
+    // (the last one finished after the trim)
+    let kept = crate::state::FINISHED_TASKS_KEPT;
+    assert!((kept..=kept + 1).contains(&finished), "{finished}");
+    assert!(tasks.iter().any(|t| t.id == running && t.active()));
+    // still listed, so still cancellable
+    let r = send(
+        &s.app,
+        Request::delete(format!("/$/tasks/{running}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(wait_done(st, &running).await.state, task_state::CANCELLED);
+}
+
+#[tokio::test]
+async fn nquads_backups_are_bounded() {
+    let s = limited(&[], |st| st.task_queue.set_max(1));
+    let st = &s.state;
+    let backup = |q: &str| {
+        Request::post(format!("/$/backup/ds{q}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    for q in [
+        "?level=999",
+        "?level=x",
+        "?compression=gzip&level=10",
+        "?compression=lz4&level=1",
+    ] {
+        let r = send(&s.app, backup(q)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}: {}", r.text());
+    }
+    // one backup of a dataset at a time: the first waits for the busy slot
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = spin(st, "", false, stop.clone());
+    let r = send(&s.app, backup("?level=9")).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let first = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(r.json()["state"], "queued");
+    let r = send(&s.app, backup("")).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    stop.store(true, Ordering::Relaxed);
+    wait_done(st, &busy).await;
+    let t = wait_done(st, &first).await;
+    assert_eq!(t.state, task_state::DONE, "{:?}", t.message);
+    let files: Vec<_> = std::fs::read_dir(st.data_dir.join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].starts_with("ds_") && files[0].ends_with(".nq.gz"));
+
+    // no backup when the disk keeps less than the reserve free
+    let s = limited(&[], |st| {
+        st.limits.min_free_disk_bytes = Some(u64::MAX / 2);
+    });
+    let r = send(&s.app, backup("")).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert!(s.state.tasks.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_second_task_of_a_kind_is_refused_while_one_waits() {
+    let s = limited(&[], |st| st.task_queue.set_max(1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = spin(&s.state, "", false, stop.clone());
+    let compact = || Request::post("/$/compact/ds").body(Body::empty()).unwrap();
+    let r = send(&s.app, compact()).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(r.json()["state"], "queued");
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let r = send(&s.app, compact()).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    stop.store(true, Ordering::Relaxed);
+    wait_done(&s.state, &busy).await;
+    wait_state(&s.state, &id, task_state::DONE).await;
 }

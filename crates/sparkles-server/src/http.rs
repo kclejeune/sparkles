@@ -1011,6 +1011,7 @@ async fn text_enable(
             )
         })?
     };
+    task_start_check(&st, Some("text-rebuild"), &name)?;
     let task = st.start_task("text-rebuild", &name, move |h| {
         h.progress(0.1, "building the full-text index");
         let s = ds.store.enable_text(cfg)?;
@@ -1044,17 +1045,7 @@ async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
             "full-text search is not enabled",
         ));
     }
-    let running = st
-        .tasks
-        .lock()
-        .iter()
-        .any(|t| t.kind == "text-rebuild" && t.dataset == name && t.state == "running");
-    if running {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "text index rebuild already running",
-        ));
-    }
+    task_start_check(&st, Some("text-rebuild"), &name)?;
     let task = st.start_task("text-rebuild", &name, move |h| {
         h.progress(0.1, "rebuilding the full-text index");
         let s = ds.store.rebuild_text()?;
@@ -2268,6 +2259,7 @@ async fn clone_dataset(
             )
         })?,
     };
+    task_start_check(&st, None, &source)?;
     let id = st.next_task_id();
     let reservation = st
         .reserve(&name, &id)
@@ -2520,6 +2512,7 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &name)?;
+    task_start_check(&st, Some("compact"), &name)?;
     let task = st.start_task("compact", &name, move |h| {
         h.progress(0.1, "rebuilding index");
         ds.store.compact()?;
@@ -2531,8 +2524,95 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
+/// Refuse to start a task: `503` when [`MAX_QUEUED_TASKS`](crate::state::MAX_QUEUED_TASKS)
+/// tasks already wait for a slot, `409` when a task of `kind` is queued or running for
+/// `dataset`.
+fn task_start_check(st: &AppState, kind: Option<&str>, dataset: &str) -> ApiResult<()> {
+    if let Some(kind) = kind
+        && let Some(id) = st.active_task(kind, dataset)
+    {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("a {kind} task of /{dataset} is already queued or running (task {id})"),
+        ));
+    }
+    st.task_room()
+        .map_err(|m| err(StatusCode::SERVICE_UNAVAILABLE, m))
+}
+
+/// The compression level a `/$/backup` may ask for: gzip 0-9, zstd 1-19 (the levels
+/// above need far more memory per thread), brotli 0-11; LZ4 and uncompressed have none.
+fn backup_level(codec: sparkles::codec::Codec, level: Option<&str>) -> ApiResult<Option<i32>> {
+    use sparkles::codec::Codec;
+    let Some(l) = level else {
+        return Ok(None);
+    };
+    let range = match codec {
+        Codec::Gzip => 0..=9,
+        Codec::Zstd => 1..=19,
+        Codec::Brotli => 0..=11,
+        Codec::Lz4 | Codec::None => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("compression {codec} takes no level"),
+            ));
+        }
+    };
+    match l.trim().parse::<i32>() {
+        Ok(n) if range.contains(&n) => Ok(Some(n)),
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "level must be an integer from {} to {} for {codec}",
+                range.start(),
+                range.end()
+            ),
+        )),
+    }
+}
+
+/// A backup file being written: stops (an I/O error) once the file system would keep
+/// less than `reserve` free (checked every [`DISK_CHECK_EVERY`] bytes) or the task is
+/// cancelled.
+struct GuardedFile<W> {
+    inner: W,
+    dir: std::path::PathBuf,
+    reserve: Option<u64>,
+    unchecked: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<W: std::io::Write> std::io::Write for GuardedFile<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.unchecked += buf.len() as u64;
+        if self.unchecked >= DISK_CHECK_EVERY {
+            self.unchecked = 0;
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            if let Some(reserve) = self.reserve {
+                let free = free_disk_bytes(&self.dir)?;
+                if free < reserve.saturating_add(DISK_CHECK_EVERY) {
+                    return Err(std::io::Error::other(format!(
+                        "not enough free disk space ({} free, {} kept free by --min-free-disk-mb)",
+                        sparkles::error::human_bytes(free),
+                        sparkles::error::human_bytes(reserve)
+                    )));
+                }
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// `POST /$/backup/{ds}[?compression=gzip|zstd|brotli|lz4|none&level=N]`: an N-Quads
-/// backup in `backups/`, gzip by default (as Fuseki).
+/// backup in `backups/`, gzip by default (as Fuseki). One per dataset at a time; `507`
+/// when the data directory's file system keeps less than `--min-free-disk-mb` free, and
+/// the task fails once writing would go below it.
 async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     use sparkles::codec::{Codec, Level};
     let ds = dataset(&st, &name)?;
@@ -2541,26 +2621,62 @@ async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult 
         Some(c) => Codec::parse(c)?,
         None => Codec::Gzip,
     };
-    let level = match params.get("level") {
-        Some(l) => Some(Level(l.parse().map_err(|_| {
-            err(StatusCode::BAD_REQUEST, "level must be an integer")
-        })?)),
-        None => None,
-    };
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
+    let level = backup_level(codec, params.get("level"))?.map(Level);
+    task_start_check(&st, Some("backup"), &name)?;
     let dir = st.data_dir.join("backups");
-    let task = st.start_task("backup", &name, move |h| {
+    let reserve = st.limits.min_free_disk_bytes;
+    if let Some(reserve) = reserve {
+        let free = free_disk_bytes(&st.data_dir)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if free < reserve {
+            return Err(err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                format!(
+                    "not enough free disk space for a backup ({} free, {} kept free by --min-free-disk-mb)",
+                    sparkles::error::human_bytes(free),
+                    sparkles::error::human_bytes(reserve)
+                ),
+            ));
+        }
+    }
+    // a quarter of the cores (zstd only), at most 4: backups never take the machine
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 4)
+        .clamp(1, 4);
+    let id = st.next_task_id();
+    let task = st.start_task_opts(id, "backup", &name, None, true, move |h| {
         h.progress(0.1, "writing N-Quads");
         let t = std::time::Instant::now();
-        let p = ds
-            .store
-            .backup_with(&dir, &ds.name, codec, level, threads)?;
-        let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+        std::fs::create_dir_all(&dir)?;
+        let ts = sparkles::builder::now_rfc3339().replace(':', "-");
+        let path = dir.join(format!("{}_{ts}.nq{}", ds.name, codec.extension()));
+        // written under a temporary name, so a failed backup leaves no partial file
+        let tmp = tempfile::Builder::new()
+            .prefix(".backup-")
+            .tempfile_in(&dir)?;
+        let out = GuardedFile {
+            inner: std::io::BufWriter::new(tmp.as_file()),
+            dir: dir.clone(),
+            reserve,
+            unchecked: DISK_CHECK_EVERY,
+            cancel: h.cancel_flag(),
+        };
+        let written = (|| -> sparkles::Result<()> {
+            let mut w = codec.writer(out, level, threads)?;
+            ds.store.dump_nquads(&mut w)?;
+            w.finish()?;
+            Ok(())
+        })();
+        if h.is_cancelled() {
+            return Err(sparkles::Error::Cancelled.into());
+        }
+        written?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path)?;
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
         Ok(format!(
             "backup written to {} ({}, {codec}, {:.1} s)",
-            p.display(),
+            path.display(),
             sparkles::error::human_bytes(size),
             t.elapsed().as_secs_f64()
         ))
@@ -2618,6 +2734,7 @@ async fn reason(
             )
         })?
     };
+    task_start_check(&st, None, &name)?;
     let task = crate::reasoning::start_reason(&st, ds, profile, false);
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }

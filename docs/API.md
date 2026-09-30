@@ -345,15 +345,15 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations; see [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
-| POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
-| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it). Returns `Task`; its message gives the size and time. |
+| POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
+| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (clones, until the clone is in place): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (a queued task, a clone until it is in place, an N-Quads backup): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
@@ -403,6 +403,13 @@ type Task = {
   detail?: object;          // a typed result, for task kinds that have one
 };
 ```
+
+**Task slots.** At most `sparkles serve --max-tasks` (default 4; `0`: no limit) background
+tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) run at once; the
+others wait `queued`, in start order, and may be cancelled while they wait. Backup
+repository tasks (`backup-*` kinds) wait for their own `--backup-max-tasks` slots instead.
+Starting a task while 1000 already wait answers `503`. The task list keeps every queued
+and running task and the 200 most recent finished ones.
 
 ## Schema discovery
 
@@ -1097,7 +1104,7 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
 | `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
 | `--max-upload-mb` | `65536` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
-| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory (0: no check) |
+| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory, and an N-Quads backup in the data directory (0: no check) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an

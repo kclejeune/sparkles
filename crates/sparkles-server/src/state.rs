@@ -223,6 +223,8 @@ pub struct AppState {
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
     manage: Mutex<()>,
+    /// background task slots (`serve --max-tasks`)
+    pub task_queue: TaskQueue,
 }
 
 /// Reasoning status is kept inside the database directory (`reasoning.json`) so it
@@ -421,6 +423,7 @@ impl AppState {
             #[cfg(feature = "backup")]
             backup: None,
             manage: Mutex::new(()),
+            task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
         };
         // clones that were being built when the server stopped are never registered
         for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
@@ -475,6 +478,7 @@ impl AppState {
             #[cfg(feature = "backup")]
             backup: None,
             manage: Mutex::new(()),
+            task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             rate_limit: None,
             auth: None,
             allow_unvalidated_writes: false,
@@ -758,7 +762,7 @@ impl AppState {
         cancellable: bool,
         work: impl FnOnce(&TaskHandle) -> Result<String> + Send + 'static,
     ) -> Task {
-        let task = Task {
+        let mut task = Task {
             id: id.clone(),
             kind: kind.to_string(),
             dataset: dataset.to_string(),
@@ -773,45 +777,108 @@ impl AppState {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let cancel = task.cancel.clone();
-        {
-            let mut tasks = self.tasks.lock();
-            tasks.push(task.clone());
-            let n = tasks.len();
-            if n > 200 {
-                tasks.drain(..n - 200);
-            }
-        }
+        // backup tasks wait for their own slots (`--backup-max-tasks`)
+        let counted = !kind.starts_with("backup-");
         let state = self.clone();
         let span = crate::otel::task_span(kind, &id, dataset);
-        std::thread::spawn(move || {
-            let handle = TaskHandle {
-                state: state.clone(),
-                id: id.clone(),
-                cancel,
-            };
-            let r = span.in_scope(|| work(&handle));
-            let mut tasks = state.tasks.lock();
-            if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
-                t.finished_at = Some(now());
-                t.progress = Some(1.0);
-                t.cancellable = false;
-                match r {
-                    Ok(msg) => {
-                        t.state = task_state::DONE.into();
-                        t.message = Some(msg);
+        let run = {
+            let id = id.clone();
+            move |waited: bool| {
+                std::thread::spawn(move || {
+                    let handle = TaskHandle {
+                        state: state.clone(),
+                        id: id.clone(),
+                        cancel,
+                    };
+                    // a task that waited runs unless it was cancelled meanwhile (checked
+                    // and switched to running under the list's lock, as cancels are)
+                    let mut start = !waited;
+                    if waited {
+                        handle.update(|t| {
+                            if !t.cancel.load(Ordering::Relaxed) {
+                                t.state = task_state::RUNNING.into();
+                                t.cancellable = cancellable;
+                                t.message = None;
+                                start = true;
+                            }
+                        });
                     }
-                    Err(e) if rooted_in_cancel(&e) => {
-                        t.state = task_state::CANCELLED.into();
-                        t.message = Some("cancelled".into());
+                    let r = if start {
+                        span.in_scope(|| work(&handle))
+                    } else {
+                        Err(sparkles::Error::Cancelled.into())
+                    };
+                    finish(&state.tasks, &id, r);
+                    if counted {
+                        state.task_queue.done();
                     }
-                    Err(e) => {
-                        t.state = task_state::FAILED.into();
-                        t.message = Some(format!("{e:#}"));
-                    }
-                }
+                });
             }
-        });
+        };
+        if !counted {
+            self.push_task(task.clone());
+            run(false);
+            return task;
+        }
+        // decided and listed under the queue's lock, so the task is listed before a
+        // finishing task can start it
+        let mut q = self.task_queue.inner.lock();
+        let now_running = q.running < self.task_queue.max();
+        if now_running {
+            q.running += 1;
+        } else {
+            // a task that has not started may always be cancelled
+            task.state = task_state::QUEUED.into();
+            task.cancellable = true;
+            task.message = Some("waiting for a free task slot (--max-tasks)".into());
+        }
+        self.push_task(task.clone());
+        if now_running {
+            drop(q);
+            run(false);
+        } else {
+            q.queued.push_back((id, Box::new(move || run(true))));
+        }
         task
+    }
+
+    /// List a new task, dropping the oldest finished ones past [`FINISHED_TASKS_KEPT`]
+    /// (queued and running tasks always stay listed).
+    fn push_task(&self, task: Task) {
+        let mut tasks = self.tasks.lock();
+        tasks.push(task);
+        let finished = tasks.iter().filter(|t| !t.active()).count();
+        let mut excess = finished.saturating_sub(FINISHED_TASKS_KEPT);
+        if excess > 0 {
+            tasks.retain(|t| {
+                if excess > 0 && !t.active() {
+                    excess -= 1;
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
+    /// Whether another task may be queued: `Err` with the message for a `503` once
+    /// [`MAX_QUEUED_TASKS`] wait.
+    pub fn task_room(&self) -> std::result::Result<(), String> {
+        let n = self.task_queue.inner.lock().queued.len();
+        if n >= MAX_QUEUED_TASKS {
+            return Err(format!(
+                "{n} tasks are waiting for a task slot; try again later"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The queued or running task of `kind` on `dataset`, if there is one.
+    pub fn active_task(&self, kind: &str, dataset: &str) -> Option<String> {
+        self.tasks
+            .lock()
+            .iter()
+            .find(|t| t.kind == kind && t.dataset == dataset && t.active())
+            .map(|t| t.id.clone())
     }
 
     /// Ask task `id` to stop: `Ok` with the task when it accepted (the work stops at
@@ -825,7 +892,119 @@ impl AppState {
         }
         t.cancel.store(true, Ordering::Relaxed);
         t.message = Some("cancelling".into());
-        Some(Ok(t.clone()))
+        let t = t.clone();
+        drop(tasks);
+        // a task still waiting for its turn never starts
+        if t.state == task_state::QUEUED && self.task_queue.remove(id) {
+            finish(&self.tasks, id, Err(sparkles::Error::Cancelled.into()));
+            let tasks = self.tasks.lock();
+            return Some(Ok(tasks.iter().find(|t| t.id == id).cloned().unwrap_or(t)));
+        }
+        Some(Ok(t))
+    }
+}
+
+/// Record how task `id` ended.
+fn finish(tasks: &Mutex<Vec<Task>>, id: &str, r: Result<String>) {
+    let mut tasks = tasks.lock();
+    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+        t.finished_at = Some(now());
+        t.progress = Some(1.0);
+        t.cancellable = false;
+        match r {
+            Ok(msg) => {
+                t.state = task_state::DONE.into();
+                t.message = Some(msg);
+            }
+            Err(e) if rooted_in_cancel(&e) => {
+                t.state = task_state::CANCELLED.into();
+                t.message = Some("cancelled".into());
+            }
+            Err(e) => {
+                t.state = task_state::FAILED.into();
+                t.message = Some(format!("{e:#}"));
+            }
+        }
+    }
+}
+
+/// Finished tasks kept in the task list (`/$/tasks`); queued and running tasks are
+/// never dropped from it.
+pub const FINISHED_TASKS_KEPT: usize = 200;
+
+/// Tasks that may wait for a slot at once; further starts are refused (`503`).
+pub const MAX_QUEUED_TASKS: usize = 1000;
+
+/// Background tasks running at once by default (`serve --max-tasks`).
+pub const DEFAULT_MAX_TASKS: usize = 4;
+
+/// The background task slots: at most `max` tasks run at once (each on its own
+/// thread); the others wait, `queued`, in start order. Backup tasks are not counted
+/// here: they wait for the slots of `--backup-max-tasks`.
+pub struct TaskQueue {
+    max: std::sync::atomic::AtomicUsize,
+    inner: Mutex<QueueState>,
+}
+
+/// A queued task: its id and what starts it.
+type Queued = (String, Box<dyn FnOnce() + Send>);
+
+#[derive(Default)]
+struct QueueState {
+    running: usize,
+    queued: std::collections::VecDeque<Queued>,
+}
+
+impl TaskQueue {
+    pub fn new(max: usize) -> TaskQueue {
+        TaskQueue {
+            max: std::sync::atomic::AtomicUsize::new(max),
+            inner: Mutex::new(QueueState::default()),
+        }
+    }
+
+    /// Tasks that may run at once (0: no limit).
+    pub fn set_max(&self, max: usize) {
+        self.max.store(max, Ordering::Relaxed);
+    }
+
+    fn max(&self) -> usize {
+        match self.max.load(Ordering::Relaxed) {
+            0 => usize::MAX,
+            n => n,
+        }
+    }
+
+    /// Tasks running now and waiting.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn counts(&self) -> (usize, usize) {
+        let q = self.inner.lock();
+        (q.running, q.queued.len())
+    }
+
+    /// A counted task ended: start the next one in its slot.
+    fn done(&self) {
+        let mut q = self.inner.lock();
+        match q.queued.pop_front() {
+            Some((_, start)) => {
+                drop(q);
+                start();
+            }
+            None => q.running -= 1,
+        }
+    }
+
+    /// Take a queued task out; whether it was queued.
+    fn remove(&self, id: &str) -> bool {
+        let mut q = self.inner.lock();
+        let Some(i) = q.queued.iter().position(|(t, _)| t == id) else {
+            return false;
+        };
+        let entry = q.queued.remove(i);
+        drop(q);
+        // its work (and whatever it holds, e.g. a name reservation) is dropped unrun
+        drop(entry);
+        true
     }
 }
 
