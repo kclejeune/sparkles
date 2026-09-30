@@ -91,6 +91,25 @@ pub struct WriteOptions {
     pub report_limit: Option<usize>,
 }
 
+impl WriteOptions {
+    /// [`Error::Cancelled`](crate::Error::Cancelled) once `cancel` is set,
+    /// [`Error::Timeout`](crate::Error::Timeout) past the deadline: loads, replaces and
+    /// the wait for the writer lock stop there, before anything is published.
+    pub fn check(&self) -> Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(crate::Error::Cancelled);
+        }
+        if self.deadline.is_some_and(|d| Instant::now() > d) {
+            return Err(crate::Error::Timeout);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GuardStatus {

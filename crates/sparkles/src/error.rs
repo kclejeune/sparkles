@@ -53,6 +53,10 @@ pub enum Error {
     /// `LOAD <file:…>`); raised before any connection or file is opened.
     #[error("{0}")]
     NotPermitted(String),
+    /// A commit refused before anything was written: it would leave less free disk space
+    /// than the store keeps, or grow an in-memory store past its size limit.
+    #[error("{0}")]
+    StorageFull(String),
 }
 
 /// Which budget a request exceeded.

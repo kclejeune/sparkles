@@ -345,6 +345,8 @@ impl VocabWriter {
 pub struct AppendVocab {
     keys: Vec<Arc<[u8]>>,
     map: FxHashMap<Arc<[u8]>, u64>,
+    /// total key length
+    key_bytes: usize,
 }
 
 impl AppendVocab {
@@ -366,6 +368,7 @@ impl AppendVocab {
         }
         let k: Arc<[u8]> = key.into();
         let i = self.keys.len() as u64;
+        self.key_bytes += k.len();
         self.keys.push(k.clone());
         self.map.insert(k, i);
         (i, true)
@@ -374,7 +377,7 @@ impl AppendVocab {
         self.keys.iter().enumerate().map(|(i, k)| (i as u64, &**k))
     }
     pub fn bytes(&self) -> usize {
-        self.keys.iter().map(|k| k.len() + 48).sum()
+        self.key_bytes + self.keys.len() * 48
     }
 }
 

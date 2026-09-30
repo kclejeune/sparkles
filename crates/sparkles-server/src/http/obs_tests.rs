@@ -420,7 +420,7 @@ async fn server_info_lists_the_limits() {
             "maxQueryBodyBytes": 16u64 << 20,
             "maxUpdateBodyBytes": 256u64 << 20,
             "maxAdminBodyBytes": 16u64 << 20,
-            "maxUploadBytes": 64u64 << 30,
+            "maxUploadBytes": 4u64 << 30,
         })
     );
 }

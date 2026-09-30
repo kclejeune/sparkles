@@ -14,7 +14,7 @@ use sparkles::sparql::value;
 use sparkles::store::Snapshot;
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 /// Validation options.
@@ -32,9 +32,28 @@ pub struct ValidateOptions {
     pub exclude_graphs: Vec<String>,
     /// Validate focus nodes in parallel (rayon).
     pub parallel: bool,
+    /// The thread pool parallel validation runs in (the global rayon pool if `None`),
+    /// to bound the threads one caller's validations may use.
+    pub pool: Option<Arc<rayon::ThreadPool>>,
     pub timeout: Option<Duration>,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Stop with [`TooManyResults`] once the report would hold more results than this.
+    pub max_results: Option<usize>,
 }
+
+/// A report that would hold more than [`ValidateOptions::max_results`] results.
+#[derive(Debug)]
+pub struct TooManyResults {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for TooManyResults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the validation report exceeds {} results", self.limit)
+    }
+}
+
+impl std::error::Error for TooManyResults {}
 
 impl Default for ValidateOptions {
     fn default() -> Self {
@@ -43,8 +62,10 @@ impl Default for ValidateOptions {
             extra_graphs: Vec::new(),
             exclude_graphs: Vec::new(),
             parallel: true,
+            pool: None,
             timeout: None,
             cancel: None,
+            max_results: None,
         }
     }
 }
@@ -136,8 +157,12 @@ pub(crate) struct Engine<'a> {
     pub ids: Vec<Id>,
     paths: Vec<Option<CPath>>,
     parallel: bool,
+    pool: Option<Arc<rayon::ThreadPool>>,
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    max_results: Option<usize>,
+    /// results collected so far (checked against `max_results`)
+    collected: AtomicUsize,
 }
 
 /// A one-element result message.
@@ -171,8 +196,11 @@ impl<'a> Engine<'a> {
             ids,
             paths,
             parallel: opts.parallel,
+            pool: opts.pool.clone(),
             deadline: opts.timeout.map(|t| Instant::now() + t),
             cancel: opts.cancel.clone(),
+            max_results: opts.max_results,
+            collected: AtomicUsize::new(0),
         })
     }
 
@@ -186,6 +214,17 @@ impl<'a> Engine<'a> {
             && Instant::now() > d
         {
             bail!("validation timed out");
+        }
+        Ok(())
+    }
+
+    /// Count `n` more results against `max_results`.
+    fn count_results(&self, n: usize) -> Result<()> {
+        let Some(limit) = self.max_results else {
+            return Ok(());
+        };
+        if n > 0 && self.collected.fetch_add(n, AtomicOrdering::Relaxed) + n > limit {
+            return Err(TooManyResults { limit }.into());
         }
         Ok(())
     }
@@ -226,13 +265,20 @@ impl<'a> Engine<'a> {
                     if i % 256 == 0 {
                         self.check_limits()?;
                     }
+                    let before = out.results.len();
                     self.validate_focus(si, f, &mut out, &mut cx)?;
+                    self.count_results(out.results.len() - before)?;
                 }
                 Ok(out.results)
             };
             if self.parallel && focus.len() >= 512 {
-                let parts: Vec<Result<Vec<ValidationResult>>> =
-                    focus.par_chunks(256).map(chunk).collect();
+                let run = || -> Vec<Result<Vec<ValidationResult>>> {
+                    focus.par_chunks(256).map(chunk).collect()
+                };
+                let parts = match &self.pool {
+                    Some(pool) => pool.install(run),
+                    None => run(),
+                };
                 for p in parts {
                     results.extend(p?);
                 }

@@ -286,7 +286,7 @@ fn reason_running(st: &AppState, name: &str) -> bool {
     st.tasks
         .lock()
         .iter()
-        .any(|t| t.kind == "reason" && t.dataset == name && t.state == "running")
+        .any(|t| t.kind == "reason" && t.dataset == name && t.active())
 }
 
 // -------------------------------------------------------------- auto mode ------
