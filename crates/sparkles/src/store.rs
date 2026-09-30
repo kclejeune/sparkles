@@ -135,6 +135,9 @@ pub struct Snapshot {
     /// delta-vocabulary size visible to this snapshot
     pub dvocab_len: u64,
     pub union_default_graph: bool,
+    /// per-predicate statistics of the delta (computed lazily, once per snapshot)
+    pub delta_stats:
+        Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
 }
 
 /// A contiguous run of rows produced by a scan.
@@ -149,6 +152,54 @@ impl Snapshot {
     #[inline]
     pub fn perm(&self, p: Perm) -> &PermIndex {
         self.generation.perm(p)
+    }
+
+    /// Planner statistics for a predicate: base-index statistics combined with the
+    /// inserted quads of the delta (deleted quads are ignored — estimates only).
+    pub fn predicate_stat(&self, p: u64) -> Option<crate::builder::PredicateStat> {
+        let base = self.generation.stats.predicate(p).cloned();
+        if self.delta.ins[0].is_empty() {
+            return base;
+        }
+        let delta = self.delta_stats.get_or_init(|| {
+            let mut m: rustc_hash::FxHashMap<u64, crate::builder::PredicateStat> =
+                Default::default();
+            // PSO: count and distinct subjects; POS: distinct objects
+            let mut prev: Option<Key> = None;
+            for k in self.delta.ins[Perm::Pso.index()].iter() {
+                let e = m
+                    .entry(k[0])
+                    .or_insert_with(|| crate::builder::PredicateStat {
+                        p: k[0],
+                        ..Default::default()
+                    });
+                e.count += 1;
+                if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1]) {
+                    e.distinct_subjects += 1;
+                }
+                prev = Some(*k);
+            }
+            prev = None;
+            for k in self.delta.ins[Perm::Pos.index()].iter() {
+                if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1])
+                    && let Some(e) = m.get_mut(&k[0])
+                {
+                    e.distinct_objects += 1;
+                }
+                prev = Some(*k);
+            }
+            m
+        });
+        match (base, delta.get(&p)) {
+            (b, None) => b,
+            (None, Some(d)) => Some(d.clone()),
+            (Some(mut b), Some(d)) => {
+                b.count += d.count;
+                b.distinct_subjects += d.distinct_subjects;
+                b.distinct_objects += d.distinct_objects;
+                Some(b)
+            }
+        }
     }
 
     /// Approximate number of quads (exact unless the delta is inconsistent).
@@ -506,6 +557,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len: 0,
                 union_default_graph: opts.union_default_graph,
+                delta_stats: Default::default(),
             }),
             writer: Mutex::new(WriterState {
                 wal: None,
@@ -560,6 +612,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len: u64::MAX,
                 union_default_graph: false,
+                delta_stats: Default::default(),
             };
             for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate() {
                 let q: [Id; 4] = std::array::from_fn(|j| {
@@ -605,6 +658,7 @@ impl Store {
                 results: results.clone(),
                 dvocab_len,
                 union_default_graph: opts.union_default_graph,
+                delta_stats: Default::default(),
             }),
             writer: Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
@@ -817,6 +871,7 @@ impl Store {
             results: self.results.clone(),
             dvocab_len,
             union_default_graph: self.opts.union_default_graph,
+            delta_stats: Default::default(),
         }));
         // Old generation files are unlinked; open readers keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -925,6 +980,7 @@ impl WriteTxn<'_> {
             results: self.base.results.clone(),
             dvocab_len: self.base.generation.dvocab.len(),
             union_default_graph: self.base.union_default_graph,
+            delta_stats: Default::default(),
         }
     }
 
@@ -1138,6 +1194,7 @@ impl WriteTxn<'_> {
             results: self.base.results.clone(),
             dvocab_len: gen_.dvocab.len(),
             union_default_graph: self.base.union_default_graph,
+            delta_stats: Default::default(),
         }));
         Ok(version)
     }
@@ -1268,6 +1325,42 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         drop(store);
         let store = Store::open(&dir.path().join("db"), opts).unwrap();
         assert_eq!(store.snapshot().len(), 104);
+    }
+
+    #[test]
+    fn predicate_stats_include_delta() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[src()]).unwrap();
+        let mut t = store.write();
+        let p = t
+            .intern(&Term::NamedNode(named("http://ex.org/new")))
+            .unwrap();
+        let old_p = t
+            .intern(&Term::NamedNode(named("http://ex.org/p")))
+            .unwrap();
+        for i in 0..100 {
+            let s = Id::bnode(10_000 + i % 10);
+            t.insert([s, p, Id::from_i64(i as i64).unwrap(), Id::DEFAULT_GRAPH])
+                .unwrap();
+        }
+        t.insert([
+            Id::bnode(20_000),
+            old_p,
+            Id::from_i64(7).unwrap(),
+            Id::DEFAULT_GRAPH,
+        ])
+        .unwrap();
+        t.commit().unwrap();
+        let s = store.snapshot();
+        let ps = s.predicate_stat(p.0).unwrap();
+        assert_eq!(
+            (ps.count, ps.distinct_subjects, ps.distinct_objects),
+            (100, 10, 100)
+        );
+        // base statistics combined with the delta
+        let ps = s.predicate_stat(old_p.0).unwrap();
+        assert_eq!(ps.count, 5);
+        assert_eq!(ps.distinct_subjects, 3);
     }
 
     #[test]

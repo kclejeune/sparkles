@@ -1088,13 +1088,13 @@ impl<'a> Planner<'a> {
             // distinct estimates
             let mut dist = FxHashMap::default();
             let pstat = match pos[P] {
-                Some(PT::C(p)) => stats.predicate(p.0),
+                Some(PT::C(p)) => snap.predicate_stat(p.0),
                 _ => None,
             };
             let quads = snap.len().max(1) as f64;
             for &(kc, v) in &cols {
                 let comp = order[kc];
-                let d = match (comp, pstat) {
+                let d = match (comp, pstat.as_ref()) {
                     (S, Some(ps)) if pstat.is_some() => {
                         ps.distinct_subjects as f64 * est / ps.count.max(1) as f64
                     }
@@ -1104,7 +1104,13 @@ impl<'a> Planner<'a> {
                     (P, _) => (stats.distinct_predicates as f64).min(est),
                     _ => est,
                 };
-                let d = if kc == first_free { d } else { est };
+                // per-predicate statistics give distinct counts for both the subject and the
+                // object column; without them only the first free column is estimated
+                let d = if pstat.is_some() || kc == first_free {
+                    d
+                } else {
+                    est
+                };
                 dist.insert(v, d.clamp(1.0, est.max(1.0)));
             }
             let desc = format!(
