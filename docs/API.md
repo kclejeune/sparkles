@@ -7,6 +7,10 @@ The server speaks the **Fuseki** protocol surface (so existing Jena tooling —
 All admin endpoints live under `/$/`. Dataset names match `[A-Za-z0-9_.-]+` and are
 addressed as `/{ds}`. JSON responses use `application/json`.
 
+Without `sparkles serve --auth-config` the server is open, as described below. With it,
+every route needs credentials or a grant to `anonymous`; see
+[Authentication and access control](#authentication-and-access-control).
+
 ## Server
 
 | Method | Path          | Description |
@@ -14,7 +18,8 @@ addressed as `/{ds}`. JSON responses use `application/json`.
 | GET    | `/$/ping`     | Plain-text timestamp. Liveness check: `200` whenever the process serves HTTP. |
 | GET    | `/$/ready`    | Readiness: `200` when ready, else `503`; the body is always `ReadyInfo`. `Cache-Control: no-store`. |
 | GET    | `/$/ready/{ds}` | The same for one dataset (`datasets` has one entry); `404` if the dataset is unknown. |
-| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits }` |
+| GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }` |
+| GET    | `/$/whoami`   | The caller and its permissions (see [whoami](#whoami)). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`), see [Metrics](#metrics). `?format=json` returns a JSON snapshot of the same counters (`MetricsSnapshot`) for the UI. `404` when started with `--no-metrics`. |
 
 ```ts
@@ -46,7 +51,10 @@ generates one (`{boot:08x}-{seq:012x}`, unique per process and increasing). The 
 `sparkles::access` (`--no-access-log` turns it off; `/ui/*`, `/$/ping`, `/$/ready` and
 `/$/metrics` are logged at DEBUG). Fields: `dataset` (or `$none`), `operation` (`query`,
 `update`, `gsp`, `upload`, `shacl`, `explain`, `admin`, `other`), `status`, `outcome`
-(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`), and where known `rows`,
+(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `denied`), with auth
+the `principal` (`user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`, `anonymous`; never a
+credential), `auth` (`none`, `basic`, `bearer`, `session`, `proxy`) and, for a failed
+login, `auth_error`, and where known `rows`,
 `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`, `response_bytes` and
 `mem_peak_bytes`. A request whose client disconnects is logged with `status=499` and
 `outcome=cancelled` (never sent). The span holds the matched route (`/{ds}/sparql`), never
@@ -78,7 +86,7 @@ JSON object per line.
 Label values are bounded: `dataset` is an existing dataset name (at most
 `--metrics-max-datasets`, default 100; the others share `$other`) or `$none` for requests
 that name no existing dataset. A (dataset, operation) pair appears after its first request,
-then with all six outcomes. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
+then with all seven outcomes (`denied`: refused by the auth layer). Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
 are not counted. Deleting a dataset removes its series. Each dataset has its own block and
 result cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
 
@@ -145,6 +153,7 @@ type DatasetInfo = {
   };
   forkedFrom?: { id: string; seq: number };   // clones: source dataset id and copied commit
   origin?: DatasetOrigin;                     // clones: origin.json (see Clone)
+  access?: "read" | "write" | "admin";        // with auth: the caller's level (absent without)
 };
 
 type DatasetStats = {
@@ -326,7 +335,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 | Method     | Path                  | Description |
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol (`query=` param, `application/sparql-query` body, or form). `default-graph-uri` / `named-graph-uri` supported. |
-| POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). |
+| POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
 | POST       | `/{ds}/shacl`         | SHACL validation (Fuseki `/{ds}/shacl`); see [SHACL validation](#shacl-validation). |
@@ -693,7 +702,8 @@ type PlanNode = {
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number }`
-with `400` for parse errors, `404` unknown dataset, `408` timeout, `409` conflict, `503` for a
+with `400` for parse errors, `401`/`403` for authentication and permissions, `404` unknown
+dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `503` for a
 cancelled query or when a write-ahead log write failed (writes are refused until restart;
 reads continue), `500` otherwise.
 
@@ -720,3 +730,295 @@ the request with `507 Insufficient Storage` and
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
 includes `memPeakBytes`, and `meta.memory.peakBytes` in `application/x-sparkles+json` reports
 the peak estimate of a query.
+
+## Authentication and access control
+
+`sparkles serve --auth-config FILE` turns authentication on. Without it nothing changes:
+no credentials, permissive CORS, and every request may do everything. With it the server
+**denies by default**: a caller may do only what a grant allows.
+
+### Principals and credentials
+
+Each request resolves to one principal. The first applicable source wins:
+
+1. **`Authorization`**: `Bearer spk_…` (an API token), or `Basic` with a configured user
+   and password, or with a token as the password (any user name; for Basic-only clients
+   such as Jena). Invalid credentials are **401**, never treated as anonymous.
+2. **The session cookie** of the web UI (`__Host-sparkles_session` over https,
+   `sparkles_session` on http://localhost). A bad, expired or revoked cookie is ignored and
+   cleared.
+3. **Trusted proxy headers** (`Remote-User`, `X-Forwarded-User`, …), only from a peer in
+   `proxy.trusted` (a CIDR, or `unix` for `--unix-socket`). From any other peer they are
+   ignored and counted (`sparkles_auth_untrusted_proxy_headers_total`).
+4. **Anonymous**, with the grants of `[anonymous]` (none by default).
+
+| Principal | Log name | From |
+|---|---|---|
+| user | `user:bob` | `[[users]]` (argon2id password) |
+| token | `token:tok_…`, `token:cfg-NAME` | minted tokens, and static `[[tokens]]` |
+| oidc | `oidc:alice@example.org` | a web UI login through the OIDC provider |
+| proxy | `proxy:dave` | trusted headers of a forward-auth proxy |
+| anonymous | `anonymous` | nothing else applied |
+
+### Permissions
+
+Per dataset, by name or `*` pattern (`"team-*"`): `read` < `write` < `admin`.
+
+| Level | Allows |
+|---|---|
+| `read` | queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}`, the dataset's tasks |
+| `write` | `read` plus SPARQL Update, Graph Store PUT/POST/DELETE, upload |
+| `admin` | `write` plus compact, backup, reason/unreason, text index configuration, result-cache clear, clone (source), delete |
+
+Server permissions: `metrics` (`/$/metrics`, the full `/$/ready` list), `federate`
+(`SERVICE` and `LOAD <http…>`), and `server-admin` (everything: `admin` on every dataset,
+create datasets, every token, `LOAD <file:…>`). Grants are a union of a principal's own
+grants and its roles'; there are no deny rules. `--read-only` still applies to everyone,
+after authorization.
+
+A **token** never exceeds its owner: at each use its permissions are its scope
+intersected with its owner's current grants (or its parent token's, for a token minted
+by a token). Removing a grant or a role mapping shrinks every token at its next request.
+
+### Status codes
+
+| Caller's level on `{ds}` | Caller | Dataset exists | Answer |
+|---|---|---|---|
+| none | anonymous | either | `401` with `WWW-Authenticate` |
+| none | signed in | either | `404 {"error":"no such dataset: /ds"}` (hidden, like a missing one) |
+| too low | anonymous | either | `401` |
+| too low | signed in | no | `404` |
+| too low | signed in | yes | `403 {"error":"write access to /ds required"}` |
+
+Invalid credentials get `401 {"error":"invalid credentials"}` (or `token expired`) with
+`WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"` and, for browser
+navigations and non-browser clients when users are configured, a `Basic` challenge.
+Missing server permissions give `401` (anonymous) or `403`
+(`{"error":"metrics permission required"}`). A clone needs `admin` on the source and on
+the new name (`403 no admin access to the target name /x`). `SERVICE` or `LOAD` without
+the permission is `403` before any connection or file is opened, even under `SILENT`.
+
+### Route permissions
+
+| Route | Method | Needs |
+|---|---|---|
+| `/ui/*`, `/$/ping`, `/$/ready` | GET | nothing (`/$/ready` lists only readable datasets without `metrics`) |
+| `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*`, `/$/auth/device`, `/$/auth/token` | | nothing (invalid credentials are still `401`) |
+| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout` | | any caller; listings show readable datasets only |
+| `/$/metrics` | GET | `metrics` |
+| `/$/datasets` | POST | `server-admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild` | | `admin` |
+| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/data` (GET, HEAD) | | `read` |
+| `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods) | | `write` |
+| `/{ds}` | any | by operation: `update=` or `application/sparql-update` → `write`; queries and GET → `read`; other writes → `write` |
+| `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |
+| `/$/auth/tokens?owner=…` | DELETE | `server-admin` |
+| `/$/auth/device/{code}`, `…/approve`, `…/deny`, `/$/auth/cli/authorize` | | a web UI session or proxy identity |
+| any other route | | `server-admin` (fail closed) |
+
+`/$/metrics` needs the `metrics` permission: counters by dataset name would otherwise
+reveal which datasets exist. Prometheus scrapes it with a static token
+(`Authorization: Bearer spk_…`, e.g. `bearer_token_file` in the scrape config).
+
+### CSRF and CORS
+
+With auth, unsafe requests (and any request needing `write`, `admin` or `server-admin`)
+are refused with `403 cross-origin request refused` when `Sec-Fetch-Site: cross-site` is
+sent, or when `Origin` is neither the server's (`server.public_url`, else the request's
+own) nor in `cors.origins`. Session and proxy principals must also send
+`X-Sparkles-CSRF: <whoami csrfToken>` on unsafe requests (`403 CSRF token missing or
+invalid`). CORS then allows only `cors.origins`, without credentials; tools such as
+YASGUI send `Authorization: Bearer` themselves.
+
+### whoami
+
+`GET /$/whoami` (`Cache-Control: no-store`; `401` only for invalid credentials):
+
+```ts
+type Whoami = {
+  authEnabled: boolean;
+  principal: { kind: "local" | "anonymous" | "user" | "token" | "oidc" | "proxy";
+               name?: string; displayName?: string; groups?: string[];
+               owner?: string /* tokens: e.g. "oidc:alice@example.org" */ };
+  method: "none" | "basic" | "bearer" | "session" | "proxy";
+  expires?: string;       // the credential's expiry (tokens, sessions)
+  csrfToken?: string;     // session and proxy principals
+  tokenId?: string;       // token principals
+  server: ("metrics" | "federate" | "server-admin")[];
+  datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
+  canMintTokens: boolean;
+  logout: boolean;
+  tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
+};
+```
+
+Without auth: `{"authEnabled": false, "principal": {"kind": "local"}, "server":
+["server-admin"], "datasets": {…all "admin"}}`.
+
+`GET /$/auth/config` (public) tells the UI and the CLI how to sign in:
+`{"enabled": true, "methods": ["oidc", "token", "password", "proxy"], "oidc": {"loginUrl",
+"displayName"}, "cli": {"authorizeUrl", "deviceAuthorizationEndpoint", "tokenEndpoint",
+"deviceVerificationUri"}}`, or `{"enabled": false}`. Without auth the other `/$/auth/*`
+routes answer `404`.
+
+### Web UI sign-in and sessions
+
+* `POST /$/auth/login` with `{"user", "password"}` or `{"token": "spk_…"}` → `204` and a
+  session cookie (`HttpOnly`, `SameSite=Lax`, `Secure` over https, `Max-Age` = `session.ttl`,
+  default 12 h; a token session ends with its token). Wrong credentials → `401`.
+* `GET /$/auth/oidc/login?return_to=/ui/…` → `302` to the provider (authorization code
+  with PKCE `S256`, `state` bound to the browser by a login cookie, `nonce`). The callback
+  `GET /$/auth/oidc/callback` checks the state, redeems the code, verifies the ID token
+  (JWKS signature with the configured algorithms, `iss`, `aud`, `azp`, `exp`, `iat`,
+  `nonce`), reads the name and groups (UserInfo when the ID token lacks them), checks
+  admission, and answers `303` to `return_to` with a session cookie. Failures go to
+  `/ui/login?error=state|idp|idp_unavailable|not_allowed`.
+* `POST /$/auth/logout` → `{"redirect": url | null}`: the provider's end-session URL for
+  OIDC sessions, `proxy.logout_url` for proxy users.
+
+Sessions are kept in `<data>/auth/sessions.json` (hashed ids, 0600) and survive restarts;
+replacing `<data>/auth/session.key` signs everyone out.
+
+### API tokens
+
+Tokens are `spk_` plus 43 base64url characters (256 random bits); the server stores only
+their SHA-256 (`<data>/auth/tokens.json`, 0600).
+
+* `POST /$/auth/tokens` `{"name", "datasets": {"wiki": "read"}, "server": [], "expiresIn":
+  "30d"}` → `201` with `token` (shown only here), `id` (`tok_…`), `scope`, `created`,
+  `expires`. Defaults: all the minter's access, `tokens_policy.default_ttl`; at most
+  `tokens_policy.max_ttl`, and no later than a minting token. Static tokens cannot mint.
+* `GET /$/auth/tokens` → `{"tokens": [{id, name, scope, created, expires, lastUsed, via,
+  client, owner}]}`: the caller's own; `?all=true` (server-admin) adds everyone's and the
+  static ones.
+* `DELETE /$/auth/tokens/{id}` (`self`: the token in use) → `204`; the owner or
+  server-admin, else `404`. Tokens minted by a revoked token die with it.
+* `DELETE /$/auth/tokens?owner=oidc:alice@example.org` (server-admin) → `{"revoked": n}`.
+
+### CLI logins
+
+`sparkles auth login --server URL` gets a token without copying secrets around:
+
+* **Browser** (default on desktops, `--web`): the CLI listens on `127.0.0.1:PORT`, opens
+  `/ui/cli/authorize?port&state&code_challenge…`; after approval the browser is sent to
+  the CLI with a one-time code (valid 120 s) that the CLI redeems at `POST /$/auth/token`
+  (`grant_type=authorization_code`, `code`, `code_verifier`). The token never appears in
+  a URL.
+* **Device code** (over SSH, without a display, or `--device`; RFC 8628):
+  `POST /$/auth/device` → `{device_code, user_code: "WDJB-MJHT", verification_uri,
+  verification_uri_complete, expires_in: 600, interval: 5}`; the user approves at
+  `/ui/cli/device`; the CLI polls `POST /$/auth/token`
+  (`grant_type=urn:ietf:params:oauth:grant-type:device_code`) and gets
+  `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, or once
+  `{access_token, token_type: "Bearer", expires_in, token_id, principal}`. At most 1000
+  logins are pending; a session may fail 20 code lookups per 10 minutes (then `429`).
+
+Approval needs a web UI session or proxy identity (`403 this action requires signing in
+to the web UI` for Bearer or Basic callers).
+
+### Configuration
+
+TOML, unknown keys are errors (with line and column). Keep it `0600`; `sparkles auth
+check --config FILE` validates it; `SIGHUP` reloads it (sessions and tokens follow the new
+policy at their next request; a bad file keeps the old policy).
+
+```toml
+version = 1
+realm = "sparkles"
+
+[server]
+public_url = "https://sparql.example.org"   # required with [oidc]
+
+[anonymous]
+datasets = { public = "read" }
+
+[roles.wiki-editors]
+datasets = { wiki = "write", "wiki-*" = "write" }
+[roles.admins]
+server = ["server-admin"]
+
+[[users]]                                    # HTTP Basic and UI password sign-in
+name = "bob"
+password = "$argon2id$v=19$m=19456,t=2,p=1$…"  # sparkles auth hash
+roles = ["wiki-editors"]
+datasets = { "team-*" = "read" }
+
+[[tokens]]                                   # static machine token
+name = "prometheus"
+hash = "sha256:…"                            # sparkles auth gen-token --name prometheus
+server = ["metrics"]
+# expires = "2027-06-30T00:00:00Z"
+
+[tokens_policy]
+default_ttl = "30d"
+max_ttl = "90d"
+
+[oidc]
+issuer = "https://auth.example.org"
+client_id = "sparkles"
+client_secret_file = "/run/secrets/sparkles-oidc"   # omit for a public client (PKCE only)
+scopes = ["openid", "profile", "email", "groups"]
+name_claim = "email"                         # or preferred_username, sub
+groups_claim = "groups"
+display_name = "Example SSO"
+algorithms = ["RS256", "ES256"]
+
+[external]                                   # OIDC and proxy identities
+allowed_groups = ["sparkles"]                # empty lists admit everyone
+allowed_users = []
+default_roles = []
+[external.group_roles]
+"kg-editors" = ["wiki-editors"]
+"kg-admins" = ["admins"]
+[external.user_roles]
+"alice@example.org" = ["admins"]
+
+[session]
+ttl = "12h"
+# key_file = "/var/lib/sparkles/auth/session.key"
+
+[proxy]                                      # off unless present
+preset = "authelia"                          # oauth2-proxy, authelia, tailscale, cloudflare-access
+trusted = ["127.0.0.1/32", "unix"]
+# user_header = "Remote-User"; email_header = "Remote-Email"; groups_header = "Remote-Groups"
+groups_separator = ","
+name_from = "user"                           # or "email"
+logout_url = "https://auth.example.org/logout"
+
+[cors]
+origins = ["https://yasgui.example.org"]     # default: none
+```
+
+The OIDC redirect URI to register at the provider is
+`{public_url}/$/auth/oidc/callback`.
+
+**Forward-auth proxies.** The proxy must overwrite or strip client-supplied identity
+headers on every route, including routes it lets through without authentication. Trust
+the narrowest range: the Unix socket (`--unix-socket`, mode 0660, `trusted = ["unix"]`) is
+the safest; `tailscale serve` connects from 127.0.0.1. Let `/$/auth/config`,
+`/$/auth/device`, `/$/auth/token` and requests with `Authorization: Bearer spk_…` through
+the proxy unauthenticated so the CLI can sign in, or give the CLI a separate route.
+An `Authorization` header wins over proxy headers. Do not combine a proxy's own Basic
+authentication with Sparkles auth: the proxy would forward its `Authorization` header.
+
+Credentials travel as bearer secrets: terminate TLS in front of the server (the server
+warns when auth is on and it listens beyond loopback).
+
+**Command line.** `sparkles auth hash` (password → argon2id), `sparkles auth gen-token
+--name N` (static token; the `[[tokens]]` entry on stderr), `sparkles auth check --config
+FILE`, `sparkles auth login|logout|status`, `sparkles auth token create|list|revoke`.
+`query`, `update` and `load` accept `--server URL --dataset NAME` (or `SPARKLES_SERVER`)
+and use the stored token (`$XDG_CONFIG_HOME/sparkles/credentials.toml`, 0600) or
+`SPARKLES_TOKEN`.
+
+**Metrics.** `sparkles_auth_failures_total{scheme,reason}`,
+`sparkles_auth_denied_total{kind}` (`unauthenticated`, `forbidden`, `hidden`,
+`cross_origin`, `csrf`, `not_interactive`), `sparkles_auth_logins_total{method,result}`,
+`sparkles_auth_tokens_minted_total{via}`, `sparkles_auth_tokens_revoked_total`,
+`sparkles_auth_tokens_active`, `sparkles_auth_sessions_active`,
+`sparkles_auth_device_grants_pending`, `sparkles_auth_password_verifications_total`,
+`sparkles_auth_untrusted_proxy_headers_total`, `sparkles_auth_reloads_total{result}`, and
+the policy sizes `sparkles_auth_policy_{users,tokens,roles}`. Audit events (logins,
+logouts, minted and revoked tokens, device approvals, reloads) are logged at INFO under
+`sparkles::audit`.
