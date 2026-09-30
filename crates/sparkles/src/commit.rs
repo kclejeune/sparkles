@@ -413,6 +413,13 @@ pub(crate) fn clone_dataset_file_bytes(
     .unwrap()
 }
 
+/// The dataset id of `dataset.json`'s content.
+pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
+    let f: DatasetFile =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
+    Ok(f.id)
+}
+
 /// `<root>/dataset.json`: the dataset id, if the database has one yet.
 pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
     match std::fs::read(root.join("dataset.json")) {
@@ -625,6 +632,9 @@ pub(crate) struct Catalog {
     /// records not yet written to the file after a write error
     pending: Vec<CommitInfo>,
     ring: Option<usize>,
+    /// test hook: appends to the file fail
+    #[cfg(any(test, feature = "failpoints"))]
+    pub(crate) fail_writes: bool,
 }
 
 impl Catalog {
@@ -636,6 +646,8 @@ impl Catalog {
             records: [root].into(),
             pending: Vec::new(),
             ring: Some(ring.max(1)),
+            #[cfg(any(test, feature = "failpoints"))]
+            fail_writes: false,
         }
     }
 
@@ -733,6 +745,8 @@ impl Catalog {
             records: records.into(),
             pending: Vec::new(),
             ring: None,
+            #[cfg(any(test, feature = "failpoints"))]
+            fail_writes: false,
         })
     }
 
@@ -763,6 +777,11 @@ impl Catalog {
         let Some(f) = self.file.as_mut() else {
             return;
         };
+        #[cfg(any(test, feature = "failpoints"))]
+        if self.fail_writes {
+            tracing::error!("commit catalog: write failed (failpoint); will retry");
+            return;
+        }
         let mut buf = Vec::with_capacity(self.pending.len() * REC);
         for c in &self.pending {
             buf.extend_from_slice(&encode_record(c));
@@ -794,6 +813,31 @@ impl Catalog {
 
     pub fn complete(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    /// Write pending records (without `fsync`) and return the file's length in bytes,
+    /// which then ends at the newest record. Fails with `Conflict("catalog-lagging: …")`
+    /// (retryable) while the file lags the commits (after a write error). For backups,
+    /// which read the file up to this length through their own handle.
+    pub fn flushed_len(&mut self) -> Result<u64> {
+        if self.path.is_none() {
+            return Err(Error::unsupported(
+                "the commit catalog of an in-memory store",
+            ));
+        }
+        if !self.pending.is_empty() {
+            self.flush_pending();
+        }
+        if !self.pending.is_empty() {
+            return Err(Error::Conflict(format!(
+                "catalog-lagging: the commit catalog lags {} commits after a write error; retry later",
+                self.pending.len()
+            )));
+        }
+        match &self.file {
+            Some(f) => Ok(f.metadata()?.len()),
+            None => Err(Error::unsupported("the commit catalog has no file")),
+        }
     }
 
     pub fn get(&self, seq: u64) -> Option<CommitInfo> {

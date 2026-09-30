@@ -125,6 +125,8 @@ pub enum Hold {
     Head,
     Snapshot(String),
     Retention,
+    /// a backup reading the generation (a lease, by backup name)
+    Lease(String),
 }
 
 impl std::fmt::Display for Hold {
@@ -133,6 +135,7 @@ impl std::fmt::Display for Hold {
             Hold::Head => write!(f, "head"),
             Hold::Snapshot(n) => write!(f, "snapshot:{n}"),
             Hold::Retention => write!(f, "retention"),
+            Hold::Lease(n) => write!(f, "backup:{n}"),
         }
     }
 }
@@ -310,10 +313,22 @@ pub(crate) struct GenEntry {
     pub bytes: u64,
 }
 
+/// A backup's hold on a generation directory: kept, whatever else needs it, until the
+/// backup has read it. In memory only (never in `history.json`).
+#[derive(Clone, Debug)]
+pub(crate) struct Lease {
+    pub generation: u32,
+    pub label: String,
+}
+
 /// The in-memory history state of a persistent store.
 pub(crate) struct HistoryState {
     pub pins: BTreeMap<String, Pin>,
     pub retention: Retention,
+    /// backup leases by lease id
+    pub leases: BTreeMap<u64, Lease>,
+    /// the id of the next lease
+    pub next_lease: u64,
     /// by generation number, the current one included
     pub gens: BTreeMap<u32, GenEntry>,
     /// sealed generations open for reading, most recent first
@@ -330,6 +345,8 @@ impl HistoryState {
         HistoryState {
             pins,
             retention,
+            leases: BTreeMap::new(),
+            next_lease: 1,
             gens: BTreeMap::new(),
             open: Vec::new(),
             cache: Vec::new(),
@@ -403,10 +420,32 @@ impl HistoryState {
         p
     }
 
+    /// Add a lease on generation `generation`; returns its id.
+    pub fn lease(&mut self, generation: u32, label: &str) -> u64 {
+        let id = self.next_lease;
+        self.next_lease += 1;
+        self.leases.insert(
+            id,
+            Lease {
+                generation,
+                label: label.to_string(),
+            },
+        );
+        id
+    }
+
+    /// The leases on generation `no`, as holds.
+    pub fn lease_holds(&self, no: u32) -> impl Iterator<Item = Hold> + '_ {
+        self.leases
+            .values()
+            .filter(move |l| l.generation == no)
+            .map(|l| Hold::Lease(l.label.clone()))
+    }
+
     /// The non-current generations to keep, with what holds each: a generation is
-    /// needed if it is the newest retained one covering some protected commit. At most
-    /// `max_gens` are kept for the retention window alone (oldest dropped first); pins
-    /// always win.
+    /// needed if it is the newest retained one covering some protected commit, or if a
+    /// backup leases it. At most `max_gens` are kept for the retention window alone
+    /// (oldest dropped first); pins and leases always win.
     pub fn needed(
         &self,
         current: u32,
@@ -450,6 +489,16 @@ impl HistoryState {
         if window_only.len() > allowed {
             for no in &window_only[..window_only.len() - allowed] {
                 out.remove(no);
+            }
+        }
+        // a leased generation is kept whatever covers its commits (a compaction's new
+        // generation covers the leased head), and outside the limit
+        for (&no, _) in self.gens.iter().filter(|(no, _)| **no != current) {
+            for hold in self.lease_holds(no) {
+                let holds = out.entry(no).or_default();
+                if !holds.contains(&hold) {
+                    holds.push(hold);
+                }
             }
         }
         out
@@ -729,5 +778,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2]
         );
+    }
+
+    #[test]
+    fn leases_keep_generations() {
+        let ts = |s: u64| Some(s as i64 * 1000);
+        // gen 2 is compacted into gen 3 at its head 9: nothing needs it by commits
+        let mut h = state(&[(1, 0, 5), (2, 5, 9), (3, 9, 9)]);
+        assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
+        let a = h.lease(2, "nightly");
+        let b = h.lease(2, "hourly");
+        h.lease(3, "now");
+        let n = h.needed(3, 12, 0, &ts, 8);
+        assert_eq!(n.keys().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            n[&2],
+            [Hold::Lease("nightly".into()), Hold::Lease("hourly".into())]
+        );
+        assert_eq!(n[&2][0].to_string(), "backup:nightly");
+        // next to the retention window, and outside the generation limit
+        h.retention.keep_commits = Some(20);
+        let n = h.needed(3, 12, 0, &ts, 8);
+        assert_eq!(n.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(n[&2].len(), 3);
+        assert_eq!(n[&2][0], Hold::Retention);
+        let n = h.needed(3, 12, 0, &ts, 0);
+        assert_eq!(n.keys().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(n[&2].len(), 2);
+        h.leases.remove(&a);
+        h.leases.remove(&b);
+        assert!(h.needed(3, 12, 0, &ts, 0).is_empty());
+        assert_eq!(h.lease_holds(3).count(), 1);
     }
 }
