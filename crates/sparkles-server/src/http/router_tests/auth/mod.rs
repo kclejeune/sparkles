@@ -14,6 +14,7 @@ mod limits;
 mod oidc;
 mod proxy;
 mod sessions;
+mod tasks;
 mod tokens;
 
 pub(super) fn tok(c: char) -> String {

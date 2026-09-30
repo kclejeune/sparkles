@@ -247,7 +247,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
 }
 
 /// The `{ds}` segment of the request path, if the route has one.
-fn ds_param(route: Option<&str>, uri: &Uri) -> Option<String> {
+pub(crate) fn ds_param(route: Option<&str>, uri: &Uri) -> Option<String> {
     let pos = route?.split('/').position(|s| s == "{ds}")?;
     let seg = uri.path().split('/').nth(pos)?;
     Some(

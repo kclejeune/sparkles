@@ -17,6 +17,7 @@ mod auth;
 mod clone;
 #[cfg(feature = "reasoning")]
 mod reasoning;
+mod tasks;
 
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .

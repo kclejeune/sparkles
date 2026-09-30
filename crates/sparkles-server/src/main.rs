@@ -1815,6 +1815,7 @@ fn run() -> Result<()> {
                 &to,
                 inferences,
                 None,
+                None,
             )?;
             eprintln!(
                 "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",

@@ -279,6 +279,41 @@ async fn failed_clones_leave_nothing_behind() {
     assert_eq!(st.datasets.read().len(), 1);
 }
 
+#[tokio::test]
+async fn cancelled_clones_leave_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = prod(dir.path());
+    let app = router(st.clone());
+    // clone tasks accept cancellation
+    let (r, _) = post(&app, "/$/datasets/prod/clone?name=c1").await;
+    assert_eq!(r.json()["cancellable"], true);
+    let t = wait_task(&st, r.json()["id"].as_str().unwrap()).await;
+    assert_eq!(t.state, "done");
+    assert!(!t.cancellable);
+
+    // a cancelled clone stops before the rename
+    let src = st.get("prod").unwrap();
+    let databases = dir.path().join("databases");
+    let (tmp, dst) = (databases.join(".clone-c2-1"), databases.join("c2"));
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let e = crate::clone::clone_into(
+        &src.store,
+        "prod",
+        None,
+        &tmp,
+        &dst,
+        crate::clone::Inferences::Copy,
+        None,
+        Some(cancel),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        e.downcast_ref::<sparkles::Error>(),
+        Some(sparkles::Error::Cancelled)
+    ));
+    assert!(!tmp.exists() && !dst.exists());
+}
+
 #[cfg(feature = "reasoning")]
 #[tokio::test]
 async fn clones_copy_or_drop_the_inferences() {

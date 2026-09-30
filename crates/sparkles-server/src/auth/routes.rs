@@ -52,7 +52,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
     ("/$/tasks", &["GET"]),
-    ("/$/tasks/{id}", &["GET"]),
+    // DELETE (cancel) checks admin on the task's dataset in the handler
+    ("/$/tasks/{id}", &["GET", "DELETE"]),
     ("/$/prefixes/{ds}", &["GET"]),
     ("/$/cache/clear/{ds}", &["POST"]),
     ("/$/text/{ds}", &["GET", "PUT", "DELETE"]),
