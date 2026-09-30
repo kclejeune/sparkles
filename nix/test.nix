@@ -33,6 +33,7 @@
 
           [[users]]
           name = "alice"
+          datasets = { demo = "read" }
           password = "$argon2id$v=19$m=19456,t=2,p=1$Rx7LbFknfawV8XRp8CMm0Q$dEIdCOdMNBRhz+OBLTVscRhb7x5z8rlt9+wV1jOZBls"
         '';
       };
