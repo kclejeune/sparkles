@@ -77,7 +77,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit, graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
-| W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **479/482**, SPARQL 1.2 **265/269** (all 7 failures are `spargebra` parser limitations, see `tests/w3c-known-failures.txt`) | ✅ |
+| W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
 ### Server (Fuseki equivalent), reasoning, validation, UI
 
@@ -161,7 +161,7 @@ feature gaps are:
 | Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
 | SPARQL extensions | property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, full `afn:`/`fn:` library | ✗ none of the extensions; common `fn:`/`afn:`/`math:` functions only |
-| SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
+| SPARQL parser | JavaCC grammar | `spargebra` 0.4.7, vendored with fixes for the W3C syntax/evaluation tests it failed (see `vendor/spargebra/PATCHED.md`) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD only) |
 | Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` endpoint | ✗ none |
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | Basic, Bearer tokens, OIDC (UI) and trusted proxy headers, with per-dataset levels; no graph-level ACLs yet; Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |

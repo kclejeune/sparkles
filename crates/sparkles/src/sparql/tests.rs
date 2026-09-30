@@ -401,6 +401,236 @@ fn arithmetic_is_left_associative() {
     assert_eq!(strs(&r), ["7"]);
 }
 
+/// Whether the query is rejected (with the test prefixes, so only its syntax is at fault).
+fn rejected(s: &Store, text: &str) -> bool {
+    let prefixes = vec![
+        ("ex".to_string(), "http://ex.org/".to_string()),
+        ("foaf".to_string(), "http://xmlns.com/foaf/0.1/".to_string()),
+    ];
+    let opts = QueryOptions {
+        prefixes,
+        ..Default::default()
+    };
+    query(s.snapshot(), text, &opts).is_err()
+}
+
+#[test]
+fn boolean_keywords_are_case_insensitive() {
+    let s = store();
+    let r = q(
+        &s,
+        "SELECT (TRUE AS ?t) (False AS ?f) (tRuE && true AS ?a) (DATATYPE(FALSE) = xsd:boolean AS ?d) {}",
+    );
+    assert_eq!(strs(&r), ["true false true true"]);
+    let r = q(&s, "SELECT ?x { VALUES ?x { TRUE } }");
+    assert_eq!(strs(&r), ["true"]);
+    // a prefix spelled like the keyword is still a prefixed name
+    let r = q(
+        &s,
+        "PREFIX TRUE: <http://ex.org/> SELECT ?a { TRUE:alice foaf:age ?a }",
+    );
+    assert_eq!(strs(&r), ["30"]);
+}
+
+#[test]
+fn less_than_yields_to_a_longer_iriref_token() {
+    let s = store();
+    // `<?a&&?b>` and `<2&&3>` are IRIREF tokens (longest match), not `<` ... `>`
+    assert!(rejected(&s, "SELECT * { FILTER(?x<?a&&?b>?y) }"));
+    assert!(rejected(&s, "SELECT (1<2&&3>2 AS ?v) {}"));
+    assert!(rejected(&s, "SELECT (1<=2&&3>2 AS ?v) {}"));
+    // whitespace ends an IRIREF, and without a closing `>` there is none
+    let r = q(
+        &s,
+        "SELECT (1<2 && 3>2 AS ?a) (1<2 AS ?b) (2<=2 AS ?c) (1 < 2&&3>2 AS ?d) {}",
+    );
+    assert_eq!(strs(&r), ["true true true true"]);
+    let r = q(
+        &s,
+        "SELECT ?n { ?p foaf:age ?a ; foaf:name ?n FILTER(?a<30) }",
+    );
+    assert_eq!(strs(&r), ["Bob"]);
+}
+
+#[test]
+fn optional_nested_group_filter_keeps_its_scope() {
+    let s = store();
+    // FILTER directly in the OPTIONAL group: the LeftJoin condition, sees ?n
+    let r = q(
+        &s,
+        "SELECT ?n ?a { ?p foaf:name ?n OPTIONAL { ?p foaf:age ?a FILTER(?n = \"Alice\") } }",
+    );
+    assert_eq!(
+        strs(&r),
+        ["Alice 30", "Bob UNDEF", "Carol UNDEF", "Dave UNDEF"]
+    );
+    // FILTER in a nested group: scoped to that group, where ?n is unbound
+    let r = q(
+        &s,
+        "SELECT ?n ?a { ?p foaf:name ?n OPTIONAL { { ?p foaf:age ?a FILTER(?n = \"Alice\") } } }",
+    );
+    assert_eq!(
+        strs(&r),
+        ["Alice UNDEF", "Bob UNDEF", "Carol UNDEF", "Dave UNDEF"]
+    );
+    // a nested-group filter that only uses the group's own variables still applies
+    let r = q(
+        &s,
+        "SELECT ?n ?a { ?p foaf:name ?n OPTIONAL { { ?p foaf:age ?a FILTER(?a > 26) } } }",
+    );
+    assert_eq!(
+        strs(&r),
+        ["Alice 30", "Bob UNDEF", "Carol 35", "Dave UNDEF"]
+    );
+}
+
+#[test]
+fn optional_filter_algebra_and_round_trip() {
+    use spargebra::algebra::GraphPattern as GP;
+    fn left_join(p: &GP) -> Option<(&GP, Option<&spargebra::algebra::Expression>)> {
+        match p {
+            GP::LeftJoin {
+                right, expression, ..
+            } => Some((right, expression.as_ref())),
+            GP::Project { inner, .. } | GP::Filter { inner, .. } => left_join(inner),
+            _ => None,
+        }
+    }
+    let parse = |text: &str| SparqlParser::new().parse_query(text).unwrap();
+    let pattern = |q: &Query| match q {
+        Query::Select { pattern, .. } => pattern.clone(),
+        _ => unreachable!(),
+    };
+    let direct =
+        parse("SELECT * { ?s <http://e/p> ?o OPTIONAL { ?o <http://e/q> ?x FILTER(?s = ?x) } }");
+    let p = pattern(&direct);
+    let (right, expr) = left_join(&p).unwrap();
+    assert!(matches!(right, GP::Bgp { .. }) && expr.is_some());
+    let nested = parse(
+        "SELECT * { ?s <http://e/p> ?o OPTIONAL { { ?o <http://e/q> ?x FILTER(?s = ?x) } } }",
+    );
+    let p = pattern(&nested);
+    let (right, expr) = left_join(&p).unwrap();
+    assert!(matches!(right, GP::Filter { .. }) && expr.is_none());
+    let both = parse(
+        "SELECT * { ?s <http://e/p> ?o
+                    OPTIONAL { { ?o <http://e/q> ?x FILTER(?s = ?x) } FILTER(?o != ?x) } }",
+    );
+    let p = pattern(&both);
+    let (right, expr) = left_join(&p).unwrap();
+    assert!(matches!(right, GP::Filter { .. }) && expr.is_some());
+    // serializing and re-parsing keeps each filter where it was
+    for query in [direct, nested, both] {
+        assert_eq!(parse(&query.to_string()), query, "{query}");
+    }
+}
+
+#[test]
+fn select_expressions_see_earlier_aliases() {
+    let s = store();
+    let r = q(
+        &s,
+        "SELECT (COUNT(?a) AS ?c) (?c + 1 AS ?d) { ?p foaf:age ?a }",
+    );
+    assert_eq!(strs(&r), ["3 4"]);
+    let r = q(
+        &s,
+        "SELECT ?t (COUNT(?p) AS ?c) (?c * 10 AS ?d) { ?p a ?t } GROUP BY ?t",
+    );
+    assert_eq!(strs(&r), ["Agent 1 10", "Person 3 30"]);
+    let r = q(&s, "SELECT (1 AS ?x) (?x + 1 AS ?y) {}");
+    assert_eq!(strs(&r), ["1 2"]);
+    // an alias is not visible before it is defined, and cannot be assigned twice
+    assert!(rejected(
+        &s,
+        "SELECT (?c + 1 AS ?d) (COUNT(?a) AS ?c) { ?p foaf:age ?a }"
+    ));
+    assert!(rejected(&s, "SELECT (1 AS ?x) (2 AS ?x) {}"));
+    assert!(rejected(
+        &s,
+        "SELECT (COUNT(?a) AS ?c) (?c AS ?c) { ?p foaf:age ?a }"
+    ));
+    // ungrouped variables are still rejected
+    assert!(rejected(
+        &s,
+        "SELECT (COUNT(?a) AS ?c) (?a + ?c AS ?d) { ?p foaf:age ?a }"
+    ));
+}
+
+#[test]
+fn nested_aggregates_are_rejected() {
+    let s = store();
+    assert!(rejected(&s, "SELECT (COUNT(COUNT(*)) AS ?c) {}"));
+    assert!(rejected(
+        &s,
+        "SELECT (SUM(MAX(?a) + 1) AS ?x) { ?p foaf:age ?a }"
+    ));
+    // the inner aggregate also appears on its own
+    assert!(rejected(
+        &s,
+        "SELECT (MAX(?a) AS ?m) (COUNT(MAX(?a)) AS ?c) { ?p foaf:age ?a }"
+    ));
+    assert!(rejected(
+        &s,
+        "SELECT (GROUP_CONCAT(DISTINCT STR(MIN(?a)); SEPARATOR=\",\") AS ?g) { ?p foaf:age ?a }"
+    ));
+    assert!(rejected(
+        &s,
+        "SELECT ?t { ?p a ?t } GROUP BY ?t HAVING (SUM(COUNT(?p)) > 1)"
+    ));
+    assert!(rejected(
+        &s,
+        "SELECT ?t { ?p a ?t } GROUP BY ?t ORDER BY AVG(COUNT(?p))"
+    ));
+    // aggregates side by side, repeated, or in a subquery are fine
+    let r = q(
+        &s,
+        "SELECT (COUNT(?a) + MAX(?a) AS ?x) (MAX(?a) AS ?m) (MAX(?a) + 1 AS ?n) { ?p foaf:age ?a }",
+    );
+    assert_eq!(strs(&r), ["38 35 36"]);
+    let r = q(
+        &s,
+        "SELECT (SUM(?c) AS ?s) { { SELECT ?t (COUNT(?p) AS ?c) { ?p a ?t } GROUP BY ?t } }",
+    );
+    assert_eq!(strs(&r), ["4"]);
+}
+
+#[test]
+fn triple_term_subjects_follow_the_grammar() {
+    let s = store();
+    // SPARQL 1.2 [138] ExprTripleTermSubject ::= iri | Var
+    assert!(rejected(
+        &s,
+        "SELECT * { BIND(<<( \"l\" ex:q ex:z )>> AS ?x) }"
+    ));
+    assert!(rejected(&s, "SELECT * { BIND(<<( 1 ex:q ex:z )>> AS ?x) }"));
+    assert!(rejected(
+        &s,
+        "SELECT * { BIND(<<( <<( ex:s ex:p ex:o )>> ex:q ex:z )>> AS ?x) }"
+    ));
+    // [123] TripleTermDataSubject ::= iri
+    assert!(rejected(
+        &s,
+        "SELECT * { VALUES ?x { <<( \"l\" ex:q ex:z )>> } }"
+    ));
+    assert!(rejected(
+        &s,
+        "SELECT * { VALUES ?x { <<( <<( ex:s ex:p ex:o )>> ex:q ex:z )>> } }"
+    ));
+    let r = q(
+        &s,
+        "SELECT ?x ?y ?z { BIND(ex:a AS ?s) BIND(<<( ?s ex:p \"l\" )>> AS ?x)
+                            BIND(<<( ex:s ex:p <<( ex:a ex:b 1 )>> )>> AS ?y)
+                            VALUES ?z { <<( ex:s a <<( ex:a ex:b true )>> )>> } }",
+    );
+    assert_eq!(r.len(), 1);
+    assert!(
+        r.rows()[0]
+            .iter()
+            .all(|t| matches!(t, Some(Term::Triple(_))))
+    );
+}
+
 #[test]
 fn aggregates() {
     let s = store();

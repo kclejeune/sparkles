@@ -691,6 +691,10 @@ fn build_select(
                             variable: variable.clone(),
                             expression,
                         };
+                        // SPARQL 1.2 §16.1.2: "The scoping for (expr AS v) applies
+                        // immediately": later SELECT expressions may use v (and it may
+                        // not be assigned again), as the Extend chain of §18.3.4.4 implies.
+                        visible.insert(variable.clone());
                         variable
                     }
                 };
@@ -785,6 +789,44 @@ fn are_variables_bound(expression: &Expression, variables: &HashSet<Variable>) -
             are_variables_bound(a, variables)
                 && are_variables_bound(b, variables)
                 && are_variables_bound(c, variables)
+        }
+    }
+}
+
+/// Whether `expression` mentions `variable`, not looking inside EXISTS patterns
+/// (which are their own group graph patterns, not part of the expression).
+fn expression_uses_variable(expression: &Expression, variable: &Variable) -> bool {
+    match expression {
+        Expression::NamedNode(_) | Expression::Literal(_) | Expression::Exists(_) => false,
+        Expression::Variable(v) | Expression::Bound(v) => v == variable,
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            expression_uses_variable(e, variable)
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            expression_uses_variable(a, variable) || expression_uses_variable(b, variable)
+        }
+        Expression::In(a, b) => {
+            expression_uses_variable(a, variable)
+                || b.iter().any(|b| expression_uses_variable(b, variable))
+        }
+        Expression::FunctionCall(_, parameters) | Expression::Coalesce(parameters) => parameters
+            .iter()
+            .any(|p| expression_uses_variable(p, variable)),
+        Expression::If(a, b, c) => {
+            expression_uses_variable(a, variable)
+                || expression_uses_variable(b, variable)
+                || expression_uses_variable(c, variable)
         }
     }
 }
@@ -967,6 +1009,18 @@ impl ParserState {
 
     fn new_aggregation(&mut self, agg: AggregateExpression) -> Result<Variable, &'static str> {
         let aggregates = self.aggregates.last_mut().ok_or("Unexpected aggregate")?;
+        // SPARQL 1.2 §19.7: "The expression argument of an aggregate function cannot
+        // contain an aggregate function." An aggregate call parsed inside `expr` has
+        // already been replaced by the fresh variable registered for it at this query
+        // level, so a nested aggregate shows up as one of those variables.
+        if let AggregateExpression::FunctionCall { expr, .. } = &agg {
+            if aggregates
+                .iter()
+                .any(|(v, _)| expression_uses_variable(expr, v))
+            {
+                return Err("Aggregate functions cannot be nested");
+            }
+        }
         Ok(aggregates
             .iter()
             .find_map(|(v, a)| (a == &agg).then_some(v))
@@ -1457,16 +1511,25 @@ parser! {
         }
         rule TriplesTemplate_inner() -> Vec<TriplePattern> = _ t:TriplesSameSubject() _ { t }
 
-        rule GroupGraphPattern() -> GraphPattern =
+        rule GroupGraphPattern() -> GraphPattern = p:GroupGraphPattern_parts() {
+            match p {
+                (inner, Some(expr)) => GraphPattern::Filter { expr, inner: Box::new(inner) },
+                (inner, None) => inner,
+            }
+        }
+        // A group's pattern and the conjunction of the FILTERs written directly in it
+        // (SPARQL 1.1 §18.2.2.7), kept apart so that OPTIONAL can tell them from a filter
+        // of a nested group.
+        rule GroupGraphPattern_parts() -> (GraphPattern, Option<Expression>) =
             "{" _ GroupGraphPattern_clear() p:GroupGraphPatternSub() GroupGraphPattern_clear() _ "}" { p } /
-            "{" _ GroupGraphPattern_clear() p:SubSelect() GroupGraphPattern_clear() _ "}" { p }
+            "{" _ GroupGraphPattern_clear() p:SubSelect() GroupGraphPattern_clear() _ "}" { (p, None) }
         rule GroupGraphPattern_clear() = {
              // We deal with blank nodes aliases rule
             state.used_bnodes.extend(state.currently_used_bnodes.iter().cloned());
             state.currently_used_bnodes.clear();
         }
 
-        rule GroupGraphPatternSub() -> GraphPattern = a:TriplesBlock()? _ b:GroupGraphPatternSub_item()* {?
+        rule GroupGraphPatternSub() -> (GraphPattern, Option<Expression>) = a:TriplesBlock()? _ b:GroupGraphPatternSub_item()* {?
             let mut filter: Option<Expression> = None;
             let mut g = a.map_or_else(GraphPattern::default, build_bgp);
             for e in b.into_iter().flatten() {
@@ -1513,11 +1576,7 @@ parser! {
                 }
             }
 
-            Ok(if let Some(expr) = filter {
-                GraphPattern::Filter { expr, inner: Box::new(g) }
-            } else {
-                g
-            })
+            Ok((g, filter))
         }
         rule GroupGraphPatternSub_item() -> Vec<PartialGraphPattern> = a:GraphPatternNotTriples() _ ("." _)? b:TriplesBlock()? _ {
             let mut result = vec![a];
@@ -1556,12 +1615,13 @@ parser! {
 
         rule GraphPatternNotTriples() -> PartialGraphPattern = GroupOrUnionGraphPattern() / OptionalGraphPattern() / LateralGraphPattern() / MinusGraphPattern() / GraphGraphPattern() / ServiceGraphPattern() / Filter() / Bind() / InlineData()
 
-        rule OptionalGraphPattern() -> PartialGraphPattern = i("OPTIONAL") _ p:GroupGraphPattern() {
-            if let GraphPattern::Filter { expr, inner } =  p {
-               PartialGraphPattern::Optional(*inner, Some(expr))
-            } else {
-               PartialGraphPattern::Optional(p, None)
-            }
+        // SPARQL 1.1 §18.2.2.6: OPTIONAL{P} is LeftJoin(G, A2, F) when Translate(P) is
+        // Filter(F, A2), i.e. when P itself has FILTERs (§18.2.2.7). The simplification of
+        // Join(Z, A) to A (§18.2.2.8) comes after the translation, so in
+        // `OPTIONAL { { P FILTER(e) } }` the filter stays inside the right-hand side, where
+        // it only sees P's bindings, instead of becoming the LeftJoin expression.
+        rule OptionalGraphPattern() -> PartialGraphPattern = i("OPTIONAL") _ p:GroupGraphPattern_parts() {
+            PartialGraphPattern::Optional(p.0, p.1)
         }
 
         rule LateralGraphPattern() -> PartialGraphPattern = i("LATERAL") _ p:GroupGraphPattern() {?
@@ -2102,16 +2162,17 @@ parser! {
             l:BooleanLiteral() { l.into() } /
             b:BlankNode() { b.into() }
 
-        rule TripleTermData() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ p:TripleTermData_p() _ o:TripleTermDataObject() _ ")>>" {?
-            Ok(GroundTriple {
-                subject: if let GroundTerm::NamedNode(s) = s { s } else { return Err("Literals or triple terms are not allowed in subject position of nested patterns") },
+        rule TripleTermData() -> GroundTriple = "<<(" _ s:TripleTermDataSubject() _ p:TripleTermData_p() _ o:TripleTermDataObject() _ ")>>" {
+            GroundTriple {
+                subject: s,
                 predicate: p,
                 object: o
-            })
+            }
         }
         rule TripleTermData_p() -> NamedNode = i: iri() { i } / "a" { rdf::TYPE.into() }
 
-        rule TripleTermDataSubject() -> GroundTerm = TripleTermDataObject()
+        // SPARQL 1.2 §19.7 [123] TripleTermDataSubject ::= iri
+        rule TripleTermDataSubject() -> NamedNode = iri()
 
         rule TripleTermDataObject() -> GroundTerm =
             t:TripleTermData() {?
@@ -2155,8 +2216,12 @@ parser! {
             Some(_) => unreachable!(),
             None => a
         } }
+        // SPARQL 1.1 §19.8: "When tokenizing the input and choosing grammar rules, the
+        // longest match is chosen". Where the input from `<` on forms an IRIREF token,
+        // that token wins over the `<` / `<=` operator: `?x<?a&&?b>?y` is `?x <?a&&?b> ?y`,
+        // a syntax error, not `?x < ?a && ?b > ?y`.
         rule RelationalExpression_inner() -> (&'input str, Option<Expression>, Option<Vec<Expression>>) =
-            s: $("="  / "!=" / ">=" / ">" / "<=" / "<") _ e:NumericExpression() { (s, Some(e), None) } /
+            s: $("="  / "!=" / ">=" / ">" / !IRIREF_token() ("<=" / "<")) _ e:NumericExpression() { (s, Some(e), None) } /
             i("IN") _ l:ExpressionList() { ("IN", None, Some(l)) } /
             i("NOT") _ i("IN") _ l:ExpressionList() { ("NOT IN", None, Some(l)) }
 
@@ -2211,7 +2276,11 @@ parser! {
             #[cfg(not(feature = "sparql-12"))]{Err("Triple terms are only available in SPARQL 1.2")}
         }
 
-        rule ExprTripleTermSubject() -> Expression = ExprTripleTermObject()
+        // SPARQL 1.2 §19.7 [138] ExprTripleTermSubject ::= iri | Var: no literal and no
+        // nested triple term in the subject of `<<( ... )>>` in an expression.
+        rule ExprTripleTermSubject() -> Expression =
+            i:iri() { i.into() } /
+            v:Var() { v.into() }
 
         rule ExprTripleTermObject() -> Expression =
             ExprTripleTerm() /
@@ -2417,9 +2486,11 @@ parser! {
             d:$(DECIMAL_NEGATIVE()) { Literal::new_typed_literal(d, xsd::DECIMAL) } /
             i:$(INTEGER_NEGATIVE()) { Literal::new_typed_literal(i, xsd::INTEGER) }
 
+        // 'true' and 'false' are keywords, and SPARQL 1.1 §19.8 matches keywords
+        // case-insensitively (only 'a' is case-sensitive): `TRUE` is xsd:boolean "true".
         rule BooleanLiteral() -> Literal =
-            "true" { Literal::new_typed_literal("true", xsd::BOOLEAN) } /
-            "false" { Literal::new_typed_literal("false", xsd::BOOLEAN) }
+            i("true") { Literal::new_typed_literal("true", xsd::BOOLEAN) } /
+            i("false") { Literal::new_typed_literal("false", xsd::BOOLEAN) }
 
         rule String() -> String = STRING_LITERAL_LONG1() / STRING_LITERAL_LONG2() / STRING_LITERAL1() / STRING_LITERAL2()
 
@@ -2447,6 +2518,11 @@ parser! {
         rule IRIREF() -> Iri<String> = "<" i:$((!['>'] [_])*) ">" {?
             state.parse_iri(unescape_iriref(i)?).map_err(|_| "IRI parsing failed")
         }
+
+        // The IRIREF terminal exactly as the grammar defines it (SPARQL 1.1 §19.8 [139]:
+        // '<' ([^<>"{}|^`\]-[#x00-#x20])* '>', plus the \u / \U escapes §19.2 allows
+        // anywhere). Used only as a lookahead to apply the longest-match rule.
+        rule IRIREF_token() = "<" (UCHAR() / !['<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' | '\u{00}'..='\u{20}'] [_])* ">"
 
         rule PNAME_NS() -> &'input str = ns:$(PN_PREFIX()?) ":" {
             ns
