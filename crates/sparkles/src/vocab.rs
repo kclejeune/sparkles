@@ -482,6 +482,20 @@ impl DeltaVocab {
         }
         Ok(())
     }
+
+    /// Write buffered entries to the file (without `fsync`) and return its length in
+    /// bytes: every entry inserted so far lies within it. 0 for an in-memory vocabulary.
+    /// For backups, which read the file up to this length through their own handle.
+    pub fn flush(&self) -> Result<u64> {
+        match &self.file {
+            Some(f) => {
+                let mut f = f.lock();
+                f.flush()?;
+                Ok(f.get_ref().metadata()?.len())
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -471,7 +471,6 @@ async fn keep_is_refused_before_downloading() {
 }
 
 #[tokio::test]
-#[ignore = "needs S1 (commit::reidentify)"]
 async fn a_new_identity_forks_the_lineage() {
     let (dir, repo, m) = setup().await;
     let tmp = dir.path().join("t");
