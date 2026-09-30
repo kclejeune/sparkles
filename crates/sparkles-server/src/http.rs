@@ -20,6 +20,8 @@ use sparkles::{Error, id::Id};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod schema;
+
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
 type St = State<Arc<AppState>>;
@@ -39,6 +41,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/datasets", get(list_datasets).post(create_dataset))
         .route("/$/datasets/{ds}", get(get_dataset).delete(delete_dataset))
         .route("/$/stats/{ds}", get(stats))
+        .route("/$/schema/{ds}", get(schema::summary))
+        .route("/$/schema/{ds}/classes", get(schema::classes))
+        .route("/$/schema/{ds}/predicates", get(schema::predicates))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route("/$/reason/{ds}", post(reason).delete(unreason))

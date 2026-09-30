@@ -615,6 +615,314 @@ function stats(ds) {
 }
 
 // ---------------------------------------------------------------------------
+// schema discovery (/$/schema/{ds}[/classes|/predicates]), computed in JS over the quads
+
+const NS = {
+  rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+  rdfs: 'http://www.w3.org/2000/01/rdf-schema#',
+  owl: 'http://www.w3.org/2002/07/owl#',
+  xsd: 'http://www.w3.org/2001/XMLSchema#',
+  sh: 'http://www.w3.org/ns/shacl#',
+};
+const CLASS_TYPES = ['rdfs:Class', 'owl:Class', 'rdfs:Datatype'].map(expand);
+const PROPERTY_TYPES = [
+  'rdf:Property',
+  'owl:ObjectProperty',
+  'owl:DatatypeProperty',
+  'owl:AnnotationProperty',
+  'owl:FunctionalProperty',
+  'owl:InverseFunctionalProperty',
+  'owl:TransitiveProperty',
+  'owl:SymmetricProperty',
+].map(expand);
+
+function expand(pn) {
+  const [p, l] = pn.split(':');
+  return NS[p] + l;
+}
+
+const builtin = (iri) => Object.values(NS).some((ns) => iri.startsWith(ns));
+
+/** The schema report of a dataset (all items; the router paginates). */
+function schemaReport(ds, p) {
+  const graph = p.get('graph') || 'default';
+  const reasoning = p.has('reasoning') ? p.get('reasoning') === 'true' : !!ds.reasoning;
+  const declaredAll = p.get('declared') === 'all';
+  const accepts = (q, withInferred) => {
+    const g = q.graph;
+    const inferred = g.termType === 'NamedNode' && g.value === INFERRED.value;
+    if (graph === 'default') return g.termType === 'DefaultGraph' || (inferred && withInferred);
+    if (graph === 'union') return !inferred || withInferred;
+    return g.termType === 'NamedNode' && g.value === graph;
+  };
+  const all = ds.store.match(null, null, null, null);
+  if (!['default', 'union'].includes(graph) && !all.some((q) => accepts(q, true)))
+    return { status: 404, error: `no such graph: <${graph}>` };
+  /** Distinct triples of the selection. */
+  const triples = (withInferred) => {
+    const seen = new Map();
+    for (const q of all) {
+      if (!accepts(q, withInferred)) continue;
+      const k = `${q.subject} ${q.predicate} ${q.object}`;
+      if (!seen.has(k)) seen.set(k, q);
+    }
+    return [...seen.values()];
+  };
+  const obs = triples(reasoning);
+  const decl = triples(declaredAll);
+  const lit = (t) => ({ value: t.value, ...(t.language ? { lang: t.language } : {}) });
+
+  // observed
+  const preds = new Map();
+  const instances = new Map();
+  const anonTypes = new Set();
+  for (const q of obs) {
+    const p = q.predicate.value;
+    let e = preds.get(p);
+    if (!e) preds.set(p, (e = { subjects: new Map(), objects: new Map(), triples: 0 }));
+    e.triples++;
+    const s = String(q.subject);
+    e.subjects.set(s, (e.subjects.get(s) ?? 0) + 1);
+    const o = String(q.object);
+    const ob = e.objects.get(o) ?? { term: q.object, n: 0 };
+    ob.n++;
+    e.objects.set(o, ob);
+    if (p === RDF_TYPE_IRI) {
+      if (q.object.termType === 'NamedNode') {
+        const set = instances.get(q.object.value) ?? new Set();
+        set.add(s);
+        instances.set(q.object.value, set);
+      } else if (q.object.termType === 'BlankNode') anonTypes.add(o);
+    }
+  }
+
+  // declared
+  const classes = new Map();
+  const props = new Map();
+  const cls = (iri) => {
+    let c = classes.get(iri);
+    if (!c)
+      classes.set(
+        iri,
+        (c = { types: [], superClasses: [], equivalentClasses: [], disjointWith: [] }),
+      );
+    return c;
+  };
+  const prop = (iri) => {
+    let e = props.get(iri);
+    if (!e)
+      props.set(
+        iri,
+        (e = { types: [], domains: [], ranges: [], superProperties: [], inverseOf: [] }),
+      );
+    return e;
+  };
+  const add = (arr, v) => arr.includes(v) || arr.push(v);
+  const bySubject = new Map();
+  const anonExprs = new Set();
+  for (const q of decl) {
+    const s = q.subject.value;
+    const p = q.predicate.value;
+    const o = q.object;
+    if (q.subject.termType === 'NamedNode') {
+      const list = bySubject.get(s) ?? [];
+      list.push(q);
+      bySubject.set(s, list);
+    }
+    if (q.subject.termType !== 'NamedNode') continue;
+    const oIri = o.termType === 'NamedNode';
+    if (
+      o.termType === 'BlankNode' &&
+      /#(subClassOf|equivalentClass|disjointWith|domain|range)$/.test(p)
+    )
+      anonExprs.add(String(o));
+    if (p === RDF_TYPE_IRI && oIri && CLASS_TYPES.includes(o.value)) add(cls(s).types, o.value);
+    if (p === RDF_TYPE_IRI && oIri && PROPERTY_TYPES.includes(o.value)) add(prop(s).types, o.value);
+    const classRel = {
+      [NS.rdfs + 'subClassOf']: 'superClasses',
+      [NS.owl + 'equivalentClass']: 'equivalentClasses',
+      [NS.owl + 'disjointWith']: 'disjointWith',
+    }[p];
+    if (classRel) {
+      const c = cls(s);
+      if (oIri) {
+        cls(o.value);
+        if (!(classRel === 'superClasses' && o.value === s)) add(c[classRel], o.value);
+      }
+    }
+    const propRel = {
+      [NS.rdfs + 'domain']: 'domains',
+      [NS.rdfs + 'range']: 'ranges',
+      [NS.rdfs + 'subPropertyOf']: 'superProperties',
+      [NS.owl + 'inverseOf']: 'inverseOf',
+    }[p];
+    if (propRel) {
+      const e = prop(s);
+      if (oIri) {
+        if (propRel === 'superProperties' || propRel === 'inverseOf') prop(o.value);
+        add(e[propRel], o.value);
+      }
+    }
+  }
+  for (const c of instances.keys()) cls(c);
+  for (const p of preds.keys()) prop(p);
+  const literals = (iri, p) =>
+    (bySubject.get(iri) ?? [])
+      .filter((q) => q.predicate.value === p && q.object.termType === 'Literal')
+      .map((q) => lit(q.object));
+
+  const classItems = [...classes.entries()]
+    .map(([iri, d]) => ({
+      iri,
+      builtin: builtin(iri),
+      observed: { instances: instances.get(iri)?.size ?? 0 },
+      declared: {
+        ...d,
+        labels: literals(iri, NS.rdfs + 'label'),
+        comments: literals(iri, NS.rdfs + 'comment'),
+      },
+    }))
+    .sort((a, b) => (a.iri < b.iri ? -1 : 1));
+  const predItems = [...props.entries()]
+    .map(([iri, d]) => {
+      const e = preds.get(iri);
+      const perSubject = e ? [...e.subjects.values()] : [];
+      const objects = { literals: [] };
+      const groups = new Map();
+      for (const { term, n } of e?.objects.values() ?? []) {
+        const kind = { NamedNode: 'iri', BlankNode: 'blank', Quad: 'tripleTerm' }[term.termType];
+        if (kind) {
+          objects[kind] ??= { triples: 0, distinct: 0 };
+          objects[kind].triples += n;
+          objects[kind].distinct++;
+          continue;
+        }
+        const dt = term.language ? NS.rdf + 'langString' : term.datatype.value;
+        const g = groups.get(dt) ?? { datatype: dt, triples: 0, distinct: 0 };
+        g.triples += n;
+        g.distinct++;
+        if (term.language) {
+          g.languages ??= [];
+          const l = g.languages.find((x) => x.lang === term.language);
+          if (l) l.triples += n;
+          else g.languages.push({ lang: term.language, triples: n });
+        }
+        groups.set(dt, g);
+      }
+      objects.literals = [...groups.values()].sort((a, b) => (a.datatype < b.datatype ? -1 : 1));
+      return {
+        iri,
+        builtin: builtin(iri),
+        observed: {
+          triples: e?.triples ?? 0,
+          distinctSubjects: perSubject.length,
+          distinctObjects: e?.objects.size ?? 0,
+          maxPerSubject: Math.max(0, ...perSubject),
+          subjectsWithMultiple: perSubject.filter((n) => n >= 2).length,
+          objects,
+        },
+        declared: {
+          ...d,
+          labels: literals(iri, NS.rdfs + 'label'),
+          comments: literals(iri, NS.rdfs + 'comment'),
+        },
+      };
+    })
+    .sort((a, b) => (a.iri < b.iri ? -1 : 1));
+
+  // hierarchy: components of mutually reachable classes (small data: plain DFS)
+  const supers = (c) => classes.get(c)?.superClasses.filter((s) => classes.has(s)) ?? [];
+  const reach = new Map();
+  for (const c of classes.keys()) {
+    const seen = new Set();
+    const stack = [...supers(c)];
+    while (stack.length) {
+      const x = stack.pop();
+      if (seen.has(x)) continue;
+      seen.add(x);
+      stack.push(...supers(x));
+    }
+    reach.set(c, seen);
+  }
+  const comp = (c) =>
+    [...classes.keys()]
+      .filter((x) => x === c || (reach.get(c).has(x) && reach.get(x).has(c)))
+      .sort();
+  const subCount = (c) =>
+    classItems.filter((x) => x.declared.superClasses.includes(c) && x.iri !== c).length;
+  const cycles = [];
+  const roots = [];
+  for (const c of classes.keys()) {
+    const members = comp(c);
+    if (members[0] !== c) continue;
+    if (members.length > 1) cycles.push(members);
+    if (members.every((m) => supers(m).every((s) => members.includes(s)))) roots.push(c);
+  }
+  roots.sort((a, b) => subCount(b) - subCount(a) || (a < b ? -1 : 1));
+  cycles.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+
+  const ontologies = decl
+    .filter(
+      (q) =>
+        q.predicate.value === RDF_TYPE_IRI &&
+        q.object.value === NS.owl + 'Ontology' &&
+        q.subject.termType === 'NamedNode',
+    )
+    .map((q) => q.subject.value);
+  return {
+    report: {
+      schemaFormat: 1,
+      dataset: ds.name,
+      snapshot: {
+        version: ds.baseQuads + ds.deltaInserts + ds.deltaDeletes,
+        generation: 'mock',
+        computedAt: new Date().toISOString(),
+      },
+      selection: {
+        graph,
+        declaredGraph: graph,
+        reasoning,
+        declared: declaredAll ? 'all' : 'asserted',
+      },
+      totals: {
+        triples: obs.length,
+        classes: classItems.length,
+        predicates: predItems.length,
+        anonymousTypeTargets: anonTypes.size,
+        anonymousClassExpressions: anonExprs.size,
+      },
+      ontology: [...new Set(ontologies)].sort().map((iri) => ({
+        iri,
+        labels: literals(iri, NS.rdfs + 'label'),
+        versionInfo: literals(iri, NS.owl + 'versionInfo'),
+        comments: literals(iri, NS.rdfs + 'comment'),
+      })),
+      hierarchy: { roots, cycles },
+      classes: classItems,
+      predicates: predItems,
+    },
+  };
+}
+const RDF_TYPE_IRI = NS.rdf + 'type';
+
+/** A page of an IRI-sorted list after the cursor (base64url JSON `{ a: lastIri }`). */
+function schemaPage(items, limit, cursor) {
+  let after = null;
+  if (cursor) after = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')).a;
+  const start = after == null ? 0 : items.findIndex((x) => x.iri > after);
+  const from = start < 0 ? items.length : start;
+  const page = items.slice(from, from + limit);
+  const more = from + page.length < items.length;
+  return {
+    items: page,
+    total: items.length,
+    next: more
+      ? Buffer.from(JSON.stringify({ a: page[page.length - 1].iri })).toString('base64url')
+      : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // router
 
 const server = http.createServer(async (req, res) => {
@@ -679,6 +987,22 @@ const server = http.createServer(async (req, res) => {
         case 'stats':
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
           return send(res, 200, stats(ds));
+        case 'schema': {
+          if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          const limit = Number(url.searchParams.get('limit') ?? 1000);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
+            return fail(res, 400, 'limit must be an integer from 1 to 10000');
+          const r = schemaReport(ds, url.searchParams);
+          if (r.error) return fail(res, r.status, r.error);
+          const cursor = url.searchParams.get('cursor');
+          if (extra === 'classes' || extra === 'predicates')
+            return send(res, 200, schemaPage(r.report[extra], limit, cursor));
+          return send(res, 200, {
+            ...r.report,
+            classes: schemaPage(r.report.classes, limit, null),
+            predicates: schemaPage(r.report.predicates, limit, null),
+          });
+        }
         case 'prefixes':
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
           return send(res, 200, { prefixes: ds.prefixes });

@@ -32,6 +32,17 @@ pub struct Dataset {
     pub reasoning: RwLock<Option<ReasoningInfo>>,
     /// not part of the persisted registry (e.g. `--loc` on the command line)
     pub ephemeral: bool,
+    /// the last schema report served (`/$/schema/{ds}`), kept for its pagination cursors
+    pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
+}
+
+/// A computed schema report and what it was computed for.
+pub struct SchemaCacheEntry {
+    /// snapshot identity (`sparkles::schema::snapshot_identity`)
+    pub identity: u64,
+    /// hash of the selection parameters
+    pub selection: u64,
+    pub report: Arc<sparkles::schema::SchemaReport>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -75,6 +86,8 @@ pub struct AppState {
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     pub allow_service: bool,
+    /// cap on the classes, and separately the predicates, of one schema report
+    pub schema_max_entries: usize,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -142,6 +155,7 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: true,
+            schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             manage: Mutex::new(()),
         };
         let reg_path = data_dir.join("config.json");
@@ -179,6 +193,7 @@ impl AppState {
             store,
             reasoning: RwLock::new(reasoning),
             ephemeral: loc.is_some(),
+            schema_cache: Mutex::new(None),
         }))
     }
 

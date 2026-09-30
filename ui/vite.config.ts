@@ -1,5 +1,6 @@
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig, type ProxyOptions } from 'vite';
+import type { ProxyOptions } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 // Where the Sparkles backend (or `pnpm mock`) is listening.
 const target = process.env.SPARKLES_API ?? 'http://localhost:3030';
@@ -17,4 +18,6 @@ export default defineConfig({
   plugins: [sveltekit()],
   server: { port: 5173, proxy },
   preview: { port: 4173, proxy },
+  // Unit tests for the pure modules under src/lib (`pnpm test`).
+  test: { include: ['src/**/*.test.ts'], environment: 'node' },
 });

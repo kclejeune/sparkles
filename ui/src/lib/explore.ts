@@ -159,19 +159,34 @@ export type ClassInfo = {
   iri: string;
   label?: string;
   comment?: string;
+  /** Asserted superclasses after transitive reduction: the edges the tree draws. */
   supers: string[];
   subs: string[];
   instances: number;
+  /** Declared with rdf:type rdfs:Class, owl:Class or rdfs:Datatype. */
   declared: boolean;
+  /** In the rdf:, rdfs:, owl:, xsd: or sh: namespace. */
+  builtin: boolean;
+  /** Asserted superclasses, as declared. */
+  assertedSupers: string[];
+  equivalents: string[];
+  disjoint: string[];
+  /** The other members of the subClassOf cycle the class is on (empty if none). */
+  cycle: string[];
 };
 
 export type PropertyInfo = {
   iri: string;
   label?: string;
+  comment?: string;
+  /** Declared property types (rdf:Property, owl:ObjectProperty, owl:FunctionalProperty, …). */
   kinds: string[];
   domains: string[];
   ranges: string[];
   supers: string[];
+  inverseOf: string[];
+  builtin: boolean;
+  observed: api.SchemaPredicate['observed'];
 };
 
 export type Schema = {
@@ -179,6 +194,10 @@ export type Schema = {
   roots: string[];
   properties: PropertyInfo[];
   ontology?: { iri: string; label?: string; version?: string; comment?: string };
+  snapshot: api.SchemaSummary['snapshot'];
+  selection: api.SchemaSummary['selection'];
+  totals: api.SchemaSummary['totals'];
+  cycles: string[][];
 };
 
 /**
@@ -213,101 +232,21 @@ export function reduceSupers(supers: Map<string, string[]>): Map<string, string[
 }
 
 /**
- * Ontology browser data. The hierarchy and property declarations come from asserted
- * triples only (`reasoning=false`): materialized RDFS/OWL inferences would add the
- * transitive closure of rdfs:subClassOf plus rdfs:Resource / owl:Thing everywhere.
- * Instance counts include inferences, so a superclass counts its subclasses' members.
+ * Roots of the class tree, most subclasses first, then by label or IRI: `seeds` (the
+ * server's roots) or, without seeds, the classes without superclasses; followed by one
+ * representative of every group of classes that is not reachable from them. Classes on
+ * a subClassOf cycle (A ⊑ B ⊑ A, or A ⊑ A) all have superclasses, so a cycle with no
+ * ordinary root above it would otherwise never be drawn. Expects `subs` to be the
+ * inverse of `supers`.
  */
-export async function loadSchema(ds: string): Promise<Schema> {
-  const asserted = { reasoning: false };
-  const [classRows, countRows, propRows, ontRows] = await Promise.all([
-    api.select(
-      ds,
-      `${P}
-SELECT DISTINCT ?c ?super ?label ?comment ?declared WHERE {
-  { ?c a owl:Class BIND(true AS ?declared) } UNION { ?c a rdfs:Class BIND(true AS ?declared) }
-  UNION { ?c rdfs:subClassOf ?x } UNION { ?x rdfs:subClassOf ?c }
-  UNION { ?x rdf:type ?c FILTER(?c NOT IN (owl:Class, rdfs:Class, owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:Ontology, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty, owl:InverseFunctionalProperty)) }
-  FILTER(isIRI(?c))
-  OPTIONAL { ?c rdfs:subClassOf ?super FILTER(isIRI(?super) && ?super != ?c) }
-  OPTIONAL { ?c rdfs:label ?label }
-  OPTIONAL { ?c rdfs:comment ?comment }
-}
-LIMIT 20000`,
-      { send: 20000, ...asserted },
-    ),
-    api.select(
-      ds,
-      `SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c } GROUP BY ?c LIMIT 5000`,
-      { send: 5000 },
-    ),
-    api.select(
-      ds,
-      `${P}
-SELECT DISTINCT ?p ?kind ?domain ?range ?label ?super WHERE {
-  { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty, owl:InverseFunctionalProperty)) }
-  UNION { ?p rdfs:domain ?d0 } UNION { ?p rdfs:range ?r0 } UNION { ?p rdfs:subPropertyOf ?s0 }
-  OPTIONAL { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty, owl:InverseFunctionalProperty)) }
-  OPTIONAL { ?p rdfs:domain ?domain }
-  OPTIONAL { ?p rdfs:range ?range }
-  OPTIONAL { ?p rdfs:subPropertyOf ?super }
-  OPTIONAL { ?p rdfs:label ?label }
-}
-LIMIT 20000`,
-      { send: 20000, ...asserted },
-    ),
-    api.select(
-      ds,
-      `${P}
-SELECT ?o ?label ?version ?comment WHERE {
-  ?o a owl:Ontology .
-  OPTIONAL { ?o rdfs:label|dcterms:title ?label }
-  OPTIONAL { ?o owl:versionInfo ?version }
-  OPTIONAL { ?o rdfs:comment|dcterms:description ?comment }
-} LIMIT 1`,
-      asserted,
-    ),
-  ]);
-
-  const classes = new Map<string, ClassInfo>();
-  const labelsBy = new Map<string, Term[]>();
-  const commentsBy = new Map<string, Term[]>();
-  const get = (iri: string) => {
-    let c = classes.get(iri);
-    if (!c) classes.set(iri, (c = { iri, supers: [], subs: [], instances: 0, declared: false }));
-    return c;
-  };
-  for (const r of classRows) {
-    const c = get(v(r.c)!);
-    if (r.declared) c.declared = true;
-    if (r.super && !c.supers.includes(v(r.super)!)) c.supers.push(v(r.super)!);
-    if (r.label) labelsBy.set(c.iri, [...(labelsBy.get(c.iri) ?? []), r.label]);
-    if (r.comment) commentsBy.set(c.iri, [...(commentsBy.get(c.iri) ?? []), r.comment]);
-  }
-  const reduced = reduceSupers(new Map([...classes.values()].map((c) => [c.iri, c.supers])));
-  for (const c of classes.values()) c.supers = reduced.get(c.iri) ?? c.supers;
-  for (const c of [...classes.values()]) {
-    for (const s of c.supers) {
-      const sup = get(s);
-      if (!sup.subs.includes(c.iri)) sup.subs.push(c.iri);
-    }
-    c.label = pickLabel(labelsBy.get(c.iri) ?? []);
-    c.comment = pickLabel(commentsBy.get(c.iri) ?? []);
-  }
-  for (const r of countRows) {
-    const c = r.c && classes.get(v(r.c)!);
-    if (c) c.instances = Number(v(r.n) ?? 0);
-  }
+export function hierarchyRoots(classes: Map<string, ClassInfo>, seeds?: string[]): string[] {
   const name = (c: ClassInfo) => (c.label ?? c.iri).toLowerCase();
   const byRank = (a: ClassInfo, b: ClassInfo) =>
     b.subs.length - a.subs.length || name(a).localeCompare(name(b));
-  const roots = [...classes.values()]
-    .filter((c) => c.supers.length === 0)
-    .sort(byRank)
-    .map((c) => c.iri);
-  // Classes on a subClassOf cycle (A ⊑ B ⊑ A, or A ⊑ A) all have superclasses, so a
-  // cycle with no ordinary root above it would be unreachable: promote one member of
-  // each such group to a root.
+  const initial = seeds
+    ? [...new Set(seeds)].flatMap((iri) => classes.get(iri) ?? [])
+    : [...classes.values()].filter((c) => c.supers.length === 0);
+  const roots = initial.sort(byRank).map((c) => c.iri);
   const reached = new Set<string>();
   const visit = (iri: string) => {
     const stack = [iri];
@@ -324,37 +263,185 @@ SELECT ?o ?label ?version ?comment WHERE {
     roots.push(c.iri);
     visit(c.iri);
   }
+  return roots;
+}
+
+/** Best label among literals (English or untagged first). */
+export function pickLit(lits: api.Lit[]): string | undefined {
+  return pickLabel(
+    lits.map((l) => ({
+      type: 'literal',
+      value: l.value,
+      ...(l.lang ? { 'xml:lang': l.lang } : {}),
+    })),
+  );
+}
+
+/**
+ * The explorer's schema model from a complete schema report. Built-in classes (rdf:,
+ * rdfs:, owl:, …) are kept only when they take part in the declared hierarchy, so
+ * `owl:Class` used as an rdf:type target does not show up as a class of the data while
+ * `owl:Thing` as a superclass does.
+ */
+export function schemaFromSummary(s: api.SchemaSummary): Schema {
+  const superOf = new Set(s.classes.items.flatMap((c) => c.declared.superClasses));
+  const kept = s.classes.items.filter(
+    (c) => !c.builtin || c.declared.superClasses.length > 0 || superOf.has(c.iri),
+  );
+  const cycleOf = new Map<string, string[]>();
+  for (const cycle of s.hierarchy.cycles)
+    for (const m of cycle)
+      cycleOf.set(
+        m,
+        cycle.filter((x) => x !== m),
+      );
+  const classes = new Map<string, ClassInfo>();
+  for (const c of kept) {
+    classes.set(c.iri, {
+      iri: c.iri,
+      label: pickLit(c.declared.labels),
+      comment: pickLit(c.declared.comments),
+      supers: [],
+      subs: [],
+      instances: c.observed.instances,
+      declared: c.declared.types.length > 0,
+      builtin: c.builtin,
+      assertedSupers: c.declared.superClasses,
+      equivalents: c.declared.equivalentClasses,
+      disjoint: c.declared.disjointWith,
+      cycle: cycleOf.get(c.iri) ?? [],
+    });
+  }
+  const reduced = reduceSupers(
+    new Map(
+      [...classes.values()].map((c) => [c.iri, c.assertedSupers.filter((x) => classes.has(x))]),
+    ),
+  );
+  for (const c of classes.values()) {
+    c.supers = reduced.get(c.iri) ?? [];
+    for (const sup of c.supers) classes.get(sup)!.subs.push(c.iri);
+  }
+  const roots = hierarchyRoots(classes, s.hierarchy.roots);
+  const name = (c: ClassInfo) => (c.label ?? c.iri).toLowerCase();
   for (const c of classes.values())
     c.subs.sort((a, b) => name(classes.get(a)!).localeCompare(name(classes.get(b)!)));
 
-  const props = new Map<string, PropertyInfo & { _labels: Term[] }>();
-  for (const r of propRows) {
-    if (!r.p) continue;
-    let p = props.get(v(r.p)!);
-    if (!p)
-      props.set(
-        v(r.p)!,
-        (p = { iri: v(r.p)!, kinds: [], domains: [], ranges: [], supers: [], _labels: [] }),
-      );
-    const add = (arr: string[], t?: Term) =>
-      t && t.type === 'uri' && !arr.includes(t.value) && arr.push(t.value);
-    add(p.kinds, r.kind);
-    add(p.domains, r.domain);
-    add(p.ranges, r.range);
-    add(p.supers, r.super);
-    if (r.label) p._labels.push(r.label);
-  }
-  const properties = [...props.values()]
-    .map(({ _labels, ...p }) => ({ ...p, label: pickLabel(_labels) }))
+  const properties = s.predicates.items
+    .map((p): PropertyInfo => ({
+      iri: p.iri,
+      label: pickLit(p.declared.labels),
+      comment: pickLit(p.declared.comments),
+      kinds: p.declared.types,
+      domains: p.declared.domains,
+      ranges: p.declared.ranges,
+      supers: p.declared.superProperties,
+      inverseOf: p.declared.inverseOf,
+      builtin: p.builtin,
+      observed: p.observed,
+    }))
     .sort((a, b) => (a.label ?? a.iri).localeCompare(b.label ?? b.iri));
 
-  const o = ontRows[0];
+  const o = s.ontology[0];
   return {
     classes,
     roots,
     properties,
-    ontology: o?.o
-      ? { iri: v(o.o)!, label: v(o.label), version: v(o.version), comment: v(o.comment) }
+    ontology: o
+      ? {
+          iri: o.iri,
+          label: pickLit(o.labels),
+          version: o.versionInfo[0]?.value,
+          comment: pickLit(o.comments),
+        }
       : undefined,
+    snapshot: s.snapshot,
+    selection: s.selection,
+    totals: s.totals,
+    cycles: s.hierarchy.cycles,
   };
+}
+
+/**
+ * Ontology browser data from the server's schema report (`/$/schema/{ds}`, all pages of
+ * one snapshot). Declarations are asserted ones only (the server's default): materialized
+ * RDFS/OWL would add the transitive closure of rdfs:subClassOf plus rdfs:Resource /
+ * owl:Thing everywhere. Instance counts include inferences unless `reasoning` is false.
+ */
+export async function loadSchema(
+  ds: string,
+  opts: { graph?: string; reasoning?: boolean } = {},
+): Promise<Schema> {
+  return schemaFromSummary(await api.schema(ds, { ...opts, limit: 5000 }));
+}
+
+/** One segment of a property's object-kind bar. */
+export type ObjectSegment = {
+  kind: 'iri' | 'blank' | 'triple' | 'literal';
+  /** Datatype IRI for literals. */
+  datatype?: string;
+  triples: number;
+  /** Share of the property's triples, 0–1. */
+  share: number;
+  /** Language tags (with direction) of language-tagged literals. */
+  languages: string[];
+};
+
+/** Object kinds and literal datatypes of a property, largest first. */
+export function objectSegments(o: api.SchemaPredicate['observed']): ObjectSegment[] {
+  const total = o.triples || 1;
+  const segs: ObjectSegment[] = [];
+  const kinds = [
+    ['iri', o.objects.iri],
+    ['blank', o.objects.blank],
+    ['triple', o.objects.tripleTerm],
+  ] as const;
+  for (const [kind, k] of kinds)
+    if (k?.triples)
+      segs.push({ kind, triples: k.triples, share: k.triples / total, languages: [] });
+  for (const l of o.objects.literals)
+    segs.push({
+      kind: 'literal',
+      datatype: l.datatype,
+      triples: l.triples,
+      share: l.triples / total,
+      languages: (l.languages ?? []).map((x) =>
+        x.direction ? `${x.lang}--${x.direction}` : x.lang,
+      ),
+    });
+  return segs.sort((a, b) => b.triples - a.triples);
+}
+
+export const OWL_FUNCTIONAL = 'http://www.w3.org/2002/07/owl#FunctionalProperty';
+
+/**
+ * Cardinality chips of a property. What was observed and what is declared are separate
+ * chips and never merged: at most one value per subject in this snapshot says nothing
+ * about the next write, and a declared owl:FunctionalProperty says nothing about the data.
+ */
+export function cardinalityChips(
+  p: PropertyInfo,
+): { kind: 'observed' | 'declared'; text: string; title: string }[] {
+  const chips: { kind: 'observed' | 'declared'; text: string; title: string }[] = [];
+  if (p.observed.triples > 0 && p.observed.maxPerSubject === 1)
+    chips.push({
+      kind: 'observed',
+      text: '≤1 per subject (observed)',
+      title: 'No constraint enforces this; a future write may add a second value.',
+    });
+  if (p.kinds.includes(OWL_FUNCTIONAL))
+    chips.push({
+      kind: 'declared',
+      text: 'functional (declared)',
+      title: 'Declared owl:FunctionalProperty in the data; not validated on write.',
+    });
+  return chips;
+}
+
+/** "as of version N · generation G · computed HH:MM" for the schema header. */
+export function snapshotLine(s: api.SchemaSummary['snapshot']): string {
+  const d = new Date(s.computedAt);
+  const at = Number.isNaN(d.getTime())
+    ? s.computedAt
+    : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return `as of version ${s.version} · generation ${s.generation} · computed ${at}`;
 }

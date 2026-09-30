@@ -23,6 +23,9 @@ addressed as `/{ds}`. JSON responses use `application/json`.
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | DELETE | `/$/datasets/{ds}`           | Remove dataset (and its files). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
+| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations; see [Schema discovery](#schema-discovery). |
+| GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
+| GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
 | POST   | `/$/backup/{ds}`             | Write gzipped N-Quads dump to `<data>/backups/`. Returns `Task`. |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`. Returns `Task`. |
@@ -62,6 +65,114 @@ type Task = {
   startedAt: string; finishedAt?: string; message?: string; progress?: number /*0..1*/;
 };
 ```
+
+## Schema discovery
+
+`GET /$/schema/{ds}` reports the classes and predicates of a dataset in two separate
+layers:
+
+* **observed**: exact counts over the selected graphs at one snapshot. A triple stored in
+  several selected graphs counts once. These are measurements of the current data, not
+  constraints: `maxPerSubject: 1` only says that no subject has two values *now*.
+* **declared**: what the RDFS/OWL vocabulary in the data asserts (`rdf:type` `owl:Class`,
+  `rdfs:subClassOf`, `rdfs:domain`, `owl:FunctionalProperty`, labels, …). Only IRI objects
+  are listed; blank-node class expressions (`owl:Restriction`, …) are counted in
+  `totals.anonymousClassExpressions`.
+
+A class is listed when it is an IRI object of `rdf:type` in the selection, is declared
+with `rdf:type rdfs:Class | owl:Class | rdfs:Datatype`, or is an IRI subject or object of
+`rdfs:subClassOf`, `owl:equivalentClass` or `owl:disjointWith`. A predicate is listed when
+it occurs in the selection (`observed.triples > 0`) or is declared (a property type,
+`rdfs:domain`/`range`/`subPropertyOf`, `owl:inverseOf`) with no triples. Nothing is
+truncated: every list reports its `total` and is paginated with a cursor.
+
+Parameters (all optional; the read-only server allows them):
+
+| Param | Values | Default | Meaning |
+|---|---|---|---|
+| `graph` | `default`, `union`, a graph IRI; also `urn:x-arq:DefaultGraph`, `urn:x-arq:UnionGraph` | `default` | Graphs whose triples are counted. `default` is every graph with `--union-default-graph`. A graph IRI with no quads → `404`. |
+| `declaredGraph` | same | same as `graph` | Graphs read for declarations (an ontology in its own named graph) |
+| `reasoning` | `true`, `false` | `true` if the dataset has materialized inferences | Count `urn:x-sparkles:inferred` as part of `default` / `union` |
+| `declared` | `asserted`, `all` | `asserted` | `all` also reads declarations from the inferred graph (which holds the transitive closure of `rdfs:subClassOf`, `rdfs:Resource` supers, …) |
+| `limit` | 1–10000 | 1000 | Page size (the summary uses it for both first pages) |
+| `cursor` | opaque | — | The `next` of the previous page; send the same selection parameters with it |
+| `timeout` | seconds | server query timeout | Budget for computing the report |
+
+```ts
+type SchemaSummary = {
+  schemaFormat: 1;                 // version of this JSON shape
+  dataset: string;
+  snapshot: { version: number;     // changes on every commit and compaction; restarts with the server
+              generation: string;  // base index generation
+              computedAt: string };// RFC 3339
+  selection: { graph: string; declaredGraph: string; reasoning: boolean; declared: "asserted" | "all" };
+  totals: { triples: number;       // distinct triples in the selection
+            classes: number; predicates: number;
+            anonymousTypeTargets: number;        // blank-node objects of rdf:type
+            anonymousClassExpressions: number }; // blank-node objects of class axioms, rdfs:domain, rdfs:range
+  ontology: { iri: string; labels: Lit[]; versionInfo: Lit[]; comments: Lit[] }[];  // every owl:Ontology
+  hierarchy: { roots: string[];    // classes with no declared superclass outside their own subClassOf cycle
+                                   // (one per cycle), most subclasses first, then by IRI
+               cycles: string[][] };// subClassOf cycles with more than one member (A ⊑ A is not a cycle)
+  classes: Page<ClassEntry>;
+  predicates: Page<PredicateEntry>;
+};
+type Page<T> = { items: T[]; total: number; next: string | null };  // items in IRI order
+type Lit = { value: string; lang?: string };
+
+type ClassEntry = {
+  iri: string;
+  builtin: boolean;                // rdf:, rdfs:, owl:, xsd: or sh: namespace
+  observed: { instances: number }; // distinct subjects with rdf:type C (no subclass roll-up)
+  declared: { types: string[];     // subset of rdfs:Class, owl:Class, rdfs:Datatype
+              superClasses: string[]; equivalentClasses: string[]; disjointWith: string[];
+              labels: Lit[]; comments: Lit[] };
+};
+type PredicateEntry = {
+  iri: string;
+  builtin: boolean;
+  observed: {
+    triples: number; distinctSubjects: number; distinctObjects: number;
+    maxPerSubject: number;         // largest number of distinct objects of one subject, in this snapshot
+    subjectsWithMultiple: number;  // subjects with two or more distinct objects
+    objects: {
+      iri?: KindCount; blank?: KindCount; tripleTerm?: KindCount;
+      literals: { datatype: string;  // xsd:string for simple literals; rdf:langString / rdf:dirLangString
+                  triples: number; distinct: number;  // distinct terms: "01"^^xsd:integer ≠ "1"^^xsd:integer
+                  languages?: { lang: string; direction?: "ltr" | "rtl"; triples: number }[] }[];
+    };
+  };
+  declared: { types: string[];     // rdf:Property, owl:ObjectProperty, owl:FunctionalProperty, …
+              domains: string[]; ranges: string[]; superProperties: string[]; inverseOf: string[];
+              labels: Lit[]; comments: Lit[] };
+};
+type KindCount = { triples: number; distinct: number };
+```
+
+**Pagination.** Every page of a listing comes from the report of one snapshot. The
+server keeps the last report per dataset; the summary and a page request without a
+cursor reuse it while the snapshot and the selection are unchanged, and compute a new one
+otherwise. A cursor from an older snapshot is still served while that report is the one
+kept; once a newer report replaces it the request fails with `409` and the client
+restarts from the first page. Cursors do not survive a restart.
+
+**Errors** (`{ "error" }` body): `400` for a bad parameter, a malformed cursor or a
+cursor issued for other selection parameters; `404` for an unknown dataset or a graph
+with no quads; `408` when the report did not finish within `timeout`
+(`"schema discovery exceeded 60s while scanning predicates (412/9031); narrow graph= or
+raise timeout="`); `409` as above; `413` when there are more than `--schema-max-entries`
+(default 1,000,000) classes or predicates (`"dataset has 1204331 classes (limit
+1000000)"`). A report is never returned partially.
+
+The counts come from one ordered pass over the PSO and one over the POS index per
+predicate, so a report costs about two sequential reads of the selected triples.
+
+The CLI equivalent prints the complete report without pagination:
+`sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
+[--no-inferences] [--declared asserted|all] [--format text|json] [--timeout S]
+[--max-entries N]` (or `--data FILE…`). `json` is the `SchemaSummary` with every item and
+`next: null`; `text` prints one line per class and per predicate. It exits with status 2
+when the timeout or the entry cap is exceeded. In Rust, `sparkles::schema::discover`.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
