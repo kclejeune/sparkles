@@ -70,6 +70,9 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Largest number of classes, and of predicates, a schema report may have
+        #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
+        schema_max_entries: usize,
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
@@ -147,6 +150,37 @@ enum Cmd {
         #[arg(long)]
         clear: bool,
     },
+    /// Print the schema of a database (or data files): classes and predicates with exact
+    /// counts and their RDFS/OWL declarations; exits with status 2 when a budget is exceeded
+    Schema {
+        /// Database directory
+        #[arg(long)]
+        loc: Option<PathBuf>,
+        /// Data files (loaded into memory)
+        #[arg(long)]
+        data: Vec<PathBuf>,
+        /// Graph whose triples are counted: `default`, `union` (all graphs) or a graph IRI
+        #[arg(long, default_value = "default")]
+        graph: String,
+        /// Graph read for declarations (default: the same as --graph)
+        #[arg(long)]
+        declared_graph: Option<String>,
+        /// Leave materialized inferences (`urn:x-sparkles:inferred`) out of the counts
+        #[arg(long)]
+        no_inferences: bool,
+        /// Declarations to read: `asserted`, or `all` (including inferred ones)
+        #[arg(long, default_value = "asserted")]
+        declared: String,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Timeout in seconds
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Largest number of classes, and of predicates
+        #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
+        max_entries: usize,
+    },
     /// Validate a database (or data files) against a SHACL shapes graph; exits with
     /// status 1 when the data does not conform
     Shacl {
@@ -211,10 +245,12 @@ fn main() -> Result<()> {
             read_only,
             no_service,
             idle_release_ms,
+            schema_max_entries,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
             st.allow_service = !no_service;
+            st.schema_max_entries = schema_max_entries;
             let st = Arc::new(st);
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -471,6 +507,84 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Schema {
+            loc,
+            data,
+            graph,
+            declared_graph,
+            no_inferences,
+            declared,
+            format,
+            timeout,
+            max_entries,
+        } => {
+            use sparkles::index::Perm;
+            use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
+            let json = match format.as_str() {
+                "json" => true,
+                "text" => false,
+                f => bail!("unknown format '{f}' (text or json)"),
+            };
+            let declared_from_inferred = match declared.as_str() {
+                "asserted" => false,
+                "all" => true,
+                d => bail!("--declared must be asserted or all, not '{d}'"),
+            };
+            let name = loc
+                .as_deref()
+                .and_then(|l| l.file_name())
+                .map_or_else(|| "data".to_string(), |f| f.to_string_lossy().into_owned());
+            let store = open_or_load(loc, &data, opts)?;
+            let snap = store.snapshot();
+            let sopts = SchemaOptions {
+                graph: GraphSelection::parse(&graph).map_err(anyhow::Error::msg)?,
+                declared_graph: declared_graph
+                    .as_deref()
+                    .map(GraphSelection::parse)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+                inferred_graph: Some(http::INFERRED_GRAPH.to_string()),
+                include_inferred: !no_inferences
+                    && snap
+                        .lookup_iri(http::INFERRED_GRAPH)
+                        .is_some_and(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0),
+                declared_from_inferred,
+                deadline: timeout.map(|t| Instant::now() + Duration::from_secs_f64(t)),
+                cancel: None,
+                max_entries,
+            };
+            let report = match sparkles::schema::discover(&snap, &sopts) {
+                Ok(r) => r,
+                Err(e @ (SchemaError::Timeout { .. } | SchemaError::TooManyEntries { .. })) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = std::io::stdout().lock();
+            if json {
+                // every item on one page
+                let summary = report.summary(
+                    &name,
+                    Page {
+                        items: &report.classes,
+                        total: report.classes.len(),
+                        next: None,
+                    },
+                    Page {
+                        items: &report.predicates,
+                        total: report.predicates.len(),
+                        next: None,
+                    },
+                );
+                serde_json::to_writer_pretty(&mut out, &summary)?;
+                writeln!(out)?;
+            } else {
+                print_schema(&mut out, &report)?;
+            }
+            out.flush()?;
+            Ok(())
+        }
         #[cfg(not(feature = "shacl"))]
         Cmd::Shacl { .. } => bail!("built without the `shacl` feature"),
         #[cfg(feature = "shacl")]
@@ -511,6 +625,81 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `sparkles schema --format text`: one line per class and per predicate.
+fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Result<()> {
+    let s = &r.selection;
+    writeln!(
+        out,
+        "# version {} · generation {} · computed {}",
+        r.snapshot.version, r.snapshot.generation, r.snapshot.computed_at
+    )?;
+    writeln!(
+        out,
+        "# graph {} · declarations from {} ({}) · inferences {}",
+        s.graph,
+        s.declared_graph,
+        s.declared,
+        if s.reasoning { "included" } else { "excluded" }
+    )?;
+    let t = &r.totals;
+    writeln!(
+        out,
+        "# {} triples · {} classes · {} predicates",
+        t.triples, t.classes, t.predicates
+    )?;
+    for o in &r.ontology {
+        let version = o.version_info.first().map(|v| v.value.as_str());
+        writeln!(out, "# ontology <{}> {}", o.iri, version.unwrap_or(""))?;
+    }
+    writeln!(out, "\nclasses ({}):", r.classes.len())?;
+    for c in &r.classes {
+        write!(out, "  <{}>  instances {}", c.iri, c.observed.instances)?;
+        if !c.declared.super_classes.is_empty() {
+            write!(out, "  ⊑ {}", c.declared.super_classes.join(", "))?;
+        }
+        if c.declared.types.is_empty() {
+            write!(out, "  (undeclared)")?;
+        }
+        writeln!(out)?;
+    }
+    for cycle in &r.hierarchy.cycles {
+        writeln!(out, "  cycle: {}", cycle.join(" ⊑ "))?;
+    }
+    writeln!(out, "\npredicates ({}):", r.predicates.len())?;
+    for p in &r.predicates {
+        let o = &p.observed;
+        let mut kinds: Vec<String> = Vec::new();
+        for (name, k) in [
+            ("iri", o.objects.iri),
+            ("blank", o.objects.blank),
+            ("triple", o.objects.triple_term),
+        ] {
+            if let Some(k) = k {
+                kinds.push(format!("{name} {}", k.triples));
+            }
+        }
+        for l in &o.objects.literals {
+            let dt = l.datatype.rsplit(['#', '/']).next().unwrap_or(&l.datatype);
+            kinds.push(format!("{dt} {}", l.triples));
+        }
+        writeln!(
+            out,
+            "  <{}>  triples {}  S {}  O {}  max/subject {}{}",
+            p.iri,
+            o.triples,
+            o.distinct_subjects,
+            o.distinct_objects,
+            o.max_per_subject,
+            if kinds.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", kinds.join(", "))
+            }
+        )?;
+    }
+    Ok(())
 }
 
 /// A database directory, or the given files loaded into an in-memory store.

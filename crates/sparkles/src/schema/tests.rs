@@ -476,6 +476,36 @@ fn budgets() {
 }
 
 #[test]
+fn many_vocabulary_literals() {
+    // more distinct base-vocabulary literals than one batched key lookup
+    let data: String = (0..10_000)
+        .map(|i| match i % 3 {
+            0 => format!("ex:s{i} ex:v \"s{i}\" .\n"),
+            1 => format!("ex:s{i} ex:v \"l{i}\"@de .\n"),
+            _ => format!("ex:s{i} ex:v \"{i}\"^^xsd:gYear .\n"),
+        })
+        .collect();
+    let s = store_with(&data);
+    let r = report(&s, &SchemaOptions::default());
+    let v = &pred(&r, &ex("v")).observed;
+    assert_eq!((v.triples, v.distinct_objects), (10_000, 10_000));
+    let groups: Vec<(&str, u64, u64)> = v
+        .objects
+        .literals
+        .iter()
+        .map(|g| (g.datatype.as_str(), g.triples, g.distinct))
+        .collect();
+    assert_eq!(
+        groups,
+        vec![
+            (RDF_LANG_STRING, 3333, 3333),
+            ("http://www.w3.org/2001/XMLSchema#gYear", 3333, 3333),
+            (XSD_STRING, 3334, 3334),
+        ]
+    );
+}
+
+#[test]
 fn graph_selection_parsing() {
     assert_eq!(graph("default"), GraphSelection::Default);
     assert_eq!(graph("urn:x-arq:DefaultGraph"), GraphSelection::Default);
