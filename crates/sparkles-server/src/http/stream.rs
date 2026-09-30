@@ -122,7 +122,10 @@ where
     let span = tracing::Span::current();
     let t0 = Instant::now();
     tokio::task::spawn_blocking(move || {
-        let _span = span.enter();
+        // released before the body is handed over: this may be the request span's last
+        // handle, and the span ends (and is exported) when that drops, which must come
+        // before the client can see the response
+        let span = span.entered();
         let sw = SwitchWriter {
             buf: Vec::new(),
             threshold,
@@ -139,11 +142,13 @@ where
         match (sw.tx.take(), result) {
             (None, Ok(())) => {
                 let body = std::mem::take(&mut sw.buf);
+                drop(span);
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Whole(body));
                 }
             }
             (None, Err(e)) => {
+                drop(span);
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Failed(e));
                 }
@@ -162,6 +167,7 @@ where
                     error,
                     disconnected,
                 });
+                drop(span);
                 if let Some(msg) = abort {
                     // an error item aborts the response: the client sees a truncated
                     // transfer rather than a complete-looking one
