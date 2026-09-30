@@ -533,17 +533,23 @@ fn verify_exit_codes() {
     expect(h, &["repo", "locks", &url, "--break", "nope"], 1);
 }
 
+/// Some file under `dir`, searching every subdirectory (GC can leave empty ones behind).
 fn first_file(dir: &Path) -> PathBuf {
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
-        let p = e.path();
-        if p.is_file() {
-            return p;
+    fn find(dir: &Path) -> Option<PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                return Some(p);
+            }
+            if p.is_dir()
+                && let Some(f) = find(&p)
+            {
+                return Some(f);
+            }
         }
-        if p.is_dir() {
-            return first_file(&p);
-        }
+        None
     }
-    panic!("no file under {}", dir.display())
+    find(dir).unwrap_or_else(|| panic!("no file under {}", dir.display()))
 }
 
 #[test]
