@@ -531,9 +531,39 @@ pub struct Store {
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
+    /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
+    _lock: Option<File>,
 }
 
 const WAL_INSERT: u8 = 1;
+
+/// Take the exclusive process lock of a database directory.
+fn lock_dir(root: &Path) -> Result<File> {
+    let path = root.join("sparkles.lock");
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match f.try_lock() {
+        Ok(()) => {
+            f.set_len(0)?;
+            writeln!(f, "{}", std::process::id())?;
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut pid = String::new();
+            let _ = File::open(&path).and_then(|mut f| f.read_to_string(&mut pid));
+            Err(Error::Invalid(format!(
+                "database {} is in use by another process (pid {}); stop it or talk to it over HTTP",
+                root.display(),
+                pid.trim()
+            )))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
 const WAL_DELETE: u8 = 2;
 const WAL_COMMIT: u8 = 3;
 const WAL_REC: usize = 1 + 32;
@@ -566,6 +596,7 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(BTreeMap::new()),
+            _lock: None,
             opts,
         }
     }
@@ -573,6 +604,7 @@ impl Store {
     /// Open (or create) a persistent store rooted at `root`.
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Store> {
         std::fs::create_dir_all(root)?;
+        let lock = lock_dir(root)?;
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             // create an empty generation
@@ -667,6 +699,7 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            _lock: Some(lock),
             opts,
         })
     }
@@ -1361,6 +1394,18 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let ps = s.predicate_stat(old_p.0).unwrap();
         assert_eq!(ps.count, 5);
         assert_eq!(ps.distinct_subjects, 3);
+    }
+
+    #[test]
+    fn database_directory_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let err = Store::open(dir.path(), StoreOptions::default())
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(a);
+        Store::open(dir.path(), StoreOptions::default()).unwrap();
     }
 
     #[test]
