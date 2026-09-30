@@ -540,19 +540,31 @@ impl PermIndex {
         prefix: &[u64],
         mut f: impl FnMut(&Block, usize, usize) -> Result<()>,
     ) -> Result<()> {
+        self.for_each_range_until(cache, prefix, |b, s, e| f(b, s, e).map(|()| true))
+    }
+
+    /// Like [`for_each_range`](Self::for_each_range), but stops (without decoding further
+    /// blocks) as soon as the callback returns `false`.
+    pub fn for_each_range_until(
+        &self,
+        cache: &BlockCache,
+        prefix: &[u64],
+        mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
         let (lo, hi) = self.block_range(prefix);
         let lo_key = pad(prefix, 0);
         let hi_key = pad(prefix, u64::MAX);
         for b in lo..hi {
             let m = &self.blocks[b];
             let blk = cache.get(self, b)?;
-            if m.first >= lo_key && m.last <= hi_key {
-                f(&blk, 0, blk.len())?;
+            let go_on = if m.first >= lo_key && m.last <= hi_key {
+                f(&blk, 0, blk.len())?
             } else {
                 let (s, e) = blk.prefix_range(prefix);
-                if s < e {
-                    f(&blk, s, e)?;
-                }
+                s >= e || f(&blk, s, e)?
+            };
+            if !go_on {
+                break;
             }
         }
         Ok(())

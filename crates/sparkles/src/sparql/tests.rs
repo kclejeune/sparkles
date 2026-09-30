@@ -243,6 +243,41 @@ fn rdf12_triple_terms() {
     }
 }
 
+fn has_desc(p: &PlanInfo, needle: &str) -> bool {
+    p.description.contains(needle) || p.children.iter().any(|c| has_desc(c, needle))
+}
+
+#[test]
+fn limit_and_ask_stop_early() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut nt = String::new();
+    for i in 0..5000 {
+        nt.push_str(&format!("<http://ex.org/s{i}> <http://ex.org/p> {i} .\n<http://ex.org/s{i}> <http://ex.org/q> <http://ex.org/o{}> .\n", i % 7));
+    }
+    s.load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
+        .unwrap();
+    let r = q(&s, "SELECT * WHERE { ?s ?p ?o } LIMIT 10");
+    assert_eq!(r.table.len(), 10);
+    assert!(has_desc(&r.plan, "stopped early"));
+    let r = q(
+        &s,
+        "SELECT ?s WHERE { ?s ex:p ?v FILTER(?v > 4000) } LIMIT 5 OFFSET 2",
+    );
+    assert_eq!(r.table.len(), 5);
+    let r = q(&s, "SELECT ?s ?o WHERE { ?s ex:p ?v . ?s ex:q ?o } LIMIT 3");
+    assert_eq!(r.table.len(), 3);
+    assert!(q(&s, "ASK { ?s ex:q ex:o3 }").boolean);
+    assert!(!q(&s, "ASK { ?s ex:q ex:o9 }").boolean);
+    // a limit larger than the result returns everything
+    let r = q(
+        &s,
+        "SELECT ?s WHERE { ?s ex:p ?v FILTER(?v < 20) } LIMIT 100",
+    );
+    assert_eq!(r.table.len(), 20);
+    let r = q(&s, "SELECT DISTINCT ?o WHERE { ?s ex:q ?o } LIMIT 100");
+    assert_eq!(r.table.len(), 7);
+}
+
 #[test]
 fn bgp_join() {
     let s = store();

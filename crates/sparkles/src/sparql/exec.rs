@@ -204,6 +204,16 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::Project(vars) => child(0, &mut infos)?.project(vars),
         Kind::Distinct => distinct(child(0, &mut infos)?),
+        Kind::Slice {
+            offset,
+            limit: Some(limit),
+        } => {
+            // LIMIT without ORDER BY: any `offset + limit` solutions will do, so the
+            // input is computed with early termination
+            let (t, info, _) = execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
+            infos.push(info);
+            t.slice(*offset, Some(*limit))
+        }
         Kind::Slice { offset, limit } => child(0, &mut infos)?.slice(*offset, *limit),
         Kind::Group { keys, aggs } => {
             let t = child(0, &mut infos)?;
@@ -376,6 +386,145 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
 }
 
 fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
+    Ok(scan_limited(ctx, spec, vars, None)?.0)
+}
+
+/// Apply a row-preserving / row-reducing unary operator to its input.
+fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table) -> Result<Table> {
+    Ok(match &n.kind {
+        Kind::Filter(exprs) => {
+            apply_filter(ctx, &mut t, exprs);
+            t
+        }
+        Kind::Extend(v, e) => {
+            let col = compute_column(ctx, &t, e);
+            t.vars.push(*v);
+            t.cols.push(col);
+            t
+        }
+        Kind::Project(vars) => t.project(vars),
+        Kind::Unpack { t: tv, parts } => unpack(ctx, t, *tv, parts, &n.vars)?,
+        Kind::Distinct => distinct(t),
+        _ => unreachable!("not a unary streaming operator"),
+    })
+}
+
+/// Execute `n` so that it produces at least `want` solutions if it has that many; any
+/// subset of the solutions is acceptable (LIMIT without ORDER BY, ASK, EXISTS). Scans stop
+/// early; operators whose output over a prefix of their input is a subset of their full
+/// output re-run with a geometrically growing input budget until they have enough rows.
+/// Returns `(table, info, complete)`; `complete` means no further rows exist.
+fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo, bool)> {
+    ctx.check()?;
+    let start = Instant::now();
+    let finish = |t: Table, children: Vec<PlanInfo>, complete: bool| {
+        let mut info = describe(ctx, n);
+        info.children = children;
+        info.actual_rows = t.len() as i64;
+        info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if !complete {
+            info.description = format!("{} [stopped early]", info.description);
+        }
+        Ok((t, info, complete))
+    };
+    match &n.kind {
+        Kind::Scan(spec) => {
+            let (t, truncated) = scan_limited(ctx, spec, &n.vars, Some(want))?;
+            finish(t, Vec::new(), !truncated)
+        }
+        Kind::Filter(_)
+        | Kind::Extend(..)
+        | Kind::Project(_)
+        | Kind::Unpack { .. }
+        | Kind::Distinct => {
+            let mut budget = want.max(64);
+            loop {
+                let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
+                let out = apply_unary(ctx, n, input)?;
+                if out.len() >= want || complete {
+                    return finish(out, vec![cinfo], complete);
+                }
+                budget = budget.saturating_mul(8);
+            }
+        }
+        Kind::Join { algo, .. } => {
+            // limit the (estimated) larger side, compute the other one fully
+            let lim = if n.children[0].est >= n.children[1].est {
+                0
+            } else {
+                1
+            };
+            let (other, oinfo) = execute(ctx, &n.children[1 - lim])?;
+            if other.is_empty() {
+                let mut e = Table::empty(n.vars.clone());
+                e.sorted.clear();
+                return finish(e, vec![describe(ctx, &n.children[lim]), oinfo], true);
+            }
+            let mut budget = want.max(64);
+            loop {
+                let (part, pinfo, complete) = execute_limited(ctx, &n.children[lim], budget)?;
+                let (l, r) = if lim == 0 {
+                    (&part, &other)
+                } else {
+                    (&other, &part)
+                };
+                let out = match algo {
+                    JoinAlgo::Cross => cross(ctx, l, r)?,
+                    JoinAlgo::Merge => join_tables(ctx, l, r, &[], true)?,
+                    JoinAlgo::Hash => join_tables(ctx, l, r, &[], false)?,
+                };
+                if out.len() >= want || complete {
+                    let infos = if lim == 0 {
+                        vec![pinfo, oinfo]
+                    } else {
+                        vec![oinfo, pinfo]
+                    };
+                    return finish(out, infos, complete);
+                }
+                budget = budget.saturating_mul(8);
+            }
+        }
+        Kind::Union => {
+            let mut out = Table::new(n.vars.clone());
+            let mut infos = Vec::new();
+            let mut complete = true;
+            for (i, c) in n.children.iter().enumerate() {
+                if out.len() >= want {
+                    complete = false;
+                    infos.extend(n.children[i..].iter().map(|c| describe(ctx, c)));
+                    break;
+                }
+                let (t, info, c_complete) = execute_limited(ctx, c, want - out.len())?;
+                complete &= c_complete;
+                infos.push(info);
+                out.append(t);
+            }
+            finish(out, infos, complete)
+        }
+        Kind::Slice {
+            offset,
+            limit: Some(limit),
+        } => {
+            let (t, info, _) = execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
+            // the slice's output does not grow with a larger budget
+            finish(t.slice(*offset, Some(*limit)), vec![info], true)
+        }
+        _ => {
+            let (t, info) = execute(ctx, n)?;
+            Ok((t, info, true))
+        }
+    }
+}
+
+/// Scan with an optional row limit; returns `(table, truncated)`.
+fn scan_limited(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    vars: &[VarId],
+    limit: Option<usize>,
+) -> Result<(Table, bool)> {
+    let limit = limit.unwrap_or(usize::MAX);
+    let mut truncated = false;
     let mut t = Table::new(vars.to_vec());
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut last: Option<[u64; 4]> = None;
@@ -403,8 +552,13 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
         t.len += 1;
     };
     ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
+        if t.len >= limit {
+            truncated = true;
+            return Ok(false);
+        }
         match chunk {
             Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
+                let e = e.min(s.saturating_add(limit - t.len));
                 for (c, &kc) in kcs.iter().enumerate() {
                     t.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                 }
@@ -427,9 +581,14 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
             ctx.check()?;
             ctx.check_rows(t.len())?;
         }
+        if t.len >= limit {
+            // there may be more matching rows after this point
+            truncated = true;
+            return Ok(false);
+        }
         Ok(true)
     })?;
-    Ok(t)
+    Ok((t, truncated))
 }
 
 // ------------------------------------------------------------------ joins ------

@@ -226,9 +226,9 @@ impl Snapshot {
         let base = self.perm(perm);
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_range(&self.cache, prefix, |blk, s, e| {
+            let r = base.for_each_range_until(&self.cache, prefix, |blk, s, e| {
                 if stop {
-                    return Ok(());
+                    return Ok(!stop);
                 }
                 let last = blk.key(e - 1);
                 let ins_hit = ins.peek().is_some_and(|k| **k <= last);
@@ -237,7 +237,7 @@ impl Snapshot {
                     if !f(Chunk::Block(blk, s, e))? {
                         stop = true;
                     }
-                    return Ok(());
+                    return Ok(!stop);
                 }
                 // merge row by row
                 let mut run_start = s;
@@ -254,12 +254,12 @@ impl Snapshot {
                     if flush_before || skip {
                         if run_start < i && !f(Chunk::Block(blk, run_start, i))? {
                             stop = true;
-                            return Ok(());
+                            return Ok(!stop);
                         }
                         while let Some(x) = ins.peek().filter(|x| ***x < k) {
                             if !f(Chunk::Row(**x))? {
                                 stop = true;
-                                return Ok(());
+                                return Ok(!stop);
                             }
                             ins.next();
                         }
@@ -278,7 +278,7 @@ impl Snapshot {
                 if run_start < e && !f(Chunk::Block(blk, run_start, e))? {
                     stop = true;
                 }
-                Ok(())
+                Ok(!stop)
             });
             r?;
         }
