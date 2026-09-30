@@ -258,7 +258,11 @@ impl Default for GcOptions {
 
 /// The current time as RFC 3339 with milliseconds (UTC).
 pub fn now_rfc3339() -> String {
-    sparkles::builder::now_rfc3339()
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    sparkles::commit::rfc3339_ms(ms)
 }
 
 #[cfg(test)]
