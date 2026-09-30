@@ -451,7 +451,7 @@ async fn dataset_root(
     if params.has("update") || ct == "application/sparql-update" {
         return update_endpoint(st, Path(name), uri, headers, body).await;
     }
-    gsp(st, Path(name), method, uri, headers, body).await
+    gsp(st, Path(name), method, uri, headers, body.into()).await
 }
 
 async fn query_endpoint(
@@ -1030,6 +1030,80 @@ fn gsp_target(params: &Params) -> Target {
     }
 }
 
+/// Request bodies up to this size are kept in memory; larger ones go to a temp file.
+const SPOOL_AFTER: usize = 16 << 20;
+
+/// A request body: in memory, or spooled to a temporary file that lives as long as this.
+enum Spooled {
+    Memory(Vec<u8>),
+    File(tempfile::NamedTempFile),
+}
+
+impl Spooled {
+    /// The body as an RDF source, and the temporary file to keep until it is read.
+    fn into_source(
+        self,
+        format: RdfFormat,
+        graph: Option<oxrdf::NamedNode>,
+    ) -> (Source, Option<tempfile::NamedTempFile>) {
+        match self {
+            Spooled::Memory(b) => (Source::from_bytes(b, format, graph), None),
+            Spooled::File(f) => (
+                Source {
+                    data: sparkles::io::SourceData::File(f.path().to_path_buf()),
+                    format,
+                    gzip: false,
+                    graph,
+                    base: None,
+                    name: "<request body>".into(),
+                },
+                Some(f),
+            ),
+        }
+    }
+}
+
+/// Read a request body, spooling it to a temporary file once it passes
+/// [`SPOOL_AFTER`] bytes, so a large upload is never held in memory whole. Large
+/// sources then take the bulk path, which parses them as a stream.
+async fn spool(body: axum::body::Body) -> ApiResult<Spooled> {
+    spool_after(body, SPOOL_AFTER).await
+}
+
+async fn spool_after(body: axum::body::Body, limit: usize) -> ApiResult<Spooled> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    let mut file: Option<tempfile::NamedTempFile> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        match &mut file {
+            Some(f) => f.write_all(&chunk).map_err(io)?,
+            None => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > limit {
+                    let mut f = tempfile::Builder::new()
+                        .prefix("sparkles-body-")
+                        .tempfile()
+                        .map_err(io)?;
+                    f.write_all(&buf).map_err(io)?;
+                    buf = Vec::new();
+                    file = Some(f);
+                }
+            }
+        }
+    }
+    Ok(match file {
+        Some(mut f) => {
+            f.flush().map_err(io)?;
+            Spooled::File(f)
+        }
+        None => Spooled::Memory(buf),
+    })
+}
+
 /// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
 /// snapshot, serialized while scanning (see [`stream`]), so no result-size budget
 /// applies. Returns the body and, for a body returned whole, its bytes and quads.
@@ -1109,7 +1183,7 @@ async fn gsp(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -1172,6 +1246,7 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
+            let body = spool(body).await?;
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -1180,7 +1255,7 @@ async fn gsp(
                     ),
                     _ => None,
                 };
-                let src = Source::from_bytes(body.to_vec(), format, graph.clone());
+                let (src, _spooled) = body.into_source(format, graph.clone());
                 use sparkles::commit::CommitKind;
                 let (count, receipt) = if replace {
                     // parse first, then clear and insert atomically
@@ -1279,7 +1354,7 @@ async fn upload(
         let mut mp = Multipart::from_request(request, &())
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        while let Some(field) = mp
+        while let Some(mut field) = mp
             .next_field()
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
@@ -1300,13 +1375,20 @@ async fn upload(
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "upload.ttl".into());
-                    let data = field
-                        .bytes()
-                        .await
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    // copied chunk by chunk: an upload is never held in memory whole
                     let path = tmp.path().join(format!("{}-{fname}", files.len()));
-                    std::fs::write(&path, &data)
-                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    let io =
+                        |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                    let mut out =
+                        std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
+                    while let Some(chunk) = field
+                        .chunk()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
+                    {
+                        std::io::Write::write_all(&mut out, &chunk).map_err(io)?;
+                    }
+                    std::io::Write::flush(&mut out).map_err(io)?;
                     files.push(path);
                 }
             }
@@ -1319,9 +1401,7 @@ async fn upload(
                 format!("unsupported content type '{ct}'"),
             )
         })?;
-        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let body = spool_after(request.into_body(), 0).await?;
         let ext = match format {
             RdfFormat::NTriples => "nt",
             RdfFormat::NQuads => "nq",
@@ -1331,8 +1411,13 @@ async fn upload(
             _ => "ttl",
         };
         let path = tmp.path().join(format!("body.{ext}"));
-        std::fs::write(&path, &bytes)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        match body {
+            Spooled::File(f) => {
+                f.persist(&path).map_err(|e| io(e.error))?;
+            }
+            Spooled::Memory(b) => std::fs::write(&path, b).map_err(io)?,
+        }
         files.push(path);
     }
     if files.is_empty() {
@@ -2117,6 +2202,30 @@ async fn shacl() -> ApiResult {
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
+
+#[cfg(test)]
+mod spool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn large_bodies_are_spooled_to_a_file() {
+        let data: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let Ok(small) = spool_after(axum::body::Body::from(data.clone()), 1 << 20).await else {
+            panic!("spooling failed")
+        };
+        assert!(matches!(&small, Spooled::Memory(b) if *b == data));
+        let Ok(Spooled::File(f)) = spool_after(axum::body::Body::from(data.clone()), 100).await
+        else {
+            panic!("expected a file")
+        };
+        assert_eq!(std::fs::read(f.path()).unwrap(), data);
+        let path = f.path().to_path_buf();
+        let (src, guard) = Spooled::File(f).into_source(RdfFormat::NTriples, None);
+        assert!(matches!(src.data, sparkles::io::SourceData::File(ref p) if *p == path));
+        drop(guard);
+        assert!(!path.exists(), "the temporary file goes with its guard");
+    }
+}
 
 #[cfg(test)]
 mod tests {

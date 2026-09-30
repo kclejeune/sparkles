@@ -735,6 +735,12 @@ server memory stays flat; an error after that point (e.g. the budget exceeded at
 aborts the transfer, and the client sees a truncated response instead of a status code.
 A query result whose smallest encoding already exceeds the budget is refused with `507`
 before anything is sent. A client that disconnects stops the serialization.
+
+**Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
+written to a temporary file as they arrive rather than held in memory. A large PUT
+(estimated above the bulk threshold) replaces its graphs in one index rebuild that parses
+the body as a stream; like every write it is atomic, so a parse error leaves the data as
+it was.
 * `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
 
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`

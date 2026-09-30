@@ -1300,18 +1300,7 @@ impl Store {
     /// [`load`](Self::load), recording the commit as `kind`.
     pub fn load_as(&self, sources: &[Source], kind: CommitKind) -> Result<Receipt> {
         let snap = self.snapshot();
-        let mut size_hint: u64 = 0;
-        for s in sources {
-            size_hint += match &s.data {
-                crate::io::SourceData::Bytes(b) => b.len() as u64,
-                crate::io::SourceData::File(p) => {
-                    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-                }
-            } * if s.gzip { 8 } else { 1 };
-        }
-        // ~80 bytes per quad in text formats
-        let est_quads = size_hint / 80;
-        if snap.is_empty() || est_quads > self.opts.bulk_threshold {
+        if snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold {
             let mut w = self.writer.lock();
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -1323,7 +1312,7 @@ impl Store {
                 start_len: snap.len(),
             };
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], Some(bulk))?
+                .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk))?
                 .1)
         } else {
             let mut txn = self.write_as(kind);
@@ -1359,6 +1348,9 @@ impl Store {
         sources: &[Source],
         kind: CommitKind,
     ) -> Result<(u64, Receipt)> {
+        if estimated_quads(sources) > self.opts.bulk_threshold {
+            return self.replace_bulk(target, sources, kind);
+        }
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
         for s in sources {
@@ -1399,6 +1391,44 @@ impl Store {
         Ok((n, r))
     }
 
+    /// A large replace: one rebuild that leaves out the target graphs and adds the
+    /// sources, parsed as a stream by the bulk builder. Atomic like every rebuild: a parse
+    /// error leaves the store as it was.
+    fn replace_bulk(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+    ) -> Result<(u64, Receipt)> {
+        let mut w = self.writer.lock();
+        if w.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let snap = self.snapshot();
+        let graphs: Vec<Id> = match &target {
+            ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
+            ReplaceTarget::Named(n) => snap.lookup_iri(n.as_str()).into_iter().collect(),
+            ReplaceTarget::All => {
+                let mut v = snap.graph_ids()?;
+                v.push(Id::DEFAULT_GRAPH);
+                v
+            }
+        };
+        let mut dropped = 0;
+        for g in &graphs {
+            dropped += snap.count(Perm::Gspo, &[g.0])?;
+        }
+        let start_len = snap.len();
+        let bulk = BulkCommit {
+            kind,
+            net_del: dropped,
+            start_len,
+        };
+        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, Some(bulk))?;
+        // the quads the replacement holds: what is left, less what was kept
+        Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
+    }
+
     /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
     /// neither does the head commit.
     pub fn compact(&self) -> Result<()> {
@@ -1407,7 +1437,7 @@ impl Store {
             return Err(Error::Poisoned);
         }
         let snap = self.snapshot();
-        self.rebuild_locked(&mut w, &snap, &[], &[], None)?;
+        self.rebuild_locked(&mut w, &snap, &[], &[], &[], None)?;
         Ok(())
     }
 
@@ -1421,6 +1451,7 @@ impl Store {
         snap: &Snapshot,
         extra: &[Source],
         extra_quads: &[[Id; 4]],
+        drop_graphs: &[Id],
         bulk: Option<BulkCommit>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
@@ -1456,7 +1487,12 @@ impl Store {
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = w.next_bnode;
         let builder = Builder::new(&dir, bopts)?;
-        write_snapshot(&builder, snap, |_| Ok(true), extra_quads)?;
+        write_snapshot(
+            &builder,
+            snap,
+            |q| Ok(!drop_graphs.contains(&q[3])),
+            extra_quads,
+        )?;
         for s in extra {
             builder.add_source(s)?;
         }
@@ -2141,7 +2177,7 @@ impl WriteTxn<'_> {
         };
         let (_, receipt) =
             self.store
-                .rebuild_locked(&mut self.guard, &view, &[], &bulk, Some(commit))?;
+                .rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], Some(commit))?;
         Ok(receipt)
     }
 
@@ -2232,6 +2268,19 @@ pub enum ReplaceTarget {
 /// Convenience helper for tests and the CLI.
 pub fn named(iri: &str) -> NamedNode {
     NamedNode::new_unchecked(iri)
+}
+
+/// A rough quad count of RDF sources from their size (~80 bytes per quad in text
+/// formats, gzip counted as 8×).
+fn estimated_quads(sources: &[Source]) -> u64 {
+    let mut bytes = 0u64;
+    for s in sources {
+        bytes += match &s.data {
+            crate::io::SourceData::Bytes(b) => b.len() as u64,
+            crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        } * if s.gzip { 8 } else { 1 };
+    }
+    bytes / 80
 }
 
 /// A Turtle prefix name (`PN_PREFIX`, ASCII subset), or the empty prefix.
