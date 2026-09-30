@@ -202,7 +202,7 @@
                     >{checkLabel(f.check)}</span
                   >
                 </td>
-                <td class="mono cell">
+                <td class="mono cell rule">
                   {#if isRlRule(f.rule)}
                     <a href={RULES_URL} target="_blank" rel="noreferrer" title="OWL 2 RL rule table"
                       >{f.rule}</a
@@ -322,6 +322,9 @@
   }
   .cell {
     font-size: 12px;
+  }
+  .rule {
+    white-space: nowrap;
   }
   .ev {
     display: flex;

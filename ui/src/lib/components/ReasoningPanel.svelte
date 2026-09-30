@@ -125,13 +125,20 @@
     {#if r}
       <div class="status" class:stale={stale !== false}>
         <span class="line">
-          <strong>{r.profile}</strong> · {fmtInt(r.inferred)} inferred{#if commit != null}
-            · at commit {commit}{/if} · {fmtRelative(r.at, now)}
+          <strong>{r.profile}</strong>
+          {[
+            '',
+            `${fmtInt(r.inferred)} inferred`,
+            ...(commit != null ? [`at commit ${commit}`] : []),
+            fmtRelative(r.at, now),
+          ].join(' · ')}
         </span>
         {#if stale !== false}
           <span class="faint why">
             {#if stale === true}
-              {status?.staleReason ?? 'The data changed since the inferences were materialized.'}
+              {status?.staleReason
+                ? `${status.staleReason[0].toUpperCase()}${status.staleReason.slice(1)}.`
+                : 'The data changed since the inferences were materialized.'}
               Queries may miss new entailments or keep ones of deleted data.
             {:else}
               These inferences were recorded without a store position, so it is unknown whether they
