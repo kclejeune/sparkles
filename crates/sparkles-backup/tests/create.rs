@@ -23,7 +23,7 @@ fn blob_ids(m: &sparkles_backup::Manifest) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
-/// A2: the first backup of a database holds its files, and uploads about everything.
+/// The first backup of a database holds its files, and uploads about everything.
 #[tokio::test]
 async fn first_backup() {
     let tmp = tempfile::tempdir().unwrap();
@@ -93,7 +93,7 @@ async fn first_backup() {
     assert_eq!(repo.requests().errors(), 0);
 }
 
-/// A3: an incremental backup reuses every immutable blob and the WAL's segments.
+/// An incremental backup reuses every immutable blob and the WAL's segments.
 #[tokio::test]
 async fn incremental_backup() {
     let tmp = tempfile::tempdir().unwrap();
@@ -144,7 +144,7 @@ async fn incremental_backup() {
     }
 }
 
-/// A19: deleting a backup removes its manifest only; the name can be used again.
+/// Deleting a backup removes its manifest only; the name can be used again.
 #[tokio::test]
 async fn delete_keeps_blobs_and_frees_the_name() {
     let tmp = tempfile::tempdir().unwrap();

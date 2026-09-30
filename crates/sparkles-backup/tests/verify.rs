@@ -1,4 +1,4 @@
-//! Verifying backups (A10) and restoring what `create` wrote.
+//! Verifying backups at every level, and restoring what `create` wrote.
 
 mod common;
 
@@ -30,7 +30,7 @@ fn dump(dir: &std::path::Path) -> (u64, Vec<String>) {
     (s.head_commit().seq, lines)
 }
 
-/// A10 on an `fs` repository: a missing blob, then a damaged one.
+/// Verification levels on an `fs` repository: a missing blob, then a damaged one.
 #[tokio::test]
 async fn verify_levels() {
     let tmp = tempfile::tempdir().unwrap();
@@ -185,7 +185,7 @@ async fn orphans_and_bad_manifests() {
     assert_eq!(l.len(), 1);
 }
 
-/// What `create` writes restores to the database it read (A2, A3 and A19 end to end).
+/// What `create` writes restores to the database it read (first, incremental, and after a delete).
 #[tokio::test]
 async fn backups_restore_to_their_commits() {
     let tmp = tempfile::tempdir().unwrap();
