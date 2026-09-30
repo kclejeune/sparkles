@@ -1,7 +1,10 @@
 # Benchmarks
 
 This document records how Sparkles compares with **Apache Jena (TDB2 + Fuseki)**,
-**QLever** and **Fluree** as of 2026-09-30, and where it still loses. Reproduce it with
+**QLever** and **Fluree** as of 2026-09-30, and where it still loses. The Sparkles column
+was re-measured after the executor and allocator changes of that night (same machine,
+data and harness; the other engines' numbers are from the earlier run the same day).
+Reproduce it with
 `mise run bench [people] [workdir]` (or `scripts/bench.sh`). Add `--engines fluree` to
 re-measure one engine and merge its results into an existing run, or `--answers-only` to
 re-check every engine's answers without timing anything.
@@ -61,59 +64,59 @@ re-check every engine's answers without timing anything.
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) |
 |---|---:|---:|---:|---:|
-| **load** (s) | **0.81** | 4.34 | 1.54 | 1.35 |
-| count-all | **4.7 ± 0.9** | 148.3 ± 28.1 | 15.3 ± 3.8 ‡ | 6.5 ± 2.2 |
-| types-grouped | **5.1 ± 0.2** | 63.0 ± 11.0 | 19.1 ± 4.2 ‡ | 30.5 ± 8.8 |
-| star-join | **23.6 ± 7.3** | 42.4 ± 3.9 | 48.2 ± 8.0 ‡ | 38.2 ± 5.5 |
-| two-hop-count | 25.1 ± 5.8 | 276.1 ± 13.8 | 47.4 ± 3.3 ‡ | **17.0 ± 5.7** |
-| range-topk | 19.4 ± 5.5 ‡ | 64.2 ± 1.9 | **10.3 ± 4.6** | 40.1 ± 5.2 |
-| optional-count | **10.2 ± 5.3** | 67.2 ± 1.9 | 17.4 ± 6.9 ‡ | 34.0 ± 7.1 |
-| contains | **11.2 ± 4.3** | 42.9 ± 9.8 | 82.1 ± 11.1 ‡ | 24.4 ± 5.5 |
-| group-avg | **20.8 ± 1.1** | 171.6 ± 9.4 | 26.8 ± 9.5 | 70.3 ± 15.6 |
-| path-plus | **4.5 ± 0.3** | 15.0 ± 6.3 | 19.5 ± 1.0 ‡ | 17.7 ± 5.9 |
-| distinct-obj | **7.4 ± 2.7** | 86.0 ± 16.3 | 50.5 ± 7.8 ‡ | 7.4 ± 4.1 |
-| export-500k | **171.9 ± 3.4** | 394.6 ± 8.2 | 662.6 ± 16.7 | 221.8 ± 13.7 |
-| predicate-counts | **6.3 ± 0.8** | 212.1 ± 10.8 | 32.3 ± 7.0 ‡ | 69.7 ± 8.2 |
-| order-by-full | **62.0 ± 8.4** | 471.5 ± 8.0 | 144.1 ± 5.2 | 100.5 ± 9.1 |
-| optional-chain | **24.0 ± 3.5** | 186.9 ± 8.4 | 93.0 ± 4.1 | 1465.9 ± 111.2 |
-| minus | **9.5 ± 1.1** | 42.1 ± 10.3 | 21.2 ± 2.7 ‡ | 26.2 ± 25.6 |
-| subquery-agg | **13.1 ± 2.8** | 57.9 ± 11.8 | 16.8 ± 1.4 ‡ | 38.9 ± 4.9 |
-| regex-iri | **15.9 ± 5.0** | 64.3 ± 13.0 | 82.7 ± 11.4 ‡ | 81.0 ± 12.8 |
-| knows-reach | **39.7 ± 2.5** | error ¹ | 97.8 ± 13.5 ‡ | 63.0 ± 11.3 |
-| distinct-join | **27.3 ± 5.9** | 311.8 ± 14.9 | 51.7 ± 9.6 | 99.0 ± 11.0 |
-| lang-filter | **7.6 ± 1.1** | 34.4 ± 8.1 | 61.8 ± 15.6 ‡ | 14.2 ± 5.0 |
-| **update** (1-triple INSERT DATA) | **6.4 ± 2.8** | 41.7 ± 2.1 | 11.8 ± 3.5 | 6.5 ± 0.9 |
-| **throughput** star-join, 16 clients (queries/s) | **898** | 53 | 408 | 497 |
-| **server RSS** after the run (MiB) | 229 | 1744 | 225 | 2275 |
+| **load** (s) | **0.58** | 4.34 | 1.54 | 1.35 |
+| count-all | **5.1 ± 0.3** | 148.3 ± 28.1 | 15.3 ± 3.8 ‡ | 6.5 ± 2.2 |
+| types-grouped | **6.4 ± 1.8** | 63.0 ± 11.0 | 19.1 ± 4.2 ‡ | 30.5 ± 8.8 |
+| star-join | **26.7 ± 3.8** | 42.4 ± 3.9 | 48.2 ± 8.0 ‡ | 38.2 ± 5.5 |
+| two-hop-count | 17.2 ± 5.7 | 276.1 ± 13.8 | 47.4 ± 3.3 ‡ | **17.0 ± 5.7** |
+| range-topk | **8.6 ± 2.5** ‡ | 64.2 ± 1.9 | 10.3 ± 4.6 | 40.1 ± 5.2 |
+| optional-count | **8.1 ± 2.8** | 67.2 ± 1.9 | 17.4 ± 6.9 ‡ | 34.0 ± 7.1 |
+| contains | **8.2 ± 2.3** | 42.9 ± 9.8 | 82.1 ± 11.1 ‡ | 24.4 ± 5.5 |
+| group-avg | **17.5 ± 2.4** | 171.6 ± 9.4 | 26.8 ± 9.5 | 70.3 ± 15.6 |
+| path-plus | **8.0 ± 3.1** | 15.0 ± 6.3 | 19.5 ± 1.0 ‡ | 17.7 ± 5.9 |
+| distinct-obj | 11.3 ± 3.6 | 86.0 ± 16.3 | 50.5 ± 7.8 ‡ | **7.4 ± 4.1** |
+| export-500k | **154.6 ± 3.0** | 394.6 ± 8.2 | 662.6 ± 16.7 | 221.8 ± 13.7 |
+| predicate-counts | **6.1 ± 0.4** | 212.1 ± 10.8 | 32.3 ± 7.0 ‡ | 69.7 ± 8.2 |
+| order-by-full | **65.1 ± 14.3** | 471.5 ± 8.0 | 144.1 ± 5.2 | 100.5 ± 9.1 |
+| optional-chain | **24.6 ± 3.6** | 186.9 ± 8.4 | 93.0 ± 4.1 | 1465.9 ± 111.2 |
+| minus | **14.7 ± 5.3** | 42.1 ± 10.3 | 21.2 ± 2.7 ‡ | 26.2 ± 25.6 |
+| subquery-agg | **6.3 ± 2.6** | 57.9 ± 11.8 | 16.8 ± 1.4 ‡ | 38.9 ± 4.9 |
+| regex-iri | **12.8 ± 5.8** | 64.3 ± 13.0 | 82.7 ± 11.4 ‡ | 81.0 ± 12.8 |
+| knows-reach | **21.9 ± 5.9** | error ¹ | 97.8 ± 13.5 ‡ | 63.0 ± 11.3 |
+| distinct-join | **26.3 ± 4.2** | 311.8 ± 14.9 | 51.7 ± 9.6 | 99.0 ± 11.0 |
+| lang-filter | **8.2 ± 2.2** | 34.4 ± 8.1 | 61.8 ± 15.6 ‡ | 14.2 ± 5.0 |
+| **update** (1-triple INSERT DATA) | **5.1 ± 0.4** | 41.7 ± 2.1 | 11.8 ± 3.5 | 6.5 ± 0.9 |
+| **throughput** star-join, 16 clients (queries/s) | **940** | 53 | 408 | 497 |
+| **server RSS** after the run (MiB) | 364 | 1744 | 225 | 2275 |
 
 ## Results: 10.5M triples
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) |
 |---|---:|---:|---:|---:|
-| **load** (s) | **6.11** | 42.57 | 9.12 | 10.19 |
-| count-all | 5.9 ± 1.8 | 1200.5 ± 13.1 | 37.9 ± 2.0 ‡ | **5.2 ± 0.4** |
-| types-grouped | 9.3 ± 3.7 | 3776.9 ± 857.1 | **8.4 ± 0.5** ‡ | 113.2 ± 5.9 |
-| star-join | **73.3 ± 0.6** | 275.7 ± 47.2 | 113.6 ± 10.7 ‡ | 135.5 ± 13.0 |
-| two-hop-count | 97.1 ± 0.7 | 2739.2 ± 7.4 | 61.8 ± 8.9 ‡ | **41.0 ± 1.6** |
-| range-topk | 108.8 ± 11.6 | 592.2 ± 4.4 | **21.9 ± 1.8** | 138.5 ± 12.7 |
-| optional-count | 54.9 ± 3.6 | 997.1 ± 164.3 | **39.5 ± 1.3** ‡ | 113.1 ± 13.1 |
-| contains | 52.3 ± 11.7 | 2398.5 ± 669.6 | 557.0 ± 13.9 ‡ | **22.2 ± 0.7** |
-| group-avg | 141.9 ± 12.3 | 3663.1 ± 575.8 | **91.4 ± 5.4** | 493.9 ± 16.4 |
-| path-plus | **5.7 ± 2.5** | 10.1 ± 3.3 | 11.0 ± 1.6 ‡ | 67.2 ± 16.4 |
-| distinct-obj | 13.4 ± 5.9 | 1135.5 ± 122.7 | 222.6 ± 16.9 ‡ | **5.8 ± 0.3** |
-| export-500k | **171.1 ± 2.0** | 415.7 ± 10.6 | 562.6 ± 13.1 | 287.8 ± 12.1 |
-| predicate-counts | **18.2 ± 7.1** | 2086.8 ± 14.5 | 70.7 ± 18.2 ‡ | 474.2 ± 7.5 |
-| order-by-full | **448.8 ± 12.3** | 11353.7 ± 417.9 | 1167.4 ± 21.0 | 2106.9 ± 35.7 |
-| optional-chain | **129.1 ± 2.8** | 2687.8 ± 279.2 | 481.5 ± 12.6 | OOM ² |
-| minus | 42.6 ± 1.8 | 1301.6 ± 771.6 | **22.0 ± 2.5** ‡ | 57.9 ± 5.8 |
-| subquery-agg | **10.0 ± 5.2** | 686.2 ± 312.8 | 20.3 ± 1.6 ‡ | 122.6 ± 10.7 |
-| regex-iri | **43.8 ± 5.4** | 1906.4 ± 116.4 | 509.7 ± 19.5 ‡ | 673.1 ± 13.2 |
-| knows-reach | 987.6 ± 38.1 | error ¹ | 1086.1 ± 21.0 ‡ | **564.4 ± 12.7** |
-| distinct-join | **102.3 ± 17.1** | 3380.5 ± 9.7 | 182.7 ± 11.4 | 1577.2 ± 27.4 |
-| lang-filter | 36.1 ± 6.8 | 1575.8 ± 888.8 | 310.5 ± 19.1 ‡ | **30.1 ± 3.7** |
-| **update** (1-triple INSERT DATA) | 10.9 ± 4.1 | 38.6 ± 3.8 | 15.8 ± 1.0 | **6.8 ± 0.3** |
-| **throughput** star-join, 16 clients (queries/s) | **144** | 7 | 57 | 51 |
-| **server RSS** after the run (MiB) | 1608 | 3968 | 362 | 3204 |
+| **load** (s) | **4.75** | 42.57 | 9.12 | 10.19 |
+| count-all | **5.1 ± 0.6** | 1200.5 ± 13.1 | 37.9 ± 2.0 ‡ | 5.2 ± 0.4 |
+| types-grouped | **5.5 ± 1.6** | 3776.9 ± 857.1 | 8.4 ± 0.5 ‡ | 113.2 ± 5.9 |
+| star-join | **40.7 ± 6.3** | 275.7 ± 47.2 | 113.6 ± 10.7 ‡ | 135.5 ± 13.0 |
+| two-hop-count | **29.9 ± 2.3** | 2739.2 ± 7.4 | 61.8 ± 8.9 ‡ | 41.0 ± 1.6 |
+| range-topk | 40.2 ± 3.1 | 592.2 ± 4.4 | **21.9 ± 1.8** | 138.5 ± 12.7 |
+| optional-count | **22.1 ± 0.4** | 997.1 ± 164.3 | 39.5 ± 1.3 ‡ | 113.1 ± 13.1 |
+| contains | 35.2 ± 4.7 | 2398.5 ± 669.6 | 557.0 ± 13.9 ‡ | **22.2 ± 0.7** |
+| group-avg | **82.5 ± 6.3** | 3663.1 ± 575.8 | 91.4 ± 5.4 | 493.9 ± 16.4 |
+| path-plus | 12.2 ± 3.9 | **10.1 ± 3.3** | 11.0 ± 1.6 ‡ | 67.2 ± 16.4 |
+| distinct-obj | 9.2 ± 0.9 | 1135.5 ± 122.7 | 222.6 ± 16.9 ‡ | **5.8 ± 0.3** |
+| export-500k | **151.7 ± 1.4** | 415.7 ± 10.6 | 562.6 ± 13.1 | 287.8 ± 12.1 |
+| predicate-counts | **25.7 ± 7.1** | 2086.8 ± 14.5 | 70.7 ± 18.2 ‡ | 474.2 ± 7.5 |
+| order-by-full | **400.3 ± 27.7** | 11353.7 ± 417.9 | 1167.4 ± 21.0 | 2106.9 ± 35.7 |
+| optional-chain | **105.4 ± 2.8** | 2687.8 ± 279.2 | 481.5 ± 12.6 | OOM ² |
+| minus | 23.0 ± 4.0 | 1301.6 ± 771.6 | **22.0 ± 2.5** ‡ | 57.9 ± 5.8 |
+| subquery-agg | **17.6 ± 5.1** | 686.2 ± 312.8 | 20.3 ± 1.6 ‡ | 122.6 ± 10.7 |
+| regex-iri | **46.2 ± 8.7** | 1906.4 ± 116.4 | 509.7 ± 19.5 ‡ | 673.1 ± 13.2 |
+| knows-reach | **138.0 ± 2.5** | error ¹ | 1086.1 ± 21.0 ‡ | 564.4 ± 12.7 |
+| distinct-join | **68.2 ± 2.9** | 3380.5 ± 9.7 | 182.7 ± 11.4 | 1577.2 ± 27.4 |
+| lang-filter | **28.3 ± 4.2** | 1575.8 ± 888.8 | 310.5 ± 19.1 ‡ | 30.1 ± 3.7 |
+| **update** (1-triple INSERT DATA) | 7.6 ± 4.0 | 38.6 ± 3.8 | 15.8 ± 1.0 | **6.8 ± 0.3** |
+| **throughput** star-join, 16 clients (queries/s) | **191** | 7 | 57 | 51 |
+| **server RSS** after the run (MiB) | 897 | 3968 | 362 | 3204 |
 
 ‡ Same values, different RDF terms. QLever returns integers (counts, ages) as
 `xsd:int` where the data and the other engines use `xsd:integer`. Sparkles writes
@@ -128,11 +131,14 @@ re-check every engine's answers without timing anything.
    run the kernel OOM-killed it at 26 GB of anonymous RSS (the machine has 30 GB). It
    was not re-run.
 
-Sparkles' RSS after the 10.5M run above (1608 MiB) was mostly heap retained by glibc,
-not live data. Since then the server links mimalloc and returns free heap memory to
-the OS once it has been idle for a second (`--idle-release-ms`, default 1000). Scans
-also reserve their output from the exact index count instead of growing it.
-`scripts/rss-probe.sh` measures the effect on a fresh 10.5M server: it runs every query
+Sparkles' RSS after the 10.5M run was 1608 MiB before those changes, mostly heap
+retained by glibc rather than live data. The server now links mimalloc, and returns
+free heap memory to the OS once it has been idle for a second (`--idle-release-ms`,
+default 1000). Scans also reserve their output from the exact index count instead of
+growing it. At 1.05M, RSS after the run grew from 229 to 364 MiB: mimalloc keeps more
+memory in its per-thread heaps than glibc does at that size.
+
+`scripts/rss-probe.sh` measures retention on a fresh 10.5M server: it runs every query
 once, then 3 × 160 concurrent `star-join` requests, and reads RSS 2 s after each step.
 
 | Build (Sparkles only, same machine, 2026-09-30) | after the queries | after the concurrent rounds | peak |
@@ -163,53 +169,50 @@ Peak RSS during the Sparkles bulk load: 1.9 GB.
 
 ## Where Sparkles loses
 
-Sparkles is the fastest of the four on 18 of 20 queries at 1.05M and 9 of 20 at 10.5M.
+Sparkles is the fastest of the four on 18 of 20 queries at 1.05M and 15 of 20 at 10.5M.
 Head to head:
-* **vs. QLever:** it wins 19 of 20 at 1.05M and 14 of 20 at 10.5M.
-* **vs. Fluree:** it wins 18 of 20 at 1.05M (plus one tie) and 14 of 20 at 10.5M.
-* **vs. Jena/Fuseki:** it wins every query; Fuseki is 1.8–34× slower at 1.05M and
-  1.8–400× slower at 10.5M.
+* **vs. QLever:** it wins all 20 at 1.05M and 17 of 20 at 10.5M.
+* **vs. Fluree:** it wins 18 of 20 at 1.05M and 18 of 20 at 10.5M.
+* **vs. Jena/Fuseki:** it wins every query except `path-plus` at 10.5M (within noise).
+  Fuseki is 1.6–35× slower at 1.05M and 2.7–690× slower on the other queries at 10.5M.
 
 ### Specific benchmarks
 
 | Case | Loses to | By | Likely cause |
 |---|---|---|---|
-| `range-topk` (range FILTER on a decimal + ORDER BY … LIMIT) | QLever | 1.9× at 1M, 5.0× at 10M | QLever prefilters blocks on sorted ids, so it skips blocks outside the range. Sparkles decodes and filters every row of the predicate, then sorts the survivors. |
-| `two-hop-count` (`?a knows ?b . ?b knows ?c`, COUNT) | Fluree, QLever | Fluree 1.5× at 1M and 2.4× at 10M; QLever 1.6× at 10M | The count only needs per-key degrees on the shared `?b`. Sparkles' count join multiplies merge-join runs without materializing pairs, but still materializes both scans in full. |
-| `contains` (`COUNT` + `FILTER(CONTAINS(?name, "Ada"))`) | Fluree | 2.4× at 10M (Sparkles 2.2× faster at 1M) | The filter itself tests stored vocabulary keys in parallel. About half the time goes to materializing the 1M-row name column first. |
-| `distinct-obj` (`COUNT(DISTINCT ?o)` over `foaf:knows`) | Fluree | 2.3× at 10M (tie at 1M) | Sparkles counts runs in the object-sorted index without materializing rows, but walks its 2.5M rows block by block on one thread. |
-| `minus` | QLever | 1.9× at 10M (Sparkles 2.2× faster at 1M) | QLever's MINUS merges sorted inputs; Sparkles materializes both sides and builds a hash set. |
-| `knows-reach` (`foaf:knows*` from one node) | Fluree | 1.75× at 10M (Sparkles 1.6× faster at 1M) | Sparkles' transitive-path operator expands the frontier one node at a time; batched frontier expansion over sorted ids is not implemented yet. |
-| `group-avg` | QLever | 1.6× at 10M | Generic GROUP BY builds per-row key vectors and collects values per group; incremental aggregation states would avoid that. |
-| `optional-count` | QLever | 1.4× at 10M | Both sides of the OPTIONAL are materialized before joining. |
-| `lang-filter` (`LANGMATCHES(LANG(?t), "en")`) | Fluree | 1.2× at 10M (Sparkles 1.9× faster at 1M) | As with `contains`, most of the time is spent materializing the 500k-row title column. |
-| `count-all`, `types-grouped` | Fluree, QLever | within noise at 10M | All of them answer from index metadata or runs. |
-| Single-triple update latency | Fluree | 1.6× at 10M (6.8 vs 10.9 ms; tie at 1M) | Sparkles fsyncs its WAL and publishes a new snapshot before acknowledging. Fluree documents that it indexes in the background. |
-| Memory: server RSS after the 10M run | QLever | 4.4× (362 vs 1608 MiB); 2.6× (947 MiB) with the current build | See the note above: the 1608 MiB were mostly glibc retention after the concurrent throughput step, which the idle release now returns. Sparkles also materializes every intermediate result and keeps a 1 GiB decoded-block cache (about 500 MiB filled here); QLever streams lazily and uses a memory-limited allocator. |
+| `range-topk` (range FILTER on a decimal + ORDER BY … LIMIT) | QLever | 1.8× at 10M (Sparkles 1.2× faster at 1M) | The range scan reads only the matching id ranges of inline integers and decimals, but the 10% of salaries written in non-canonical form (`"175000.50"`) are vocabulary literals that must be read and tested, and the top-k step still decodes the surviving rows. |
+| `contains` (`COUNT` + `FILTER(CONTAINS(?name, "Ada"))`) | Fluree | 1.6× at 10M (Sparkles 3× faster at 1M) | The filter tests stored vocabulary keys in parallel; most of the remaining time is materializing the 1M-row name column first. |
+| `distinct-obj` (`COUNT(DISTINCT ?o)` over `foaf:knows`) | Fluree | 1.6× at 10M, 1.5× at 1M | Sparkles counts runs in the object-sorted index without materializing rows, but walks the 2.5M rows block by block on one thread. |
+| `two-hop-count` | Fluree | tie at 1M (17.2 vs 17.0 ms) | Counted from per-key runs of both sides; Sparkles is 1.4× faster than Fluree at 10M. |
+| `minus`, `path-plus` | QLever, Jena | within noise at 10M | A few ms of `curl` overhead dominates both. |
+| Single-triple update latency | Fluree | 1.1× at 10M (6.8 vs 7.6 ms) | Sparkles fsyncs its WAL and publishes a new snapshot before acknowledging. Fluree documents that it indexes in the background. |
+| Memory: server RSS after the run | QLever | 1.6× at 1M (364 vs 225 MiB), 2.5× at 10M (897 vs 362 MiB) | Sparkles materializes every intermediate result and keeps a 1 GiB decoded-block cache (about 450 MiB filled here); QLever streams lazily and uses a memory-limited allocator. |
 | Large results | QLever / Jena (in principle) | — | Sparkles serializes the whole response in memory before sending. The others stream. `export-500k` is still fastest in Sparkles at this size, but memory grows with result size. |
 
 Where Sparkles wins against QLever at 10.5M, it is often by a wide margin:
-`distinct-obj` 17×, `regex-iri` 12×, `contains` 11×, `lang-filter` 8.6×,
-`predicate-counts` 3.9×, `export-500k` 3.3× and `order-by-full` 2.6×.
+`distinct-obj` 24×, `contains` 16×, `regex-iri` 11×, `lang-filter` 11×,
+`knows-reach` 7.9×, `count-all` 7.4×, `export-500k` 3.7×, `order-by-full` 2.9× and
+`star-join` 2.8×.
 
 Fluree is fast on single-pattern scans and counts, but general joins, OPTIONAL,
 subqueries, grouping and sorting are much slower:
 
 | Query | Fluree slower by (1.05M / 10.5M) |
 |---|---|
-| `optional-chain` | 61× (1.47 s); OOM at 10.5M |
-| `predicate-counts` | 11× / 26× |
-| `distinct-join` | 3.6× / 15× |
-| `regex-iri` | 5.1× / 15× |
-| `subquery-agg` | 3.0× / 12× |
-| `path-plus` | 3.9× / 12× |
-| `order-by-full` | 1.6× / 4.7× |
-| `group-avg` | 3.4× / 3.5× |
+| `optional-chain` | 60× (1.47 s); OOM at 10.5M |
+| `predicate-counts` | 11× / 18× |
+| `distinct-join` | 3.8× / 23× |
+| `regex-iri` | 6.3× / 15× |
+| `subquery-agg` | 6.2× / 7.0× |
+| `path-plus` | 2.2× / 5.5× |
+| `order-by-full` | 1.5× / 5.3× |
+| `group-avg` | 4.0× / 6.0× |
+| `knows-reach` | 2.9× / 4.1× |
 
-Fluree's throughput is also lower: 497 vs 898 q/s at 1.05M, and 51 vs 144 at 10.5M.
-It uses about 10× the memory at 1.05M (2.2 GiB vs 229 MiB).
+Fluree's throughput is also lower: 497 vs 940 q/s at 1.05M, and 51 vs 191 at 10.5M.
+It uses about 6× the memory at 1.05M (2.2 GiB vs 364 MiB).
 
-Jena/Fuseki wins no query at either size. Its one advantage is that it streams results
+Jena/Fuseki wins no query at 1.05M. Its one advantage is that it streams results
 (see the memory row).
 
 ### What the benchmark does not cover (so no claims either way)

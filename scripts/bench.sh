@@ -133,7 +133,7 @@ wait_for() { for _ in $(seq 1 240); do curl -sf "$1" >/dev/null 2>&1 && return 0
 declare -A NAME URL UPDATE PORT
 if has sparkles; then
   "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
-  PIDS+=($!); wait_for "localhost:$SPORT/\$/ping"
+  SPID=$!; PIDS+=($SPID); wait_for "localhost:$SPORT/\$/ping"
   NAME[sparkles]=sparkles; URL[sparkles]=localhost:$SPORT/bench/sparql; PORT[sparkles]=$SPORT
   UPDATE[sparkles]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$SPORT/bench/update"
 fi
@@ -278,6 +278,8 @@ echo; echo "RSS (MiB) after the run: $(cat results/rss.json)"
 # 3 x 160 concurrent star-join requests; RSS at each step, block-cache bytes and peak RSS
 if has sparkles && [ -z "${SKIP_PROBE:-}" ]; then
   echo; echo "== memory probe"
+  # the probe opens the database itself: stop this run's Sparkles server first
+  kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null || true
   SPARKLES="$SPARKLES" "$ROOT/scripts/rss-probe.sh" "$WORK"
 fi
 fi # ANSWERS_ONLY

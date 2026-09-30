@@ -46,8 +46,12 @@ rm -rf probe-server
 # shellcheck disable=SC2086 # SERVE_ARGS holds extra `serve` flags
 "$SPARKLES" --result-cache-mb 0 serve --data probe-server --loc bench="$WORK/sparkles.db" --port "$PORT" ${SERVE_ARGS:-} > probe-server.log 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$WORK/probe-server"' EXIT
-for _ in $(seq 240); do curl -sf "localhost:$PORT/\$/ping" >/dev/null && break; sleep 0.5; done
+trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null || true; rm -rf "$WORK/probe-server"' EXIT
+for _ in $(seq 240); do
+  curl -sf "localhost:$PORT/\$/ping" >/dev/null && break
+  kill -0 "$PID" 2>/dev/null || { echo "server exited:" >&2; cat probe-server.log >&2; exit 1; }
+  sleep 0.5
+done
 rss() { awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$PID/status"; }
 hwm() { awk '/VmHWM/ {printf "%.0f", $2/1024}' "/proc/$PID/status"; }
 q() { curl -sf --max-time 300 -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode "query@$1" "localhost:$PORT/bench/sparql"; }

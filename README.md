@@ -95,32 +95,34 @@ on its own. Before timing, it checks that all engines return the same answers.
 
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
-| Bulk load | **0.8 s** (Fluree 1.4, QLever 1.5, TDB2 4.3) | **6.1 s** (QLever 9.1, Fluree 10.2, TDB2 42.6) |
-| Fastest of the four | 18 of 20 queries | 9 of 20 queries |
-| Loses to QLever | `range-topk` 1.9× | `range-topk` 5.0×, `minus` 1.9×, `group-avg` 1.6×, `two-hop-count` 1.6×, `optional-count` 1.4×, `types-grouped` ≈ |
-| Loses to Fluree | `two-hop-count` 1.5×, `distinct-obj` ≈ | `two-hop-count` 2.4×, `contains` 2.4×, `distinct-obj` 2.3×, `knows-reach` 1.75×, `lang-filter` 1.2×, `count-all` ≈ |
-| vs. Fuseki | 1.8–34× faster; Fuseki errors on `foaf:knows*` | 1.8–400× faster |
-| Update latency (1 triple, real insert) | **6.4 ms** (Fluree 6.5, QLever 11.8, Fuseki 41.7) | 10.9 ms (**Fluree 6.8**, QLever 15.8, Fuseki 38.6) |
-| Throughput, 16 clients | **898 q/s** (Fluree 497, QLever 408, Fuseki 53) | **144 q/s** (QLever 57, Fluree 51, Fuseki 7) |
-| Server memory | 229 MiB (**QLever 225**, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 1.6 GiB (**QLever 362 MiB**, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
+| Bulk load | **0.6 s** (Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.8 s** (QLever 9.1, Fluree 10.2, TDB2 42.6) |
+| Fastest of the four | 18 of 20 queries | 15 of 20 queries |
+| Loses to QLever | none | `range-topk` 1.8×; `minus`, `path-plus` ≈ |
+| Loses to Fluree | `distinct-obj` 1.5×, `two-hop-count` ≈ | `contains` 1.6×, `distinct-obj` 1.6× |
+| vs. Fuseki | 1.6–35× faster; Fuseki errors on `foaf:knows*` | 2.7–690× faster (`path-plus` ≈) |
+| Update latency (1 triple, real insert) | **5.1 ms** (Fluree 6.5, QLever 11.8, Fuseki 41.7) | 7.6 ms (**Fluree 6.8**, QLever 15.8, Fuseki 38.6) |
+| Throughput, 16 clients | **940 q/s** (Fluree 497, QLever 408, Fuseki 53) | **191 q/s** (QLever 57, Fluree 51, Fuseki 7) |
+| Server memory | 364 MiB (**QLever 225**, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 897 MiB (**QLever 362 MiB**, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
 
-Against QLever at 10.5M, Sparkles wins 14 of 20 queries, several by 8–17×
-(`distinct-obj`, `regex-iri`, `contains`, `lang-filter`). Fluree is 1.6–61× slower
-than Sparkles on general joins, OPTIONAL, subqueries, grouping and sorting, and was
-OOM-killed (26 GB) on `optional-chain` at 10.5M.
+The Sparkles column was re-measured after the latest executor and allocator changes;
+the other engines' numbers are from the earlier run on the same machine and data.
+Against QLever at 10.5M, Sparkles wins 17 of 20 queries, several by 7–24×
+(`distinct-obj`, `contains`, `regex-iri`, `lang-filter`, `knows-reach`, `count-all`).
+Fluree is 1.5–60× slower than Sparkles on general joins, OPTIONAL, subqueries, grouping,
+sorting and path traversal, and was OOM-killed (26 GB) on `optional-chain` at 10.5M.
 
 Where Sparkles still loses on performance:
-* **Range filters:** QLever skips blocks on range FILTERs (5× on `range-topk` at 10.5M).
-* **Joins and grouping at scale:** at 10.5M, QLever is 1.4–1.9× faster on OPTIONAL,
-  MINUS, GROUP BY with AVG and two-hop counts.
-* **Count-only joins and single-predicate scans:** Fluree is 1.2–2.4× faster at 10.5M
-  on `two-hop-count`, `contains`, `distinct-obj` and `lang-filter`, and 1.75× on the
-  `foaf:knows*` traversal.
-* **Update latency:** Fluree commits faster at 10.5M (it indexes in the background).
+* **Range filters with ORDER BY … LIMIT:** QLever is 1.8× faster on `range-topk` at
+  10.5M. Sparkles reads only the matching id ranges of inline numbers, but must still
+  test the non-canonical numerals (vocabulary literals) and decode the surviving rows.
+* **Single-predicate scans:** Fluree is 1.6× faster at 10.5M on `contains` and
+  `distinct-obj`.
+* **Update latency:** Fluree commits slightly faster at 10.5M (it indexes in the
+  background).
 * **Memory:** Sparkles materializes every intermediate result and buffers whole
-  responses. The table's 1.6 GiB at 10.5M was mostly heap retained by glibc. The
-  server now uses mimalloc and releases free memory when idle, and ends the same run
-  at 947 MiB, about 500 MiB of which is the block cache.
+  responses, and it keeps a decoded-block cache (about 450 MiB of the 897 MiB at 10.5M).
+  The server uses mimalloc and releases free heap memory when idle; with glibc malloc
+  the same 10.5M run ended at 1.6 GiB.
 * **Untested ground:** nothing above 10.5M triples, cold caches, standard benchmarks
   (LUBM/BSBM/WatDiv) and sustained update workloads. QLever's design targets billions
   of triples.
@@ -154,7 +156,7 @@ feature gaps are:
 |---|---|---|
 | Scale | tested to tens of billions of triples (Wikidata, UniProt) | tested to 10.5M; the external-sort path is covered by tests but not measured at 100M+ |
 | Streaming execution | lazy, block-wise evaluation of scans, joins, filters and GROUP BY; results streamed to the client | every operator materializes its full result (bounded by a row limit); HTTP responses are serialized to a buffer before sending |
-| Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | not implemented (this is why `range-topk` loses) |
+| Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals); non-canonical numerals are still tested row by row |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts use index runs instead) |
 | Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | ✗ |
 | Vocabulary compression | FSST string compression, IRI-as-id encoding for numeric IRIs | front coding, no IRI encoding |
@@ -246,6 +248,32 @@ See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the head-to-head numbers.
 * **Per-distinct-value filters.** A deterministic filter over one variable is
   evaluated once per distinct id, and rows look up the outcome. When the column is
   sorted on the variable, the distinct ids are its runs.
+* **Numeric range scans.** A FILTER comparing a scan's sort column with numeric
+  constants reads only the id ranges that can match. Inline integers, and inline
+  decimals of one scale, sort by value within their id segment. So each segment's
+  matching ids form one range, found by binary search with the ordinary comparison.
+  Doubles and literals from the vocabulary are read and tested; booleans, dates and
+  blank nodes are skipped. The planner costs the scan from an exact count of the rows
+  in those ranges (`IndexRangeScan` in EXPLAIN).
+* **Numeric top-k.** `ORDER BY ?v LIMIT k` over numbers ranks cheap rounded keys first.
+  Exact values are computed only for rows that can still reach the first k.
+* **Incremental GROUP BY.** With one group key and COUNT / SUM / AVG / MIN / MAX /
+  SAMPLE over variables, each group keeps a running state in a hash map on the key id.
+  Sums stay exact 64-bit integers until a value is not an inline integer.
+* **Count joins from key runs.** `COUNT(*)` over two scans joined on one variable reads
+  both sides as (key, run length) pairs from indexes sorted on that variable and sums
+  the products (`CountJoinFromRuns`).
+* **Class counts from statistics.** `GROUP BY ?class` with a count over `?s a ?class`
+  uses the per-class counts in the index statistics when they are exact: no delta, and
+  all data in the default graph (`GroupCountFromMetadata`).
+* **Batched path frontiers.** `p*` / `p+` traversals expand a large BFS level with one
+  merged pass over the predicate's index rows, instead of one seek per node.
+* **Selective column decoding.** The block cache holds decoded columns. Scans decode
+  only the key columns they read (variables, graph, repeated variables), which also
+  leaves room for more of the cache.
+* Every one of these can be switched off per query (`QueryOptions::optimizations`) or
+  per process (`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`), and EXPLAIN shows
+  which one ran.
 * **Whole-block scans under graph filters.** A block slice is copied column-wise
   whenever every row passes the graph filter (one pass over the graph column), so
   default-graph queries no longer fall back to row-by-row filtering.
