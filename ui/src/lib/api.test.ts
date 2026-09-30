@@ -93,6 +93,39 @@ describe('query', () => {
     expect(await api.update('ds', 'INSERT DATA {}')).toBeNull();
   });
 
+  it('update asks for a receipt and returns it', async () => {
+    const commit = {
+      seq: 42,
+      parent: 41,
+      ref: 'commit:42',
+      timestamp: '2026-09-30T16:10:15.821Z',
+      kind: 'update',
+      inserted: 2,
+      deleted: 0,
+      quads: 182,
+      generation: 'gen-0002',
+      bulk: false,
+      exact: true,
+    };
+    const calls = stubFetch(() =>
+      jsonResponse({
+        inserted: 2,
+        deleted: 0,
+        operations: 1,
+        dataset: 'ds',
+        datasetId: 'f436',
+        committed: true,
+        commit,
+      }),
+    );
+    const r = await api.update('ds', 'INSERT DATA {}');
+    expect(calls[0].url).toBe('/ds/update?receipt=true');
+    expect(r?.receipt).toEqual({ dataset: 'ds', datasetId: 'f436', committed: true, commit });
+    // no receipt members (older server): none reported
+    stubFetch(() => jsonResponse({ inserted: 0, deleted: 0, operations: 1 }));
+    expect((await api.update('ds', 'INSERT DATA {}'))?.receipt).toBeUndefined();
+  });
+
   it('rejects invalid JSON from a JSON endpoint (schema)', async () => {
     stubFetch(() => new Response('{nope'));
     const e = await api.schemaSummary('ds').catch((x) => x);
@@ -189,5 +222,49 @@ describe('schema', () => {
     const e = await api.schema('ds', { graph: 'http://ex.org/g' }).catch((x) => x);
     expect(e.status).toBe(404);
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe('commits and full-text admin', () => {
+  it('pages the commit catalog with before= and limit=', async () => {
+    const calls = stubFetch(() =>
+      jsonResponse({ head: 3, firstRetained: 0, complete: true, commits: [], next: null }),
+    );
+    await api.commits('my ds', { before: 20, limit: 25 });
+    expect(calls[0].url).toBe('/$/commits/my%20ds?limit=25&before=20');
+    await api.commits('ds');
+    expect(calls[1].url).toBe('/$/commits/ds');
+  });
+
+  it('reads the text status, null when disabled', async () => {
+    stubFetch(() => jsonResponse({ enabled: false }));
+    expect(await api.textStatus('ds')).toBeNull();
+    stubFetch(() => jsonResponse({ enabled: true, state: 'ready', docs: 3 }));
+    expect(await api.textStatus('ds')).toMatchObject({ state: 'ready', docs: 3 });
+    stubFetch(() => jsonResponse({ error: 'built without full-text search' }, 501));
+    const e = await api.textStatus('ds').catch((x) => x);
+    expect(e.status).toBe(501);
+  });
+
+  it('enables with PUT and a JSON config, rebuilds with POST', async () => {
+    const calls = stubFetch(() =>
+      jsonResponse({ id: '1', kind: 'text-rebuild', state: 'running' }, 202),
+    );
+    const t = await api.enableText('ds', { predicates: ['http://ex/label'] });
+    expect(t.kind).toBe('text-rebuild');
+    expect(calls[0].init.method).toBe('PUT');
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ predicates: ['http://ex/label'] });
+    await api.rebuildText('ds');
+    expect(calls[1].url).toBe('/$/text/ds/rebuild');
+    expect(calls[1].init.method).toBe('POST');
+  });
+
+  it('extracts receipts only from bodies that have them', () => {
+    expect(api.receiptOf({ count: 3 })).toBeUndefined();
+    expect(api.receiptOf({ committed: true, commit: 'x' })).toBeUndefined();
+    expect(
+      api.receiptOf({ committed: false, dataset: 'd', datasetId: 'i', commit: { seq: 4 } })?.commit
+        .seq,
+    ).toBe(4);
   });
 });

@@ -1,6 +1,14 @@
 import type { Term } from './api';
 import type { GEdge, GNode } from './components/GraphView.svelte';
-import { displayIri, localName, RDF_TYPE, RDFS_LABEL, termKey, type PrefixMap } from './rdf';
+import {
+  displayIri,
+  literalText,
+  localName,
+  RDF_TYPE,
+  RDFS_LABEL,
+  termKey,
+  type PrefixMap,
+} from './rdf';
 
 export type Triple = [Term, Term, Term];
 
@@ -17,7 +25,10 @@ const LABEL_PREDICATES = new Set([
 export function nodeLabel(t: Term, prefixes: PrefixMap): string {
   if (t.type === 'uri') return shortLabel(t.value, prefixes);
   if (t.type === 'bnode') return `_:${t.value}`;
-  if (t.type === 'literal') return t.value.length > 60 ? t.value.slice(0, 57) + '…' : t.value;
+  if (t.type === 'literal') {
+    const s = literalText(t);
+    return s.length > 60 ? s.slice(0, 57) + '…' : s;
+  }
   return '<<triple>>';
 }
 
