@@ -57,13 +57,11 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-#[allow(dead_code)] // used by the login flows
 /// Constant-time equality of two byte strings (the length is not secret).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
-#[allow(dead_code)] // used by the login flows
 /// The PKCE S256 challenge of a verifier (RFC 7636): `BASE64URL(SHA256(verifier))`.
 pub fn pkce_challenge(verifier: &str) -> String {
     b64url(&sha256(verifier.as_bytes()))
