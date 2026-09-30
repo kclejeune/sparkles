@@ -8,6 +8,7 @@ use super::{
     Access, Grants, Identity, Kind, Level, Principal, PrincipalInfo, Scheme, ServerPerm, crypto,
     store,
 };
+use crate::ratelimit::Admission;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use axum::http::{HeaderMap, header};
@@ -16,7 +17,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -25,6 +26,43 @@ const CACHE_MAX: usize = 10_000;
 const CACHE_TTL: Duration = Duration::from_secs(300);
 /// How long a password verification may wait for a permit before `busy`.
 const PERMIT_WAIT: Duration = Duration::from_secs(5);
+/// Password verifications that may wait for a permit, per permit; more are refused at
+/// once (`busy`) instead of queueing without bound.
+const QUEUE_PER_PERMIT: usize = 4;
+
+/// Named limits of [`Auth::throttle`]: device logins started per client address, failed
+/// user-code lookups per session.
+pub const DEVICE: &str = "device";
+pub const DEVICE_CODE: &str = "device-code";
+/// Clients the throttle tracks at most.
+const THROTTLE_KEYS: usize = 10_000;
+
+/// `count` per minute, `burst` at once.
+fn per_minute(count: u32, burst: u32) -> crate::ratelimit::Limit {
+    crate::ratelimit::Limit {
+        rate: Some(crate::ratelimit::Rate {
+            count,
+            period: Duration::from_secs(60),
+        }),
+        burst: Some(burst),
+        ..Default::default()
+    }
+}
+
+/// The throttle's limits under `policy`: 20 device logins per address, then two a minute
+/// (the pending grants of one address stay far below the server's cap); 20 unknown user
+/// codes per session, then two a minute.
+fn throttle_config(_: &Policy) -> crate::ratelimit::Config {
+    let mut c = crate::ratelimit::Config {
+        max_keys: Some(THROTTLE_KEYS),
+        ..Default::default()
+    };
+    c.named
+        .insert(DEVICE, (per_minute(2, 20), "device logins started"));
+    c.named
+        .insert(DEVICE_CODE, (per_minute(2, 20), "unknown codes"));
+    c
+}
 
 /// A static token from the configuration.
 struct StaticToken {
@@ -281,10 +319,12 @@ pub enum Failure {
     State,
     Idp,
     NotAllowed,
+    /// not checked: the client address has no authentication failures left
+    Limited,
 }
 
 impl Failure {
-    pub const ALL: [Failure; 7] = [
+    pub const ALL: [Failure; 8] = [
         Failure::Malformed,
         Failure::Invalid,
         Failure::Expired,
@@ -292,6 +332,7 @@ impl Failure {
         Failure::State,
         Failure::Idp,
         Failure::NotAllowed,
+        Failure::Limited,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -303,6 +344,7 @@ impl Failure {
             Failure::State => "state",
             Failure::Idp => "idp",
             Failure::NotAllowed => "not_allowed",
+            Failure::Limited => "limited",
         }
     }
 }
@@ -328,7 +370,7 @@ pub struct Authenticated {
 #[derive(Default)]
 pub struct AuthMetrics {
     /// `[scheme][reason]` (`FAILURE_SCHEMES` × `Failure::ALL`)
-    pub failures: [[AtomicU64; 7]; 5],
+    pub failures: [[AtomicU64; 8]; 5],
     /// `routes::Denied::ALL`
     pub denied: [AtomicU64; 6],
     /// `[method][result]`: oidc, password, token × ok, denied, error
@@ -355,13 +397,43 @@ struct Creds {
 /// A password verification in progress, shared by concurrent requests.
 type Inflight = Arc<tokio::sync::OnceCell<Option<Principal>>>;
 
+/// The permits of argon2 verifications and the bounded queue for them.
+struct Argon {
+    permits: tokio::sync::Semaphore,
+    size: usize,
+    waiting: AtomicUsize,
+}
+
+/// A place in the queue of password verifications, left when dropped (also when the
+/// request is cancelled).
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn enter(n: &'a AtomicUsize, max: usize) -> Option<Waiting<'a>> {
+        n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+            (w < max).then_some(w + 1)
+        })
+        .ok()
+        .map(|_| Waiting(n))
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The auth state of a server: the current policy, the token and session stores, the
 /// login flows in progress and the password machinery.
 pub struct Auth {
     path: Option<PathBuf>,
     policy: ArcSwap<Policy>,
     creds: Mutex<Creds>,
-    argon: tokio::sync::Semaphore,
+    argon: Argon,
+    /// the auth layer's own limits ([`DEVICE`], [`DEVICE_CODE`]) on the
+    /// server's rate-limit machinery
+    pub throttle: crate::ratelimit::RateLimiter,
     hmac_key: Vec<u8>,
     pub tokens: TokenStore,
     pub sessions: SessionStore,
@@ -399,11 +471,18 @@ impl Auth {
         let policy = Policy::build(cfg)?;
         let now = store::unix_now();
         let oidc = super::oidc::OidcState::new(&policy)?;
+        let throttle = crate::ratelimit::RateLimiter::new(&throttle_config(&policy))
+            .map_err(anyhow::Error::msg)?;
         Ok(Auth {
             path: None,
             policy: ArcSwap::from_pointee(policy),
             creds: Mutex::new(Creds::default()),
-            argon: tokio::sync::Semaphore::new(permits),
+            argon: Argon {
+                permits: tokio::sync::Semaphore::new(permits),
+                size: permits,
+                waiting: AtomicUsize::new(0),
+            },
+            throttle,
             hmac_key: crypto::random_bytes(32),
             tokens: TokenStore::open(dir.join("tokens.json"))?,
             sessions: SessionStore::open(dir.join("sessions.json"), now)?,
@@ -425,6 +504,28 @@ impl Auth {
         store::unix_now() + self.clock_offset.load(Ordering::Relaxed)
     }
 
+    /// Password verifications running and waiting for a permit.
+    pub fn argon_load(&self) -> (usize, usize) {
+        let a = &self.argon;
+        (
+            a.size.saturating_sub(a.permits.available_permits()),
+            a.waiting.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Take every verification permit (tests: verifications queue until it is dropped).
+    #[cfg(test)]
+    pub fn hold_verifications(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let a = &self.argon;
+        a.permits.try_acquire_many(a.size as u32).unwrap()
+    }
+
+    /// Password verifications that may wait for a permit.
+    #[cfg(test)]
+    pub fn verification_queue(&self) -> (usize, usize) {
+        (self.argon.size, self.argon.size * QUEUE_PER_PERMIT)
+    }
+
     /// Move the clock forward (tests).
     #[cfg(test)]
     pub fn advance(&self, secs: i64) {
@@ -441,6 +542,10 @@ impl Auth {
             let (cfg, warnings) = FileConfig::load(path)?;
             let p = Policy::build(&cfg)?;
             self.oidc.reconfigure(&p)?;
+            // the throttle keeps its clients' state
+            self.throttle
+                .reload(&throttle_config(&p))
+                .map_err(anyhow::Error::msg)?;
             self.policy.store(Arc::new(p));
             self.creds.lock().cache.clear();
             Ok(warnings)
@@ -507,10 +612,14 @@ impl Auth {
     /// The first applicable source wins: `Authorization`, the session cookie, trusted
     /// proxy headers, anonymous. Invalid `Authorization` is an error, never anonymous;
     /// an invalid session cookie is ignored (and cleared).
+    ///
+    /// `admission`: the request's standing under the pre-authentication limit, charged
+    /// before a password is verified.
     pub async fn authenticate(
         &self,
         h: &HeaderMap,
         peer: Option<&Peer>,
+        admission: Option<&Admission>,
     ) -> Result<Authenticated, AuthError> {
         let policy = self.policy.load_full();
         let ok = |principal| Authenticated {
@@ -518,7 +627,7 @@ impl Auth {
             clear_cookie: false,
         };
         if let Some(v) = h.get(header::AUTHORIZATION) {
-            return self.authorization(&policy, v).await.map(ok);
+            return self.authorization(&policy, v, admission).await.map(ok);
         }
         let mut clear_cookie = false;
         let mode = self.cookie_mode(h);
@@ -570,6 +679,7 @@ impl Auth {
         &self,
         policy: &Policy,
         v: &axum::http::HeaderValue,
+        admission: Option<&Admission>,
     ) -> Result<Principal, AuthError> {
         let malformed = |scheme| AuthError {
             scheme,
@@ -598,7 +708,7 @@ impl Auth {
             // Basic-only clients carry a token as the password; the user is ignored
             return self.token_principal(policy, password, Scheme::Basic);
         }
-        self.password(policy, user, password).await
+        self.password(policy, user, password, admission).await
     }
 
     /// A static or minted token.
@@ -737,6 +847,7 @@ impl Auth {
         policy: &Policy,
         user: &str,
         password: &str,
+        admission: Option<&Admission>,
     ) -> Result<Principal, AuthError> {
         let err = |failure| AuthError {
             scheme: "basic",
@@ -756,6 +867,11 @@ impl Auth {
             }
             c.inflight.entry(key).or_default().clone()
         };
+        // a verification is charged to the address as a failure before it starts
+        if admission.is_some_and(|a| !a.reserve()) {
+            self.creds.lock().inflight.remove(&key);
+            return Err(err(Failure::Limited));
+        }
         let (phc, principal) = match policy.users.get(user) {
             Some(u) => (
                 u.password.clone(),
@@ -815,12 +931,20 @@ impl Auth {
         result.ok_or(err(Failure::Invalid))
     }
 
-    /// Check a password for a UI login (no cache; one verification).
+    /// Check a password for a UI login (no cache; one verification, charged to the
+    /// address as a failure before it starts).
     pub async fn check_password(
         &self,
         user: &str,
         password: &str,
+        admission: Option<&Admission>,
     ) -> Result<Option<Principal>, AuthError> {
+        if admission.is_some_and(|a| !a.reserve()) {
+            return Err(AuthError {
+                scheme: "session",
+                failure: Failure::Limited,
+            });
+        }
         let policy = self.policy.load_full();
         let (phc, principal) = match policy.users.get(user) {
             Some(u) => (
@@ -849,10 +973,17 @@ impl Auth {
             scheme: "basic",
             failure: Failure::Busy,
         };
-        let _permit = tokio::time::timeout(PERMIT_WAIT, self.argon.acquire())
-            .await
-            .map_err(|_| busy)?
-            .map_err(|_| busy)?;
+        let a = &self.argon;
+        let _permit = match a.permits.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                let _place = Waiting::enter(&a.waiting, a.size * QUEUE_PER_PERMIT).ok_or(busy)?;
+                tokio::time::timeout(PERMIT_WAIT, a.permits.acquire())
+                    .await
+                    .map_err(|_| busy)?
+                    .map_err(|_| busy)?
+            }
+        };
         self.metrics
             .password_verifications
             .fetch_add(1, Ordering::Relaxed);
@@ -961,6 +1092,18 @@ impl Auth {
                 "counter",
                 "argon2 password verifications (cache hits excluded).",
                 get(&m.password_verifications) as usize,
+            ),
+            (
+                "sparkles_auth_password_verifications_running",
+                "gauge",
+                "argon2 password verifications running.",
+                self.argon_load().0,
+            ),
+            (
+                "sparkles_auth_password_verifications_waiting",
+                "gauge",
+                "Password verifications waiting for a permit (bounded; more are refused as busy).",
+                self.argon_load().1,
             ),
             (
                 "sparkles_auth_untrusted_proxy_headers_total",

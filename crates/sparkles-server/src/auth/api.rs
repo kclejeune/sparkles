@@ -226,6 +226,17 @@ pub async fn whoami(
     r
 }
 
+/// The auth layer's own limits (device logins, failed code lookups), for the metrics;
+/// `None` without auth.
+pub fn throttle(st: &AppState) -> Option<&crate::ratelimit::RateLimiter> {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        return Some(&a.throttle);
+    }
+    let _ = st;
+    None
+}
+
 /// Rate-limit key: a signed-in principal is limited as itself (across addresses);
 /// anonymous callers, the open local mode, and the `auth` class (logins) are limited by
 /// client address.

@@ -433,13 +433,25 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<axum::extract::ConnectInfo<super::Peer>>()
         .map(|c| c.0);
-    let authed = match auth.authenticate(req.headers(), peer.as_ref()).await {
+    let admission = req
+        .extensions()
+        .get::<crate::ratelimit::Admission>()
+        .cloned();
+    let authed = match auth
+        .authenticate(req.headers(), peer.as_ref(), admission.as_ref())
+        .await
+    {
         Ok(a) => a,
         Err(e) => {
             auth.count_failure(e);
             span.record("principal", "-");
             span.record("auth", e.scheme);
             let r = match e.failure {
+                // the address spent its failures: the pre-authentication limit's 429
+                Failure::Limited => match &admission {
+                    Some(a) => a.refusal(),
+                    None => json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures"),
+                },
                 Failure::Busy => {
                     let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
                     r.headers_mut()
@@ -494,6 +506,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     let finish = |mut r: Response| {
         if let Some(c) = &clear {
             r.headers_mut().append(header::SET_COOKIE, c.clone());
+            // an invalid session cookie is a failed authentication, though not refused
+            r.extensions_mut().insert(crate::ratelimit::AuthFailed);
         }
         r
     };

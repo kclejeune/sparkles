@@ -93,7 +93,7 @@ export type Outcome =
   | 'budget'
   | 'rate_limited'
   | 'denied';
-export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
+export type LimitClass = 'auth' | 'query' | 'update' | 'admin' | 'preauth';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 
 type CacheStats = {

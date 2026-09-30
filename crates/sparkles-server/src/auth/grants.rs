@@ -13,9 +13,6 @@ pub const DEVICE_INTERVAL: i64 = 5;
 pub const MAX_DEVICE_GRANTS: usize = 1_000;
 /// Loopback codes are valid this long.
 pub const LOOPBACK_TTL: i64 = 120;
-/// Failed user-code lookups allowed per session and window.
-pub const MAX_LOOKUP_FAILURES: u32 = 20;
-pub const LOOKUP_WINDOW: i64 = 600;
 
 /// Unambiguous user-code alphabet (no 0/O, 1/I).
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -81,8 +78,6 @@ struct Inner {
     user_codes: HashMap<String, [u8; 32]>,
     /// by `sha256(code)`
     loopback: HashMap<[u8; 32], Loopback>,
-    /// failed user-code lookups per session: (count, window start)
-    failures: HashMap<[u8; 32], (u32, i64)>,
 }
 
 #[derive(Default)]
@@ -117,9 +112,6 @@ fn prune(inner: &mut Inner, now: i64) {
         }
     }
     inner.loopback.retain(|_, l| l.expires > now);
-    inner
-        .failures
-        .retain(|_, (_, start)| now - *start < LOOKUP_WINDOW);
 }
 
 impl CliGrants {
@@ -157,49 +149,25 @@ impl CliGrants {
         Some((device_code, format_user_code(&user_code)))
     }
 
-    /// Whether `session` may look up another user code (at most
-    /// [`MAX_LOOKUP_FAILURES`] failures per [`LOOKUP_WINDOW`]).
-    pub fn lookups_allowed(&self, session: &[u8; 32], now: i64) -> bool {
-        let inner = self.inner.lock();
-        inner
-            .failures
-            .get(session)
-            .is_none_or(|(n, start)| now - start >= LOOKUP_WINDOW || *n < MAX_LOOKUP_FAILURES)
-    }
-
-    fn fail(inner: &mut Inner, session: &[u8; 32], now: i64) {
-        let e = inner.failures.entry(*session).or_insert((0, now));
-        if now - e.1 >= LOOKUP_WINDOW {
-            *e = (0, now);
-        }
-        e.0 += 1;
-    }
-
-    /// A pending (or decided, unexpired) grant by user code; counts a failure for
-    /// `session` when there is none.
-    pub fn lookup(&self, user_code: &str, session: &[u8; 32], now: i64) -> Option<DeviceInfo> {
+    /// A pending (or decided, unexpired) grant by user code. The caller counts failed
+    /// lookups (the auth throttle's `device-code` limit).
+    pub fn lookup(&self, user_code: &str, now: i64) -> Option<DeviceInfo> {
         let mut inner = self.inner.lock();
         prune(&mut inner, now);
         let found = normalize_user_code(user_code)
             .and_then(|c| inner.user_codes.get(&c).copied())
             .and_then(|d| inner.devices.get(&d).cloned());
-        match found {
-            Some(g) => Some(DeviceInfo {
-                user_code: g.user_code,
-                label: g.label,
-                hostname: g.hostname,
-                expires_in: g.expires - now,
-                status: match g.status {
-                    Status::Pending => "pending",
-                    Status::Approved(_) => "approved",
-                    Status::Denied => "denied",
-                },
-            }),
-            None => {
-                Self::fail(&mut inner, session, now);
-                None
-            }
-        }
+        found.map(|g| DeviceInfo {
+            user_code: g.user_code,
+            label: g.label,
+            hostname: g.hostname,
+            expires_in: g.expires - now,
+            status: match g.status {
+                Status::Pending => "pending",
+                Status::Approved(_) => "approved",
+                Status::Denied => "denied",
+            },
+        })
     }
 
     /// Approve (with the minted token) or deny (`None`) a pending grant. `false` when
@@ -352,8 +320,8 @@ mod tests {
         );
         assert!(matches!(g.poll(&dc, 1000), Poll::Pending));
         assert!(matches!(g.poll(&dc, 1002), Poll::SlowDown));
-        let s = [0u8; 32];
-        assert!(g.lookup(&uc.to_lowercase(), &s, 1003).is_some());
+        assert!(g.lookup(&uc.to_lowercase(), 1003).is_some());
+        assert!(g.lookup("AAAA-AAAA", 1003).is_none());
         assert!(g.decide(&uc, Some(issued()), 1003));
         assert!(!g.decide(&uc, None, 1003));
         assert!(matches!(g.poll(&dc, 1020), Poll::Token(_)));
@@ -363,12 +331,6 @@ mod tests {
         assert!(matches!(g.poll(&dc, 2000), Poll::Denied));
         let (dc, _) = g.start("cli", "h", 3000).unwrap();
         assert!(matches!(g.poll(&dc, 3601), Poll::Expired));
-        for _ in 0..MAX_LOOKUP_FAILURES {
-            assert!(g.lookups_allowed(&s, 4000));
-            assert!(g.lookup("AAAA-AAAA", &s, 4000).is_none());
-        }
-        assert!(!g.lookups_allowed(&s, 4000));
-        assert!(g.lookups_allowed(&s, 4000 + LOOKUP_WINDOW));
     }
 
     #[test]
