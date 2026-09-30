@@ -481,6 +481,13 @@ fn triple_equals(x: &oxrdf::Triple, y: &oxrdf::Triple) -> EvalResult<bool> {
 /// Total order for ORDER BY (SPARQL 15.1 + ARQ's fallback ordering):
 /// unbound < blank nodes < IRIs < literals; comparable literals by value, the rest by
 /// (kind, lexical form, datatype/lang).
+/// A numeric value as `f64` (rounded; monotone in the value: `x < y` implies
+/// `f(x) <= f(y)`), `None` for non-numeric values and NaN.
+pub fn approx_f64(v: &Value) -> Option<f64> {
+    let d = f64::from(Num::of(v).ok()?.to_double());
+    (!d.is_nan()).then_some(d)
+}
+
 pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     let (a, b) = match (a, b) {
         (None, None) => return Ordering::Equal,

@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::Perm;
 use crate::store::{Chunk, Snapshot};
-pub use ctx::{Ctx, DatasetSpec};
+pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use exec::PlanInfo;
 use oxrdf::{BlankNode, NamedOrBlankNode, Term, Triple};
 use plan::{ActiveGraph, Planner};
@@ -51,6 +51,8 @@ pub struct QueryOptions {
     pub initial_bindings: Vec<(String, Term)>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
+    /// Executor optimizations in effect (all on by default; see [`Optimizations`]).
+    pub optimizations: Option<Optimizations>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -189,6 +191,9 @@ fn make_ctx(
     }
     ctx.allow_service = opts.allow_service;
     ctx.use_cache = !opts.no_cache;
+    if let Some(o) = opts.optimizations {
+        ctx.opt = o;
+    }
     ctx.base_iri = base.cloned();
     let resolve = |iris: &[String]| -> Vec<Id> { iris.iter().map(|i| ctx.graph_id(i)).collect() };
     let mut ds = DatasetSpec::default();
@@ -559,5 +564,7 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod opt_tests;
 #[cfg(test)]
 mod tests;

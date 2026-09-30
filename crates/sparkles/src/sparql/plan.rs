@@ -80,6 +80,33 @@ pub struct ScanSpec {
     pub dedup: bool,
 }
 
+/// A numeric range FILTER pushed into a scan whose first free key column holds `var`.
+///
+/// That column is sorted by id, and ids sort by tag, then payload. For inline integers
+/// (non-negative, then negative payloads) and inline decimals (per scale, non-negative,
+/// then negative mantissas), payload order is value order, so the values satisfying a
+/// conjunction of comparisons with numeric constants form one contiguous id range per
+/// such segment; it is found by binary search with the ordinary comparison. Ids whose
+/// order says nothing about their value (doubles because of NaN, vocabulary and delta
+/// literals) are read and tested with the filter. Every other inline kind (booleans,
+/// dates, blank nodes) can never compare true with a number and is skipped.
+#[derive(Clone)]
+pub struct RangeSpec {
+    pub var: VarId,
+    /// sorted, disjoint id intervals `[lo, hi]` to read; `exact` means every id in it
+    /// satisfies the filter, otherwise its rows are tested
+    pub ranges: Vec<IdRange>,
+    /// the pushed filter (a conjunction), evaluated on rows of inexact ranges
+    pub filter: Vec<Expr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdRange {
+    pub lo: u64,
+    pub hi: u64,
+    pub exact: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum JoinAlgo {
     Merge,
@@ -121,6 +148,8 @@ pub struct PathSpec {
 #[derive(Clone)]
 pub enum Kind {
     Scan(ScanSpec),
+    /// scan restricted to the id ranges of a numeric range filter on its sorted column
+    RangeScan(ScanSpec, RangeSpec),
     Values(Table),
     Empty,
     Join {
@@ -161,6 +190,13 @@ pub enum Kind {
         spec: ScanSpec,
         key: VarId,
         counts: Vec<VarId>,
+        /// answered from the index statistics' per-class counts (exact for this snapshot)
+        metadata: bool,
+    },
+    /// `COUNT(*)` over a join of two scans on one variable: both children are scans
+    /// sorted on it, read as (key, run length) pairs; the count is Σ left × right
+    CountJoinRuns {
+        var: VarId,
     },
     CountScan {
         spec: ScanSpec,
@@ -257,6 +293,7 @@ impl Node {
     pub fn operator(&self) -> &'static str {
         match &self.kind {
             Kind::Scan(_) => "IndexScan",
+            Kind::RangeScan(..) => "IndexRangeScan",
             Kind::Values(_) => "Values",
             Kind::Empty => "Empty",
             Kind::Join {
@@ -285,7 +322,9 @@ impl Node {
             Kind::Group { .. } => "GroupBy",
             Kind::CountScan { .. } => "CountFromIndex",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
+            Kind::GroupCountScan { metadata: true, .. } => "GroupCountFromMetadata",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
+            Kind::CountJoinRuns { .. } => "CountJoinFromRuns",
             Kind::CountJoin { .. } => "CountJoin",
             Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
@@ -1344,10 +1383,18 @@ impl<'a> Planner<'a> {
             let items: Vec<Vec<Node>> =
                 members.iter().map(|&i| leaves[i].take().unwrap()).collect();
             let plan = if items.len() == 1 {
-                let mut opts = items.into_iter().next().unwrap();
-                opts.sort_by(|a, b| a.cost.total_cmp(&b.cost));
-                let best = opts.swap_remove(0);
-                self.place_filters(best, filters)
+                // filters can change which access path is cheapest (range pushdown)
+                let opts = items.into_iter().next().unwrap();
+                let (best, rest) = opts
+                    .into_iter()
+                    .map(|o| {
+                        let mut f = filters.clone();
+                        (self.place_filters(o, &mut f), f)
+                    })
+                    .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost))
+                    .unwrap();
+                *filters = rest;
+                best
             } else if items.len() <= DP_LIMIT {
                 self.dp(items, filters)?
             } else {
@@ -1935,6 +1982,10 @@ fn union(children: Vec<Node>) -> Node {
 }
 
 pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
+    let (n, exprs) = push_range(n, exprs, ctx);
+    if exprs.is_empty() {
+        return n;
+    }
     let desc = exprs
         .iter()
         .map(|e| e.display(ctx))
@@ -1947,6 +1998,211 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
         *d = d.min(f.est.max(1.0));
     }
     f
+}
+
+/// Comparison of the range variable with a numeric constant: `?v op c`.
+#[derive(Clone, Copy, PartialEq)]
+enum RangeOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+/// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
+fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
+    use super::expr::CmpOp;
+    let (a, b, op) = match e {
+        Expr::Cmp(a, b, op) => (a, b, Some(*op)),
+        Expr::Eq(a, b) => (a, b, None),
+        _ => return None,
+    };
+    fn constant(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
+        use super::value::{NumOp, Value, arith};
+        match e {
+            Expr::Lit(_, c) => Some(c.clone()),
+            Expr::Const(id) => ctx.value(*id),
+            Expr::Neg(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &constant(x, ctx)?).ok(),
+            Expr::Pos(x) => constant(x, ctx).filter(|c| c.is_numeric()),
+            _ => None,
+        }
+    }
+    let constant = |e: &Expr| constant(e, ctx);
+    let (c, flip) = match (&**a, &**b) {
+        (Expr::Var(x), c) if *x == v => (constant(c)?, false),
+        (c, Expr::Var(x)) if *x == v => (constant(c)?, true),
+        _ => return None,
+    };
+    if !c.is_numeric() {
+        return None;
+    }
+    let op = match (op, flip) {
+        (None, _) => RangeOp::Eq,
+        (Some(CmpOp::Lt), false) | (Some(CmpOp::Gt), true) => RangeOp::Lt,
+        (Some(CmpOp::Le), false) | (Some(CmpOp::Ge), true) => RangeOp::Le,
+        (Some(CmpOp::Gt), false) | (Some(CmpOp::Lt), true) => RangeOp::Gt,
+        (Some(CmpOp::Ge), false) | (Some(CmpOp::Le), true) => RangeOp::Ge,
+    };
+    Some((op, c))
+}
+
+/// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
+fn numeric_ranges(atoms: &[(RangeOp, super::value::Value)], ctx: &Ctx) -> Vec<IdRange> {
+    use super::value::compare;
+    use std::cmp::Ordering;
+    // the atoms split into lower bounds (false, then true along a segment in value order)
+    // and upper bounds (true, then false); `=` is both
+    let cmp = |id: u64| {
+        ctx.value(Id(id)).map(|x| {
+            atoms
+                .iter()
+                .map(move |(op, c)| (*op, compare(&x, c).ok().flatten()))
+        })
+    };
+    let lower_ok = |id: u64| {
+        cmp(id).is_some_and(|mut it| {
+            it.all(|(op, o)| match op {
+                RangeOp::Gt => o == Some(Ordering::Greater),
+                RangeOp::Ge | RangeOp::Eq => matches!(o, Some(Ordering::Greater | Ordering::Equal)),
+                RangeOp::Lt | RangeOp::Le => true,
+            })
+        })
+    };
+    let upper_ok = |id: u64| {
+        cmp(id).is_some_and(|mut it| {
+            it.all(|(op, o)| match op {
+                RangeOp::Lt => o == Some(Ordering::Less),
+                RangeOp::Le | RangeOp::Eq => matches!(o, Some(Ordering::Less | Ordering::Equal)),
+                RangeOp::Gt | RangeOp::Ge => true,
+            })
+        })
+    };
+    // first id in [lo, hi] for which `pred` holds (`pred` monotone false → true)
+    let first = |lo: u64, hi: u64, pred: &dyn Fn(u64) -> bool| {
+        let (mut a, mut b) = (lo, hi + 1);
+        while a < b {
+            let m = a + (b - a) / 2;
+            if pred(m) { b = m } else { a = m + 1 }
+        }
+        a
+    };
+    let mut out = Vec::new();
+    let segment = |tag: Tag, lo: u64, hi: u64, out: &mut Vec<IdRange>| {
+        let (lo, hi) = (Id::new(tag, lo).0, Id::new(tag, hi).0);
+        let s = first(lo, hi, &lower_ok);
+        let e = first(lo, hi, &|id| !upper_ok(id));
+        if s < e {
+            out.push(IdRange {
+                lo: s,
+                hi: e - 1,
+                exact: true,
+            });
+        }
+    };
+    let residual = |tag: Tag, out: &mut Vec<IdRange>| {
+        out.push(IdRange {
+            lo: Id::new(tag, 0).0,
+            hi: Id::new(tag, crate::id::PAYLOAD_MASK).0,
+            exact: false,
+        })
+    };
+    // tags in id order: Int < Double < Vocab < Delta < Decimal
+    let half = 1u64 << (crate::id::PAYLOAD_BITS - 1);
+    segment(Tag::Int, 0, half - 1, &mut out);
+    segment(Tag::Int, half, 2 * half - 1, &mut out);
+    residual(Tag::Double, &mut out);
+    residual(Tag::Vocab, &mut out);
+    residual(Tag::Delta, &mut out);
+    const MANTISSA: u32 = 56;
+    for scale in 0..16u64 {
+        let base = scale << MANTISSA;
+        let m = 1u64 << (MANTISSA - 1);
+        segment(Tag::Decimal, base, base + m - 1, &mut out);
+        segment(Tag::Decimal, base + m, base + 2 * m - 1, &mut out);
+    }
+    debug_assert!(out.windows(2).all(|w| w[0].hi < w[1].lo));
+    out
+}
+
+/// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
+fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
+    let Kind::Scan(spec) = &n.kind else {
+        return (n, exprs);
+    };
+    let Some(&(col, v)) = spec.cols.first() else {
+        return (n, exprs);
+    };
+    if !ctx.opt.range_pushdown || col != spec.prefix.len() || spec.graph_col == col {
+        return (n, exprs);
+    }
+    let (pushed, rest): (Vec<Expr>, Vec<Expr>) = exprs
+        .into_iter()
+        .flat_map(Expr::conjuncts)
+        .partition(|e| range_atom(e, v, ctx).is_some());
+    if pushed.is_empty() {
+        return (n, rest);
+    }
+    let atoms: Vec<_> = pushed
+        .iter()
+        .filter_map(|e| range_atom(e, v, ctx))
+        .collect();
+    let ranges = numeric_ranges(&atoms, ctx);
+    let exact = ranges.iter().filter(|r| r.exact).count();
+    let desc = format!(
+        "{} | {} [{exact} exact + {} tested id ranges]",
+        n.desc,
+        pushed
+            .iter()
+            .map(|e| e.display(ctx))
+            .collect::<Vec<_>>()
+            .join(" && "),
+        ranges.len() - exact
+    );
+    // rows read, counted exactly (the boundary blocks are the ones the scan reads first):
+    // exact ranges all qualify, the others are filtered
+    let (mut exact_rows, mut tested_rows) = (0.0, 0.0);
+    for r in &ranges {
+        let bound = |v: u64, fill: u64| {
+            let mut k = crate::index::pad(&spec.prefix, fill);
+            k[spec.prefix.len()] = v;
+            k
+        };
+        let Ok(rows) = ctx
+            .snap
+            .count_between(spec.perm, bound(r.lo, 0), bound(r.hi, u64::MAX))
+        else {
+            return (n, rest.into_iter().chain(pushed).collect());
+        };
+        let rows = rows as f64;
+        if r.exact {
+            exact_rows += rows;
+        } else {
+            tested_rows += rows;
+        }
+    }
+    let read = (exact_rows + tested_rows).min(n.est);
+    let est = (exact_rows + tested_rows * FILTER_SELECTIVITY.powi(pushed.len() as i32)).min(n.est);
+    let seeks = 4.0 * ranges.len() as f64;
+    let spec = spec.clone();
+    let mut r = Node {
+        kind: Kind::RangeScan(
+            spec,
+            RangeSpec {
+                var: v,
+                ranges,
+                filter: pushed,
+            },
+        ),
+        desc,
+        ..n
+    };
+    r.cost = read + seeks;
+    r.est = est.max(if r.est > 0.0 { 1.0 } else { 0.0 });
+    for d in r.dist.values_mut() {
+        *d = d.min(r.est.max(1.0));
+    }
+    (r, rest)
 }
 
 pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
@@ -2065,6 +2321,31 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         n.cost = child.est;
         return n;
     }
+    // COUNT(*) over a join of two scans on one variable: per-key run lengths
+    if keys.is_empty()
+        && ctx.opt.count_join_runs
+        && aggs.len() == 1
+        && matches!(aggs[0].1.func, AggregateFunction::Count)
+        && aggs[0].1.expr.is_none()
+        && !aggs[0].1.distinct
+        && let Kind::Join { algo, keys: jk } = &child.kind
+        && *algo != JoinAlgo::Cross
+        && let [k] = jk.as_slice()
+        && let Some(runs) = key_run_scans(&child, *k, ctx)
+    {
+        let var = aggs[0].0;
+        return Node {
+            kind: Kind::CountJoinRuns { var },
+            vars: vec![var],
+            certain: vec![var],
+            sorted: Vec::new(),
+            est: 1.0,
+            cost: runs.iter().map(|c| c.est).sum(),
+            dist: [(var, 1.0)].into_iter().collect(),
+            desc: child.desc.clone(),
+            children: runs,
+        };
+    }
     // COUNT(*) over a plain join: count pairs
     if keys.is_empty()
         && aggs.len() == 1
@@ -2115,7 +2396,23 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             retarget_desc(&child.desc, &spec),
             ctx.var_name(key)
         );
-        let mut n = Node::leaf(Kind::GroupCountScan { spec, key, counts }, vars, est, desc);
+        let metadata = ctx.opt.metadata_counts && class_counts_exact(&spec, key, ctx);
+        let desc = if metadata {
+            format!("{desc} [from statistics]")
+        } else {
+            desc
+        };
+        let mut n = Node::leaf(
+            Kind::GroupCountScan {
+                spec,
+                key,
+                counts,
+                metadata,
+            },
+            vars,
+            est,
+            desc,
+        );
         n.cost = child.est;
         n.sorted = vec![key];
         return n;
@@ -2142,6 +2439,13 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             .collect::<Vec<_>>()
             .join(" ")
     );
+    let desc = if ctx.opt.incremental_group
+        && super::exec::incremental_group_ok(&keys, &aggs, &child.vars)
+    {
+        format!("{desc} [incremental]")
+    } else {
+        desc
+    };
     let dist = vars.iter().map(|&v| (v, est)).collect();
     let certain = keys
         .iter()
@@ -2164,6 +2468,62 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
 // ------------------------------------------------------------------------------
 // helpers
 // ------------------------------------------------------------------------------
+
+/// The two children of a join, as scans sorted on the join variable `k`, when both are
+/// plain scans sharing only `k` (so the count needs nothing but each side's run lengths).
+fn key_run_scans(join: &Node, k: VarId, ctx: &Ctx) -> Option<Vec<Node>> {
+    let [l, r] = join.children.as_slice() else {
+        return None;
+    };
+    let shared: Vec<VarId> = l
+        .vars
+        .iter()
+        .filter(|v| r.vars.contains(v))
+        .copied()
+        .collect();
+    if shared != [k] {
+        return None;
+    }
+    [l, r]
+        .into_iter()
+        .map(|c| {
+            let Kind::Scan(spec) = &c.kind else {
+                return None;
+            };
+            let spec = reorder_scan(spec, k)?;
+            let desc = format!(
+                "{} [runs of ?{}]",
+                retarget_desc(&c.desc, &spec),
+                ctx.var_name(k)
+            );
+            Some(Node {
+                kind: Kind::Scan(spec),
+                desc,
+                sorted: vec![k],
+                ..c.clone()
+            })
+        })
+        .collect()
+}
+
+/// Whether the per-class subject counts in the index statistics are exactly the answer
+/// of `GROUP BY ?class` + COUNT over `?s rdf:type ?class`: the snapshot has no delta,
+/// every quad is in the default graph (so a class's rows are its distinct subjects), and
+/// the scan reads the default graph without further constraints.
+fn class_counts_exact(spec: &ScanSpec, key: VarId, ctx: &Ctx) -> bool {
+    let snap = &ctx.snap;
+    let stats = &snap.generation.stats;
+    spec.perm == Perm::Pos
+        && spec.eqs.is_empty()
+        && spec.cols.first() == Some(&(1, key))
+        && spec.cols[1..].iter().all(|&(c, _)| c == 2)
+        && snap.delta.is_empty()
+        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
+        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0)
+        && snap
+            .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
+            .is_some_and(|t| spec.prefix == [t.0])
+}
 
 /// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.
 fn retarget_desc(desc: &str, spec: &ScanSpec) -> String {

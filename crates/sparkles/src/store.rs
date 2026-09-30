@@ -116,10 +116,10 @@ impl Delta {
         self.ins[0].is_empty() && self.del[0].is_empty()
     }
     fn range<'a>(set: &'a OrdSet<Key>, prefix: &[u64]) -> impl Iterator<Item = &'a Key> + 'a {
-        set.range((
-            Bound::Included(pad(prefix, 0)),
-            Bound::Included(pad(prefix, u64::MAX)),
-        ))
+        Self::key_range(set, pad(prefix, 0), pad(prefix, u64::MAX))
+    }
+    fn key_range(set: &OrdSet<Key>, lo: Key, hi: Key) -> impl Iterator<Item = &Key> + '_ {
+        set.range((Bound::Included(lo), Bound::Included(hi)))
     }
 }
 
@@ -269,15 +269,27 @@ impl Snapshot {
         &self,
         perm: Perm,
         prefix: &[u64],
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between(perm, pad(prefix, 0), pad(prefix, u64::MAX), f)
+    }
+
+    /// Visit all quads whose permuted key lies in `[lo, hi]`, in key order, merging the
+    /// base index with the delta (see [`scan`](Self::scan)).
+    pub fn scan_between(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
         let pi = perm.index();
-        let mut ins = Delta::range(&self.delta.ins[pi], prefix).peekable();
-        let mut del = Delta::range(&self.delta.del[pi], prefix).peekable();
+        let mut ins = Delta::key_range(&self.delta.ins[pi], lo, hi).peekable();
+        let mut del = Delta::key_range(&self.delta.del[pi], lo, hi).peekable();
         let base = self.perm(perm);
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_range_until(&self.cache, prefix, |blk, s, e| {
+            let r = base.for_each_key_range_until(&self.cache, &lo, &hi, |blk, s, e| {
                 if stop {
                     return Ok(!stop);
                 }
@@ -376,6 +388,15 @@ impl Snapshot {
             .take(10_000)
             .count() as u64;
         base + ins
+    }
+
+    /// Exact number of quads with keys in `[lo, hi]` (at most two block decodes).
+    pub fn count_between(&self, perm: Perm, lo: Key, hi: Key) -> Result<u64> {
+        let base = self.perm(perm).count_between(&self.cache, &lo, &hi)?;
+        let pi = perm.index();
+        let ins = Delta::key_range(&self.delta.ins[pi], lo, hi).count() as u64;
+        let del = Delta::key_range(&self.delta.del[pi], lo, hi).count() as u64;
+        Ok((base + ins).saturating_sub(del))
     }
 
     pub fn contains(&self, quad: &[Id; 4]) -> Result<bool> {

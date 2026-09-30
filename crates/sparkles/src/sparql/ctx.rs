@@ -35,6 +35,100 @@ const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
 
+/// Executor optimizations that can be switched off for diagnosis (every one of them has
+/// a generic fallback with the same results). `SPARKLES_DISABLE_OPTIMIZATIONS` holds a
+/// comma-separated list of names that are off by default in a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Optimizations {
+    /// numeric range FILTERs on a scan's sorted column read only the matching id ranges
+    pub range_pushdown: bool,
+    /// GROUP BY on one variable with plain-variable aggregates keeps one state per group
+    pub incremental_group: bool,
+    /// COUNT(*) over a join of two scans counts per-key runs instead of reading rows
+    pub count_join_runs: bool,
+    /// per-class counts from index statistics when they are exact
+    pub metadata_counts: bool,
+    /// property paths expand a whole frontier per index sweep
+    pub batched_paths: bool,
+    /// ORDER BY one numeric variable with LIMIT ranks rounded keys first
+    pub topk_prefilter: bool,
+}
+
+impl Optimizations {
+    pub const NAMES: [&str; 6] = [
+        "range_pushdown",
+        "incremental_group",
+        "count_join_runs",
+        "metadata_counts",
+        "batched_paths",
+        "topk_prefilter",
+    ];
+
+    /// Everything on.
+    pub const ALL: Optimizations = Optimizations {
+        range_pushdown: true,
+        incremental_group: true,
+        count_join_runs: true,
+        metadata_counts: true,
+        batched_paths: true,
+        topk_prefilter: true,
+    };
+
+    /// Everything off: the generic operators only.
+    pub const NONE: Optimizations = Optimizations {
+        range_pushdown: false,
+        incremental_group: false,
+        count_join_runs: false,
+        metadata_counts: false,
+        batched_paths: false,
+        topk_prefilter: false,
+    };
+
+    fn flag(&mut self, name: &str) -> Option<&mut bool> {
+        Some(match name {
+            "range_pushdown" => &mut self.range_pushdown,
+            "incremental_group" => &mut self.incremental_group,
+            "count_join_runs" => &mut self.count_join_runs,
+            "metadata_counts" => &mut self.metadata_counts,
+            "batched_paths" => &mut self.batched_paths,
+            "topk_prefilter" => &mut self.topk_prefilter,
+            _ => return None,
+        })
+    }
+
+    /// Switch off the named optimizations (`all` switches off every one). Unknown names
+    /// are returned as an error.
+    pub fn disable(mut self, names: &str) -> std::result::Result<Optimizations, String> {
+        for n in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if n == "all" {
+                self = Optimizations::NONE;
+                continue;
+            }
+            *self.flag(n).ok_or_else(|| {
+                format!(
+                    "unknown optimization {n:?} (known: {})",
+                    Self::NAMES.join(", ")
+                )
+            })? = false;
+        }
+        Ok(self)
+    }
+}
+
+impl Default for Optimizations {
+    /// Everything on, except what `SPARKLES_DISABLE_OPTIMIZATIONS` lists.
+    fn default() -> Optimizations {
+        static DEFAULT: std::sync::OnceLock<Optimizations> = std::sync::OnceLock::new();
+        *DEFAULT.get_or_init(|| match std::env::var("SPARKLES_DISABLE_OPTIMIZATIONS") {
+            Ok(v) => Optimizations::ALL.disable(&v).unwrap_or_else(|e| {
+                tracing::warn!("SPARKLES_DISABLE_OPTIMIZATIONS: {e}");
+                Optimizations::ALL
+            }),
+            Err(_) => Optimizations::ALL,
+        })
+    }
+}
+
 pub struct Ctx {
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
@@ -52,6 +146,7 @@ pub struct Ctx {
     pub allow_service: bool,
     /// consult / fill the store's result cache
     pub use_cache: bool,
+    pub opt: Optimizations,
 }
 
 impl Ctx {
@@ -73,6 +168,7 @@ impl Ctx {
             max_rows: 200_000_000,
             allow_service: true,
             use_cache: true,
+            opt: Optimizations::default(),
         }
     }
 

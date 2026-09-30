@@ -133,6 +133,13 @@ impl Block {
         }
         std::cmp::Ordering::Equal
     }
+    /// Row range `[s, e)` whose keys lie in `[lo, hi]` (full-key comparison).
+    pub fn key_range(&self, lo: &Key, hi: &Key) -> (usize, usize) {
+        let n = self.len();
+        let s = partition(n, |i| self.key(i) < *lo);
+        let e = s + partition(n - s, |i| self.key(s + i) <= *hi);
+        (s, e)
+    }
     /// Row range `[lo, hi)` whose keys start with `prefix`.
     pub fn prefix_range(&self, prefix: &[u64]) -> (usize, usize) {
         if prefix.is_empty() {
@@ -163,6 +170,16 @@ impl Block {
     pub fn bytes(&self) -> usize {
         self.len() * 32
     }
+}
+
+/// Number of leading indexes in `0..n` for which `pred` holds (`pred` must be monotone).
+fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let m = (lo + hi) / 2;
+        if pred(m) { lo = m + 1 } else { hi = m }
+    }
+    lo
 }
 
 #[derive(Clone, Debug)]
@@ -397,10 +414,13 @@ impl PermIndex {
     /// Block index range `[lo, hi)` that may contain keys with this prefix
     /// (QLever-style block skipping on in-RAM first/last keys).
     pub fn block_range(&self, prefix: &[u64]) -> (usize, usize) {
-        let lo_key = pad(prefix, 0);
-        let hi_key = pad(prefix, u64::MAX);
-        let lo = self.blocks.partition_point(|b| b.last < lo_key);
-        let hi = self.blocks.partition_point(|b| b.first <= hi_key);
+        self.key_block_range(&pad(prefix, 0), &pad(prefix, u64::MAX))
+    }
+
+    /// Block index range `[lo, hi)` that may contain keys in `[lo_key, hi_key]`.
+    pub fn key_block_range(&self, lo_key: &Key, hi_key: &Key) -> (usize, usize) {
+        let lo = self.blocks.partition_point(|b| b.last < *lo_key);
+        let hi = self.blocks.partition_point(|b| b.first <= *hi_key);
         (lo, hi.max(lo))
     }
 }
@@ -479,12 +499,16 @@ impl PermIndex {
         if prefix.is_empty() {
             return Ok(self.rows);
         }
-        let (lo, hi) = self.block_range(prefix);
+        self.count_between(cache, &pad(prefix, 0), &pad(prefix, u64::MAX))
+    }
+
+    /// Exact number of base rows with keys in `[lo_key, hi_key]` (at most two decodes).
+    pub fn count_between(&self, cache: &BlockCache, lo_key: &Key, hi_key: &Key) -> Result<u64> {
+        let (lo, hi) = self.key_block_range(lo_key, hi_key);
         if lo >= hi {
             return Ok(0);
         }
-        let lo_key = pad(prefix, 0);
-        let hi_key = pad(prefix, u64::MAX);
+        let (lo_key, hi_key) = (*lo_key, *hi_key);
         let mut total = 0u64;
         // interior blocks fully contained in the range need no decoding
         let mut b = lo;
@@ -503,7 +527,7 @@ impl PermIndex {
                 b = e + 1;
             } else {
                 let blk = cache.get(self, b)?;
-                let (s, e) = blk.prefix_range(prefix);
+                let (s, e) = blk.key_range(&lo_key, &hi_key);
                 total += (e - s) as u64;
                 b += 1;
             }
@@ -517,16 +541,19 @@ impl PermIndex {
         if prefix.is_empty() {
             return self.rows;
         }
-        let (lo, hi) = self.block_range(prefix);
+        self.estimate_between(&pad(prefix, 0), &pad(prefix, u64::MAX))
+    }
+
+    /// Estimated number of rows with keys in `[lo_key, hi_key]`, without decoding.
+    pub fn estimate_between(&self, lo_key: &Key, hi_key: &Key) -> u64 {
+        let (lo, hi) = self.key_block_range(lo_key, hi_key);
         if lo >= hi {
             return 0;
         }
         let upper: u64 = self.blocks[lo..hi].iter().map(|m| m.rows as u64).sum();
-        let lo_key = pad(prefix, 0);
-        let hi_key = pad(prefix, u64::MAX);
         let lower: u64 = self.blocks[lo..hi]
             .iter()
-            .filter(|m| m.first >= lo_key && m.last <= hi_key)
+            .filter(|m| m.first >= *lo_key && m.last <= *hi_key)
             .map(|m| m.rows as u64)
             .sum();
         (lower + upper).div_ceil(2).max(1)
@@ -549,18 +576,28 @@ impl PermIndex {
         &self,
         cache: &BlockCache,
         prefix: &[u64],
+        f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
+        self.for_each_key_range_until(cache, &pad(prefix, 0), &pad(prefix, u64::MAX), f)
+    }
+
+    /// Visit every base row whose key lies in `[lo_key, hi_key]`, block-slice at a time,
+    /// until the callback returns `false`. Blocks outside the range are never decoded.
+    pub fn for_each_key_range_until(
+        &self,
+        cache: &BlockCache,
+        lo_key: &Key,
+        hi_key: &Key,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
-        let (lo, hi) = self.block_range(prefix);
-        let lo_key = pad(prefix, 0);
-        let hi_key = pad(prefix, u64::MAX);
+        let (lo, hi) = self.key_block_range(lo_key, hi_key);
         for b in lo..hi {
             let m = &self.blocks[b];
             let blk = cache.get(self, b)?;
-            let go_on = if m.first >= lo_key && m.last <= hi_key {
+            let go_on = if m.first >= *lo_key && m.last <= *hi_key {
                 f(&blk, 0, blk.len())?
             } else {
-                let (s, e) = blk.prefix_range(prefix);
+                let (s, e) = blk.key_range(lo_key, hi_key);
                 s >= e || f(&blk, s, e)?
             };
             if !go_on {

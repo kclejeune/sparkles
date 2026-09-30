@@ -2,7 +2,7 @@
 
 use super::ctx::Ctx;
 use super::expr::{Expr, Row, Val, ebv, eval};
-use super::plan::{Agg, GraphFilter, JoinAlgo, Kind, Node, PathEnd, PathSpec, ScanSpec};
+use super::plan::{Agg, GraphFilter, JoinAlgo, Kind, Node, PathEnd, PathSpec, RangeSpec, ScanSpec};
 use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
@@ -92,11 +92,13 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         && !matches!(
             n.kind,
             Kind::Scan(_)
+                | Kind::RangeScan(..)
                 | Kind::Values(_)
                 | Kind::Empty
                 | Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
                 | Kind::GroupCountScan { .. }
+                | Kind::CountJoinRuns { .. }
         );
     let key = if cacheable {
         super::cache::key(n, ctx)
@@ -136,15 +138,56 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         infos.push(info);
         Ok(t)
     };
+    // runtime detail for EXPLAIN (which variant of the operator ran)
+    let mut note: Option<String> = None;
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
         Kind::Scan(spec) => scan(ctx, spec, &n.vars)?,
+        Kind::RangeScan(spec, range) => range_scan(ctx, spec, range, &n.vars)?,
         Kind::GroupCountScan {
             spec,
             key: _,
             counts,
-        } => group_count_scan(ctx, spec, &n.vars, counts.len())?,
+            metadata,
+        } => {
+            if *metadata {
+                class_counts(ctx, &n.vars, counts.len())
+            } else {
+                group_count_scan(ctx, spec, &n.vars, counts.len())?
+            }
+        }
+        Kind::CountJoinRuns { var } => {
+            let mut sides = Vec::with_capacity(2);
+            for c in &n.children {
+                let t0 = Instant::now();
+                let Kind::Scan(spec) = &c.kind else {
+                    unreachable!("CountJoinRuns children are scans")
+                };
+                let runs = key_runs(ctx, spec)?;
+                let mut info = describe(ctx, c);
+                info.actual_rows = runs.0.len() as i64;
+                info.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                infos.push(info);
+                sides.push(runs);
+            }
+            let ((lk, lc), (rk, rc)) = (&sides[0], &sides[1]);
+            let (mut i, mut j, mut total) = (0, 0, 0u64);
+            while i < lk.len() && j < rk.len() {
+                match lk[i].cmp(&rk[j]) {
+                    Ordering::Less => i += 1,
+                    Ordering::Greater => j += 1,
+                    Ordering::Equal => {
+                        total = total.saturating_add(lc[i].saturating_mul(rc[j]));
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            let mut t = Table::new(vec![*var]);
+            t.push_row(&[Id::from_i64(total.min(i64::MAX as u64) as i64).unwrap_or(Id::UNDEF)]);
+            t
+        }
         Kind::CountScan { spec, var } => {
             let c = ctx.snap.count(spec.perm, &spec.prefix)?;
             let mut t = Table::new(vec![*var]);
@@ -229,7 +272,11 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::OrderBy { keys, limit } => {
             let t = child(0, &mut infos)?;
-            order_by(ctx, t, keys, *limit)?
+            let (t, pre) = order_by(ctx, t, keys, *limit)?;
+            if let Some(kept) = pre {
+                note = Some(format!("[numeric prefilter kept {kept} rows]"));
+            }
+            t
         }
         Kind::Project(vars) => child(0, &mut infos)?.project(vars),
         Kind::Distinct => distinct(child(0, &mut infos)?),
@@ -271,6 +318,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     if !matches!(
         n.kind,
         Kind::Scan(_)
+            | Kind::RangeScan(..)
             | Kind::Sort(_)
             | Kind::Join {
                 algo: JoinAlgo::Merge,
@@ -287,7 +335,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     ctx.check_rows(table.len())?;
     let info = PlanInfo {
         operator: n.operator().to_string(),
-        description: n.desc.clone(),
+        description: match note {
+            Some(x) => format!("{} {x}", n.desc),
+            None => n.desc.clone(),
+        },
         columns: names(ctx, &n.vars),
         sorted_on: names(ctx, &n.sorted),
         estimated_rows: n.est.round(),
@@ -313,9 +364,57 @@ fn block_passes(spec: &ScanSpec, b: &Block, s: usize, e: usize) -> bool {
                 .all(|&g| spec.graph.accepts(g)))
 }
 
+/// Per-class subject counts from the index statistics (admitted by the planner only when
+/// they are exact), in class id order like the index runs.
+fn class_counts(ctx: &Ctx, vars: &[VarId], naggs: usize) -> Table {
+    let mut classes = ctx.snap.generation.stats.classes.clone();
+    classes.sort_unstable();
+    let mut t = Table::new(vars.to_vec());
+    t.cols[0] = classes.iter().map(|&(c, _)| Id(c)).collect();
+    let cnt: Vec<Id> = classes
+        .iter()
+        .map(|&(_, n)| Id::from_i64(n as i64).unwrap_or(Id::UNDEF))
+        .collect();
+    for a in 0..naggs {
+        t.cols[1 + a] = cnt.clone();
+    }
+    t.len = classes.len();
+    t
+}
+
 /// Count runs of the first free key column of a scan (graph filter / repeated variables /
 /// union-graph dedup applied row by row; plain blocks counted directly).
 fn group_count_scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId], naggs: usize) -> Result<Table> {
+    let (keys, counts) = key_runs(ctx, spec)?;
+    let mut t = Table::new(vars.to_vec());
+    let cnt: Vec<Id> = counts
+        .iter()
+        .map(|&c| Id::from_i64(c as i64).unwrap_or(Id::UNDEF))
+        .collect();
+    t.len = keys.len();
+    t.cols[0] = keys;
+    for a in 0..naggs {
+        t.cols[1 + a] = cnt.clone();
+    }
+    Ok(t)
+}
+
+/// Length of the run of `v` at the start of the sorted slice `col`: a short linear probe
+/// (most runs are short), then binary search for long runs.
+#[inline]
+fn run_len(col: &[u64], v: u64) -> usize {
+    const PROBE: usize = 16;
+    let end = col.len().min(PROBE);
+    match col[..end].iter().position(|x| *x != v) {
+        Some(n) => n,
+        None if end < col.len() => end + col[end..].partition_point(|x| *x == v),
+        None => end,
+    }
+}
+
+/// The distinct values of a scan's first free key column with the number of rows of each,
+/// in key order.
+fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
     let kc = spec.cols[0].0;
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut keys: Vec<Id> = Vec::new();
@@ -353,7 +452,7 @@ fn group_count_scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId], naggs: usize) ->
                 let mut i = 0;
                 while i < col.len() {
                     let v = col[i];
-                    let run = col[i..].partition_point(|x| *x == v);
+                    let run = run_len(&col[i..], v);
                     bump(v, run as u64);
                     i += run;
                 }
@@ -364,17 +463,7 @@ fn group_count_scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId], naggs: usize) ->
         ctx.check()?;
         Ok(true)
     })?;
-    let mut t = Table::new(vars.to_vec());
-    t.cols[0] = keys;
-    let cnt: Vec<Id> = counts
-        .iter()
-        .map(|&c| Id::from_i64(c as i64).unwrap_or(Id::UNDEF))
-        .collect();
-    for a in 0..naggs {
-        t.cols[1 + a] = cnt.clone();
-    }
-    t.len = t.cols[0].len();
-    Ok(t)
+    Ok((keys, counts))
 }
 
 /// Number of distinct values in the first free key column of a scan sorted on it: the
@@ -553,8 +642,6 @@ fn scan_limited(
     vars: &[VarId],
     limit: Option<usize>,
 ) -> Result<(Table, bool)> {
-    let limit = limit.unwrap_or(usize::MAX);
-    let mut truncated = false;
     let mut t = Table::new(vars.to_vec());
     // the exact number of rows under the prefix (at most two block decodes, and those
     // blocks are read by the scan anyway) bounds the output: reserve it once instead of
@@ -562,11 +649,60 @@ fn scan_limited(
     let bound = ctx.snap.count(spec.perm, &spec.prefix)?;
     let cap = usize::try_from(bound)
         .unwrap_or(usize::MAX)
-        .min(limit)
+        .min(limit.unwrap_or(usize::MAX))
         .min(ctx.max_rows.saturating_add(1));
     for c in &mut t.cols {
         c.reserve_exact(cap);
     }
+    let truncated = scan_into(
+        ctx,
+        spec,
+        pad(&spec.prefix, 0),
+        pad(&spec.prefix, u64::MAX),
+        limit,
+        &mut t,
+    )?;
+    Ok((t, truncated))
+}
+
+/// A scan restricted to id ranges of its first free column: exact ranges are copied,
+/// the others filtered. The output keeps the scan's order.
+fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> Result<Table> {
+    let mut t = Table::new(vars.to_vec());
+    let bound = |v: u64, fill: u64| {
+        let mut k = pad(&spec.prefix, fill);
+        k[spec.prefix.len()] = v;
+        k
+    };
+    for r in &range.ranges {
+        let (lo, hi) = (bound(r.lo, 0), bound(r.hi, u64::MAX));
+        if r.exact {
+            scan_into(ctx, spec, lo, hi, None, &mut t)?;
+        } else {
+            let mut part = Table::new(vars.to_vec());
+            scan_into(ctx, spec, lo, hi, None, &mut part)?;
+            if !part.is_empty() {
+                apply_filter(ctx, &mut part, &range.filter)?;
+                t.append(part);
+            }
+        }
+        ctx.check_rows(t.len())?;
+    }
+    Ok(t)
+}
+
+/// Append the scan's rows with keys in `[lo, hi]` to `t`, stopping after `limit` rows in
+/// total; returns whether rows may remain.
+fn scan_into(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    lo: crate::index::Key,
+    hi: crate::index::Key,
+    limit: Option<usize>,
+    t: &mut Table,
+) -> Result<bool> {
+    let limit = limit.unwrap_or(usize::MAX);
+    let mut truncated = false;
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
@@ -592,7 +728,7 @@ fn scan_limited(
         }
         t.len += 1;
     };
-    ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
+    ctx.snap.scan_between(spec.perm, lo, hi, |chunk| {
         if t.len >= limit {
             truncated = true;
             return Ok(false);
@@ -608,12 +744,12 @@ fn scan_limited(
             }
             Chunk::Block(b, s, e) => {
                 for i in s..e {
-                    row(&b.key(i), &mut t);
+                    row(&b.key(i), t);
                 }
                 n += e - s;
             }
             Chunk::Row(k) => {
-                row(&k, &mut t);
+                row(&k, t);
                 n += 1;
             }
         }
@@ -629,7 +765,7 @@ fn scan_limited(
         }
         Ok(true)
     })?;
-    Ok((t, truncated))
+    Ok(truncated)
 }
 
 // ------------------------------------------------------------------ joins ------
@@ -1281,7 +1417,67 @@ fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
     map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD && !e.has_exists(), f)
 }
 
-fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) -> Result<Table> {
+/// Candidate rows for `ORDER BY ?v LIMIT k` when every `?v` is a number other than NaN:
+/// a rounded `f64` per row is cheap, and rows whose rounded key is worse than the k-th
+/// best rounded key have at least k rows strictly ahead of them in the exact order (the
+/// rounding is monotone and numbers order by value first), so they cannot be among the
+/// first k. `None` when the shortcut does not apply.
+fn topk_candidates(ctx: &Ctx, t: &Table, keys: &[(Expr, bool)], k: usize) -> Option<Vec<usize>> {
+    let [(Expr::Var(v), asc)] = keys else {
+        return None;
+    };
+    if k == 0 || k.saturating_mul(8) > t.len() {
+        return None;
+    }
+    let col = &t.cols[t.col_of(*v)?];
+    let approx = |id: Id| -> Option<f64> {
+        use crate::id::Tag;
+        match id.tag() {
+            Tag::Int => Some(id.as_i64() as f64),
+            Tag::Double => Some(id.as_f64()).filter(|d| !d.is_nan()),
+            Tag::Decimal | Tag::Vocab | Tag::Delta => super::value::approx_f64(&ctx.value(id)?),
+            _ => None,
+        }
+    };
+    // ascending order ⇔ smallest first; negate so that "best" is always the largest
+    let sign = if *asc { -1.0 } else { 1.0 };
+    let f: Vec<f64> = col
+        .par_iter()
+        .map(|&id| approx(id).map(|d| d * sign))
+        .collect::<Option<Vec<f64>>>()?;
+    let mut sorted = f.clone();
+    let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    let tau = *kth;
+    Some((0..f.len()).filter(|&i| f[i] >= tau).collect())
+}
+
+/// ORDER BY (with an optional LIMIT); also returns how many rows the numeric top-k
+/// prefilter kept, if it ran.
+fn order_by(
+    ctx: &Ctx,
+    mut t: Table,
+    keys: &[(Expr, bool)],
+    limit: Option<usize>,
+) -> Result<(Table, Option<usize>)> {
+    let mut prefiltered = None;
+    if let Some(k) = limit
+        && ctx.opt.topk_prefilter
+        && let Some(cand) = topk_candidates(ctx, &t, keys, k)
+        && cand.len() < t.len()
+    {
+        // the candidates keep their relative order, so ties break as in the full sort
+        prefiltered = Some(cand.len());
+        t = t.take_rows(&cand);
+    }
+    Ok((order_by_rows(ctx, t, keys, limit)?, prefiltered))
+}
+
+fn order_by_rows(
+    ctx: &Ctx,
+    t: Table,
+    keys: &[(Expr, bool)],
+    limit: Option<usize>,
+) -> Result<Table> {
     let dec = decode_for(ctx, &t, &keys.iter().map(|(e, _)| e).collect::<Vec<_>>());
     let map = t.var_map(ctx.nvars());
     let key_vals: Vec<Vec<Option<Value>>> = keys
@@ -1360,6 +1556,11 @@ fn distinct(t: Table) -> Table {
 // ------------------------------------------------------------------ group ------
 
 fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<Table> {
+    if ctx.opt.incremental_group
+        && let Some(out) = group_incremental(ctx, t, keys, aggs)?
+    {
+        return Ok(out);
+    }
     let kcols: Vec<Option<usize>> = keys.iter().map(|k| t.col_of(*k)).collect();
     let mut order: Vec<Vec<Id>> = Vec::new();
     let mut groups: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
@@ -1394,6 +1595,226 @@ fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<
         out.push_row(&row);
     }
     Ok(out)
+}
+
+/// Whether `group` can run incrementally: at most one key variable, and aggregates that
+/// are `COUNT(*)` or COUNT / SUM / AVG / MIN / MAX / SAMPLE of an input column, without
+/// DISTINCT. The planner uses this to name the operator in EXPLAIN.
+pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarId]) -> bool {
+    keys.len() <= 1
+        && keys.iter().all(|k| input.contains(k))
+        && aggs.iter().all(|(_, a)| {
+            !a.distinct
+                && match &a.expr {
+                    None => matches!(a.func, AggregateFunction::Count),
+                    Some(Expr::Var(v)) => {
+                        input.contains(v)
+                            && matches!(
+                                a.func,
+                                AggregateFunction::Count
+                                    | AggregateFunction::Sum
+                                    | AggregateFunction::Avg
+                                    | AggregateFunction::Min
+                                    | AggregateFunction::Max
+                                    | AggregateFunction::Sample
+                            )
+                    }
+                    _ => false,
+                }
+        })
+}
+
+/// Running state of one aggregate of one group (same results as [`aggregate`]).
+enum AggState {
+    /// COUNT(*) / COUNT(?v): rows / bound values
+    Count(u64),
+    /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
+    /// generic numeric sum; `None` once a value was unbound or not numeric
+    Sum {
+        int: i64,
+        generic: Option<Value>,
+        ok: bool,
+        rows: u64,
+    },
+    /// MIN / MAX: the best id and its value
+    Best(Option<Id>, Option<Value>),
+    Sample(Option<Id>),
+}
+
+impl AggState {
+    fn new(agg: &Agg) -> AggState {
+        match agg.func {
+            AggregateFunction::Sum | AggregateFunction::Avg => AggState::Sum {
+                int: 0,
+                generic: None,
+                ok: true,
+                rows: 0,
+            },
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None),
+            AggregateFunction::Sample => AggState::Sample(None),
+            _ => AggState::Count(0),
+        }
+    }
+
+    /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    #[inline]
+    fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
+        match self {
+            AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
+            AggState::Sum {
+                int,
+                generic,
+                ok,
+                rows,
+            } => {
+                *rows += 1;
+                let id = id.unwrap_or(Id::UNDEF);
+                if !*ok {
+                    return;
+                }
+                if generic.is_none()
+                    && id.tag() == crate::id::Tag::Int
+                    && let Some(s) = int.checked_add(id.as_i64())
+                {
+                    *int = s;
+                    return;
+                }
+                let acc = generic
+                    .take()
+                    .unwrap_or_else(|| Value::Integer((*int).into()));
+                match (!id.is_undef()).then(|| ctx.value(id)).flatten() {
+                    Some(v) => match arith(NumOp::Add, &acc, &v) {
+                        Ok(v) => *generic = Some(v),
+                        Err(_) => *ok = false,
+                    },
+                    None => *ok = false,
+                }
+            }
+            AggState::Best(best, best_v) => {
+                let Some(id) = id.filter(|id| !id.is_undef()) else {
+                    return;
+                };
+                let v = ctx.value(id);
+                let better = match best_v {
+                    None => best.is_none(),
+                    Some(b) => {
+                        let o = order_cmp(v.as_ref(), Some(b));
+                        if matches!(agg.func, AggregateFunction::Min) {
+                            o == Ordering::Less
+                        } else {
+                            o == Ordering::Greater
+                        }
+                    }
+                };
+                if better {
+                    *best = Some(id);
+                    *best_v = v;
+                }
+            }
+            AggState::Sample(x) => {
+                if x.is_none() {
+                    *x = id.filter(|id| !id.is_undef());
+                }
+            }
+        }
+    }
+
+    fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
+        match self {
+            AggState::Count(n) => Id::from_i64(n as i64).unwrap_or(Id::UNDEF),
+            AggState::Sum {
+                int,
+                generic,
+                ok,
+                rows,
+            } => {
+                if !ok {
+                    return Id::UNDEF;
+                }
+                let sum = generic.unwrap_or_else(|| Value::Integer(int.into()));
+                let v = if matches!(agg.func, AggregateFunction::Avg) {
+                    if rows == 0 {
+                        Some(Value::Integer(0.into()))
+                    } else {
+                        arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+                    }
+                } else {
+                    Some(sum)
+                };
+                v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+            }
+            AggState::Best(best, _) => best.unwrap_or(Id::UNDEF),
+            AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
+        }
+    }
+}
+
+/// GROUP BY in one pass: groups are found through a hash map on the single key id and
+/// every aggregate keeps a running state, instead of collecting per-group row lists and
+/// value vectors. `None` when the query shape is not admitted (see
+/// [`incremental_group_ok`]).
+fn group_incremental(
+    ctx: &Ctx,
+    t: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+) -> Result<Option<Table>> {
+    if !incremental_group_ok(keys, aggs, &t.vars) {
+        return Ok(None);
+    }
+    let kcol = keys.first().and_then(|k| t.col_of(*k));
+    let acols: Vec<Option<usize>> = aggs
+        .iter()
+        .map(|(_, a)| match &a.expr {
+            Some(Expr::Var(v)) => t.col_of(*v),
+            _ => None,
+        })
+        .collect();
+    let mut index: FxHashMap<Id, u32> = FxHashMap::default();
+    let mut order: Vec<Id> = Vec::new();
+    let mut states: Vec<AggState> = Vec::new();
+    let na = aggs.len();
+    if kcol.is_none() {
+        // no grouping: one group, also for empty input
+        order.push(Id::UNDEF);
+        states.extend(aggs.iter().map(|(_, a)| AggState::new(a)));
+    }
+    for i in 0..t.len() {
+        if i % 65_536 == 0 {
+            ctx.check()?;
+        }
+        let g = match kcol {
+            None => 0,
+            Some(c) => {
+                let k = t.cols[c][i];
+                *index.entry(k).or_insert_with(|| {
+                    order.push(k);
+                    states.extend(aggs.iter().map(|(_, a)| AggState::new(a)));
+                    (order.len() - 1) as u32
+                }) as usize
+            }
+        };
+        for (a, ((_, agg), col)) in aggs.iter().zip(&acols).enumerate() {
+            states[g * na + a].add(ctx, agg, col.map(|c| t.cols[c][i]));
+        }
+    }
+    let mut vars = keys.to_vec();
+    vars.extend(aggs.iter().map(|(v, _)| *v));
+    let mut out = Table::new(vars);
+    let mut states = states.into_iter();
+    let mut row = Vec::with_capacity(1 + na);
+    for k in order {
+        ctx.check()?;
+        row.clear();
+        if kcol.is_some() {
+            row.push(k);
+        }
+        for (_, agg) in aggs {
+            row.push(states.next().unwrap().finish(ctx, agg));
+        }
+        out.push_row(&row);
+    }
+    Ok(Some(out))
 }
 
 fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Agg) -> Id {

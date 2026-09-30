@@ -108,6 +108,9 @@ impl Request<'_> {
             ctx.max_rows = m;
         }
         ctx.allow_service = self.opts.allow_service;
+        if let Some(o) = self.opts.optimizations {
+            ctx.opt = o;
+        }
         ctx.base_iri = self.base.clone();
         ctx
     }

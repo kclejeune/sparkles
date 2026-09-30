@@ -398,7 +398,8 @@ fn aggregates() {
         "SELECT ?t (COUNT(?p) AS ?c) WHERE { ?p a ?t } GROUP BY ?t HAVING (COUNT(?p) > 1)",
     );
     assert_eq!(strs(&r), ["Person 3"]);
-    assert!(has_op(&r.plan, "GroupCountFromIndex"));
+    // exact per-class counts come from the statistics (no delta, default graph only)
+    assert!(has_op(&r.plan, "GroupCountFromMetadata"));
     let r = q(
         &s,
         "SELECT ?t (COUNT(*) AS ?c) WHERE { ?p a ?t } GROUP BY ?t",
@@ -420,7 +421,8 @@ fn aggregates() {
         "SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }",
     );
     assert_eq!(strs(&r), ["1"]);
-    assert!(has_op(&r.plan, "CountJoin"));
+    // two scans joined on one variable: counted from per-key runs
+    assert!(has_op(&r.plan, "CountJoinFromRuns"));
     let r = q(
         &s,
         "SELECT (COUNT(*) AS ?c) WHERE { ?a foaf:knows ?b . ?b foaf:name ?n }",

@@ -271,6 +271,10 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
             true
         }
+        Kind::RangeScan(spec, range) => {
+            let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
+            range.filter.iter().all(deterministic)
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),
