@@ -171,18 +171,36 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
 };
 
-export type TaskKind = 'compact' | 'backup' | 'reason' | 'load' | 'clone' | 'text-rebuild';
+export type TaskKind =
+  | 'compact'
+  | 'backup'
+  | 'reason'
+  | 'load'
+  | 'clone'
+  | 'text-rebuild'
+  | 'backup-create'
+  | 'backup-restore'
+  | 'backup-verify'
+  | 'backup-gc'
+  | 'backup-policy';
+/** `queued`: waiting for a task slot; `cancelled`: stopped by `DELETE /$/tasks/{id}`. */
+export type TaskState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Task = {
   id: string;
   kind: TaskKind;
+  /** The dataset the task works on; `""` for server-scoped tasks (repository verify, GC, policy runs). */
   dataset: string;
-  /** The dataset a task creates (clone). */
+  /** The dataset a task creates (clone, restore), or the backup, repository or policy it works on. */
   target?: string;
-  state: 'running' | 'done' | 'failed';
+  state: TaskState;
   startedAt: string;
   finishedAt?: string;
   message?: string;
   progress?: number;
+  /** `DELETE /$/tasks/{id}` may stop it; absent on servers that predate cancellation. */
+  cancellable?: boolean;
+  /** The typed result of a finished task (a backup summary, verify or GC report, policy run). */
+  detail?: unknown;
 };
 
 export type Term =

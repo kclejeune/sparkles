@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
+import { handleBackups } from './backups.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -1644,6 +1645,21 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end();
     }
+    // backup repositories, backups, policies and task cancellation (mock/backups.mjs)
+    if (
+      seg[0] === '$' &&
+      (await handleBackups(req, res, url, seg, {
+        datasets,
+        tasks,
+        nextTaskId: () => String(taskSeq++),
+        makeDataset,
+        addCommit,
+        headCommit,
+        send,
+        readBody,
+      }))
+    )
+      return;
     if (seg[0] === '$') {
       const [, what, name, extra] = seg;
       const ds = name ? datasets.get(name) : undefined;

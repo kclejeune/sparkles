@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
+  import { toasts } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
+  import { cancelTask } from '$lib/backups';
   import { fmtRelative } from '$lib/format';
 
   let {
@@ -8,6 +11,8 @@
     ondone,
     limit = 12,
     refreshKey = 0,
+    filter,
+    empty = 'No tasks yet. Compact, backup, reasoning and full-text index jobs show up here.',
   }: {
     dataset?: string;
     /** Called when a task we saw running finishes. */
@@ -15,6 +20,10 @@
     limit?: number;
     /** Bump to force an immediate poll (e.g. right after starting a task). */
     refreshKey?: number;
+    /** Only the tasks this accepts (e.g. backup kinds). */
+    filter?: (t: api.Task) => boolean;
+    /** What to say when there are none. */
+    empty?: string;
   } = $props();
 
   let tasks = $state<api.Task[]>([]);
@@ -25,7 +34,31 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
 
-  const shown = $derived(tasks.filter((t) => !dataset || t.dataset === dataset).slice(0, limit));
+  const shown = $derived(
+    tasks
+      .filter((t) => (!dataset || t.dataset === dataset) && (!filter || filter(t)))
+      .slice(0, limit),
+  );
+  const active = (t: api.Task) => t.state === 'running' || t.state === 'queued';
+  /** Cancelling needs admin on the task's dataset, or server-admin for server tasks. */
+  const mayCancel = (t: api.Task) =>
+    t.cancellable === true &&
+    active(t) &&
+    (t.dataset ? auth.can(t.dataset, 'admin') : auth.hasServer('server-admin'));
+  let cancelling = $state<Record<string, boolean>>({});
+
+  async function cancel(t: api.Task) {
+    cancelling[t.id] = true;
+    try {
+      await cancelTask(t.id);
+      toasts.push('info', `Cancelling ${t.kind}`, `Task ${t.id}`);
+      await poll();
+    } catch (e) {
+      toasts.error(`Could not cancel task ${t.id}`, e);
+    } finally {
+      cancelling[t.id] = false;
+    }
+  }
 
   async function poll() {
     clearTimeout(timer);
@@ -33,7 +66,7 @@
       const list = await api.listTasks();
       list.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
       for (const t of list) {
-        if (t.state === 'running') running.add(t.id);
+        if (active(t)) running.add(t.id);
         else if (running.has(t.id)) {
           running.delete(t.id);
           ondone?.(t);
@@ -46,7 +79,7 @@
     } finally {
       loaded = true;
       now = Date.now();
-      const busy = tasks.some((t) => t.state === 'running');
+      const busy = tasks.some(active);
       if (alive) timer = setTimeout(poll, busy ? 700 : 5000);
     }
   }
@@ -67,28 +100,48 @@
     <strong>Could not load tasks.</strong> <span class="muted">{error}</span>
   </div>
 {:else if loaded && shown.length === 0}
-  <p class="faint none">
-    No tasks yet. Compact, backup, reasoning and full-text index jobs show up here.
-  </p>
+  <p class="faint none">{empty}</p>
 {:else}
   <ul class="tasks">
     {#each shown as t (t.id)}
       <li class={t.state}>
         <span class="state" title={t.state}></span>
-        <span class="kind">{t.kind}</span>
-        {#if !dataset}<span class="ds mono">{t.dataset}</span>{/if}
+        <span class="kind" title={t.kind}>{t.kind}</span>
+        {#if !dataset}
+          <span class="ds mono" title={t.dataset ? t.target : 'Server task'}
+            >{t.dataset || t.target || 'server'}</span
+          >
+        {/if}
         <span class="msg" title={t.message}>
           {#if t.state === 'running'}
-            <span class="progress"
+            <span
+              class="progress"
+              role="progressbar"
+              aria-label="{t.kind} progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={t.progress != null ? Math.round(t.progress * 100) : undefined}
               ><span style:width="{Math.round((t.progress ?? 0) * 100)}%"></span></span
             >
             <span class="faint"
               >{t.progress != null ? `${Math.round(t.progress * 100)}%` : 'running'}</span
             >
+            {#if t.message}<span class="detail">{t.message}</span>{/if}
+          {:else if t.state === 'queued'}
+            <span class="badge">queued</span>
+            {#if t.message}<span class="detail">{t.message}</span>{/if}
           {:else}
             {t.message ?? t.state}
           {/if}
         </span>
+        {#if mayCancel(t)}
+          <button
+            class="btn sm"
+            onclick={() => cancel(t)}
+            disabled={cancelling[t.id]}
+            aria-label="Cancel task {t.id} ({t.kind})">Cancel</button
+          >
+        {/if}
         <span class="when faint" title={t.finishedAt ?? t.startedAt}
           >{fmtRelative(t.finishedAt ?? t.startedAt, now)}</span
         >
@@ -110,7 +163,7 @@
   }
   li {
     display: grid;
-    grid-template-columns: 10px 84px auto 1fr auto;
+    grid-template-columns: 10px 104px auto 1fr auto;
     align-items: center;
     gap: 10px;
     padding: 7px 0;
@@ -136,6 +189,16 @@
   .failed .msg {
     color: var(--danger);
   }
+  .queued .state {
+    background: var(--text-3);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .cancelled .state {
+    background: var(--text-3);
+  }
+  .cancelled .msg {
+    color: var(--text-3);
+  }
   @keyframes pulse {
     50% {
       opacity: 0.35;
@@ -143,6 +206,14 @@
   }
   .kind {
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .detail {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .ds {
     color: var(--text-2);
@@ -172,9 +243,15 @@
     transition: width 0.3s;
   }
   li:has(.ds) {
-    grid-template-columns: 10px 84px auto 1fr auto;
+    grid-template-columns: 10px 104px auto 1fr auto;
   }
   li:not(:has(.ds)) {
-    grid-template-columns: 10px 84px 1fr auto;
+    grid-template-columns: 10px 104px 1fr auto;
+  }
+  li:has(.ds):has(.btn) {
+    grid-template-columns: 10px 104px auto 1fr auto auto;
+  }
+  li:not(:has(.ds)):has(.btn) {
+    grid-template-columns: 10px 104px 1fr auto auto;
   }
 </style>

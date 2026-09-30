@@ -17,12 +17,17 @@
   let switcherOpen = $state(false);
   let switcherEl: HTMLDivElement | undefined = $state();
 
-  const nav = [
+  // Backups: server admins, and dataset admins in a reduced form
+  const backupsVisible = $derived(
+    auth.hasServer('server-admin') || Object.values(auth.who?.datasets ?? {}).includes('admin'),
+  );
+  const nav = $derived([
     { href: '/query', label: 'Query', icon: 'query' },
     { href: '/explore', label: 'Explore', icon: 'explore' },
     { href: '/datasets', label: 'Datasets', icon: 'database' },
+    ...(backupsVisible ? [{ href: '/backups', label: 'Backups', icon: 'archive' }] : []),
     { href: '/server', label: 'Server', icon: 'server' },
-  ] as const;
+  ]);
 
   const currentInfo = $derived(app.datasets.find((d) => d.name === app.current));
   // sign-in and CLI approval pages render without the sidebar

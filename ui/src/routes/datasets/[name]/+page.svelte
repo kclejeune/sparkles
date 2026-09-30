@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
+  import { untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -9,6 +10,7 @@
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
   import { load, save } from '$lib/storage';
+  import BackupsPanel from '$components/BackupsPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import FullTextPanel from '$components/FullTextPanel.svelte';
@@ -49,11 +51,16 @@
     }
   }
 
+  // only a new name resets the page: reloading the prefixes (refreshAll) must not
+  // unmount the panels and their open dialogs
   $effect(() => {
     if (!name) return;
-    stats = null;
-    void app.loadPrefixes(name);
-    void loadStats();
+    const ds = name;
+    untrack(() => {
+      stats = null;
+      void app.loadPrefixes(ds);
+      void loadStats();
+    });
   });
 
   function refreshAll() {
@@ -481,10 +488,11 @@ ex:PersonShape a sh:NodeShape ;
               </button>
               <button
                 class="btn sm"
-                onclick={() => startTask('Backup', () => api.backup(name))}
+                onclick={() => startTask('Dump', () => api.backup(name))}
                 disabled={acting != null}
+                title="Write a gzipped N-Quads dump into the server's backup directory"
               >
-                <Icon name="archive" size={13} /> Backup
+                <Icon name="download" size={13} /> Dump
               </button>
             {/if}
           </div>
@@ -915,6 +923,16 @@ ex:PersonShape a sh:NodeShape ;
           onchanged={refreshAll}
         />
 
+        <!-- backups in repositories -->
+        <BackupsPanel
+          {name}
+          {info}
+          {readOnly}
+          refreshKey={refreshKick}
+          onstarted={() => taskKick++}
+          onchanged={refreshAll}
+        />
+
         <!-- graphs -->
         <section class="panel">
           <div class="panel-head">
@@ -947,6 +965,8 @@ ex:PersonShape a sh:NodeShape ;
               refreshKey={taskKick}
               ondone={(t) => {
                 if (t.state === 'failed') toasts.push('error', `${t.kind} failed`, t.message);
+                else if (t.state === 'cancelled')
+                  toasts.push('info', `${t.kind} cancelled`, t.message);
                 else if (t.kind === 'clone' && t.target) {
                   toasts.push('success', `Cloned into /${t.target}`, t.message);
                   cloned = t.target;
