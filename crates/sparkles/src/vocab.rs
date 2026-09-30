@@ -395,6 +395,29 @@ impl DeltaVocab {
         }
     }
 
+    /// The delta vocabulary of a sealed generation, for reading: no append handle, and a
+    /// torn tail is ignored rather than truncated.
+    pub fn open_read_only(path: &Path) -> Result<DeltaVocab> {
+        let mut v = AppendVocab::default();
+        if path.exists() {
+            let mut buf = Vec::new();
+            File::open(path)?.read_to_end(&mut buf)?;
+            let mut pos = 0;
+            while pos + 4 <= buf.len() {
+                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+                if pos + 4 + len > buf.len() {
+                    break;
+                }
+                v.insert(&buf[pos + 4..pos + 4 + len]);
+                pos += 4 + len;
+            }
+        }
+        Ok(DeltaVocab {
+            inner: RwLock::new(v),
+            file: None,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<DeltaVocab> {
         let mut v = AppendVocab::default();
         if path.exists() {

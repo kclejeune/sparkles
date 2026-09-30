@@ -34,6 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Immutable base index generation.
 pub struct Generation {
+    /// unique within the process: two openings of one directory differ
+    pub uid: u64,
     pub name: String,
     pub dir: Option<PathBuf>,
     pub vocab: Vocab,
@@ -50,6 +52,7 @@ pub struct Generation {
 impl Generation {
     fn empty(dvocab: DeltaVocab) -> Generation {
         Generation {
+            uid: crate::index::next_uid(),
             name: "mem".into(),
             dir: None,
             vocab: Vocab::empty(),
@@ -62,7 +65,25 @@ impl Generation {
         }
     }
 
+    /// A generation no longer written (not `CURRENT`), opened for reading past states.
+    pub(crate) fn open_sealed(dir: &Path, name: &str) -> Result<Generation> {
+        Self::open_with(
+            dir,
+            name,
+            DeltaVocab::open_read_only(&dir.join("delta.vocab"))?,
+        )
+    }
+
     fn open(dir: &Path, name: &str, persistent: bool) -> Result<Generation> {
+        let dvocab = if persistent {
+            DeltaVocab::open(&dir.join("delta.vocab"))?
+        } else {
+            DeltaVocab::in_memory()
+        };
+        Self::open_with(dir, name, dvocab)
+    }
+
+    fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
             .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
         if meta.format_version != crate::builder::FORMAT_VERSION {
@@ -75,12 +96,8 @@ impl Generation {
         }
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
-        let dvocab = if persistent {
-            DeltaVocab::open(&dir.join("delta.vocab"))?
-        } else {
-            DeltaVocab::in_memory()
-        };
         Ok(Generation {
+            uid: crate::index::next_uid(),
             name: name.to_string(),
             dir: Some(dir.to_path_buf()),
             vocab: Vocab::open(dir)?,
@@ -150,6 +167,8 @@ pub struct Snapshot {
     /// per-predicate statistics of the delta (computed lazily, once per snapshot)
     pub delta_stats:
         Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
+    /// a past state (see [`Store::snapshot_at`]), not the live one
+    pub historical: bool,
 }
 
 /// A contiguous run of rows produced by a scan.
@@ -161,6 +180,15 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// The same snapshot, reading through the block cache without filling it: for full
+    /// scans such as exports, which would evict the blocks queries use.
+    pub fn without_cache_fill(&self) -> Snapshot {
+        Snapshot {
+            cache: Arc::new(self.cache.read_through()),
+            ..self.clone()
+        }
+    }
+
     #[inline]
     pub fn perm(&self, p: Perm) -> &PermIndex {
         self.generation.perm(p)
@@ -558,6 +586,12 @@ pub struct StoreOptions {
     pub bulk_threshold: u64,
     /// In-memory stores keep the metadata of this many most recent commits.
     pub memory_commit_ring: usize,
+    /// Memory for materialized past states (point-in-time reads).
+    pub history_cache_bytes: u64,
+    /// Non-current generations named snapshots may keep (the retention window shares it).
+    pub history_max_generations: usize,
+    /// Named snapshots per dataset.
+    pub max_snapshots: usize,
 }
 
 impl Default for StoreOptions {
@@ -570,6 +604,9 @@ impl Default for StoreOptions {
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
+            history_cache_bytes: 1 << 30,
+            history_max_generations: 8,
+            max_snapshots: 256,
         }
     }
 }
@@ -610,6 +647,8 @@ pub struct Store {
     clock: Mutex<Option<Clock>>,
     /// full-text index, when enabled for this dataset
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
+    /// pins, retention, generations and materialized past states (persistent stores)
+    history: Option<Mutex<crate::history::HistoryState>>,
 }
 
 const WAL_INSERT: u8 = 1;
@@ -680,6 +719,7 @@ impl Store {
                 text: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
+                historical: false,
             }),
             writer: Mutex::new(WriterState {
                 wal: None,
@@ -695,6 +735,7 @@ impl Store {
             catalog: Mutex::new(Catalog::memory(root, opts.memory_commit_ring)),
             clock: Mutex::new(None),
             text: Default::default(),
+            history: None,
             opts,
         }
     }
@@ -749,11 +790,13 @@ impl Store {
             opts.result_cache_min_ms,
         ));
         let mut next_bnode = gen_.meta.next_bnode;
+        // prefixes.json holds the whole map once written (so removals persist); the
+        // generation's own prefixes are used until then
         let mut prefixes = gen_.meta.prefixes.clone();
         if let Ok(p) = std::fs::read(root.join("prefixes.json"))
             && let Ok(p) = serde_json::from_slice::<BTreeMap<String, String>>(&p)
         {
-            prefixes.extend(p);
+            prefixes = p;
         }
         // The commit the generation's base index holds. A database from an older version
         // has no dataset.json yet: it gets a baseline root commit after replay.
@@ -803,125 +846,38 @@ impl Store {
         let mut version = 0;
         let gen_ = Arc::new(gen_);
         let mut replayed: Vec<CommitInfo> = Vec::new();
+        // the quads each replayed commit changed, for catching up the full-text index
+        let text_on = cfg!(feature = "text") && root.join("text.json").exists();
+        let mut wal_text: Vec<(u64, Vec<[Id; 4]>)> = Vec::new();
         // quads of the base plus WAL transactions folded into a baseline commit
         let mut base_quads = gen_.meta.quads;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
-            let recs = buf.as_chunks::<WAL_REC>().0;
-            // the last complete transaction may be torn; damage before it is corruption
-            let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
-            let mut pending: Vec<(u8, [Id; 4])> = Vec::new();
-            let mut txn_start = 0usize;
-            let mut good = 0usize;
-            let mut start_delta = delta.clone();
-            let probe = Snapshot {
-                generation: gen_.clone(),
-                delta: Delta::default(),
-                version: 0,
-                cache: cache.clone(),
-                results: results.clone(),
-                dvocab_len: u64::MAX,
-                commit: 0,
-                text: None,
-                union_default_graph: false,
-                delta_stats: Default::default(),
+            let from = ReplayFrom {
+                generation: &gen_,
+                cache: &cache,
+                results: &results,
+                base,
+                gen_no,
+                fold_legacy,
+                next_bnode,
+                keep_touched: text_on,
+                path: &wal_path,
             };
-            let mut quads = base_quads;
-            let mut seen_v2 = false;
-            for (i, rec) in recs.iter().enumerate() {
-                let q: [Id; 4] = std::array::from_fn(|j| {
-                    Id(u64::from_le_bytes(
-                        rec[1 + j * 8..9 + j * 8].try_into().unwrap(),
-                    ))
-                });
-                match rec[0] {
-                    WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
-                    WAL_COMMIT => {
-                        let meta =
-                            commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
-                        if matches!(meta, Some(Err(()))) {
-                            if Some(i) == last_commit {
-                                break; // torn tail: truncated below
-                            }
-                            return Err(Error::Corrupt(format!(
-                                "{}: checksum mismatch in the transaction ending at byte {}",
-                                wal_path.display(),
-                                (i + 1) * WAL_REC
-                            )));
-                        }
-                        let (mut ins, mut del) = (0i64, 0i64);
-                        for (op, q) in pending.drain(..) {
-                            let k = Perm::Spo.to_key(&q);
-                            let in_base = probe.perm(Perm::Spo).contains(&cache, &k)?;
-                            let spo = Perm::Spo.index();
-                            let present = start_delta.ins[spo].contains(&k)
-                                || (in_base && !start_delta.del[spo].contains(&k));
-                            match (op == WAL_INSERT, present) {
-                                (true, false) => ins += 1,
-                                (true, true) => del -= 1,
-                                (false, true) => del += 1,
-                                (false, false) => ins -= 1,
-                            }
-                            apply(&mut delta, &q, op == WAL_INSERT, in_base);
-                        }
-                        start_delta = delta.clone();
-                        let (ins, del) = (ins.max(0) as u64, del.max(0) as u64);
-                        quads = (quads + ins).saturating_sub(del);
-                        next_bnode = next_bnode.max(q[0].0);
-                        version += 1;
-                        let prev = replayed.last().copied().unwrap_or(base);
-                        match meta {
-                            Some(Ok((seq, ts, kind))) => {
-                                seen_v2 = true;
-                                if seq != prev.seq + 1 {
-                                    return Err(Error::Corrupt(format!(
-                                        "{}: commit {seq} follows commit {}",
-                                        wal_path.display(),
-                                        prev.seq
-                                    )));
-                                }
-                                replayed.push(CommitInfo {
-                                    seq,
-                                    timestamp_ms: ts,
-                                    kind,
-                                    inserted: ins,
-                                    deleted: del,
-                                    quads,
-                                    generation: gen_no,
-                                    bulk: false,
-                                    exact: true,
-                                    reconstructed: false,
-                                });
-                            }
-                            // a legacy commit record: folded into the baseline when the
-                            // database is being upgraded, otherwise numbered in order
-                            _ if fold_legacy && !seen_v2 => base_quads = quads,
-                            _ => replayed.push(CommitInfo {
-                                seq: prev.seq + 1,
-                                timestamp_ms: prev.timestamp_ms,
-                                kind: CommitKind::Unknown,
-                                inserted: ins,
-                                deleted: del,
-                                quads,
-                                generation: gen_no,
-                                bulk: false,
-                                exact: true,
-                                reconstructed: true,
-                            }),
-                        }
-                        good = (i + 1) * WAL_REC;
-                        txn_start = i + 1;
-                    }
-                    _ => break,
-                }
-            }
-            if good != buf.len() {
+            let r = replay_wal(&from, &buf, Stop::End, &mut |_, _| Ok(()))?;
+            if r.good != buf.len() {
                 OpenOptions::new()
                     .write(true)
                     .open(&wal_path)?
-                    .set_len(good as u64)?;
+                    .set_len(r.good as u64)?;
             }
+            delta = r.delta;
+            version = r.version;
+            replayed = r.commits;
+            base_quads = r.base_quads;
+            next_bnode = r.next_bnode;
+            wal_text = r.touched;
         }
         let mut base = base;
         if rebased {
@@ -945,6 +901,7 @@ impl Store {
             .append(true)
             .open(&wal_path)?;
         let dvocab_len = gen_.dvocab.len();
+        let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
         let store = Store {
             root: Some(root.to_path_buf()),
             current: ArcSwap::from_pointee(Snapshot {
@@ -958,6 +915,7 @@ impl Store {
                 text: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
+                historical: false,
             }),
             writer: Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
@@ -973,15 +931,515 @@ impl Store {
             catalog: Mutex::new(catalog),
             clock: Mutex::new(None),
             text: Default::default(),
+            history: Some(Mutex::new(history)),
             opts,
         };
-        store.open_text()?;
+        store.collect_history(gen_no, head.seq);
+        store.open_text(&wal_text)?;
         Ok(store)
     }
 
     /// The dataset id (a UUID created with the database).
     pub fn dataset_id(&self) -> uuid::Uuid {
         self.dataset_id
+    }
+
+    // ---------------------------------------------------------------- history ------
+
+    fn now_ms(&self) -> i64 {
+        match &*self.clock.lock() {
+            Some(c) => c(),
+            None => commit::now_ms(),
+        }
+    }
+
+    /// Remove the generations history no longer needs (at open).
+    fn collect_history(&self, current: u32, head: u64) {
+        if let Some(h) = &self.history {
+            self.collect_locked(&mut h.lock(), current, head);
+        }
+    }
+
+    /// Collect unneeded generations; call with the writer lock held (or at open).
+    fn collect_locked(&self, h: &mut crate::history::HistoryState, current: u32, head: u64) {
+        let Some(root) = &self.root else { return };
+        let now = self.now_ms();
+        let needed = {
+            let cat = self.catalog.lock();
+            let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
+            h.needed(current, head, now, &ts, self.opts.history_max_generations)
+        };
+        let doomed: Vec<(u32, PathBuf)> = h
+            .gens
+            .iter()
+            .filter(|(no, _)| **no != current && !needed.contains_key(no))
+            .map(|(no, g)| (*no, g.dir.clone()))
+            .collect();
+        for (no, dir) in doomed {
+            h.open.retain(|(n, _)| *n != no);
+            h.cache.retain(|(k, _, _)| k.0 != no);
+            match crate::history::delete_generation(root, &dir) {
+                Ok(()) => {
+                    h.gens.remove(&no);
+                }
+                Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
+            }
+        }
+    }
+
+    fn history_gone(
+        &self,
+        h: &crate::history::HistoryState,
+        seq: u64,
+        head: u64,
+        snapshot: Option<String>,
+        metadata: Option<CommitInfo>,
+    ) -> Error {
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let reconstructable = h.reconstructable(current, head);
+        let oldest = reconstructable.first().map_or(String::new(), |r| {
+            format!("; the oldest reconstructable commit is {}", r.0)
+        });
+        Error::HistoryGone(Box::new(crate::history::HistoryGone {
+            message: format!("commit {seq} is no longer reconstructable{oldest}"),
+            seq,
+            head,
+            snapshot,
+            reconstructable,
+            metadata,
+        }))
+    }
+
+    /// Resolve a selector to a commit (metadata only): `NotFound` for a commit beyond the
+    /// head, an unknown snapshot or a time before history; `HistoryGone` for a commit
+    /// whose metadata is gone.
+    pub fn resolve(&self, at: &crate::history::At) -> Result<crate::history::Resolved> {
+        let head = self.head_commit();
+        self.resolve_with(at, head)
+    }
+
+    fn resolve_with(
+        &self,
+        at: &crate::history::At,
+        head: CommitInfo,
+    ) -> Result<crate::history::Resolved> {
+        use crate::history::At;
+        let seq = match at {
+            At::Head => head.seq,
+            At::Commit(n) => *n,
+            At::Time(ms) => {
+                let cat = self.catalog.lock();
+                match cat.at_time(*ms) {
+                    Some(c) => c.seq,
+                    None => {
+                        let first = cat.first().map_or(String::new(), |c| {
+                            format!(" (history starts at {})", c.timestamp())
+                        });
+                        return Err(Error::NotFound(format!(
+                            "no commit at or before {}{first}",
+                            commit::rfc3339_ms(*ms)
+                        )));
+                    }
+                }
+            }
+            At::Snapshot(name) => self
+                .history
+                .as_ref()
+                .and_then(|h| h.lock().pins.get(name).map(|p| p.seq))
+                .ok_or_else(|| Error::NotFound(format!("no snapshot '{name}'")))?,
+        };
+        if seq > head.seq {
+            return Err(Error::NotFound(format!(
+                "no commit {seq} (head is {})",
+                head.seq
+            )));
+        }
+        let meta = self.catalog.lock().get(seq);
+        let Some(commit) = meta else {
+            let snapshot = match at {
+                At::Snapshot(n) => Some(n.clone()),
+                _ => None,
+            };
+            return Err(match &self.history {
+                Some(h) => self.history_gone(&h.lock(), seq, head.seq, snapshot, None),
+                None => Error::HistoryGone(Box::new(crate::history::HistoryGone {
+                    message: format!("commit {seq} is no longer reconstructable"),
+                    seq,
+                    head: head.seq,
+                    snapshot,
+                    reconstructable: Vec::new(),
+                    metadata: None,
+                })),
+            });
+        };
+        Ok(crate::history::Resolved {
+            at: at.clone(),
+            commit,
+            head: head.seq,
+            historical: seq != self.snapshot().commit,
+        })
+    }
+
+    /// The state at `at`: the live snapshot when it names the current state, otherwise
+    /// the retained generation's base index with its WAL replayed through the commit
+    /// (cached, within `history_cache_bytes`).
+    pub fn snapshot_at(
+        &self,
+        at: &crate::history::At,
+        o: &crate::history::HistoryOptions,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
+        let r = self.resolve(at)?;
+        let live = self.snapshot();
+        if r.commit.seq == live.commit {
+            return Ok((
+                live,
+                crate::history::Resolved {
+                    historical: false,
+                    ..r
+                },
+            ));
+        }
+        let (Some(_), Some(hist)) = (&self.root, &self.history) else {
+            return Err(Error::HistoryUnsupported(
+                "point-in-time reads need a persistent dataset".into(),
+            ));
+        };
+        let seq = r.commit.seq;
+        let current = commit::generation_number(&live.generation.name);
+        let snapshot_name = match at {
+            crate::history::At::Snapshot(n) => Some(n.clone()),
+            _ => None,
+        };
+        // one materialization at a time: concurrent requests for a state wait for it
+        let mut h = hist.lock();
+        let Some(owner) = h.owner(seq, current, r.head) else {
+            return Err(self.history_gone(&h, seq, r.head, snapshot_name, Some(r.commit)));
+        };
+        if let Some(i) = h.cache.iter().position(|(k, _, _)| *k == (owner, seq)) {
+            let e = h.cache.remove(i);
+            let snap = e.1.clone();
+            h.cache.insert(0, e);
+            h.hits += 1;
+            return Ok((snap, r));
+        }
+        h.misses += 1;
+        let entry = h.gens[&owner].clone();
+        let generation = if owner == current {
+            live.generation.clone()
+        } else if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
+            let e = h.open.remove(i);
+            let g = e.1.clone();
+            h.open.insert(0, e);
+            g
+        } else {
+            let g = Arc::new(Generation::open_sealed(&entry.dir, &entry.name)?);
+            h.open.insert(0, (owner, g.clone()));
+            h.open.truncate(2);
+            g
+        };
+        let budget = self.opts.history_cache_bytes;
+        let delta = if seq == entry.base.seq {
+            Delta::default()
+        } else {
+            let wal = entry.dir.join("wal.log");
+            let buf = std::fs::read(&wal)?;
+            let from = ReplayFrom {
+                generation: &generation,
+                cache: &self.cache,
+                results: &self.results,
+                base: entry.base,
+                gen_no: owner,
+                fold_legacy: entry.fold_legacy,
+                next_bnode: 0,
+                keep_touched: false,
+                path: &wal,
+            };
+            let mut check = |_: u64, d: &Delta| -> Result<()> {
+                if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err(Error::Cancelled);
+                }
+                if o.deadline.is_some_and(|t| std::time::Instant::now() > t) {
+                    return Err(Error::Timeout);
+                }
+                let need = delta_bytes(d);
+                if need > budget {
+                    return Err(Error::BudgetExceeded(crate::Budget {
+                        kind: crate::BudgetKind::Memory,
+                        limit: budget,
+                        requested: need,
+                    }));
+                }
+                Ok(())
+            };
+            let rep = replay_wal(&from, &buf, Stop::AfterSeq(seq), &mut check)?;
+            if !rep.reached {
+                return Err(Error::Corrupt(format!(
+                    "{}: the log ends before commit {seq}",
+                    wal.display()
+                )));
+            }
+            rep.delta
+        };
+        h.materializations += 1;
+        let bytes = delta_bytes(&delta);
+        let dvocab_len = generation.dvocab.len();
+        let snap = Arc::new(Snapshot {
+            generation,
+            delta,
+            version: 0,
+            cache: self.cache.clone(),
+            results: self.results.clone(),
+            dvocab_len,
+            commit: seq,
+            text: None,
+            union_default_graph: self.opts.union_default_graph,
+            delta_stats: Default::default(),
+            historical: true,
+        });
+        h.cache.insert(0, ((owner, seq), snap.clone(), bytes));
+        let mut total: u64 = h.cache.iter().map(|e| e.2).sum();
+        while total > budget && h.cache.len() > 1 {
+            total -= h.cache.pop().map_or(0, |e| e.2);
+        }
+        Ok((snap, r))
+    }
+
+    fn named(
+        &self,
+        h: &crate::history::HistoryState,
+        name: &str,
+        p: &crate::history::Pin,
+        current: u32,
+        head: u64,
+    ) -> crate::history::NamedSnapshot {
+        let owner = h.owner(p.seq, current, head);
+        crate::history::NamedSnapshot {
+            name: name.to_string(),
+            seq: p.seq,
+            commit: self.catalog.lock().get(p.seq),
+            created_ms: p.created_ms,
+            note: p.note.clone(),
+            generation: owner.and_then(|o| h.gens.get(&o)).map(|g| g.name.clone()),
+            reconstructable: owner.is_some(),
+        }
+    }
+
+    /// The named snapshots, by commit then name.
+    pub fn snapshots(&self) -> Vec<crate::history::NamedSnapshot> {
+        let Some(hist) = &self.history else {
+            return Vec::new();
+        };
+        let head = self.head_commit().seq;
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let h = hist.lock();
+        let mut v: Vec<_> = h
+            .pins
+            .iter()
+            .map(|(n, p)| self.named(&h, n, p, current, head))
+            .collect();
+        v.sort_by(|a, b| (a.seq, &a.name).cmp(&(b.seq, &b.name)));
+        v
+    }
+
+    pub fn named_snapshot(&self, name: &str) -> Option<crate::history::NamedSnapshot> {
+        self.snapshots().into_iter().find(|s| s.name == name)
+    }
+
+    /// Pin commit `at` under `name`. Returns the snapshot and whether it was created
+    /// (`false`: the name already pinned that commit). The pin is durable on return.
+    pub fn create_snapshot(
+        &self,
+        name: &str,
+        at: &crate::history::At,
+        note: Option<String>,
+    ) -> Result<(crate::history::NamedSnapshot, bool)> {
+        if !crate::history::valid_name(name) {
+            return Err(Error::invalid(format!(
+                "invalid snapshot name {name:?}: letters, digits, '.', '_' and '-', 1 to 64, starting with a letter or digit"
+            )));
+        }
+        if note.as_ref().is_some_and(|n| n.len() > 1024) {
+            return Err(Error::invalid("the note is longer than 1024 bytes"));
+        }
+        let (Some(root), Some(hist)) = (&self.root, &self.history) else {
+            return Err(Error::HistoryUnsupported(
+                "named snapshots need a persistent dataset".into(),
+            ));
+        };
+        // no rebuild may run while the pin is being established
+        let w = self.writer.lock();
+        let head = w.head;
+        let r = self.resolve_with(at, head)?;
+        let seq = r.commit.seq;
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let mut h = hist.lock();
+        if let Some(p) = h.pins.get(name) {
+            if p.seq == seq {
+                return Ok((self.named(&h, name, p, current, head.seq), false));
+            }
+            return Err(Error::Conflict(format!(
+                "snapshot '{name}' already pins commit {}",
+                p.seq
+            )));
+        }
+        if h.pins.len() >= self.opts.max_snapshots {
+            return Err(Error::Conflict(format!(
+                "history-limit: at most {} snapshots",
+                self.opts.max_snapshots
+            )));
+        }
+        let Some(owner) = h.owner(seq, current, head.seq) else {
+            return Err(self.history_gone(&h, seq, head.seq, None, Some(r.commit)));
+        };
+        // the generations pins will hold: a pin inside the current generation (not at
+        // its head) holds it once it is compacted away
+        let mut held: std::collections::BTreeSet<u32> = h
+            .pins
+            .values()
+            .filter_map(|p| h.owner(p.seq, current, head.seq))
+            .collect();
+        held.insert(owner);
+        let pinned_current = h.pins.values().any(|p| p.seq != head.seq) || seq != head.seq;
+        let count = held.iter().filter(|n| **n != current).count()
+            + usize::from(held.contains(&current) && pinned_current);
+        if count > self.opts.history_max_generations {
+            return Err(Error::Conflict(format!(
+                "history-limit: pins may hold at most {} generations",
+                self.opts.history_max_generations
+            )));
+        }
+        let pin = crate::history::Pin {
+            seq,
+            created_ms: self.now_ms(),
+            note,
+        };
+        h.pins.insert(name.to_string(), pin.clone());
+        if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, h.retention) {
+            h.pins.remove(name);
+            return Err(e);
+        }
+        drop(w);
+        Ok((self.named(&h, name, &pin, current, head.seq), true))
+    }
+
+    /// Remove a named snapshot and collect the generations only it held. Returns
+    /// whether it existed.
+    pub fn delete_snapshot(&self, name: &str) -> Result<bool> {
+        let (Some(root), Some(hist)) = (&self.root, &self.history) else {
+            return Ok(false);
+        };
+        let w = self.writer.lock();
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let mut h = hist.lock();
+        let Some(pin) = h.pins.remove(name) else {
+            return Ok(false);
+        };
+        if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, h.retention) {
+            h.pins.insert(name.to_string(), pin);
+            return Err(e);
+        }
+        self.collect_locked(&mut h, current, w.head.seq);
+        Ok(true)
+    }
+
+    pub fn retention(&self) -> crate::history::Retention {
+        self.history
+            .as_ref()
+            .map(|h| h.lock().retention)
+            .unwrap_or_default()
+    }
+
+    /// Set the retention window (durable), then collect what it no longer needs.
+    pub fn set_retention(
+        &self,
+        r: crate::history::Retention,
+    ) -> Result<crate::history::HistoryStatus> {
+        let (Some(root), Some(hist)) = (&self.root, &self.history) else {
+            return Err(Error::HistoryUnsupported(
+                "retention needs a persistent dataset".into(),
+            ));
+        };
+        {
+            let w = self.writer.lock();
+            let current = commit::generation_number(&self.snapshot().generation.name);
+            let mut h = hist.lock();
+            let old = h.retention;
+            h.retention = r;
+            if let Err(e) = crate::history::write_file(root, self.dataset_id, &h.pins, r) {
+                h.retention = old;
+                return Err(e);
+            }
+            self.collect_locked(&mut h, current, w.head.seq);
+        }
+        Ok(self.history())
+    }
+
+    /// Retained generations, readable commits, retention and cache counters.
+    pub fn history(&self) -> crate::history::HistoryStatus {
+        use crate::history::{HistoryGeneration, HistoryStatus, Hold};
+        let head = self.head_commit().seq;
+        let current = commit::generation_number(&self.snapshot().generation.name);
+        let Some(hist) = &self.history else {
+            return HistoryStatus {
+                head,
+                reconstructable: vec![(head, head)],
+                generations: Vec::new(),
+                bytes: 0,
+                retention: Default::default(),
+                snapshots: 0,
+                cache_entries: 0,
+                cache_bytes: 0,
+                hits: 0,
+                misses: 0,
+                materializations: 0,
+            };
+        };
+        let h = hist.lock();
+        let now = self.now_ms();
+        let needed = {
+            let cat = self.catalog.lock();
+            let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
+            h.needed(current, head, now, &ts, self.opts.history_max_generations)
+        };
+        let generations: Vec<HistoryGeneration> = h
+            .gens
+            .iter()
+            .map(|(no, g)| HistoryGeneration {
+                name: g.name.clone(),
+                base_seq: g.base.seq,
+                end_seq: if *no == current { head } else { g.end },
+                bytes: g.bytes,
+                current: *no == current,
+                held_by: if *no == current {
+                    vec![Hold::Head]
+                } else {
+                    needed.get(no).cloned().unwrap_or_default()
+                },
+            })
+            .collect();
+        HistoryStatus {
+            head,
+            reconstructable: h.reconstructable(current, head),
+            bytes: generations
+                .iter()
+                .filter(|g| !g.current)
+                .map(|g| g.bytes)
+                .sum(),
+            generations,
+            retention: h.retention,
+            snapshots: h.pins.len(),
+            cache_entries: h.cache.len(),
+            cache_bytes: h.cache.iter().map(|e| e.2).sum(),
+            hits: h.hits,
+            misses: h.misses,
+            materializations: h.materializations,
+        }
+    }
+
+    /// Write the quads of the state at `at` as N-Quads.
+    pub fn dump_nquads_at(&self, at: &crate::history::At, w: impl Write) -> Result<u64> {
+        let (snap, _) = self.snapshot_at(at, &Default::default())?;
+        dump_snapshot(&snap.without_cache_fill(), w)
     }
 
     /// The latest commit.
@@ -1008,7 +1466,7 @@ impl Store {
     // ------------------------------------------------------------ full-text ------
 
     /// Open the full-text index if `text.json` enables it (rebuilding it if needed).
-    fn open_text(&self) -> Result<()> {
+    fn open_text(&self, wal: &[(u64, Vec<[Id; 4]>)]) -> Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
         };
@@ -1018,7 +1476,7 @@ impl Store {
                 return Ok(());
             };
             let snap = self.snapshot();
-            match crate::text::TextIndex::open(Some(root), cfg, &snap) {
+            match crate::text::TextIndex::open(Some(root), cfg, &snap, wal) {
                 Ok((ti, view)) => {
                     self.text.store(Some(Arc::new(ti)));
                     let mut s = (*snap).clone();
@@ -1028,6 +1486,8 @@ impl Store {
                 Err(e) => tracing::error!("full-text index of {}: {e}", root.display()),
             }
         }
+        #[cfg(not(feature = "text"))]
+        let _ = wal;
         #[cfg(not(feature = "text"))]
         if root.join("text.json").exists() {
             tracing::warn!(
@@ -1080,7 +1540,7 @@ impl Store {
             )?;
         }
         let snap = self.snapshot();
-        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap)?;
+        let (ti, view) = crate::text::TextIndex::open(self.root.as_deref(), cfg, &snap, &[])?;
         let ti = Arc::new(ti);
         self.text.store(Some(ti.clone()));
         let mut s = (*snap).clone();
@@ -1103,6 +1563,7 @@ impl Store {
                 _ => {}
             }
             let _ = std::fs::remove_dir_all(root.join("text"));
+            let _ = std::fs::remove_file(root.join("text.dirty"));
         }
         Ok(())
     }
@@ -1200,6 +1661,47 @@ impl Store {
         Ok(())
     }
 
+    /// Set (or replace) one prefix. Prefixes are metadata: no commit is made.
+    pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
+        if !valid_prefix_name(prefix) {
+            return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
+        }
+        oxrdf::NamedNode::new(iri)
+            .map_err(|e| Error::invalid(format!("invalid IRI {iri:?}: {e}")))?;
+        let mut cur = self.prefixes.lock();
+        if cur.get(prefix).map(String::as_str) == Some(iri) {
+            return Ok(());
+        }
+        let mut next = cur.clone();
+        next.insert(prefix.to_string(), iri.to_string());
+        self.save_prefixes(&next)?;
+        *cur = next;
+        Ok(())
+    }
+
+    /// Remove one prefix; returns whether it was defined.
+    pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
+        let mut cur = self.prefixes.lock();
+        if !cur.contains_key(prefix) {
+            return Ok(false);
+        }
+        let mut next = cur.clone();
+        next.remove(prefix);
+        self.save_prefixes(&next)?;
+        *cur = next;
+        Ok(true)
+    }
+
+    fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {
+        if let Some(root) = &self.root {
+            write_atomic(
+                &root.join("prefixes.json"),
+                &serde_json::to_vec_pretty(p).unwrap(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Begin the (single) write transaction; blocks while another writer is active.
     pub fn write(&self) -> WriteTxn<'_> {
         self.write_as(CommitKind::Transaction)
@@ -1233,18 +1735,7 @@ impl Store {
     /// [`load`](Self::load), recording the commit as `kind`.
     pub fn load_as(&self, sources: &[Source], kind: CommitKind) -> Result<Receipt> {
         let snap = self.snapshot();
-        let mut size_hint: u64 = 0;
-        for s in sources {
-            size_hint += match &s.data {
-                crate::io::SourceData::Bytes(b) => b.len() as u64,
-                crate::io::SourceData::File(p) => {
-                    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-                }
-            } * if s.gzip { 8 } else { 1 };
-        }
-        // ~80 bytes per quad in text formats
-        let est_quads = size_hint / 80;
-        if snap.is_empty() || est_quads > self.opts.bulk_threshold {
+        if snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold {
             let mut w = self.writer.lock();
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -1256,7 +1747,7 @@ impl Store {
                 start_len: snap.len(),
             };
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], Some(bulk))?
+                .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk))?
                 .1)
         } else {
             let mut txn = self.write_as(kind);
@@ -1292,6 +1783,9 @@ impl Store {
         sources: &[Source],
         kind: CommitKind,
     ) -> Result<(u64, Receipt)> {
+        if estimated_quads(sources) > self.opts.bulk_threshold {
+            return self.replace_bulk(target, sources, kind);
+        }
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
         for s in sources {
@@ -1332,6 +1826,44 @@ impl Store {
         Ok((n, r))
     }
 
+    /// A large replace: one rebuild that leaves out the target graphs and adds the
+    /// sources, parsed as a stream by the bulk builder. Atomic like every rebuild: a parse
+    /// error leaves the store as it was.
+    fn replace_bulk(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+    ) -> Result<(u64, Receipt)> {
+        let mut w = self.writer.lock();
+        if w.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let snap = self.snapshot();
+        let graphs: Vec<Id> = match &target {
+            ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
+            ReplaceTarget::Named(n) => snap.lookup_iri(n.as_str()).into_iter().collect(),
+            ReplaceTarget::All => {
+                let mut v = snap.graph_ids()?;
+                v.push(Id::DEFAULT_GRAPH);
+                v
+            }
+        };
+        let mut dropped = 0;
+        for g in &graphs {
+            dropped += snap.count(Perm::Gspo, &[g.0])?;
+        }
+        let start_len = snap.len();
+        let bulk = BulkCommit {
+            kind,
+            net_del: dropped,
+            start_len,
+        };
+        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, Some(bulk))?;
+        // the quads the replacement holds: what is left, less what was kept
+        Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
+    }
+
     /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
     /// neither does the head commit.
     pub fn compact(&self) -> Result<()> {
@@ -1340,7 +1872,7 @@ impl Store {
             return Err(Error::Poisoned);
         }
         let snap = self.snapshot();
-        self.rebuild_locked(&mut w, &snap, &[], &[], None)?;
+        self.rebuild_locked(&mut w, &snap, &[], &[], &[], None)?;
         Ok(())
     }
 
@@ -1354,12 +1886,18 @@ impl Store {
         snap: &Snapshot,
         extra: &[Source],
         extra_quads: &[[Id; 4]],
+        drop_graphs: &[Id],
         bulk: Option<BulkCommit>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
         // the old generation's WAL is the only other copy of the recent commits' ids:
         // the catalog must be durable before it is discarded
         self.catalog.lock().sync()?;
+        // and so must the full-text index, which could otherwise only catch up from it
+        #[cfg(feature = "text")]
+        if let Some(ti) = self.text.load_full() {
+            ti.checkpoint()?;
+        }
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
                 let n: u32 = snap
@@ -1384,7 +1922,12 @@ impl Store {
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = w.next_bnode;
         let builder = Builder::new(&dir, bopts)?;
-        write_snapshot(&builder, snap, |_| Ok(true), extra_quads)?;
+        write_snapshot(
+            &builder,
+            snap,
+            |q| Ok(!drop_graphs.contains(&q[3])),
+            extra_quads,
+        )?;
         for s in extra {
             builder.add_source(s)?;
         }
@@ -1437,6 +1980,7 @@ impl Store {
             return Err(e);
         }
         let old = snap.generation.dir.clone();
+        let old_name = snap.generation.name.clone();
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
             generation: Arc::new(gen_),
@@ -1453,17 +1997,46 @@ impl Store {
             },
             union_default_graph: self.opts.union_default_graph,
             delta_stats: Default::default(),
+            historical: false,
         };
         if bulk.is_some() {
             self.rebuild_text_locked(&mut new_snap, snap.text.clone());
         }
         self.current.store(Arc::new(new_snap));
-        // Old generation files are unlinked; open readers keep their mmaps alive.
+        // The old generation is kept if history needs it, else removed; open readers
+        // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
             && old.starts_with(root)
             && old != dir
         {
-            let _ = std::fs::remove_dir_all(old);
+            match &self.history {
+                Some(h) => {
+                    let mut h = h.lock();
+                    let (old_no, new_no) = (
+                        commit::generation_number(&old_name),
+                        commit::generation_number(&name),
+                    );
+                    if let Some(g) = h.gens.get_mut(&old_no) {
+                        g.end = snap.commit;
+                        g.bytes = dir_size(&g.dir);
+                    }
+                    h.gens.insert(
+                        new_no,
+                        crate::history::GenEntry {
+                            name: name.clone(),
+                            dir: dir.clone(),
+                            base: head,
+                            end: head.seq,
+                            fold_legacy: false,
+                            bytes: 0,
+                        },
+                    );
+                    self.collect_locked(&mut h, new_no, head.seq);
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(old);
+                }
+            }
         }
         let receipt = Receipt {
             dataset_id: self.dataset_id,
@@ -1631,18 +2204,7 @@ impl Store {
 
     /// Write all quads as N-Quads to `w`.
     pub fn dump_nquads(&self, w: impl Write) -> Result<u64> {
-        let snap = self.snapshot();
-        let mut ser = oxttl::NQuadsSerializer::new().for_writer(w);
-        let mut n = 0;
-        snap.for_each_quad(|q| {
-            if let Some(quad) = snap.quad_to_terms(q) {
-                ser.serialize_quad(&quad)?;
-                n += 1;
-            }
-            Ok(())
-        })?;
-        ser.finish().flush()?;
-        Ok(n)
+        dump_snapshot(&self.snapshot().without_cache_fill(), w)
     }
 
     /// Gzipped N-Quads backup into `dir` (Fuseki `/$/backup`). Returns the file path.
@@ -1790,7 +2352,7 @@ pub(crate) fn dir_size(p: &Path) -> u64 {
 
 /// Replace `path` durably: write and sync a temporary file, rename it over `path`, then
 /// sync the directory so the rename itself survives a power loss.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     write_synced(&tmp, bytes)?;
     std::fs::rename(tmp, path)?;
@@ -1862,6 +2424,7 @@ impl WriteTxn<'_> {
             text: self.base.text.clone(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
+            historical: false,
         }
     }
 
@@ -2049,7 +2612,29 @@ impl WriteTxn<'_> {
 
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
     /// without a bulk batch) creates no commit: its receipt carries the unchanged head.
-    pub fn commit(mut self) -> Result<Receipt> {
+    pub fn commit(self) -> Result<Receipt> {
+        let span = tracing::info_span!(
+            target: "sparkles::commit",
+            "commit",
+            kind = self.kind.name(),
+            seq = tracing::field::Empty,
+            inserted = tracing::field::Empty,
+            deleted = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let r = self.commit_inner();
+        if let Ok(r) = &r
+            && r.committed
+        {
+            // as i64: exporters render u64 fields as strings
+            span.record("seq", r.commit.seq as i64);
+            span.record("inserted", r.commit.inserted as i64);
+            span.record("deleted", r.commit.deleted as i64);
+        }
+        r
+    }
+
+    fn commit_inner(mut self) -> Result<Receipt> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
@@ -2069,7 +2654,7 @@ impl WriteTxn<'_> {
         };
         let (_, receipt) =
             self.store
-                .rebuild_locked(&mut self.guard, &view, &[], &bulk, Some(commit))?;
+                .rebuild_locked(&mut self.guard, &view, &[], &bulk, &[], Some(commit))?;
         Ok(receipt)
     }
 
@@ -2137,6 +2722,7 @@ impl WriteTxn<'_> {
             text: self.base.text.clone(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
+            historical: false,
         };
         self.store.maintain_text(&mut snap, &self.log);
         self.store.current.store(Arc::new(snap));
@@ -2160,6 +2746,315 @@ pub enum ReplaceTarget {
 /// Convenience helper for tests and the CLI.
 pub fn named(iri: &str) -> NamedNode {
     NamedNode::new_unchecked(iri)
+}
+
+/// A rough quad count of RDF sources from their size (~80 bytes per quad in text
+/// formats, gzip counted as 8×).
+fn estimated_quads(sources: &[Source]) -> u64 {
+    let mut bytes = 0u64;
+    for s in sources {
+        bytes += match &s.data {
+            crate::io::SourceData::Bytes(b) => b.len() as u64,
+            crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        } * if s.gzip { 8 } else { 1 };
+    }
+    bytes / 80
+}
+
+/// A Turtle prefix name (`PN_PREFIX`, ASCII subset), or the empty prefix.
+fn valid_prefix_name(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.is_empty()
+        || (b[0].is_ascii_alphabetic()
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            && !p.ends_with('.'))
+}
+
+/// Write the quads of `snap` as N-Quads.
+fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
+    let mut ser = oxttl::NQuadsSerializer::new().for_writer(w);
+    let mut n = 0;
+    snap.for_each_quad(|q| {
+        if let Some(quad) = snap.quad_to_terms(q) {
+            ser.serialize_quad(&quad)?;
+            n += 1;
+        }
+        Ok(())
+    })?;
+    ser.finish().flush()?;
+    Ok(n)
+}
+
+/// Estimated memory of a replayed delta (seven ordered sets of 32-byte keys).
+fn delta_bytes(d: &Delta) -> u64 {
+    (d.inserts() + d.deletes()) as u64 * 7 * 64
+}
+
+/// The history state of a store being opened: pins and retention from
+/// `history.json`, and the table of this dataset's generation directories. Finishes
+/// interrupted collections and removes interrupted rebuilds (generations newer than
+/// the current one).
+fn open_history(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    current: u32,
+    head: u64,
+    catalog: &Catalog,
+) -> Result<crate::history::HistoryState> {
+    use crate::history;
+    history::remove_deleting(root)?;
+    let (pins, retention) = history::read_file(root, dataset_id)?;
+    let mut h = history::HistoryState::new(pins, retention);
+    for (no, name, base, fold_legacy) in history::scan_generations(root, dataset_id)? {
+        let dir = root.join(&name);
+        if no > current {
+            if let Err(e) = history::delete_generation(root, &dir) {
+                tracing::warn!("could not remove the interrupted rebuild {name}: {e}");
+            }
+            continue;
+        }
+        let end = if no == current {
+            head
+        } else {
+            catalog
+                .last_in_generation(no)
+                .map_or_else(|| wal_end(&dir, &base, fold_legacy), |e| e.max(base.seq))
+        };
+        let bytes = if no == current { 0 } else { dir_size(&dir) };
+        h.gens.insert(
+            no,
+            history::GenEntry {
+                name,
+                dir,
+                base,
+                end,
+                fold_legacy,
+                bytes,
+            },
+        );
+    }
+    Ok(h)
+}
+
+/// The last commit in a generation's WAL, from its commit records alone.
+fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
+    let Ok(buf) = std::fs::read(dir.join("wal.log")) else {
+        return base.seq;
+    };
+    let recs = buf.as_chunks::<WAL_REC>().0;
+    let (mut end, mut txn_start, mut seen_v2) = (base.seq, 0usize, false);
+    for (i, rec) in recs.iter().enumerate() {
+        match rec[0] {
+            WAL_INSERT | WAL_DELETE => {}
+            WAL_COMMIT => {
+                match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
+                    Some(Ok((seq, _, _))) => {
+                        seen_v2 = true;
+                        end = seq;
+                    }
+                    Some(Err(())) => break,
+                    None if fold_legacy && !seen_v2 => {}
+                    None => end += 1,
+                }
+                txn_start = i + 1;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Where replay stops.
+pub(crate) enum Stop {
+    /// at the end of the log (a torn final transaction is left out)
+    End,
+    /// right after the commit with this sequence number
+    AfterSeq(u64),
+}
+
+/// The state a WAL replay starts from.
+pub(crate) struct ReplayFrom<'a> {
+    pub generation: &'a Arc<Generation>,
+    pub cache: &'a Arc<BlockCache>,
+    pub results: &'a Arc<crate::sparql::cache::ResultCache>,
+    /// the commit the generation's base index holds
+    pub base: CommitInfo,
+    pub gen_no: u32,
+    /// legacy commit records before the first one with metadata fold into the base
+    pub fold_legacy: bool,
+    pub next_bnode: u64,
+    /// collect the quads each commit changed
+    pub keep_touched: bool,
+    /// for error messages
+    pub path: &'a Path,
+}
+
+/// What a WAL replay yields.
+pub(crate) struct Replay {
+    pub delta: Delta,
+    /// complete transactions replayed
+    pub version: u64,
+    /// the commits replayed (without those folded into the base)
+    pub commits: Vec<CommitInfo>,
+    /// quads of the base plus transactions folded into it
+    pub base_quads: u64,
+    pub next_bnode: u64,
+    /// bytes of complete transactions (anything after is a torn tail)
+    pub good: usize,
+    pub touched: Vec<(u64, Vec<[Id; 4]>)>,
+    /// `Stop::AfterSeq` found its commit
+    pub reached: bool,
+}
+
+/// Replay the records of a generation's WAL (`buf`) onto its base index. A checksum
+/// mismatch in the final transaction is a torn tail and ends the replay; one before it
+/// is [`Error::Corrupt`]. `check` runs every 64 Ki records with the delta so far (for
+/// cancellation and memory budgets). The same inputs always give the same commit
+/// numbers, whether the replay is for opening the store or for reading a past state.
+pub(crate) fn replay_wal(
+    from: &ReplayFrom<'_>,
+    buf: &[u8],
+    stop: Stop,
+    check: &mut dyn FnMut(u64, &Delta) -> Result<()>,
+) -> Result<Replay> {
+    let cache = from.cache;
+    let recs = buf.as_chunks::<WAL_REC>().0;
+    // the last complete transaction may be torn; damage before it is corruption
+    let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
+    let mut out = Replay {
+        delta: Delta::default(),
+        version: 0,
+        commits: Vec::new(),
+        base_quads: from.generation.meta.quads,
+        next_bnode: from.next_bnode,
+        good: 0,
+        touched: Vec::new(),
+        reached: false,
+    };
+    let mut pending: Vec<(u8, [Id; 4])> = Vec::new();
+    let mut txn_start = 0usize;
+    let mut start_delta = out.delta.clone();
+    let probe = Snapshot {
+        generation: from.generation.clone(),
+        delta: Delta::default(),
+        version: 0,
+        cache: cache.clone(),
+        results: from.results.clone(),
+        dvocab_len: u64::MAX,
+        commit: 0,
+        text: None,
+        union_default_graph: false,
+        delta_stats: Default::default(),
+        historical: false,
+    };
+    let mut quads = out.base_quads;
+    let mut seen_v2 = false;
+    for (i, rec) in recs.iter().enumerate() {
+        if i % 65_536 == 65_535 {
+            check(i as u64 + 1, &out.delta)?;
+        }
+        let q: [Id; 4] = std::array::from_fn(|j| {
+            Id(u64::from_le_bytes(
+                rec[1 + j * 8..9 + j * 8].try_into().unwrap(),
+            ))
+        });
+        match rec[0] {
+            WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
+            WAL_COMMIT => {
+                let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
+                if matches!(meta, Some(Err(()))) {
+                    if Some(i) == last_commit {
+                        break; // torn tail
+                    }
+                    return Err(Error::Corrupt(format!(
+                        "{}: checksum mismatch in the transaction ending at byte {}",
+                        from.path.display(),
+                        (i + 1) * WAL_REC
+                    )));
+                }
+                let (mut ins, mut del) = (0i64, 0i64);
+                let touched: Vec<[Id; 4]> = if from.keep_touched {
+                    pending.iter().map(|(_, q)| *q).collect()
+                } else {
+                    Vec::new()
+                };
+                let before = out.commits.len();
+                for (op, q) in pending.drain(..) {
+                    let k = Perm::Spo.to_key(&q);
+                    let in_base = probe.perm(Perm::Spo).contains(cache, &k)?;
+                    let spo = Perm::Spo.index();
+                    let present = start_delta.ins[spo].contains(&k)
+                        || (in_base && !start_delta.del[spo].contains(&k));
+                    match (op == WAL_INSERT, present) {
+                        (true, false) => ins += 1,
+                        (true, true) => del -= 1,
+                        (false, true) => del += 1,
+                        (false, false) => ins -= 1,
+                    }
+                    apply(&mut out.delta, &q, op == WAL_INSERT, in_base);
+                }
+                start_delta = out.delta.clone();
+                let (ins, del) = (ins.max(0) as u64, del.max(0) as u64);
+                quads = (quads + ins).saturating_sub(del);
+                out.next_bnode = out.next_bnode.max(q[0].0);
+                out.version += 1;
+                let prev = out.commits.last().copied().unwrap_or(from.base);
+                match meta {
+                    Some(Ok((seq, ts, kind))) => {
+                        seen_v2 = true;
+                        if seq != prev.seq + 1 {
+                            return Err(Error::Corrupt(format!(
+                                "{}: commit {seq} follows commit {}",
+                                from.path.display(),
+                                prev.seq
+                            )));
+                        }
+                        out.commits.push(CommitInfo {
+                            seq,
+                            timestamp_ms: ts,
+                            kind,
+                            inserted: ins,
+                            deleted: del,
+                            quads,
+                            generation: from.gen_no,
+                            bulk: false,
+                            exact: true,
+                            reconstructed: false,
+                        });
+                    }
+                    // a legacy commit record: folded into the baseline when the
+                    // database is being upgraded, otherwise numbered in order
+                    _ if from.fold_legacy && !seen_v2 => out.base_quads = quads,
+                    _ => out.commits.push(CommitInfo {
+                        seq: prev.seq + 1,
+                        timestamp_ms: prev.timestamp_ms,
+                        kind: CommitKind::Unknown,
+                        inserted: ins,
+                        deleted: del,
+                        quads,
+                        generation: from.gen_no,
+                        bulk: false,
+                        exact: true,
+                        reconstructed: true,
+                    }),
+                }
+                if from.keep_touched && out.commits.len() > before {
+                    out.touched.push((out.commits.last().unwrap().seq, touched));
+                }
+                out.good = (i + 1) * WAL_REC;
+                txn_start = i + 1;
+                if let Stop::AfterSeq(s) = stop
+                    && out.commits.last().is_some_and(|c| c.seq >= s)
+                {
+                    out.reached = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

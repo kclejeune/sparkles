@@ -932,40 +932,66 @@ fn cached_paths_respect_the_graph() {
 #[test]
 fn replace_is_atomic_and_leaves_data_on_parse_errors() {
     use crate::store::ReplaceTarget;
-    let s = Store::in_memory(StoreOptions::default());
-    s.load(&[Source::from_bytes(
-        TRIG.as_bytes().to_vec(),
-        RdfFormat::TriG,
-        None,
-    )])
-    .unwrap();
-    let g1 = oxrdf::NamedNode::new_unchecked("http://ex.org/g1");
-    let bad = Source::from_bytes(
-        b"<http://ex.org/n> <http://ex.org/p> 7 . this is not turtle".to_vec(),
-        RdfFormat::Turtle,
-        Some(g1.clone()),
-    );
-    assert!(s.replace(ReplaceTarget::Named(g1.clone()), &[bad]).is_err());
-    assert_eq!(
-        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
-        ["1", "2"]
-    );
-    let good = Source::from_bytes(
-        b"<http://ex.org/n> <http://ex.org/p> 7 .".to_vec(),
-        RdfFormat::Turtle,
-        Some(g1.clone()),
-    );
-    assert_eq!(s.replace(ReplaceTarget::Named(g1), &[good]).unwrap(), 1);
-    assert_eq!(
-        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
-        ["7"]
-    );
-    // other graphs are untouched
-    assert_eq!(
-        strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g2 { ?s ex:p ?o } }")),
-        ["3", "4"]
-    );
-    assert_eq!(strs(&q(&s, "SELECT ?o WHERE { ?s ex:p ?o }")), ["9"]);
+    // the in-place path, then the bulk rebuild path of large replaces
+    for bulk_threshold in [StoreOptions::default().bulk_threshold, 0] {
+        let s = Store::in_memory(StoreOptions {
+            bulk_threshold,
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            TRIG.as_bytes().to_vec(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+        // a comment long enough for the size estimate to count as large
+        let pad = format!("# {}\n", "x".repeat(200));
+        let g1 = oxrdf::NamedNode::new_unchecked("http://ex.org/g1");
+        let bad = Source::from_bytes(
+            format!("{pad}<http://ex.org/n> <http://ex.org/p> 7 . this is not turtle").into_bytes(),
+            RdfFormat::Turtle,
+            Some(g1.clone()),
+        );
+        let head = s.head_commit().seq;
+        assert!(s.replace(ReplaceTarget::Named(g1.clone()), &[bad]).is_err());
+        assert_eq!(s.head_commit().seq, head, "{bulk_threshold}");
+        assert_eq!(
+            strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
+            ["1", "2"],
+            "{bulk_threshold}"
+        );
+        let good = Source::from_bytes(
+            format!("{pad}<http://ex.org/n> <http://ex.org/p> 7 .").into_bytes(),
+            RdfFormat::Turtle,
+            Some(g1.clone()),
+        );
+        assert_eq!(
+            s.replace(ReplaceTarget::Named(g1), &[good]).unwrap(),
+            1,
+            "{bulk_threshold}"
+        );
+        assert_eq!(
+            strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g1 { ?s ex:p ?o } }")),
+            ["7"]
+        );
+        // other graphs are untouched
+        assert_eq!(
+            strs(&q(&s, "SELECT ?o WHERE { GRAPH ex:g2 { ?s ex:p ?o } }")),
+            ["3", "4"]
+        );
+        assert_eq!(strs(&q(&s, "SELECT ?o WHERE { ?s ex:p ?o }")), ["9"]);
+        // the commit counts the replacement
+        let c = s.head_commit();
+        assert_eq!((c.inserted, c.deleted), (1, 2), "{bulk_threshold}");
+        // replacing everything
+        let all = Source::from_bytes(
+            format!("{pad}<http://ex.org/z> <http://ex.org/p> 0 .").into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        );
+        assert_eq!(s.replace(ReplaceTarget::All, &[all]).unwrap(), 1);
+        assert_eq!(s.snapshot().len(), 1, "{bulk_threshold}");
+    }
 }
 
 #[test]
@@ -1278,4 +1304,23 @@ fn limited_writer_enforces_the_result_size() {
     let big = vec![b'x'; 128 << 10];
     let e = std::io::Write::write_all(&mut w, &big).unwrap_err();
     assert!(matches!(w.classify(Error::Io(e)), Error::Cancelled));
+}
+
+#[test]
+fn exports_read_through_the_block_cache() {
+    let s = store();
+    let before = s.cache().bytes();
+    let mut out = Vec::new();
+    let n = s.dump_nquads(&mut out).unwrap();
+    assert!(n > 0);
+    // a full export decodes every block but keeps none of them
+    assert_eq!(s.cache().bytes(), before);
+    // a query still fills the cache, and the export can use what it holds
+    q(&s, "SELECT * { ?s ?p ?o }");
+    let warm = s.cache().bytes();
+    assert!(warm > before);
+    let mut again = Vec::new();
+    assert_eq!(s.dump_nquads(&mut again).unwrap(), n);
+    assert_eq!(s.cache().bytes(), warm);
+    assert_eq!(out, again);
 }

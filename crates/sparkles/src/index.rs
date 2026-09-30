@@ -465,7 +465,7 @@ pub fn pad(prefix: &[u64], fill: u64) -> Key {
     k
 }
 
-fn next_uid() -> u64 {
+pub(crate) fn next_uid() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UID: AtomicU64 = AtomicU64::new(1);
     UID.fetch_add(1, Ordering::Relaxed)
@@ -474,10 +474,15 @@ fn next_uid() -> u64 {
 /// Process-wide cache of decoded blocks, weighted by bytes.
 /// Cache of decoded block columns, keyed by (permutation instance, block, column):
 /// readers decode and keep only the columns they use.
+/// Decoded columns by (permutation instance, block, column).
+type ColumnCache = quick_cache::sync::Cache<(u64, u32, u8), Arc<[u64]>, BlockWeighter>;
+
 pub struct BlockCache {
-    cache: quick_cache::sync::Cache<(u64, u32, u8), Arc<[u64]>, BlockWeighter>,
+    cache: Arc<ColumnCache>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
+    /// decoded blocks are added (false: a read-through view, see [`BlockCache::read_through`])
+    fill: bool,
 }
 
 #[derive(Clone)]
@@ -496,13 +501,26 @@ fn empty_col() -> Arc<[u64]> {
 impl BlockCache {
     pub fn new(bytes: u64) -> BlockCache {
         BlockCache {
-            cache: quick_cache::sync::Cache::with_weighter(
+            cache: Arc::new(quick_cache::sync::Cache::with_weighter(
                 (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
                 bytes,
                 BlockWeighter,
-            ),
+            )),
             hits: Default::default(),
             misses: Default::default(),
+            fill: true,
+        }
+    }
+
+    /// A view of the same cache that uses its blocks but never adds any: for one-off
+    /// full scans (exports, backups) that would otherwise evict the blocks queries use.
+    /// Its hit and miss counts are its own.
+    pub fn read_through(&self) -> BlockCache {
+        BlockCache {
+            cache: self.cache.clone(),
+            hits: Default::default(),
+            misses: Default::default(),
+            fill: false,
         }
     }
 
@@ -528,7 +546,9 @@ impl BlockCache {
                     self.misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let v: Arc<[u64]> = idx.decode_col(b, c)?.into();
-                    self.cache.insert(key, v.clone());
+                    if self.fill {
+                        self.cache.insert(key, v.clone());
+                    }
                     v
                 }
             };

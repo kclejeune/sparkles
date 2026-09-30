@@ -259,8 +259,39 @@ pub struct GenerationVectors {
     by_pred: parking_lot::Mutex<FxHashMap<u64, Arc<PredicateVectors>>>,
 }
 
+/// One packed predicate, for status reports.
+pub struct PackedStatus {
+    pub predicate: u64,
+    pub bytes: u64,
+    pub malformed: u64,
+    /// (dimension, rows): a vector in several graphs counts once per graph
+    pub dims: Vec<(usize, usize)>,
+}
+
 impl GenerationVectors {
-    fn used_bytes(&self) -> u64 {
+    /// The predicates packed so far (on their first search), by predicate id.
+    pub fn status(&self) -> Vec<PackedStatus> {
+        let mut out: Vec<PackedStatus> = self
+            .by_pred
+            .lock()
+            .iter()
+            .map(|(&p, v)| {
+                let mut dims: Vec<(usize, usize)> =
+                    v.by_dim.values().map(|s| (s.dim, s.ids.len())).collect();
+                dims.sort_unstable();
+                PackedStatus {
+                    predicate: p,
+                    bytes: v.bytes,
+                    malformed: v.malformed,
+                    dims,
+                }
+            })
+            .collect();
+        out.sort_unstable_by_key(|s| s.predicate);
+        out
+    }
+
+    pub fn used_bytes(&self) -> u64 {
         self.by_pred.lock().values().map(|p| p.bytes).sum()
     }
 

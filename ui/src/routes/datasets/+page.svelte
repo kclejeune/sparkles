@@ -70,6 +70,7 @@
               <th>Name</th>
               <th>Storage</th>
               <th class="num">Quads</th>
+              <th title="Head commit and when it was made">Head</th>
               <th>Reasoning</th>
               <th>Endpoint</th>
               <th></th>
@@ -84,6 +85,14 @@
                 </td>
                 <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
                 <td class="num">{fmtInt(d.quads)}</td>
+                <td>
+                  {#if d.head != null}
+                    <span class="mono" title={d.modified}>commit {d.head}</span>
+                    {#if d.modified}<span class="faint">, {fmtRelative(d.modified)}</span>{/if}
+                  {:else}
+                    <span class="faint">—</span>
+                  {/if}
+                </td>
                 <td>
                   {#if d.reasoning}
                     <span class="badge ok">{d.reasoning.profile}</span>

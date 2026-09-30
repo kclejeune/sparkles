@@ -72,7 +72,7 @@ export function displayTerm(t: Term | null | undefined, prefixes: PrefixMap): st
     case 'bnode':
       return `_:${t.value}`;
     case 'literal':
-      return t.value;
+      return literalText(t);
     case 'triple':
       return `<< ${displayTerm(t.value.subject, prefixes)} ${displayTerm(t.value.predicate, prefixes)} ${displayTerm(t.value.object, prefixes)} >>`;
   }
@@ -110,6 +110,55 @@ export function sparqlIri(value: string): string {
 
 export function sparqlString(value: string): string {
   return JSON.stringify(value);
+}
+
+// --- vector literals (docs/API.md "Vector similarity") ------------------------------
+
+export const SPK = 'urn:x-sparkles:';
+export const VECTOR_DATATYPE = SPK + 'vector';
+
+export function isVectorLiteral(
+  t: Term | null | undefined,
+): t is Extract<Term, { type: 'literal' }> & { datatype: string } {
+  return t?.type === 'literal' && t.datatype === VECTOR_DATATYPE;
+}
+
+/**
+ * The numbers of a vector literal (a JSON array of 1–16384 finite numbers), or null when
+ * it does not parse (the server stores such a literal but never matches it).
+ */
+export function parseVector(value: string): number[] | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(v) || v.length === 0 || v.length > 16384) return null;
+  return v.every((x) => typeof x === 'number' && Number.isFinite(x)) ? (v as number[]) : null;
+}
+
+/** A component for display: at most 3 decimals (tiny or huge ones in exponent form). */
+function fmtComponent(x: number): string {
+  const a = Math.abs(x);
+  const s = a >= 1e4 || (a !== 0 && a < 0.001) ? x.toExponential(1) : String(+x.toFixed(3));
+  return s.replace(/^-/, '−');
+}
+
+/**
+ * Compact text of a vector literal: `vector(384) [0.12, −0.03, 0.4, …]` showing the first
+ * `head` components; `vector(invalid) …` for one that does not parse.
+ */
+export function abbreviateVector(value: string, head = 3): string {
+  const v = parseVector(value);
+  if (!v) return `vector(invalid) ${value.length > 24 ? value.slice(0, 21) + '…' : value}`;
+  const shown = v.slice(0, head).map(fmtComponent);
+  return `vector(${v.length}) [${shown.join(', ')}${v.length > head ? ', …' : ''}]`;
+}
+
+/** Display text of a literal's value: vectors abbreviated, everything else unchanged. */
+export function literalText(t: Extract<Term, { type: 'literal' }>): string {
+  return isVectorLiteral(t) ? abbreviateVector(t.value) : t.value;
 }
 
 // --- query text analysis --------------------------------------------------

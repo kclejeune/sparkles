@@ -602,6 +602,44 @@ async fn graph_store_get_streams_large_graphs() {
 }
 
 #[tokio::test]
+async fn large_query_results_are_streamed() {
+    let s = server_with(|st| st.limits.max_result_bytes = Some(64 << 20));
+    let ds = s.state.get("ds").unwrap();
+    // about 3 MiB as TSV: well past the 1 MiB a response is buffered for
+    let nt: String = (0..30_000)
+        .map(|i| format!("<urn:big:{i}> <urn:big:p> \"{}\" .\n", "x".repeat(80)))
+        .collect();
+    ds.store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let q =
+        "/ds/sparql?query=SELECT%20%3Fs%20%3Fo%20WHERE%20%7B%3Fs%20%3Curn%3Abig%3Ap%3E%20%3Fo%7D";
+    let r = tsv(&s.app, q).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.header("content-length").is_empty(), "streamed");
+    assert_eq!(r.text().lines().count(), 30_001);
+    assert!(r.body.len() > 2 << 20);
+    // the commit header is set before the body streams
+    assert!(!r.header("sparkles-commit").is_empty());
+    let m = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_response_bytes_total{dataset="ds",operation="query"}"#
+        ),
+        Some(r.body.len() as f64),
+        "{m}"
+    );
+    // a small result is still sent whole
+    let r = tsv(&s.app, "/ds/sparql?query=ASK%20%7B%7D").await;
+    assert_eq!(r.header("content-length"), r.body.len().to_string());
+}
+
+#[tokio::test]
 async fn row_limit_keeps_507() {
     let s = server_with(|st| st.limits.max_rows = 5);
     let r = tsv(&s.app, ALL).await;
@@ -752,4 +790,25 @@ async fn client_disconnect_cancels_the_query() {
         assert!(std::time::Instant::now() < deadline, "{m}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn error_bodies_carry_the_request_id() {
+    let s = server();
+    let r = get(&s.app, "/nope/sparql?query=ASK%7B%7D").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let j = r.json();
+    assert_eq!(j["requestId"], r.header("x-request-id"), "{j}");
+    assert!(j["error"].as_str().unwrap().contains("nope"));
+    // an incoming id is the one reported
+    let r = get_with(
+        &s.app,
+        "/ds/sparql?query=SELEC",
+        "x-request-id",
+        "client-42",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["requestId"], "client-42");
+    assert_eq!(r.header("content-length"), r.body.len().to_string());
 }

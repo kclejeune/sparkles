@@ -8,6 +8,8 @@ mod auth;
 mod clone;
 mod http;
 mod obs;
+mod otel;
+mod ratelimit;
 mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
@@ -43,11 +45,234 @@ struct Cli {
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
+    /// Memory for materialized past states (point-in-time reads), in MiB
+    #[arg(long, global = true, default_value_t = 1024)]
+    history_cache_mb: u64,
+    /// Old index generations named snapshots may keep per dataset
+    #[arg(long, global = true, default_value_t = 8)]
+    history_max_generations: usize,
+    /// Named snapshots per dataset
+    #[arg(long, global = true, default_value_t = 256)]
+    max_snapshots: usize,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Pin a commit under a name (default: the head)
+    Create {
+        #[arg(long)]
+        loc: PathBuf,
+        name: String,
+        /// N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// List named snapshots
+    List {
+        #[arg(long)]
+        loc: PathBuf,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Remove a named snapshot (and the history only it kept)
+    Delete {
+        #[arg(long)]
+        loc: PathBuf,
+        name: String,
+    },
+    /// Retained generations and readable commits
+    History {
+        #[arg(long)]
+        loc: PathBuf,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Keep the recent past readable: the last N commits and/or a duration (90s, 30m, 12h, 7d)
+    Retain {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long)]
+        keep_commits: Option<u64>,
+        #[arg(long)]
+        keep_age: Option<String>,
+        /// turn retention off
+        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age"])]
+        off: bool,
+    },
+}
+
+/// `90s`, `30m`, `12h`, `7d`, `2w`, or plain seconds, to milliseconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?}"))?;
+    let secs = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => bail!("invalid duration {s:?}: use s, m, h, d or w"),
+    };
+    Ok(n * secs * 1000)
+}
+
+fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
+    use sparkles::history::{At, Retention};
+    match cmd {
+        SnapshotCmd::Create {
+            loc,
+            name,
+            at,
+            note,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let at: At = at.as_deref().unwrap_or("head").parse()?;
+            let (s, created) = store.create_snapshot(&name, &at, note)?;
+            println!(
+                "{} → commit {}{}",
+                s.name,
+                s.seq,
+                if created { "" } else { " (already pinned)" }
+            );
+        }
+        SnapshotCmd::List { loc, format } => {
+            let store = Store::open(&loc, opts)?;
+            let snaps = store.snapshots();
+            if format == "json" {
+                let j: Vec<serde_json::Value> = snaps
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name, "seq": s.seq, "commit": s.commit,
+                            "created": sparkles::commit::rfc3339_ms(s.created_ms),
+                            "note": s.note, "generation": s.generation,
+                            "reconstructable": s.reconstructable,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&j)?);
+            } else {
+                println!(
+                    "{:<16} {:>8}  {:<24}  {:<10}  note",
+                    "snapshot", "commit", "timestamp", "generation"
+                );
+                for s in snaps {
+                    println!(
+                        "{:<16} {:>8}  {:<24}  {:<10}  {}{}",
+                        s.name,
+                        s.seq,
+                        s.commit.map(|c| c.timestamp()).unwrap_or_default(),
+                        s.generation.unwrap_or_else(|| "-".into()),
+                        s.note.unwrap_or_default(),
+                        if s.reconstructable {
+                            ""
+                        } else {
+                            "  (not reconstructable)"
+                        }
+                    );
+                }
+            }
+        }
+        SnapshotCmd::Delete { loc, name } => {
+            let store = Store::open(&loc, opts)?;
+            if !store.delete_snapshot(&name)? {
+                bail!("no snapshot '{name}'");
+            }
+            println!("deleted {name}");
+        }
+        SnapshotCmd::History { loc, format } => {
+            let store = Store::open(&loc, opts)?;
+            print_history(&store.history(), &format)?;
+        }
+        SnapshotCmd::Retain {
+            loc,
+            keep_commits,
+            keep_age,
+            off,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let r = if off {
+                Retention::default()
+            } else {
+                Retention {
+                    keep_commits,
+                    keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                }
+            };
+            print_history(&store.set_retention(r)?, "text")?;
+        }
+    }
+    Ok(())
+}
+
+fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<()> {
+    if format == "json" {
+        let j = serde_json::json!({
+            "head": h.head,
+            "reconstructable": h.reconstructable.iter().map(|(a, b)| serde_json::json!({"from": a, "to": b})).collect::<Vec<_>>(),
+            "bytes": h.bytes,
+            "generations": h.generations.iter().map(|g| serde_json::json!({
+                "name": g.name, "baseSeq": g.base_seq, "endSeq": g.end_seq, "bytes": g.bytes,
+                "current": g.current, "heldBy": g.held_by.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "retention": h.retention,
+            "snapshots": h.snapshots,
+        });
+        println!("{}", serde_json::to_string_pretty(&j)?);
+        return Ok(());
+    }
+    let ranges: Vec<String> = h
+        .reconstructable
+        .iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}..{b}")
+            }
+        })
+        .collect();
+    println!("head {}   readable commits: {}", h.head, ranges.join(", "));
+    for g in &h.generations {
+        let held: Vec<String> = g.held_by.iter().map(|x| x.to_string()).collect();
+        println!(
+            "  {}  commits {}..{}  {}  {}",
+            g.name,
+            g.base_seq,
+            g.end_seq,
+            if g.current {
+                "current".to_string()
+            } else {
+                format!("{} MiB", g.bytes >> 20)
+            },
+            held.join(", ")
+        );
+    }
+    let r = &h.retention;
+    println!(
+        "retention: {}",
+        match (r.keep_commits, r.keep_age_ms) {
+            (None, None) => "off".to_string(),
+            (c, a) => format!(
+                "{}{}",
+                c.map(|c| format!("last {c} commits ")).unwrap_or_default(),
+                a.map(|a| format!("last {}s", a / 1000)).unwrap_or_default()
+            ),
+        }
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -111,6 +336,9 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
+        /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
+        #[arg(long, default_value_t = 4096)]
+        vector_memory_mb: u64,
         /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
         #[arg(long, default_value_t = 0.0)]
         update_timeout: f64,
@@ -122,6 +350,32 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
+        /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
+        /// auth, query, update, admin (e.g. query=100/s,burst=200)
+        #[arg(long, value_name = "SPEC")]
+        rate_limit: Vec<String>,
+        /// JSON file of rate limits (re-read on SIGHUP); --rate-limit flags apply on top
+        #[arg(long, value_name = "FILE")]
+        rate_limit_config: Option<PathBuf>,
+        /// Proxy (address or CIDR) whose Forwarded / X-Forwarded-For names the client
+        /// for rate limiting
+        #[arg(long, value_name = "CIDR")]
+        rate_limit_trusted_proxy: Vec<String>,
+        /// Export traces and metrics over OTLP (also enabled by OTEL_EXPORTER_OTLP_ENDPOINT
+        /// and the other OTEL_* variables)
+        #[arg(long)]
+        otel: bool,
+        /// Record query and update text (db.query.text) and plan operator descriptions in
+        /// spans; they may hold data
+        #[arg(long)]
+        otel_query_text: bool,
+        /// One span per executed plan operator, synthesized from the recorded timings
+        #[arg(long)]
+        otel_plan_spans: bool,
+        /// Export log events over OTLP too (also OTEL_LOGS_EXPORTER=otlp)
+        #[arg(long)]
+        otel_logs: bool,
         /// Enable authentication and per-dataset authorization from this TOML file
         /// (re-read on SIGHUP); without it the server is open
         #[arg(long, value_name = "FILE")]
@@ -197,6 +451,9 @@ enum Cmd {
         time: bool,
         #[arg(long)]
         timeout: Option<f64>,
+        /// Query a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME (needs --loc)
+        #[arg(long)]
+        at: Option<String>,
         /// Budget for the estimated memory of intermediate results, in MiB (0: unlimited)
         #[arg(long, default_value_t = 0)]
         memory_mb: u64,
@@ -233,6 +490,14 @@ enum Cmd {
     Dump {
         #[arg(long)]
         loc: PathBuf,
+        /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Named snapshots (pins that keep a commit readable) and history retention
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
     },
     /// Merge updates into a freshly built index generation
     Compact {
@@ -385,6 +650,9 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
         union_default_graph: cli.union_default_graph,
+        history_cache_bytes: cli.history_cache_mb << 20,
+        history_max_generations: cli.history_max_generations,
+        max_snapshots: cli.max_snapshots,
         ..Default::default()
     }
 }
@@ -571,16 +839,42 @@ fn main() -> Result<()> {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    match cli.log_format {
-        LogFormat::Text => fmt.init(),
-        LogFormat::Json => fmt
-            .json()
-            .with_current_span(true)
-            .with_span_list(false)
-            .init(),
+    let otel_settings = match &cli.cmd {
+        Cmd::Serve {
+            otel,
+            otel_query_text,
+            otel_plan_spans,
+            otel_logs,
+            ..
+        } => otel::Settings {
+            enabled: *otel,
+            query_text: *otel_query_text,
+            plan_spans: *otel_plan_spans,
+            logs: *otel_logs,
+        },
+        _ => otel::Settings::default(),
+    };
+    let otel_guard = otel::init(&otel_settings)?;
+    {
+        use tracing_subscriber::prelude::*;
+        let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+        let fmt = match cli.log_format {
+            LogFormat::Text => fmt.boxed(),
+            LogFormat::Json => fmt
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .boxed(),
+        };
+        let base = tracing_subscriber::registry().with(filter).with(fmt);
+        // not `.with(Option)`: a `None` layer reports OFF and would silence the others
+        match otel_guard.layers() {
+            Some(otel) => base.with(otel).init(),
+            None => base.init(),
+        }
+    }
+    if let Some(d) = otel::describe(&otel_guard) {
+        tracing::info!("{d}");
     }
     let opts = store_opts(&cli);
     match cli.cmd {
@@ -603,10 +897,15 @@ fn main() -> Result<()> {
             max_result_mb,
             max_rows,
             update_timeout,
+            vector_memory_mb,
             auto_reason,
             auto_reason_max_delay,
             auth_config,
             unix_socket,
+            rate_limit,
+            rate_limit_config,
+            rate_limit_trusted_proxy,
+            ..
         } => {
             // a bad auth configuration stops the server before anything else
             let bound = if unix_socket.is_some() { "unix" } else { &host };
@@ -616,6 +915,7 @@ fn main() -> Result<()> {
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
+            sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             let mib = |m: u64| (m > 0).then_some(m << 20);
@@ -641,7 +941,21 @@ fn main() -> Result<()> {
                     max,
                 ));
             }
+            let limit_sources = ratelimit::Sources {
+                file: rate_limit_config,
+                flags: rate_limit,
+                trusted_proxies: rate_limit_trusted_proxy,
+            };
+            if let Some(cfg) = limit_sources.load()? {
+                // signed-in callers are limited per principal, others per address
+                st.rate_limit = Some(Arc::new(
+                    ratelimit::RateLimiter::new(&cfg)
+                        .map_err(anyhow::Error::msg)?
+                        .with_keyer(Arc::new(auth::PrincipalKeyer)),
+                ));
+            }
             let st = Arc::new(st);
+            otel::register_metrics(&st);
             #[cfg(feature = "reasoning")]
             if st.auto_reason.is_some() {
                 if st.read_only {
@@ -668,7 +982,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(async move {
+            let served = rt.block_on(async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
                     None => Some(
@@ -700,6 +1014,13 @@ fn main() -> Result<()> {
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
                 }
+                if let Some(rl) = &st.rate_limit {
+                    ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));
+                    #[cfg(unix)]
+                    if limit_sources.file.is_some() {
+                        ratelimit::spawn_reload_on_sighup(rl.clone(), limit_sources);
+                    }
+                }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
                 auth::spawn_reload_on_sighup(&st);
@@ -727,7 +1048,11 @@ fn main() -> Result<()> {
                 }
                 auth::flush(&st);
                 anyhow::Ok(())
-            })
+            });
+            drop(rt);
+            // flush spans and metrics of the last requests (bounded)
+            otel_guard.shutdown();
+            served
         }
         Cmd::Load {
             loc,
@@ -781,6 +1106,7 @@ fn main() -> Result<()> {
             explain,
             time,
             timeout,
+            at,
             memory_mb,
             text,
             server,
@@ -815,13 +1141,22 @@ fn main() -> Result<()> {
                 prefixes: store.prefixes().into_iter().collect(),
                 ..Default::default()
             };
+            let snap = match at {
+                Some(a) => {
+                    let a: sparkles::history::At = a.parse()?;
+                    let (snap, r) = store.snapshot_at(&a, &Default::default())?;
+                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
+                    snap
+                }
+                None => store.snapshot(),
+            };
             if explain {
-                let (sse, plan) = sparkles::sparql::explain(store.snapshot(), &q, &qopts)?;
+                let (sse, plan) = sparkles::sparql::explain(snap, &q, &qopts)?;
                 println!("{sse}\n");
                 print_plan(&plan, 0);
                 return Ok(());
             }
-            let r = sparkles::sparql::query(store.snapshot(), &q, &qopts)?;
+            let r = sparkles::sparql::query(snap, &q, &qopts)?;
             let out = std::io::stdout();
             let mut out = out.lock();
             match r.kind {
@@ -920,12 +1255,23 @@ fn main() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump { loc } => {
+        Cmd::Dump { loc, at } => {
             let store = Store::open(&loc, opts)?;
             let out = std::io::BufWriter::new(std::io::stdout().lock());
-            store.dump_nquads(out)?;
+            match at {
+                Some(a) => {
+                    let a: sparkles::history::At = a.parse()?;
+                    let r = store.resolve(&a)?;
+                    eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
+                    store.dump_nquads_at(&a, out)?;
+                }
+                None => {
+                    store.dump_nquads(out)?;
+                }
+            }
             Ok(())
         }
+        Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();

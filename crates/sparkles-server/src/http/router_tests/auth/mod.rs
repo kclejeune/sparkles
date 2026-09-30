@@ -255,6 +255,13 @@ impl R {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+    /// The JSON error body without its `requestId` (which differs per request).
+    pub fn err(&self) -> J {
+        let mut j = self.json();
+        assert!(j["requestId"].is_string(), "no requestId in {j}");
+        j.as_object_mut().unwrap().remove("requestId");
+        j
+    }
     pub fn all(&self, name: &str) -> Vec<String> {
         self.headers
             .get_all(name)
@@ -453,13 +460,13 @@ async fn anonymous() {
         ]
     );
     assert_eq!(
-        wiki.json(),
+        wiki.err(),
         serde_json::json!({"error": "authentication required"})
     );
     let nope = get_as(&s.app, &format!("/nope{ASK}"), None).await;
     assert_eq!(nope.status, wiki.status);
     assert_eq!(nope.all("www-authenticate"), wiki.all("www-authenticate"));
-    assert_eq!(nope.body, wiki.body);
+    assert_eq!(nope.err(), wiki.err());
     // a script fetch gets no Basic challenge (no browser login dialog)
     let script = call(
         &s.app,
@@ -499,7 +506,7 @@ async fn invalid_credentials_are_not_anonymous() {
     )
     .await;
     assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(unknown.body, bad.body);
+    assert_eq!(unknown.err(), bad.err());
     let malformed = get_as(&s.app, &format!("/public{ASK}"), Some("Basic !!!")).await;
     assert_eq!(malformed.status, StatusCode::UNAUTHORIZED);
     let other = get_as(&s.app, &format!("/public{ASK}"), Some("Digest x")).await;
@@ -533,14 +540,14 @@ async fn hidden_versus_forbidden() {
     let secret = get_as(&s.app, &format!("/secret{ASK}"), Some(&bob)).await;
     assert_eq!(secret.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        secret.json(),
+        secret.err(),
         serde_json::json!({"error": "no such dataset: /secret"})
     );
     let nope = get_as(&s.app, &format!("/nope{ASK}"), Some(&bob)).await;
     assert_eq!(nope.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        nope.text().replace("nope", "X"),
-        secret.text().replace("secret", "X")
+        nope.err().to_string().replace("nope", "X"),
+        secret.err().to_string().replace("secret", "X")
     );
     let zzz = get_as(&s.app, &format!("/team-zzz{ASK}"), Some(&bob)).await;
     assert_eq!(zzz.status, StatusCode::NOT_FOUND);
@@ -553,7 +560,7 @@ async fn hidden_versus_forbidden() {
     )
     .await;
     assert_eq!(del.status, StatusCode::NOT_FOUND);
-    assert_eq!(del.body, secret.body);
+    assert_eq!(del.err(), secret.err());
     // a missing dataset that the caller could administer: the handler's 404, same body
     let alice_del = call(
         &s.app,
@@ -564,7 +571,7 @@ async fn hidden_versus_forbidden() {
     )
     .await;
     assert_eq!(alice_del.status, StatusCode::NOT_FOUND);
-    assert_eq!(alice_del.body, nope.body);
+    assert_eq!(alice_del.err(), nope.err());
     let m = get_as(&s.app, "/$/metrics", Some(&bearer(&t_prom())))
         .await
         .text();

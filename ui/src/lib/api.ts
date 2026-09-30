@@ -25,6 +25,14 @@ export type DatasetInfo = {
   forkedFrom?: { id: string; seq: number };
   /** Clones: the source and when the copy was made (`origin.json`). */
   origin?: DatasetOrigin;
+  /** Dataset id (a UUID created with the dataset); absent on servers that predate commits. */
+  id?: string;
+  /** Head commit sequence number. */
+  head?: number;
+  /** Timestamp of the head commit. */
+  modified?: string;
+  /** Full-text index summary (null: disabled; absent: server without the field). */
+  text?: { state: TextState; docs: number } | null;
   /** The caller's level on the dataset; absent without auth (then everything goes). */
   access?: Level;
 };
@@ -70,7 +78,8 @@ export type ReadyInfo = {
 export type Operation =
   'query' | 'update' | 'gsp' | 'upload' | 'shacl' | 'explain' | 'admin' | 'other';
 export type Outcome =
-  'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget' | 'denied';
+  'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget' | 'rate_limited' | 'denied';
+export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 
 type CacheStats = {
@@ -103,6 +112,8 @@ export type MetricsSnapshot = {
     diskBytes: number;
     resultRows: number;
     budgetExceeded: Record<BudgetKind, number> | null;
+    /** Requests refused by a rate or concurrency limit, per limit class. */
+    rateLimited?: Record<LimitClass, number> | null;
     blockCache: CacheStats;
     resultCache: CacheStats & { enabled: boolean };
   }[];
@@ -140,7 +151,7 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
 };
 
-export type TaskKind = 'compact' | 'backup' | 'reason' | 'load' | 'clone';
+export type TaskKind = 'compact' | 'backup' | 'reason' | 'load' | 'clone' | 'text-rebuild';
 export type Task = {
   id: string;
   kind: TaskKind;
@@ -196,6 +207,9 @@ export type SparklesResult = {
     plan: PlanNode;
     /** Peak estimated memory of intermediate results; absent on older servers. */
     memory?: { peakBytes: number };
+    /** The commit the query read (absent on servers that predate commits). */
+    commit?: number;
+    datasetId?: string;
   };
   /** From the `Sparkles-Inferences` header: the result used outdated inferences. */
   inferences?: InferencesNotice;
@@ -624,14 +638,20 @@ export type UpdateResult = {
   deleted: number;
   operations: number;
   timing?: Timing;
+  /** The commit the update produced (absent on servers that predate commits). */
+  receipt?: Receipt;
 };
 
+/**
+ * Run a SPARQL update. Asks for a commit receipt (`receipt=true`); servers that predate
+ * receipts ignore the parameter.
+ */
 export async function update(
   ds: string,
   sparql: string,
   signal?: AbortSignal,
 ): Promise<UpdateResult | null> {
-  const res = await request(`/${enc(ds)}/update`, {
+  const res = await request(`/${enc(ds)}/update?receipt=true`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
     body: sparql,
@@ -641,7 +661,15 @@ export async function update(
   const text = await res.text();
   try {
     const body = JSON.parse(text);
-    return body && typeof body.inserted === 'number' ? (body as UpdateResult) : null;
+    if (!body || typeof body.inserted !== 'number') return null;
+    const receipt = receiptOf(body);
+    return {
+      inserted: body.inserted,
+      deleted: body.deleted,
+      operations: body.operations,
+      timing: body.timing,
+      ...(receipt ? { receipt } : {}),
+    };
   } catch {
     return null;
   }
@@ -752,18 +780,30 @@ export async function shaclRaw(
 
 export type UploadProgress = { loaded: number; total: number };
 
-/** Multipart upload to /{ds}/upload with progress reporting (XHR, since fetch has no upload progress). */
+/** Body of a successful upload. */
+export type UploadResult = {
+  count?: number;
+  tripleCount?: number;
+  quadCount?: number;
+  /** The commit the upload produced (absent on servers that predate commits). */
+  receipt?: Receipt;
+};
+
+/**
+ * Multipart upload to /{ds}/upload with progress reporting (XHR, since fetch has no upload
+ * progress). Asks for a commit receipt (`receipt=true`).
+ */
 export function upload(
   ds: string,
   files: File[],
   opts: { graph?: string; onProgress?: (p: UploadProgress) => void; signal?: AbortSignal } = {},
-): Promise<unknown> {
+): Promise<UploadResult | string> {
   return new Promise((resolve, reject) => {
     const form = new FormData();
     if (opts.graph) form.append('graph', opts.graph);
     for (const f of files) form.append('file', f, f.name);
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/${enc(ds)}/upload`);
+    xhr.open('POST', `/${enc(ds)}/upload?receipt=true`);
     xhr.setRequestHeader('Accept', 'application/json');
     const csrf = authHooks.csrf();
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
@@ -778,7 +818,11 @@ export function upload(
       } catch {
         /* text body */
       }
-      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (!body || typeof body !== 'object') return resolve(String(body ?? ''));
+        const receipt = receiptOf(body as Record<string, unknown>);
+        return resolve({ ...(body as UploadResult), receipt });
+      }
       const b = body as { error?: string; detail?: string; line?: number; column?: number };
       reject(
         new ApiError(xhr.status, b?.error ?? `Upload failed (${xhr.status})`, {
@@ -926,3 +970,149 @@ export type DatasetOrigin = {
 /** Copy one snapshot of `ds` into the new persistent dataset `name` (a task). */
 export const cloneDataset = (ds: string, name: string, inferences: 'copy' | 'drop' = 'copy') =>
   json<Task>(`/$/datasets/${enc(ds)}/clone`, jsonBody({ name, inferences }));
+
+// --- commits ----------------------------------------------------------------------
+
+export type CommitKind =
+  | 'create'
+  | 'baseline'
+  | 'update'
+  | 'gsp-put'
+  | 'gsp-post'
+  | 'gsp-delete'
+  | 'upload'
+  | 'load'
+  | 'reason'
+  | 'reason-clear'
+  | 'transaction'
+  | 'unknown';
+
+/** One commit: the state after a write that changed data. */
+export type Commit = {
+  seq: number;
+  parent: number | null;
+  /** `commit:42` */
+  ref: string;
+  /** RFC 3339 UTC with milliseconds, never decreasing along the sequence. */
+  timestamp: string;
+  kind: CommitKind;
+  /** Net change relative to the parent. */
+  inserted: number;
+  deleted: number;
+  /** Dataset size after the commit. */
+  quads: number;
+  /** Index generation the commit was made in. */
+  generation: string;
+  /** Made by rebuilding the index. */
+  bulk: boolean;
+  /** false: a bulk commit that also deleted, whose counts may include a quad twice. */
+  exact: boolean;
+  /** Rebuilt from a write-ahead log record without commit metadata. */
+  reconstructed?: boolean;
+};
+
+/** What a write produced: the new commit, or the unchanged head when nothing changed. */
+export type Receipt = {
+  dataset: string;
+  datasetId: string;
+  committed: boolean;
+  commit: Commit;
+};
+
+/** The receipt members of a write response body, if it has them. */
+export function receiptOf(body: Record<string, unknown> | null | undefined): Receipt | undefined {
+  if (!body || typeof body.committed !== 'boolean') return undefined;
+  const c = body.commit as Commit | undefined;
+  if (!c || typeof c !== 'object' || typeof c.seq !== 'number') return undefined;
+  return {
+    dataset: String(body.dataset ?? ''),
+    datasetId: String(body.datasetId ?? ''),
+    committed: body.committed,
+    commit: c,
+  };
+}
+
+/** `GET /$/commits/{ds}`: a page of the commit catalog, newest first. */
+export type CommitPage = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  /** Oldest commit whose metadata is still available. */
+  firstRetained: number;
+  /** false while the catalog lags the write-ahead log after a write error. */
+  complete: boolean;
+  commits: Commit[];
+  /** URL of the next (older) page, or null. */
+  next: string | null;
+};
+
+/** Newest commits first; `before` pages backwards from a sequence number. */
+export function commits(
+  ds: string,
+  opts: { before?: number; limit?: number; signal?: AbortSignal } = {},
+): Promise<CommitPage> {
+  const p = new URLSearchParams();
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.before != null) p.set('before', String(opts.before));
+  const qs = p.toString();
+  return json<CommitPage>(`/$/commits/${enc(ds)}${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
+}
+
+// --- full-text search --------------------------------------------------------------
+
+export type TextState = 'ready' | 'stale' | 'failed';
+
+export type TextConfig = {
+  /** Default "all". */
+  predicates?: 'all' | string[];
+  graphs?: { include?: 'all' | string[]; exclude?: string[] };
+  maxTextBytes?: number;
+  maxHits?: number;
+};
+
+export type TextStatus = {
+  enabled: true;
+  state: TextState;
+  docs: number;
+  /** The commit the index reflects; ready when equal to `storeSeq`. */
+  seq: number;
+  storeSeq: number;
+  epoch: number;
+  diskBytes: number;
+  segments: number;
+  config: TextConfig;
+  formatVersion: number;
+  lastRebuild?: { at: string; ms: number; docs: number };
+  message?: string;
+};
+
+/**
+ * `GET /$/text/{ds}`: the index status, or null when full-text search is disabled for
+ * the dataset. Throws an ApiError with status 501 on servers built without it.
+ */
+export async function textStatus(ds: string, signal?: AbortSignal): Promise<TextStatus | null> {
+  const body = await json<TextStatus | { enabled: false }>(`/$/text/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body && body.enabled ? body : null;
+}
+
+/** Enable or reconfigure full-text search; the index is built by the returned task. */
+export const enableText = (ds: string, config: TextConfig = {}) =>
+  json<Task>(`/$/text/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+/** Disable full-text search and delete the index. */
+export const disableText = (ds: string) =>
+  json<unknown>(`/$/text/${enc(ds)}`, { method: 'DELETE' });
+
+/** Rebuild the index from the current data (`409` while a rebuild runs). */
+export const rebuildText = (ds: string) =>
+  json<Task>(`/$/text/${enc(ds)}/rebuild`, { method: 'POST' });

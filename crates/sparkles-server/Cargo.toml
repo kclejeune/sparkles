@@ -34,6 +34,7 @@ regex.workspace = true
 mime_guess = "2"
 form_urlencoded = "1"
 futures-util = { version = "0.3", default-features = false }
+httpdate = "1"
 base64 = "0.23"
 mimalloc = { version = "0.1.52", optional = true }
 libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
@@ -41,6 +42,14 @@ rayon.workspace = true
 ipnet = "2"
 arc-swap.workspace = true
 chrono.workspace = true
+quick_cache = "0.7.0"
+http-body = "1"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"], optional = true }
+opentelemetry-appender-tracing = { version = "0.33", default-features = false, optional = true }
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+uuid = { workspace = true, optional = true }
 # authentication (feature `auth`)
 sha2 = { workspace = true, optional = true }
 subtle = { version = "2.6", optional = true }
@@ -57,11 +66,12 @@ libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "testing"] }
 # signs the ID tokens of the mock OIDC provider in tests (already in the tree via rustls)
 aws-lc-rs = "1"
 
 [features]
-default = ["reasoning", "shacl", "mimalloc", "text", "auth"]
+default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -83,3 +93,13 @@ auth = [
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# OpenTelemetry: OTLP traces, metrics and logs (`serve --otel`, `OTEL_*`; off at run time
+# unless enabled)
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry-appender-tracing",
+  "dep:tracing-opentelemetry",
+  "dep:uuid",
+]

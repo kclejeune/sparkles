@@ -478,9 +478,9 @@ fn load(
         s.base = Some(url.to_string());
         s
     } else {
-        let resp = reqwest::blocking::Client::new()
+        let resp = crate::outbound::apply(reqwest::blocking::Client::new()
             .get(url)
-            .header("Accept", "text/turtle, application/n-triples, application/n-quads, application/trig, application/rdf+xml, application/ld+json;q=0.9")
+            .header("Accept", "text/turtle, application/n-triples, application/n-quads, application/trig, application/rdf+xml, application/ld+json;q=0.9"))
             .send()
             .map_err(|e| Error::invalid(format!("LOAD {url}: {e}")))?;
         let ct = resp

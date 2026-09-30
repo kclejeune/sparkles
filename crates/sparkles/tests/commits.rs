@@ -356,3 +356,29 @@ fn library_receipts() {
     assert_eq!(json["commit"]["kind"], "transaction");
     assert_eq!(json["datasetId"], ds.dataset_id().to_string());
 }
+
+#[test]
+fn prefix_changes_persist_without_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.add_prefixes([("ex".to_string(), "http://ex.org/".to_string())].into())
+            .unwrap();
+        // compaction writes the prefixes into the new generation too
+        s.compact().unwrap();
+        s.set_prefix("zz", "http://zz.example/").unwrap();
+        let head = s.head_commit().seq;
+        assert!(s.remove_prefix("ex").unwrap());
+        assert!(!s.remove_prefix("ex").unwrap());
+        // metadata only
+        assert_eq!(s.head_commit().seq, head);
+    }
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let p = s.prefixes();
+    assert_eq!(p.get("zz").map(String::as_str), Some("http://zz.example/"));
+    assert!(
+        !p.contains_key("ex"),
+        "a removed prefix stays removed: {p:?}"
+    );
+}

@@ -51,9 +51,9 @@ generates one (`{boot:08x}-{seq:012x}`, unique per process and increasing). The 
 `sparkles::access` (`--no-access-log` turns it off; `/ui/*`, `/$/ping`, `/$/ready` and
 `/$/metrics` are logged at DEBUG). Fields: `dataset` (or `$none`), `operation` (`query`,
 `update`, `gsp`, `upload`, `shacl`, `explain`, `admin`, `other`), `status`, `outcome`
-(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `denied`), with auth
-the `principal` (`user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`, `anonymous`; never a
-credential), `auth` (`none`, `basic`, `bearer`, `session`, `proxy`) and, for a failed
+(`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `rate_limited`, `denied`),
+with auth the `principal` (`user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`, `anonymous`; never
+a credential), `auth` (`none`, `basic`, `bearer`, `session`, `proxy`) and, for a failed
 login, `auth_error`, and where known `rows`,
 `parse_ms`, `plan_ms`, `exec_ms`, `serialize_ms`, `total_ms`, `response_bytes` and
 `mem_peak_bytes`. A request whose client disconnects is logged with `status=499` and
@@ -86,9 +86,13 @@ JSON object per line.
 Label values are bounded: `dataset` is an existing dataset name (at most
 `--metrics-max-datasets`, default 100; the others share `$other`) or `$none` for requests
 that name no existing dataset. A (dataset, operation) pair appears after its first request,
-then with all seven outcomes (`denied`: refused by the auth layer). Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
+then with all eight outcomes (`denied`: refused by the auth layer). Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI assets
 are not counted. Deleting a dataset removes its series. Each dataset has its own block and
 result cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
+
+With rate limits configured, `sparkles_rate_limited_total{dataset,class}` (counter)
+counts refused requests per limit class, and `outcome="rate_limited"` appears in
+`sparkles_requests_total`.
 
 ```ts
 type MetricsSnapshot = {
@@ -109,11 +113,172 @@ type MetricsSnapshot = {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; resultRows: number;
     budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
+    rateLimited: Record<"auth" | "query" | "update" | "admin", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
   }[];
 };
 ```
+
+### OpenTelemetry
+
+`sparkles serve` exports traces, metrics and (optionally) logs over OTLP. It is off by
+default: nothing is exported and no connection is opened unless `--otel` is given or the
+environment asks for it (`OTEL_EXPORTER_OTLP_ENDPOINT` or a signal-specific endpoint, or
+`OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER=otlp`).
+`OTEL_SDK_DISABLED=true` turns it off again. Builds without the `otel` cargo feature (on by
+default) have none of it.
+
+| Variable | Meaning |
+|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | collector address (default `http://localhost:4318`, or `:4317` for gRPC) |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `…_{TRACES,METRICS,LOGS}_PROTOCOL` | `http/protobuf` (default) or `grpc` (plain-text gRPC; use `http/protobuf` for an `https://` collector) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` (and per signal) | as specified by OpenTelemetry (no compression support is built in) |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | resource; `service.name` defaults to `sparkles` |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | default `parentbased_always_on` |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp` (the default once enabled) or `none` |
+| `OTEL_LOGS_EXPORTER` | `otlp` or `none` (the default: logs are opt-in, see below) |
+| `OTEL_METRIC_EXPORT_INTERVAL` | milliseconds between metric exports (default 60000) |
+| `OTEL_BSP_*` | batch span processor settings |
+
+Flags of `serve`: `--otel` (enable), `--otel-logs` (export log events too),
+`--otel-query-text` (record query and update text, which may hold data, in
+`db.query.text`, cut to 2048 characters, and plan operator descriptions), and
+`--otel-plan-spans` (one span per executed plan operator). Spans and log records are sent
+in batches; on SIGTERM / SIGINT the server finishes its requests, then flushes the
+exporters for at most 5 seconds. The resource carries `service.name`, `service.version`,
+`service.instance.id` (a UUID per process), `host.name` and `process.pid`.
+
+**Traces.** Each request is a server span named after its route (`GET /{ds}/sparql`),
+continuing the trace of an incoming W3C `traceparent` / `tracestate`. Attributes:
+`http.request.method`, `http.route`, `http.response.status_code`, `url.scheme`,
+`url.path` (never the query string), `server.address` / `server.port` (from `Host`),
+`client.address` (the peer), `user_agent.original`, `sparkles.request_id`,
+`db.system.name` = `sparkles`, `db.namespace` (the dataset), `db.operation.name` (the
+operation of the access log: `query`, `update`, `gsp`, …), `sparkles.sparql.kind`
+(`SELECT`, `ASK`, `CONSTRUCT`, `DESCRIBE`), `sparkles.outcome`,
+`db.response.returned_rows`, `http.response.body.size`, `sparkles.memory.peak_bytes`,
+and for writes `sparkles.commit.seq`. 5xx responses set the span status to error with
+`error.type`. Children:
+
+* `sparql.parse`, `sparql.plan`, `sparql.execute` (with `db.response.returned_rows`) and
+  `sparql.serialize` for queries; `sparql.parse` and `sparql.execute` for updates. They
+  are synthesized after the request from the recorded timings, so the executor itself is
+  not instrumented.
+* With `--otel-plan-spans`, the executed operator tree under `sparql.execute`: one span
+  per operator (at most 256) with `sparkles.operator`, `sparkles.rows`,
+  `sparkles.rows.estimated`, `sparkles.cost.estimated` and `sparkles.cached`. Durations
+  are the recorded ones; children are laid out one after another from their parent's
+  start, so their offsets are approximate.
+* `commit` (`seq`, `kind`, `inserted`, `deleted`) for every commit, `sparql.service` (a
+  client span) for each SERVICE call, and `shacl.validate`.
+* Refusals by a rate limit add a `rate_limited` event and `sparkles.rate_limit.class`.
+
+Background tasks (compaction, backups, clones, reasoning, full-text rebuilds) are root
+spans `task {kind}` linked to the request that started them. SERVICE and `LOAD <url>`
+requests carry `traceparent` (and `tracestate`), so a federated endpoint continues the
+trace. A sampled request's response carries `traceresponse: 00-{trace-id}-{span-id}-01`
+(W3C Trace Context Level 2, exposed through CORS), and its log lines carry `trace_id`
+and `span_id` in the request span.
+
+**Metrics.** `http.server.request.duration` (histogram, seconds, the buckets of
+`sparkles_request_duration_seconds`) with `http.request.method`, `http.route`,
+`http.response.status_code`, `url.scheme`, `db.namespace` (the capped `dataset` label),
+`db.operation.name` and, for 5xx, `error.type`. The Prometheus registry is exported as
+observable instruments read at collection time, so nothing is counted twice and
+`/$/metrics` is unchanged: `sparkles.requests` (`dataset`, `operation`, `outcome`),
+`sparkles.response.size`, `sparkles.requests.active`, `sparkles.result.rows`,
+`sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
+`sparkles.delta.quads`, `sparkles.wal.size`, `sparkles.disk.size`,
+`sparkles.block_cache.{size,capacity,hits,misses}`,
+`sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.ready`,
+`process.uptime` and `process.memory.usage`.
+
+**Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
+`RUST_LOG` (the access log included) is also exported as an OTLP log record with the
+trace and span id of its request.
+
+### Rate limiting
+
+Off by default. `sparkles serve --rate-limit SPEC` (repeatable) and/or
+`--rate-limit-config FILE` limit each request class per client:
+
+| Class | Requests |
+|-------|----------|
+| `auth` | every path under `/$/auth/` (login, token minting, device flow, OIDC callback), matched or not |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
+| `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
+
+`/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
+
+`SPEC` is `CLASS[@DATASET]=LIMIT`, where `LIMIT` is `off` or a comma-separated list of
+
+* `N/s`, `N/min`, `N/h` or `N/d`: the sustained rate per client;
+* `burst=N`: requests a client may make at once after being idle (default: the rate's `N`);
+* `concurrency=N`: requests of the class in flight server-wide;
+* `client-concurrency=N`: requests in flight per client;
+* `failure-cost=N`: what a `401` or `403` response costs, in requests (default 1), so that
+  failed logins exhaust the budget faster.
+
+`CLASS@DATASET=…` replaces the class limit for requests to that dataset (with its own
+counters); `CLASS@DATASET=off` exempts the dataset. Examples:
+
+```sh
+sparkles serve --rate-limit auth=10/min,burst=5,failure-cost=3 \
+               --rate-limit query=100/s,burst=200,client-concurrency=8,concurrency=64 \
+               --rate-limit update=10/s --rate-limit query@public=5/s
+```
+
+`auth=10/min,burst=5` (with `failure-cost=3`) is a reasonable strict default for
+authentication endpoints. The configuration file is JSON; the flags apply on top of it,
+and `SIGHUP` re-reads it (client counters start afresh; a bad file keeps the running
+configuration):
+
+```json
+{
+  "classes": {
+    "auth":  { "rate": "10/min", "burst": 5, "failureCost": 3 },
+    "query": { "rate": "100/s", "burst": 200, "concurrency": 64, "clientConcurrency": 8 }
+  },
+  "datasets": { "public": { "query": { "rate": "5/s" } } },
+  "trustedProxies": ["127.0.0.1", "::1"],
+  "maxKeys": 100000
+}
+```
+
+**Clients.** A client is its peer address (an IPv6 client by its /64). Behind a reverse
+proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`): for
+requests from a trusted address the client is the rightmost untrusted hop of `Forwarded`
+(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. At most
+`maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of new
+addresses evicts other rarely seen clients, never one with requests in flight. Clients
+whose bucket has refilled are dropped every minute.
+
+**Algorithm.** GCRA (the virtual-scheduling form of a token bucket): a client may send
+`burst` requests at once, then one every `period / N`.
+
+**Responses.** Over the rate: `429 Too Many Requests` with `Retry-After` (whole seconds).
+Over a concurrency cap: `503 Service Unavailable` with `Retry-After: 1`, immediately;
+requests are never queued, so a saturated server sheds load instead of holding waiting
+requests. A request holds its concurrency slot until its response body has been sent
+(streamed Graph Store GETs included). The body uses the error format:
+
+```json
+{ "error": "too many query requests: retry in 2 s",
+  "limitClass": "query", "reason": "rate", "retryAfterSeconds": 2 }
+```
+
+`reason` is `rate`, `concurrency` or `client-concurrency`. Responses of a class with a
+rate carry the headers of draft-ietf-httpapi-ratelimit-headers-11:
+`RateLimit-Policy: "query";q=100;w=1` (the configured rate: `q` requests per `w`
+seconds; the policy name is `CLASS` or `CLASS@DATASET`) and `RateLimit: "query";r=57;t=1`
+(`r` requests available now, `t` seconds until the bucket is full). CORS exposes
+`Retry-After`, `RateLimit` and `RateLimit-Policy`.
+
+**Observability.** Refused requests are logged with `outcome=rate_limited` and counted
+in `sparkles_requests_total{outcome="rate_limited"}` and
+`sparkles_rate_limited_total{dataset,class}`.
 
 ## Datasets (admin)
 
@@ -137,7 +302,10 @@ type MetricsSnapshot = {
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
-| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — prefixes seen during loading plus well-known ones. |
+| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
+| GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
+| POST/PUT | `/{ds}/prefixes`           | Bind `prefix` to `uri` (query, form or JSON body `{prefix, uri}`); `400` for an invalid name or IRI. Prefixes are metadata: no commit is made. |
+| DELETE | `/{ds}/prefixes?prefix=p`    | Remove a binding (`204`, or `404` if unbound). |
 
 ```ts
 type DatasetInfo = {
@@ -368,7 +536,8 @@ load, reasoning) gets the next `seq`. A write with no net effect, such as insert
 quad that is already present, creates no commit. Commit 0 is the root. Compaction keeps
 the head. Ids survive restarts and are durable exactly when the data is.
 
-**Headers.** Every successful query, update, Graph Store and explain response carries:
+**Headers.** Every successful query, update, Graph Store, explain and SHACL validation
+response carries:
 
 ```
 Sparkles-Commit: 42                 (the commit a read saw, or a write produced)
@@ -410,6 +579,80 @@ type Commit = {
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
 lists commits without taking the database lock, so it works next to a running server.
 
+## Point-in-time reads and snapshots
+
+Every commit since the dataset's last compaction or bulk commit can be read, at no extra
+cost: its state is the current index generation plus a prefix of its write-ahead log.
+Older commits stay readable while a **named snapshot** or the **retention window** keeps
+the generation that holds them (compaction and bulk commits then keep that generation
+instead of deleting it). Only persistent datasets have history.
+
+**Selector** (`at`, in the query string or a form body) on `/{ds}/sparql`, `/{ds}/query`,
+`/{ds}?query=`, `/{ds}/explain` and Graph Store `GET`/`HEAD`:
+
+| `at` | State |
+|---|---|
+| `head` (or absent) | the live state |
+| `42`, `commit:42` | right after commit 42 |
+| `time:2026-09-30T14:03:11.482Z` | the last commit at or before that instant (any RFC 3339 offset; a `+` that arrives as a space is accepted) |
+| `snapshot:NAME` | the commit a named snapshot pins |
+
+Responses add `Sparkles-At` (the selector, canonical form) and `Sparkles-Head`; for a
+past state also `Memento-Datetime` (the commit's time) and `Link: <…>; rel="original"`
+(RFC 7089). `Sparkles-Commit` is the commit read. Freshness of inferences
+(`Sparkles-Inferences`) is reported for the live state only. `text:query` works at the
+head only (`501` at a past commit); vector search works at any commit. Writes with `at`
+(even `at=head`) are refused with `400` and `code: "at-on-write"`.
+
+Errors (with a `code`): `400 invalid-at`; `404` for a commit beyond the head, an unknown
+snapshot, or a time before history; `410 history-gone` for a commit whose data is no
+longer kept, with the readable ranges:
+
+```json
+{ "error": "commit 12 is no longer reconstructable; the oldest reconstructable commit is 40",
+  "code": "history-gone", "commit": 12, "head": 57, "oldestReconstructable": 40,
+  "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
+```
+
+`501 history-unsupported` for in-memory datasets. Materializing a past state is bounded by
+`--history-cache-mb` (default 1024, `507` beyond it) and the request timeout; results are
+cached, one materialization at a time.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
+| POST | `/$/snapshots/{ds}` | Pin `{ name, at?: selector (default head), note? }` (JSON, form or query). `201` + `Location`; `200` if the name already pins that commit; `409` if it pins another one, or with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8); `410` if the commit is no longer readable |
+| GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
+| DELETE | `/$/snapshots/{ds}/{name}` | `204`; generations only it kept are removed |
+| GET | `/$/history/{ds}` | `HistoryStatus` |
+| PUT | `/$/history/{ds}` | Set the retention window `{ keepCommits?: number \| null, keepAge?: "7d" \| seconds \| null }` and return `HistoryStatus` |
+
+```ts
+type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
+  created: string; note: string | null; generation: string | null; reconstructable: boolean };
+type HistoryStatus = { dataset: string; datasetId: string; head: number;
+  oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
+  bytes: number;   // disk of kept non-current generations
+  generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
+                 current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
+  retention: { keepCommits: number | null; keepAge: string | null };
+  snapshots: number;
+  cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
+```
+
+A pin at the head costs nothing (the next generation starts at that commit); a pin inside
+a generation keeps the whole generation, so its other commits stay readable too. Removing
+a generation renames it to `gen-NNNN.deleting` first, so an interrupted removal is
+finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable`,
+`reconstructable`, and per commit `reconstructable` and `snapshots`.
+
+CLI: `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT]`,
+`snapshot list|history --loc DB [--format json]`, `snapshot delete --loc DB NAME`,
+`snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--off]`, and
+`sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL`. These open the
+database, so stop a server that holds it or use the HTTP API. In Rust:
+`Store::snapshot_at`, `create_snapshot`, `set_retention`, `history`.
+
 ## Full-text search
 
 Datasets can index their string and language-tagged literals for ranked (BM25) search,
@@ -441,6 +684,11 @@ SELECT ?s ?score ?label WHERE {
   the text of its own snapshot. If an index is behind (a failed update, a rebuild in
   progress), text queries return `503` until it is rebuilt. They never return stale
   results.
+* **Durability**: index commits are not fsynced; the write-ahead log is the durable
+  record. The index is checkpointed (synced) about once a second while writes continue,
+  before compaction and on close. After a crash, an index with unsynced changes
+  (`text.dirty` next to it) is checksum-verified and caught up from the WAL; it is
+  rebuilt only if it is damaged or older than the WAL.
 * **Errors**: `400` for malformed calls, unparseable query strings, predicates that
   are not indexed, and datasets without an index. `501` if the server was built without
   the `text` feature.
@@ -506,8 +754,12 @@ as written; one that does not parse is stored but never matched.
 * **Implementation:** vectors are packed per predicate and dimension on first use and
   cached per index generation. Every query overlays its snapshot's uncommitted inserts
   and deletes, so results always match its data. A process-wide budget (default 4 GiB)
-  caps the packed vectors; beyond it a search returns `507`. A variable query vector
-  gives `501`.
+  caps the packed vectors (`sparkles serve --vector-memory-mb`, default 4096); beyond it
+  a search returns `507`. A variable query vector gives `501`.
+* **Status:** `GET /$/vector/{ds}` returns
+  `{ budgetBytes, usedBytes, generation, predicates: [{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }] }`
+  for the predicates packed so far in the current generation (packing happens on a
+  predicate's first search; `vectors` counts a vector once per graph it is in).
 
 ## Reasoning status and diagnostics
 
@@ -701,11 +953,13 @@ type PlanNode = {
 
 ## Errors
 
-Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number }`
+Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`
+(`requestId` is the response's `X-Request-Id`, for finding the request in the logs)
 with `400` for parse errors, `401`/`403` for authentication and permissions, `404` unknown
-dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `503` for a
-cancelled query or when a write-ahead log write failed (writes are refused until restart;
-reads continue), `500` otherwise.
+dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `429` over a rate
+limit, `503` for a cancelled query, over a concurrency limit (see
+[Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
+until restart; reads continue), `500` otherwise.
 
 ### Budgets
 
@@ -722,9 +976,21 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query response. Graph Store GET is streamed from one snapshot in 64 KiB chunks, so it
-  needs no budget and suits whole-dataset exports; an error after the first byte aborts
-  the transfer, so the client sees a truncated response rather than a status code.
+  query response. Graph Store GET has no such budget and suits whole-dataset exports.
+
+**Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
+of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
+gets its status code. A larger body is streamed in 64 KiB chunks as it is serialized, so
+server memory stays flat; an error after that point (e.g. the budget exceeded at 1.2 GiB)
+aborts the transfer, and the client sees a truncated response instead of a status code.
+A query result whose smallest encoding already exceeds the budget is refused with `507`
+before anything is sent. A client that disconnects stops the serialization.
+
+**Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
+written to a temporary file as they arrive rather than held in memory. A large PUT
+(estimated above the bulk threshold) replaces its graphs in one index rebuild that parses
+the body as a stream; like every write it is atomic, so a parse error leaves the data as
+it was.
 * `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
 
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
@@ -807,10 +1073,10 @@ the permission is `403` before any connection or file is opened, even under `SIL
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout` | | any caller; listings show readable datasets only |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild` | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/data` (GET, HEAD) | | `read` |
-| `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods) | | `write` |
+| `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | by operation: `update=` or `application/sparql-update` → `write`; queries and GET → `read`; other writes → `write` |
 | `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |
 | `/$/auth/tokens?owner=…` | DELETE | `server-admin` |
@@ -1011,6 +1277,10 @@ FILE`, `sparkles auth login|logout|status`, `sparkles auth token create|list|rev
 `query`, `update` and `load` accept `--server URL --dataset NAME` (or `SPARKLES_SERVER`)
 and use the stored token (`$XDG_CONFIG_HOME/sparkles/credentials.toml`, 0600) or
 `SPARKLES_TOKEN`.
+
+**Rate limits** (`--rate-limit`) count a signed-in principal as one client across
+addresses; anonymous callers and the `auth` class (logins, CLI grants) are counted per
+client address.
 
 **Metrics.** `sparkles_auth_failures_total{scheme,reason}`,
 `sparkles_auth_denied_total{kind}` (`unauthenticated`, `forbidden`, `hidden`,

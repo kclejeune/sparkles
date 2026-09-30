@@ -17,6 +17,25 @@ let
     types
     ;
 
+  json = pkgs.formats.json { };
+
+  # behind the bundled nginx, the client address comes from X-Forwarded-For
+  rateLimits =
+    if cfg.rateLimits == null then
+      null
+    else
+      cfg.rateLimits
+      // lib.optionalAttrs cfg.nginx.enable {
+        trustedProxies = lib.unique (
+          (cfg.rateLimits.trustedProxies or [ ])
+          ++ [
+            "127.0.0.1"
+            "::1"
+          ]
+        );
+      };
+  rateLimitsFile = "/etc/sparkles/rate-limits.json";
+
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
   datasetArgs = lib.concatLists (
@@ -63,6 +82,14 @@ let
   ]
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
+  ++ lib.optional cfg.otel.enable "--otel"
+  ++ lib.optional cfg.otel.logs "--otel-logs"
+  ++ lib.optional cfg.otel.queryText "--otel-query-text"
+  ++ lib.optional cfg.otel.planSpans "--otel-plan-spans"
+  ++ lib.optionals (rateLimits != null) [
+    "--rate-limit-config"
+    rateLimitsFile
+  ]
   ++ datasetArgs
   ++ cfg.extraArgs;
 
@@ -246,6 +273,64 @@ in
       description = "`RUST_LOG` filter for the service.";
     };
 
+    otel = {
+      enable = mkEnableOption "OpenTelemetry export of traces and metrics over OTLP";
+
+      endpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "http://127.0.0.1:4318";
+        description = "Collector address (`OTEL_EXPORTER_OTLP_ENDPOINT`); `null`: the OTLP default.";
+      };
+
+      protocol = mkOption {
+        type = types.enum [
+          "http/protobuf"
+          "grpc"
+        ];
+        default = "http/protobuf";
+        description = "OTLP transport (`OTEL_EXPORTER_OTLP_PROTOCOL`).";
+      };
+
+      logs = mkEnableOption "export of log events over OTLP";
+
+      queryText = mkEnableOption "query text and plan descriptions in spans (they may hold data)";
+
+      planSpans = mkEnableOption "one span per executed plan operator";
+
+      environment = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        example = {
+          OTEL_TRACES_SAMPLER = "parentbased_traceidratio";
+          OTEL_TRACES_SAMPLER_ARG = "0.1";
+          OTEL_RESOURCE_ATTRIBUTES = "deployment.environment.name=prod";
+        };
+        description = "Further `OTEL_*` variables for the service.";
+      };
+    };
+
+    rateLimits = mkOption {
+      type = types.nullOr json.type;
+      default = null;
+      example = lib.literalExpression ''
+        {
+          classes = {
+            auth = { rate = "10/min"; burst = 5; failureCost = 3; };
+            query = { rate = "100/s"; burst = 200; concurrency = 64; clientConcurrency = 8; };
+            update = { rate = "10/s"; };
+          };
+        }
+      '';
+      description = ''
+        Rate and concurrency limits per request class (`auth`, `query`, `update`,
+        `admin`), written to ${rateLimitsFile} and passed as `--rate-limit-config`
+        (see the Rate limiting section of `docs/API.md`). Changing it reloads the service
+        (SIGHUP) instead of restarting it. With `nginx.enable`, the loopback addresses
+        are added to `trustedProxies`. `null` (the default): no limits.
+      '';
+    };
+
     extraArgs = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -328,6 +413,10 @@ in
 
     environment.systemPackages = lib.optional cfg.installCli cfg.package;
 
+    environment.etc."sparkles/rate-limits.json" = mkIf (rateLimits != null) {
+      source = json.generate "sparkles-rate-limits.json" rateLimits;
+    };
+
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
 
     systemd.tmpfiles.settings."10-sparkles" = lib.listToAttrs (
@@ -346,8 +435,24 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
-      environment.RUST_LOG = cfg.logLevel;
+      environment = {
+        RUST_LOG = cfg.logLevel;
+      }
+      // lib.optionalAttrs cfg.otel.enable (
+        {
+          OTEL_EXPORTER_OTLP_PROTOCOL = cfg.otel.protocol;
+        }
+        // lib.optionalAttrs (cfg.otel.endpoint != null) {
+          OTEL_EXPORTER_OTLP_ENDPOINT = cfg.otel.endpoint;
+        }
+        // cfg.otel.environment
+      );
+      reloadTriggers = lib.optional (
+        rateLimits != null
+      ) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
+        # re-reads the rate-limit configuration (without one, SIGHUP would stop it)
+        ExecReload = mkIf (rateLimits != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
         # re-reads the auth configuration
         ExecReload = mkIf (cfg.auth.configFile != null) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";

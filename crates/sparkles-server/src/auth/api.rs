@@ -225,3 +225,26 @@ pub async fn whoami(
     );
     r
 }
+
+/// Rate-limit key: a signed-in principal is limited as itself (across addresses);
+/// anonymous callers, the open local mode, and the `auth` class (logins) are limited by
+/// client address.
+pub struct PrincipalKeyer;
+
+impl crate::ratelimit::ClientKeyer for PrincipalKeyer {
+    fn key(
+        &self,
+        class: crate::ratelimit::Class,
+        req: &axum::extract::Request,
+        trusted: &crate::ratelimit::TrustedProxies,
+    ) -> crate::ratelimit::ClientKey {
+        match req.extensions().get::<Principal>() {
+            Some(p)
+                if class != crate::ratelimit::Class::Auth && !p.is_local() && !p.is_anonymous() =>
+            {
+                crate::ratelimit::ClientKey::principal(&p.id())
+            }
+            _ => crate::ratelimit::PeerKeyer.key(class, req, trusted),
+        }
+    }
+}

@@ -302,3 +302,20 @@ fn search_is_exact_on_larger_data() {
         assert_eq!(fast, slow, "{metric}");
     }
 }
+
+#[test]
+fn searches_count_toward_the_memory_budget() {
+    let s = store(StoreOptions::default());
+    let opts = QueryOptions {
+        max_memory_bytes: Some(8),
+        ..Default::default()
+    };
+    let q = format!("{P}SELECT ?s {{ ?s spk:vectorSearch (ex:emb ex:a 3) }}");
+    let Err(e) = query(s.snapshot(), &q, &opts) else {
+        panic!("over budget");
+    };
+    assert!(
+        matches!(e, sparkles::Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::Memory),
+        "{e}"
+    );
+}

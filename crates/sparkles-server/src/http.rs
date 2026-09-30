@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod history;
 mod schema;
+mod stream;
 
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
@@ -36,9 +38,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             header::HeaderName::from_static(SPARKLES_DATASET_ID),
             crate::obs::X_REQUEST_ID.clone(),
             header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+            header::HeaderName::from_static(history::SPARKLES_AT),
+            header::HeaderName::from_static(history::SPARKLES_HEAD),
+            header::HeaderName::from_static("memento-datetime"),
+            header::LINK,
+            header::RETRY_AFTER,
+            header::HeaderName::from_static("ratelimit"),
+            header::HeaderName::from_static("ratelimit-policy"),
+            header::HeaderName::from_static("traceresponse"),
         ],
     );
-    Router::new()
+    let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui/", get(crate::ui::serve_index))
@@ -83,26 +93,50 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/upload", post(upload))
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
-        .layer(DefaultBodyLimit::max(8 << 30))
-        .layer(tower_http::compression::CompressionLayer::new())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::auth::middleware,
-        ))
-        .layer(cors)
-        .layer(
-            tower_http::trace::TraceLayer::new_for_http()
-                .make_span_with(crate::obs::MakeSpan)
-                .on_request(())
-                // the access log is written by `obs::observe`
-                .on_response(()),
+        .route("/$/vector/{ds}", get(vector_status))
+        .route("/{ds}/prefixes", any(dataset_prefixes))
+        .route(
+            "/$/snapshots/{ds}",
+            get(history::list_snapshots).post(history::create_snapshot),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::obs::observe,
-        ))
-        .layer(axum::middleware::from_fn(crate::alloc::track))
-        .with_state(state)
+        .route(
+            "/$/snapshots/{ds}/{name}",
+            get(history::get_snapshot).delete(history::delete_snapshot),
+        )
+        .route(
+            "/$/history/{ds}",
+            get(history::get_history).put(history::put_history),
+        )
+        .layer(axum::middleware::from_fn(error_request_id))
+        .layer(DefaultBodyLimit::max(8 << 30))
+        .layer(tower_http::compression::CompressionLayer::new());
+    // inside `observe` (limited requests are logged and counted) and CORS (browsers
+    // can read the 429); inside the auth layer, which puts the principal in the request
+    let app = match &state.rate_limit {
+        Some(rl) => app.layer(axum::middleware::from_fn_with_state(
+            rl.clone(),
+            crate::ratelimit::limit,
+        )),
+        None => app,
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::middleware,
+    ))
+    .layer(cors)
+    .layer(
+        tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(crate::obs::MakeSpan)
+            .on_request(())
+            // the access log is written by `obs::observe`
+            .on_response(()),
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::obs::observe,
+    ))
+    .layer(axum::middleware::from_fn(crate::alloc::track))
+    .with_state(state)
 }
 
 // ------------------------------------------------------------------ errors ------
@@ -124,12 +158,45 @@ impl IntoResponse for ApiError {
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
         };
-        RequestReport {
+        let mut resp = RequestReport {
             outcome,
             budget,
             ..Default::default()
         }
-        .attach((self.0, Json(self.1)).into_response())
+        .attach((self.0, Json(self.1.clone())).into_response());
+        resp.extensions_mut().insert(ErrorJson(self.1));
+        resp
+    }
+}
+
+/// The JSON body of an [`ApiError`] response, for [`error_request_id`].
+#[derive(Clone)]
+pub(crate) struct ErrorJson(pub(crate) J);
+
+/// Add the request's id to JSON error bodies (`requestId`), so an error shown by a
+/// client can be found in the logs. Runs inside the layer that assigns the id.
+async fn error_request_id(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let id = req
+        .headers()
+        .get(&crate::obs::X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut resp = next.run(req).await;
+    add_request_id(&mut resp, id);
+    resp
+}
+
+/// Put `requestId` into a response's [`ErrorJson`] body (also used by the auth layer,
+/// which answers outside [`error_request_id`]).
+pub(crate) fn add_request_id(resp: &mut Response, id: Option<String>) {
+    if let (Some(ErrorJson(mut body)), Some(id)) = (resp.extensions_mut().remove(), id)
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("requestId".into(), id.into());
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        resp.headers_mut()
+            .insert(header::CONTENT_LENGTH, bytes.len().into());
+        *resp.body_mut() = axum::body::Body::from(bytes);
     }
 }
 
@@ -151,10 +218,19 @@ impl From<Error> for ApiError {
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             Error::NotPermitted(_) => StatusCode::FORBIDDEN,
+            Error::NotFound(_) => StatusCode::NOT_FOUND,
+            Error::HistoryGone(_) => StatusCode::GONE,
+            Error::HistoryUnsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
             Error::SparqlSyntax(_) => syntax_error_body(&msg),
+            Error::HistoryGone(g) => history::gone_body(&g),
+            Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
+            Error::Conflict(_) if msg.starts_with("history-limit") => {
+                json!({ "error": msg, "code": "history-limit" })
+            }
             Error::BudgetExceeded(b) => json!({
                 "error": msg,
                 "budget": b.kind,
@@ -216,10 +292,13 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
 }
 
+/// Run `f` on a blocking thread, inside the request's span (so engine events carry the
+/// request id and engine spans are its children).
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
-    tokio::task::spawn_blocking(f)
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(f))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
@@ -444,7 +523,7 @@ async fn dataset_root(
         }
         return update_endpoint(st, Path(name), p, uri, headers, body).await;
     }
-    gsp(st, Path(name), method, uri, headers, body).await
+    gsp(st, Path(name), method, uri, headers, body.into()).await
 }
 
 async fn query_endpoint(
@@ -492,88 +571,192 @@ async fn query_endpoint(
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let prefixes = ds.store.prefixes();
-    blocking(move || {
-        let t = std::time::Instant::now();
-        let snap = ds.store.snapshot();
-        let seq = snap.commit;
-        let r = sparkles::sparql::query(snap, &query, &opts)?;
-        let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
-        let sparkles_doc =
-            sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
-        if let Some(l) = limit
-            && r.kind == QueryKind::Select
-        {
-            // refuse before serializing when even the smallest encoding is too large
-            let rows = send.map_or(r.len(), |s| s.min(r.len()));
-            let min = sfmt.min_bytes(rows, r.vars.len());
-            if min > l {
-                return Err(Error::BudgetExceeded(sparkles::Budget {
-                    kind: BudgetKind::ResultBytes,
-                    limit: l,
-                    requested: min,
-                })
-                .into());
-            }
+    let with_extra = !opts.default_graph_extra.is_empty();
+    let at = history::at_param(&params)?;
+    let (r, seq, resolved, t0) = blocking({
+        let ds = ds.clone();
+        move || {
+            let t = std::time::Instant::now();
+            let t0 = crate::otel::start();
+            let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+            let seq = snap.commit;
+            let r = sparkles::sparql::query(snap, &query, &opts)?;
+            tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
+            Ok((r, seq, resolved, t0))
         }
-        let ts = std::time::Instant::now();
-        let mut w = LimitedWriter::new(Vec::new(), limit, Some(cancel));
-        let ct: String = match r.kind {
-            _ if sparkles_doc => {
-                // Build the document once, then patch the serialization time into it.
-                let mut doc = results::sparkles_json(&r, send);
-                let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
-                if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
-                    let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
-                    timing.insert("serializeMs".into(), ser_ms.into());
-                    timing.insert("totalMs".into(), (total + ser_ms).into());
-                }
-                if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
-                    meta.insert("commit".into(), seq.into());
-                    meta.insert("datasetId".into(), ds.store.dataset_id().to_string().into());
-                }
-                serde_json::to_writer(&mut w, &doc).map_err(|e| w.classify(Error::Io(e.into())))?;
-                SolutionsFormat::Sparkles.media_type().into()
-            }
-            QueryKind::Select | QueryKind::Ask => {
-                results::write_solutions(&r, sfmt, &mut w, send).map_err(|e| w.classify(e))?;
-                sfmt.media_type().into()
-            }
-            _ => {
-                results::write_graph(&r, rfmt, &prefixes, &mut w).map_err(|e| w.classify(e))?;
-                results::rdf_media_type(rfmt).into()
-            }
-        };
-        let serialize_ms = ts.elapsed().as_secs_f64() * 1000.0;
-        tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-        let buf = w.into_inner();
-        let report = RequestReport {
-            operation: Some(Op::Query),
-            rows: Some(r.len() as u64),
-            response_bytes: Some(buf.len() as u64),
-            serialize_ms: Some(serialize_ms),
-            mem_peak_bytes: Some(r.mem_peak_bytes),
-            timing: Some(r.timing),
-            ..Default::default()
-        };
-        let resp = with_commit(
-            ([(header::CONTENT_TYPE, ct)], buf).into_response(),
-            &ds,
-            seq,
-        );
-        Ok(report.attach(with_inferences(
-            resp,
-            &ds,
-            !opts.default_graph_extra.is_empty(),
-            seq,
-        )))
     })
-    .await
+    .await?;
+    let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
+    let sparkles_doc =
+        sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
+    if let Some(l) = limit
+        && r.kind == QueryKind::Select
+    {
+        // refuse before serializing when even the smallest encoding is too large
+        let rows = send.map_or(r.len(), |s| s.min(r.len()));
+        let min = sfmt.min_bytes(rows, r.vars.len());
+        if min > l {
+            return Err(Error::BudgetExceeded(sparkles::Budget {
+                kind: BudgetKind::ResultBytes,
+                limit: l,
+                requested: min,
+            })
+            .into());
+        }
+    }
+    let ct: String = if sparkles_doc {
+        SolutionsFormat::Sparkles.media_type().into()
+    } else if is_graph {
+        results::rdf_media_type(rfmt).into()
+    } else {
+        sfmt.media_type().into()
+    };
+    let report = RequestReport {
+        operation: Some(Op::Query),
+        rows: Some(r.len() as u64),
+        mem_peak_bytes: Some(r.mem_peak_bytes),
+        timing: Some(r.timing.clone()),
+        ..Default::default()
+    };
+    let dataset_id = ds.store.dataset_id().to_string();
+    let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
+        let ts = std::time::Instant::now();
+        let written = serialize_result(
+            &r,
+            w,
+            sparkles_doc,
+            is_graph,
+            sfmt,
+            rfmt,
+            send,
+            &prefixes,
+            seq,
+            dataset_id,
+        );
+        // phase spans once serialization has ended (the request span is current here)
+        crate::otel::query_done(t0, &r, ts.elapsed().as_secs_f64() * 1000.0);
+        written
+    };
+    // weak: the serializer thread must not keep the server state (and its stores' locks)
+    // alive after the response
+    let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
+    let body = stream::serialize(limit, write, move |end| {
+        if let Some(st) = metrics_st.upgrade() {
+            st.metrics
+                .add_response_bytes(Some(&name), Op::Query, end.bytes);
+        }
+        stream_end_log("query", &end);
+    })
+    .await?;
+    let (body, report) = match body {
+        stream::Serialized::Whole { body, serialize_ms } => {
+            let report = RequestReport {
+                response_bytes: Some(body.len() as u64),
+                serialize_ms: Some(serialize_ms),
+                ..report
+            };
+            (axum::body::Body::from(body), report)
+        }
+        stream::Serialized::Streamed(body) => (body, report),
+    };
+    let resp = with_commit(
+        ([(header::CONTENT_TYPE, ct)], body).into_response(),
+        &ds,
+        seq,
+    );
+    let resp = history::history_headers(resp, resolved.as_ref(), &uri);
+    // freshness is reported for the live state only
+    let resp = match &resolved {
+        Some(r) if r.historical => resp,
+        _ => with_inferences(resp, &ds, with_extra, seq),
+    };
+    Ok(report.attach(resp))
+}
+
+/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
+#[allow(clippy::too_many_arguments)]
+fn serialize_result(
+    r: &sparkles::sparql::QueryResult,
+    w: &mut LimitedWriter<stream::SwitchWriter>,
+    sparkles_doc: bool,
+    is_graph: bool,
+    sfmt: SolutionsFormat,
+    rfmt: RdfFormat,
+    send: Option<usize>,
+    prefixes: &std::collections::BTreeMap<String, String>,
+    seq: u64,
+    dataset_id: String,
+) -> sparkles::Result<()> {
+    if sparkles_doc {
+        // Build the document once, then patch the serialization time into it.
+        let ts = std::time::Instant::now();
+        let mut doc = results::sparkles_json(r, send);
+        let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
+        if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
+            let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
+            timing.insert("serializeMs".into(), ser_ms.into());
+            timing.insert("totalMs".into(), (total + ser_ms).into());
+        }
+        if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
+            meta.insert("commit".into(), seq.into());
+            meta.insert("datasetId".into(), dataset_id.into());
+        }
+        serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
+    } else if is_graph {
+        results::write_graph(r, rfmt, prefixes, w)
+    } else {
+        results::write_solutions(r, sfmt, w, send)
+    }
+}
+
+/// Log how a streamed response ended (its bytes are counted in the metrics).
+fn stream_end_log(what: &str, end: &stream::StreamEnd) {
+    let (bytes, ms) = (end.bytes, end.serialize_ms);
+    match &end.error {
+        None => tracing::debug!(bytes, serialize_ms = ms, "{what} stream finished"),
+        Some(_) if end.disconnected => {
+            tracing::debug!(bytes, "{what} stream: client disconnected")
+        }
+        Some(e) => tracing::warn!(bytes, "{what} stream aborted: {e}"),
+    }
 }
 
 fn params_wants_sparkles(h: &HeaderMap) -> bool {
     h.get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
+}
+
+// ------------------------------------------------------------------- vectors ------
+
+/// `GET /$/vector/{ds}`: the vector memory budget and the predicates whose vectors are
+/// packed in the current generation (packing happens on a predicate's first search).
+async fn vector_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    let ds = dataset(&st, &name)?;
+    let snap = ds.store.snapshot();
+    let vectors = &snap.generation.vectors;
+    let predicates: Vec<J> = vectors
+        .status()
+        .into_iter()
+        .map(|p| {
+            let iri = match snap.term(Id(p.predicate)) {
+                Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
+                other => other.map(|t| t.to_string()).unwrap_or_default(),
+            };
+            json!({
+                "predicate": iri,
+                "bytes": p.bytes,
+                "malformed": p.malformed,
+                "dimensions": p.dims.iter().map(|(dim, rows)| json!({ "dimension": dim, "vectors": rows })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "budgetBytes": sparkles::vector::budget(),
+        "usedBytes": vectors.used_bytes(),
+        "generation": snap.generation.name,
+        "predicates": predicates,
+    })))
 }
 
 // ---------------------------------------------------------------- full-text ------
@@ -706,6 +889,7 @@ fn write_response(
     receipt: &sparkles::commit::Receipt,
     wanted: bool,
 ) -> Response {
+    crate::otel::commit(receipt);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
         if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
@@ -797,13 +981,16 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
         }
         _ => None,
     };
+    let (oldest, reconstructable, commits) = history::commit_list_extras(&ds, &page.commits);
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
         "head": head.seq,
         "firstRetained": page.first_retained,
         "complete": page.complete,
-        "commits": page.commits,
+        "oldestReconstructable": oldest,
+        "reconstructable": reconstructable,
+        "commits": commits,
         "next": next,
     })))
 }
@@ -863,6 +1050,7 @@ async fn update_endpoint(
         }
         _ => params.get("update").unwrap_or_default().to_string(),
     };
+    history::reject_at(&params)?;
     if update.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "missing 'update' parameter"));
     }
@@ -877,12 +1065,14 @@ async fn update_endpoint(
     crate::auth::restrict(&mut opts, &p);
     let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
+        let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,
             &update,
             &opts,
             sparkles::commit::CommitKind::Update,
         )?;
+        crate::otel::update_done(t0, &stats);
         let receipt = stats.commit.expect("update receipts");
         let report = RequestReport {
             operation: Some(Op::Update),
@@ -924,15 +1114,17 @@ async fn explain(
     };
     let mut opts = query_options(&st, &ds, &params);
     crate::auth::restrict(&mut opts, &p);
+    let at = history::at_param(&params)?;
     blocking(move || {
-        let snap = ds.store.snapshot();
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let seq = snap.commit;
         let (algebra, plan) = sparkles::sparql::explain(snap, &query, &opts)?;
-        Ok(with_commit(
+        let resp = with_commit(
             Json(json!({ "algebra": algebra, "plan": plan })).into_response(),
             &ds,
             seq,
-        ))
+        );
+        Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await
 }
@@ -968,140 +1160,154 @@ fn gsp_target(params: &Params) -> Target {
     }
 }
 
-/// Size of the chunks of a streamed response body.
-const STREAM_CHUNK: usize = 64 << 10;
+/// Request bodies up to this size are kept in memory; larger ones go to a temp file.
+const SPOOL_AFTER: usize = 16 << 20;
 
-/// A `Write` that hands [`STREAM_CHUNK`]-sized chunks to a streamed response body.
-/// Writes fail once the client has gone away.
-struct ChunkWriter {
-    tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
-    buf: Vec<u8>,
-    sent: u64,
+/// A request body: in memory, or spooled to a temporary file that lives as long as this.
+enum Spooled {
+    Memory(Vec<u8>),
+    File(tempfile::NamedTempFile),
 }
 
-impl ChunkWriter {
-    fn send(&mut self) -> std::io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
+impl Spooled {
+    /// The body as an RDF source, and the temporary file to keep until it is read.
+    fn into_source(
+        self,
+        format: RdfFormat,
+        graph: Option<oxrdf::NamedNode>,
+    ) -> (Source, Option<tempfile::NamedTempFile>) {
+        match self {
+            Spooled::Memory(b) => (Source::from_bytes(b, format, graph), None),
+            Spooled::File(f) => (
+                Source {
+                    data: sparkles::io::SourceData::File(f.path().to_path_buf()),
+                    format,
+                    gzip: false,
+                    graph,
+                    base: None,
+                    name: "<request body>".into(),
+                },
+                Some(f),
+            ),
         }
-        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_CHUNK));
-        self.sent += chunk.len() as u64;
-        self.tx
-            .blocking_send(Ok(Bytes::from(chunk)))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
     }
 }
 
-impl std::io::Write for ChunkWriter {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(b);
-        if self.buf.len() >= STREAM_CHUNK {
-            self.send()?;
-        }
-        Ok(b.len())
-    }
+/// Read a request body, spooling it to a temporary file once it passes
+/// [`SPOOL_AFTER`] bytes, so a large upload is never held in memory whole. Large
+/// sources then take the bulk path, which parses them as a stream.
+async fn spool(body: axum::body::Body) -> ApiResult<Spooled> {
+    spool_after(body, SPOOL_AFTER).await
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+async fn spool_after(body: axum::body::Body, limit: usize) -> ApiResult<Spooled> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    let mut file: Option<tempfile::NamedTempFile> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        match &mut file {
+            Some(f) => f.write_all(&chunk).map_err(io)?,
+            None => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > limit {
+                    let mut f = tempfile::Builder::new()
+                        .prefix("sparkles-body-")
+                        .tempfile()
+                        .map_err(io)?;
+                    f.write_all(&buf).map_err(io)?;
+                    buf = Vec::new();
+                    file = Some(f);
+                }
+            }
+        }
     }
+    Ok(match file {
+        Some(mut f) => {
+            f.flush().map_err(io)?;
+            Spooled::File(f)
+        }
+        None => Spooled::Memory(buf),
+    })
 }
 
 /// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
-/// snapshot, serialized on a blocking thread and streamed, so memory stays flat and no
-/// result-size budget applies. An error after the first byte aborts the response (the
-/// client sees a truncated transfer); a client disconnect stops the serialization.
-fn stream_graph(
+/// snapshot, serialized while scanning (see [`stream`]), so no result-size budget
+/// applies. Returns the body and, for a body returned whole, its bytes and quads.
+async fn graph_body(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
     snap: Arc<sparkles::store::Snapshot>,
     g: Option<Id>,
     fmt: RdfFormat,
-) -> axum::body::Body {
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _span = span.enter();
-        let mut w = ChunkWriter {
-            tx: tx.clone(),
-            buf: Vec::with_capacity(STREAM_CHUNK),
-            sent: 0,
-        };
+) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
+    let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = quads.clone();
+    // an export reads every block once: keep the blocks queries use cached
+    let snap = snap.without_cache_fill();
+    let prefixes = ds.store.prefixes();
+    let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let mut ser = RdfSerializer::from_format(fmt);
         if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-            for (p, ns) in ds.store.prefixes() {
+            for (p, ns) in prefixes {
                 if let Ok(s) = ser.clone().with_prefix(p, ns) {
                     ser = s;
                 }
             }
         }
-        let mut quads = 0u64;
-        let written = (|| -> sparkles::Result<()> {
-            let mut s = ser.for_writer(&mut w);
-            let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
-            let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
-                if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
-                    if g.is_some() {
-                        s.serialize_triple(oxrdf::TripleRef::new(
-                            &q.subject,
-                            &q.predicate,
-                            &q.object,
-                        ))?;
-                    } else {
-                        s.serialize_quad(&q)?;
-                    }
-                    quads += 1;
+        let mut s = ser.for_writer(w);
+        let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
+        let mut n = 0u64;
+        let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
+            if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
+                if g.is_some() {
+                    s.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+                } else {
+                    s.serialize_quad(&q)?;
                 }
-                Ok(())
-            };
-            // serialize while scanning: nothing but the current block is held
-            snap.scan(Perm::Gspo, &prefix, |c| {
-                match c {
-                    Chunk::Block(b, start, end) => {
-                        for i in start..end {
-                            write(&b.key(i))?;
-                        }
-                    }
-                    Chunk::Row(k) => write(&k)?,
-                }
-                Ok(true)
-            })?;
-            s.finish()?;
+                n += 1;
+            }
             Ok(())
-        })()
-        .and_then(|()| Ok(w.send()?));
-        st.metrics
-            .add_response_bytes(Some(&ds.name), Op::Gsp, w.sent);
-        match written {
-            Ok(()) => tracing::debug!(quads, bytes = w.sent, "graph store stream finished"),
-            Err(_) if tx.is_closed() => {
-                tracing::debug!(
-                    quads,
-                    bytes = w.sent,
-                    "graph store stream: client disconnected"
-                )
+        };
+        // serialize while scanning: nothing but the current block is held
+        snap.scan(Perm::Gspo, &prefix, |c| {
+            match c {
+                Chunk::Block(b, start, end) => {
+                    for i in start..end {
+                        write(&b.key(i))?;
+                    }
+                }
+                Chunk::Row(k) => write(&k)?,
             }
-            Err(e) => {
-                tracing::warn!(quads, bytes = w.sent, "graph store stream aborted: {e}");
-                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-            }
+            Ok(true)
+        })?;
+        counted.store(n, std::sync::atomic::Ordering::Relaxed);
+        s.finish()?;
+        Ok(())
+    };
+    let (name, st) = (ds.name.clone(), Arc::downgrade(&st));
+    drop(ds);
+    let body = stream::serialize(None, write, move |end| {
+        if let Some(st) = st.upgrade() {
+            st.metrics
+                .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
         }
-    });
-    axum::body::Body::from_stream(ChunkStream(rx))
-}
-
-/// The receiving end of a [`ChunkWriter`] as a body stream. It keeps answering `None`
-/// after the end, since the compression layer polls once more.
-struct ChunkStream(tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>);
-
-impl futures_util::Stream for ChunkStream {
-    type Item = std::io::Result<Bytes>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
+        stream_end_log("graph store", &end);
+    })
+    .await?;
+    Ok(match body {
+        stream::Serialized::Whole { body, .. } => {
+            let whole = (
+                body.len() as u64,
+                quads.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            (axum::body::Body::from(body), Some(whole))
+        }
+        stream::Serialized::Streamed(body) => (body, None),
+    })
 }
 
 async fn gsp(
@@ -1110,7 +1316,7 @@ async fn gsp(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -1121,10 +1327,12 @@ async fn gsp(
             let fmt = rdf_format(&params, &headers, quads);
             let head = method == Method::HEAD;
             // resolve the graph (or 404) before the response starts
-            let (snap, g) = blocking({
+            let at = history::at_param(&params)?;
+            let opts = query_options(&st, &ds, &params);
+            let (snap, g, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
-                    let snap = ds.store.snapshot();
+                    let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
                     let g = match &target {
                         Target::Default => Some(Id::DEFAULT_GRAPH),
                         Target::Named(iri) => Some(
@@ -1136,27 +1344,34 @@ async fn gsp(
                         ),
                         Target::Dataset => None,
                     };
-                    Ok((snap, g))
+                    Ok((snap, g, resolved))
                 }
             })
             .await?;
             let seq = snap.commit;
             let ct = [(header::CONTENT_TYPE, results::rdf_media_type(fmt))];
-            let resp = if head {
-                ct.into_response()
-            } else {
-                (ct, stream_graph(st.clone(), ds.clone(), snap, g, fmt)).into_response()
-            };
-            let report = RequestReport {
+            let mut report = RequestReport {
                 operation: Some(Op::Gsp),
                 ..Default::default()
             };
-            Ok(report.attach(with_commit(resp, &ds, seq)))
+            let resp = if head {
+                ct.into_response()
+            } else {
+                let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
+                if let Some((bytes, quads)) = whole {
+                    report.response_bytes = Some(bytes);
+                    report.rows = Some(quads);
+                }
+                (ct, body).into_response()
+            };
+            let resp = with_commit(resp, &ds, seq);
+            Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
         }
         Method::PUT | Method::POST => {
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
             }
+            history::reject_at(&params)?;
             let ct = content_type(&headers);
             let format = sparkles::io::format_for_media_type(&ct)
                 .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
@@ -1168,6 +1383,7 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
+            let body = spool(body).await?;
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -1176,7 +1392,7 @@ async fn gsp(
                     ),
                     _ => None,
                 };
-                let src = Source::from_bytes(body.to_vec(), format, graph.clone());
+                let (src, _spooled) = body.into_source(format, graph.clone());
                 use sparkles::commit::CommitKind;
                 let (count, receipt) = if replace {
                     // parse first, then clear and insert atomically
@@ -1210,6 +1426,7 @@ async fn gsp(
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
             }
+            history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -1262,6 +1479,7 @@ async fn upload(
     }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
@@ -1275,7 +1493,7 @@ async fn upload(
         let mut mp = Multipart::from_request(request, &())
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        while let Some(field) = mp
+        while let Some(mut field) = mp
             .next_field()
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
@@ -1296,13 +1514,20 @@ async fn upload(
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "upload.ttl".into());
-                    let data = field
-                        .bytes()
-                        .await
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+                    // copied chunk by chunk: an upload is never held in memory whole
                     let path = tmp.path().join(format!("{}-{fname}", files.len()));
-                    std::fs::write(&path, &data)
-                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    let io =
+                        |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                    let mut out =
+                        std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
+                    while let Some(chunk) = field
+                        .chunk()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
+                    {
+                        std::io::Write::write_all(&mut out, &chunk).map_err(io)?;
+                    }
+                    std::io::Write::flush(&mut out).map_err(io)?;
                     files.push(path);
                 }
             }
@@ -1315,9 +1540,7 @@ async fn upload(
                 format!("unsupported content type '{ct}'"),
             )
         })?;
-        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let body = spool_after(request.into_body(), 0).await?;
         let ext = match format {
             RdfFormat::NTriples => "nt",
             RdfFormat::NQuads => "nq",
@@ -1327,8 +1550,13 @@ async fn upload(
             _ => "ttl",
         };
         let path = tmp.path().join(format!("body.{ext}"));
-        std::fs::write(&path, &bytes)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        match body {
+            Spooled::File(f) => {
+                f.persist(&path).map_err(|e| io(e.error))?;
+            }
+            Spooled::Memory(b) => std::fs::write(&path, b).map_err(io)?,
+        }
         files.push(path);
     }
     if files.is_empty() {
@@ -1742,6 +1970,78 @@ async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>>
     Ok(Json(json!({ "prefixes": p })))
 }
 
+/// `/{ds}/prefixes`, after Fuseki's prefixes service. GET: `?prefix=` → its IRI,
+/// `?uri=` → the prefixes bound to it, neither → all stored prefixes. POST / PUT with
+/// `prefix` and `uri` (query, form or JSON body) sets one; DELETE `?prefix=` removes one.
+async fn dataset_prefixes(
+    State(st): St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let mut params = Params::from_query(&uri);
+    match content_type(&headers).as_str() {
+        "application/x-www-form-urlencoded" => params.extend_form(&body),
+        "application/json" => {
+            let j: J = serde_json::from_slice(&body)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
+            for k in ["prefix", "uri"] {
+                if let Some(v) = j.get(k).and_then(J::as_str) {
+                    params.0.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+    let prefixes = ds.store.prefixes();
+    let prefix = params.get("prefix").map(str::to_string);
+    let iri = params.get("uri").map(str::to_string);
+    if method != Method::GET && method != Method::HEAD && st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let missing = |what: &str| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("missing '{what}' parameter"),
+        )
+    };
+    match method {
+        Method::GET | Method::HEAD => Ok(match (prefix, iri) {
+            (Some(p), _) => match prefixes.get(&p) {
+                Some(u) => Json(json!({ "prefix": p, "uri": u })).into_response(),
+                None => return Err(err(StatusCode::NOT_FOUND, format!("no prefix '{p}'"))),
+            },
+            (None, Some(u)) => {
+                let bound: Vec<&String> = prefixes
+                    .iter()
+                    .filter(|(_, v)| **v == u)
+                    .map(|(k, _)| k)
+                    .collect();
+                Json(json!({ "uri": u, "prefixes": bound })).into_response()
+            }
+            (None, None) => Json(json!({ "prefixes": prefixes })).into_response(),
+        }),
+        Method::POST | Method::PUT => {
+            let p = prefix.ok_or_else(|| missing("prefix"))?;
+            let u = iri.ok_or_else(|| missing("uri"))?;
+            ds.store.set_prefix(&p, &u)?;
+            Ok(Json(json!({ "prefix": p, "uri": u })).into_response())
+        }
+        Method::DELETE => {
+            let p = prefix.ok_or_else(|| missing("prefix"))?;
+            if ds.store.remove_prefix(&p)? {
+                Ok(StatusCode::NO_CONTENT.into_response())
+            } else {
+                Err(err(StatusCode::NOT_FOUND, format!("no prefix '{p}'")))
+            }
+        }
+        _ => Err(err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")),
+    }
+}
+
 async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -2037,6 +2337,7 @@ async fn shacl(
         let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
         opts.timeout = Some(timeout);
         let t = std::time::Instant::now();
+        let _validate = tracing::info_span!("shacl.validate").entered();
         let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
             let msg = format!("{e:#}");
             match e.downcast::<Error>() {
@@ -2053,6 +2354,7 @@ async fn shacl(
         );
         let buf = crate::shacl::write_report(&report, rfmt)?;
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
+        let resp = with_commit(resp, &ds, snap.commit);
         Ok(with_inferences(
             resp,
             &ds,
@@ -2072,9 +2374,35 @@ async fn shacl() -> ApiResult {
 }
 
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
+
+#[cfg(test)]
+mod spool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn large_bodies_are_spooled_to_a_file() {
+        let data: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let Ok(small) = spool_after(axum::body::Body::from(data.clone()), 1 << 20).await else {
+            panic!("spooling failed")
+        };
+        assert!(matches!(&small, Spooled::Memory(b) if *b == data));
+        let Ok(Spooled::File(f)) = spool_after(axum::body::Body::from(data.clone()), 100).await
+        else {
+            panic!("expected a file")
+        };
+        assert_eq!(std::fs::read(f.path()).unwrap(), data);
+        let path = f.path().to_path_buf();
+        let (src, guard) = Spooled::File(f).into_source(RdfFormat::NTriples, None);
+        assert!(matches!(src.data, sparkles::io::SourceData::File(ref p) if *p == path));
+        drop(guard);
+        assert!(!path.exists(), "the temporary file goes with its guard");
+    }
+}
 
 #[cfg(test)]
 mod tests {

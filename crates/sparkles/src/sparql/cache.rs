@@ -232,10 +232,12 @@ pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
 fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     let mut s = String::with_capacity(256);
     let ds = &ctx.dataset;
+    // the data is a function of the generation instance and the commit (a compaction
+    // makes a new instance; a past state shares its generation's instance)
     let _ = write!(
         s,
-        "v{}|{}|{:?}|{:?}|{}|",
-        ctx.snap.version, ctx.snap.generation.name, ds.default, ds.named, ds.union_default
+        "g{}|c{}|{:?}|{:?}|{}|",
+        ctx.snap.generation.uid, ctx.snap.commit, ds.default, ds.named, ds.union_default
     );
     write_node(n, ctx, &mut s).then_some(s)
 }

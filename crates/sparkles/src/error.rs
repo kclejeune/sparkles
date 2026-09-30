@@ -31,6 +31,18 @@ pub enum Error {
     /// The dataset's full-text index is not at the queried snapshot (stale or rebuilding).
     #[error("{0}")]
     TextUnavailable(String),
+    /// A commit, snapshot or other named thing that does not exist.
+    #[error("{0}")]
+    NotFound(String),
+    /// A commit that existed but whose data is no longer kept.
+    #[error("{0}")]
+    HistoryGone(Box<crate::history::HistoryGone>),
+    /// A past-state read that this dataset or feature cannot serve (e.g. in memory).
+    #[error("{0}")]
+    HistoryUnsupported(String),
+    /// A request that conflicts with the current state (e.g. a name already in use).
+    #[error("{0}")]
+    Conflict(String),
     /// The caller lacks a permission the operation needs (outbound SERVICE or LOAD,
     /// `LOAD <file:…>`); raised before any connection or file is opened.
     #[error("{0}")]

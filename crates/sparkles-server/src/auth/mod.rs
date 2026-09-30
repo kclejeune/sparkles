@@ -42,7 +42,8 @@ mod store;
 mod tokens;
 
 pub use api::{
-    cors_layer, flush, load, render_metrics, restrict, routes, server_json, spawn_reload_on_sighup,
+    PrincipalKeyer, cors_layer, flush, load, render_metrics, restrict, routes, server_json,
+    spawn_reload_on_sighup,
 };
 pub use proxy::Peer;
 pub use routes::{AuthReport, Denied, forbidden, middleware};

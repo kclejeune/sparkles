@@ -5,11 +5,14 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
-  import { fmtBytes, fmtCompact, fmtInt, fmtMs } from '$lib/format';
+  import { receiptSummary } from '$lib/commits';
+  import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
   import { load, save } from '$lib/storage';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
+  import FullTextPanel from '$components/FullTextPanel.svelte';
+  import HistoryPanel from '$components/HistoryPanel.svelte';
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
   import TaskList from '$components/TaskList.svelte';
@@ -23,6 +26,8 @@
   let statsError = $state<api.ApiError | Error | null>(null);
   let loading = $state(false);
   let taskKick = $state(0);
+  /** Bumped after anything that may have changed the dataset (panels reload). */
+  let refreshKick = $state(0);
   let deleteTarget = $state<string | null>(null);
   let cloneOpen = $state(false);
   /** The last clone of this dataset that finished, for an "Open" link. */
@@ -52,6 +57,7 @@
   });
 
   function refreshAll() {
+    refreshKick++;
     void loadStats();
     void app.refreshDatasets();
     void app.loadPrefixes(name, true);
@@ -89,6 +95,12 @@
   let uploading = $state(false);
   let progress = $state(0);
   let uploadError = $state<string | null>(null);
+  /** What the last upload committed ("commit 42 · +120 −0"). */
+  let uploadReceipt = $state<api.Receipt | null>(null);
+  $effect(() => {
+    void name;
+    uploadReceipt = null;
+  });
   let uploadCtl: AbortController | null = null;
   let fileInput: HTMLInputElement | undefined = $state();
 
@@ -109,17 +121,19 @@
     progress = 0;
     uploadCtl = new AbortController();
     try {
-      const res = (await api.upload(name, files, {
+      const res = await api.upload(name, files, {
         graph: graph.trim() || undefined,
         onProgress: (p) => (progress = p.total ? p.loaded / p.total : 0),
         signal: uploadCtl.signal,
-      })) as { count?: number; tripleCount?: number; quadCount?: number } | string;
+      });
       const n =
         typeof res === 'object' ? (res.quadCount ?? res.tripleCount ?? res.count) : undefined;
+      const receipt = typeof res === 'object' ? res.receipt : undefined;
+      uploadReceipt = receipt ?? null;
       toasts.push(
         'success',
         `Uploaded ${files.length} file${files.length === 1 ? '' : 's'}`,
-        n != null ? `${fmtInt(n)} quads added` : undefined,
+        receipt ? receiptSummary(receipt) : n != null ? `${fmtInt(n)} quads added` : undefined,
       );
       files = [];
       refreshAll();
@@ -342,6 +356,14 @@ ex:PersonShape a sh:NodeShape ;
                 : ''}</span
           >
         {/if}
+        {#if info?.head != null}
+          <span
+            class="badge iri"
+            title="Head commit{info.modified ? `, made ${fmtTime(info.modified)}` : ''}"
+            >commit {info.head}</span
+          >
+          {#if info.modified}<span class="faint">modified {fmtRelative(info.modified)}</span>{/if}
+        {/if}
         <span class="mono faint">{info?.endpoints?.query ?? `/${name}/sparql`}</span>
       </div>
       {#if info?.origin}
@@ -545,6 +567,9 @@ ex:PersonShape a sh:NodeShape ;
             </div>
           </div>
         </section>
+
+        <!-- commit history -->
+        <HistoryPanel {name} {info} refreshKey={refreshKick} />
 
         <!-- SHACL validation -->
         <section class="panel">
@@ -846,6 +871,14 @@ ex:PersonShape a sh:NodeShape ;
                 <strong>Upload failed.</strong>
                 {uploadError}
               </div>{/if}
+            {#if uploadReceipt && !uploading}
+              <p class="receipt faint" class:none={!uploadReceipt.committed}>
+                <Icon name={uploadReceipt.committed ? 'check' : 'info'} size={13} />
+                Last upload: {receiptSummary(uploadReceipt)}{uploadReceipt.committed
+                  ? ` (${uploadReceipt.commit.quads.toLocaleString('en-US')} quads after)`
+                  : ''}
+              </p>
+            {/if}
             <div class="row">
               <span class="spacer"></span>
               <button class="btn primary" disabled={!files.length || uploading} onclick={doUpload}>
@@ -866,6 +899,19 @@ ex:PersonShape a sh:NodeShape ;
           readOnly={readOnly || !auth.can(name, 'admin')}
           busy={acting != null}
           onstart={startTask}
+          onchanged={refreshAll}
+        />
+
+        <!-- full-text search -->
+        <FullTextPanel
+          {name}
+          {prefixes}
+          predicates={stats.predicates.map((p) => p.iri)}
+          readOnly={readOnly || !auth.can(name, 'admin')}
+          busy={acting != null}
+          refreshKey={refreshKick}
+          onstart={startTask}
+          onstarted={() => taskKick++}
           onchanged={refreshAll}
         />
 
@@ -904,7 +950,9 @@ ex:PersonShape a sh:NodeShape ;
                 else if (t.kind === 'clone' && t.target) {
                   toasts.push('success', `Cloned into /${t.target}`, t.message);
                   cloned = t.target;
-                } else toasts.push('success', `${t.kind} finished`, t.message);
+                } else if (t.kind === 'text-rebuild')
+                  toasts.push('success', 'Full-text index built', t.message);
+                else toasts.push('success', `${t.kind} finished`, t.message);
                 refreshAll();
               }}
             />
@@ -1235,6 +1283,17 @@ ex:PersonShape a sh:NodeShape ;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .receipt {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--ok);
+  }
+  .receipt.none {
+    color: var(--text-2);
   }
   .progress {
     height: 6px;

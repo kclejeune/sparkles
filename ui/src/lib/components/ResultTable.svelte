@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
-  import { displayIri, displayTerm, toSparql, type PrefixMap } from '$lib/rdf';
+  import { displayIri, displayTerm, isVectorLiteral, toSparql, type PrefixMap } from '$lib/rdf';
   import { sortedOrder, type SortSpec } from '$lib/table';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
@@ -40,7 +40,7 @@
         const t = rows[i][c];
         // literal suffix as TermView renders it: "@lang" or "^^prefix:local" (smaller font)
         const suffix =
-          t?.type === 'literal'
+          t?.type === 'literal' && !isVectorLiteral(t)
             ? t['xml:lang']
               ? t['xml:lang'].length + 2
               : t.datatype

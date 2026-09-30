@@ -120,6 +120,8 @@ pub struct AppState {
     /// Emit one `sparkles::access` event per request.
     pub access_log: bool,
     pub metrics: crate::obs::Metrics,
+    /// rate and concurrency limits (`None`: no limits, the default)
+    pub rate_limit: Option<Arc<crate::ratelimit::RateLimiter>>,
     phase: AtomicU8,
     /// authentication and authorization (`serve --auth-config`); `None`: open
     pub auth: Option<Arc<crate::auth::Auth>>,
@@ -272,6 +274,7 @@ impl AppState {
             limits: Limits::default(),
             access_log: true,
             metrics: crate::obs::Metrics::new(true, 100),
+            rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             auth: None,
             auto_reason: None,
@@ -536,12 +539,13 @@ impl AppState {
             }
         }
         let state = self.clone();
+        let span = crate::otel::task_span(kind, &id, dataset);
         std::thread::spawn(move || {
             let handle = TaskHandle {
                 state: state.clone(),
                 id: id.clone(),
             };
-            let r = work(&handle);
+            let r = span.in_scope(|| work(&handle));
             let mut tasks = state.tasks.lock();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
                 t.finished_at = Some(now());

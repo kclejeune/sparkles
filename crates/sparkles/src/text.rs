@@ -8,10 +8,16 @@
 //! The index is derived data kept consistent with the store inside the commit path:
 //! every snapshot carries a [`TextView`] whose `seq` is the commit it reflects, and a
 //! search runs only when that equals the snapshot's commit. `<root>/text.json` holds the
-//! configuration; `<root>/text/` the Tantivy index, rebuilt from RDF whenever it is
-//! missing, damaged, or behind the store.
+//! configuration; `<root>/text/` the Tantivy index. Commits write it without fsync (see
+//! `lazydir`): the WAL is the durable record, the index is checkpointed about once a
+//! second, and on open an index that may hold unsynced data is verified, then caught up
+//! from the WAL. It is rebuilt from RDF only when it is missing, damaged, or behind the
+//! WAL.
 
 use crate::error::{Error, Result};
+
+#[cfg(feature = "text")]
+mod lazydir;
 use serde::{Deserialize, Serialize};
 
 /// Which predicates are indexed.
@@ -184,6 +190,7 @@ pub fn search(
 
 #[cfg(feature = "text")]
 mod imp {
+    use super::lazydir::LazySyncDir;
     use super::*;
     use crate::id::{Id, Tag};
     use crate::sparql::ctx::Ctx;
@@ -195,6 +202,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
     use tantivy::collector::TopDocs;
     use tantivy::query::{
         BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery,
@@ -268,10 +276,27 @@ mod imp {
         config: String,
     }
 
+    impl Live {
+        fn writer(&mut self) -> Result<&mut IndexWriter<TantivyDocument>> {
+            self.writer
+                .as_mut()
+                .ok_or_else(|| text_err("the index is closed"))
+        }
+    }
+
     struct Live {
         shared: Arc<Shared>,
-        writer: IndexWriter<TantivyDocument>,
+        /// `None` only once the index is closing
+        writer: Option<IndexWriter<TantivyDocument>>,
         reader: IndexReader,
+        /// the on-disk directory (`None` in memory or while an index is being built)
+        dir: Option<LazySyncDir>,
+        /// the first commit since the last checkpoint
+        dirty_since: Option<Instant>,
+        /// the commit the index reflects, and the one its on-disk payload names (behind
+        /// after commits that changed no document)
+        applied: u64,
+        committed: u64,
     }
 
     /// A dataset's full-text index.
@@ -325,18 +350,54 @@ mod imp {
         Ok((index, fields))
     }
 
-    fn open_index(dir: &Path) -> Result<(Index, Fields)> {
-        let index = Index::open_in_dir(dir).map_err(text_err)?;
+    /// Marker of an index that may hold unsynced writes (next to `<root>/text/`).
+    fn marker(root: &Path) -> PathBuf {
+        root.join("text.dirty")
+    }
+
+    /// Open the index in `<root>/text/` for maintenance without per-commit fsync.
+    fn open_index(root: &Path) -> Result<(Index, Fields, LazySyncDir)> {
+        let dir = LazySyncDir::open(&root.join("text"), marker(root))?;
+        let index = Index::open(dir.clone()).map_err(text_err)?;
         register_tokenizer(&index);
         let (_, fields) = schema();
         if index.schema() != schema().0 {
             return Err(text_err("unexpected index schema"));
         }
-        Ok((index, fields))
+        Ok((index, fields, dir))
     }
 
+    /// Check an index that may hold unsynced writes: every file of the committed
+    /// segments must exist and match its checksum.
+    fn verify(index: &Index) -> Result<()> {
+        let d = index.directory();
+        for meta in index.searchable_segment_metas().map_err(text_err)? {
+            for f in meta.list_files() {
+                // `list_files` names a deletes file even for segments that have none
+                if meta.delete_opstamp().is_none() && f.extension().is_some_and(|e| e == "del") {
+                    continue;
+                }
+                let ok = tantivy::directory::Directory::exists(d, &f).map_err(text_err)?
+                    && d.validate_checksum(&f).map_err(text_err)?;
+                if !ok {
+                    return Err(text_err(format!("{} is missing or damaged", f.display())));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How long the index may hold unsynced commits before a checkpoint.
+    const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
+
     /// The single-threaded writer and the reader used between rebuilds.
-    fn live_of(index: Index, fields: Fields, config: &TextConfig) -> Result<Live> {
+    fn live_of(
+        index: Index,
+        fields: Fields,
+        config: &TextConfig,
+        dir: Option<LazySyncDir>,
+        seq: u64,
+    ) -> Result<Live> {
         let writer = index
             .writer_with_num_threads(1, 32 << 20)
             .map_err(text_err)?;
@@ -351,8 +412,12 @@ mod imp {
                 fields,
                 config: config.clone(),
             }),
-            writer,
+            writer: Some(writer),
             reader,
+            dir,
+            dirty_since: None,
+            applied: seq,
+            committed: seq,
         })
     }
 
@@ -464,30 +529,23 @@ mod imp {
 
     impl TextIndex {
         /// Open the index of a store at its current state `snap` (`root` = `None` for an
-        /// in-memory store), rebuilding it when it is missing, damaged, configured
-        /// differently, or not at `snap`'s commit. Returns the index and `snap`'s view.
+        /// in-memory store). An index on disk with the same configuration is reused:
+        /// verified first when it may hold unsynced writes, then caught up from `wal` when
+        /// it is behind. `wal` holds the quads each commit of the WAL changed, oldest
+        /// first, by commit. Otherwise the index is rebuilt. Returns the index and `snap`'s
+        /// view.
         pub fn open(
             root: Option<&Path>,
             config: TextConfig,
             snap: &Snapshot,
+            wal: &[(u64, Vec<[Id; 4]>)],
         ) -> Result<(TextIndex, Arc<TextView>)> {
-            let dir = root.map(|r| r.join("text"));
             if let Some(r) = root {
                 for stale in ["text.new", "text.old"] {
                     let _ = std::fs::remove_dir_all(r.join(stale));
                 }
             }
             let hash = config_hash(&config);
-            // reuse an index that is exactly at this snapshot's commit
-            let reusable = dir.as_deref().and_then(|d| {
-                let (index, fields) = open_index(d).ok()?;
-                let meta = index.load_metas().ok()?;
-                let p: Payload = serde_json::from_str(meta.payload.as_deref()?).ok()?;
-                if p.format != FORMAT || p.config != hash || p.seq != snap.commit {
-                    return None;
-                }
-                Some((live_of(index, fields, &config).ok()?, p.epoch))
-            });
             let ti = |live: Live, epoch: u64| TextIndex {
                 root: root.map(Path::to_path_buf),
                 config: config.clone(),
@@ -497,23 +555,58 @@ mod imp {
                 last_rebuild: Mutex::new(None),
                 fail_next_commit: Default::default(),
             };
-            match reusable {
-                Some((live, epoch)) => {
-                    let t = ti(live, epoch);
-                    let view = t.view(snap.commit)?;
-                    Ok((t, view))
+            let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
+                let (index, fields, dir) = open_index(r)
+                    .inspect_err(|e| tracing::warn!("{e}; rebuilding"))
+                    .ok()?;
+                if dir.is_marked()
+                    && let Err(e) = verify(&index)
+                {
+                    tracing::warn!("{e}; rebuilding");
+                    return None;
                 }
-                None => {
-                    if dir.as_deref().is_some_and(Path::exists) {
-                        tracing::info!("full-text index is missing or behind the data; rebuilding");
+                let meta = index.load_metas().ok()?;
+                let p: Payload = serde_json::from_str(meta.payload.as_deref()?).ok()?;
+                if p.format != FORMAT || p.config != hash || p.seq > snap.commit {
+                    return None;
+                }
+                // the quads changed since the index's commit: all in the WAL, or rebuild
+                let mut touched = Vec::new();
+                if p.seq < snap.commit {
+                    if wal.first().is_none_or(|(first, _)| *first > p.seq + 1) {
+                        return None;
                     }
-                    // an empty placeholder until the rebuild below swaps the real one in
-                    let (index, fields) = new_index(None)?;
-                    let t = ti(live_of(index, fields, &config)?, 0);
-                    let view = t.rebuild(snap)?;
-                    Ok((t, view))
+                    for (_, qs) in wal.iter().filter(|(seq, _)| *seq > p.seq) {
+                        touched.extend_from_slice(qs);
+                    }
                 }
+                let live = live_of(index, fields, &config, Some(dir), p.seq).ok()?;
+                Some((live, p.epoch, p.seq, touched))
+            });
+            if let Some((live, epoch, seq, touched)) = reusable {
+                let t = ti(live, epoch);
+                if seq < snap.commit {
+                    tracing::info!(
+                        "full-text index is at commit {seq}, the data at {}: catching up from the WAL",
+                        snap.commit
+                    );
+                }
+                // a verified or caught-up index is made durable before it is used
+                match t
+                    .apply(snap, &touched)
+                    .and_then(|v| t.checkpoint().map(|()| v))
+                {
+                    Ok(view) => return Ok((t, view)),
+                    Err(e) => tracing::warn!("full-text index: {e}; rebuilding"),
+                }
+            } else if root.is_some_and(|r| r.join("text").exists()) {
+                tracing::info!("full-text index is missing, damaged or behind the WAL; rebuilding");
             }
+            // an empty placeholder until the rebuild below swaps the real one in
+            let (index, fields) = new_index(None)?;
+            let t = ti(live_of(index, fields, &config, None, 0)?, 0);
+            let view = t.rebuild(snap)?;
+            Ok((t, view))
         }
 
         pub fn config(&self) -> &TextConfig {
@@ -546,9 +639,8 @@ mod imp {
         }
 
         /// Apply a commit: `touched` are the quads the transaction changed and `snap` the
-        /// state after it (commit `snap.commit`). Each touched quad in scope is deleted and
-        /// re-added if still present, so the result depends only on the final state.
-        /// Returns the new view, or `None` (the index is marked stale) on failure.
+        /// state after it (commit `snap.commit`). Returns the new view, or `None` (the
+        /// index is marked stale) on failure.
         pub fn apply_commit(
             &self,
             snap: &Snapshot,
@@ -558,51 +650,95 @@ mod imp {
             if !self.healthy() {
                 return prev.cloned();
             }
-            let result = (|| -> Result<Arc<TextView>> {
-                let mut live = self.live.lock();
-                let fields = live.shared.fields;
-                let mut changed = false;
-                let mut seen = rustc_hash::FxHashSet::default();
-                for q in touched {
-                    if !seen.insert(*q) {
-                        continue;
-                    }
-                    let Some(d) = document(snap, &fields, &self.config, q) else {
-                        continue;
-                    };
-                    live.writer
-                        .delete_term(Term::from_field_bytes(fields.key, &d.key));
-                    changed = true;
-                    if let Some(doc) = d.doc
-                        && snap.contains(q)?
-                    {
-                        live.writer.add_document(doc).map_err(text_err)?;
-                    }
-                }
-                if !changed {
-                    drop(live);
-                    return self.view(snap.commit);
-                }
-                if self.fail_next_commit.swap(false, Ordering::SeqCst) {
-                    return Err(text_err("injected failure"));
-                }
-                let payload = self.payload(snap.commit);
-                let mut prepared = live.writer.prepare_commit().map_err(text_err)?;
-                prepared.set_payload(&payload);
-                prepared.commit().map_err(text_err)?;
-                live.reader.reload().map_err(text_err)?;
-                drop(live);
-                self.view(snap.commit)
-            })();
-            match result {
+            match self.apply(snap, touched) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::error!("{e}; the full-text index is stale until it is rebuilt");
-                    let _ = self.live.lock().writer.rollback();
+                    if let Ok(w) = self.live.lock().writer() {
+                        let _ = w.rollback();
+                    }
                     *self.stale.lock() = Some(e.to_string());
                     prev.cloned()
                 }
             }
+        }
+
+        /// Bring the index to `snap` given the quads changed since its commit. Each touched
+        /// quad in scope is deleted and re-added if still present, so the result depends
+        /// only on the final state. The Tantivy commit is not synced: see `lazydir`.
+        fn apply(&self, snap: &Snapshot, touched: &[[Id; 4]]) -> Result<Arc<TextView>> {
+            let mut live = self.live.lock();
+            let fields = live.shared.fields;
+            let mut changed = false;
+            let mut seen = rustc_hash::FxHashSet::default();
+            for q in touched {
+                if !seen.insert(*q) {
+                    continue;
+                }
+                let Some(d) = document(snap, &fields, &self.config, q) else {
+                    continue;
+                };
+                live.writer()?
+                    .delete_term(Term::from_field_bytes(fields.key, &d.key));
+                changed = true;
+                if let Some(doc) = d.doc
+                    && snap.contains(q)?
+                {
+                    live.writer()?.add_document(doc).map_err(text_err)?;
+                }
+            }
+            live.applied = snap.commit;
+            if changed {
+                if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+                    return Err(text_err("injected failure"));
+                }
+                self.commit_locked(&mut live)?;
+            }
+            if live
+                .dirty_since
+                .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
+            {
+                self.checkpoint_locked(&mut live)?;
+            }
+            drop(live);
+            self.view(snap.commit)
+        }
+
+        /// Commit the writer (payload: the applied commit) and reload the reader.
+        fn commit_locked(&self, live: &mut Live) -> Result<()> {
+            let payload = self.payload(live.applied);
+            let mut prepared = live.writer()?.prepare_commit().map_err(text_err)?;
+            prepared.set_payload(&payload);
+            prepared.commit().map_err(text_err)?;
+            live.reader.reload().map_err(text_err)?;
+            live.committed = live.applied;
+            if live.dir.is_some() && live.dirty_since.is_none() {
+                live.dirty_since = Some(Instant::now());
+            }
+            Ok(())
+        }
+
+        fn checkpoint_locked(&self, live: &mut Live) -> Result<()> {
+            let Some(dir) = live.dir.clone() else {
+                return Ok(());
+            };
+            if live.committed != live.applied {
+                self.commit_locked(live)?;
+            }
+            dir.checkpoint()?;
+            live.dirty_since = None;
+            Ok(())
+        }
+
+        /// Make the on-disk index durable, with a payload naming the last applied commit:
+        /// reopening it then needs neither verification nor WAL catch-up. Runs about once
+        /// a second during writes, before compaction, and on drop.
+        pub fn checkpoint(&self) -> Result<()> {
+            if !self.healthy() {
+                return Ok(());
+            }
+            let mut live = self.live.lock();
+            self.checkpoint_locked(&mut live)
         }
 
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
@@ -669,12 +805,19 @@ mod imp {
                     }
                     std::fs::rename(&new_dir, &cur)?;
                     crate::store::sync_dir(root)?;
-                    let (index, fields) = open_index(&cur)?;
-                    *live = live_of(index, fields, &self.config)?;
+                    // the new index was synced by its build: a marker left by the old one
+                    // is stale
+                    match std::fs::remove_file(marker(root)) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                        _ => {}
+                    }
+                    crate::store::sync_dir(root)?;
+                    let (index, fields, dir) = open_index(root)?;
+                    *live = live_of(index, fields, &self.config, Some(dir), snap.commit)?;
                     Some(old)
                 }
                 _ => {
-                    *live = live_of(index, fields, &self.config)?;
+                    *live = live_of(index, fields, &self.config, None, snap.commit)?;
                     None
                 }
             };
@@ -725,9 +868,40 @@ mod imp {
         }
     }
 
+    impl Drop for TextIndex {
+        fn drop(&mut self) {
+            // commit, let running merges finish (they write metadata too), then sync
+            let close = || -> Result<()> {
+                if !self.healthy() {
+                    return Ok(());
+                }
+                let mut live = self.live.lock();
+                if live.committed != live.applied {
+                    self.commit_locked(&mut live)?;
+                }
+                if let Some(w) = live.writer.take() {
+                    w.wait_merging_threads().map_err(text_err)?;
+                }
+                match live.dir.clone() {
+                    Some(dir) => Ok(dir.checkpoint()?),
+                    None => Ok(()),
+                }
+            };
+            if let Err(e) = close() {
+                tracing::warn!("full-text index checkpoint on close: {e}");
+            }
+        }
+    }
+
     /// Evaluate a `text:query` call against the snapshot's text view.
     pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
         let snap = &ctx.snap;
+        if snap.historical {
+            return Err(Error::HistoryUnsupported(format!(
+                "full-text search is only available at the head; this query reads commit {}",
+                snap.commit
+            )));
+        }
         let Some(view) = &snap.text else {
             return Err(Error::invalid(
                 "dataset has no full-text index; enable it with `sparkles text-index` or --text",
@@ -859,6 +1033,8 @@ mod imp {
                 requested: hits.len() as u64,
             }));
         }
+        // the per-query memory budget, before the output is built
+        ctx.check_output(hits.len(), vars.len())?;
         // columns
         let mut t = Table::new(vars.to_vec());
         let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));

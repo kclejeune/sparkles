@@ -919,3 +919,120 @@ async fn full_text_endpoints() {
         false
     );
 }
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_reports_name_the_commit_they_validated() {
+    let s = server();
+    let (r, h) = sparql_update(&s.app, "INSERT DATA { <urn:v> <urn:p> 1 }", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let head = commit_header(&h);
+    let req = Request::post("/ds/shacl")
+        .header(header::CONTENT_TYPE, "text/turtle")
+        .body(Body::from(NAME_SHAPES.to_string()))
+        .unwrap();
+    let (r, h) = send_h(&s.app, req).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(commit_header(&h), head);
+    assert!(h.get("sparkles-dataset-id").is_some());
+}
+
+#[tokio::test]
+async fn vector_status_lists_packed_predicates() {
+    let s = server();
+    let ds = s.state.get("ds").unwrap();
+    let nt = r#"<urn:v1> <urn:emb> "[1, 0]"^^<urn:x-sparkles:vector> .
+<urn:v2> <urn:emb> "[0, 1]"^^<urn:x-sparkles:vector> .
+<urn:v3> <urn:emb> "[1, 2, 3]"^^<urn:x-sparkles:vector> .
+<urn:v4> <urn:emb> "[oops]"^^<urn:x-sparkles:vector> .
+"#;
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    // in the base index, which is what gets packed
+    ds.store.compact().unwrap();
+    let before = get_json(&s.app, "/$/vector/ds").await;
+    assert_eq!(before["predicates"], serde_json::json!([]));
+    assert_eq!(before["budgetBytes"], sparkles::vector::budget());
+    let q = "SELECT ?s { ?s <urn:x-sparkles:vectorSearch> (<urn:emb> <urn:v1> 2) }";
+    let r = get_uri(
+        &s.app,
+        &format!(
+            "/ds/sparql?query={}",
+            percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC)
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get_json(&s.app, "/$/vector/ds").await;
+    let p = &j["predicates"][0];
+    assert_eq!(p["predicate"], "urn:emb");
+    assert_eq!(p["malformed"], 1);
+    assert_eq!(
+        p["dimensions"],
+        serde_json::json!([{ "dimension": 2, "vectors": 2 }, { "dimension": 3, "vectors": 1 }])
+    );
+    assert!(j["usedBytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        get_uri(&s.app, "/$/vector/nope").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+async fn get_uri(app: &Router, uri: &str) -> Resp {
+    send(app, Request::get(uri).body(Body::empty()).unwrap()).await
+}
+
+async fn get_json(app: &Router, uri: &str) -> J {
+    let r = get_uri(app, uri).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+#[tokio::test]
+async fn prefixes_can_be_set_read_and_removed() {
+    let s = server();
+    let post = |body: &'static str| {
+        Request::post("/ds/prefixes")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let r = send(&s.app, post("prefix=zz&uri=http%3A%2F%2Fzz.example%2F")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        get_json(&s.app, "/ds/prefixes?prefix=zz").await["uri"],
+        "http://zz.example/"
+    );
+    let j = get_json(&s.app, "/ds/prefixes?uri=http%3A%2F%2Fzz.example%2F").await;
+    assert_eq!(j["prefixes"], serde_json::json!(["zz"]));
+    assert_eq!(
+        get_json(&s.app, "/ds/prefixes").await["prefixes"]["zz"],
+        "http://zz.example/"
+    );
+    // the UI's listing sees it too
+    assert_eq!(
+        get_json(&s.app, "/$/prefixes/ds").await["prefixes"]["zz"],
+        "http://zz.example/"
+    );
+    // invalid names and IRIs
+    let r = send(&s.app, post("prefix=1bad&uri=http%3A%2F%2Fx%2F")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = send(&s.app, post("prefix=ok&uri=not%20an%20iri")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let del = || {
+        Request::delete("/ds/prefixes?prefix=zz")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(send(&s.app, del()).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(send(&s.app, del()).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_uri(&s.app, "/ds/prefixes?prefix=zz").await.status,
+        StatusCode::NOT_FOUND
+    );
+}

@@ -59,6 +59,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/text/{ds}/rebuild", &["POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
+    ("/$/vector/{ds}", &["GET"]),
+    ("/$/snapshots/{ds}", &["GET", "POST"]),
+    ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
+    ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/auth/config", &["GET"]),
     ("/$/auth/login", &["POST"]),
     ("/$/auth/logout", &["POST"]),
@@ -81,6 +85,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/upload", &["POST"]),
     ("/{ds}/explain", &["GET", "POST"]),
     ("/{ds}/shacl", &["POST"]),
+    ("/{ds}/prefixes", &["*"]),
 ];
 
 /// Routes of the CLI grants: they identify the client by a device code or a PKCE
@@ -144,19 +149,34 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
         | "/$/commits/{ds}/{reference}"
+        | "/$/vector/{ds}"
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
         | "/{ds}/get"
         | "/{ds}/shacl" => Dataset(Read),
-        "/$/reason/{ds}" | "/$/text/{ds}" if get => Dataset(Read),
+        "/$/reason/{ds}"
+        | "/$/text/{ds}"
+        | "/$/snapshots/{ds}"
+        | "/$/snapshots/{ds}/{name}"
+        | "/$/history/{ds}"
+        | "/{ds}/prefixes"
+            if get =>
+        {
+            Dataset(Read)
+        }
+        // prefixes are dataset content; snapshots and history retention pin storage
+        "/{ds}/prefixes" => Dataset(Write),
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
         | "/$/backup/{ds}"
-        | "/$/cache/clear/{ds}" => Dataset(Admin),
+        | "/$/cache/clear/{ds}"
+        | "/$/snapshots/{ds}"
+        | "/$/snapshots/{ds}/{name}"
+        | "/$/history/{ds}" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
         "/{ds}/data" if get => Dataset(Read),
         "/{ds}/data" => Dataset(Write),
@@ -270,7 +290,11 @@ pub struct AuthReport {
 }
 
 pub fn json_error(status: StatusCode, msg: &str) -> Response {
-    (status, axum::Json(json!({ "error": msg }))).into_response()
+    let body = json!({ "error": msg });
+    let mut r = (status, axum::Json(body.clone())).into_response();
+    // the error gets the request id like every other error body
+    r.extensions_mut().insert(crate::http::ErrorJson(body));
+    r
 }
 
 /// `WWW-Authenticate` challenges of a 401. `Basic` is left out for script fetches (no
@@ -362,7 +386,14 @@ pub const CSRF_HEADER: &str = "x-sparkles-csrf";
 pub async fn middleware(State(st): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
     #[cfg(feature = "auth")]
     if let Some(auth) = st.auth.clone() {
-        return enforce(&st, &auth, req, next).await;
+        let id = req
+            .headers()
+            .get(&crate::obs::X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let mut resp = enforce(&st, &auth, req, next).await;
+        crate::http::add_request_id(&mut resp, id);
+        return resp;
     }
     let _ = &st;
     req.extensions_mut().insert(Principal::local());
