@@ -89,11 +89,68 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 ## Performance
 
-See `docs/BENCHMARKS.md`. On 1.05M triples (hyperfine over HTTP, result caches off),
-Sparkles bulk-loads in 0.8 s (QLever 1.5 s, Jena TDB2 4.3 s). It is the fastest of the
-three on 9 of 11 queries, within 1.6× of QLever on the other two, and 1.3–11× faster
-than Fuseki throughout. At 10.5M triples the load takes 6.1 s (QLever 9.1 s, TDB2
-42.6 s).
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The comparison uses hyperfine over HTTP
+with result caches off, and every engine's row count is checked before timing.
+
+| | 1.05M triples | 10.5M triples |
+|---|---|---|
+| Bulk load | **0.8 s** (QLever 1.5 s, TDB2 4.3 s) | **6.1 s** (QLever 9.1 s, TDB2 42.6 s) |
+| Fastest of the three | 18 of 20 queries | 16 of 20 queries |
+| Loses to QLever | `range-topk` (1.4×), `minus` (≈) | `range-topk` (1.8×), `types-grouped` (1.7×), `two-hop-count` (1.7×), `minus` (≈) |
+| vs. Fuseki | 1.3–19× faster; Fuseki errors on a `foaf:knows*` query | 1.4–180× faster |
+| Update latency (1 triple) | 10 ms (QLever 14, Fuseki 24) | 14 ms (QLever 18, Fuseki 20) |
+| Throughput, 16 clients | 657 q/s (QLever 505, Fuseki 58) | 116 q/s (QLever 57, Fuseki 5) |
+| Server memory | 176 MiB (QLever 172, Fuseki 1.9 GiB) | 824 MiB (**QLever 293**, Fuseki 3.7 GiB) |
+
+Where Sparkles still loses on performance:
+* **Range filters:** QLever skips blocks on range FILTERs.
+* **Metadata-only GROUP BY:** QLever answers these faster at 10M.
+* **Large two-way joins:** QLever pipelines them lazily.
+* **Memory:** Sparkles materializes every intermediate result and buffers whole
+  responses.
+* **Untested ground:** nothing above 10.5M triples, cold caches, standard benchmarks
+  (LUBM/BSBM/WatDiv) and sustained update workloads. QLever's design targets billions
+  of triples.
+
+## Where Sparkles still falls short
+
+The performance side (which queries and datasets we lose on, and what the benchmarks do
+not cover) is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#where-sparkles-loses). The
+feature gaps are:
+
+### vs. Apache Jena / Fuseki
+
+| Area | Jena / Fuseki has | Sparkles |
+|---|---|---|
+| Full-text search | jena-text (Lucene), `text:query` | ✗ none |
+| Spatial | GeoSPARQL (`geof:` functions, spatial index) | ✗ none |
+| Shape languages | ShEx (jena-shex) | ✗ SHACL only |
+| Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); must be re-run after updates; no inconsistency detection (`owl:Nothing`, `disjointWith`) |
+| Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
+| SPARQL extensions | property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, full `afn:`/`fn:` library | ✗ none of the extensions; common `fn:`/`afn:`/`math:` functions only |
+| SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
+| RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD only) |
+| Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` endpoint | ✗ none |
+| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); no metrics; datasets are configured by CLI flags / admin API only; prefixes are read-only |
+| SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
+| Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
+
+### vs. QLever
+
+| Area | QLever has | Sparkles |
+|---|---|---|
+| Scale | tested to tens of billions of triples (Wikidata, UniProt) | tested to 10.5M; the external-sort path is covered by tests but not measured at 100M+ |
+| Streaming execution | lazy, block-wise evaluation of scans, joins, filters and GROUP BY; results streamed to the client | every operator materializes its full result (bounded by a row limit); HTTP responses are serialized to a buffer before sending |
+| Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | not implemented (this is why `range-topk` loses) |
+| Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts use index runs instead) |
+| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | ✗ |
+| Vocabulary compression | FSST string compression, IRI-as-id encoding for numeric IRIs | front coding, no IRI encoding |
+| Named / pinned results, materialized views | `pin-result-with-name`, materialized views | result cache only (no pinning) |
+| Live query monitoring | websocket runtime-information updates | executed plan returned after completion only |
+
+Conversely, Sparkles provides Jena behaviour that QLever does not aim for: exact term
+identity (no lossy inlining), the Graph Store Protocol, Fuseki endpoints and admin API,
+materialized reasoning, SHACL validation, and an embedded library API.
 
 ## Notable optimizations adopted from QLever
 
