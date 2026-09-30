@@ -26,6 +26,8 @@ pub mod cache;
 pub mod capture;
 pub mod create;
 pub mod error;
+#[cfg(test)]
+mod fixture;
 pub mod gc;
 pub mod layout;
 pub mod lock;
