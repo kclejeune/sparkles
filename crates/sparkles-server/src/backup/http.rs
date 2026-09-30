@@ -4,15 +4,20 @@
 //! `server-admin`, except `GET /$/repositories`, open to every caller and filtered here
 //! (full entries for `server-admin`, `{name, type, readonly, reachable}` for callers
 //! with `admin` on some dataset, `[]` otherwise). `/$/backups/{ds}…` needs `read` (GET)
-//! or `admin` on `{ds}`; the handlers also check that the backup belongs to `{ds}` (by
-//! `dataset.name`, or the live dataset's id), answering `404` otherwise, and a restore
-//! needs `admin` on its target too. Errors are `{error, code}`
+//! or `admin` on `{ds}`; the handlers also check that the backup belongs to `{ds}`
+//! ([`Lineage`]), answering `404` otherwise, and a restore needs `admin` on its target
+//! too. Errors are `{error, code}`
 //! (`sparkles_backup::BackupError::body`, status `http_status`); tasks answer `202`
 //! with `Location` and the task.
 //!
 //! `--read-only` servers: backups can be created, verified and deleted, repositories
 //! tested, collected and their locks broken (on writable repositories); restores and
 //! changes to the registry answer `403 server-read-only`.
+//!
+//! Repositories registered here are held to what the backup config file allows
+//! (`BackupState::check_api`: named credential sources only, `fs` roots) and connect
+//! only where the server's outbound policy allows. Tasks started here are admitted
+//! first (`BackupState::admit`: `503 too-many-tasks` beyond the queue).
 
 use super::registry::{RepoEntry, no_such_repository};
 use super::{BackupState, ClaimSpec, ops};
@@ -321,10 +326,11 @@ async fn add_repository(
         Ok(())
     };
     exists(&b)?;
-    cfg.validate(std::slice::from_ref(&b.data_dir))?;
+    cfg.validate(&b.forbid)?;
+    let open_cfg = b.prepare(&cfg, ConfigSource::Api)?;
     let verify = query(&uri).get("verify").is_none_or(|v| v != "false");
-    let env = b.open_env(&cfg, !cfg.readonly);
-    let (repo, open_err) = match Repository::open(&cfg, &env).await {
+    let env = b.open_env(&cfg, ConfigSource::Api, !cfg.readonly);
+    let (repo, open_err) = match Repository::open(&open_cfg, &env).await {
         Ok(r) => (Some(Arc::new(r)), None),
         // an unreachable location is registered anyway, and shown unreachable
         Err(e) if e.code() == Code::RepositoryUnavailable => (None, Some(e)),
@@ -450,7 +456,8 @@ async fn put_repository(
         )
         .into());
     }
-    cfg.validate(std::slice::from_ref(&b.data_dir))?;
+    cfg.validate(&b.forbid)?;
+    b.check_api(&cfg)?;
     b.registry
         .update(&name, |e| {
             e.config = cfg.clone();
@@ -560,6 +567,7 @@ async fn verify_repository(State(st): St, Path(name): Path<String>, body: Bytes)
         .into());
     }
     b.open_repo(&name).await?;
+    let admission = b.admit()?;
     let id = st.next_task_id();
     let claim = b.claim(
         &id,
@@ -572,7 +580,7 @@ async fn verify_repository(State(st): St, Path(name): Path<String>, body: Bytes)
     let st2 = st.clone();
     let repo = name.clone();
     let task = st.start_task_opts(id, "backup-verify", "", Some(&name), true, move |h| {
-        let _claim = claim;
+        let _held = (claim, admission);
         let r = ops::verify(&st2, &repo, Vec::new(), req.level, h, Some(tx))
             .map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&r)?);
@@ -644,7 +652,8 @@ async fn gc_repository(
     }
     b.open_repo(&name).await?;
     let grace = Duration::from_secs_f64(hours * 3600.0);
-    let (task, rx) = ops::start_gc(&st, &name, req.dry_run, grace, p.id())?;
+    let admission = b.admit()?;
+    let (task, rx) = ops::start_gc(&st, &name, req.dry_run, grace, p.id(), Some(admission))?;
     Ok(accepted(started_task(&st, task, rx).await, None))
 }
 
@@ -687,14 +696,40 @@ async fn break_lock(
 
 // ---------------------------------------------------------------- backups ------
 
-/// Whether a manifest is a backup of `ds`: by name, or by the live dataset's id.
-fn belongs(m: &Manifest, ds: &str, live: Option<Uuid>) -> bool {
-    m.dataset.name == ds || Some(m.dataset.id) == live
+/// Which backups belong to `/$/backups/{ds}` for a caller. By dataset id, not by name
+/// alone: a dataset that reuses the name of a deleted one must not reach the backups
+/// of the old one (another tenant's data, perhaps).
+/// * the backups of the live dataset `ds` (its id);
+/// * those of the dataset it replaced by an in-place restore (its `forkedFrom` id,
+///   taken under the same name);
+/// * for `server-admin`, every backup taken of a dataset named `ds`; when no dataset
+///   `ds` is served (disaster recovery), that is all there is, so only `server-admin`
+///   sees them.
+struct Lineage {
+    live: Option<Uuid>,
+    replaced: Option<Uuid>,
+    by_name: bool,
 }
 
-/// The live dataset id of `ds`, if it is registered.
-fn live_id(st: &AppState, ds: &str) -> Option<Uuid> {
-    st.get(ds).map(|d| d.store.dataset_id())
+impl Lineage {
+    fn of(st: &AppState, ds: &str, p: &Principal) -> Lineage {
+        let d = st.get(ds);
+        Lineage {
+            live: d.as_ref().map(|d| d.store.dataset_id()),
+            replaced: d.and_then(|d| d.store.forked_from()).map(|f| f.id),
+            by_name: p.has(ServerPerm::ServerAdmin),
+        }
+    }
+
+    /// Whether a backup of the dataset `name` with id `id` belongs to `ds`.
+    fn shows(&self, ds: &str, name: &str, id: Uuid) -> bool {
+        Some(id) == self.live || (name == ds && (self.by_name || Some(id) == self.replaced))
+    }
+
+    /// `sameLineage`: taken of the live dataset or of the one it replaced.
+    fn same(&self, id: Uuid) -> bool {
+        Some(id) == self.live || Some(id) == self.replaced
+    }
 }
 
 /// Backup `name` of repository `repo`, if it belongs to `ds`; `404 no-such-backup`
@@ -702,6 +737,7 @@ fn live_id(st: &AppState, ds: &str) -> Option<Uuid> {
 async fn find_backup(
     st: &AppState,
     b: &BackupState,
+    p: &Principal,
     ds: &str,
     repo: &str,
     name: &str,
@@ -722,7 +758,7 @@ async fn find_backup(
         Err(e) if e.code() == Code::NoSuchBackup => return Err(hidden()),
         Err(e) => return Err(e.into()),
     };
-    if !belongs(&m, ds, live_id(st, ds)) {
+    if !Lineage::of(st, ds, p).shows(ds, &m.dataset.name, m.dataset.id) {
         return Err(hidden());
     }
     Ok((r, m))
@@ -730,9 +766,14 @@ async fn find_backup(
 
 /// `GET /$/backups/{ds}[?repository=]` → `DatasetBackups`, newest first, with
 /// `sameLineage`
-async fn dataset_backups(State(st): St, Path(ds): Path<String>, uri: Uri) -> Res {
+async fn dataset_backups(
+    State(st): St,
+    Extension(p): Extension<Principal>,
+    Path(ds): Path<String>,
+    uri: Uri,
+) -> Res {
     let b = backups(&st)?;
-    let live = live_id(&st, &ds);
+    let lineage = Lineage::of(&st, &ds, &p);
     let names: Vec<String> = match query(&uri).get("repository") {
         Some(r) => {
             b.registry.config(r)?;
@@ -762,9 +803,9 @@ async fn dataset_backups(State(st): St, Path(ds): Path<String>, uri: Uri) -> Res
         };
         let mut list: Vec<_> = list
             .into_iter()
-            .filter(|s| s.dataset.name == ds || Some(s.dataset.id) == live)
+            .filter(|s| lineage.shows(&ds, &s.dataset.name, s.dataset.id))
             .map(|mut s| {
-                s.same_lineage = Some(Some(s.dataset.id) == live);
+                s.same_lineage = Some(lineage.same(s.dataset.id));
                 s
             })
             .collect();
@@ -774,7 +815,7 @@ async fn dataset_backups(State(st): St, Path(ds): Path<String>, uri: Uri) -> Res
     out.sort_by(|a, b| b.completed.cmp(&a.completed));
     Ok(Json(DatasetBackups {
         dataset: ds,
-        dataset_id: live,
+        dataset_id: lineage.live,
         backups: out,
     })
     .into_response())
@@ -824,6 +865,7 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
         )
         .into());
     }
+    let admission = b.admit()?;
     let id = st.next_task_id();
     let claim = b.claim(
         &id,
@@ -842,7 +884,7 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
     };
     let repo2 = repo.clone();
     let task = st.start_task_opts(id, "backup-create", &ds_name, Some(&name), true, move |h| {
-        let _claim = claim;
+        let _held = (claim, admission);
         let s = ops::create(&st2, &ds, &repo2, args, h, Some(tx)).map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&s)?);
         Ok(format!(
@@ -855,9 +897,13 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
 }
 
 /// `GET /$/backups/{ds}/{repo}/{backup}` → `Backup`
-async fn get_backup(State(st): St, Path((ds, repo, name)): Path<(String, String, String)>) -> Res {
+async fn get_backup(
+    State(st): St,
+    Extension(p): Extension<Principal>,
+    Path((ds, repo, name)): Path<(String, String, String)>,
+) -> Res {
     let b = backups(&st)?;
-    let (r, m) = find_backup(&st, &b, &ds, &repo, &name).await?;
+    let (r, m) = find_backup(&st, &b, &p, &ds, &repo, &name).await?;
     let mut view = m.view(&repo);
     view.summary.verified = b.verified.get(r.id(), &name);
     Ok(Json(view).into_response())
@@ -871,7 +917,7 @@ async fn delete_backup(
 ) -> Res {
     let b = backups(&st)?;
     writable_repo(&b.registry.config(&repo)?)?;
-    find_backup(&st, &b, &ds, &repo, &name).await?;
+    find_backup(&st, &b, &p, &ds, &repo, &name).await?;
     ops::delete(&st, &b, &repo, &name, &p.id()).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -887,7 +933,7 @@ async fn restore_backup(
     let b = backups(&st)?;
     writable_server(&st)?;
     let req: RestoreRequest = parse(&body)?;
-    let (_, m) = find_backup(&st, &b, &ds, &repo, &name).await?;
+    let (_, m) = find_backup(&st, &b, &p, &ds, &repo, &name).await?;
     let target = req.target.clone().unwrap_or_else(|| ds.clone());
     if !crate::state::valid_name(&target) {
         return Err(BackupError::new(
@@ -967,6 +1013,7 @@ async fn restore_backup(
         }
     }
     drop(existing);
+    let admission = b.admit()?;
     let id = st.next_task_id();
     let claim = b.claim(
         &id,
@@ -1009,7 +1056,7 @@ async fn restore_backup(
     };
     let t2 = target.clone();
     let task = st.start_task_opts(id, "backup-restore", &ds, Some(&target), true, move |h| {
-        let _claim = claim;
+        let _held = (claim, admission);
         let d = ops::restore(&st2, args, h, Some(tx)).map_err(ops::task_error)?;
         h.set_detail(d);
         Ok(format!(
@@ -1027,12 +1074,14 @@ async fn restore_backup(
 /// `backup-verify`, `detail: VerifyReport`
 async fn verify_backup(
     State(st): St,
+    Extension(p): Extension<Principal>,
     Path((ds, repo, name)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Res {
     let b = backups(&st)?;
     let req: VerifyRequest = parse(&body)?;
-    find_backup(&st, &b, &ds, &repo, &name).await?;
+    find_backup(&st, &b, &p, &ds, &repo, &name).await?;
+    let admission = b.admit()?;
     let id = st.next_task_id();
     let claim = b.claim(
         &id,
@@ -1046,7 +1095,7 @@ async fn verify_backup(
     let st2 = st.clone();
     let n2 = name.clone();
     let task = st.start_task_opts(id, "backup-verify", &ds, Some(&name), true, move |h| {
-        let _claim = claim;
+        let _held = (claim, admission);
         let r = ops::verify(&st2, &repo, vec![n2.clone()], req.level, h, Some(tx))
             .map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&r)?);

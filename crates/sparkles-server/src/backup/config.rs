@@ -20,7 +20,22 @@
 //! schedule = "30 2 * * *"
 //! timezone = "Europe/Berlin"
 //! retention = { expire_after = "30d", min_count = 7, max_count = 60 }
+//!
+//! # what repositories registered through the HTTP API may use
+//! [api]
+//! fs_roots = ["/srv/backups"]
+//!
+//! [credentials.minio]
+//! source = "env"
+//! access_key_id_var = "MINIO_ACCESS_KEY"
+//! secret_access_key_var = "MINIO_SECRET_KEY"
 //! ```
+//!
+//! Repositories registered through the API are held to the operator's choices here:
+//! their credentials can only be one of the `[credentials.<name>]` sources (by name:
+//! `{"source": "named", "name": "minio"}`), never environment variables, files or the
+//! default provider chain of their own choosing; `fs` ones must lie under one of
+//! `[api] fs_roots` when it is set.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -43,6 +58,30 @@ pub struct ConfigFile {
     pub repositories: BTreeMap<String, RepoToml>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policies: BTreeMap<String, PolicyToml>,
+    /// `[credentials.<name>]`: credential sources repositories name
+    /// (`credentials = { source = "named", name = … }`), the only ones API
+    /// registrations may use
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, CredentialsToml>,
+    /// `[api]`
+    #[serde(default, skip_serializing_if = "ApiToml::is_empty")]
+    pub api: ApiToml,
+}
+
+/// `[api]`: limits of repositories registered through the HTTP API.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiToml {
+    /// absolute directories `fs` repositories must lie under (empty: anywhere outside
+    /// the server's own directories)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fs_roots: Vec<String>,
+}
+
+impl ApiToml {
+    fn is_empty(&self) -> bool {
+        self.fs_roots.is_empty()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -107,6 +146,10 @@ pub enum CredentialsToml {
     File {
         path: String,
     },
+    /// a `[credentials.<name>]` source
+    Named {
+        name: String,
+    },
 }
 
 impl From<CredentialsToml> for Credentials {
@@ -123,6 +166,7 @@ impl From<CredentialsToml> for Credentials {
                 session_token_var,
             },
             CredentialsToml::File { path } => Credentials::File { path },
+            CredentialsToml::Named { name } => Credentials::Named { name },
         }
     }
 }
@@ -141,6 +185,7 @@ impl From<&Credentials> for CredentialsToml {
                 session_token_var,
             },
             Credentials::File { path } => CredentialsToml::File { path },
+            Credentials::Named { name } => CredentialsToml::Named { name },
         }
     }
 }
@@ -303,9 +348,31 @@ impl ConfigFile {
         if f.version != 1 {
             bail!("unsupported version {} (expected 1)", f.version);
         }
-        for name in f.repositories.keys().chain(f.policies.keys()) {
+        for name in f
+            .repositories
+            .keys()
+            .chain(f.policies.keys())
+            .chain(f.credentials.keys())
+        {
             if !sparkles_backup::layout::valid_repo_name(name) {
                 bail!("invalid name {name:?}: use a-z, 0-9, '_' and '-' (max 64)");
+            }
+        }
+        for (name, c) in &f.credentials {
+            if matches!(c, CredentialsToml::Named { .. }) {
+                bail!("credentials {name:?}: a credential source cannot name another");
+            }
+        }
+        for (name, r) in &f.repositories {
+            if let Some(CredentialsToml::Named { name: n }) = &r.credentials
+                && !f.credentials.contains_key(n)
+            {
+                bail!("repository {name:?}: no [credentials.{n}] in this file");
+            }
+        }
+        for root in &f.api.fs_roots {
+            if !Path::new(root).is_absolute() {
+                bail!("[api] fs_roots: {root:?} is not an absolute path");
             }
         }
         Ok(f)
@@ -328,6 +395,14 @@ impl ConfigFile {
     /// The policies in API form.
     pub fn policy_configs(&self) -> Vec<PolicyConfig> {
         self.policies.iter().map(|(n, p)| p.to_config(n)).collect()
+    }
+
+    /// The credential sources in API form.
+    pub fn credential_sources(&self) -> BTreeMap<String, Credentials> {
+        self.credentials
+            .iter()
+            .map(|(n, c)| (n.clone(), c.clone().into()))
+            .collect()
     }
 }
 
@@ -381,6 +456,21 @@ prefix = "prod/sparkles"
 readonly = true
 credentials = { source = "env", access_key_id_var = "K", secret_access_key_var = "S" }
 
+[repositories.minio]
+type = "s3"
+bucket = "lab"
+endpoint = "http://127.0.0.1:9000"
+allow_http = true
+credentials = { source = "named", name = "lab" }
+
+[credentials.lab]
+source = "env"
+access_key_id_var = "LAB_KEY"
+secret_access_key_var = "LAB_SECRET"
+
+[api]
+fs_roots = ["/srv/backups"]
+
 [policies.nightly]
 repository = "s3-main"
 datasets = ["*"]
@@ -410,6 +500,13 @@ gc_after_retention = true
         assert!(matches!(dr.credentials, Credentials::Env { .. }));
         let local = repos.iter().find(|r| r.name == "local").unwrap();
         assert_eq!(local.credentials, Credentials::Default);
+        let minio = repos.iter().find(|r| r.name == "minio").unwrap();
+        assert_eq!(minio.credentials, Credentials::Named { name: "lab".into() });
+        assert!(matches!(
+            f.credential_sources()["lab"],
+            Credentials::Env { .. }
+        ));
+        assert_eq!(f.api.fs_roots, ["/srv/backups"]);
         let p = &f.policy_configs()[0];
         assert_eq!(p.name, "nightly");
         assert_eq!(p.retention.min_count, 7);
@@ -427,6 +524,9 @@ gc_after_retention = true
         // and through the API form
         let mut again = ConfigFile {
             version: 1,
+            // (no API form)
+            credentials: f.credentials.clone(),
+            api: f.api.clone(),
             ..Default::default()
         };
         for r in f.repository_configs() {
@@ -457,5 +557,18 @@ gc_after_retention = true
             )
             .is_err()
         );
+        // a named source must exist, and cannot name another
+        let e = ConfigFile::parse(
+            "version = 1\n[repositories.a]\ntype = \"s3\"\nbucket = \"b\"\ncredentials = { source = \"named\", name = \"x\" }\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("[credentials.x]"), "{e:#}");
+        assert!(
+            ConfigFile::parse(
+                "version = 1\n[credentials.a]\nsource = \"named\"\nname = \"b\"\n[credentials.b]\nsource = \"default\"\n"
+            )
+            .is_err()
+        );
+        assert!(ConfigFile::parse("version = 1\n[api]\nfs_roots = [\"rel\"]\n").is_err());
     }
 }

@@ -52,6 +52,11 @@ impl RepoType {
 }
 
 /// Where S3 credentials come from. Sparkles never stores secrets: only these references.
+///
+/// Repositories registered through the HTTP API may only use [`Named`](Self::Named)
+/// sources, which the operator defines in the server's backup config file: the other
+/// forms name environment variables, files or the instance's own credentials, which an
+/// API caller must not be able to send to an endpoint of their choice.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "source",
@@ -72,6 +77,10 @@ pub enum Credentials {
     },
     /// a JSON file `{accessKeyId, secretAccessKey, sessionToken?}`, re-read at each open
     File { path: String },
+    /// a credential source the server's operator defined under this name
+    /// (`[credentials.<name>]` of the backup config file); the server resolves it to
+    /// one of the other forms before opening the repository
+    Named { name: String },
 }
 
 /// S3 server-side encryption.

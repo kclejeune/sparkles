@@ -1436,3 +1436,419 @@ async fn e2e_gc_collects_the_blobs_of_deleted_backups() {
     assert!(d["keptYoung"].as_u64().unwrap() >= 1, "{d}");
     assert_eq!(d["deleted"], 0, "{d}");
 }
+
+// ------------------------------------------------ API registrations (security) ------
+
+/// Load backup config `text` into the server's registry (as a SIGHUP reload would).
+fn load_config(s: &Srv, text: &str) {
+    s.b()
+        .registry
+        .replace_config(&config::ConfigFile::parse(text).unwrap())
+        .unwrap();
+}
+
+/// An HTTP server on 127.0.0.1 answering every request with `403` and an S3 error
+/// body holding a secret; its port.
+async fn forbidding_endpoint() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut c, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf).await;
+                let body = "<Error><Code>AccessDenied</Code><Message>internal-secret-123</Message></Error>";
+                let res = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = c.write_all(res.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_registrations_name_credential_sources_and_honour_the_outbound_policy() {
+    let s = server(Opts {
+        // registered before this server's rules: ambient credentials
+        repos: vec![json!({"name": "old", "type": "s3", "bucket": "b",
+            "credentials": {"source": "env", "accessKeyIdVar": "HOME", "secretAccessKeyVar": "PATH"}})],
+        ..Default::default()
+    });
+    let keys = s.dir.path().join("keys.json");
+    std::fs::write(&keys, r#"{"accessKeyId": "AK", "secretAccessKey": "SK"}"#).unwrap();
+    load_config(
+        &s,
+        &format!(
+            "version = 1\n[credentials.lab]\nsource = \"file\"\npath = {:?}\n",
+            keys.display().to_string()
+        ),
+    );
+    let port = forbidding_endpoint().await;
+    let s3 = |endpoint: &str, credentials: J| {
+        json!({"name": "lab", "type": "s3", "bucket": "b", "endpoint": endpoint,
+            "allowHttp": true, "credentials": credentials})
+    };
+    let local = format!("http://127.0.0.1:{port}");
+    let named = json!({"source": "named", "name": "lab"});
+    // credentials the caller would pick: environment variables, files, the default chain
+    for c in [
+        json!({"source": "env", "accessKeyIdVar": "HOME", "secretAccessKeyVar": "PATH"}),
+        json!({"source": "file", "path": "/etc/shadow"}),
+        json!({"source": "default"}),
+    ] {
+        let r = post(&s.app, "/$/repositories", s3(&local, c)).await;
+        expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+        assert_eq!(r.body["field"], "credentials", "{}", r.body);
+    }
+    let r = post(
+        &s.app,
+        "/$/repositories",
+        s3(&local, json!({"source": "named", "name": "nope"})),
+    )
+    .await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    assert_eq!(r.body["field"], "credentials.name");
+    let r = post(
+        &s.app,
+        "/$/repositories",
+        json!({"name": "g", "type": "gcs", "bucket": "b"}),
+    )
+    .await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    // loopback, the metadata service and names resolving to them are refused by the
+    // server's default outbound policy
+    for e in [
+        local.clone(),
+        format!("http://localhost:{port}"),
+        "http://169.254.169.254".to_string(),
+        "http://[::ffff:127.0.0.1]:9000".to_string(),
+    ] {
+        let r = post(&s.app, "/$/repositories", s3(&e, named.clone())).await;
+        expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+        assert!(
+            r.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("outbound policy"),
+            "{e}: {}",
+            r.body
+        );
+    }
+    assert_eq!(
+        get(&s.app, "/$/repositories").await.body["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // allowed by the policy: the endpoint is contacted, and its answer is not echoed
+    *s.b().outbound.write() = sparkles::outbound::OutboundPolicy {
+        allow_private: true,
+        ..Default::default()
+    };
+    let r = post(&s.app, "/$/repositories", s3(&local, named.clone())).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    assert_eq!(r.body["credentials"], named);
+    assert_eq!(r.body["test"]["ok"], false, "{}", r.body);
+    let text = r.body.to_string();
+    assert!(text.contains("AccessDenied"), "{text}");
+    assert!(!text.contains("internal-secret-123"), "{text}");
+    let r = post(&s.app, "/$/repositories/lab/test", J::Null).await;
+    assert!(
+        !r.body.to_string().contains("internal-secret-123"),
+        "{}",
+        r.body
+    );
+    // a changed location is refused, other changes are checked like a registration
+    let mut changed = s3(
+        &local,
+        json!({"source": "env", "accessKeyIdVar": "A", "secretAccessKeyVar": "B"}),
+    );
+    let r = call(&s.app, "PUT", "/$/repositories/lab", None, changed.clone()).await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    changed["credentials"] = named.clone();
+    changed["maxConcurrency"] = json!(2);
+    let r = call(&s.app, "PUT", "/$/repositories/lab", None, changed).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // an entry with ambient credentials from before is not opened
+    let r = post(&s.app, "/$/repositories/old/test", J::Null).await;
+    assert_eq!(r.body["ok"], false);
+    assert!(
+        r.body.to_string().contains("credential source"),
+        "{}",
+        r.body
+    );
+}
+
+#[tokio::test]
+async fn fs_repositories_stay_out_of_the_servers_directories_and_under_the_api_roots() {
+    let s = server(Opts::default());
+    let outside = tempfile::tempdir().unwrap();
+    // a symbolic link into the data directory
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(s.dir.path(), outside.path().join("link")).unwrap();
+        let r = post(
+            &s.app,
+            "/$/repositories",
+            fs_repo("sneaky", &format!("{}/link/repo", outside.path().display())),
+        )
+        .await;
+        expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    }
+    let r = post(
+        &s.app,
+        "/$/repositories",
+        fs_repo("dots", &format!("{}/x/../../y", outside.path().display())),
+    )
+    .await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    // with [api] fs_roots, only below them
+    let root = outside.path().join("roots");
+    std::fs::create_dir_all(&root).unwrap();
+    load_config(
+        &s,
+        &format!(
+            "version = 1\n[api]\nfs_roots = [{:?}]\n",
+            root.display().to_string()
+        ),
+    );
+    let r = post(
+        &s.app,
+        "/$/repositories",
+        fs_repo("elsewhere", &format!("{}/else", outside.path().display())),
+    )
+    .await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    assert_eq!(r.body["field"], "path");
+    let r = post(
+        &s.app,
+        "/$/repositories",
+        fs_repo("inside", &format!("{}/r1", root.display())),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    // the directories of the server's config files
+    let conf = tempfile::tempdir().unwrap();
+    let file = conf.path().join("backup.toml");
+    std::fs::write(&file, "version = 1\n").unwrap();
+    let mut b = BackupState::new(s.dir.path(), Some(file.clone()), 1).unwrap();
+    b.forbid_config_dir(&conf.path().join("auth.toml"));
+    let cfg = RepoConfig {
+        name: "c".into(),
+        kind: RepoType::Fs,
+        path: Some(conf.path().join("repo").display().to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        cfg.validate(&b.forbid).unwrap_err().code(),
+        Code::InvalidConfig
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_tasks_beyond_the_queue_are_refused() {
+    let (s, _repo) = with_local(false).await;
+    let b = s.b();
+    let held: Vec<Admission> = (0..b.max_tasks * (1 + QUEUE_PER_SLOT))
+        .map(|_| b.admit().unwrap())
+        .collect();
+    assert_eq!(b.admit().err().unwrap().code(), Code::TooManyTasks);
+    for (uri, body) in [
+        ("/$/backups/ds", json!({"repository": "local"})),
+        ("/$/repositories/local/gc", json!({})),
+        ("/$/repositories/local/verify", json!({})),
+    ] {
+        let r = post(&s.app, uri, body).await;
+        expect(&r, StatusCode::SERVICE_UNAVAILABLE, "too-many-tasks");
+    }
+    drop(held);
+    backup_ds(&s, "b1").await;
+}
+
+// ---------------------------------------------- permissions and lineage (auth) ------
+
+/// Run a request as `user` and wait for its task; the task.
+#[cfg(feature = "auth")]
+async fn run_as(s: &Srv, user: &str, uri: &str, body: J) -> Task {
+    let r = call(&s.app, "POST", uri, Some(user), body).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{uri}: {}", r.body);
+    wait_task(&s.st, r.body["id"].as_str().unwrap()).await
+}
+
+#[cfg(feature = "auth")]
+fn names(r: &R) -> Vec<String> {
+    r.body["backups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_permissions_and_lineage() {
+    let s = server(Opts {
+        auth: true,
+        ..Default::default()
+    });
+    start(&s.st, &Handle::current());
+    let app = &s.app;
+    let repo = tempfile::tempdir().unwrap();
+    let r = call(
+        app,
+        "POST",
+        "/$/repositories",
+        Some("alice"),
+        json!({"name": "local", "type": "fs", "path": repo.path()}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    // anonymous callers and callers without admin anywhere see no repositories
+    let r = call(app, "GET", "/$/repositories", None, J::Null).await;
+    assert!(
+        r.status == StatusCode::UNAUTHORIZED || r.body["repositories"] == json!([]),
+        "{} {}",
+        r.status,
+        r.body
+    );
+    let r = call(app, "GET", "/$/repositories", Some("dave"), J::Null).await;
+    assert_eq!(r.body["repositories"], json!([]));
+    let r = call(app, "GET", "/$/repositories", Some("carol"), J::Null).await;
+    assert_eq!(
+        r.body["repositories"],
+        json!([{"name": "local", "type": "fs", "readonly": false, "reachable": true}])
+    );
+    // alice backs up secret; carol (admin on wiki*) backs up wiki
+    let t = run_as(
+        &s,
+        "alice",
+        "/$/backups/secret",
+        json!({"repository": "local", "name": "s1"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let t = run_as(
+        &s,
+        "carol",
+        "/$/backups/wiki",
+        json!({"repository": "local", "name": "w1"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    // the backup of secret is not reachable through wiki
+    for m in ["GET", "DELETE"] {
+        let r = call(app, m, "/$/backups/wiki/local/s1", Some("carol"), J::Null).await;
+        expect(&r, StatusCode::NOT_FOUND, "no-such-backup");
+    }
+    let r = call(
+        app,
+        "POST",
+        "/$/backups/wiki/local/s1/restore",
+        Some("carol"),
+        json!({"target": "wiki-s"}),
+    )
+    .await;
+    expect(&r, StatusCode::NOT_FOUND, "no-such-backup");
+    // a restore may only create a dataset its caller administers
+    let r = call(
+        app,
+        "POST",
+        "/$/backups/wiki/local/w1/restore",
+        Some("carol"),
+        json!({"target": "secret2"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert!(r.body.to_string().contains("/secret2"), "{}", r.body);
+    // dave reads wiki: its backups, but no changes, and not carol's tasks
+    let r = call(app, "GET", "/$/backups/wiki", Some("dave"), J::Null).await;
+    assert_eq!(names(&r), ["w1"]);
+    let r = call(
+        app,
+        "POST",
+        "/$/backups/wiki",
+        Some("dave"),
+        json!({"repository": "local"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let slow = call(
+        app,
+        "POST",
+        "/$/backups/wiki/local/w1/verify",
+        Some("carol"),
+        json!({"level": "restore"}),
+    )
+    .await;
+    assert_eq!(slow.status, StatusCode::ACCEPTED, "{}", slow.body);
+    let id = slow.body["id"].as_str().unwrap().to_string();
+    let r = call(
+        app,
+        "DELETE",
+        &format!("/$/tasks/{id}"),
+        Some("dave"),
+        J::Null,
+    )
+    .await;
+    assert!(
+        r.status == StatusCode::FORBIDDEN || r.status == StatusCode::NOT_FOUND,
+        "{} {}",
+        r.status,
+        r.body
+    );
+    wait_task(&s.st, &id).await;
+    // carol restores wiki in place: a new id, and its earlier backups still belong to it
+    let t = run_as(
+        &s,
+        "carol",
+        "/$/backups/wiki/local/w1/restore",
+        json!({"replace": true}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let r = call(app, "GET", "/$/backups/wiki", Some("carol"), J::Null).await;
+    assert_eq!(names(&r), ["w1"]);
+    assert_eq!(r.body["backups"][0]["sameLineage"], true);
+    // a new dataset under an old name does not inherit the old one's backups
+    assert!(s.st.delete("wiki").unwrap());
+    s.st.create("wiki", DbType::Persistent).unwrap();
+    let r = call(app, "GET", "/$/backups/wiki", Some("carol"), J::Null).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(names(&r).is_empty(), "{}", r.body);
+    let r = call(
+        app,
+        "GET",
+        "/$/backups/wiki/local/w1",
+        Some("carol"),
+        J::Null,
+    )
+    .await;
+    expect(&r, StatusCode::NOT_FOUND, "no-such-backup");
+    let r = call(
+        app,
+        "POST",
+        "/$/backups/wiki/local/w1/restore",
+        Some("carol"),
+        json!({"target": "wiki-old"}),
+    )
+    .await;
+    expect(&r, StatusCode::NOT_FOUND, "no-such-backup");
+    // a server admin still finds them by name, marked as another lineage
+    let r = call(app, "GET", "/$/backups/wiki", Some("alice"), J::Null).await;
+    assert_eq!(names(&r), ["w1"]);
+    assert_eq!(r.body["backups"][0]["sameLineage"], false);
+    // backups of a dataset that is gone: server admins only
+    assert!(s.st.delete("wiki").unwrap());
+    let r = call(app, "GET", "/$/backups/wiki", Some("carol"), J::Null).await;
+    assert!(names(&r).is_empty(), "{}", r.body);
+    let r = call(app, "GET", "/$/backups/wiki", Some("alice"), J::Null).await;
+    assert_eq!(names(&r), ["w1"]);
+    let t = run_as(&s, "alice", "/$/backups/wiki/local/w1/restore", json!({})).await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+}

@@ -174,7 +174,8 @@ impl Engine for ServerEngine {
     /// The GC task of `POST /$/repositories/{repo}/gc`, with the default grace period.
     fn start_gc(&self, st: &Arc<AppState>, repo: &str) -> Result<String, BackupError> {
         let grace = GcOptions::default().grace;
-        let (task, _) = super::ops::start_gc(st, repo, false, grace, "policy retention".into())?;
+        let (task, _) =
+            super::ops::start_gc(st, repo, false, grace, "policy retention".into(), None)?;
         Ok(task.id)
     }
 }
