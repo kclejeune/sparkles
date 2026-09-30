@@ -178,6 +178,37 @@ fn torn_wal_tails_are_dropped_and_damage_before_them_is_detected() {
 }
 
 #[test]
+fn an_unknown_wal_record_before_the_last_commit_is_not_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        upd(&s, "INSERT DATA { <urn:b> <urn:p> 2 }");
+    }
+    let path = wal(&root);
+    let good = std::fs::read(&path).unwrap();
+    // a damaged record type in the first transaction: truncating there would silently
+    // drop the second, acknowledged, commit
+    let mut bad = good.clone();
+    bad[0] = 0x7f;
+    std::fs::write(&path, &bad).unwrap();
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(e.to_string().contains("unknown record type"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), bad, "the WAL was modified");
+    // after the last commit record it is a torn tail, truncated as before
+    let mut torn = good.clone();
+    let mut rec = good[..33].to_vec();
+    rec[0] = 0x7f;
+    torn.extend_from_slice(&rec);
+    std::fs::write(&path, &torn).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, 2);
+    drop(s);
+    assert_eq!(std::fs::read(&path).unwrap(), good);
+}
+
+#[test]
 fn compaction_keeps_the_head_and_bulk_writes_are_commits() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

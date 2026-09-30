@@ -9,7 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::vocab::{read_varint, write_varint};
+use crate::vocab::write_varint;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -220,7 +220,8 @@ pub struct BlockMeta {
     pub row_start: u64,
 }
 
-const META_BYTES: usize = 8 * 4 * 2 + 8 + 4 * 4 + 4 + 8;
+/// Bytes of one block's metadata record in a `.meta` file.
+pub(crate) const META_BYTES: usize = 8 * 4 * 2 + 8 + 4 * 4 + 4 + 8;
 
 impl BlockMeta {
     fn write(&self, out: &mut Vec<u8>) {
@@ -234,7 +235,7 @@ impl BlockMeta {
         out.extend_from_slice(&self.rows.to_le_bytes());
         out.extend_from_slice(&self.row_start.to_le_bytes());
     }
-    fn read(b: &[u8]) -> BlockMeta {
+    pub(crate) fn read(b: &[u8]) -> BlockMeta {
         let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
         BlockMeta {
@@ -259,19 +260,60 @@ fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
     lz4_flex::compress_prepend_size(scratch)
 }
 
-fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
+/// Decode one compressed column of `rows` values. Damaged input is an error, never a
+/// panic: the size prefix must fit `rows` varints, and the values must use exactly the
+/// decompressed bytes.
+pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Vec<u64>> {
+    let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
+    let size = bytes
+        .get(..4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or_else(|| bad("shorter than its size prefix"))?;
+    // a varint takes at most 10 bytes: a larger size is damage (and would be allocated)
+    if size > rows.saturating_mul(10) {
+        return Err(bad(&format!(
+            "decompressed size {size} is too large for {rows} rows"
+        )));
+    }
     let raw = lz4_flex::decompress_size_prepended(bytes)
         .map_err(|e| Error::Corrupt(format!("block decompression: {e}")))?;
     let mut out = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut prev = 0u64;
     for _ in 0..rows {
-        let z = read_varint(&raw, &mut pos);
+        let z = read_varint_checked(&raw, &mut pos)
+            .ok_or_else(|| bad(&format!("holds fewer than {rows} values")))?;
         let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
         prev = prev.wrapping_add(d as u64);
         out.push(prev);
     }
+    if pos != raw.len() {
+        return Err(bad(&format!(
+            "{} bytes left after {rows} values",
+            raw.len() - pos
+        )));
+    }
     Ok(out)
+}
+
+/// [`read_varint`](crate::vocab::read_varint) that returns `None` at the end of `buf` or
+/// on a value longer than 64 bits.
+#[inline]
+pub(crate) fn read_varint_checked(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    let mut shift = 0;
+    loop {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        if shift > 63 {
+            return None;
+        }
+        v |= ((b & 0x7F) as u64) << shift;
+        if b < 0x80 {
+            return Some(v);
+        }
+        shift += 7;
+    }
 }
 
 /// Streaming writer for one permutation. Keys must arrive sorted and deduplicated.
@@ -441,7 +483,13 @@ impl PermIndex {
             .as_ref()
             .ok_or_else(|| Error::Corrupt("no data".into()))?;
         let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
-        decode_column(&data[off..off + m.col_len[c] as usize], m.rows as usize)
+        let bytes = data.get(off..off + m.col_len[c] as usize).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "{}.dat: block {b} ends past the end of the file",
+                self.perm.name()
+            ))
+        })?;
+        decode_column(bytes, m.rows as usize)
     }
 
     /// Block index range `[lo, hi)` that may contain keys with this prefix
@@ -758,5 +806,37 @@ mod tests {
         assert!(!idx.contains(&cache, &[5, 5, 10, 0]).unwrap());
         let est = idx.estimate(&[7]);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn damaged_blocks_are_errors_not_panics() {
+        let col: Vec<u64> = (0..1000u64).map(|i| i * 7).collect();
+        let mut scratch = Vec::new();
+        let enc = encode_column(&col, &mut scratch);
+        assert_eq!(decode_column(&enc, 1000).unwrap(), col);
+        // fewer values than rows, values left over, a size prefix that is too large
+        assert!(decode_column(&enc, 1001).is_err());
+        assert!(decode_column(&enc, 999).is_err());
+        let mut big = enc.clone();
+        big[3] = 0x7f;
+        assert!(decode_column(&big, 1000).is_err());
+        assert!(decode_column(&enc[..2], 1000).is_err());
+        // a truncated data file
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..100u64 {
+            w.push([i, 0, 0, 0]).unwrap();
+        }
+        w.finish(dir.path(), Perm::Spo).unwrap();
+        let dat = dir.path().join("spo.dat");
+        let len = std::fs::metadata(&dat).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dat)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        assert!(idx.decode_block(0).is_err());
     }
 }

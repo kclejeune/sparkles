@@ -369,3 +369,27 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+#[test]
+fn check_accepts_generations_kept_for_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = setup(&root, StoreOptions::default());
+        s.create_snapshot("v1", &At::Commit(1), None).unwrap();
+        s.compact().unwrap();
+    }
+    let leftovers = |root: &Path| -> Vec<String> {
+        let r = sparkles::check::check(root, &Default::default()).unwrap();
+        r.checks
+            .iter()
+            .flat_map(|c| c.issues.iter())
+            .filter(|i| i.message.contains("leftover"))
+            .filter_map(|i| i.file.clone())
+            .collect()
+    };
+    assert!(leftovers(&root).is_empty(), "{:?}", leftovers(&root));
+    // unpinned (hand-edited history.json gone), the old generation is a leftover again
+    std::fs::remove_file(root.join("history.json")).unwrap();
+    assert_eq!(leftovers(&root), ["gen-0001"]);
+}

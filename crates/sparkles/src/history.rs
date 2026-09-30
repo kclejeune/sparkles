@@ -506,6 +506,59 @@ pub(crate) fn scan_generations(
     Ok(out)
 }
 
+/// The non-current generations that named snapshots or the retention window keep,
+/// with what holds each, computed from the files alone (for read-only tools such as
+/// `sparkles check`), with the default generation limit.
+pub fn retained_offline(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    current: u32,
+) -> Result<BTreeMap<u32, Vec<Hold>>> {
+    let (pins, retention) = read_file(root, dataset_id)?;
+    if pins.is_empty() && retention == Retention::default() {
+        return Ok(BTreeMap::new());
+    }
+    let recs = commit::read_catalog(&root.join("commits.bin"))?
+        .map(|(_, r)| r)
+        .unwrap_or_default();
+    let head = recs.last().map_or(0, |c| c.seq);
+    let mut h = HistoryState::new(pins, retention);
+    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+        if no > current {
+            continue;
+        }
+        let dir = root.join(&name);
+        let end = if no == current {
+            head
+        } else {
+            recs.iter()
+                .rev()
+                .find(|c| c.generation == no)
+                .map(|c| c.seq.max(base.seq))
+                .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy))
+        };
+        h.gens.insert(
+            no,
+            GenEntry {
+                name,
+                dir,
+                base,
+                end,
+                fold_legacy,
+                bytes: 0,
+            },
+        );
+    }
+    let first = recs.first().map_or(0, |c| c.seq);
+    let ts = |s: u64| {
+        s.checked_sub(first)
+            .and_then(|i| recs.get(i as usize))
+            .map(|c| c.timestamp_ms)
+    };
+    let max_gens = crate::store::StoreOptions::default().history_max_generations;
+    Ok(h.needed(current, head, commit::now_ms(), &ts, max_gens))
+}
+
 /// Finish interrupted collections: remove `gen-*.deleting` directories.
 pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
     for e in std::fs::read_dir(root)? {

@@ -487,7 +487,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
 // ----------------------------------------------------------------- catalog ------
 
 const MAGIC: &[u8; 8] = b"SPKCMTS\0";
-const REC: usize = 64;
+pub(crate) const REC: usize = 64;
 
 fn crc32(parts: &[&[u8]]) -> u32 {
     let mut c = flate2::Crc::new();
@@ -512,7 +512,7 @@ fn encode_record(c: &CommitInfo) -> [u8; REC] {
     r
 }
 
-fn decode_record(r: &[u8]) -> Option<CommitInfo> {
+pub(crate) fn decode_record(r: &[u8]) -> Option<CommitInfo> {
     let crc = u32::from_le_bytes(r[60..64].try_into().unwrap());
     if crc != crc32(&[&r[..60]]) {
         return None;
@@ -545,7 +545,7 @@ fn encode_header(id: uuid::Uuid, first_seq: u64) -> [u8; REC] {
 }
 
 /// `(dataset id, first seq)` of a valid header.
-fn decode_header(h: &[u8]) -> Option<(uuid::Uuid, u64)> {
+pub(crate) fn decode_header(h: &[u8]) -> Option<(uuid::Uuid, u64)> {
     (h.len() >= REC
         && &h[0..8] == MAGIC
         && h[8..12] == 1u32.to_le_bytes()
