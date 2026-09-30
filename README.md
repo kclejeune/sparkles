@@ -105,23 +105,25 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 ## Performance
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). It compares Jena/Fuseki, QLever and
-Fluree using hyperfine over HTTP, with every result cache off and each engine measured
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). It compares Jena/Fuseki, QLever, Fluree
+and Oxigraph using hyperfine over HTTP, with every result cache off and each engine measured
 on its own. Before timing, it checks that all engines return the same answers.
 
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
-| Bulk load | **0.6 s** (Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.8 s** (QLever 9.1, Fluree 10.2, TDB2 42.6) |
-| Fastest of the four | 18 of 20 queries | 15 of 20 queries |
+| Bulk load | **0.6 s** (Oxigraph 1.0, Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.8 s** (Oxigraph 9.0, QLever 9.1, Fluree 10.2, TDB2 42.6) |
+| Fastest of the five | 18 of 20 queries | 15 of 20 queries |
 | Loses to QLever | none | `range-topk` 1.8×; `minus`, `path-plus` ≈ |
 | Loses to Fluree | `distinct-obj` 1.5×, `two-hop-count` ≈ | `contains` 1.6×, `distinct-obj` 1.6× |
 | vs. Fuseki | 1.6–35× faster; Fuseki errors on `foaf:knows*` | 2.7–690× faster (`path-plus` ≈) |
-| Update latency (1 triple, real insert) | **5.1 ms** (Fluree 6.5, QLever 11.8, Fuseki 41.7) | 7.6 ms (**Fluree 6.8**, QLever 15.8, Fuseki 38.6) |
-| Throughput, 16 clients | **940 q/s** (Fluree 497, QLever 408, Fuseki 53) | **191 q/s** (QLever 57, Fluree 51, Fuseki 7) |
-| Server memory | 364 MiB (**QLever 225**, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 897 MiB (**QLever 362 MiB**, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
+| vs. Oxigraph | 2.5–44× faster (`path-plus` ≈) | 10–435× faster (`path-plus` ≈) |
+| Update latency (1 triple, real insert) | **5.1 ms** (Fluree 6.5, Oxigraph 11.2, QLever 11.8, Fuseki 41.7) | 7.6 ms (**Fluree 6.8**, Oxigraph 10.7, QLever 15.8, Fuseki 38.6) |
+| Throughput, 16 clients | **940 q/s** (Fluree 497, QLever 408, Fuseki 53, Oxigraph 25) | **191 q/s** (QLever 57, Fluree 51, Fuseki 7, Oxigraph 2) |
+| Server memory | 364 MiB (**QLever 225**, Oxigraph 890, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 897 MiB (**QLever 362 MiB**, Oxigraph 2.3 GiB, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
 
 The Sparkles column was re-measured after the latest executor and allocator changes;
-the other engines' numbers are from the earlier run on the same machine and data.
+the other engines' numbers are from earlier runs on the same machine and data (Oxigraph's
+the same day, after the others).
 Against QLever at 10.5M, Sparkles wins 17 of 20 queries, several by 7–24×
 (`distinct-obj`, `contains`, `regex-iri`, `lang-filter`, `knows-reach`, `count-all`).
 Fluree is 1.5–60× slower than Sparkles on general joins, OPTIONAL, subqueries, grouping,
@@ -216,6 +218,30 @@ Where Sparkles is ahead:
     folds updates into an in-memory delta and compacts on request.
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the head-to-head numbers.
+
+### vs. Oxigraph
+
+[Oxigraph](https://github.com/oxigraph/oxigraph) (MIT / Apache-2.0) is a Rust RDF
+database and toolkit on RocksDB. Sparkles is built on Oxigraph's libraries: `oxrdf`,
+`oxttl`/`oxrdfio`, `spargebra`, `sparesults` and `oxsdatatypes` supply its term model,
+parsers, serializers, SPARQL parser and XSD datatypes. The storage engine, query planner
+and executor are Sparkles' own. So the two share the front end and differ in how
+queries run.
+
+| Area | Oxigraph has | Sparkles |
+|---|---|---|
+| Embedding | Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | Rust library (persistent or in-memory); no Python or WebAssembly bindings |
+| Storage | RocksDB (an LSM tree; C++), 9 index orders (6 for named graphs, 3 for the default graph) plus a string dictionary; updates in place; online backups via RocksDB checkpoints | immutable sorted blocks in 7 orders plus a WAL-logged in-memory delta, merged by compaction |
+| Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI; no spatial index) | ✗ none |
+| Write durability | a RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default write options) | the WAL is fsynced before a write is acknowledged |
+
+Oxigraph describes its query evaluation as "not optimized yet": it evaluates lazily,
+iterator by iterator over RocksDB scans. In the benchmarks it loads quickly (second to
+Sparkles) but joins, grouping, sorting and counting are 10–400× slower at 10.5M
+triples, and it serves 2 concurrent star-join queries/s against Sparkles' 191. Sparkles
+adds what Oxigraph leaves out: reasoning, SHACL, full-text and vector search, point-in-time
+reads, authentication and per-dataset permissions, Fuseki's admin API, budgets and a
+result cache, and the web UI.
 
 ## Notable optimizations adopted from QLever
 

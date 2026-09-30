@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Load + query benchmark: Sparkles vs Apache Jena (TDB2 + Fuseki) vs QLever vs Fluree,
-# via hyperfine.
+# Load + query benchmark: Sparkles vs Apache Jena (TDB2 + Fuseki) vs QLever vs Fluree vs
+# Oxigraph, via hyperfine.
 #
 #   scripts/bench.sh [N_PEOPLE] [WORKDIR]
 #
 # All engines are queried over HTTP (SPARQL protocol, TSV results) so JVM start-up is not
 # measured. No engine may answer from a result cache: Sparkles runs with
 # --result-cache-mb 0, QLever with --cache-max-size-single-entry 0B (and its cache is also
-# cleared before every timed run), and Fuseki and Fluree have none. Before timing, every
+# cleared before every timed run), and Fuseki, Fluree and Oxigraph have none. Before timing, every
 # engine's answer to every query is fingerprinted (scripts/bench-answers.py) and
 # compared: an engine whose answer differs in value from the majority is footnoted and
 # not ranked. Timed samples that fail are reported as errors, with the failure count.
 # Results go to WORKDIR/results/*.{md,json} and a combined
 # WORKDIR/results/summary.md.
 #
-# Jena, Fuseki and QLever come from nixpkgs when not on PATH. Fluree (BUSL-1.1, not in
+# Jena, Fuseki, QLever and Oxigraph come from nixpkgs when not on PATH. Fluree (BUSL-1.1, not in
 # nixpkgs) is the checksum-verified release binary, downloaded to WORKDIR (Linux x86_64 /
 # aarch64, macOS) unless FLUREE points at one.
 # Env: WARMUP (default 2), RUNS (default 10), SKIP_LOAD=1 to reuse existing indexes,
 # SKIP_QUERIES=1 to reuse existing per-query results (re-runs updates/throughput/RSS),
 # SKIP_PROBE=1 to skip the Sparkles memory probe (scripts/rss-probe.sh),
 # ANSWERS_ONLY=1 to re-check answers and rebuild the summary without timing anything,
-# ENGINES="sparkles jena qlever fluree" (default) to run a subset. Results are merged per engine
+# ENGINES="sparkles jena qlever fluree oxigraph" (default) to run a subset. Results are merged per engine
 # into existing results/*.json, so e.g. ENGINES=qlever re-measures only QLever and keeps
 # the other engines' numbers. QUERIES="name …" limits the row check and timings to those
 # queries (e.g. to resume after an engine crashed). SPARKLES_DB (default
@@ -44,7 +44,7 @@ cd "$WORK"
 nixbin() { # nixbin <pkg> <bin>
   if command -v "$2" >/dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
 }
-ENGINES=${ENGINES:-sparkles jena qlever fluree}
+ENGINES=${ENGINES:-sparkles jena qlever fluree oxigraph}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 if has jena; then
   TDBLOADER=$(nixbin apache-jena tdb2.tdbloader)
@@ -54,6 +54,7 @@ if has qlever; then
   QINDEX=$(nixbin qlever qlever-index)
   QSERVER=$(nixbin qlever qlever-server)
 fi
+if has oxigraph; then OXIGRAPH=$(nixbin oxigraph oxigraph); fi
 
 FLUREE_VERSION=${FLUREE_VERSION:-4.2.2}
 if has fluree && [ -z "${FLUREE:-}" ]; then
@@ -122,14 +123,27 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   # Fluree's bulk import (`create --from`) builds the index directly; without
   # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
   if has fluree; then LOAD+=(--prepare 'rm -rf fluree' --command-name fluree "mkdir -p fluree && cd fluree && $FLUREE init -q && $FLUREE --memory-budget-mb 8192 create bench --from ../data.nt --chunk-size-mb 16"); fi
+  # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
+  # it recommends before read-heavy workloads (`optimize`); both are timed as the load
+  if has oxigraph; then LOAD+=(--prepare 'rm -rf oxigraph.db' --command-name oxigraph "$OXIGRAPH load --location oxigraph.db --file data.nt && $OXIGRAPH optimize --location oxigraph.db"); fi
   hyperfine --runs 1 --style basic "${LOAD[@]}" --export-json results/load.new.json
   merge results/load.new.json results/load.json
 fi
 
 # ---------------------------------------------------------------------------- servers
-SPORT=3931; JPORT=3933; QPORT=3932; FPORT=3934
+SPORT=3931; JPORT=3933; QPORT=3932; FPORT=3934; OPORT=3935
 PIDS=()
-trap '[ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null; true' EXIT
+# on exit, also stop whatever listens on a selected engine's port: `fuseki-server` is a
+# wrapper script whose JVM outlives it
+stop_all() {
+  [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null
+  for p in "${PORT[@]}"; do
+    pid=$(ss -ltnp 2>/dev/null | grep ":$p " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+  done
+  true
+}
+trap stop_all EXIT
 wait_for() { for _ in $(seq 1 240); do curl -sf "$1" >/dev/null 2>&1 && return 0; sleep 0.5; done; echo "timeout waiting for $1" >&2; exit 1; }
 # per engine: result name, query endpoint, update command (printf template taking the
 # update file under queries/), port (for RSS)
@@ -160,6 +174,12 @@ if has fluree; then
   PIDS+=($!); wait_for "localhost:$FPORT/health"
   NAME[fluree]=fluree; URL[fluree]=localhost:$FPORT/v1/fluree/query/bench:main; PORT[fluree]=$FPORT
   UPDATE[fluree]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$FPORT/v1/fluree/update/bench:main"
+fi
+if has oxigraph; then
+  "$OXIGRAPH" serve --location "$WORK/oxigraph.db" --bind 127.0.0.1:$OPORT --timeout-s 600 > oxigraph.log 2>&1 &
+  PIDS+=($!); wait_for "localhost:$OPORT/query?query=ASK%7B%7D"
+  NAME[oxigraph]=oxigraph; URL[oxigraph]=localhost:$OPORT/query; PORT[oxigraph]=$OPORT
+  UPDATE[oxigraph]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$OPORT/update"
 fi
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
@@ -237,7 +257,8 @@ done
 # it before every run, so every timed request performs a real insertion. It goes into a
 # named graph so it never shows up in the default-graph queries above. Durability is each
 # engine's default: Sparkles fsyncs its WAL, TDB2 commits durably, QLever keeps updates
-# in memory only, and Fluree commits to its log (see docs/BENCHMARKS.md).
+# in memory only, Fluree commits to its log, and Oxigraph commits a RocksDB transaction
+# (see docs/BENCHMARKS.md).
 ask() { curl -sf --max-time 30 -H 'Accept: application/sparql-results+json' --data-urlencode query@queries/_ask.rq "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boolean"])' 2>/dev/null || echo error; }
 echo; echo "== update-latency"
 ARGS=()
@@ -292,7 +313,7 @@ fi # ANSWERS_ONLY
 python3 - "$WORK/results" "${NAMES[@]}" <<'EOF'
 import json, sys, os
 d, names = sys.argv[1], sys.argv[2:]
-ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree"]
+ORDER = ["sparkles", "jena-fuseki", "qlever", "fluree", "oxigraph"]
 LOADNAME = {"jena-fuseki": "jena-tdb2"}
 def load(f):
     return {r["command"]: r for r in json.load(open(f))["results"]} if os.path.exists(f) else {}

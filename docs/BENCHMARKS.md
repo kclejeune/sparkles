@@ -1,9 +1,11 @@
 # Benchmarks
 
 This document records how Sparkles compares with **Apache Jena (TDB2 + Fuseki)**,
-**QLever** and **Fluree** as of 2026-09-30, and where it still loses. The Sparkles column
+**QLever**, **Fluree** and **Oxigraph** as of 2026-09-30, and where it still loses. The Sparkles column
 was re-measured after the executor and allocator changes of that night (same machine,
 data and harness; the other engines' numbers are from the earlier run the same day).
+Oxigraph was added later that day, measured on its own with the same harness, machine
+and data.
 Reproduce it with
 `mise run bench [people] [workdir]` (or `scripts/bench.sh`). Add `--engines fluree` to
 re-measure one engine and merge its results into an existing run, or `--answers-only` to
@@ -32,6 +34,9 @@ re-check every engine's answers without timing anything.
       `FLUREE_PATH_MAX_VISITED=20000000` because the default 1M-node traversal cap
       rejects `knows-reach` at 10M.
     * No result cache.
+  * Oxigraph 0.5.11 (nixpkgs): loaded with `oxigraph load` followed by `oxigraph optimize`
+    (the compaction its loader recommends before read-heavy workloads; both are timed
+    as the load), served by `oxigraph serve --timeout-s 600`. No result cache.
 * **Method** (hyperfine):
   * Each engine was measured on its own, one after another, with only its own server
     running and nothing else heavy on the machine.
@@ -42,7 +47,9 @@ re-check every engine's answers without timing anything.
     fetched as SPARQL JSON and fingerprinted (`scripts/bench-answers.py`):
     * the row count;
     * the solution multiset by RDF term identity;
-    * the same multiset with numeric literals compared by value.
+    * the same multiset with numeric literals compared by value, to 12 significant
+      digits (engines print the non-terminating averages of `group-avg` to different
+      precisions).
 
     An engine whose answer differs *in value* from the majority would be marked † and
     not ranked. None did in these runs. A ‡ marks equal values returned as different RDF
@@ -54,7 +61,9 @@ re-check every engine's answers without timing anything.
     * Sparkles fsyncs its WAL before acknowledging;
     * TDB2 commits durably;
     * QLever keeps updates in memory only;
-    * Fluree uses its default commit path.
+    * Fluree uses its default commit path;
+    * Oxigraph commits a RocksDB transaction with RocksDB's default write options (the
+      WAL is written but not fsynced).
   * **Throughput:** 160 `star-join` requests from 16 parallel clients.
   * **Memory:** server RSS after the run.
 * **Machine:** Intel Core Ultra X7 358H (16 threads), 30 GB RAM, NVMe, Linux 6.18. The
@@ -62,66 +71,68 @@ re-check every engine's answers without timing anything.
 
 ## Results: 1.05M triples
 
-| query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) |
-|---|---:|---:|---:|---:|
-| **load** (s) | **0.58** | 4.34 | 1.54 | 1.35 |
-| count-all | **5.1 ± 0.3** | 148.3 ± 28.1 | 15.3 ± 3.8 ‡ | 6.5 ± 2.2 |
-| types-grouped | **6.4 ± 1.8** | 63.0 ± 11.0 | 19.1 ± 4.2 ‡ | 30.5 ± 8.8 |
-| star-join | **26.7 ± 3.8** | 42.4 ± 3.9 | 48.2 ± 8.0 ‡ | 38.2 ± 5.5 |
-| two-hop-count | 17.2 ± 5.7 | 276.1 ± 13.8 | 47.4 ± 3.3 ‡ | **17.0 ± 5.7** |
-| range-topk | **8.6 ± 2.5** ‡ | 64.2 ± 1.9 | 10.3 ± 4.6 | 40.1 ± 5.2 |
-| optional-count | **8.1 ± 2.8** | 67.2 ± 1.9 | 17.4 ± 6.9 ‡ | 34.0 ± 7.1 |
-| contains | **8.2 ± 2.3** | 42.9 ± 9.8 | 82.1 ± 11.1 ‡ | 24.4 ± 5.5 |
-| group-avg | **17.5 ± 2.4** | 171.6 ± 9.4 | 26.8 ± 9.5 | 70.3 ± 15.6 |
-| path-plus | **8.0 ± 3.1** | 15.0 ± 6.3 | 19.5 ± 1.0 ‡ | 17.7 ± 5.9 |
-| distinct-obj | 11.3 ± 3.6 | 86.0 ± 16.3 | 50.5 ± 7.8 ‡ | **7.4 ± 4.1** |
-| export-500k | **154.6 ± 3.0** | 394.6 ± 8.2 | 662.6 ± 16.7 | 221.8 ± 13.7 |
-| predicate-counts | **6.1 ± 0.4** | 212.1 ± 10.8 | 32.3 ± 7.0 ‡ | 69.7 ± 8.2 |
-| order-by-full | **65.1 ± 14.3** | 471.5 ± 8.0 | 144.1 ± 5.2 | 100.5 ± 9.1 |
-| optional-chain | **24.6 ± 3.6** | 186.9 ± 8.4 | 93.0 ± 4.1 | 1465.9 ± 111.2 |
-| minus | **14.7 ± 5.3** | 42.1 ± 10.3 | 21.2 ± 2.7 ‡ | 26.2 ± 25.6 |
-| subquery-agg | **6.3 ± 2.6** | 57.9 ± 11.8 | 16.8 ± 1.4 ‡ | 38.9 ± 4.9 |
-| regex-iri | **12.8 ± 5.8** | 64.3 ± 13.0 | 82.7 ± 11.4 ‡ | 81.0 ± 12.8 |
-| knows-reach | **21.9 ± 5.9** | error ¹ | 97.8 ± 13.5 ‡ | 63.0 ± 11.3 |
-| distinct-join | **26.3 ± 4.2** | 311.8 ± 14.9 | 51.7 ± 9.6 | 99.0 ± 11.0 |
-| lang-filter | **8.2 ± 2.2** | 34.4 ± 8.1 | 61.8 ± 15.6 ‡ | 14.2 ± 5.0 |
-| **update** (1-triple INSERT DATA) | **5.1 ± 0.4** | 41.7 ± 2.1 | 11.8 ± 3.5 | 6.5 ± 0.9 |
-| **throughput** star-join, 16 clients (queries/s) | **940** | 53 | 408 | 497 |
-| **server RSS** after the run (MiB) | 364 | 1744 | 225 | 2275 |
+| query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
+|---|---:|---:|---:|---:|---:|
+| **load** (s) | **0.58** | 4.34 | 1.54 | 1.35 | 0.98 |
+| count-all | **5.1 ± 0.3** | 148.3 ± 28.1 | 15.3 ± 3.8 ‡ | 6.5 ± 2.2 | 223.1 ± 2.2 |
+| types-grouped | **6.4 ± 1.8** | 63.0 ± 11.0 | 19.1 ± 4.2 ‡ | 30.5 ± 8.8 | 47.6 ± 6.8 |
+| star-join | **26.7 ± 3.8** | 42.4 ± 3.9 | 48.2 ± 8.0 ‡ | 38.2 ± 5.5 | 322.1 ± 3.3 |
+| two-hop-count | 17.2 ± 5.7 | 276.1 ± 13.8 | 47.4 ± 3.3 ‡ | **17.0 ± 5.7** | 682.3 ± 4.2 |
+| range-topk | **8.6 ± 2.5** ‡ | 64.2 ± 1.9 | 10.3 ± 4.6 | 40.1 ± 5.2 | 72.8 ± 5.8 |
+| optional-count | **8.1 ± 2.8** | 67.2 ± 1.9 | 17.4 ± 6.9 ‡ | 34.0 ± 7.1 | 97.6 ± 3.9 |
+| contains | **8.2 ± 2.3** | 42.9 ± 9.8 | 82.1 ± 11.1 ‡ | 24.4 ± 5.5 | 115.4 ± 2.4 |
+| group-avg | **17.5 ± 2.4** | 171.6 ± 9.4 ‡ | 26.8 ± 9.5 ‡ | 70.3 ± 15.6 ‡ | 270.8 ± 4.2 |
+| path-plus | **8.0 ± 3.1** | 15.0 ± 6.3 | 19.5 ± 1.0 ‡ | 17.7 ± 5.9 | 8.2 ± 3.1 |
+| distinct-obj | 11.3 ± 3.6 | 86.0 ± 16.3 | 50.5 ± 7.8 ‡ | **7.4 ± 4.1** | 81.7 ± 6.0 |
+| export-500k | **154.6 ± 3.0** | 394.6 ± 8.2 | 662.6 ± 16.7 | 221.8 ± 13.7 | 1323.7 ± 7.2 |
+| predicate-counts | **6.1 ± 0.4** | 212.1 ± 10.8 | 32.3 ± 7.0 ‡ | 69.7 ± 8.2 | 255.3 ± 7.0 |
+| order-by-full | **65.1 ± 14.3** | 471.5 ± 8.0 | 144.1 ± 5.2 | 100.5 ± 9.1 | 2770.0 ± 13.2 |
+| optional-chain | **24.6 ± 3.6** | 186.9 ± 8.4 | 93.0 ± 4.1 | 1465.9 ± 111.2 | 310.2 ± 5.4 |
+| minus | **14.7 ± 5.3** | 42.1 ± 10.3 | 21.2 ± 2.7 ‡ | 26.2 ± 25.6 | 36.1 ± 4.2 |
+| subquery-agg | **6.3 ± 2.6** | 57.9 ± 11.8 | 16.8 ± 1.4 ‡ | 38.9 ± 4.9 | 32.9 ± 5.9 |
+| regex-iri | **12.8 ± 5.8** | 64.3 ± 13.0 | 82.7 ± 11.4 ‡ | 81.0 ± 12.8 | 144.3 ± 2.5 |
+| knows-reach | **21.9 ± 5.9** | error ¹ | 97.8 ± 13.5 ‡ | 63.0 ± 11.3 | 310.7 ± 3.8 |
+| distinct-join | **26.3 ± 4.2** | 311.8 ± 14.9 | 51.7 ± 9.6 | 99.0 ± 11.0 | 556.7 ± 2.2 |
+| lang-filter | **8.2 ± 2.2** | 34.4 ± 8.1 | 61.8 ± 15.6 ‡ | 14.2 ± 5.0 | 82.8 ± 5.7 |
+| **update** (1-triple INSERT DATA) | **5.1 ± 0.4** | 41.7 ± 2.1 | 11.8 ± 3.5 | 6.5 ± 0.9 | 11.2 ± 3.7 |
+| **throughput** star-join, 16 clients (queries/s) | **940** | 53 | 408 | 497 | 25 |
+| **server RSS** after the run (MiB) | 364 | 1744 | 225 | 2275 | 890 |
 
 ## Results: 10.5M triples
 
-| query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) |
-|---|---:|---:|---:|---:|
-| **load** (s) | **4.75** | 42.57 | 9.12 | 10.19 |
-| count-all | **5.1 ± 0.6** | 1200.5 ± 13.1 | 37.9 ± 2.0 ‡ | 5.2 ± 0.4 |
-| types-grouped | **5.5 ± 1.6** | 3776.9 ± 857.1 | 8.4 ± 0.5 ‡ | 113.2 ± 5.9 |
-| star-join | **40.7 ± 6.3** | 275.7 ± 47.2 | 113.6 ± 10.7 ‡ | 135.5 ± 13.0 |
-| two-hop-count | **29.9 ± 2.3** | 2739.2 ± 7.4 | 61.8 ± 8.9 ‡ | 41.0 ± 1.6 |
-| range-topk | 40.2 ± 3.1 | 592.2 ± 4.4 | **21.9 ± 1.8** | 138.5 ± 12.7 |
-| optional-count | **22.1 ± 0.4** | 997.1 ± 164.3 | 39.5 ± 1.3 ‡ | 113.1 ± 13.1 |
-| contains | 35.2 ± 4.7 | 2398.5 ± 669.6 | 557.0 ± 13.9 ‡ | **22.2 ± 0.7** |
-| group-avg | **82.5 ± 6.3** | 3663.1 ± 575.8 | 91.4 ± 5.4 | 493.9 ± 16.4 |
-| path-plus | 12.2 ± 3.9 | **10.1 ± 3.3** | 11.0 ± 1.6 ‡ | 67.2 ± 16.4 |
-| distinct-obj | 9.2 ± 0.9 | 1135.5 ± 122.7 | 222.6 ± 16.9 ‡ | **5.8 ± 0.3** |
-| export-500k | **151.7 ± 1.4** | 415.7 ± 10.6 | 562.6 ± 13.1 | 287.8 ± 12.1 |
-| predicate-counts | **25.7 ± 7.1** | 2086.8 ± 14.5 | 70.7 ± 18.2 ‡ | 474.2 ± 7.5 |
-| order-by-full | **400.3 ± 27.7** | 11353.7 ± 417.9 | 1167.4 ± 21.0 | 2106.9 ± 35.7 |
-| optional-chain | **105.4 ± 2.8** | 2687.8 ± 279.2 | 481.5 ± 12.6 | OOM ² |
-| minus | 23.0 ± 4.0 | 1301.6 ± 771.6 | **22.0 ± 2.5** ‡ | 57.9 ± 5.8 |
-| subquery-agg | **17.6 ± 5.1** | 686.2 ± 312.8 | 20.3 ± 1.6 ‡ | 122.6 ± 10.7 |
-| regex-iri | **46.2 ± 8.7** | 1906.4 ± 116.4 | 509.7 ± 19.5 ‡ | 673.1 ± 13.2 |
-| knows-reach | **138.0 ± 2.5** | error ¹ | 1086.1 ± 21.0 ‡ | 564.4 ± 12.7 |
-| distinct-join | **68.2 ± 2.9** | 3380.5 ± 9.7 | 182.7 ± 11.4 | 1577.2 ± 27.4 |
-| lang-filter | **28.3 ± 4.2** | 1575.8 ± 888.8 | 310.5 ± 19.1 ‡ | 30.1 ± 3.7 |
-| **update** (1-triple INSERT DATA) | 7.6 ± 4.0 | 38.6 ± 3.8 | 15.8 ± 1.0 | **6.8 ± 0.3** |
-| **throughput** star-join, 16 clients (queries/s) | **191** | 7 | 57 | 51 |
-| **server RSS** after the run (MiB) | 897 | 3968 | 362 | 3204 |
+| query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
+|---|---:|---:|---:|---:|---:|
+| **load** (s) | **4.75** | 42.57 | 9.12 | 10.19 | 9.02 |
+| count-all | **5.1 ± 0.6** | 1200.5 ± 13.1 | 37.9 ± 2.0 ‡ | 5.2 ± 0.4 | 2232.8 ± 88.4 |
+| types-grouped | **5.5 ± 1.6** | 3776.9 ± 857.1 | 8.4 ± 0.5 ‡ | 113.2 ± 5.9 | 364.0 ± 4.3 |
+| star-join | **40.7 ± 6.3** | 275.7 ± 47.2 | 113.6 ± 10.7 ‡ | 135.5 ± 13.0 | 4230.1 ± 90.7 |
+| two-hop-count | **29.9 ± 2.3** | 2739.2 ± 7.4 | 61.8 ± 8.9 ‡ | 41.0 ± 1.6 | 6986.3 ± 111.4 |
+| range-topk | 40.2 ± 3.1 | 592.2 ± 4.4 | **21.9 ± 1.8** | 138.5 ± 12.7 | 574.1 ± 9.8 |
+| optional-count | **22.1 ± 0.4** | 997.1 ± 164.3 | 39.5 ± 1.3 ‡ | 113.1 ± 13.1 | 793.0 ± 10.1 |
+| contains | 35.2 ± 4.7 | 2398.5 ± 669.6 | 557.0 ± 13.9 ‡ | **22.2 ± 0.7** | 1104.6 ± 8.1 |
+| group-avg | **82.5 ± 6.3** | 3663.1 ± 575.8 ‡ | 91.4 ± 5.4 ‡ | 493.9 ± 16.4 ‡ | 3485.9 ± 8.4 |
+| path-plus | 12.2 ± 3.9 | 10.1 ± 3.3 | 11.0 ± 1.6 ‡ | 67.2 ± 16.4 | **8.2 ± 4.0** |
+| distinct-obj | 9.2 ± 0.9 | 1135.5 ± 122.7 | 222.6 ± 16.9 ‡ | **5.8 ± 0.3** | 682.7 ± 5.1 |
+| export-500k | **151.7 ± 1.4** | 415.7 ± 10.6 | 562.6 ± 13.1 | 287.8 ± 12.1 | 1711.7 ± 26.1 |
+| predicate-counts | **25.7 ± 7.1** | 2086.8 ± 14.5 | 70.7 ± 18.2 ‡ | 474.2 ± 7.5 | 2384.6 ± 18.0 |
+| order-by-full | **400.3 ± 27.7** | 11353.7 ± 417.9 | 1167.4 ± 21.0 | 2106.9 ± 35.7 | 42401.4 ± 188.8 |
+| optional-chain | **105.4 ± 2.8** | 2687.8 ± 279.2 | 481.5 ± 12.6 | OOM ² | 4070.2 ± 25.1 |
+| minus | 23.0 ± 4.0 | 1301.6 ± 771.6 | **22.0 ± 2.5** ‡ | 57.9 ± 5.8 | 342.4 ± 5.9 |
+| subquery-agg | **17.6 ± 5.1** | 686.2 ± 312.8 | 20.3 ± 1.6 ‡ | 122.6 ± 10.7 | 177.7 ± 4.4 |
+| regex-iri | **46.2 ± 8.7** | 1906.4 ± 116.4 | 509.7 ± 19.5 ‡ | 673.1 ± 13.2 | 2278.1 ± 10.3 |
+| knows-reach | **138.0 ± 2.5** | error ¹ | 1086.1 ± 21.0 ‡ | 564.4 ± 12.7 | 4084.4 ± 23.9 |
+| distinct-join | **68.2 ± 2.9** | 3380.5 ± 9.7 | 182.7 ± 11.4 | 1577.2 ± 27.4 | 5402.9 ± 18.8 |
+| lang-filter | **28.3 ± 4.2** | 1575.8 ± 888.8 | 310.5 ± 19.1 ‡ | 30.1 ± 3.7 | 607.6 ± 5.1 |
+| **update** (1-triple INSERT DATA) | 7.6 ± 4.0 | 38.6 ± 3.8 | 15.8 ± 1.0 | **6.8 ± 0.3** | 10.7 ± 4.3 |
+| **throughput** star-join, 16 clients (queries/s) | **191** | 7 | 57 | 51 | 2 |
+| **server RSS** after the run (MiB) | 897 | 3968 | 362 | 3204 | 2317 |
 
 ‡ Same values, different RDF terms. QLever returns integers (counts, ages) as
 `xsd:int` where the data and the other engines use `xsd:integer`. Sparkles writes
 `xsd:decimal` values in XSD 1.1 canonical form (`"175000.5"` for the data's
-`"175000.50"`).
+`"175000.50"`). In `group-avg` the averages agree to 12 significant digits; Sparkles and
+Oxigraph (which share the `oxsdatatypes` decimal type) print the same digits, and the
+others print fewer or more.
 
 1. Fuseki 5.1 fails `knows-reach` (`<person/0> foaf:knows* ?x`) at both sizes with a
    `StackOverflowError` in TDB2's node cache. At 10.5M the failure also left the cache
@@ -156,25 +167,27 @@ changed latency. Sparkles-only 10.5M runs of the default build against the glibc
 * load 4.95 vs 5.5 s.
 
 jemalloc and glibc with fixed mmap thresholds were also measured and were slower.
-The four-engine tables above have not been re-run with this build yet. Sparkles'
+The engine comparison tables above have not been re-run with this build yet. Sparkles'
 server RSS after its 10.5M run is now 947 MiB.
 
 Index size at 10.5M:
 
-| Sparkles | QLever | Fluree (including its commit log) | TDB2 |
-|---:|---:|---:|---:|
-| 286 MB | 277 MB | 413 MB | 1.4 GB |
+| Sparkles | QLever | Fluree (including its commit log) | TDB2 | Oxigraph (after `optimize`) |
+|---:|---:|---:|---:|---:|
+| 286 MB | 277 MB | 413 MB | 1.4 GB | 1.5 GB |
 
 Peak RSS during the Sparkles bulk load: 1.9 GB.
 
 ## Where Sparkles loses
 
-Sparkles is the fastest of the four on 18 of 20 queries at 1.05M and 15 of 20 at 10.5M.
+Sparkles is the fastest of the five on 18 of 20 queries at 1.05M and 15 of 20 at 10.5M.
 Head to head:
 * **vs. QLever:** it wins all 20 at 1.05M and 17 of 20 at 10.5M.
 * **vs. Fluree:** it wins 18 of 20 at 1.05M and 18 of 20 at 10.5M.
 * **vs. Jena/Fuseki:** it wins every query except `path-plus` at 10.5M (within noise).
   Fuseki is 1.6–35× slower at 1.05M and 2.7–690× slower on the other queries at 10.5M.
+* **vs. Oxigraph:** it wins all 20 at 1.05M (median 12×) and 19 of 20 at 10.5M (median
+  40×); `path-plus` at 10.5M is within noise (8.2 vs 12.2 ms).
 
 ### Specific benchmarks
 
@@ -184,7 +197,7 @@ Head to head:
 | `contains` (`COUNT` + `FILTER(CONTAINS(?name, "Ada"))`) | Fluree | 1.6× at 10M (Sparkles 3× faster at 1M) | The filter tests stored vocabulary keys in parallel; most of the remaining time is materializing the 1M-row name column first. |
 | `distinct-obj` (`COUNT(DISTINCT ?o)` over `foaf:knows`) | Fluree | 1.6× at 10M, 1.5× at 1M | Sparkles counts runs in the object-sorted index without materializing rows, but walks the 2.5M rows block by block on one thread. |
 | `two-hop-count` | Fluree | tie at 1M (17.2 vs 17.0 ms) | Counted from per-key runs of both sides; Sparkles is 1.4× faster than Fluree at 10M. |
-| `minus`, `path-plus` | QLever, Jena | within noise at 10M | A few ms of `curl` overhead dominates both. |
+| `minus`, `path-plus` | QLever, Oxigraph | within noise at 10M | A few ms of `curl` overhead dominates both. |
 | Single-triple update latency | Fluree | 1.1× at 10M (6.8 vs 7.6 ms) | Sparkles fsyncs its WAL and publishes a new snapshot before acknowledging. Fluree documents that it indexes in the background. |
 | Memory: server RSS after the run | QLever | 1.6× at 1M (364 vs 225 MiB), 2.5× at 10M (897 vs 362 MiB) | Sparkles materializes every intermediate result and keeps a 1 GiB decoded-block cache (about 450 MiB filled here); QLever streams lazily and uses a memory-limited allocator. |
 | Large results | QLever / Jena (in principle) | — | Sparkles serializes the whole response in memory before sending. The others stream. `export-500k` is still fastest in Sparkles at this size, but memory grows with result size. |
@@ -214,6 +227,26 @@ It uses about 6× the memory at 1.05M (2.2 GiB vs 364 MiB).
 
 Jena/Fuseki wins no query at 1.05M. Its one advantage is that it streams results
 (see the memory row).
+
+Oxigraph loads quickly (0.98 s at 1.05M, second to Sparkles, and 9.0 s at 10.5M
+including `optimize`) and follows a single path fast (`path-plus`). Every query that
+joins, groups, sorts or counts over many rows is an order of magnitude slower, and the
+gap grows with the data:
+
+| Query | Oxigraph slower by (1.05M / 10.5M) |
+|---|---|
+| `count-all` | 44× / 435× |
+| `two-hop-count` | 40× / 233× |
+| `order-by-full` | 43× / 106× (42 s at 10.5M) |
+| `star-join` | 12× / 104× |
+| `predicate-counts` | 42× / 93× |
+| `distinct-join` | 21× / 79× |
+| `export-500k` | 8.6× / 11× |
+| `subquery-agg` | 5.2× / 10× |
+
+Its throughput is 25 q/s at 1.05M and 2 q/s at 10.5M (940 and 191 for Sparkles), and
+its server used 890 MiB and 2.3 GiB after the runs. Its update latency (11.2 and
+10.7 ms) is behind only Sparkles' and Fluree's, without an fsync per commit.
 
 ### What the benchmark does not cover (so no claims either way)
 

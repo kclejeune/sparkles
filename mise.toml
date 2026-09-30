@@ -142,7 +142,7 @@ flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--skip-queries" help="reuse per-query results; re-run updates / throughput / memory"
 flag "--answers-only" help="only re-check answers across engines and rebuild the summary"
-flag "--engines <list>" default="sparkles jena qlever fluree" help="engines to (re-)measure; others' results are kept"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to (re-)measure; others' results are kept"
 flag "--queries <list>" help="only these queries (default: all 20)"
 '''
 run = '''

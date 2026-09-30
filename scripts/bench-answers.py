@@ -13,7 +13,8 @@ things for <engine> under <query-name> in <answers.json>:
   compare case-insensitively. Blank nodes compare by position, not label, which is a
   weaker policy than graph isomorphism but enough for these queries.
 * `value`: the same digest with numeric literals compared by value, so for example
-  `"34.50"^^xsd:decimal` equals `"34.5"^^xsd:decimal`.
+  `"34.50"^^xsd:decimal` equals `"34.5"^^xsd:decimal`, rounded to 12 significant digits
+  (engines print non-terminating decimals such as averages to different precisions).
 
 Solutions are compared as multisets over variables sorted by name, since ORDER BY ties
 may be broken differently and engines list the result variables in different orders.
@@ -27,7 +28,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 NUMERIC = {XSD + t for t in (
@@ -51,7 +52,11 @@ def term(t, by_value):
         dt = t.get("datatype", XSD + "string")
         if by_value and dt in NUMERIC:
             try:
-                v = Decimal(t["value"])
+                # 12 significant digits: the precision of a non-terminating decimal
+                # (an AVG) is implementation-defined
+                with localcontext() as c:
+                    c.prec = 12
+                    v = +Decimal(t["value"])
                 return ("num", str(v.normalize()) if v == v else "NaN")
             except InvalidOperation:
                 pass
