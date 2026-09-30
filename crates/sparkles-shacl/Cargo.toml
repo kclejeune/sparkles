@@ -1,0 +1,22 @@
+[package]
+name = "sparkles-shacl"
+description = "SHACL Core / SHACL-SPARQL validation for Sparkles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles.workspace = true
+oxrdf.workspace = true
+oxrdfio.workspace = true
+oxttl.workspace = true
+oxsdatatypes.workspace = true
+spargebra.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

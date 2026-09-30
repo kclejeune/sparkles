@@ -2182,6 +2182,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-shacl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxrdf",
+ "oxrdfio",
+ "oxsdatatypes",
+ "oxttl",
+ "rayon",
+ "regex",
+ "rustc-hash",
+ "spargebra",
+ "sparkles",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

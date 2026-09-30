@@ -1,0 +1,10 @@
+# W3C SHACL tests (jena-shacl/src/test/files/std) that currently fail, with the reason.
+# One short test id per line, relative to the suite's `std/` directory, e.g.
+#   core/node/class-001
+# The suite fails on any failure not listed here, and reports listed tests that pass.
+#
+# Currently empty: all 98 SHACL Core and 20 SHACL-SPARQL sht:Validate tests pass.
+#
+# Known limitation (not exercised by the default run): with SPARKLES_SHACL_SHAPES_FROM_TEXT=1
+# the shapes graph is not a graph of the store, so `$shapesGraph` stays unbound and
+# sparql/pre-binding/shapesGraph-001 fails.

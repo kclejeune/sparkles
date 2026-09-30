@@ -11,6 +11,7 @@ repository = "https://github.com/kclejeune/sparkles"
 [workspace.dependencies]
 sparkles = { path = "crates/sparkles" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
+sparkles-shacl = { path = "crates/sparkles-shacl" }
 oxrdf = { version = "0.3", features = ["rdfc-10"] }
 oxrdfio = "0.2"
 oxttl = "0.2"
