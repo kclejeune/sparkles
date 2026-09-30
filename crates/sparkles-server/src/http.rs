@@ -15,7 +15,7 @@ use sparkles::index::Perm;
 use sparkles::io::Source;
 use sparkles::sparql::results::{self, LimitedWriter, SolutionsFormat};
 use sparkles::sparql::{QueryKind, QueryOptions};
-use sparkles::store::ReplaceTarget;
+use sparkles::store::{Chunk, ReplaceTarget};
 use sparkles::{Error, id::Id};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -938,6 +938,142 @@ fn gsp_target(params: &Params) -> Target {
     }
 }
 
+/// Size of the chunks of a streamed response body.
+const STREAM_CHUNK: usize = 64 << 10;
+
+/// A `Write` that hands [`STREAM_CHUNK`]-sized chunks to a streamed response body.
+/// Writes fail once the client has gone away.
+struct ChunkWriter {
+    tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
+    buf: Vec<u8>,
+    sent: u64,
+}
+
+impl ChunkWriter {
+    fn send(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_CHUNK));
+        self.sent += chunk.len() as u64;
+        self.tx
+            .blocking_send(Ok(Bytes::from(chunk)))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(b);
+        if self.buf.len() >= STREAM_CHUNK {
+            self.send()?;
+        }
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
+/// snapshot, serialized on a blocking thread and streamed, so memory stays flat and no
+/// result-size budget applies. An error after the first byte aborts the response (the
+/// client sees a truncated transfer); a client disconnect stops the serialization.
+fn stream_graph(
+    st: Arc<AppState>,
+    ds: Arc<Dataset>,
+    snap: Arc<sparkles::store::Snapshot>,
+    g: Option<Id>,
+    fmt: RdfFormat,
+) -> axum::body::Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _span = span.enter();
+        let mut w = ChunkWriter {
+            tx: tx.clone(),
+            buf: Vec::with_capacity(STREAM_CHUNK),
+            sent: 0,
+        };
+        let mut ser = RdfSerializer::from_format(fmt);
+        if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
+            for (p, ns) in ds.store.prefixes() {
+                if let Ok(s) = ser.clone().with_prefix(p, ns) {
+                    ser = s;
+                }
+            }
+        }
+        let mut quads = 0u64;
+        let written = (|| -> sparkles::Result<()> {
+            let mut s = ser.for_writer(&mut w);
+            let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
+            let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
+                if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
+                    if g.is_some() {
+                        s.serialize_triple(oxrdf::TripleRef::new(
+                            &q.subject,
+                            &q.predicate,
+                            &q.object,
+                        ))?;
+                    } else {
+                        s.serialize_quad(&q)?;
+                    }
+                    quads += 1;
+                }
+                Ok(())
+            };
+            // serialize while scanning: nothing but the current block is held
+            snap.scan(Perm::Gspo, &prefix, |c| {
+                match c {
+                    Chunk::Block(b, start, end) => {
+                        for i in start..end {
+                            write(&b.key(i))?;
+                        }
+                    }
+                    Chunk::Row(k) => write(&k)?,
+                }
+                Ok(true)
+            })?;
+            s.finish()?;
+            Ok(())
+        })()
+        .and_then(|()| Ok(w.send()?));
+        st.metrics
+            .add_response_bytes(Some(&ds.name), Op::Gsp, w.sent);
+        match written {
+            Ok(()) => tracing::debug!(quads, bytes = w.sent, "graph store stream finished"),
+            Err(_) if tx.is_closed() => {
+                tracing::debug!(
+                    quads,
+                    bytes = w.sent,
+                    "graph store stream: client disconnected"
+                )
+            }
+            Err(e) => {
+                tracing::warn!(quads, bytes = w.sent, "graph store stream aborted: {e}");
+                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+            }
+        }
+    });
+    axum::body::Body::from_stream(ChunkStream(rx))
+}
+
+/// The receiving end of a [`ChunkWriter`] as a body stream. It keeps answering `None`
+/// after the end, since the compression layer polls once more.
+struct ChunkStream(tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>);
+
+impl futures_util::Stream for ChunkStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
 async fn gsp(
     State(st): St,
     Path(name): Path<String>,
@@ -954,85 +1090,38 @@ async fn gsp(
             let quads = matches!(target, Target::Dataset);
             let fmt = rdf_format(&params, &headers, quads);
             let head = method == Method::HEAD;
-            let limit = st.limits.max_result_bytes;
-            blocking(move || {
-                let snap = ds.store.snapshot();
-                let seq = snap.commit;
-                let prefixes = ds.store.prefixes();
-                let g = match &target {
-                    Target::Default => Some(Id::DEFAULT_GRAPH),
-                    Target::Named(iri) => Some(
-                        snap.lookup_iri(iri)
-                            .filter(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0)
-                            .ok_or_else(|| {
-                                err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>"))
-                            })?,
-                    ),
-                    Target::Dataset => None,
-                };
-                let mut w = LimitedWriter::new(Vec::new(), limit, None);
-                let mut quads = 0u64;
-                if !head {
-                    let mut ser = RdfSerializer::from_format(fmt);
-                    if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-                        for (p, ns) in &prefixes {
-                            if let Ok(s) = ser.clone().with_prefix(p.clone(), ns.clone()) {
-                                ser = s;
-                            }
-                        }
-                    }
-                    let written = (|| -> sparkles::Result<()> {
-                        let mut s = ser.for_writer(&mut w);
-                        let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
-                        for k in snap.scan_keys(Perm::Gspo, &prefix)? {
-                            if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)) {
-                                if g.is_some() {
-                                    s.serialize_triple(oxrdf::TripleRef::new(
-                                        &q.subject,
-                                        &q.predicate,
-                                        &q.object,
-                                    ))?;
-                                } else {
-                                    s.serialize_quad(&q)?;
-                                }
-                                quads += 1;
-                            }
-                        }
-                        s.finish()?;
-                        Ok(())
-                    })();
-                    if let Err(e) = written {
-                        return Err(match w.classify(e) {
-                            Error::BudgetExceeded(b) => ApiError(
-                                StatusCode::INSUFFICIENT_STORAGE,
-                                json!({
-                                    "error": format!(
-                                        "{b}; use POST /$/backup/{} or `sparkles dump` for full exports",
-                                        ds.name
-                                    ),
-                                    "budget": b.kind,
-                                    "limit": b.limit,
-                                    "requested": b.requested,
-                                }),
-                            ),
-                            e => e.into(),
-                        });
-                    }
+            // resolve the graph (or 404) before the response starts
+            let (snap, g) = blocking({
+                let ds = ds.clone();
+                move || {
+                    let snap = ds.store.snapshot();
+                    let g = match &target {
+                        Target::Default => Some(Id::DEFAULT_GRAPH),
+                        Target::Named(iri) => Some(
+                            snap.lookup_iri(iri)
+                                .filter(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0)
+                                .ok_or_else(|| {
+                                    err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>"))
+                                })?,
+                        ),
+                        Target::Dataset => None,
+                    };
+                    Ok((snap, g))
                 }
-                let buf = w.into_inner();
-                let report = RequestReport {
-                    operation: Some(Op::Gsp),
-                    rows: Some(quads),
-                    response_bytes: Some(buf.len() as u64),
-                    ..Default::default()
-                };
-                Ok(report.attach(with_commit(
-                    ([(header::CONTENT_TYPE, results::rdf_media_type(fmt))], buf).into_response(),
-                    &ds,
-                    seq,
-                )))
             })
-            .await
+            .await?;
+            let seq = snap.commit;
+            let ct = [(header::CONTENT_TYPE, results::rdf_media_type(fmt))];
+            let resp = if head {
+                ct.into_response()
+            } else {
+                (ct, stream_graph(st.clone(), ds.clone(), snap, g, fmt)).into_response()
+            };
+            let report = RequestReport {
+                operation: Some(Op::Gsp),
+                ..Default::default()
+            };
+            Ok(report.attach(with_commit(resp, &ds, seq)))
         }
         Method::PUT | Method::POST => {
             if st.read_only {

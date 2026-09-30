@@ -518,21 +518,20 @@ async fn result_budget_fails_with_507() {
         get(&s.app, "/ds/sparql?query=ASK%20%7B%7D").await.status,
         StatusCode::OK
     );
-    // the Sparkles JSON format and Graph Store GET
+    // the Sparkles JSON format
     let r = get_with(&s.app, ALL, "accept", "application/x-sparkles+json").await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
+    // Graph Store GET streams, so the budget does not apply
     let r = get(&s.app, "/ds/data?default").await;
-    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
-    let j = r.json();
-    assert_eq!(j["budget"], "result-bytes");
-    assert!(j["error"].as_str().unwrap().contains("/$/backup/ds"), "{j}");
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.body.len() > 200);
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
             &m,
             r#"sparkles_budget_exceeded_total{dataset="ds",budget="result-bytes"}"#
         ),
-        Some(3.0),
+        Some(2.0),
         "{m}"
     );
     // `send` limits what is serialized
@@ -544,6 +543,62 @@ async fn result_budget_fails_with_507() {
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.body.len() > 200);
     assert_eq!(get(&s.app, "/ds/data?default").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn graph_store_get_streams_large_graphs() {
+    let s = server_with(|st| st.limits.max_result_bytes = Some(1024));
+    let ds = s.state.get("ds").unwrap();
+    // well past one 64 KiB chunk
+    let nt: String = (0..5000)
+        .map(|i| format!("<urn:s{i}> <urn:p> \"value number {i}\" .\n"))
+        .collect();
+    ds.store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let r = get_with(&s.app, "/ds/data", "accept", "application/n-quads").await;
+    assert_eq!(r.status, StatusCode::OK);
+    let mut got: Vec<&str> = std::str::from_utf8(&r.body).unwrap().lines().collect();
+    got.sort_unstable();
+    let mut dump = Vec::new();
+    ds.store.dump_nquads(&mut dump).unwrap();
+    let mut want: Vec<&str> = std::str::from_utf8(&dump).unwrap().lines().collect();
+    want.sort_unstable();
+    assert_eq!(got, want);
+    assert!(r.body.len() > 128 << 10);
+    // the streamed bytes are counted once the stream ends
+    let m = metrics(&s.app).await;
+    assert_eq!(
+        sample(
+            &m,
+            r#"sparkles_response_bytes_total{dataset="ds",operation="gsp"}"#
+        ),
+        Some(r.body.len() as f64),
+        "{m}"
+    );
+    // through the compression layer, which polls the body again after its end
+    let gz = Request::get("/ds/data")
+        .header(header::ACCEPT, "application/n-quads")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let r2 = send(&s.app, gz).await;
+    assert_eq!(r2.status, StatusCode::OK);
+    let mut plain = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&r2.body[..]), &mut plain)
+        .unwrap();
+    assert_eq!(plain, r.body);
+    // HEAD has the headers and no body
+    let head = Request::head("/ds/data?default")
+        .body(Body::empty())
+        .unwrap();
+    let r = send(&s.app, head).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.is_empty());
 }
 
 #[tokio::test]

@@ -573,6 +573,17 @@ impl Metrics {
         }
     }
 
+    /// Count the bytes of a streamed response, known only once the stream ends.
+    pub fn add_response_bytes(&self, dataset: Option<&str>, op: Op, bytes: u64) {
+        if !self.enabled {
+            return;
+        }
+        let (_, ds) = self.series(dataset);
+        ds.ops[op.index()]
+            .response_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
     pub fn forget(&self, dataset: &str) {
         self.datasets.write().remove(dataset);

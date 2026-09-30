@@ -398,7 +398,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
-| `--max-result-mb N` | `1024` | budget for the body of a query or Graph Store GET response (`0`: unlimited) |
+| `--max-result-mb N` | `1024` | budget for the body of a query response (`0`: unlimited); Graph Store GET streams and has none |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |

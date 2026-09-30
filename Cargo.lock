@@ -2545,6 +2545,7 @@ dependencies = [
  "clap",
  "flate2",
  "form_urlencoded",
+ "futures-util",
  "libc",
  "libmimalloc-sys",
  "mimalloc",

@@ -327,7 +327,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol (`query=` param, `application/sparql-query` body, or form). `default-graph-uri` / `named-graph-uri` supported. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol (`update=` form or `application/sparql-update` body). |
-| GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. |
+| GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
 | POST       | `/{ds}/shacl`         | SHACL validation (Fuseki `/{ds}/shacl`); see [SHACL validation](#shacl-validation). |
 
@@ -712,8 +712,9 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query or Graph Store GET response. For whole-dataset exports use `POST /$/backup/{ds}` or
-  `sparkles dump`.
+  query response. Graph Store GET is streamed from one snapshot in 64 KiB chunks, so it
+  needs no budget and suits whole-dataset exports; an error after the first byte aborts
+  the transfer, so the client sees a truncated response rather than a status code.
 * `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
 
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
