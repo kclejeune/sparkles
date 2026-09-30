@@ -33,10 +33,14 @@ pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats
     let t0 = Instant::now();
     let mut p = SparqlParser::new();
     if let Some(b) = &opts.base_iri {
-        p = p.with_base_iri(b).map_err(|e| Error::invalid(e.to_string()))?;
+        p = p
+            .with_base_iri(b)
+            .map_err(|e| Error::invalid(e.to_string()))?;
     }
     for (k, v) in &opts.prefixes {
-        p = p.with_prefix(k, v).map_err(|e| Error::invalid(e.to_string()))?;
+        p = p
+            .with_prefix(k, v)
+            .map_err(|e| Error::invalid(e.to_string()))?;
     }
     let parsed = p.parse_update(u)?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -68,13 +72,21 @@ fn graph_id(txn: &mut WriteTxn<'_>, g: &GraphName) -> Result<Id> {
     })
 }
 
-fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions, stats: &mut UpdateStats, store: &Store) -> Result<()> {
+fn run_op(
+    txn: &mut WriteTxn<'_>,
+    op: &GraphUpdateOperation,
+    opts: &QueryOptions,
+    stats: &mut UpdateStats,
+    store: &Store,
+) -> Result<()> {
     match op {
         GraphUpdateOperation::InsertData { data } => {
             let mut bnodes: FxHashMap<String, Id> = FxHashMap::default();
             for q in data {
                 let s = match &q.subject {
-                    oxrdf::NamedOrBlankNode::NamedNode(n) => txn.intern(&Term::NamedNode(n.clone()))?,
+                    oxrdf::NamedOrBlankNode::NamedNode(n) => {
+                        txn.intern(&Term::NamedNode(n.clone()))?
+                    }
                     oxrdf::NamedOrBlankNode::BlankNode(b) => bnode(txn, &mut bnodes, b),
                 };
                 let p = txn.intern(&Term::NamedNode(q.predicate.clone()))?;
@@ -110,15 +122,27 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                 }
             }
         }
-        GraphUpdateOperation::DeleteInsert { delete, insert, using, pattern } => {
+        GraphUpdateOperation::DeleteInsert {
+            delete,
+            insert,
+            using,
+            pattern,
+        } => {
             let snap = Arc::new(txn.view());
             let mut ctx = Ctx::new(snap);
             if let Some(QueryDataset { default, named }) = using {
-                ctx.dataset.default = Some(default.iter().map(|n| ctx.intern_term(&Term::NamedNode(n.clone()))).collect());
+                ctx.dataset.default = Some(
+                    default
+                        .iter()
+                        .map(|n| ctx.intern_term(&Term::NamedNode(n.clone())))
+                        .collect(),
+                );
                 // WITH is encoded as USING without USING NAMED: named graphs stay visible
-                ctx.dataset.named = named
-                    .as_ref()
-                    .map(|n| n.iter().map(|n| ctx.intern_term(&Term::NamedNode(n.clone()))).collect());
+                ctx.dataset.named = named.as_ref().map(|n| {
+                    n.iter()
+                        .map(|n| ctx.intern_term(&Term::NamedNode(n.clone())))
+                        .collect()
+                });
             }
             ctx.allow_service = opts.allow_service;
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
@@ -147,8 +171,12 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                     let gt = |t: &GroundTermPattern| -> Option<Id> {
                         match t {
                             GroundTermPattern::Variable(v) => get(&ctx, v.as_str(), i),
-                            GroundTermPattern::NamedNode(n) => ctx.snap.lookup_term(&Term::NamedNode(n.clone())),
-                            GroundTermPattern::Literal(l) => ctx.snap.lookup_term(&Term::Literal(l.clone())),
+                            GroundTermPattern::NamedNode(n) => {
+                                ctx.snap.lookup_term(&Term::NamedNode(n.clone()))
+                            }
+                            GroundTermPattern::Literal(l) => {
+                                ctx.snap.lookup_term(&Term::Literal(l.clone()))
+                            }
                             #[allow(unreachable_patterns)]
                             _ => None,
                         }
@@ -170,7 +198,9 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                                 None => None,
                             },
                             TermPattern::BlankNode(b) => Some(bnode(txn, &mut bnodes, b)),
-                            TermPattern::NamedNode(n) => Some(txn.intern(&Term::NamedNode(n.clone()))?),
+                            TermPattern::NamedNode(n) => {
+                                Some(txn.intern(&Term::NamedNode(n.clone()))?)
+                            }
                             TermPattern::Literal(l) => Some(txn.intern(&Term::Literal(l.clone()))?),
                             #[allow(unreachable_patterns)]
                             _ => None,
@@ -179,7 +209,9 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                     let s = tp(txn, &q.subject)?;
                     let o = tp(txn, &q.object)?;
                     let p = match &q.predicate {
-                        NamedNodePattern::NamedNode(n) => Some(txn.intern(&Term::NamedNode(n.clone()))?),
+                        NamedNodePattern::NamedNode(n) => {
+                            Some(txn.intern(&Term::NamedNode(n.clone()))?)
+                        }
                         NamedNodePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
                             Some(id) => to_store(txn, &ctx, id)?,
                             None => None,
@@ -187,13 +219,17 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                     };
                     let g = match &q.graph_name {
                         GraphNamePattern::DefaultGraph => Some(Id::DEFAULT_GRAPH),
-                        GraphNamePattern::NamedNode(n) => Some(txn.intern(&Term::NamedNode(n.clone()))?),
+                        GraphNamePattern::NamedNode(n) => {
+                            Some(txn.intern(&Term::NamedNode(n.clone()))?)
+                        }
                         GraphNamePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
                             Some(id) => to_store(txn, &ctx, id)?,
                             None => None,
                         },
                     };
-                    let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) else { continue };
+                    let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) else {
+                        continue;
+                    };
                     // well-formedness: subject not a literal, predicate an IRI
                     let view = &ctx;
                     if view.kind(s) == super::ctx::TermKind::Literal
@@ -215,7 +251,11 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
                 }
             }
         }
-        GraphUpdateOperation::Load { silent, source, destination } => {
+        GraphUpdateOperation::Load {
+            silent,
+            source,
+            destination,
+        } => {
             let r = load(txn, source, destination, stats);
             if r.is_err() && !silent {
                 return r;
@@ -225,7 +265,10 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
             let view = txn.view();
             let graphs: Vec<Id> = match graph {
                 GraphTarget::DefaultGraph => vec![Id::DEFAULT_GRAPH],
-                GraphTarget::NamedNode(n) => view.lookup_term(&Term::NamedNode(n.clone())).into_iter().collect(),
+                GraphTarget::NamedNode(n) => view
+                    .lookup_term(&Term::NamedNode(n.clone()))
+                    .into_iter()
+                    .collect(),
                 GraphTarget::NamedGraphs => view.graph_ids()?,
                 GraphTarget::AllGraphs => {
                     let mut v = view.graph_ids()?;
@@ -247,18 +290,32 @@ fn run_op(txn: &mut WriteTxn<'_>, op: &GraphUpdateOperation, opts: &QueryOptions
     Ok(())
 }
 
-fn named_pat(ctx: &Ctx, p: &NamedNodePattern, get: impl Fn(&str) -> Option<Id>, lookup: bool) -> Option<Id> {
+fn named_pat(
+    ctx: &Ctx,
+    p: &NamedNodePattern,
+    get: impl Fn(&str) -> Option<Id>,
+    lookup: bool,
+) -> Option<Id> {
     match p {
-        NamedNodePattern::NamedNode(n) if lookup => ctx.snap.lookup_term(&Term::NamedNode(n.clone())),
+        NamedNodePattern::NamedNode(n) if lookup => {
+            ctx.snap.lookup_term(&Term::NamedNode(n.clone()))
+        }
         NamedNodePattern::NamedNode(n) => Some(ctx.intern_term(&Term::NamedNode(n.clone()))),
         NamedNodePattern::Variable(v) => get(v.as_str()),
     }
 }
 
-fn graph_pat(ctx: &Ctx, g: &GraphNamePattern, get: impl Fn(&str) -> Option<Id>, lookup: bool) -> Option<Id> {
+fn graph_pat(
+    ctx: &Ctx,
+    g: &GraphNamePattern,
+    get: impl Fn(&str) -> Option<Id>,
+    lookup: bool,
+) -> Option<Id> {
     match g {
         GraphNamePattern::DefaultGraph => Some(Id::DEFAULT_GRAPH),
-        GraphNamePattern::NamedNode(n) if lookup => ctx.snap.lookup_term(&Term::NamedNode(n.clone())),
+        GraphNamePattern::NamedNode(n) if lookup => {
+            ctx.snap.lookup_term(&Term::NamedNode(n.clone()))
+        }
         GraphNamePattern::NamedNode(n) => Some(ctx.intern_term(&Term::NamedNode(n.clone()))),
         GraphNamePattern::Variable(v) => get(v.as_str()),
     }
@@ -273,7 +330,12 @@ fn bnode(txn: &mut WriteTxn<'_>, map: &mut FxHashMap<String, Id>, b: &BlankNode)
     id
 }
 
-fn load(txn: &mut WriteTxn<'_>, source: &NamedNode, dest: &GraphName, stats: &mut UpdateStats) -> Result<()> {
+fn load(
+    txn: &mut WriteTxn<'_>,
+    source: &NamedNode,
+    dest: &GraphName,
+    stats: &mut UpdateStats,
+) -> Result<()> {
     let url = source.as_str();
     let graph = match dest {
         GraphName::NamedNode(n) => Some(n.clone()),
@@ -289,11 +351,19 @@ fn load(txn: &mut WriteTxn<'_>, source: &NamedNode, dest: &GraphName, stats: &mu
             .header("Accept", "text/turtle, application/n-triples, application/n-quads, application/trig, application/rdf+xml, application/ld+json;q=0.9")
             .send()
             .map_err(|e| Error::invalid(format!("LOAD {url}: {e}")))?;
-        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let format = crate::io::format_for_media_type(&ct)
             .or_else(|| crate::io::format_for_path(std::path::Path::new(url)).map(|f| f.0))
             .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
-        let body = resp.bytes().map_err(|e| Error::invalid(e.to_string()))?.to_vec();
+        let body = resp
+            .bytes()
+            .map_err(|e| Error::invalid(e.to_string()))?
+            .to_vec();
         let mut s = Source::from_bytes(body, format, graph);
         s.base = Some(url.to_string());
         s

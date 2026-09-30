@@ -319,7 +319,9 @@ impl Snapshot {
         if self.delta.is_empty() {
             return base;
         }
-        let ins = Delta::range(&self.delta.ins[pi], prefix).take(10_000).count() as u64;
+        let ins = Delta::range(&self.delta.ins[pi], prefix)
+            .take(10_000)
+            .count() as u64;
         base + ins
     }
 
@@ -539,15 +541,19 @@ impl Store {
                 dvocab_len: u64::MAX,
                 union_default_graph: false,
             };
-            for (i, rec) in buf.chunks_exact(WAL_REC).enumerate() {
+            for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate() {
                 let q: [Id; 4] = std::array::from_fn(|j| {
-                    Id(u64::from_le_bytes(rec[1 + j * 8..9 + j * 8].try_into().unwrap()))
+                    Id(u64::from_le_bytes(
+                        rec[1 + j * 8..9 + j * 8].try_into().unwrap(),
+                    ))
                 });
                 match rec[0] {
                     WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
                     WAL_COMMIT => {
                         for (op, q) in pending.drain(..) {
-                            let in_base = probe.perm(Perm::Spo).contains(&cache, &Perm::Spo.to_key(&q))?;
+                            let in_base = probe
+                                .perm(Perm::Spo)
+                                .contains(&cache, &Perm::Spo.to_key(&q))?;
                             apply(&mut delta, &q, op == WAL_INSERT, in_base);
                         }
                         next_bnode = next_bnode.max(q[0].0);
@@ -558,10 +564,16 @@ impl Store {
                 }
             }
             if good != buf.len() {
-                OpenOptions::new().write(true).open(&wal_path)?.set_len(good as u64)?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&wal_path)?
+                    .set_len(good as u64)?;
             }
         }
-        let wal = OpenOptions::new().create(true).append(true).open(&wal_path)?;
+        let wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)?;
         let dvocab_len = gen_.dvocab.len();
         Ok(Store {
             root: Some(root.to_path_buf()),
@@ -617,7 +629,10 @@ impl Store {
         if cur.len() != before
             && let Some(root) = &self.root
         {
-            write_atomic(&root.join("prefixes.json"), &serde_json::to_vec_pretty(&*cur).unwrap())?;
+            write_atomic(
+                &root.join("prefixes.json"),
+                &serde_json::to_vec_pretty(&*cur).unwrap(),
+            )?;
         }
         Ok(())
     }
@@ -644,7 +659,9 @@ impl Store {
         for s in sources {
             size_hint += match &s.data {
                 crate::io::SourceData::Bytes(b) => b.len() as u64,
-                crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                crate::io::SourceData::File(p) => {
+                    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                }
             } * if s.gzip { 8 } else { 1 };
         }
         // ~80 bytes per quad in text formats
@@ -686,7 +703,13 @@ impl Store {
 
     /// Rebuild with the writer lock held; `extra_quads` are encoded store ids (from a
     /// bulk write transaction) added to the new generation.
-    fn rebuild_locked(&self, w: &mut WriterState, snap: &Snapshot, extra: &[Source], extra_quads: &[[Id; 4]]) -> Result<u64> {
+    fn rebuild_locked(
+        &self,
+        w: &mut WriterState,
+        snap: &Snapshot,
+        extra: &[Source],
+        extra_quads: &[[Id; 4]],
+    ) -> Result<u64> {
         let before = snap.len();
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
@@ -720,9 +743,11 @@ impl Store {
                 for (i, id) in q.iter().enumerate() {
                     keys[i].clear();
                     if matches!(id.tag(), Tag::Vocab | Tag::Delta) {
-                        keys[i].extend_from_slice(&snap.key(*id).ok_or_else(|| {
-                            Error::Corrupt(format!("dangling id {id:?}"))
-                        })?);
+                        keys[i].extend_from_slice(
+                            &snap
+                                .key(*id)
+                                .ok_or_else(|| Error::Corrupt(format!("dangling id {id:?}")))?,
+                        );
                     }
                 }
                 let slot = |i: usize| {
@@ -813,7 +838,9 @@ impl Store {
 }
 
 fn dir_size(p: &Path) -> u64 {
-    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
     rd.flatten()
         .map(|e| match e.metadata() {
             Ok(m) if m.is_dir() => dir_size(&e.path()),
@@ -955,7 +982,9 @@ impl WriteTxn<'_> {
 
     /// Insert a quad; returns true if it was not present.
     pub fn insert(&mut self, q: [Id; 4]) -> Result<bool> {
-        if q.iter().any(|id| matches!(id.tag(), Tag::Local | Tag::Undef)) {
+        if q.iter()
+            .any(|id| matches!(id.tag(), Tag::Local | Tag::Undef))
+        {
             return Err(Error::invalid("cannot store query-local or unbound terms"));
         }
         if self.contains(&q)? {
@@ -994,7 +1023,11 @@ impl WriteTxn<'_> {
             }
             return Ok(());
         }
-        if quads.iter().flatten().any(|id| matches!(id.tag(), Tag::Local | Tag::Undef)) {
+        if quads
+            .iter()
+            .flatten()
+            .any(|id| matches!(id.tag(), Tag::Local | Tag::Undef))
+        {
             return Err(Error::invalid("cannot store query-local or unbound terms"));
         }
         self.bulk.extend(quads);
@@ -1012,7 +1045,8 @@ impl WriteTxn<'_> {
         let bulk = std::mem::take(&mut self.bulk);
         let view = self.view();
         self.base.generation.dvocab.sync()?;
-        self.store.rebuild_locked(&mut self.guard, &view, &[], &bulk)?;
+        self.store
+            .rebuild_locked(&mut self.guard, &view, &[], &bulk)?;
         Ok(self.store.snapshot().version)
     }
 
@@ -1083,13 +1117,25 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
             // update: insert + delete
             let s0 = store.snapshot();
             let mut t = store.write();
-            let a = t.intern(&Term::NamedNode(named("http://ex.org/a"))).unwrap();
-            let p = t.intern(&Term::NamedNode(named("http://ex.org/p"))).unwrap();
-            let z = t.intern(&Term::NamedNode(named("http://ex.org/new"))).unwrap();
+            let a = t
+                .intern(&Term::NamedNode(named("http://ex.org/a")))
+                .unwrap();
+            let p = t
+                .intern(&Term::NamedNode(named("http://ex.org/p")))
+                .unwrap();
+            let z = t
+                .intern(&Term::NamedNode(named("http://ex.org/new")))
+                .unwrap();
             assert_eq!(z.tag(), Tag::Delta);
             assert!(t.insert([a, p, z, Id::DEFAULT_GRAPH]).unwrap());
-            assert!(t.delete([a, p, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH]).unwrap());
-            assert!(!t.delete([a, p, Id::from_i64(99).unwrap(), Id::DEFAULT_GRAPH]).unwrap());
+            assert!(
+                t.delete([a, p, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH])
+                    .unwrap()
+            );
+            assert!(
+                !t.delete([a, p, Id::from_i64(99).unwrap(), Id::DEFAULT_GRAPH])
+                    .unwrap()
+            );
             t.commit().unwrap();
             // old snapshot unaffected (MVCC)
             assert_eq!(s0.len(), 5);
@@ -1125,18 +1171,35 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     #[test]
     fn bulk_insert_rebuilds() {
         let dir = tempfile::tempdir().unwrap();
-        let opts = StoreOptions { bulk_threshold: 10, ..Default::default() };
+        let opts = StoreOptions {
+            bulk_threshold: 10,
+            ..Default::default()
+        };
         let store = Store::open(&dir.path().join("db"), opts.clone()).unwrap();
         store.load(&[src()]).unwrap();
         let mut t = store.write();
-        let p = t.intern(&Term::NamedNode(named("http://ex.org/bulk"))).unwrap();
+        let p = t
+            .intern(&Term::NamedNode(named("http://ex.org/bulk")))
+            .unwrap();
         let quads: Vec<[Id; 4]> = (0..100)
-            .map(|i| [Id::bnode(1000 + i), p, Id::from_i64(i as i64).unwrap(), Id::DEFAULT_GRAPH])
+            .map(|i| {
+                [
+                    Id::bnode(1000 + i),
+                    p,
+                    Id::from_i64(i as i64).unwrap(),
+                    Id::DEFAULT_GRAPH,
+                ]
+            })
             .collect();
         t.insert_bulk(quads).unwrap();
-        let a = t.intern(&Term::NamedNode(named("http://ex.org/a"))).unwrap();
-        let q = t.intern(&Term::NamedNode(named("http://ex.org/p"))).unwrap();
-        t.delete([a, q, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH]).unwrap();
+        let a = t
+            .intern(&Term::NamedNode(named("http://ex.org/a")))
+            .unwrap();
+        let q = t
+            .intern(&Term::NamedNode(named("http://ex.org/p")))
+            .unwrap();
+        t.delete([a, q, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH])
+            .unwrap();
         t.commit().unwrap();
         let s = store.snapshot();
         assert_eq!(s.len(), 5 + 100 - 1);
@@ -1158,7 +1221,11 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
             ex:g1 { ex:s ex:p ex:o1 . }
             ex:g2 { ex:s ex:p ex:o2 . ex:s ex:p ex:o3 . }"#;
         store
-            .load(&[Source::from_bytes(trig.as_bytes().to_vec(), RdfFormat::TriG, None)])
+            .load(&[Source::from_bytes(
+                trig.as_bytes().to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
             .unwrap();
         let s = store.snapshot();
         assert_eq!(s.len(), 4);

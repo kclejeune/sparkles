@@ -116,7 +116,12 @@ impl Block {
     }
     #[inline]
     pub fn key(&self, i: usize) -> Key {
-        [self.cols[0][i], self.cols[1][i], self.cols[2][i], self.cols[3][i]]
+        [
+            self.cols[0][i],
+            self.cols[1][i],
+            self.cols[2][i],
+            self.cols[3][i],
+        ]
     }
     #[inline]
     fn cmp_prefix(&self, i: usize, prefix: &[u64]) -> std::cmp::Ordering {
@@ -261,8 +266,8 @@ impl PermWriter {
         }
         debug_assert!(self.last.is_none_or(|l| l < key), "keys out of order");
         self.last = Some(key);
-        for c in 0..4 {
-            self.buf[c].push(key[c]);
+        for (col, v) in self.buf.iter_mut().zip(key) {
+            col.push(v);
         }
         if self.buf[0].len() == BLOCK_ROWS {
             self.flush_block()?;
@@ -275,7 +280,12 @@ impl PermWriter {
         if n == 0 {
             return Ok(());
         }
-        let first = [self.buf[0][0], self.buf[1][0], self.buf[2][0], self.buf[3][0]];
+        let first = [
+            self.buf[0][0],
+            self.buf[1][0],
+            self.buf[2][0],
+            self.buf[3][0],
+        ];
         let last = [
             self.buf[0][n - 1],
             self.buf[1][n - 1],
@@ -284,12 +294,12 @@ impl PermWriter {
         ];
         let mut col_len = [0u32; 4];
         let offset = self.pos;
-        for c in 0..4 {
-            let enc = encode_column(&self.buf[c], &mut self.scratch);
+        for (col, len) in self.buf.iter_mut().zip(col_len.iter_mut()) {
+            let enc = encode_column(col, &mut self.scratch);
             self.data.write_all(&enc)?;
-            col_len[c] = enc.len() as u32;
+            *len = enc.len() as u32;
             self.pos += enc.len() as u64;
-            self.buf[c].clear();
+            col.clear();
         }
         BlockMeta {
             first,
@@ -341,7 +351,12 @@ impl PermIndex {
         if meta.len() % META_BYTES != 0 {
             return Err(Error::Corrupt(format!("{} metadata size", perm.name())));
         }
-        let blocks: Vec<BlockMeta> = meta.chunks_exact(META_BYTES).map(BlockMeta::read).collect();
+        let blocks: Vec<BlockMeta> = meta
+            .as_chunks::<META_BYTES>()
+            .0
+            .iter()
+            .map(|c| BlockMeta::read(c))
+            .collect();
         let rows = blocks.last().map_or(0, |b| b.row_start + b.rows as u64);
         let f = File::open(dir.join(format!("{}.dat", perm.name())))?;
         let data = if f.metadata()?.len() > 0 {
@@ -365,12 +380,15 @@ impl PermIndex {
 
     pub fn decode_block(&self, b: usize) -> Result<Block> {
         let m = &self.blocks[b];
-        let data = self.data.as_ref().ok_or_else(|| Error::Corrupt("no data".into()))?;
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("no data".into()))?;
         let mut off = m.offset as usize;
         let mut cols: [Vec<u64>; 4] = Default::default();
-        for c in 0..4 {
-            let len = m.col_len[c] as usize;
-            cols[c] = decode_column(&data[off..off + len], m.rows as usize)?;
+        for (col, &len) in cols.iter_mut().zip(&m.col_len) {
+            let len = len as usize;
+            *col = decode_column(&data[off..off + len], m.rows as usize)?;
             off += len;
         }
         Ok(Block { cols })
@@ -434,7 +452,8 @@ impl BlockCache {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(v);
         }
-        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let blk = Arc::new(idx.decode_block(b)?);
         self.cache.insert(key, blk.clone());
         Ok(blk)

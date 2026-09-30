@@ -27,7 +27,10 @@ pub enum Value {
     YearMonth(YearMonthDuration),
     DayTime(DayTimeDuration),
     /// any other (or ill-typed) literal
-    Other { lex: Arc<str>, dt: Arc<str> },
+    Other {
+        lex: Arc<str>,
+        dt: Arc<str>,
+    },
 }
 
 /// A SPARQL expression type error (evaluation → unbound / filter false).
@@ -355,8 +358,12 @@ pub fn compare(a: &Value, b: &Value) -> EvalResult<Option<Ordering>> {
         (Duration(x), Duration(y)) => x.partial_cmp(y),
         (YearMonth(x), YearMonth(y)) => x.partial_cmp(y),
         (DayTime(x), DayTime(y)) => x.partial_cmp(y),
-        (YearMonth(x), DayTime(y)) => oxsdatatypes::Duration::from(*x).partial_cmp(&oxsdatatypes::Duration::from(*y)),
-        (DayTime(x), YearMonth(y)) => oxsdatatypes::Duration::from(*x).partial_cmp(&oxsdatatypes::Duration::from(*y)),
+        (YearMonth(x), DayTime(y)) => {
+            oxsdatatypes::Duration::from(*x).partial_cmp(&oxsdatatypes::Duration::from(*y))
+        }
+        (DayTime(x), YearMonth(y)) => {
+            oxsdatatypes::Duration::from(*x).partial_cmp(&oxsdatatypes::Duration::from(*y))
+        }
         (Duration(x), YearMonth(y)) => x.partial_cmp(&oxsdatatypes::Duration::from(*y)),
         (Duration(x), DayTime(y)) => x.partial_cmp(&oxsdatatypes::Duration::from(*y)),
         (YearMonth(x), Duration(y)) => oxsdatatypes::Duration::from(*x).partial_cmp(y),
@@ -486,9 +493,18 @@ mod tests {
         let a = lit("1", xsd::INTEGER);
         let b = lit("2.5", xsd::DECIMAL);
         let c = lit("1.0E0", xsd::DOUBLE);
-        assert!(matches!(arith(NumOp::Add, &a, &b).unwrap(), Value::Decimal(_)));
-        assert!(matches!(arith(NumOp::Add, &a, &c).unwrap(), Value::Double(_)));
-        assert!(matches!(arith(NumOp::Div, &a, &a).unwrap(), Value::Decimal(_)));
+        assert!(matches!(
+            arith(NumOp::Add, &a, &b).unwrap(),
+            Value::Decimal(_)
+        ));
+        assert!(matches!(
+            arith(NumOp::Add, &a, &c).unwrap(),
+            Value::Double(_)
+        ));
+        assert!(matches!(
+            arith(NumOp::Div, &a, &a).unwrap(),
+            Value::Decimal(_)
+        ));
         assert!(equals(&a, &c).unwrap());
         assert!(equals(&lit("01", xsd::INTEGER), &a).unwrap());
         assert_eq!(compare(&a, &b).unwrap(), Some(Ordering::Less));

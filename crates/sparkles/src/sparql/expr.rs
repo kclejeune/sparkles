@@ -373,7 +373,10 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             // date/time arithmetic
             match (&x, &y, &op) {
                 (Value::DateTime(d), Value::DateTime(e), NumOp::Sub) => {
-                    return d.checked_sub(*e).map(|r| Val::V(Value::DayTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_sub(*e)
+                        .map(|r| Val::V(Value::DayTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::DateTime(d), Value::DayTime(e), NumOp::Add) => {
                     return d
@@ -394,25 +397,46 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                         .ok_or(TypeError);
                 }
                 (Value::DateTime(d), Value::Duration(e), NumOp::Add) => {
-                    return d.checked_add_duration(*e).map(|r| Val::V(Value::DateTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_add_duration(*e)
+                        .map(|r| Val::V(Value::DateTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::DateTime(d), Value::Duration(e), NumOp::Sub) => {
-                    return d.checked_sub_duration(*e).map(|r| Val::V(Value::DateTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_sub_duration(*e)
+                        .map(|r| Val::V(Value::DateTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::Date(d), Value::Date(e), NumOp::Sub) => {
-                    return d.checked_sub(*e).map(|r| Val::V(Value::DayTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_sub(*e)
+                        .map(|r| Val::V(Value::DayTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::DayTime(d), Value::DayTime(e), NumOp::Add) => {
-                    return d.checked_add(*e).map(|r| Val::V(Value::DayTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_add(*e)
+                        .map(|r| Val::V(Value::DayTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::DayTime(d), Value::DayTime(e), NumOp::Sub) => {
-                    return d.checked_sub(*e).map(|r| Val::V(Value::DayTime(r))).ok_or(TypeError);
+                    return d
+                        .checked_sub(*e)
+                        .map(|r| Val::V(Value::DayTime(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::YearMonth(d), Value::YearMonth(e), NumOp::Add) => {
-                    return d.checked_add(*e).map(|r| Val::V(Value::YearMonth(r))).ok_or(TypeError);
+                    return d
+                        .checked_add(*e)
+                        .map(|r| Val::V(Value::YearMonth(r)))
+                        .ok_or(TypeError);
                 }
                 (Value::YearMonth(d), Value::YearMonth(e), NumOp::Sub) => {
-                    return d.checked_sub(*e).map(|r| Val::V(Value::YearMonth(r))).ok_or(TypeError);
+                    return d
+                        .checked_sub(*e)
+                        .map(|r| Val::V(Value::YearMonth(r)))
+                        .ok_or(TypeError);
                 }
                 _ => {}
             }
@@ -626,7 +650,8 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     let a0 = || arg(args, 0, row, ctx);
     let a1 = || arg(args, 1, row, ctx);
     let a2 = || arg(args, 2, row, ctx);
-    let id0 = || -> EvalResult<Id> { Ok(eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx)) };
+    let id0 =
+        || -> EvalResult<Id> { Ok(eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx)) };
     Ok(match f {
         F::Str => {
             let v = eval(&args[0], row, ctx)?;
@@ -645,7 +670,10 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::LangMatches => {
             let t = a0()?;
             let r = a1()?;
-            b(lang_matches(t.as_str().ok_or(TypeError)?, r.as_str().ok_or(TypeError)?))
+            b(lang_matches(
+                t.as_str().ok_or(TypeError)?,
+                r.as_str().ok_or(TypeError)?,
+            ))
         }
         F::Datatype => {
             let v = eval(&args[0], row, ctx)?;
@@ -663,7 +691,9 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             Value::Str(st) => {
                 let iri = match &ctx.base_iri {
                     Some(base) => base.resolve(&st).map_err(|_| TypeError)?.into_inner(),
-                    None => oxiri::Iri::parse(st.to_string()).map_err(|_| TypeError)?.into_inner(),
+                    None => oxiri::Iri::parse(st.to_string())
+                        .map_err(|_| TypeError)?
+                        .into_inner(),
                 };
                 Val::V(Value::Iri(iri.into()))
             }
@@ -682,7 +712,10 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     .cols
                     .iter()
                     .map(|c| c[row.i])
-                    .filter(|id| !(id.tag() == crate::id::Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0))
+                    .filter(|id| {
+                        !(id.tag() == crate::id::Tag::BNode
+                            && id.payload() & Id::LOCAL_BNODE_BIT != 0)
+                    })
                     .collect();
                 Val::Id(ctx.bnode_for_row(key, st))
             }
@@ -757,7 +790,9 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::StrLen => {
             let v = a0()?;
-            Val::V(Value::Integer((v.string_arg()?.0.chars().count() as i64).into()))
+            Val::V(Value::Integer(
+                (v.string_arg()?.0.chars().count() as i64).into(),
+            ))
         }
         F::Replace => {
             let v = a0()?;
@@ -765,7 +800,10 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let p = a1()?;
             let r = a2()?;
             let flags = if args.len() > 3 {
-                arg(args, 3, row, ctx)?.as_str().ok_or(TypeError)?.to_string()
+                arg(args, 3, row, ctx)?
+                    .as_str()
+                    .ok_or(TypeError)?
+                    .to_string()
             } else {
                 String::new()
             };
@@ -809,7 +847,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 F::StrStarts => b(xs.starts_with(ys)),
                 F::StrEnds => b(xs.ends_with(ys)),
                 F::StrBefore => match xs.find(ys) {
-                    Some(i) => same_kind(if i == 0 && ys.is_empty() { xl } else { xl }, xs[..i].to_string()),
+                    Some(i) => same_kind(xl, xs[..i].to_string()),
                     None => s(""),
                 },
                 _ => match xs.find(ys) {
@@ -830,7 +868,15 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     dt.second(),
                     dt.timezone(),
                 ),
-                Value::Date(dt) => (dt.year(), dt.month(), dt.day(), 0, 0, Decimal::from(0), dt.timezone()),
+                Value::Date(dt) => (
+                    dt.year(),
+                    dt.month(),
+                    dt.day(),
+                    0,
+                    0,
+                    Decimal::from(0),
+                    dt.timezone(),
+                ),
                 Value::Time(t) => (0, 0, 0, t.hour(), t.minute(), t.second(), t.timezone()),
                 _ => return Err(TypeError),
             };
@@ -844,15 +890,26 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 F::Seconds => Val::V(Value::Decimal(se)),
                 F::Timezone => Val::V(Value::DayTime(tz.ok_or(TypeError)?)),
                 _ => s(match &v {
-                    Value::DateTime(dt) => dt.timezone_offset().map(|t| t.to_string()).unwrap_or_default(),
-                    Value::Date(dt) => dt.timezone_offset().map(|t| t.to_string()).unwrap_or_default(),
-                    Value::Time(dt) => dt.timezone_offset().map(|t| t.to_string()).unwrap_or_default(),
+                    Value::DateTime(dt) => dt
+                        .timezone_offset()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                    Value::Date(dt) => dt
+                        .timezone_offset()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                    Value::Time(dt) => dt
+                        .timezone_offset()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
                     _ => String::new(),
                 }),
             }
         }
         F::Now => Val::V(Value::DateTime(ctx.now)),
-        F::Uuid => Val::V(Value::Iri(format!("urn:uuid:{}", uuid::Uuid::new_v4()).into())),
+        F::Uuid => Val::V(Value::Iri(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()).into(),
+        )),
         F::StrUuid => s(uuid::Uuid::new_v4().to_string()),
         F::Md5 | F::Sha1 | F::Sha256 | F::Sha384 | F::Sha512 => {
             let v = a0()?;
@@ -880,7 +937,9 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let v = a0()?;
             let dt = a1()?;
             let st = v.as_str().ok_or(TypeError)?;
-            let Value::Iri(dt) = dt else { return Err(TypeError) };
+            let Value::Iri(dt) = dt else {
+                return Err(TypeError);
+            };
             Val::V(Value::from_literal(&Literal::new_typed_literal(
                 st,
                 NamedNode::new_unchecked(&*dt),
@@ -947,7 +1006,11 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
         return Err(TypeError);
     }
     if let Value::Iri(i) = &v {
-        return if local == "string" { Ok(s(i.clone())) } else { Err(TypeError) };
+        return if local == "string" {
+            Ok(s(i.clone()))
+        } else {
+            Err(TypeError)
+        };
     }
     let lex = v.lexical()?;
     let from_str = matches!(v, Value::Str(_) | Value::Other { .. });
@@ -973,9 +1036,15 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
             let r = match (&v, num) {
                 (Value::Bool(x), _) => Value::Integer((*x as i64).into()),
                 (_, Some(Num::Integer(i))) => Value::Integer(i),
-                (_, Some(Num::Decimal(d))) => Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?),
-                (_, Some(Num::Float(f))) => Value::Integer(Integer::try_from(f).map_err(|_| TypeError)?),
-                (_, Some(Num::Double(d))) => Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?),
+                (_, Some(Num::Decimal(d))) => {
+                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
+                }
+                (_, Some(Num::Float(f))) => {
+                    Value::Integer(Integer::try_from(f).map_err(|_| TypeError)?)
+                }
+                (_, Some(Num::Double(d))) => {
+                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
+                }
                 _ if from_str => match parsed(xsd::INTEGER)? {
                     Val::V(v) => v,
                     _ => return Err(TypeError),
@@ -995,8 +1064,12 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
             (Value::Bool(x), _) => Val::V(Value::Decimal((*x as i64).into())),
             (_, Some(Num::Integer(i))) => Val::V(Value::Decimal(i.into())),
             (_, Some(Num::Decimal(d))) => Val::V(Value::Decimal(d)),
-            (_, Some(Num::Float(f))) => Val::V(Value::Decimal(Decimal::try_from(f).map_err(|_| TypeError)?)),
-            (_, Some(Num::Double(d))) => Val::V(Value::Decimal(Decimal::try_from(d).map_err(|_| TypeError)?)),
+            (_, Some(Num::Float(f))) => {
+                Val::V(Value::Decimal(Decimal::try_from(f).map_err(|_| TypeError)?))
+            }
+            (_, Some(Num::Double(d))) => {
+                Val::V(Value::Decimal(Decimal::try_from(d).map_err(|_| TypeError)?))
+            }
             _ if from_str => return parsed(xsd::DECIMAL),
             _ => return Err(TypeError),
         },
@@ -1014,7 +1087,9 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
         },
         "dateTime" => match &v {
             Value::DateTime(d) => Val::V(Value::DateTime(*d)),
-            Value::Date(d) => Val::V(Value::DateTime(DateTime::try_from(*d).map_err(|_| TypeError)?)),
+            Value::Date(d) => Val::V(Value::DateTime(
+                DateTime::try_from(*d).map_err(|_| TypeError)?,
+            )),
             _ if from_str => return parsed(xsd::DATE_TIME),
             _ => return Err(TypeError),
         },
@@ -1039,15 +1114,17 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
         },
         "dayTimeDuration" => match &v {
             Value::DayTime(d) => Val::V(Value::DayTime(*d)),
-            Value::Duration(d) => Val::V(Value::DayTime(DayTimeDuration::try_from(*d).map_err(|_| TypeError)?)),
+            Value::Duration(d) => Val::V(Value::DayTime(
+                DayTimeDuration::try_from(*d).map_err(|_| TypeError)?,
+            )),
             _ if from_str => return parsed(xsd::DAY_TIME_DURATION),
             _ => return Err(TypeError),
         },
         "yearMonthDuration" => match &v {
             Value::YearMonth(d) => Val::V(Value::YearMonth(*d)),
-            Value::Duration(d) => {
-                Val::V(Value::YearMonth(YearMonthDuration::try_from(*d).map_err(|_| TypeError)?))
-            }
+            Value::Duration(d) => Val::V(Value::YearMonth(
+                YearMonthDuration::try_from(*d).map_err(|_| TypeError)?,
+            )),
             _ if from_str => return parsed(xsd::YEAR_MONTH_DURATION),
             _ => return Err(TypeError),
         },
@@ -1114,10 +1191,17 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "normalize-space" => {
                 let v = a(0)?;
                 let (st, l) = v.string_arg()?;
-                Ok(same_kind(l, st.split_whitespace().collect::<Vec<_>>().join(" ")))
+                Ok(same_kind(
+                    l,
+                    st.split_whitespace().collect::<Vec<_>>().join(" "),
+                ))
             }
             "string-join" => {
-                let sep = if args.len() > 1 { a(args.len() - 1)?.lexical()?.to_string() } else { String::new() };
+                let sep = if args.len() > 1 {
+                    a(args.len() - 1)?.lexical()?.to_string()
+                } else {
+                    String::new()
+                };
                 let mut parts = Vec::new();
                 for i in 0..args.len().saturating_sub(1).max(1) {
                     parts.push(a(i)?.lexical()?.to_string());
@@ -1132,9 +1216,15 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
     if let Some(l) = iri.strip_prefix(AFN) {
         return match l {
             "localname" | "namespace" => {
-                let Value::Iri(i) = a(0)? else { return Err(TypeError) };
+                let Value::Iri(i) = a(0)? else {
+                    return Err(TypeError);
+                };
                 let cut = i.rfind(['#', '/', ':']).map_or(0, |p| p + 1);
-                Ok(s(if l == "localname" { &i[cut..] } else { &i[..cut] }))
+                Ok(s(if l == "localname" {
+                    &i[cut..]
+                } else {
+                    &i[..cut]
+                }))
             }
             "now" => fb(Function::Now),
             "sqrt" => d(dbl(0)?.sqrt()),
@@ -1143,7 +1233,11 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "min" | "max" => {
                 let (x, y) = (a(0)?, a(1)?);
                 let o = compare(&x, &y)?.ok_or(TypeError)?;
-                let pick_x = if l == "min" { o != Ordering::Greater } else { o != Ordering::Less };
+                let pick_x = if l == "min" {
+                    o != Ordering::Greater
+                } else {
+                    o != Ordering::Less
+                };
                 Ok(Val::V(if pick_x { x } else { y }))
             }
             "strjoin" => {

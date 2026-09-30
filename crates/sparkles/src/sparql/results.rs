@@ -33,8 +33,12 @@ impl SolutionsFormat {
     pub fn from_name(s: &str) -> Option<SolutionsFormat> {
         let base = s.split(';').next()?.trim().to_ascii_lowercase();
         Some(match base.as_str() {
-            "application/sparql-results+json" | "application/json" | "json" => SolutionsFormat::Json,
-            "application/sparql-results+xml" | "application/xml" | "text/xml" | "xml" => SolutionsFormat::Xml,
+            "application/sparql-results+json" | "application/json" | "json" => {
+                SolutionsFormat::Json
+            }
+            "application/sparql-results+xml" | "application/xml" | "text/xml" | "xml" => {
+                SolutionsFormat::Xml
+            }
             "text/csv" | "csv" => SolutionsFormat::Csv,
             "text/tab-separated-values" | "tsv" => SolutionsFormat::Tsv,
             "application/x-sparkles+json" | "sparkles" => SolutionsFormat::Sparkles,
@@ -75,7 +79,12 @@ fn io(e: std::io::Error) -> Error {
 }
 
 /// Serialize SELECT / ASK results.
-pub fn write_solutions(r: &QueryResult, fmt: SolutionsFormat, mut w: impl Write, send: Option<usize>) -> Result<()> {
+pub fn write_solutions(
+    r: &QueryResult,
+    fmt: SolutionsFormat,
+    mut w: impl Write,
+    send: Option<usize>,
+) -> Result<()> {
     if fmt == SolutionsFormat::Sparkles {
         serde_json::to_writer(&mut w, &sparkles_json(r, send)).map_err(|e| Error::Io(e.into()))?;
         return Ok(());
@@ -92,8 +101,14 @@ pub fn write_solutions(r: &QueryResult, fmt: SolutionsFormat, mut w: impl Write,
         ser.serialize_boolean_to_writer(w, r.boolean).map_err(io)?;
         return Ok(());
     }
-    let vars: Vec<Variable> = r.vars.iter().map(|v| Variable::new_unchecked(v.clone())).collect();
-    let mut s = ser.serialize_solutions_to_writer(w, vars.clone()).map_err(io)?;
+    let vars: Vec<Variable> = r
+        .vars
+        .iter()
+        .map(|v| Variable::new_unchecked(v.clone()))
+        .collect();
+    let mut s = ser
+        .serialize_solutions_to_writer(w, vars.clone())
+        .map_err(io)?;
     let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
     for i in 0..n {
         let terms: Vec<(usize, Term)> = r
@@ -111,11 +126,18 @@ pub fn write_solutions(r: &QueryResult, fmt: SolutionsFormat, mut w: impl Write,
 }
 
 /// Serialize CONSTRUCT / DESCRIBE results.
-pub fn write_graph(r: &QueryResult, fmt: RdfFormat, prefixes: &BTreeMap<String, String>, w: impl Write) -> Result<()> {
+pub fn write_graph(
+    r: &QueryResult,
+    fmt: RdfFormat,
+    prefixes: &BTreeMap<String, String>,
+    w: impl Write,
+) -> Result<()> {
     let mut ser = RdfSerializer::from_format(fmt);
     if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
         for (p, ns) in prefixes {
-            ser = ser.with_prefix(p.clone(), ns.clone()).map_err(|e| Error::invalid(e.to_string()))?;
+            ser = ser
+                .with_prefix(p.clone(), ns.clone())
+                .map_err(|e| Error::invalid(e.to_string()))?;
         }
     }
     let mut s = ser.for_writer(w);

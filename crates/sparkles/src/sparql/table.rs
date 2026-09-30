@@ -77,7 +77,8 @@ impl Table {
 
     /// Map from variable id to column (indexed by var id).
     pub fn var_map(&self, nvars: usize) -> Vec<Option<usize>> {
-        let mut m = vec![None; nvars.max(self.vars.iter().map(|&v| v as usize + 1).max().unwrap_or(0))];
+        let mut m =
+            vec![None; nvars.max(self.vars.iter().map(|&v| v as usize + 1).max().unwrap_or(0))];
         for (c, &v) in self.vars.iter().enumerate() {
             m[v as usize] = Some(c);
         }

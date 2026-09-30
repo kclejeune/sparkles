@@ -55,7 +55,9 @@ impl Ctx {
         Ctx {
             snap,
             local: RwLock::new(AppendVocab::default()),
-            values: (0..VALUE_SHARDS).map(|_| RwLock::new(FxHashMap::default())).collect(),
+            values: (0..VALUE_SHARDS)
+                .map(|_| RwLock::new(FxHashMap::default()))
+                .collect(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             deadline: None,
@@ -183,11 +185,7 @@ impl Ctx {
 
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
-            Tag::Local => self
-                .local
-                .read()
-                .get(id.payload())
-                .map(id::key_to_term),
+            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
@@ -204,7 +202,8 @@ impl Ctx {
             Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
-                let shard = &self.values[(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS];
+                let shard = &self.values
+                    [(id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % VALUE_SHARDS];
                 if let Some(v) = shard.read().get(&id) {
                     return Some(v.clone());
                 }
@@ -223,7 +222,9 @@ impl Ctx {
     pub fn kind(&self, id: Id) -> TermKind {
         match id.tag() {
             Tag::Undef | Tag::Special => TermKind::None,
-            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => TermKind::Literal,
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                TermKind::Literal
+            }
             Tag::BNode => TermKind::BNode,
             Tag::Vocab | Tag::Delta => match self.snap.key(id) {
                 Some(k) if id::is_key_iri(&k) => TermKind::Iri,

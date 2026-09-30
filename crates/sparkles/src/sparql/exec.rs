@@ -7,7 +7,7 @@ use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Perm, S, O, P, pad};
+use crate::index::{O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -136,20 +136,35 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let t = child(0, &mut infos)?;
             group(ctx, &t, keys, aggs)?
         }
-        Kind::Path { spec, bound_from_left } => {
+        Kind::Path {
+            spec,
+            bound_from_left,
+        } => {
             let mut inputs = Vec::new();
             for i in 0..n.children.len() {
                 inputs.push(child(i, &mut infos)?);
             }
             path(ctx, spec, *bound_from_left, inputs, &n.vars)?
         }
-        Kind::Service { endpoint, query, silent } => match service(ctx, endpoint, query, &n.vars) {
+        Kind::Service {
+            endpoint,
+            query,
+            silent,
+        } => match service(ctx, endpoint, query, &n.vars) {
             Ok(t) => t,
             Err(_) if *silent => Table::unit(),
             Err(e) => return Err(e),
         },
     };
-    if !matches!(n.kind, Kind::Scan(_) | Kind::Sort(_) | Kind::Join { algo: JoinAlgo::Merge, .. }) {
+    if !matches!(
+        n.kind,
+        Kind::Scan(_)
+            | Kind::Sort(_)
+            | Kind::Join {
+                algo: JoinAlgo::Merge,
+                ..
+            }
+    ) {
         if !table.sorted.is_empty() && table.sorted != n.sorted {
             table.sorted.clear();
         }
@@ -256,7 +271,11 @@ fn layout(l: &Table, r: &Table) -> JoinLayout {
             }
         }
     }
-    JoinLayout { vars, shared, right_only }
+    JoinLayout {
+        vars,
+        shared,
+        right_only,
+    }
 }
 
 #[inline]
@@ -314,7 +333,13 @@ fn gallop(col: &[Id], from: usize, target: Id) -> usize {
 }
 
 /// Pairs of compatible rows (inner join).
-fn join_pairs(ctx: &Ctx, l: &Table, r: &Table, lay: &JoinLayout, merge: bool) -> Result<Vec<(u32, u32)>> {
+fn join_pairs(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    lay: &JoinLayout,
+    merge: bool,
+) -> Result<Vec<(u32, u32)>> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     if lay.shared.is_empty() {
         for i in 0..l.len() {
@@ -357,7 +382,7 @@ fn join_pairs(ctx: &Ctx, l: &Table, r: &Table, lay: &JoinLayout, merge: bool) ->
         let mut steps = 0usize;
         while i < a.len() && j < b.len() {
             steps += 1;
-            if steps % 4096 == 0 {
+            if steps.is_multiple_of(4096) {
                 ctx.check()?;
                 ctx.check_rows(pairs.len())?;
             }
@@ -385,8 +410,14 @@ fn join_pairs(ctx: &Ctx, l: &Table, r: &Table, lay: &JoinLayout, merge: bool) ->
     // hash join: build on the smaller side, probe preserves the larger side's order
     let build_left = l.len() < r.len();
     let (bt, pt) = if build_left { (l, r) } else { (r, l) };
-    let bcols: Vec<usize> = exact.iter().map(|&(lc, rc)| if build_left { lc } else { rc }).collect();
-    let pcols: Vec<usize> = exact.iter().map(|&(lc, rc)| if build_left { rc } else { lc }).collect();
+    let bcols: Vec<usize> = exact
+        .iter()
+        .map(|&(lc, rc)| if build_left { lc } else { rc })
+        .collect();
+    let pcols: Vec<usize> = exact
+        .iter()
+        .map(|&(lc, rc)| if build_left { rc } else { lc })
+        .collect();
     let others_needed = exact.len() < lay.shared.len();
     let emit = |bi: usize, pi: usize, pairs: &mut Vec<(u32, u32)>| {
         let (i, j) = if build_left { (bi, pi) } else { (pi, bi) };
@@ -413,7 +444,9 @@ fn join_pairs(ctx: &Ctx, l: &Table, r: &Table, lay: &JoinLayout, merge: bool) ->
     } else {
         let mut map: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
         for i in 0..bt.len() {
-            map.entry(bcols.iter().map(|&c| bt.cols[c][i]).collect()).or_default().push(i as u32);
+            map.entry(bcols.iter().map(|&c| bt.cols[c][i]).collect())
+                .or_default()
+                .push(i as u32);
         }
         let mut key = Vec::with_capacity(pcols.len());
         for pi in 0..pt.len() {
@@ -454,7 +487,18 @@ fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Tab
     if let Some(e) = expr {
         let map = joined.var_map(ctx.nvars());
         let keep: Vec<bool> = (0..joined.len())
-            .map(|i| ebv(e, &Row { table: &joined, i, map: &map }, ctx).unwrap_or(false))
+            .map(|i| {
+                ebv(
+                    e,
+                    &Row {
+                        table: &joined,
+                        i,
+                        map: &map,
+                    },
+                    ctx,
+                )
+                .unwrap_or(false)
+            })
             .collect();
         joined.filter_rows(&keep);
         let mut k = keep.iter();
@@ -521,7 +565,11 @@ fn minus(ctx: &Ctx, mut l: Table, r: &Table) -> Result<Table> {
 fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) {
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
-        let row = Row { table: t, i, map: &map };
+        let row = Row {
+            table: t,
+            i,
+            map: &map,
+        };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
     let keep: Vec<bool> = if t.len() > PAR_THRESHOLD && !exprs.iter().any(|e| e.has_exists()) {
@@ -536,7 +584,15 @@ fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) {
 
 fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Vec<Id> {
     let map = t.var_map(ctx.nvars());
-    let f = |i: usize| match eval(e, &Row { table: t, i, map: &map }, ctx) {
+    let f = |i: usize| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+        },
+        ctx,
+    ) {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
@@ -553,12 +609,20 @@ fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) ->
         .iter()
         .map(|(e, _)| {
             let f = |i: usize| {
-                eval(e, &Row { table: &t, i, map: &map }, ctx)
-                    .ok()
-                    .and_then(|v| match v {
-                        Val::Id(id) => ctx.value(id),
-                        Val::V(v) => Some(v),
-                    })
+                eval(
+                    e,
+                    &Row {
+                        table: &t,
+                        i,
+                        map: &map,
+                    },
+                    ctx,
+                )
+                .ok()
+                .and_then(|v| match v {
+                    Val::Id(id) => ctx.value(id),
+                    Val::V(v) => Some(v),
+                })
             };
             if t.len() > PAR_THRESHOLD {
                 (0..t.len()).into_par_iter().map(f).collect()
@@ -594,7 +658,9 @@ fn order_by(ctx: &Ctx, t: Table, keys: &[(Expr, bool)], limit: Option<usize>) ->
 fn distinct(t: Table) -> Table {
     if t.width() == 1 {
         let mut seen = FxHashSet::default();
-        let idx: Vec<usize> = (0..t.len()).filter(|&i| seen.insert(t.cols[0][i])).collect();
+        let idx: Vec<usize> = (0..t.len())
+            .filter(|&i| seen.insert(t.cols[0][i]))
+            .collect();
         let sorted = t.sorted.clone();
         let mut out = t.take_rows(&idx);
         out.sorted = sorted;
@@ -620,7 +686,10 @@ fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<
     let mut order: Vec<Vec<Id>> = Vec::new();
     let mut groups: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
     for i in 0..t.len() {
-        let key: Vec<Id> = kcols.iter().map(|c| c.map_or(Id::UNDEF, |c| t.cols[c][i])).collect();
+        let key: Vec<Id> = kcols
+            .iter()
+            .map(|c| c.map_or(Id::UNDEF, |c| t.cols[c][i]))
+            .collect();
         match groups.get_mut(&key) {
             Some(g) => g.push(i as u32),
             None => {
@@ -653,7 +722,10 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
-            rows.iter().map(|&i| t.row(i as usize)).collect::<FxHashSet<_>>().len()
+            rows.iter()
+                .map(|&i| t.row(i as usize))
+                .collect::<FxHashSet<_>>()
+                .len()
         } else {
             rows.len()
         };
@@ -662,9 +734,17 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
     let mut vals: Vec<Result<Id, ()>> = rows
         .iter()
         .map(|&i| {
-            eval(e, &Row { table: t, i: i as usize, map }, ctx)
-                .map(|v| v.into_id(ctx))
-                .map_err(|_| ())
+            eval(
+                e,
+                &Row {
+                    table: t,
+                    i: i as usize,
+                    map,
+                },
+                ctx,
+            )
+            .map(|v| v.into_id(ctx))
+            .map_err(|_| ())
         })
         .collect();
     if agg.distinct {
@@ -674,7 +754,11 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
             Err(_) => true,
         });
     }
-    let values = || vals.iter().filter_map(|v| v.ok()).filter_map(|id| ctx.value(id));
+    let values = || {
+        vals.iter()
+            .filter_map(|v| v.ok())
+            .filter_map(|id| ctx.value(id))
+    };
     let fold_sum = || -> Option<Value> {
         let mut acc = Value::Integer(0.into());
         for v in &vals {
@@ -685,14 +769,17 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
     };
     let result: Option<Value> = match &agg.func {
         AggregateFunction::Count => {
-            return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64).unwrap_or(Id::UNDEF);
+            return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64)
+                .unwrap_or(Id::UNDEF);
         }
         AggregateFunction::Sum => fold_sum(),
         AggregateFunction::Avg => {
             if vals.is_empty() {
                 Some(Value::Integer(0.into()))
             } else {
-                fold_sum().and_then(|s| arith(NumOp::Div, &s, &Value::Integer((vals.len() as i64).into())).ok())
+                fold_sum().and_then(|s| {
+                    arith(NumOp::Div, &s, &Value::Integer((vals.len() as i64).into())).ok()
+                })
             }
         }
         AggregateFunction::Min | AggregateFunction::Max => {
@@ -705,7 +792,11 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
                     None => best.is_none(),
                     Some(b) => {
                         let o = order_cmp(v.as_ref(), Some(b));
-                        if is_min { o == Ordering::Less } else { o == Ordering::Greater }
+                        if is_min {
+                            o == Ordering::Less
+                        } else {
+                            o == Ordering::Greater
+                        }
                     }
                 };
                 if better {
@@ -773,7 +864,10 @@ impl Graph<'_> {
             return Ok(out);
         }
         let m = if forward { &self.fwd } else { &self.bwd };
-        Ok(m.as_ref().and_then(|m| m.get(&x)).cloned().unwrap_or_default())
+        Ok(m.as_ref()
+            .and_then(|m| m.get(&x))
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Nodes reachable from `start` according to min/max length.
@@ -858,7 +952,13 @@ impl Graph<'_> {
     }
 }
 
-fn path(ctx: &Ctx, spec: &PathSpec, bound_from_left: bool, mut inputs: Vec<Table>, vars: &[VarId]) -> Result<Table> {
+fn path(
+    ctx: &Ctx,
+    spec: &PathSpec,
+    bound_from_left: bool,
+    mut inputs: Vec<Table>,
+    vars: &[VarId],
+) -> Result<Table> {
     let left = if bound_from_left { inputs.pop() } else { None };
     let edges = inputs.pop();
     let graphs: Vec<(GraphFilter, Option<Id>)> = match spec.graph_var {
@@ -915,7 +1015,13 @@ fn path(ctx: &Ctx, spec: &PathSpec, bound_from_left: bool, mut inputs: Vec<Table
             }
             _ => (None, None),
         };
-        let g = Graph { ctx, spec, graph: gf, fwd, bwd };
+        let g = Graph {
+            ctx,
+            spec,
+            graph: gf,
+            fwd,
+            bwd,
+        };
         let push = |s: u64, o: u64, out: &mut Table| {
             let mut row = Vec::with_capacity(pvars.len());
             if let Some(v) = sv {
@@ -959,7 +1065,11 @@ fn path(ctx: &Ctx, spec: &PathSpec, bound_from_left: bool, mut inputs: Vec<Table
                             (None, Some(c)) => (c, false),
                             _ => return Err(Error::invalid("path bound variable missing")),
                         };
-                        let mut s: Vec<u64> = l.cols[col].iter().map(|x| x.0).filter(|x| *x != 0).collect();
+                        let mut s: Vec<u64> = l.cols[col]
+                            .iter()
+                            .map(|x| x.0)
+                            .filter(|x| *x != 0)
+                            .collect();
                         s.sort_unstable();
                         s.dedup();
                         for x in s {
@@ -970,7 +1080,11 @@ fn path(ctx: &Ctx, spec: &PathSpec, bound_from_left: bool, mut inputs: Vec<Table
                                 if y == x && spec.min == 0 && !in_graph {
                                     continue;
                                 }
-                                if forward { push(x, y, &mut out) } else { push(y, x, &mut out) }
+                                if forward {
+                                    push(x, y, &mut out)
+                                } else {
+                                    push(y, x, &mut out)
+                                }
                             }
                         }
                         continue;
@@ -1015,12 +1129,19 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
         .map_err(|e| Error::Service(e.to_string()))?;
     let resp = client
         .post(url.as_str())
-        .header("Accept", "application/sparql-results+json, application/sparql-results+xml;q=0.8")
+        .header(
+            "Accept",
+            "application/sparql-results+json, application/sparql-results+xml;q=0.8",
+        )
         .form(&[("query", query)])
         .send()
         .map_err(|e| Error::Service(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(Error::Service(format!("{} returned {}", url.as_str(), resp.status())));
+        return Err(Error::Service(format!(
+            "{} returned {}",
+            url.as_str(),
+            resp.status()
+        )));
     }
     let ct = resp
         .headers()
@@ -1036,7 +1157,10 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     };
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
-    match parser.for_slice(&body).map_err(|e| Error::Service(e.to_string()))? {
+    match parser
+        .for_slice(&body)
+        .map_err(|e| Error::Service(e.to_string()))?
+    {
         sparesults::SliceQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
                 let sol = sol.map_err(|e| Error::Service(e.to_string()))?;

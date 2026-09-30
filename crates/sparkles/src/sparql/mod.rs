@@ -108,10 +108,14 @@ impl QueryResult {
 pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -> Result<Query> {
     let mut p = SparqlParser::new();
     if let Some(b) = base {
-        p = p.with_base_iri(b).map_err(|e| Error::invalid(e.to_string()))?;
+        p = p
+            .with_base_iri(b)
+            .map_err(|e| Error::invalid(e.to_string()))?;
     }
     for (k, v) in prefixes {
-        p = p.with_prefix(k, v).map_err(|e| Error::invalid(e.to_string()))?;
+        p = p
+            .with_prefix(k, v)
+            .map_err(|e| Error::invalid(e.to_string()))?;
     }
     let query = p.parse_query(q)?;
     let (pattern, _, _) = split(&query);
@@ -124,7 +128,9 @@ pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -
 pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
     use GraphPattern as GP;
     match gp {
-        GP::Extend { inner, variable, .. } => {
+        GP::Extend {
+            inner, variable, ..
+        } => {
             let mut in_scope = false;
             inner.on_in_scope_variable(|v| in_scope |= v == variable);
             // `SELECT (agg AS ?v)`: ?v must not occur in the grouped WHERE clause either
@@ -139,7 +145,10 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
             }
             validate_scoping(inner)
         }
-        GP::Join { left, right } | GP::Union { left, right } | GP::Minus { left, right } | GP::LeftJoin { left, right, .. } => {
+        GP::Join { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right }
+        | GP::LeftJoin { left, right, .. } => {
             validate_scoping(left)?;
             validate_scoping(right)
         }
@@ -156,7 +165,12 @@ pub fn validate_scoping(gp: &GraphPattern) -> Result<()> {
     }
 }
 
-fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryDataset>, base: Option<&oxiri::Iri<String>>) -> Ctx {
+fn make_ctx(
+    snap: Arc<Snapshot>,
+    opts: &QueryOptions,
+    dataset: Option<&QueryDataset>,
+    base: Option<&oxiri::Iri<String>>,
+) -> Ctx {
     let mut ctx = Ctx::new(snap);
     ctx.deadline = opts.timeout.map(|t| Instant::now() + t);
     if let Some(c) = &opts.cancel {
@@ -170,7 +184,11 @@ fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryData
     let resolve = |iris: &[String]| -> Vec<Id> { iris.iter().map(|i| ctx.graph_id(i)).collect() };
     let mut ds = DatasetSpec::default();
     if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
-        if opts.default_graph_uris.iter().any(|g| g == ctx::UNION_GRAPH_IRI) {
+        if opts
+            .default_graph_uris
+            .iter()
+            .any(|g| g == ctx::UNION_GRAPH_IRI)
+        {
             ds.union_default = true;
         } else if !opts.default_graph_uris.is_empty() {
             ds.default = Some(resolve(&opts.default_graph_uris));
@@ -182,9 +200,18 @@ fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryData
             ds.named = Some(Vec::new());
         }
     } else if let Some(d) = dataset {
-        ds.default = Some(resolve(&d.default.iter().map(|n| n.as_str().to_string()).collect::<Vec<_>>()));
+        ds.default = Some(resolve(
+            &d.default
+                .iter()
+                .map(|n| n.as_str().to_string())
+                .collect::<Vec<_>>(),
+        ));
         ds.named = Some(resolve(
-            &d.named.iter().flatten().map(|n| n.as_str().to_string()).collect::<Vec<_>>(),
+            &d.named
+                .iter()
+                .flatten()
+                .map(|n| n.as_str().to_string())
+                .collect::<Vec<_>>(),
         ));
     }
     // extra graphs merged into the store's default graph (inference overlay)
@@ -197,12 +224,35 @@ fn make_ctx(snap: Arc<Snapshot>, opts: &QueryOptions, dataset: Option<&QueryData
     ctx
 }
 
-fn split(q: &Query) -> (&GraphPattern, Option<&QueryDataset>, Option<&oxiri::Iri<String>>) {
+fn split(
+    q: &Query,
+) -> (
+    &GraphPattern,
+    Option<&QueryDataset>,
+    Option<&oxiri::Iri<String>>,
+) {
     match q {
-        Query::Select { pattern, dataset, base_iri }
-        | Query::Ask { pattern, dataset, base_iri }
-        | Query::Describe { pattern, dataset, base_iri }
-        | Query::Construct { pattern, dataset, base_iri, .. } => (pattern, dataset.as_ref(), base_iri.as_ref()),
+        Query::Select {
+            pattern,
+            dataset,
+            base_iri,
+        }
+        | Query::Ask {
+            pattern,
+            dataset,
+            base_iri,
+        }
+        | Query::Describe {
+            pattern,
+            dataset,
+            base_iri,
+        }
+        | Query::Construct {
+            pattern,
+            dataset,
+            base_iri,
+            ..
+        } => (pattern, dataset.as_ref(), base_iri.as_ref()),
     }
 }
 
@@ -222,7 +272,8 @@ pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryR
 /// order of first appearance in the query text.
 fn select_star_order(q: &str, r: &mut QueryResult) {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());
     if !re.is_match(q) {
         return;
     }
@@ -243,10 +294,18 @@ fn select_star_order(q: &str, r: &mut QueryResult) {
     order.sort_by_key(|&i| pos(&r.vars[i]));
     r.vars = order.iter().map(|&i| r.vars[i].clone()).collect();
     r.table.vars = order.iter().map(|&i| r.table.vars[i]).collect();
-    r.table.cols = order.iter().map(|&i| std::mem::take(&mut r.table.cols[i])).collect();
+    r.table.cols = order
+        .iter()
+        .map(|&i| std::mem::take(&mut r.table.cols[i]))
+        .collect();
 }
 
-pub fn execute_query(snap: Arc<Snapshot>, parsed: &Query, opts: &QueryOptions, parse_ms: f64) -> Result<QueryResult> {
+pub fn execute_query(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> Result<QueryResult> {
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
     let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
@@ -255,7 +314,11 @@ pub fn execute_query(snap: Arc<Snapshot>, parsed: &Query, opts: &QueryOptions, p
         Query::Select { .. } => (QueryKind::Select, pattern.clone()),
         Query::Ask { .. } => (
             QueryKind::Ask,
-            GraphPattern::Slice { inner: Box::new(pattern.clone()), start: 0, length: Some(1) },
+            GraphPattern::Slice {
+                inner: Box::new(pattern.clone()),
+                start: 0,
+                length: Some(1),
+            },
         ),
         Query::Construct { .. } => (QueryKind::Construct, pattern.clone()),
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
@@ -277,8 +340,12 @@ pub fn execute_query(snap: Arc<Snapshot>, parsed: &Query, opts: &QueryOptions, p
     match parsed {
         Query::Select { .. } => {
             let vars: Vec<table::VarId> = match &pattern {
-                GraphPattern::Project { variables, .. } => variables.iter().map(|v| ctx.var(v.as_str())).collect(),
-                GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } | GraphPattern::Slice { inner, .. } => {
+                GraphPattern::Project { variables, .. } => {
+                    variables.iter().map(|v| ctx.var(v.as_str())).collect()
+                }
+                GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner }
+                | GraphPattern::Slice { inner, .. } => {
                     project_vars(inner, &ctx).unwrap_or_else(|| table.vars.clone())
                 }
                 _ => table.vars.clone(),
@@ -306,10 +373,12 @@ pub fn execute_query(snap: Arc<Snapshot>, parsed: &Query, opts: &QueryOptions, p
 
 fn project_vars(gp: &GraphPattern, ctx: &Ctx) -> Option<Vec<table::VarId>> {
     match gp {
-        GraphPattern::Project { variables, .. } => Some(variables.iter().map(|v| ctx.var(v.as_str())).collect()),
-        GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } | GraphPattern::Slice { inner, .. } => {
-            project_vars(inner, ctx)
+        GraphPattern::Project { variables, .. } => {
+            Some(variables.iter().map(|v| ctx.var(v.as_str())).collect())
         }
+        GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => project_vars(inner, ctx),
         _ => None,
     }
 }
@@ -355,10 +424,14 @@ fn construct(ctx: &Ctx, t: &Table, template: &[TriplePattern]) -> Vec<Triple> {
             let s = inst(&tp.subject, &mut bnodes);
             let p = match &tp.predicate {
                 NamedNodePattern::NamedNode(n) => Some(Term::NamedNode(n.clone())),
-                NamedNodePattern::Variable(v) => inst(&TermPattern::Variable(v.clone()), &mut bnodes),
+                NamedNodePattern::Variable(v) => {
+                    inst(&TermPattern::Variable(v.clone()), &mut bnodes)
+                }
             };
             let o = inst(&tp.object, &mut bnodes);
-            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else { continue };
+            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = (s, p, o) else {
+                continue;
+            };
             let s = match s {
                 Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
                 Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),

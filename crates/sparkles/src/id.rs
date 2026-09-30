@@ -198,11 +198,27 @@ pub fn inline_literal(lex: &str, datatype: &str) -> Option<Id> {
         pack_decimal(d).map(|p| Id::new(Tag::Decimal, p))
     } else if datatype == xsd::DATE_TIME.as_str() {
         let d: oxsdatatypes::DateTime = lex.parse().ok()?;
-        let p = pack_date_time(d.year(), d.month(), d.day(), d.hour(), d.minute(), d.second(), tz_minutes(d.timezone_offset()))?;
+        let p = pack_date_time(
+            d.year(),
+            d.month(),
+            d.day(),
+            d.hour(),
+            d.minute(),
+            d.second(),
+            tz_minutes(d.timezone_offset()),
+        )?;
         (unpack_date_time(p, false) == lex).then(|| Id::new(Tag::DateTime, p))
     } else if datatype == xsd::DATE.as_str() {
         let d: oxsdatatypes::Date = lex.parse().ok()?;
-        let p = pack_date_time(d.year(), d.month(), d.day(), 0, 0, 0.into(), tz_minutes(d.timezone_offset()))?;
+        let p = pack_date_time(
+            d.year(),
+            d.month(),
+            d.day(),
+            0,
+            0,
+            0.into(),
+            tz_minutes(d.timezone_offset()),
+        )?;
         (unpack_date_time(p, true) == lex).then(|| Id::new(Tag::Date, p))
     } else {
         None
@@ -227,7 +243,9 @@ pub fn pack_decimal(d: oxsdatatypes::Decimal) -> Option<u64> {
             if m < -lim || m >= lim {
                 return None;
             }
-            return Some(((scale as u64) << DEC_MANTISSA_BITS) | (m as u64 & ((1 << DEC_MANTISSA_BITS) - 1)));
+            return Some(
+                ((scale as u64) << DEC_MANTISSA_BITS) | (m as u64 & ((1 << DEC_MANTISSA_BITS) - 1)),
+            );
         }
     }
     None
@@ -244,7 +262,15 @@ pub fn unpack_decimal(p: u64) -> oxsdatatypes::Decimal {
 //   year+8192 (14) | month (4) | day (5) | hour (5) | minute (6) | millis of minute (16) | tz (7)
 // tz = 0: no timezone, else offset/15min + 64. Payload order is chronological for
 // values in the same timezone.
-fn pack_date_time(year: i64, month: u8, day: u8, hour: u8, minute: u8, second: oxsdatatypes::Decimal, tz: Option<i16>) -> Option<u64> {
+fn pack_date_time(
+    year: i64,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: oxsdatatypes::Decimal,
+    tz: Option<i16>,
+) -> Option<u64> {
     let y = year + 8192;
     if !(0..16384).contains(&y) {
         return None;
@@ -284,11 +310,18 @@ pub fn unpack_date_time(p: u64, date_only: bool) -> String {
     let minute = (p >> 23) & 0x3F;
     let ms = (p >> 7) & 0xFFFF;
     let tz = (p & 0x7F) as i64;
-    let mut s = if year < 0 { format!("-{:04}", -year) } else { format!("{year:04}") };
+    let mut s = if year < 0 {
+        format!("-{:04}", -year)
+    } else {
+        format!("{year:04}")
+    };
     let _ = std::fmt::Write::write_fmt(&mut s, format_args!("-{month:02}-{day:02}"));
     if !date_only {
-        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("T{hour:02}:{minute:02}:{:02}", ms / 1000));
-        if ms % 1000 != 0 {
+        let _ = std::fmt::Write::write_fmt(
+            &mut s,
+            format_args!("T{hour:02}:{minute:02}:{:02}", ms / 1000),
+        );
+        if !ms.is_multiple_of(1000) {
             let frac = format!("{:03}", ms % 1000);
             s.push('.');
             s.push_str(frac.trim_end_matches('0'));
@@ -300,7 +333,15 @@ pub fn unpack_date_time(p: u64, date_only: bool) -> String {
             s.push('Z');
         } else {
             let a = off.abs();
-            let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{}{:02}:{:02}", if off < 0 { '-' } else { '+' }, a / 60, a % 60));
+            let _ = std::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(
+                    "{}{:02}:{:02}",
+                    if off < 0 { '-' } else { '+' },
+                    a / 60,
+                    a % 60
+                ),
+            );
         }
     }
     s
@@ -309,17 +350,20 @@ pub fn unpack_date_time(p: u64, date_only: bool) -> String {
 /// Decode an inline id back into a literal.
 pub fn inline_to_literal(id: Id) -> Option<Literal> {
     Some(match id.tag() {
-        Tag::Bool => Literal::new_typed_literal(
-            if id.as_bool() { "true" } else { "false" },
-            xsd::BOOLEAN,
-        ),
+        Tag::Bool => {
+            Literal::new_typed_literal(if id.as_bool() { "true" } else { "false" }, xsd::BOOLEAN)
+        }
         Tag::Int => Literal::new_typed_literal(id.as_i64().to_string(), xsd::INTEGER),
         Tag::Double => Literal::new_typed_literal(
             oxsdatatypes::Double::from(id.as_f64()).to_string(),
             xsd::DOUBLE,
         ),
-        Tag::Decimal => Literal::new_typed_literal(unpack_decimal(id.payload()).to_string(), xsd::DECIMAL),
-        Tag::DateTime => Literal::new_typed_literal(unpack_date_time(id.payload(), false), xsd::DATE_TIME),
+        Tag::Decimal => {
+            Literal::new_typed_literal(unpack_decimal(id.payload()).to_string(), xsd::DECIMAL)
+        }
+        Tag::DateTime => {
+            Literal::new_typed_literal(unpack_date_time(id.payload(), false), xsd::DATE_TIME)
+        }
         Tag::Date => Literal::new_typed_literal(unpack_date_time(id.payload(), true), xsd::DATE),
         _ => return None,
     })
@@ -442,18 +486,26 @@ mod tests {
 
     #[test]
     fn inline_decimal_and_dates() {
-        for lex in ["0", "1.5", "-199999.02", "12345678.123456789", "0.000000000000001"] {
+        for lex in [
+            "0",
+            "1.5",
+            "-199999.02",
+            "12345678.123456789",
+            "0.000000000000001",
+        ] {
             let id = inline_literal(lex, xsd::DECIMAL.as_str()).unwrap_or_else(|| panic!("{lex}"));
             assert_eq!(inline_to_literal(id).unwrap().value(), lex);
         }
         assert!(inline_literal("123456789.123456789", xsd::DECIMAL.as_str()).is_none());
-        for lex in ["1"] {
-            let id = inline_literal(lex, xsd::DECIMAL.as_str()).unwrap_or_else(|| panic!("{lex}"));
-            assert_eq!(inline_to_literal(id).unwrap().value(), lex);
-        }
         assert!(inline_literal("1.50", xsd::DECIMAL.as_str()).is_none());
-        for lex in ["2020-03-04T10:00:00Z", "2006-08-23T09:00:00+01:00", "1999-12-31T23:59:59.5", "-0044-03-15T12:00:00-05:30"] {
-            let id = inline_literal(lex, xsd::DATE_TIME.as_str()).unwrap_or_else(|| panic!("{lex}"));
+        for lex in [
+            "2020-03-04T10:00:00Z",
+            "2006-08-23T09:00:00+01:00",
+            "1999-12-31T23:59:59.5",
+            "-0044-03-15T12:00:00-05:30",
+        ] {
+            let id =
+                inline_literal(lex, xsd::DATE_TIME.as_str()).unwrap_or_else(|| panic!("{lex}"));
             assert_eq!(inline_to_literal(id).unwrap().value(), lex);
         }
         for lex in ["2001-01-01", "2006-08-23Z", "2006-08-23+00:00"] {

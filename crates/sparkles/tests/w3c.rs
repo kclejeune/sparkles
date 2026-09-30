@@ -7,9 +7,9 @@
 //! every failure; `SPARKLES_W3C_FILTER=substr` restricts to matching test IRIs.
 //! Failures listed in `tests/w3c-known-failures.txt` do not fail the run.
 
-use oxrdf::vocab::rdf;
 use oxrdf::dataset::CanonicalizationAlgorithm;
-use oxrdf::{Dataset, Graph, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, TermRef};
+use oxrdf::vocab::rdf;
+use oxrdf::{Dataset, Graph, NamedNode, NamedOrBlankNode, Quad, Term, TermRef};
 use sparesults::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
 use sparkles::io::{RdfFormat, Source};
 use sparkles::sparql::{QueryKind, QueryOptions};
@@ -27,9 +27,12 @@ fn nn(s: &str) -> NamedNode {
 }
 
 fn suite_dir() -> Option<PathBuf> {
-    let p = std::env::var("SPARKLES_W3C_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../apache/jena/jena-arq/testing/rdf-tests-cg/sparql")
-    });
+    let p = std::env::var("SPARKLES_W3C_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../apache/jena/jena-arq/testing/rdf-tests-cg/sparql")
+        });
     p.exists().then_some(p)
 }
 
@@ -38,13 +41,20 @@ fn url_to_path(u: &str) -> PathBuf {
 }
 
 fn path_to_url(p: &Path) -> String {
-    format!("file://{}", std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display())
+    format!(
+        "file://{}",
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .display()
+    )
 }
 
 fn load_graph(url: &str) -> Graph {
     let path = url_to_path(url);
     let (fmt, _) = sparkles::io::format_for_path(&path).unwrap_or((RdfFormat::Turtle, false));
-    let parser = oxrdfio::RdfParser::from_format(fmt).with_base_iri(url).unwrap();
+    let parser = oxrdfio::RdfParser::from_format(fmt)
+        .with_base_iri(url)
+        .unwrap();
     let data = std::fs::read(&path).unwrap_or_default();
     parser
         .for_slice(&data)
@@ -59,16 +69,23 @@ struct Manifest {
 
 impl Manifest {
     fn obj(&self, s: &NamedOrBlankNode, p: &str) -> Option<Term> {
-        self.g.object_for_subject_predicate(s, &nn(p)).map(|t| t.into_owned())
+        self.g
+            .object_for_subject_predicate(s, &nn(p))
+            .map(|t| t.into_owned())
     }
     fn objs(&self, s: &NamedOrBlankNode, p: &str) -> Vec<Term> {
-        self.g.objects_for_subject_predicate(s, &nn(p)).map(|t| t.into_owned()).collect()
+        self.g
+            .objects_for_subject_predicate(s, &nn(p))
+            .map(|t| t.into_owned())
+            .collect()
     }
     fn list(&self, head: Term) -> Vec<Term> {
         let mut out = Vec::new();
         let mut cur = head;
         while let Some(node) = as_subject(&cur) {
-            let Some(first) = self.obj(&node, rdf::FIRST.as_str()) else { break };
+            let Some(first) = self.obj(&node, rdf::FIRST.as_str()) else {
+                break;
+            };
             out.push(first);
             match self.obj(&node, rdf::REST.as_str()) {
                 Some(n) => cur = n,
@@ -102,7 +119,9 @@ struct TestCase {
 }
 
 fn collect_tests(manifest_url: &str, out: &mut Vec<(TestCase, std::rc::Rc<Manifest>)>) {
-    let m = std::rc::Rc::new(Manifest { g: load_graph(manifest_url) });
+    let m = std::rc::Rc::new(Manifest {
+        g: load_graph(manifest_url),
+    });
     let root: NamedOrBlankNode = nn(manifest_url).into();
     for inc in m.objs(&root, &format!("{MF}include")) {
         for i in m.list(inc) {
@@ -112,7 +131,10 @@ fn collect_tests(manifest_url: &str, out: &mut Vec<(TestCase, std::rc::Rc<Manife
     for entries in m.objs(&root, &format!("{MF}entries")) {
         for e in m.list(entries) {
             let Some(s) = as_subject(&e) else { continue };
-            let kind = m.obj(&s, rdf::TYPE.as_str()).map(|t| iri(&t)).unwrap_or_default();
+            let kind = m
+                .obj(&s, rdf::TYPE.as_str())
+                .map(|t| iri(&t))
+                .unwrap_or_default();
             out.push((
                 TestCase {
                     id: iri(&e),
@@ -133,7 +155,9 @@ fn term_eq(a: &Term, b: &Term) -> bool {
         return true;
     }
     match (a, b) {
-        (Term::Literal(x), Term::Literal(y)) if x.datatype() == y.datatype() && x.language() == y.language() => {
+        (Term::Literal(x), Term::Literal(y))
+            if x.datatype() == y.datatype() && x.language() == y.language() =>
+        {
             let (vx, vy) = (
                 sparkles::sparql::value::Value::from_literal(x),
                 sparkles::sparql::value::Value::from_literal(y),
@@ -152,7 +176,12 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
     if expected.len() != actual.len() {
         return false;
     }
-    fn cell_match(e: &Option<Term>, a: &Option<Term>, map: &mut BTreeMap<String, String>, rev: &mut BTreeMap<String, String>) -> Option<Vec<String>> {
+    fn cell_match(
+        e: &Option<Term>,
+        a: &Option<Term>,
+        map: &mut BTreeMap<String, String>,
+        rev: &mut BTreeMap<String, String>,
+    ) -> Option<Vec<String>> {
         match (e, a) {
             (None, None) => Some(Vec::new()),
             (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => {
@@ -171,7 +200,12 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
             _ => None,
         }
     }
-    fn row_match(e: &Row, a: &Row, map: &mut BTreeMap<String, String>, rev: &mut BTreeMap<String, String>) -> Option<Vec<String>> {
+    fn row_match(
+        e: &Row,
+        a: &Row,
+        map: &mut BTreeMap<String, String>,
+        rev: &mut BTreeMap<String, String>,
+    ) -> Option<Vec<String>> {
         let mut added = Vec::new();
         for (x, y) in e.iter().zip(a) {
             match cell_match(x, y, map, rev) {
@@ -184,14 +218,28 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
         }
         Some(added)
     }
-    fn undo(added: &[String], map: &mut BTreeMap<String, String>, rev: &mut BTreeMap<String, String>) {
+    fn undo(
+        added: &[String],
+        map: &mut BTreeMap<String, String>,
+        rev: &mut BTreeMap<String, String>,
+    ) {
         for x in added {
             if let Some(y) = map.remove(x) {
                 rev.remove(&y);
             }
         }
     }
-    fn search(i: usize, e: &[Row], a: &[Row], used: &mut [bool], map: &mut BTreeMap<String, String>, rev: &mut BTreeMap<String, String>, ordered: bool, budget: &mut usize) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        i: usize,
+        e: &[Row],
+        a: &[Row],
+        used: &mut [bool],
+        map: &mut BTreeMap<String, String>,
+        rev: &mut BTreeMap<String, String>,
+        ordered: bool,
+        budget: &mut usize,
+    ) -> bool {
         if i == e.len() {
             return true;
         }
@@ -199,7 +247,11 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
             return false;
         }
         *budget -= 1;
-        let range: Vec<usize> = if ordered { vec![i] } else { (0..a.len()).collect() };
+        let range: Vec<usize> = if ordered {
+            vec![i]
+        } else {
+            (0..a.len()).collect()
+        };
         for j in range {
             if used[j] {
                 continue;
@@ -217,7 +269,16 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
     }
     let mut used = vec![false; actual.len()];
     let mut budget = 2_000_000;
-    search(0, expected, actual, &mut used, &mut BTreeMap::new(), &mut BTreeMap::new(), ordered, &mut budget)
+    search(
+        0,
+        expected,
+        actual,
+        &mut used,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        ordered,
+        &mut budget,
+    )
 }
 
 enum Expected {
@@ -238,10 +299,17 @@ fn parse_expected(url: &str) -> Result<Expected, String> {
     };
     let data = std::fs::read(&path).map_err(|e| e.to_string())?;
     match fmt {
-        Some(f) => match QueryResultsParser::from_format(f).for_slice(&data).map_err(|e| e.to_string())? {
+        Some(f) => match QueryResultsParser::from_format(f)
+            .for_slice(&data)
+            .map_err(|e| e.to_string())?
+        {
             SliceQueryResultsParserOutput::Boolean(b) => Ok(Expected::Boolean(b)),
             SliceQueryResultsParserOutput::Solutions(s) => {
-                let vars: Vec<String> = s.variables().iter().map(|v| v.as_str().to_string()).collect();
+                let vars: Vec<String> = s
+                    .variables()
+                    .iter()
+                    .map(|v| v.as_str().to_string())
+                    .collect();
                 let mut rows = Vec::new();
                 for sol in s {
                     let sol = sol.map_err(|e| e.to_string())?;
@@ -268,7 +336,10 @@ fn parse_expected(url: &str) -> Result<Expected, String> {
 fn parse_rdf_result_set(g: &Graph) -> Option<Expected> {
     const RS: &str = "http://www.w3.org/2001/sw/DataAccess/tests/result-set#";
     let rs_type = nn(&format!("{RS}ResultSet"));
-    let root = g.subjects_for_predicate_object(rdf::TYPE, &rs_type).next()?.into_owned();
+    let root = g
+        .subjects_for_predicate_object(rdf::TYPE, &rs_type)
+        .next()?
+        .into_owned();
     let m = Manifest { g: g.clone() };
     if let Some(Term::Literal(b)) = m.obj(&root, &format!("{RS}boolean")) {
         return Some(Expected::Boolean(b.value() == "true"));
@@ -277,7 +348,11 @@ fn parse_rdf_result_set(g: &Graph) -> Option<Expected> {
         Term::Literal(l) => l.value().to_string(),
         t => iri(&t),
     };
-    let vars: Vec<String> = m.objs(&root, &format!("{RS}resultVariable")).into_iter().map(lit).collect();
+    let vars: Vec<String> = m
+        .objs(&root, &format!("{RS}resultVariable"))
+        .into_iter()
+        .map(lit)
+        .collect();
     let mut rows = Vec::new();
     for sol in m.objs(&root, &format!("{RS}solution")) {
         let sol = as_subject(&sol)?;
@@ -329,7 +404,13 @@ fn datasets_match(expected: Dataset, actual: Dataset) -> bool {
 
 // ------------------------------------------------------------------ running ------
 
-fn load_store(m: &Manifest, action: &NamedOrBlankNode, data_p: &str, graph_p: &str, update: bool) -> Result<Store, String> {
+fn load_store(
+    m: &Manifest,
+    action: &NamedOrBlankNode,
+    data_p: &str,
+    graph_p: &str,
+    update: bool,
+) -> Result<Store, String> {
     let store = Store::in_memory(StoreOptions::default());
     let mut sources = Vec::new();
     for d in m.objs(action, data_p) {
@@ -342,7 +423,10 @@ fn load_store(m: &Manifest, action: &NamedOrBlankNode, data_p: &str, graph_p: &s
         // query tests: graph IRI = file IRI; update tests: [ ut:graph <file> ; rdfs:label "name" ]
         let (file, name) = match (update, as_subject(&g)) {
             (true, Some(node)) => {
-                let file = m.obj(&node, &format!("{UT}graph")).map(|t| iri(&t)).unwrap_or_default();
+                let file = m
+                    .obj(&node, &format!("{UT}graph"))
+                    .map(|t| iri(&t))
+                    .unwrap_or_default();
                 let name = m
                     .obj(&node, RDFS_LABEL)
                     .map(|t| match t {
@@ -354,7 +438,8 @@ fn load_store(m: &Manifest, action: &NamedOrBlankNode, data_p: &str, graph_p: &s
             }
             _ => (iri(&g), iri(&g)),
         };
-        let mut s = Source::from_path(&url_to_path(&file), Some(nn(&name))).map_err(|e| e.to_string())?;
+        let mut s =
+            Source::from_path(&url_to_path(&file), Some(nn(&name))).map_err(|e| e.to_string())?;
         s.base = Some(file);
         sources.push(s);
     }
@@ -378,21 +463,33 @@ fn store_dataset(store: &Store) -> Dataset {
 }
 
 fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
-    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?).ok_or("bad action")?;
+    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?)
+        .ok_or("bad action")?;
     let qurl = iri(&m.obj(&action, &format!("{QT}query")).ok_or("no query")?);
     let qtext = std::fs::read_to_string(url_to_path(&qurl)).map_err(|e| e.to_string())?;
     let result_url = iri(&m.obj(&t.entry, &format!("{MF}result")).ok_or("no result")?);
     let expected = parse_expected(&result_url)?;
-    let store = load_store(m, &action, &format!("{QT}data"), &format!("{QT}graphData"), false)?;
+    let store = load_store(
+        m,
+        &action,
+        &format!("{QT}data"),
+        &format!("{QT}graphData"),
+        false,
+    )?;
     let opts = QueryOptions {
         base_iri: Some(qurl.clone()),
         timeout: Some(std::time::Duration::from_secs(20)),
         ..Default::default()
     };
-    let r = sparkles::sparql::query(store.snapshot(), &qtext, &opts).map_err(|e| format!("error: {e}"))?;
+    let r = sparkles::sparql::query(store.snapshot(), &qtext, &opts)
+        .map_err(|e| format!("error: {e}"))?;
     match (expected, r.kind) {
         (Expected::Boolean(b), QueryKind::Ask) => {
-            if b == r.boolean { Ok(()) } else { Err(format!("expected {b}, got {}", r.boolean)) }
+            if b == r.boolean {
+                Ok(())
+            } else {
+                Err(format!("expected {b}, got {}", r.boolean))
+            }
         }
         (Expected::Solutions(vars, rows), QueryKind::Select) => {
             let actual: Vec<Row> = (0..r.table.len())
@@ -414,7 +511,12 @@ fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
                 let show = |rows: &[Row]| {
                     rows.iter()
                         .take(12)
-                        .map(|r| r.iter().map(|c| c.as_ref().map_or("-".into(), |t| t.to_string())).collect::<Vec<_>>().join(" "))
+                        .map(|r| {
+                            r.iter()
+                                .map(|c| c.as_ref().map_or("-".into(), |t| t.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
                         .collect::<Vec<_>>()
                         .join("\n      ")
                 };
@@ -432,21 +534,44 @@ fn run_query_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
             for t in &r.triples {
                 d.insert(t.as_ref().in_graph(oxrdf::GraphNameRef::DefaultGraph));
             }
-            if datasets_match(g, d) { Ok(()) } else { Err(format!("graph differs ({} triples)", r.triples.len())) }
+            if datasets_match(g, d) {
+                Ok(())
+            } else {
+                Err(format!("graph differs ({} triples)", r.triples.len()))
+            }
         }
         (_, k) => Err(format!("result kind mismatch ({k:?})")),
     }
 }
 
 fn run_update_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
-    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?).ok_or("bad action")?;
-    let uurl = iri(&m.obj(&action, &format!("{UT}request")).ok_or("no request")?);
+    let action = as_subject(&m.obj(&t.entry, &format!("{MF}action")).ok_or("no action")?)
+        .ok_or("bad action")?;
+    let uurl = iri(&m
+        .obj(&action, &format!("{UT}request"))
+        .ok_or("no request")?);
     let utext = std::fs::read_to_string(url_to_path(&uurl)).map_err(|e| e.to_string())?;
-    let store = load_store(m, &action, &format!("{UT}data"), &format!("{UT}graphData"), true)?;
-    let opts = QueryOptions { base_iri: Some(uurl.clone()), ..Default::default() };
+    let store = load_store(
+        m,
+        &action,
+        &format!("{UT}data"),
+        &format!("{UT}graphData"),
+        true,
+    )?;
+    let opts = QueryOptions {
+        base_iri: Some(uurl.clone()),
+        ..Default::default()
+    };
     let res = sparkles::sparql::update::update(&store, &utext, &opts);
-    let result = as_subject(&m.obj(&t.entry, &format!("{MF}result")).ok_or("no result")?).ok_or("bad result")?;
-    let expected_store = load_store(m, &result, &format!("{UT}data"), &format!("{UT}graphData"), true)?;
+    let result = as_subject(&m.obj(&t.entry, &format!("{MF}result")).ok_or("no result")?)
+        .ok_or("bad result")?;
+    let expected_store = load_store(
+        m,
+        &result,
+        &format!("{UT}data"),
+        &format!("{UT}graphData"),
+        true,
+    )?;
     if let Err(e) = res {
         return Err(format!("update error: {e}"));
     }
@@ -454,8 +579,16 @@ fn run_update_test(t: &TestCase, m: &Manifest) -> Result<(), String> {
     if datasets_match(e.clone(), a.clone()) {
         Ok(())
     } else {
-        Err(format!("store differs: expected {} quads, got {}\n    got: {}", e.len(), a.len(),
-            a.iter().take(8).map(|q| q.to_string()).collect::<Vec<_>>().join("\n         ")))
+        Err(format!(
+            "store differs: expected {} quads, got {}\n    got: {}",
+            e.len(),
+            a.len(),
+            a.iter()
+                .take(8)
+                .map(|q| q.to_string())
+                .collect::<Vec<_>>()
+                .join("\n         ")
+        ))
     }
 }
 
@@ -464,9 +597,17 @@ fn run_syntax_test(t: &TestCase, m: &Manifest, positive: bool, update: bool) -> 
     let url = iri(&a);
     let text = std::fs::read_to_string(url_to_path(&url)).map_err(|e| e.to_string())?;
     let parsed = if update {
-        spargebra::SparqlParser::new().with_base_iri(&url).unwrap().parse_update(&text).map(|_| ())
+        spargebra::SparqlParser::new()
+            .with_base_iri(&url)
+            .unwrap()
+            .parse_update(&text)
+            .map(|_| ())
     } else {
-        spargebra::SparqlParser::new().with_base_iri(&url).unwrap().parse_query(&text).map(|_| ())
+        spargebra::SparqlParser::new()
+            .with_base_iri(&url)
+            .unwrap()
+            .parse_query(&text)
+            .map(|_| ())
     };
     match (parsed, positive) {
         (Ok(()), true) | (Err(_), false) => Ok(()),
@@ -484,12 +625,14 @@ fn run_suite(name: &str, manifests: &[&str]) {
     for m in manifests {
         collect_tests(&path_to_url(&dir.join(m)), &mut tests);
     }
-    let known: BTreeSet<String> = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt"))
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
+    let known: BTreeSet<String> = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt"),
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(|l| l.trim().to_string())
+    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    .collect();
     let filter = std::env::var("SPARKLES_W3C_FILTER").ok();
     let verbose = std::env::var("SPARKLES_W3C_VERBOSE").is_ok();
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
@@ -499,12 +642,21 @@ fn run_suite(name: &str, manifests: &[&str]) {
         if filter.as_ref().is_some_and(|f| !t.id.contains(f.as_str())) {
             continue;
         }
-        let short = t.id.rsplit_once("/sparql/").map(|x| x.1).or_else(|| t.id.rsplit_once("/data-r2/").map(|x| x.1)).unwrap_or(&t.id).to_string();
+        let short =
+            t.id.rsplit_once("/sparql/")
+                .map(|x| x.1)
+                .or_else(|| t.id.rsplit_once("/data-r2/").map(|x| x.1))
+                .unwrap_or(&t.id)
+                .to_string();
         let r = match t.kind.as_str() {
-            "QueryEvaluationTest" => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_query_test(t, m)))
-                .unwrap_or_else(|_| Err("panic".into())),
-            "UpdateEvaluationTest" => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_update_test(t, m)))
-                .unwrap_or_else(|_| Err("panic".into())),
+            "QueryEvaluationTest" => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_query_test(t, m)))
+                    .unwrap_or_else(|_| Err("panic".into()))
+            }
+            "UpdateEvaluationTest" => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_update_test(t, m)))
+                    .unwrap_or_else(|_| Err("panic".into()))
+            }
             "PositiveSyntaxTest" | "PositiveSyntaxTest11" => run_syntax_test(t, m, true, false),
             "NegativeSyntaxTest" | "NegativeSyntaxTest11" => run_syntax_test(t, m, false, false),
             "PositiveUpdateSyntaxTest11" => run_syntax_test(t, m, true, true),
@@ -533,26 +685,45 @@ fn run_suite(name: &str, manifests: &[&str]) {
             }
         }
     }
-    eprintln!("\n{name}: {pass} passed, {fail} failed, {skip} skipped ({} tests)", tests.len());
+    eprintln!(
+        "\n{name}: {pass} passed, {fail} failed, {skip} skipped ({} tests)",
+        tests.len()
+    );
     if !fixed.is_empty() {
         eprintln!("now passing (remove from known failures): {fixed:?}");
     }
-    assert!(new_failures.is_empty(), "{} unexpected failures: {new_failures:#?}", new_failures.len());
+    assert!(
+        new_failures.is_empty(),
+        "{} unexpected failures: {new_failures:#?}",
+        new_failures.len()
+    );
 }
 
 #[test]
 fn sparql11_query() {
-    run_suite("SPARQL 1.1 query", &["sparql11/manifest-sparql11-query.ttl"]);
+    run_suite(
+        "SPARQL 1.1 query",
+        &["sparql11/manifest-sparql11-query.ttl"],
+    );
 }
 
 #[test]
 fn sparql11_update() {
-    run_suite("SPARQL 1.1 update", &["sparql11/manifest-sparql11-update.ttl"]);
+    run_suite(
+        "SPARQL 1.1 update",
+        &["sparql11/manifest-sparql11-update.ttl"],
+    );
 }
 
 #[test]
 fn sparql10() {
-    run_suite("SPARQL 1.0", &["sparql10/manifest-evaluation.ttl", "sparql10/manifest-syntax.ttl"]);
+    run_suite(
+        "SPARQL 1.0",
+        &[
+            "sparql10/manifest-evaluation.ttl",
+            "sparql10/manifest-syntax.ttl",
+        ],
+    );
 }
 
 #[allow(dead_code)]

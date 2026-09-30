@@ -136,8 +136,11 @@ pub struct Builder {
     next_bnode: AtomicU64,
     prefixes: Mutex<BTreeMap<String, String>>,
     input_quads: AtomicU64,
-    progress: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    progress: Option<ProgressFn>,
 }
+
+/// Progress callback for long-running builds.
+pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub enum Slot<'a> {
     Id(Id),
@@ -163,7 +166,7 @@ impl Builder {
         })
     }
 
-    pub fn with_progress(mut self, f: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+    pub fn with_progress(mut self, f: ProgressFn) -> Self {
         self.progress = Some(f);
         self
     }
@@ -297,9 +300,10 @@ impl Builder {
             let mut col = StatsCollector::new(perm, rdf_type);
             if in_memory {
                 keys.clear();
-                keys.par_extend(all.par_iter().map(|q| {
-                    perm.to_key(&[Id(q[0]), Id(q[1]), Id(q[2]), Id(q[3])])
-                }));
+                keys.par_extend(
+                    all.par_iter()
+                        .map(|q| perm.to_key(&[Id(q[0]), Id(q[1]), Id(q[2]), Id(q[3])])),
+                );
                 keys.par_sort_unstable();
                 keys.dedup();
                 for k in &keys {
@@ -327,7 +331,10 @@ impl Builder {
             prefixes: std::mem::take(&mut *self.prefixes.lock()),
             created: now_rfc3339(),
         };
-        std::fs::write(self.dir.join("stats.json"), serde_json::to_vec(&stats).unwrap())?;
+        std::fs::write(
+            self.dir.join("stats.json"),
+            serde_json::to_vec(&stats).unwrap(),
+        )?;
         std::fs::write(
             self.dir.join("meta.json"),
             serde_json::to_vec_pretty(&meta).unwrap(),
@@ -516,9 +523,15 @@ impl Encoder<'_> {
     pub fn push_quad(&mut self, q: &Quad) -> Result<()> {
         let s = match &q.subject {
             NamedOrBlankNode::NamedNode(n) => self.iri(n.as_str()),
-            NamedOrBlankNode::BlankNode(b) => Id::bnode(self.scope.get(b.as_str(), &self.b.next_bnode)).0,
+            NamedOrBlankNode::BlankNode(b) => {
+                Id::bnode(self.scope.get(b.as_str(), &self.b.next_bnode)).0
+            }
             #[allow(unreachable_patterns)]
-            _ => return Err(Error::unsupported("RDF 1.2 triple terms in subject position")),
+            _ => {
+                return Err(Error::unsupported(
+                    "RDF 1.2 triple terms in subject position",
+                ));
+            }
         };
         let p = self.iri(q.predicate.as_str());
         let o = self.term(&q.object);
@@ -696,14 +709,16 @@ fn read_map(path: &Path) -> Result<Vec<u64>> {
     }
     // SAFETY: temporary file written by this builder and not modified concurrently.
     let m = unsafe { Mmap::map(&f)? };
-    Ok(m.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+    Ok(m.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
 fn read_quads(path: &Path) -> Result<Vec<[u64; 4]>> {
     let v = read_map(path)?;
-    Ok(v.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect())
+    Ok(v.as_chunks::<4>().0.to_vec())
 }
 
 pub fn now_rfc3339() -> String {
@@ -748,8 +763,12 @@ ex:b a ex:C ; ex:p 2 .
 _:b1 ex:p ex:a .
 "#;
         let b = Builder::new(dir.path(), BuildOptions::default()).unwrap();
-        b.add_source(&Source::from_bytes(ttl.as_bytes().to_vec(), RdfFormat::Turtle, None))
-            .unwrap();
+        b.add_source(&Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        ))
+        .unwrap();
         let meta = b.finish().unwrap();
         assert_eq!(meta.quads, 8);
         assert!(meta.prefixes.contains_key("ex"));

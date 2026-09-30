@@ -175,17 +175,19 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     let err = |e: &dyn std::fmt::Display| Error::RdfParse(format!("{}: {e}", src.name));
     if n > 1 {
         let parsers = parser.split_slice_for_parallel_parsing(slice, n);
-        parsers.into_par_iter().try_for_each(|mut p| -> Result<()> {
-            let mut sink = make_sink();
-            for q in p.by_ref() {
-                sink.quad(q.map_err(|e| err(&e))?)?;
-            }
-            let mut pm = prefixes.lock();
-            for (k, v) in p.prefixes() {
-                pm.insert(k.to_string(), v.to_string());
-            }
-            sink.finish()
-        })?;
+        parsers
+            .into_par_iter()
+            .try_for_each(|mut p| -> Result<()> {
+                let mut sink = make_sink();
+                for q in p.by_ref() {
+                    sink.quad(q.map_err(|e| err(&e))?)?;
+                }
+                let mut pm = prefixes.lock();
+                for (k, v) in p.prefixes() {
+                    pm.insert(k.to_string(), v.to_string());
+                }
+                sink.finish()
+            })?;
     } else {
         let mut sink = make_sink();
         let mut p = parser.for_slice(slice);

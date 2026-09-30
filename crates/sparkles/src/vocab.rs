@@ -252,7 +252,7 @@ impl VocabWriter {
     pub fn push(&mut self, key: &[u8]) -> Result<u64> {
         debug_assert!(self.count == 0 || key > self.prev.as_slice());
         self.buf.clear();
-        let shared = if self.count as usize % FC_BLOCK == 0 {
+        let shared = if (self.count as usize).is_multiple_of(FC_BLOCK) {
             self.offsets.write_all(&self.pos.to_le_bytes())?;
             0
         } else {
@@ -356,7 +356,10 @@ impl DeltaVocab {
             }
             // truncate a torn tail so future appends are well-formed
             if pos != buf.len() {
-                OpenOptions::new().write(true).open(path)?.set_len(pos as u64)?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(pos as u64)?;
             }
         }
         let f = OpenOptions::new().create(true).append(true).open(path)?;
