@@ -44,8 +44,8 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
 ///   generation directory named is `generation`;
 /// * `size` is the sum of the blob sizes, every blob is at most `piece_bytes`, and
 ///   every blob id is valid (`layout::valid_blob_id`);
-/// * `dataset.id` and `commit` are well formed (`commit.generation == generation`,
-///   `commit.ref == "commit:<seq>"`), `encryption` is null.
+/// * `dataset.id` and `commit` are well formed (`commit.generation` is `generation` or
+///   an earlier one, `commit.ref == "commit:<seq>"`), `encryption` is null.
 ///
 /// The content checks that need the downloaded files (`CURRENT` names `generation`;
 /// `gen-NNNN/commit.json` has the dataset id and `baseSeq <= commit.seq`) are the
@@ -92,10 +92,16 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_format: u32) -> Result<()>
         );
     }
     let c = &m.commit;
-    if c.generation != m.generation {
+    // the head commit was recorded in `generation`, or in an earlier one when the
+    // database was compacted after its last commit
+    let number = |g: &str| g.strip_prefix("gen-").and_then(|d| d.parse::<u64>().ok());
+    if !valid_generation(&c.generation) || number(&c.generation) > number(&m.generation) {
         return bad(
             "commit.generation",
-            format!("{:?} is not {:?}", c.generation, m.generation),
+            format!(
+                "{:?} is not {:?} or an earlier generation",
+                c.generation, m.generation
+            ),
         );
     }
     if c.reference != format!("commit:{}", c.seq) {
@@ -304,6 +310,13 @@ mod tests {
     fn a_good_manifest_validates() {
         validate(&good(), PIECE, 2).unwrap();
         assert_eq!(logical_size(&good()), 8 + 64 + 207);
+        // captured after a compaction: the head commit is in the previous generation
+        let mut m = good();
+        m.generation = "gen-0002".into();
+        for f in &mut m.files {
+            f.path = f.path.replace("gen-0001/", "gen-0002/");
+        }
+        validate(&m, PIECE, 2).unwrap();
     }
 
     #[test]

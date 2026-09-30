@@ -142,6 +142,14 @@ export type Backup = BackupSummary & {
   parent: string | null;
   server: { version: string };
   files: BackupFile[];
+  stats: {
+    logicalBytes: number;
+    addedBytes: number;
+    files: number;
+    blobs: number;
+    newBlobs: number;
+    reusedBlobs: number;
+  };
   derived: { text: null | { rebuildOnRestore: true } };
 };
 

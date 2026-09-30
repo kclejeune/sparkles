@@ -415,6 +415,14 @@ function createMock({
       parent: parent?.name ?? null,
       server: { version: '0.1.0-mock' },
       files,
+      stats: {
+        logicalBytes: logical,
+        addedBytes: added,
+        files: files.length,
+        blobs: files.reduce((a, f) => a + f.blobs.length, 0),
+        newBlobs,
+        reusedBlobs: reused,
+      },
       derived: { text: src.text ? { rebuildOnRestore: true } : null },
       // mock-only: the data to restore, and seeded damage
       quads: src.data ?? null,

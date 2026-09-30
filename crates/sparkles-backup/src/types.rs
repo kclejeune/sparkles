@@ -428,6 +428,8 @@ pub struct Backup {
     pub parent: Option<String>,
     pub server: ServerInfo,
     pub files: Vec<FileEntry>,
+    /// what the backup uploaded and reused
+    pub stats: ManifestStats,
     pub derived: Derived,
 }
 
@@ -565,6 +567,7 @@ impl Manifest {
             parent: self.parent.clone(),
             server: self.server.clone(),
             files: self.files.clone(),
+            stats: self.stats.clone(),
             derived: self.derived.clone(),
         }
     }

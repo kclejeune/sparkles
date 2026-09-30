@@ -876,12 +876,14 @@ async fn permissions_follow_the_route_table_and_the_handlers() {
 /// registered at a fresh directory.
 async fn with_local(read_only_repo: bool) -> (Srv, tempfile::TempDir) {
     let s = server(Opts::default());
-    let ds = s.st.get("ds").unwrap();
-    // `ds` holds commit 1 already (INSERT <urn:ds>); rebuild the acceptance state
+    // a fresh `ds` (the fixture's has a commit already) with three commits, holding
+    // `<urn:b> <urn:p> 2` at head 3
+    assert!(s.st.delete("ds").unwrap());
+    let ds = s.st.create("ds", DbType::Persistent).unwrap();
     for u in [
-        "DELETE DATA { <urn:ds> <urn:p> 1 }",
         "INSERT DATA { <urn:a> <urn:p> 1 }",
         "INSERT DATA { <urn:b> <urn:p> 2 }",
+        "DELETE DATA { <urn:a> <urn:p> 1 }",
     ] {
         sparkles::sparql::update::update(&ds.store, u, &QueryOptions::default()).unwrap();
     }
@@ -909,7 +911,6 @@ fn update(s: &Srv, ds: &str, u: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs S2/S5"]
 async fn e2e_register_and_test() {
     let (s, repo) = with_local(false).await;
     let r = get(&s.app, "/$/repositories/local").await;
@@ -950,7 +951,6 @@ async fn e2e_register_and_test() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs S2/S5"]
 async fn e2e_backup_restore_delete_and_metrics() {
     let (s, repo) = with_local(false).await;
     let ds_id = s.st.get("ds").unwrap().store.dataset_id();
@@ -967,6 +967,12 @@ async fn e2e_backup_restore_delete_and_metrics() {
     assert_eq!(t.state, "done", "{:?}", t.message);
     let d = t.detail.unwrap();
     assert_eq!(d["commit"]["seq"], 3);
+    // a fresh repository: about everything is uploaded
+    let (added, logical) = (
+        d["addedBytes"].as_u64().unwrap(),
+        d["logicalBytes"].as_u64().unwrap(),
+    );
+    assert!(added > logical / 2 && added <= logical + 4096, "{d}");
     let r = get(&s.app, "/$/backups/ds/local/b1").await;
     assert_eq!(r.body["dataset"]["id"], ds_id.to_string().as_str());
     let files: Vec<&str> = r.body["files"]
@@ -978,8 +984,16 @@ async fn e2e_backup_restore_delete_and_metrics() {
     for f in ["CURRENT", "commits.bin", "gen-0001/wal.log"] {
         assert!(files.contains(&f), "{f} in {files:?}");
     }
-    assert_eq!(files.iter().filter(|f| f.ends_with(".dat")).count(), 7);
-    assert_eq!(files.iter().filter(|f| f.ends_with(".meta")).count(), 7);
+    // the seven index permutations (and the vocabulary's `vocab.dat`)
+    let index = |ext: &str| {
+        files
+            .iter()
+            .filter(|f| f.ends_with(ext) && !f.ends_with("/vocab.dat"))
+            .count()
+    };
+    assert_eq!(index(".dat"), 7, "{files:?}");
+    assert_eq!(index(".meta"), 7, "{files:?}");
+    assert!(files.contains(&"gen-0001/vocab.dat"), "{files:?}");
     assert!(
         !files
             .iter()
@@ -987,15 +1001,22 @@ async fn e2e_backup_restore_delete_and_metrics() {
     );
     // a second backup, and a restore to a new name
     update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
-    assert_eq!(
-        run(
-            &s,
-            "/$/backups/ds",
-            json!({"repository": "local", "name": "b2"})
-        )
-        .await
-        .state,
-        "done"
+    let t = run(
+        &s,
+        "/$/backups/ds",
+        json!({"repository": "local", "name": "b2"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    // incremental: only the appended bytes and changed meta files
+    let d = t.detail.unwrap();
+    assert_eq!(d["commit"]["seq"], 4);
+    assert!(d["addedBytes"].as_u64().unwrap() < 10_000, "{d}");
+    let b2 = get(&s.app, "/$/backups/ds/local/b2").await.body;
+    assert!(
+        b2["stats"]["newBlobs"].as_u64().unwrap() <= 5,
+        "{}",
+        b2["stats"]
     );
     let t = run(
         &s,
@@ -1009,6 +1030,27 @@ async fn e2e_backup_restore_delete_and_metrics() {
     assert_eq!(r.body["forkedFrom"], json!({"id": ds_id, "seq": 3}));
     assert_ne!(r.body["id"], ds_id.to_string().as_str());
     assert_eq!(r.body["head"], 3);
+    let r = get(
+        &s.app,
+        "/ds-r/sparql?query=SELECT%20%3Fs%20%7B%3Fs%20%3Fp%20%3Fo%7D",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.headers["sparkles-commit"], "3");
+    assert_ne!(r.headers["sparkles-dataset-id"], ds_id.to_string().as_str());
+    let rows = r.body["results"]["bindings"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{}", r.body);
+    assert_eq!(rows[0]["s"]["value"], "urn:b");
+    let r = get(&s.app, "/$/commits/ds-r").await;
+    let seqs: Vec<u64> = r.body["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, [3, 2, 1, 0], "{}", r.body);
+    update(&s, "ds-r", "INSERT DATA { <urn:x> <urn:p> 9 }");
+    assert_eq!(s.st.get("ds-r").unwrap().store.head_commit().seq, 4);
     // conflicts
     let r = post(
         &s.app,
@@ -1045,6 +1087,13 @@ async fn e2e_backup_restore_delete_and_metrics() {
     let r = get(&s.app, "/$/datasets/ds").await;
     assert_eq!(r.body["head"], 3);
     assert_eq!(r.body["forkedFrom"]["seq"], 3);
+    let new_id = r.body["id"].as_str().unwrap().to_string();
+    assert_ne!(new_id, ds_id.to_string());
+    update(&s, "ds", "INSERT DATA { <urn:f> <urn:p> 6 }");
+    let d = s.st.get("ds").unwrap();
+    assert_eq!(d.store.head_commit().seq, 4);
+    assert_eq!(d.store.dataset_id().to_string(), new_id);
+    drop(d);
     assert!(
         std::fs::read_dir(s.dir.path().join("databases"))
             .unwrap()
@@ -1067,17 +1116,26 @@ async fn e2e_backup_restore_delete_and_metrics() {
     assert_eq!(t.detail.unwrap()["status"], "ok");
     let r = get(&s.app, "/$/repositories/local/backups").await;
     assert_eq!(r.body["backups"][0]["verified"]["level"], "data");
+    // the name can be used again
+    let t = run(
+        &s,
+        "/$/backups/ds",
+        json!({"repository": "local", "name": "b1"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let r = get(&s.app, "/$/backups/ds/local/b1").await;
+    assert_eq!(r.body["dataset"]["id"], new_id.as_str());
     // metrics
     let r = get(&s.app, "/$/metrics").await;
     let text = r.body.as_str().unwrap().to_string();
-    assert!(text.contains("sparkles_backup_operations_total{repository=\"local\",operation=\"create\",result=\"ok\"} 2"), "{text}");
+    assert!(text.contains("sparkles_backup_operations_total{repository=\"local\",operation=\"create\",result=\"ok\"} 3"), "{text}");
     assert!(text.contains(
         "sparkles_backup_last_success_timestamp_seconds{dataset=\"ds\",repository=\"local\"}"
     ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs S2/S5"]
 async fn e2e_cancel_and_conflicts() {
     let (s, _repo) = with_local(false).await;
     let ds = s.st.get("ds").unwrap();
@@ -1113,11 +1171,25 @@ async fn e2e_cancel_and_conflicts() {
     .await;
     expect(&again, StatusCode::CONFLICT, "backup-in-progress");
     assert_eq!(again.body["task"], id.as_str());
+    // cancel once some blobs are uploaded
+    let t0 = Instant::now();
+    while !s.st.tasks.lock().iter().any(|t| {
+        t.id == id
+            && t.message
+                .as_deref()
+                .is_some_and(|m| m.contains(" new blobs") && !m.contains(" 0 new blobs"))
+    }) {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no upload progress");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let r = call(&s.app, "DELETE", &format!("/$/tasks/{id}"), None, J::Null).await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
     assert_eq!(wait_task(&s.st, &id).await.state, "cancelled");
     let r = get(&s.app, "/$/backups/ds/local/b3").await;
     expect(&r, StatusCode::NOT_FOUND, "no-such-backup");
+    let r = get(&s.app, "/$/backups/ds").await;
+    assert_eq!(r.body["backups"], json!([]), "{}", r.body);
+    // the second attempt reuses what the first uploaded
     let t = run(
         &s,
         "/$/backups/ds",
@@ -1125,10 +1197,15 @@ async fn e2e_cancel_and_conflicts() {
     )
     .await;
     assert_eq!(t.state, "done", "{:?}", t.message);
+    let r = get(&s.app, "/$/backups/ds/local/b3").await;
+    assert!(
+        r.body["stats"]["reusedBlobs"].as_u64().unwrap() > 0,
+        "{}",
+        r.body["stats"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs S2/S5"]
 async fn e2e_disaster_recovery_from_a_read_only_repository() {
     let (a, repo) = with_local(false).await;
     let id = a.st.get("ds").unwrap().store.dataset_id();
@@ -1178,4 +1255,184 @@ async fn e2e_disaster_recovery_from_a_read_only_repository() {
     expect(&r, StatusCode::CONFLICT, "repository-read-only");
     let locks_after = std::fs::read_dir(repo.path().join("locks")).map_or(0, |d| d.count());
     assert_eq!(locks_before, locks_after);
+}
+
+/// The blob file of the first piece of `path` in backup `name` of `ds`.
+async fn blob_file(s: &Srv, repo: &std::path::Path, name: &str, path: &str) -> (String, PathBuf) {
+    let m = get(&s.app, &format!("/$/backups/ds/local/{name}"))
+        .await
+        .body;
+    let id = m["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == path)
+        .unwrap()["blobs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let file = repo.join(format!("blobs/{}/{id}", &id[..2]));
+    (id, file)
+}
+
+/// Back up `ds` into `local` as `name`; the task must succeed.
+async fn backup_ds(s: &Srv, name: &str) {
+    let t = run(
+        s,
+        "/$/backups/ds",
+        json!({"repository": "local", "name": name}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+}
+
+async fn delete_ds_backup(s: &Srv, name: &str) {
+    let r = call(
+        &s.app,
+        "DELETE",
+        &format!("/$/backups/ds/local/{name}"),
+        None,
+        J::Null,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_damaged_blobs_fail_verifications_and_restores() {
+    let (s, repo) = with_local(false).await;
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    let (id, file) = blob_file(&s, repo.path(), "b1", "gen-0001/spo.dat").await;
+    let saved = std::fs::read(&file).unwrap();
+    // a missing blob: both backups share it
+    std::fs::remove_file(&file).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    assert_eq!(d["status"], "error", "{d}");
+    assert_eq!(d["backups"][0]["missing"], json!([id]));
+    let t = run(
+        &s,
+        "/$/repositories/local/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    assert_eq!(d["status"], "error", "{d}");
+    assert!(
+        d["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["missing"] == json!([id])),
+        "{d}"
+    );
+    // a flipped byte: present, but not intact
+    let mut bad = saved.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&file, &bad).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "exists"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "ok");
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    assert_eq!(d["backups"][0]["corrupt"], json!([id]), "{d}");
+    // a restore of it fails and leaves nothing behind
+    let t = run(&s, "/$/backups/ds/local/b1/restore", json!({"target": "x"})).await;
+    assert_eq!(t.state, "failed");
+    let msg = t.message.unwrap_or_default();
+    assert!(msg.contains(&id), "{msg}");
+    assert!(s.st.get("x").is_none());
+    let r = get(&s.app, "/$/datasets/x").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let left: Vec<String> = std::fs::read_dir(s.dir.path().join("databases"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n == "x" || n.starts_with(".restore-x-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    // repaired, a verification by restoring passes with a check report
+    std::fs::write(&file, &saved).unwrap();
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b1/verify",
+        json!({"level": "restore"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    assert_eq!(d["status"], "ok", "{d}");
+    assert_eq!(d["backups"][0]["check"]["status"], "ok", "{d}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_gc_collects_the_blobs_of_deleted_backups() {
+    let (s, _repo) = with_local(false).await;
+    backup_ds(&s, "b1").await;
+    update(&s, "ds", "INSERT DATA { <urn:c> <urn:p> 3 }");
+    backup_ds(&s, "b2").await;
+    delete_ds_backup(&s, "b1").await;
+    // after a compaction, a backup of the new generation; then nothing needs gen-0001
+    s.st.get("ds").unwrap().store.compact().unwrap();
+    backup_ds(&s, "b4").await;
+    let b4 = get(&s.app, "/$/backups/ds/local/b4").await.body;
+    assert_eq!(b4["generation"], "gen-0002");
+    delete_ds_backup(&s, "b2").await;
+    let t = run(
+        &s,
+        "/$/repositories/local/gc",
+        json!({"dryRun": true, "graceHours": 0}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let dry = t.detail.unwrap();
+    assert!(dry["candidates"].as_u64().unwrap() > 0, "{dry}");
+    let r = get(&s.app, "/$/repositories/local").await;
+    assert!(r.body["lastGc"].is_null(), "{}", r.body);
+    let t = run(&s, "/$/repositories/local/gc", json!({"graceHours": 0})).await;
+    let real = t.detail.unwrap();
+    assert_eq!(real["deleted"], dry["candidates"], "{real}");
+    assert_eq!(real["deletedBytes"], dry["deletedBytes"], "{real}");
+    assert_eq!(real["storedBytesAfter"], dry["storedBytesAfter"], "{real}");
+    let r = get(&s.app, "/$/repositories/local").await;
+    assert_eq!(r.body["lastGc"]["deleted"], real["deleted"], "{}", r.body);
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b4/verify",
+        json!({"level": "data"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "ok");
+    // (a backup taken right after a compaction restores too)
+    let t = run(
+        &s,
+        "/$/backups/ds/local/b4/verify",
+        json!({"level": "restore"}),
+    )
+    .await;
+    let d = t.detail.unwrap();
+    assert_eq!(d["status"], "ok", "{d}");
+    // with the default grace period, a fresh orphan stays
+    update(&s, "ds", "INSERT DATA { <urn:d> <urn:p> 4 }");
+    backup_ds(&s, "b5").await;
+    delete_ds_backup(&s, "b5").await;
+    let t = run(&s, "/$/repositories/local/gc", json!({})).await;
+    let d = t.detail.unwrap();
+    assert!(d["keptYoung"].as_u64().unwrap() >= 1, "{d}");
+    assert_eq!(d["deleted"], 0, "{d}");
 }

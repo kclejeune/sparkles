@@ -1221,7 +1221,6 @@ fn invalid_config_file_policies_stop_the_server() {
 
 /// A real policy run against an `fs` repository registered over HTTP.
 #[tokio::test]
-#[ignore = "needs S2"]
 async fn end_to_end_policy_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut state =
