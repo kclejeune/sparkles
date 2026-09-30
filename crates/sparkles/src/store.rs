@@ -621,7 +621,7 @@ pub struct Store {
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
 }
 
-const WAL_INSERT: u8 = 1;
+pub(crate) const WAL_INSERT: u8 = 1;
 
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
@@ -650,9 +650,9 @@ fn lock_dir(root: &Path) -> Result<File> {
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
-const WAL_DELETE: u8 = 2;
-const WAL_COMMIT: u8 = 3;
-const WAL_REC: usize = 1 + 32;
+pub(crate) const WAL_DELETE: u8 = 2;
+pub(crate) const WAL_COMMIT: u8 = 3;
+pub(crate) const WAL_REC: usize = 1 + 32;
 
 impl Store {
     /// A fresh in-memory store (Jena `DatasetGraphFactory.createTxnMem()` equivalent).
@@ -935,6 +935,15 @@ impl Store {
                         }
                         good = (i + 1) * WAL_REC;
                         txn_start = i + 1;
+                    }
+                    // damage before the last commit record is not a torn tail: truncating
+                    // here would drop the committed transactions after it
+                    op if last_commit.is_some_and(|l| i < l) => {
+                        return Err(Error::Corrupt(format!(
+                            "{}: unknown record type {op} at byte {}, before the last commit",
+                            wal_path.display(),
+                            i * WAL_REC
+                        )));
                     }
                     _ => break,
                 }
