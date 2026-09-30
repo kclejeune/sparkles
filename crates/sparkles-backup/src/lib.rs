@@ -77,6 +77,11 @@ pub struct OpenEnv {
     /// use this store instead of building one from the configuration: tests wrap
     /// stores to inject failures or share one `InMemory` between two handles
     pub store: Option<Arc<dyn ObjectStore>>,
+    /// where `s3`, `gcs` and `azure` repositories may connect: every address their
+    /// endpoint resolves to must pass it, and connections go to exactly those
+    /// addresses (`None`: anywhere; the server sets it for repositories registered
+    /// through its API)
+    pub outbound: Option<sparkles::outbound::OutboundPolicy>,
 }
 
 impl Default for OpenEnv {
@@ -88,6 +93,7 @@ impl Default for OpenEnv {
             init: true,
             server_id: String::new(),
             store: None,
+            outbound: None,
         }
     }
 }

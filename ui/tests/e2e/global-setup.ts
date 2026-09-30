@@ -3,7 +3,8 @@
 // token. It loads a small dataset (labels, comments for full-text search, vectors for
 // "Similar"), signs the user in, and hands the details to the tests through environment
 // variables (inherited by the workers). A second server without auth (the default
-// `sparkles serve`) starts empty. The returned function is the global teardown.
+// `sparkles serve`) starts empty, with a backup config that lets its API register
+// repositories under a temporary directory. The returned function is the global teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log.
@@ -14,6 +15,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   closeSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -193,9 +195,22 @@ server = ["server-admin"]
     process.env.SPARKLES_E2E_TOKEN = token;
     process.env.SPARKLES_E2E_STATE = state;
 
-    const openServer = await serve(bin, join(dir, 'open-data'), join(dir, 'open-server.log'), []);
+    // backup repositories registered through its API must lie under repos/ (the config
+    // file's own directory is off limits to them)
+    const repos = join(dir, 'repos');
+    mkdirSync(repos);
+    mkdirSync(join(dir, 'conf'));
+    const backupConfig = join(dir, 'conf', 'backup.toml');
+    writeFileSync(backupConfig, `version = 1\n\n[api]\nfs_roots = [${JSON.stringify(repos)}]\n`, {
+      mode: 0o600,
+    });
+    const openServer = await serve(bin, join(dir, 'open-data'), join(dir, 'open-server.log'), [
+      '--backup-config',
+      backupConfig,
+    ]);
     open = openServer.child;
     process.env.SPARKLES_E2E_OPEN_URL = openServer.url;
+    process.env.SPARKLES_E2E_REPOS = repos;
   } catch (e) {
     process.off('exit', kill);
     await stop(child);

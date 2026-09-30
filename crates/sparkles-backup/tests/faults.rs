@@ -19,7 +19,7 @@ fn mem() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
 }
 
-/// A7: two writers race for one name: exactly one wins, the loser's blobs are orphans.
+/// Two writers race for one name: exactly one wins, the loser's blobs are orphans.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_name_one_winner() {
     let tmp = tempfile::tempdir().unwrap();
@@ -54,7 +54,7 @@ async fn one_name_one_winner() {
     assert_eq!(v.status, VerifyStatus::Warning);
 }
 
-/// A8: a cancelled backup leaves no manifest; the next attempt reuses what it uploaded.
+/// A cancelled backup leaves no manifest; the next attempt reuses what it uploaded.
 #[tokio::test]
 async fn cancel_then_reuse() {
     let inner = mem();
@@ -125,7 +125,7 @@ async fn cancel_then_reuse() {
     assert_eq!(s.name, "b3");
 }
 
-/// A9: a backend that keeps failing blob uploads fails the backup without a manifest.
+/// A backend that keeps failing blob uploads fails the backup without a manifest.
 #[tokio::test]
 async fn failing_uploads_fail_the_backup() {
     let tmp = tempfile::tempdir().unwrap();
@@ -153,7 +153,7 @@ async fn failing_uploads_fail_the_backup() {
     assert!(r.put.error >= 3, "{r:?}");
 }
 
-/// A9: transient failures are retried, and counted.
+/// Transient failures are retried, and counted.
 #[tokio::test]
 async fn transient_failures_are_retried() {
     let tmp = tempfile::tempdir().unwrap();
@@ -188,7 +188,7 @@ async fn transient_failures_are_retried() {
     assert_eq!(v.status, VerifyStatus::Ok, "{v:?}");
 }
 
-/// A9: "already exists" answered as a precondition failure (412) is success for blobs
+/// "Already exists" answered as a precondition failure (412) is success for blobs
 /// and `backup-exists` for a manifest.
 #[tokio::test]
 async fn precondition_failures_mean_exists() {
@@ -221,7 +221,7 @@ async fn precondition_failures_mean_exists() {
     );
 }
 
-/// A21: conditional-write detection by the connection test.
+/// Conditional-write detection by the connection test.
 #[tokio::test]
 async fn connection_test_detects_conditional_writes() {
     // memory: supported
@@ -341,7 +341,7 @@ async fn connection_test_reports_failures() {
     );
 }
 
-/// A16: markers: attach, initialize, refuse.
+/// Markers: attach, initialize, refuse.
 #[tokio::test]
 async fn repository_markers() {
     let cfg = memory_config("m");

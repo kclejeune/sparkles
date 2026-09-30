@@ -516,13 +516,15 @@ pub fn gc(
 /// Start a `backup-gc` task on repository `repo` (server-scoped, cancellable; the
 /// repository counts as in use while it runs): `409 repository-read-only`. The
 /// receiver is told once the task runs or queues. For `POST /$/repositories/{repo}/gc`
-/// and `gcAfterRetention`.
+/// and `gcAfterRetention` (`admission`: that of the request, see
+/// [`BackupState::admit`](super::BackupState::admit)).
 pub fn start_gc(
     st: &Arc<AppState>,
     repo: &str,
     dry_run: bool,
     grace: Duration,
     principal: String,
+    admission: Option<super::Admission>,
 ) -> Result<(Task, tokio::sync::oneshot::Receiver<()>), BackupError> {
     let b = backup_state(st)?;
     writable(&b.registry.config(repo)?)?;
@@ -538,7 +540,7 @@ pub fn start_gc(
     let st2 = st.clone();
     let name = repo.to_string();
     let task = st.start_task_opts(id, "backup-gc", "", Some(repo), true, move |h| {
-        let _claim = claim;
+        let _held = (claim, admission);
         let r = gc(&st2, &name, dry_run, grace, &principal, h, Some(tx)).map_err(task_error)?;
         h.set_detail(serde_json::to_value(&r)?);
         Ok(if dry_run {

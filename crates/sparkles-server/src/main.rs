@@ -1300,11 +1300,11 @@ fn run() -> Result<()> {
             st.hosts = hosts;
             #[cfg(feature = "backup")]
             {
-                st.backup = Some(Arc::new(backup::BackupState::new(
-                    &data,
-                    backup_config,
-                    backup_max_tasks,
-                )?));
+                let mut b = backup::BackupState::new(&data, backup_config, backup_max_tasks)?;
+                if let Some(f) = &auth_config {
+                    b.forbid_config_dir(f);
+                }
+                st.backup = Some(Arc::new(b));
             }
             st.read_only = read_only;
             st.allow_service = !no_service;

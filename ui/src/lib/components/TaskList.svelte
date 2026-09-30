@@ -31,6 +31,8 @@
   let loaded = $state(false);
   let now = $state(Date.now());
   const running = new Set<string>();
+  /** Every task id listed so far. */
+  const seen = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
 
@@ -67,10 +69,15 @@
       list.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
       for (const t of list) {
         if (active(t)) running.add(t.id);
-        else if (running.has(t.id)) {
+        else if (
+          running.has(t.id) ||
+          // a task of ours that started and finished between two polls
+          (loaded && !seen.has(t.id) && (!dataset || t.dataset === dataset))
+        ) {
           running.delete(t.id);
           ondone?.(t);
         }
+        seen.add(t.id);
       }
       tasks = list;
       error = null;

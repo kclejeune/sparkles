@@ -19,8 +19,8 @@ use anyhow::{Context, bail};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sparkles_backup::{
-    BackupError, Code, ConfigSource, LastGc, PolicyConfig, RepoConfig, RepoStats, RepoStatus,
-    Repository, Verified,
+    BackupError, Code, ConfigSource, Credentials, LastGc, PolicyConfig, RepoConfig, RepoStats,
+    RepoStatus, Repository, Verified,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -117,11 +117,22 @@ pub struct PolicyEntry {
     pub source: ConfigSource,
 }
 
+/// What the config file allows repositories registered through the API.
+#[derive(Clone, Debug, Default)]
+pub struct ApiRules {
+    /// `[credentials.<name>]`: the credential sources repositories may name
+    pub credentials: BTreeMap<String, Credentials>,
+    /// `[api] fs_roots` (empty: no restriction beyond the server's own directories)
+    pub fs_roots: Vec<PathBuf>,
+}
+
 /// Repositories and policies by name.
 #[derive(Default)]
 pub struct Registry {
     pub repos: RwLock<BTreeMap<String, RepoEntry>>,
     pub policies: RwLock<BTreeMap<String, PolicyEntry>>,
+    /// the config file's credential sources and API limits (replaced on reload)
+    pub api: RwLock<ApiRules>,
     /// serializes the writes of `repositories.json`, so an older snapshot never
     /// overwrites a newer one
     saving: Mutex<()>,
@@ -188,6 +199,7 @@ impl Registry {
         let reg = Registry {
             repos: RwLock::new(repos),
             policies: RwLock::new(policies),
+            api: RwLock::default(),
             saving: Mutex::new(()),
         };
         if let Some(c) = config {
@@ -261,6 +273,23 @@ impl Registry {
                     source: ConfigSource::Config,
                 },
             );
+        }
+        let credentials = config.credential_sources();
+        // a changed credential source reopens the repositories that name it
+        let old = std::mem::replace(
+            &mut *self.api.write(),
+            ApiRules {
+                credentials,
+                fs_roots: config.api.fs_roots.iter().map(PathBuf::from).collect(),
+            },
+        );
+        let api = self.api.read();
+        for e in repos.values_mut() {
+            if let Credentials::Named { name } = &e.config.credentials
+                && old.credentials.get(name) != api.credentials.get(name)
+            {
+                e.opened = None;
+            }
         }
         Ok(())
     }

@@ -610,7 +610,7 @@ async fn read_only_servers_refuse_policy_changes() {
     assert_eq!(st, StatusCode::OK);
 }
 
-// A25 over HTTP, and the preview's sample and errors
+// Time zones and DST in the preview over HTTP, and the preview's sample and errors
 #[tokio::test]
 async fn preview() {
     let s = setup("2026-10-24T00:00:00Z");
@@ -682,7 +682,7 @@ async fn preview() {
     }
 }
 
-// A23: `*/10` in UTC; at 12:05 nextRun is 12:10; at 12:10 a scheduled run; a manual run
+// `*/10` in UTC; at 12:05 nextRun is 12:10; at 12:10 a scheduled run; a manual run
 // at 12:12 does not move the schedule
 #[tokio::test]
 async fn scheduled_and_manual_runs() {
@@ -782,7 +782,7 @@ fn write_state(dir: &FsPath, policy: J, last_scheduled_for: &str) {
     .unwrap();
 }
 
-// A24: an hourly policy that last ran at 09:00, back at 12:40: 60 s later one catch-up
+// An hourly policy that last ran at 09:00, back at 12:40: 60 s later one catch-up
 // run for 12:00, then the 13:00 run (the scheduler thread with a fake clock)
 #[tokio::test]
 async fn one_catch_up_run_after_a_restart() {
@@ -836,7 +836,7 @@ async fn one_catch_up_run_after_a_restart() {
     );
 }
 
-// A24 with `catchUp: "none"`: the missed 12:00 is recorded skipped; the next run is 13:00
+// Missed runs with `catchUp: "none"`: the missed 12:00 is recorded skipped; the next run is 13:00
 #[tokio::test]
 async fn missed_runs_skipped_without_catch_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -910,7 +910,7 @@ async fn overlapping_runs_are_skipped() {
     assert_eq!(j["state"]["consecutiveFailures"], 0);
 }
 
-// A26 through the route, with a dry run first
+// Retention through the route, with a dry run first
 #[tokio::test]
 async fn retention_route() {
     let s = setup("2026-09-30T12:00:00Z");
@@ -1221,7 +1221,6 @@ fn invalid_config_file_policies_stop_the_server() {
 
 /// A real policy run against an `fs` repository registered over HTTP.
 #[tokio::test]
-#[ignore = "needs S2"]
 async fn end_to_end_policy_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut state =

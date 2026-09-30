@@ -485,7 +485,7 @@ fn resolve(repo: &str, c: &ConfigArg) -> Result<RepoConfig> {
     let path = config_path(c)?;
     let f = load_existing(&path)?;
     match f.repositories.get(repo) {
-        Some(r) => Ok(r.to_config(repo)),
+        Some(r) => f.resolve_credentials(r.to_config(repo)),
         None => bail!(
             "no repository {repo:?} in {} (known: {}); a URL (file:///dir, s3://bucket/prefix) works too",
             path.display(),

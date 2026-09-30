@@ -219,3 +219,65 @@ fn credentials_files() {
     let e = sparkles_backup::repo::build_store(&c).unwrap_err();
     assert!(e.message().contains("SPARKLES_TEST_UNSET_KEY_VAR"));
 }
+
+/// Named credential sources, and the characters of buckets and regions (they become
+/// part of the service's host name).
+#[test]
+fn named_credentials_and_host_parts() {
+    let mut c = RepoConfig {
+        name: "s3".into(),
+        kind: RepoType::S3,
+        bucket: Some("b".into()),
+        conditional_writes: true,
+        credentials: Credentials::Named { name: "lab".into() },
+        ..Default::default()
+    };
+    c.validate(&[]).unwrap();
+    // resolved by the server, never here
+    let e = sparkles_backup::repo::build_store(&c).unwrap_err();
+    assert_eq!(e.code(), Code::InvalidConfig);
+    c.credentials = Credentials::Named {
+        name: "Not A Name".into(),
+    };
+    assert_eq!(c.validate(&[]).unwrap_err().code(), Code::InvalidConfig);
+    c.credentials = Credentials::Default;
+    for (bucket, region) in [
+        ("b/x", None),
+        ("b@evil.example", None),
+        ("b", Some("x.evil.example")),
+        ("b", Some("eu#")),
+    ] {
+        c.bucket = Some(bucket.into());
+        c.region = region.map(Into::into);
+        assert_eq!(
+            c.validate(&[]).unwrap_err().code(),
+            Code::InvalidConfig,
+            "{bucket} {region:?}"
+        );
+    }
+}
+
+/// With an outbound policy, endpoints it refuses are refused before any connection.
+#[test]
+fn endpoints_under_an_outbound_policy() {
+    let c = RepoConfig {
+        name: "s3".into(),
+        kind: RepoType::S3,
+        bucket: Some("b".into()),
+        endpoint: Some("http://127.0.0.1:9000".into()),
+        allow_http: true,
+        conditional_writes: true,
+        ..Default::default()
+    };
+    let strict = sparkles::outbound::OutboundPolicy::default();
+    let e = sparkles_backup::repo::build_store_with(&c, Some(&strict)).unwrap_err();
+    assert_eq!(e.code(), Code::InvalidConfig);
+    assert!(e.message().contains("outbound policy"), "{}", e.message());
+    let open = sparkles::outbound::OutboundPolicy {
+        allow_private: true,
+        ..Default::default()
+    };
+    sparkles_backup::repo::build_store_with(&c, Some(&open)).unwrap();
+    // without a policy (config-file repositories), anything goes
+    sparkles_backup::repo::build_store(&c).unwrap();
+}

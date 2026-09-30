@@ -56,6 +56,29 @@ test('adding a repository tests the connection; a failed one can be removed agai
   await expect(page.getByRole('article', { name: 'e2e-offline' })).toHaveCount(0);
 });
 
+test('S3 repositories added here name a credential source the operator defined', async ({
+  page,
+}) => {
+  await page.goto('/ui/backups?tab=repositories');
+  await page.getByRole('button', { name: 'Add repository' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Add repository' });
+  await dialog.getByRole('radio', { name: 'S3' }).check();
+  await expect(dialog.getByRole('radio', { name: 'GCS' })).toHaveCount(0);
+  await dialog.getByRole('textbox', { name: 'Name' }).fill('e2e-s3');
+  await dialog.getByRole('textbox', { name: 'Bucket' }).fill('e2e-bucket');
+  const add = dialog.getByRole('button', { name: 'Add and test' });
+  await expect(add).toBeDisabled();
+  await dialog.getByRole('textbox', { name: 'Credential source' }).fill('nope');
+  await add.click();
+  await expect(dialog).toContainText('no credential source "nope"');
+  await dialog.getByRole('textbox', { name: 'Credential source' }).fill('minio');
+  await add.click();
+  const added = page.getByRole('dialog', { name: 'Added e2e-s3' });
+  await expect(added).toBeVisible();
+  await added.getByRole('button', { name: 'Done' }).click();
+  await expect(page.getByRole('article', { name: 'e2e-s3' })).toContainText('credentials minio');
+});
+
 test('a backup made on the dataset page restores into a new dataset', async ({ page }) => {
   await page.goto('/ui/datasets/foaf');
   const panel = page.getByRole('region', { name: 'Backups' });

@@ -80,7 +80,9 @@
         ? `env ${r.credentials.accessKeyIdVar}`
         : r.credentials?.source === 'file'
           ? `file ${r.credentials.path}`
-          : 'default credential chain';
+          : r.credentials?.source === 'named'
+            ? `credentials ${r.credentials.name}`
+            : 'default credential chain';
 
   const mutable = (r: b.Repository) => r.source === 'api' && !readOnly;
 </script>
