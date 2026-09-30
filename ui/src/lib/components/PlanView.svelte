@@ -1,9 +1,21 @@
 <script lang="ts">
   import type { PlanNode } from '$lib/api';
   import { fmtCompact, fmtInt, fmtMs } from '$lib/format';
+  import { shorten, type PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
 
-  let { plan, executed = true }: { plan: PlanNode; executed?: boolean } = $props();
+  let { plan, executed = true, prefixes = {} }: { plan: PlanNode; executed?: boolean; prefixes?: PrefixMap } = $props();
+
+  /**
+   * Operator description for display: `<iri>` as a prefixed name where a prefix matches,
+   * and the parser's generated 32-hex variable names (aggregates, DESCRIBE) abbreviated.
+   * The full text stays available in the tooltip.
+   */
+  function desc(d: string): string {
+    return d
+      .replace(/<([^<>\s]+)>/g, (m, iri: string) => shorten(iri, prefixes) ?? m)
+      .replace(/\?([0-9a-f]{32})\b/g, (_, h: string) => `?_${h.slice(0, 6)}`);
+  }
 
   type Flat = { node: PlanNode; id: string; depth: number; self: number; hasKids: boolean; last: boolean[] };
 
@@ -123,7 +135,7 @@
               <span class="twisty-space"></span>
             {/if}
             <span class="name">{r.node.operator}</span>
-            <span class="desc" title={r.node.description}>{r.node.description}</span>
+            <span class="desc" title={r.node.description}>{desc(r.node.description)}</span>
             {#if r.node.cached}<span class="badge ok" title="Served from the result cache">cached</span>{/if}
             {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
           </div>
@@ -160,14 +172,14 @@
             title="{b.node.operator} {b.node.description}"
           >
             <span>{b.node.operator}</span>
-            <span class="d">{b.node.description}</span>
+            <span class="d">{desc(b.node.description)}</span>
           </button>
         {/each}
       </div>
       <div class="detail">
         {#if hoveredNode}
           <strong>{hoveredNode.operator}</strong>
-          <span class="mono">{hoveredNode.description}</span>
+          <span class="mono">{desc(hoveredNode.description)}</span>
           <span class="muted">
             est {fmtInt(hoveredNode.estimatedRows)} rows{#if hoveredNode.actualRows >= 0}, actual {fmtInt(hoveredNode.actualRows)}{/if}{#if executed},
               {fmtMs(hoveredNode.timeMs)} total, {fmtMs(selfTime(hoveredNode))} self{/if}

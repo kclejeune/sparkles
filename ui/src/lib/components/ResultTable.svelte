@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
-  import { displayTerm, toSparql, type PrefixMap } from '$lib/rdf';
+  import { displayIri, displayTerm, toSparql, type PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
 
@@ -37,7 +37,16 @@
       const n = Math.min(rows.length, 300);
       for (let i = 0; i < n; i++) {
         const t = rows[i][c];
-        const len = displayTerm(t, prefixes).length + (t?.type === 'literal' && (t['xml:lang'] || t.datatype) ? 8 : 0);
+        // literal suffix as TermView renders it: "@lang" or "^^prefix:local" (smaller font)
+        const suffix =
+          t?.type === 'literal'
+            ? t['xml:lang']
+              ? t['xml:lang'].length + 2
+              : t.datatype
+                ? Math.ceil((displayIri(t.datatype, prefixes).length + 3) * 0.85)
+                : 0
+            : 0;
+        const len = displayTerm(t, prefixes).length + suffix;
         if (len > max) max = len;
       }
       return Math.round(Math.min(460, Math.max(90, max * 7.4 + 28)));

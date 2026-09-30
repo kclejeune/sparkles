@@ -63,10 +63,12 @@
 
   // reasoning
   let profile = $state<api.ReasonProfile>('rdfs');
-  let rules = $state(`# One rule per SPARQL INSERT … WHERE, or your rule syntax.
-# Example: everyone who authored something is a Researcher.
-PREFIX ex: <http://example.org/ontology#>
-INSERT { ?p a ex:Researcher } WHERE { ?pub ex:author ?p }`);
+  let rules = $state(`# Jena rule syntax. rdf:, rdfs:, owl: and xsd: are predefined.
+# Add a built-in rule set with:  @include <rdfs> .   (or <owl-rl>)
+@prefix ex: <http://example.org/> .
+
+# Everyone who authored something is a Researcher.
+[author: (?p ex:authorOf ?d) -> (?p rdf:type ex:Researcher)]`);
   let dropping = $state(false);
 
   async function dropInf() {
@@ -391,7 +393,7 @@ INSERT { ?p a ex:Researcher } WHERE { ?pub ex:author ?p }`);
           </div>
           <div class="panel-body reason">
             <div class="profiles" role="radiogroup" aria-label="Reasoning profile">
-              {#each [{ v: 'rdfs', l: 'RDFS', d: 'subClassOf, subPropertyOf, domain, range' }, { v: 'owl-rl', l: 'OWL 2 RL', d: 'RDFS plus inverse, symmetric, transitive, sameAs…' }, { v: 'rules', l: 'Custom rules', d: 'Your own rule set' }] as const as p (p.v)}
+              {#each [{ v: 'rdfs', l: 'RDFS', d: 'subClassOf, subPropertyOf, domain, range' }, { v: 'owl-rl', l: 'OWL 2 RL', d: 'RDFS plus inverse, symmetric, transitive, sameAs…' }, { v: 'rules', l: 'Custom rules', d: 'Your own rules, Jena rule syntax' }] as const as p (p.v)}
                 <label class="opt" class:sel={profile === p.v}>
                   <input type="radio" bind:group={profile} value={p.v} />
                   <span><strong>{p.l}</strong><span class="faint">{p.d}</span></span>

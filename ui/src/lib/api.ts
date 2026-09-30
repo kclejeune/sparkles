@@ -235,22 +235,36 @@ export async function queryRaw(ds: string, sparql: string, accept: string, opts:
   return res.blob();
 }
 
-export async function update(ds: string, sparql: string, signal?: AbortSignal): Promise<string> {
+/** Response of `/{ds}/update`: quad counts and server-side timing. */
+export type UpdateResult = { inserted: number; deleted: number; operations: number; timing?: Timing };
+
+export async function update(ds: string, sparql: string, signal?: AbortSignal): Promise<UpdateResult | null> {
   const res = await request(`/${enc(ds)}/update`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/sparql-update' },
+    headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
     body: sparql,
     signal,
   });
-  return res.text();
+  // Fuseki answers with an HTML page; Sparkles with JSON counts.
+  const text = await res.text();
+  try {
+    const body = JSON.parse(text);
+    return body && typeof body.inserted === 'number' ? (body as UpdateResult) : null;
+  } catch {
+    return null;
+  }
 }
 
-export function explain(ds: string, sparql: string, signal?: AbortSignal): Promise<ExplainResult> {
-  return json<ExplainResult>(`/${enc(ds)}/explain`, {
+export function explain(
+  ds: string,
+  sparql: string,
+  opts: { reasoning?: boolean; signal?: AbortSignal } = {},
+): Promise<ExplainResult> {
+  return json<ExplainResult>(`/${enc(ds)}/explain${queryParams({ reasoning: opts.reasoning })}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ query: sparql }).toString(),
-    signal,
+    signal: opts.signal,
   });
 }
 

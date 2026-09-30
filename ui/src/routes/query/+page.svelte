@@ -5,7 +5,7 @@
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { EXAMPLES } from '$lib/examples';
-  import { fmtInt, fmtMs } from '$lib/format';
+  import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { addMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { load, save } from '$lib/storage';
@@ -23,7 +23,9 @@
     kind: string;
     result?: api.SparklesResult;
     explain?: api.ExplainResult;
-    updated?: { ms: number };
+    updated?: { ms: number; result: api.UpdateResult | null };
+    /** Whether materialized inferences were included (null: dataset has none). */
+    reasoning?: boolean | null;
     error?: api.ApiError | Error;
     view: View;
     startedAt: number;
@@ -35,7 +37,7 @@
   const STORE_KEY = 'sparkles.queryTabs';
   const LIMITS = [1_000, 10_000, 100_000, 1_000_000];
 
-  const saved = load<{ tabs: QTab[]; active: string; limit?: number; editorH?: number }>(STORE_KEY, {
+  const saved = load<{ tabs: QTab[]; active: string; limit?: number; editorH?: number; inferences?: boolean }>(STORE_KEY, {
     tabs: [],
     active: '',
   });
@@ -45,6 +47,8 @@
   let activeId = $state(tabs.some((t) => t.id === saved.active) ? saved.active : tabs[0].id);
   let limit = $state(LIMITS.includes(saved.limit ?? 0) ? saved.limit! : 10_000);
   let editorH = $state(Math.min(Math.max(saved.editorH ?? 260, 120), 900));
+  /** Include materialized inferences (the server's `reasoning=` parameter). */
+  let inferences = $state(saved.inferences !== false);
   let outcomes = $state<Record<string, Outcome>>({});
   let examplesOpen = $state(false);
   let renaming = $state<string | null>(null);
@@ -61,9 +65,13 @@
   const ds = $derived(app.current);
   const prefixes = $derived(app.prefixes(outcome?.ds ?? ds));
   const kind = $derived(queryKind(active.query));
+  const reasoningInfo = $derived(app.datasets.find((d) => d.name === ds)?.reasoning ?? null);
+  /** `reasoning=` for a dataset: only sent when it has materialized inferences. */
+  const reasoningFor = (name: string | null | undefined) =>
+    app.datasets.find((d) => d.name === name)?.reasoning ? inferences : undefined;
 
   $effect(() => {
-    save(STORE_KEY, { tabs, active: activeId, limit, editorH });
+    save(STORE_KEY, { tabs, active: activeId, limit, editorH, inferences });
   });
 
   $effect(() => {
@@ -137,17 +145,22 @@
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
     const started = performance.now();
-    outcomes[tabId] = { status: 'running', ds: dsName, kind: k, view: prevView ?? 'table', startedAt: started, controller };
+    const reasoning = reasoningFor(dsName);
+    outcomes[tabId] = { status: 'running', ds: dsName, kind: k, view: prevView ?? 'table', startedAt: started, controller, reasoning };
     try {
       if (k === 'UPDATE') {
-        await api.update(dsName, text, controller.signal);
+        const result = await api.update(dsName, text, controller.signal);
         const ms = performance.now() - started;
-        outcomes[tabId] = { status: 'done', ds: dsName, kind: k, updated: { ms }, view: 'table', startedAt: started, elapsed: ms };
-        toasts.push('success', 'Update applied', `${dsName} in ${fmtMs(ms)}`);
+        outcomes[tabId] = { status: 'done', ds: dsName, kind: k, updated: { ms, result }, view: 'table', startedAt: started, elapsed: ms };
+        toasts.push(
+          'success',
+          'Update applied',
+          result ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}` : `${dsName} in ${fmtMs(ms)}`,
+        );
         delete app.vocab[dsName];
         void app.refreshDatasets();
       } else {
-        const result = await api.query(dsName, text, { send: limit, signal: controller.signal });
+        const result = await api.query(dsName, text, { send: limit, reasoning, signal: controller.signal });
         const elapsed = performance.now() - started;
         // Keep the user's chosen view only when re-running the same kind of query.
         const sameKind = prevKind === result.queryType;
@@ -160,6 +173,7 @@
           view: keep ? prevView! : defaultView(result),
           startedAt: started,
           elapsed,
+          reasoning,
         };
         autoPickColumns(result);
       }
@@ -186,11 +200,14 @@
     }
     editor?.showError(undefined);
     const started = performance.now();
-    const prev = outcomes[tabId];
-    outcomes[tabId] = { ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }), status: 'running', view: 'explain' } as Outcome;
+    // Keep a previous query result (its Table/Plan tabs stay usable), but not an update
+    // confirmation or an error, which would otherwise take precedence over the plan.
+    const prev = outcomes[tabId]?.result ? outcomes[tabId] : undefined;
+    const base = { ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }), updated: undefined, error: undefined };
+    outcomes[tabId] = { ...base, status: 'running', view: 'explain' } as Outcome;
     try {
-      const ex = await api.explain(dsName, text);
-      outcomes[tabId] = { ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }), status: 'done', explain: ex, view: 'explain', error: undefined } as Outcome;
+      const ex = await api.explain(dsName, text, { reasoning: reasoningFor(dsName) });
+      outcomes[tabId] = { ...base, status: 'done', explain: ex, view: 'explain' } as Outcome;
     } catch (e) {
       outcomes[tabId] = { status: 'error', ds: dsName, kind: 'EXPLAIN', error: e as Error, view: 'explain', startedAt: started };
       if (e instanceof api.ApiError && e.line) editor?.showError(e.line, e.column);
@@ -290,7 +307,8 @@
     if (!dsName) return;
     downloading = fmt.label;
     try {
-      const blob = await api.queryRaw(dsName, active.query, fmt.accept);
+      const reasoning = outcome?.reasoning ?? reasoningFor(dsName);
+      const blob = await api.queryRaw(dsName, active.query, fmt.accept, { reasoning: reasoning ?? undefined });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -448,6 +466,15 @@
         </div>
       {/if}
     </div>
+    {#if reasoningInfo && kind !== 'UPDATE'}
+      <label
+        class="limit inf"
+        title="Include the {fmtInt(reasoningInfo.inferred)} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+      >
+        <input type="checkbox" bind:checked={inferences} />
+        <span>Use inferences</span>
+      </label>
+    {/if}
     <label class="limit" title="Maximum rows the server sends to the browser (send=)">
       <span class="faint">Show</span>
       <select class="select sm" bind:value={limit}>
@@ -509,6 +536,9 @@
             </button>
           {/if}
         </div>
+        {#if outcome.reasoning === false && outcome.view !== 'explain'}
+          <span class="badge" title="Ran with reasoning=false: materialized inferences were excluded">no inferences</span>
+        {/if}
         <span class="spacer"></span>
         {#if outcome.status === 'running'}
           <span class="row faint"><span class="spinner"></span> Running {fmtMs(now - outcome.startedAt)}</span>
@@ -557,15 +587,22 @@
           <div class="empty">
             <Icon name="check" size={22} />
             <p>Update applied to <strong>{outcome.ds}</strong> in {fmtMs(outcome.updated.ms)}.</p>
+            {#if outcome.updated.result}
+              {@const u = outcome.updated.result}
+              <p class="faint">
+                {fmtInt(u.inserted)} quad{u.inserted === 1 ? '' : 's'} inserted, {fmtInt(u.deleted)} deleted
+                ({u.operations} operation{u.operations === 1 ? '' : 's'}).
+              </p>
+            {/if}
           </div>
         {:else if outcome.view === 'explain'}
           {#if outcome.explain}
             <div class="explain">
               <div class="algebra">
                 <div class="sub-head">Algebra <span class="faint">(SSE)</span></div>
-                <pre class="mono">{outcome.explain.algebra}</pre>
+                <pre class="mono">{formatSse(outcome.explain.algebra)}</pre>
               </div>
-              <div class="explain-plan"><PlanView plan={outcome.explain.plan} executed={false} /></div>
+              <div class="explain-plan"><PlanView plan={outcome.explain.plan} executed={false} {prefixes} /></div>
             </div>
           {:else}
             <div class="empty"><span class="spinner"></span></div>
@@ -637,7 +674,7 @@
             </div>
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
-              <PlanView plan={r.meta.plan} />
+              <PlanView plan={r.meta.plan} {prefixes} />
             {:else}
               <div class="empty">The server did not return a plan for this query.</div>
             {/if}
@@ -673,6 +710,9 @@
     flex: 1;
     display: grid;
     grid-template-rows: auto auto var(--editor-h) 7px minmax(0, 1fr);
+    /* without an explicit column, wide content (long editor lines, the plan table)
+       stretches the grid past the viewport and the toolbar's Run button is clipped */
+    grid-template-columns: minmax(0, 1fr);
     min-height: 0;
     height: 100%;
   }
@@ -800,6 +840,10 @@
     align-items: center;
     gap: 6px;
     font-size: var(--fs-sm);
+  }
+  .inf {
+    cursor: pointer;
+    white-space: nowrap;
   }
   .select.sm {
     height: 24px;

@@ -61,3 +61,70 @@ export function fmtRelative(iso: string | undefined, now = Date.now()): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
+
+// --- SSE (SPARQL algebra) pretty-printing ---------------------------------------
+
+type Sexp = string | Sexp[];
+
+function parseSse(src: string): Sexp[] {
+  /** End (exclusive) of an `<iri>` starting at `at`, or -1 when `<` is an operator. */
+  const iriEnd = (at: number) => {
+    const end = src.indexOf('>', at);
+    return end > at && !/\s/.test(src.slice(at + 1, end)) ? end + 1 : -1;
+  };
+  const root: Sexp[] = [];
+  const stack: Sexp[][] = [root];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) {
+      i++;
+    } else if (c === '(') {
+      const list: Sexp[] = [];
+      stack[stack.length - 1].push(list);
+      stack.push(list);
+      i++;
+    } else if (c === ')') {
+      if (stack.length > 1) stack.pop();
+      i++;
+    } else {
+      // atom: a quoted string (with escapes and an optional @lang / ^^type), an <iri>, or a bare token
+      let j = i;
+      if (c === '"' || c === "'") {
+        j++;
+        while (j < src.length && src[j] !== c) j += src[j] === '\\' ? 2 : 1;
+        j++;
+      }
+      while (j < src.length && !/[\s()]/.test(src[j])) j = src[j] === '<' && iriEnd(j) > 0 ? iriEnd(j) : j + 1;
+      stack[stack.length - 1].push(src.slice(i, j));
+      i = j;
+    }
+  }
+  return root;
+}
+
+const inline = (e: Sexp): string => (typeof e === 'string' ? e : `(${e.map(inline).join(' ')})`);
+
+function printSse(e: Sexp, indent: string, width: number): string {
+  const flat = inline(e);
+  if (typeof e === 'string' || flat.length + indent.length <= width) return flat;
+  // keep leading atoms (the operator and its scalar arguments) on the first line
+  let k = 0;
+  while (k < e.length && typeof e[k] === 'string') k++;
+  const head = e.slice(0, Math.max(k, 1)).map(inline).join(' ');
+  const inner = indent + '  ';
+  const rest = e.slice(Math.max(k, 1)).map((x) => '\n' + inner + printSse(x, inner, width));
+  return `(${head}${rest.join('')})`;
+}
+
+/** Indent a single-line SSE algebra expression; returns the input unchanged if it looks multi-line already. */
+export function formatSse(src: string, width = 80): string {
+  if (!src || src.includes('\n')) return src;
+  try {
+    return parseSse(src)
+      .map((e) => printSse(e, '', width))
+      .join('\n');
+  } catch {
+    return src;
+  }
+}

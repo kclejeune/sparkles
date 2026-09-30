@@ -239,19 +239,22 @@
     const q = query.trim();
     if (q.length < 2 || !ds) {
       hits = [];
+      searching = false;
       return;
     }
+    // Show the spinner (not "Nothing matches") while the debounce is pending.
+    searching = true;
     debounce = setTimeout(async () => {
       searchCtl?.abort();
-      searchCtl = new AbortController();
+      const ctl = (searchCtl = new AbortController());
       searching = true;
       searchErr = null;
       try {
-        hits = await ex.search(ds!, q, searchCtl.signal);
+        hits = await ex.search(ds!, q, ctl.signal);
       } catch (e) {
         if (!(e instanceof DOMException && e.name === 'AbortError')) searchErr = api.errorMessage(e);
       } finally {
-        searching = false;
+        if (searchCtl === ctl) searching = false;
       }
     }, 250);
   }
@@ -787,6 +790,7 @@
   .search {
     position: relative;
     flex: 1;
+    min-width: 0;
     max-width: 620px;
     display: flex;
     align-items: center;
@@ -867,6 +871,8 @@
     flex-direction: column;
     min-height: 0;
     min-width: 0;
+    /* node labels near the edge must not paint over the details panel */
+    overflow: hidden;
   }
   .gtools {
     display: flex;
@@ -1040,6 +1046,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* a <button> is an atomic inline box, so the cell's ellipsis never applies to it */
+  .inc-s :global(.link) {
+    display: block;
+    max-width: 100%; /* buttons shrink-wrap their content even as blocks */
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .more-note {
     margin-top: 6px;
     font-size: var(--fs-sm);
@@ -1143,9 +1156,15 @@
     font-size: 12px;
     border-bottom: 1px solid var(--border);
   }
+  .bar > .tabs {
+    flex-shrink: 0;
+  }
   @media (max-width: 1000px) {
+    .bar {
+      gap: 8px;
+    }
     .split {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
     }
     .side {

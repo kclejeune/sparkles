@@ -76,7 +76,7 @@ export async function neighbours(ds: string, iri: string): Promise<{ out: Neighb
       `${P}
 SELECT ?p ?o (SAMPLE(?l) AS ?label) WHERE {
   ${node} ?p ?o .
-  OPTIONAL { ?o rdfs:label ?l }
+  OPTIONAL { ?o ${LABEL_PATH} ?l }
 }
 GROUP BY ?p ?o
 LIMIT 100`,
@@ -87,7 +87,7 @@ LIMIT 100`,
       `${P}
 SELECT ?s ?p (SAMPLE(?l) AS ?label) WHERE {
   ?s ?p ${node} .
-  OPTIONAL { ?s rdfs:label ?l }
+  OPTIONAL { ?s ${LABEL_PATH} ?l }
 }
 GROUP BY ?s ?p
 LIMIT 100`,
@@ -170,7 +170,45 @@ export type Schema = {
   ontology?: { iri: string; label?: string; version?: string; comment?: string };
 };
 
+/**
+ * Drop super classes implied by other super classes (A ⊂ B ⊂ C and A ⊂ C: keep only B),
+ * so a hierarchy that is transitively closed (for example by a reasoner, or by data
+ * that asserts every ancestor) still draws as a tree. Equivalent classes (cycles) are kept.
+ */
+export function reduceSupers(supers: Map<string, string[]>): Map<string, string[]> {
+  const memo = new Map<string, Set<string>>();
+  const ancestors = (c: string): Set<string> => {
+    const hit = memo.get(c);
+    if (hit) return hit;
+    const out = new Set<string>();
+    const stack = [...(supers.get(c) ?? [])];
+    while (stack.length) {
+      const s = stack.pop()!;
+      if (out.has(s)) continue;
+      out.add(s);
+      for (const x of supers.get(s) ?? []) stack.push(x);
+    }
+    memo.set(c, out);
+    return out;
+  };
+  const reduced = new Map<string, string[]>();
+  for (const [c, ss] of supers) {
+    reduced.set(
+      c,
+      ss.filter((s) => !ss.some((s2) => s2 !== s && ancestors(s2).has(s) && !ancestors(s).has(s2))),
+    );
+  }
+  return reduced;
+}
+
+/**
+ * Ontology browser data. The hierarchy and property declarations come from asserted
+ * triples only (`reasoning=false`): materialized RDFS/OWL inferences would add the
+ * transitive closure of rdfs:subClassOf plus rdfs:Resource / owl:Thing everywhere.
+ * Instance counts include inferences, so a superclass counts its subclasses' members.
+ */
 export async function loadSchema(ds: string): Promise<Schema> {
+  const asserted = { reasoning: false };
   const [classRows, countRows, propRows, ontRows] = await Promise.all([
     api.select(
       ds,
@@ -185,23 +223,23 @@ SELECT DISTINCT ?c ?super ?label ?comment ?declared WHERE {
   OPTIONAL { ?c rdfs:comment ?comment }
 }
 LIMIT 20000`,
-      { send: 20000 },
+      { send: 20000, ...asserted },
     ),
     api.select(ds, `SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c } GROUP BY ?c LIMIT 5000`, { send: 5000 }),
     api.select(
       ds,
       `${P}
 SELECT DISTINCT ?p ?kind ?domain ?range ?label ?super WHERE {
-  { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property)) }
+  { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty, owl:InverseFunctionalProperty)) }
   UNION { ?p rdfs:domain ?d0 } UNION { ?p rdfs:range ?r0 } UNION { ?p rdfs:subPropertyOf ?s0 }
-  OPTIONAL { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty)) }
+  OPTIONAL { ?p a ?kind FILTER(?kind IN (owl:ObjectProperty, owl:DatatypeProperty, owl:AnnotationProperty, rdf:Property, owl:TransitiveProperty, owl:SymmetricProperty, owl:FunctionalProperty, owl:InverseFunctionalProperty)) }
   OPTIONAL { ?p rdfs:domain ?domain }
   OPTIONAL { ?p rdfs:range ?range }
   OPTIONAL { ?p rdfs:subPropertyOf ?super }
   OPTIONAL { ?p rdfs:label ?label }
 }
 LIMIT 20000`,
-      { send: 20000 },
+      { send: 20000, ...asserted },
     ),
     api.select(
       ds,
@@ -212,6 +250,7 @@ SELECT ?o ?label ?version ?comment WHERE {
   OPTIONAL { ?o owl:versionInfo ?version }
   OPTIONAL { ?o rdfs:comment|dcterms:description ?comment }
 } LIMIT 1`,
+      asserted,
     ),
   ]);
 
@@ -230,6 +269,8 @@ SELECT ?o ?label ?version ?comment WHERE {
     if (r.label) labelsBy.set(c.iri, [...(labelsBy.get(c.iri) ?? []), r.label]);
     if (r.comment) commentsBy.set(c.iri, [...(commentsBy.get(c.iri) ?? []), r.comment]);
   }
+  const reduced = reduceSupers(new Map([...classes.values()].map((c) => [c.iri, c.supers])));
+  for (const c of classes.values()) c.supers = reduced.get(c.iri) ?? c.supers;
   for (const c of [...classes.values()]) {
     for (const s of c.supers) {
       const sup = get(s);

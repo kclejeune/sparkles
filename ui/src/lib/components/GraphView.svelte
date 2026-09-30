@@ -148,10 +148,15 @@
     }),
   };
 
+  let running: cytoscape.Layouts | undefined;
+
   function layout(randomize: boolean) {
     if (!cy || cy.nodes().length === 0) return;
     const n = cy.nodes().length;
-    cy.layout({
+    // A layout still animating would fight the new one (e.g. focus a node, then its
+    // expansion arrives a moment later).
+    running?.stop();
+    running = cy.layout({
       name: 'fcose',
       quality: n > 400 ? 'draft' : 'default',
       randomize,
@@ -163,7 +168,8 @@
       idealEdgeLength: () => (n > 30 ? 120 : 90),
       nodeSeparation: 60,
       packComponents: true,
-    } as cytoscape.LayoutOptions).run();
+    } as cytoscape.LayoutOptions);
+    running.run();
   }
 
   function sync() {
@@ -199,8 +205,18 @@
     });
     // Too many edge labels turn into noise: show them only on hover/selection.
     cy.edges().toggleClass('quiet', cy.edges().length > 60);
-    if (added) layout(wasEmpty);
+    // Incremental layouts keep the user's arrangement, but when most of the graph is new
+    // (a resource and then its neighbours) there is nothing to keep: lay it out afresh.
+    if (added) layout(wasEmpty || cy.nodes().length - added <= 2);
   }
+
+  /**
+   * Canvas resolution. Cytoscape defaults to devicePixelRatio, which on 1× and fractional
+   * (1.25 / 1.5) displays leaves node edges and labels visibly jagged: elements are drawn
+   * from cached textures rendered at power-of-two scales and resampled. Rendering at
+   * least 2× and letting the browser downsample the canvas supersamples everything.
+   */
+  const pixelRatio = () => Math.min(3, Math.max(2, Math.ceil(window.devicePixelRatio || 1)));
 
   onMount(() => {
     cy = cytoscape({
@@ -209,6 +225,7 @@
       minZoom: 0.08,
       maxZoom: 4,
       boxSelectionEnabled: false,
+      pixelRatio: pixelRatio(),
     });
     // Keep small graphs at a readable scale after fitting.
     cy.on('layoutstop', () => {
