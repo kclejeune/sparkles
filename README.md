@@ -155,7 +155,7 @@ feature gaps are:
 | SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD only) |
 | Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` endpoint | ✗ none |
-| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes are read-only |
+| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |
 | SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
 | Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
 

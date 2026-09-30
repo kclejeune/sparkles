@@ -758,11 +758,13 @@ impl Store {
             opts.result_cache_min_ms,
         ));
         let mut next_bnode = gen_.meta.next_bnode;
+        // prefixes.json holds the whole map once written (so removals persist); the
+        // generation's own prefixes are used until then
         let mut prefixes = gen_.meta.prefixes.clone();
         if let Ok(p) = std::fs::read(root.join("prefixes.json"))
             && let Ok(p) = serde_json::from_slice::<BTreeMap<String, String>>(&p)
         {
-            prefixes.extend(p);
+            prefixes = p;
         }
         // The commit the generation's base index holds. A database from an older version
         // has no dataset.json yet: it gets a baseline root commit after replay.
@@ -1219,6 +1221,47 @@ impl Store {
             write_atomic(
                 &root.join("prefixes.json"),
                 &serde_json::to_vec_pretty(&*cur).unwrap(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Set (or replace) one prefix. Prefixes are metadata: no commit is made.
+    pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
+        if !valid_prefix_name(prefix) {
+            return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
+        }
+        oxrdf::NamedNode::new(iri)
+            .map_err(|e| Error::invalid(format!("invalid IRI {iri:?}: {e}")))?;
+        let mut cur = self.prefixes.lock();
+        if cur.get(prefix).map(String::as_str) == Some(iri) {
+            return Ok(());
+        }
+        let mut next = cur.clone();
+        next.insert(prefix.to_string(), iri.to_string());
+        self.save_prefixes(&next)?;
+        *cur = next;
+        Ok(())
+    }
+
+    /// Remove one prefix; returns whether it was defined.
+    pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
+        let mut cur = self.prefixes.lock();
+        if !cur.contains_key(prefix) {
+            return Ok(false);
+        }
+        let mut next = cur.clone();
+        next.remove(prefix);
+        self.save_prefixes(&next)?;
+        *cur = next;
+        Ok(true)
+    }
+
+    fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {
+        if let Some(root) = &self.root {
+            write_atomic(
+                &root.join("prefixes.json"),
+                &serde_json::to_vec_pretty(p).unwrap(),
             )?;
         }
         Ok(())
@@ -2189,6 +2232,16 @@ pub enum ReplaceTarget {
 /// Convenience helper for tests and the CLI.
 pub fn named(iri: &str) -> NamedNode {
     NamedNode::new_unchecked(iri)
+}
+
+/// A Turtle prefix name (`PN_PREFIX`, ASCII subset), or the empty prefix.
+fn valid_prefix_name(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.is_empty()
+        || (b[0].is_ascii_alphabetic()
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            && !p.ends_with('.'))
 }
 
 #[cfg(test)]

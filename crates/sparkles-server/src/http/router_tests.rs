@@ -990,3 +990,47 @@ async fn get_json(app: &Router, uri: &str) -> J {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     r.json()
 }
+
+#[tokio::test]
+async fn prefixes_can_be_set_read_and_removed() {
+    let s = server();
+    let post = |body: &'static str| {
+        Request::post("/ds/prefixes")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let r = send(&s.app, post("prefix=zz&uri=http%3A%2F%2Fzz.example%2F")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        get_json(&s.app, "/ds/prefixes?prefix=zz").await["uri"],
+        "http://zz.example/"
+    );
+    let j = get_json(&s.app, "/ds/prefixes?uri=http%3A%2F%2Fzz.example%2F").await;
+    assert_eq!(j["prefixes"], serde_json::json!(["zz"]));
+    assert_eq!(
+        get_json(&s.app, "/ds/prefixes").await["prefixes"]["zz"],
+        "http://zz.example/"
+    );
+    // the UI's listing sees it too
+    assert_eq!(
+        get_json(&s.app, "/$/prefixes/ds").await["prefixes"]["zz"],
+        "http://zz.example/"
+    );
+    // invalid names and IRIs
+    let r = send(&s.app, post("prefix=1bad&uri=http%3A%2F%2Fx%2F")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = send(&s.app, post("prefix=ok&uri=not%20an%20iri")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let del = || {
+        Request::delete("/ds/prefixes?prefix=zz")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(send(&s.app, del()).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(send(&s.app, del()).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_uri(&s.app, "/ds/prefixes?prefix=zz").await.status,
+        StatusCode::NOT_FOUND
+    );
+}

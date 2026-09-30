@@ -80,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
         .route("/$/vector/{ds}", get(vector_status))
+        .route("/{ds}/prefixes", any(dataset_prefixes))
         .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
@@ -1721,6 +1722,78 @@ async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>>
     let mut p = sparkles::io::standard_prefixes();
     p.extend(ds.store.prefixes());
     Ok(Json(json!({ "prefixes": p })))
+}
+
+/// `/{ds}/prefixes`, after Fuseki's prefixes service. GET: `?prefix=` → its IRI,
+/// `?uri=` → the prefixes bound to it, neither → all stored prefixes. POST / PUT with
+/// `prefix` and `uri` (query, form or JSON body) sets one; DELETE `?prefix=` removes one.
+async fn dataset_prefixes(
+    State(st): St,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let ds = dataset(&st, &name)?;
+    let mut params = Params::from_query(&uri);
+    match content_type(&headers).as_str() {
+        "application/x-www-form-urlencoded" => params.extend_form(&body),
+        "application/json" => {
+            let j: J = serde_json::from_slice(&body)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
+            for k in ["prefix", "uri"] {
+                if let Some(v) = j.get(k).and_then(J::as_str) {
+                    params.0.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+    let prefixes = ds.store.prefixes();
+    let prefix = params.get("prefix").map(str::to_string);
+    let iri = params.get("uri").map(str::to_string);
+    if method != Method::GET && method != Method::HEAD && st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let missing = |what: &str| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("missing '{what}' parameter"),
+        )
+    };
+    match method {
+        Method::GET | Method::HEAD => Ok(match (prefix, iri) {
+            (Some(p), _) => match prefixes.get(&p) {
+                Some(u) => Json(json!({ "prefix": p, "uri": u })).into_response(),
+                None => return Err(err(StatusCode::NOT_FOUND, format!("no prefix '{p}'"))),
+            },
+            (None, Some(u)) => {
+                let bound: Vec<&String> = prefixes
+                    .iter()
+                    .filter(|(_, v)| **v == u)
+                    .map(|(k, _)| k)
+                    .collect();
+                Json(json!({ "uri": u, "prefixes": bound })).into_response()
+            }
+            (None, None) => Json(json!({ "prefixes": prefixes })).into_response(),
+        }),
+        Method::POST | Method::PUT => {
+            let p = prefix.ok_or_else(|| missing("prefix"))?;
+            let u = iri.ok_or_else(|| missing("uri"))?;
+            ds.store.set_prefix(&p, &u)?;
+            Ok(Json(json!({ "prefix": p, "uri": u })).into_response())
+        }
+        Method::DELETE => {
+            let p = prefix.ok_or_else(|| missing("prefix"))?;
+            if ds.store.remove_prefix(&p)? {
+                Ok(StatusCode::NO_CONTENT.into_response())
+            } else {
+                Err(err(StatusCode::NOT_FOUND, format!("no prefix '{p}'")))
+            }
+        }
+        _ => Err(err(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")),
+    }
 }
 
 async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
