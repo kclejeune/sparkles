@@ -1,7 +1,9 @@
-//! `sparkles auth …`: hashes, tokens and configuration checks.
+//! `sparkles auth …`: offline helpers (hashes, static tokens, configuration checks) and
+//! the remote login and token commands.
 
 use super::config::FileConfig;
 use super::policy;
+use crate::remote::client;
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use std::io::{BufRead, IsTerminal};
@@ -16,10 +18,10 @@ pub enum AuthCmd {
         #[arg(long)]
         token: bool,
     },
-    /// Generate an API token for the configuration file: the token on stdout (shown
-    /// once), the `[[tokens]]` entry on stderr
-    Token {
-        /// Name of the token (its log name is token:NAME)
+    /// Generate a static API token for the configuration file: the token on stdout
+    /// (shown once), the `[[tokens]]` entry on stderr
+    GenToken {
+        /// Name of the token (its id is cfg-NAME)
         #[arg(long, default_value = "token")]
         name: String,
     },
@@ -27,6 +29,89 @@ pub enum AuthCmd {
     Check {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Log in to a server (browser, or device code on headless machines) and store an
+    /// API token in ~/.config/sparkles/credentials.toml
+    Login {
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: String,
+        /// Authenticate in a local browser
+        #[arg(long, conflicts_with = "device")]
+        web: bool,
+        /// Authenticate with a device code (headless)
+        #[arg(long)]
+        device: bool,
+        /// Label of the token (shown on the server's token list)
+        #[arg(long)]
+        name: Option<String>,
+        /// Store this existing token instead of logging in
+        #[arg(long, conflicts_with_all = ["web", "device"])]
+        token: Option<String>,
+        /// Make this the default server even when another is
+        #[arg(long)]
+        set_default: bool,
+        /// Allow plain http to a host other than localhost
+        #[arg(long)]
+        insecure_http: bool,
+    },
+    /// Revoke the stored token on the server and forget it
+    Logout {
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        #[arg(long)]
+        insecure_http: bool,
+    },
+    /// Show the stored logins and what they may do
+    Status {
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        #[arg(long)]
+        insecure_http: bool,
+    },
+    /// Create, list or revoke API tokens on a server (with the stored login)
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TokenCmd {
+    /// Mint a token: printed once on stdout, id and expiry on stderr
+    Create {
+        #[arg(long)]
+        name: String,
+        /// A dataset grant NAME=LEVEL (read, write or admin; NAME may use `*`); repeat
+        /// for several (default: all your access)
+        #[arg(long = "dataset", value_name = "DS=LEVEL")]
+        datasets: Vec<String>,
+        /// A server permission (metrics, federate, server-admin, or `*`)
+        #[arg(long = "server-perm", value_name = "PERM")]
+        server_perms: Vec<String>,
+        /// Lifetime, e.g. 7d (default: the server's default)
+        #[arg(long)]
+        expires: Option<String>,
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        #[arg(long)]
+        insecure_http: bool,
+    },
+    /// List your tokens (--all: every token, with server-admin)
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        #[arg(long)]
+        insecure_http: bool,
+    },
+    /// Revoke a token by id
+    Revoke {
+        id: String,
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        #[arg(long)]
+        insecure_http: bool,
     },
 }
 
@@ -64,7 +149,7 @@ pub fn run(cmd: AuthCmd) -> Result<()> {
             }
             Ok(())
         }
-        AuthCmd::Token { name } => {
+        AuthCmd::GenToken { name } => {
             if !super::config::valid_principal_name(&name) {
                 bail!("invalid token name '{name}': use [A-Za-z0-9_.@-], at most 64 characters");
             }
@@ -93,6 +178,58 @@ pub fn run(cmd: AuthCmd) -> Result<()> {
                 eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
+        },
+        AuthCmd::Login {
+            server,
+            web,
+            device,
+            name,
+            token,
+            set_default,
+            insecure_http,
+        } => client::login(
+            &server,
+            web,
+            device,
+            name.as_deref(),
+            token.as_deref(),
+            set_default,
+            insecure_http,
+        ),
+        AuthCmd::Logout {
+            server,
+            insecure_http,
+        } => client::logout(server.as_deref(), insecure_http),
+        AuthCmd::Status {
+            server,
+            insecure_http,
+        } => client::status(server.as_deref(), insecure_http),
+        AuthCmd::Token { cmd } => match cmd {
+            TokenCmd::Create {
+                name,
+                datasets,
+                server_perms,
+                expires,
+                server,
+                insecure_http,
+            } => client::token_create(
+                server.as_deref(),
+                insecure_http,
+                &name,
+                &datasets,
+                &server_perms,
+                expires.as_deref(),
+            ),
+            TokenCmd::List {
+                all,
+                server,
+                insecure_http,
+            } => client::token_list(server.as_deref(), insecure_http, all),
+            TokenCmd::Revoke {
+                id,
+                server,
+                insecure_http,
+            } => client::token_revoke(server.as_deref(), insecure_http, &id),
         },
     }
 }

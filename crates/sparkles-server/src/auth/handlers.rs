@@ -169,6 +169,9 @@ async fn config(State(st): St) -> Response {
 pub fn whoami_details(auth: &Auth, p: &Principal, doc: &mut J) {
     let policy = auth.policy();
     if let Some(o) = &p.info.owner {
+        if p.kind == Kind::Token {
+            doc["principal"]["owner"] = o.log_name().into();
+        }
         if let Some(d) = &o.display_name {
             doc["principal"]["displayName"] = d.clone().into();
         }

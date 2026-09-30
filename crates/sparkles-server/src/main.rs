@@ -9,6 +9,8 @@ mod clone;
 mod http;
 mod obs;
 mod reasoning;
+#[cfg(feature = "auth")]
+mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod state;
@@ -157,12 +159,21 @@ enum Cmd {
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
-        #[arg(long)]
-        loc: PathBuf,
+        #[arg(long, required_unless_present = "server")]
+        loc: Option<PathBuf>,
         /// Load triples into this named graph
         #[arg(long)]
         graph: Option<String>,
         files: Vec<PathBuf>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Run a SPARQL query against a database or files
     Query {
@@ -191,14 +202,32 @@ enum Cmd {
         memory_mb: u64,
         /// Query string (if --query is not given)
         text: Option<String>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Run a SPARQL update against a database
     Update {
-        #[arg(long)]
-        loc: PathBuf,
+        #[arg(long, required_unless_present = "server")]
+        loc: Option<PathBuf>,
         #[arg(long)]
         update: Option<PathBuf>,
         text: Option<String>,
+        /// A server to send this to instead of a local database (with --dataset)
+        #[arg(long, env = "SPARKLES_SERVER")]
+        server: Option<String>,
+        /// The dataset on --server
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Allow plain http to a --server other than localhost
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Write the database as N-Quads (or TriG) to stdout
     Dump {
@@ -700,7 +729,27 @@ fn main() -> Result<()> {
                 anyhow::Ok(())
             })
         }
-        Cmd::Load { loc, graph, files } => {
+        Cmd::Load {
+            loc,
+            graph,
+            files,
+            server,
+            dataset,
+            insecure_http,
+        } => {
+            let Some(loc) = loc else {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::load(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    graph.as_deref(),
+                    &files,
+                );
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
+            };
             if files.is_empty() {
                 bail!("no files given");
             }
@@ -734,12 +783,30 @@ fn main() -> Result<()> {
             timeout,
             memory_mb,
             text,
+            server,
+            dataset,
+            insecure_http,
         } => {
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
                 _ => bail!("no query given"),
             };
+            if loc.is_none() && data.is_empty() && server.is_some() {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::query(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    &q,
+                    &fmt,
+                    timeout,
+                    explain,
+                );
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
+            }
             let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
@@ -789,11 +856,25 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Update { loc, update, text } => {
+        Cmd::Update {
+            loc,
+            update,
+            text,
+            server,
+            dataset,
+            insecure_http,
+        } => {
             let u = match (update, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
                 _ => bail!("no update given"),
+            };
+            let Some(loc) = loc else {
+                let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
+                #[cfg(feature = "auth")]
+                return remote::client::update(server.as_deref(), insecure_http, ds, &u);
+                #[cfg(not(feature = "auth"))]
+                return no_remote(ds, insecure_http);
             };
             let store = Store::open(&loc, opts)?;
             let qopts = QueryOptions {
@@ -1302,6 +1383,19 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
 }
 
 /// SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+/// The `--dataset` of a remote command (`--server` without `--loc`).
+fn remote_dataset<'a>(server: Option<&str>, dataset: Option<&'a str>) -> Result<&'a str> {
+    if server.is_none() {
+        bail!("give --loc (a local database) or --server URL --dataset NAME");
+    }
+    dataset.context("--dataset NAME is required with --server")
+}
+
+#[cfg(not(feature = "auth"))]
+fn no_remote(_: &str, _: bool) -> Result<()> {
+    bail!("--server: built without the remote client (cargo feature \"auth\")")
+}
+
 /// `serve --unix-socket`: remove a stale socket, bind, and allow owner and group
 /// (mode 0660).
 #[cfg(unix)]
