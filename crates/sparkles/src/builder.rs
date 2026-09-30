@@ -753,6 +753,66 @@ mod tests {
     use crate::index::{BlockCache, PermIndex};
     use crate::io::{RdfFormat, Source};
 
+    /// Tiny batch / sort budgets force many partial vocabularies and the external
+    /// sorted-runs + k-way-merge path; the result must equal the in-memory build.
+    #[test]
+    fn external_sort_matches_in_memory() {
+        let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..500 {
+            ttl.push_str(&format!(
+                "ex:s{} ex:p{} ex:o{} , \"lit {}\" , {} .\n",
+                i % 37,
+                i % 5,
+                i % 91,
+                i % 13,
+                i % 17
+            ));
+        }
+        let build = |opts: BuildOptions| {
+            let dir = tempfile::tempdir().unwrap();
+            let b = Builder::new(dir.path(), opts).unwrap();
+            b.add_source(&Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            ))
+            .unwrap();
+            let meta = b.finish().unwrap();
+            let v = Vocab::open(dir.path()).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let mut perms = Vec::new();
+            for p in Perm::ALL {
+                let idx = PermIndex::open(dir.path(), p).unwrap();
+                let mut keys = Vec::new();
+                idx.for_each_range(&cache, &[], |b, s, e| {
+                    for i in s..e {
+                        let k = b.key(i);
+                        // compare by term keys (ids may differ only if vocab differs)
+                        keys.push(k.map(|x| match Id(x).tag() {
+                            Tag::Vocab => v.get(Id(x).payload()).unwrap(),
+                            _ => x.to_le_bytes().to_vec(),
+                        }));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                perms.push(keys);
+            }
+            (meta.quads, meta.terms, perms)
+        };
+        let small = build(BuildOptions {
+            batch_quads: 7,
+            sort_mem_quads: 50,
+            threads: 3,
+            first_bnode: 0,
+        });
+        let big = build(BuildOptions::default());
+        assert!(small.0 > 1000);
+        assert_eq!(small.0, big.0);
+        assert_eq!(small.1, big.1);
+        assert_eq!(small.2, big.2);
+    }
+
     #[test]
     fn build_small() {
         let dir = tempfile::tempdir().unwrap();
