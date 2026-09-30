@@ -9,12 +9,14 @@
   import * as ex from '$lib/explore';
   import { fmtCompact, fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
-  import { displayIri, RDF_TYPE, termKey } from '$lib/rdf';
+  import { displayIri, isVectorLiteral, literalText, RDF_TYPE, termKey } from '$lib/rdf';
   import { Generation, LatestRun } from '$lib/supersede';
   import ClassTree from '$components/ClassTree.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
+  import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
+  import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
     id: string;
@@ -33,9 +35,11 @@
   const ds = $derived(app.current);
   const prefixes = $derived(app.prefixes(ds));
 
-  let tab = $state<'graph' | 'schema'>(
-    page.url.searchParams.get('tab') === 'schema' ? 'schema' : 'graph',
-  );
+  type Tab = 'graph' | 'schema' | 'search';
+  const urlTab = page.url.searchParams.get('tab');
+  let tab = $state<Tab>(urlTab === 'schema' || urlTab === 'search' ? urlTab : 'graph');
+  /** Full-text query of the Search tab (`&q=`). */
+  let textQuery = $state(page.url.searchParams.get('q') ?? '');
   let nodes = $state<Record<string, ENode>>({});
   let edges = $state<Record<string, EEdge>>({});
   let focusId = $state<string | null>(null);
@@ -80,7 +84,10 @@
     if (label) return label;
     if (t.type === 'uri') return shortLabel(t.value, prefixes);
     if (t.type === 'bnode') return `_:${t.value.slice(0, 8)}`;
-    if (t.type === 'literal') return t.value.length > 48 ? t.value.slice(0, 45) + '…' : t.value;
+    if (t.type === 'literal') {
+      const s = literalText(t);
+      return s.length > 48 ? s.slice(0, 45) + '…' : s;
+    }
     return '<<triple>>';
   }
 
@@ -179,7 +186,8 @@
     const p = new URLSearchParams();
     if (ds) p.set('ds', ds);
     if (iri) p.set('iri', iri);
-    if (tab === 'schema') p.set('tab', 'schema');
+    if (tab !== 'graph') p.set('tab', tab);
+    if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     goto(`${resolve('/explore')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
   }
 
@@ -518,10 +526,23 @@
     });
   });
 
-  function setTab(t: 'graph' | 'schema') {
+  function setTab(t: Tab) {
     tab = t;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
   }
+
+  // keep the text query in the URL (debounced: it changes with every keystroke)
+  let qSync: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    if (tab !== 'search') return;
+    void textQuery;
+    clearTimeout(qSync);
+    qSync = setTimeout(
+      () => untrack(() => syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null)),
+      500,
+    );
+    return () => clearTimeout(qSync);
+  });
 
   onMount(() => {
     const onDoc = (e: MouseEvent) => {
@@ -589,6 +610,13 @@
         aria-selected={tab === 'schema'}
         onclick={() => setTab('schema')}><Icon name="tree" size={14} /> Schema</button
       >
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={tab === 'search'}
+        onclick={() => setTab('search')}
+        title="Full-text search (text:query)"><Icon name="filter" size={14} /> Text search</button
+      >
     </div>
   </header>
 
@@ -598,6 +626,15 @@
       <p>No dataset selected.</p>
       <a class="btn" href={resolve('/datasets')}>Go to Datasets</a>
     </div>
+  {:else if tab === 'search'}
+    {#key ds}
+      <TextSearchView
+        {ds}
+        {prefixes}
+        bind:query={textQuery}
+        onopen={(iri, label) => focusOn(iri, label)}
+      />
+    {/key}
   {:else if tab === 'graph'}
     <div class="split">
       <div class="canvas">
@@ -715,7 +752,12 @@
           </div>
 
           {#if n.term.type === 'literal'}
-            <div class="side-body"><pre class="literal">{n.term.value}</pre></div>
+            <div class="side-body">
+              {#if isVectorLiteral(n.term)}
+                <p class="faint">{literalText(n.term)}</p>
+              {/if}
+              <pre class="literal">{n.term.value}</pre>
+            </div>
           {:else if n.term.type !== 'uri'}
             <div class="side-body faint">
               Blank nodes can only be explored through their neighbours.
@@ -741,6 +783,7 @@
                             <TermView
                               term={o}
                               {prefixes}
+                              expandable
                               onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })}
                             />
                           </div>
@@ -753,6 +796,10 @@
                   {/each}
                 </tbody>
               </table>
+
+              {#key n.iri}
+                <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
+              {/key}
 
               <h3 class="sub">
                 Referenced by <span class="faint">{fmtInt(detail.incomingTotal)}</span>

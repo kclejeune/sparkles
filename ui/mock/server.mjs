@@ -6,10 +6,11 @@
 //   node mock/server.mjs            # listens on :3030 (PORT env to override)
 //   MOCK_LATENCY=300 node mock/...  # add artificial latency (ms) to every request
 
+import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
-import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle } from './data.mjs';
+import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
 const LATENCY = Number(process.env.MOCK_LATENCY ?? 0);
@@ -27,6 +28,7 @@ function makeDataset(name, type) {
   const ds = {
     name,
     type,
+    id: randomUUID(),
     store: new ox.Store(),
     prefixes: { ...PREFIXES },
     reasoning: null,
@@ -34,19 +36,107 @@ function makeDataset(name, type) {
     deltaInserts: 0,
     deltaDeletes: 0,
     cache: { entries: 0, bytes: 0, hits: 0, misses: 0 },
+    /** Commit catalog, oldest first (docs/API.md "Commits"). */
+    commits: [],
+    firstRetained: 0,
+    /** Full-text configuration (null: disabled) and whether a rebuild task runs. */
+    text: null,
+    textBuilding: false,
+    textRebuilt: null,
   };
+  addCommit(ds, 'create', 0, 0);
   datasets.set(name, ds);
   return ds;
+}
+
+// ---------------------------------------------------------------------------
+// commits
+
+function addCommit(ds, kind, inserted, deleted, opts = {}) {
+  const head = ds.commits[ds.commits.length - 1];
+  const seq = head ? head.seq + 1 : 0;
+  const ts = Math.max(opts.at ?? Date.now(), head ? Date.parse(head.timestamp) : 0);
+  const c = {
+    seq,
+    parent: seq ? seq - 1 : null,
+    ref: `commit:${seq}`,
+    timestamp: new Date(ts).toISOString(),
+    kind,
+    inserted,
+    deleted,
+    quads: opts.quads ?? ds.store.size,
+    generation: ds.type === 'mem' ? 'mem' : 'gen-0001',
+    bulk: !!opts.bulk,
+    exact: opts.exact ?? true,
+  };
+  ds.commits.push(c);
+  return c;
+}
+
+const headCommit = (ds) => ds.commits[ds.commits.length - 1];
+
+/** Quads of the store as N-Quads lines, to diff a write. */
+const quadSet = (ds) => new Set(ds.store.match().map(String));
+
+/** Commit a write from the quad sets before and after it; the receipt. */
+function commitWrite(ds, kind, before, opts = {}) {
+  const after = quadSet(ds);
+  let inserted = 0;
+  let deleted = 0;
+  for (const q of after) if (!before.has(q)) inserted++;
+  for (const q of before) if (!after.has(q)) deleted++;
+  const committed = inserted + deleted > 0;
+  const commit = committed ? addCommit(ds, kind, inserted, deleted, opts) : headCommit(ds);
+  return { dataset: ds.name, datasetId: ds.id, committed, commit };
+}
+
+const wantsReceipt = (req, p) =>
+  ['true', '1', 'yes'].includes(String(p.get('receipt') ?? '').toLowerCase()) ||
+  String(req.headers.accept ?? '').includes('application/x-sparkles+json');
+
+/** A plausible history for the demo dataset: a bulk load and many small updates. */
+function seedHistory(ds) {
+  const size = ds.store.size;
+  const now = Date.now();
+  const updates = Array.from({ length: 58 }, (_, i) => ({
+    inserted: (i * 7) % 5,
+    deleted: i % 6 === 0 ? 1 + (i % 3) : 0,
+  }));
+  const net = updates.reduce((n, u) => n + u.inserted - u.deleted, 0);
+  let quads = size - net;
+  ds.commits = [];
+  const start = now - 12 * 86400_000;
+  addCommit(ds, 'create', 0, 0, { at: start, quads: 0 });
+  addCommit(ds, 'load', quads, 0, { at: start + 60_000, quads, bulk: true });
+  updates.forEach((u, i) => {
+    quads += u.inserted - u.deleted;
+    const kind = i === 20 ? 'gsp-put' : i === 33 ? 'upload' : 'update';
+    const at = start + 3600_000 + ((now - 3600_000 - start) * i) / updates.length;
+    addCommit(ds, kind, u.inserted, u.deleted, {
+      at,
+      quads,
+      bulk: kind === 'upload',
+      exact: !(kind === 'upload' && u.deleted > 0),
+    });
+  });
+  // the oldest commits are no longer retained
+  ds.firstRetained = 3;
+  ds.commits = ds.commits.filter((c) => c.seq >= ds.firstRetained);
 }
 
 {
   const foaf = makeDataset('foaf', 'persistent');
   foaf.store.load(buildTurtle(), { format: 'text/turtle' });
   foaf.store.load(provenanceTrig, { format: 'application/trig' });
+  foaf.store.load(vectorTurtle(), { format: 'text/turtle' });
   foaf.baseQuads = foaf.store.size;
+  foaf.text = { predicates: 'all', graphs: { include: 'all', exclude: [] } };
+  foaf.textRebuilt = { at: new Date().toISOString(), ms: 42.5 };
+  seedHistory(foaf);
   const scratch = makeDataset('scratch', 'mem');
   scratch.store.load(scratchTurtle, { format: 'text/turtle' });
   scratch.baseQuads = scratch.store.size;
+  addCommit(scratch, 'upload', scratch.store.size, 0, { bulk: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -65,20 +155,30 @@ function info(ds) {
     },
     quads: ds.store.size,
     reasoning: ds.reasoning,
-    ...(ds.origin ? { origin: ds.origin } : {}),
+    id: ds.id,
+    head: headCommit(ds).seq,
+    modified: headCommit(ds).timestamp,
+    text: ds.text ? { state: textState(ds), docs: textDocs(ds).length } : null,
+    ...(ds.origin ? { forkedFrom: ds.origin.forkedFrom, origin: ds.origin } : {}),
   };
 }
 
-function send(res, status, body, type = 'application/json') {
+function send(res, status, body, type = 'application/json', headers = {}) {
   const data = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Expose-Headers': 'X-Request-Id',
+    'Access-Control-Expose-Headers': 'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id',
     'X-Request-Id': res.requestId ?? '',
+    ...headers,
   });
   res.end(data);
 }
+
+const commitHeaders = (ds, seq = headCommit(ds).seq) => ({
+  'Sparkles-Commit': String(seq),
+  'Sparkles-Dataset-Id': ds.id,
+});
 
 // ---------------------------------------------------------------------------
 // observability: request ids, readiness and a metrics registry fed by the mock's own
@@ -466,6 +566,397 @@ function sse(query) {
 }
 
 // ---------------------------------------------------------------------------
+// full-text search and vector similarity. oxigraph knows neither property function, so
+// queries using `text:query` or `spk:vectorSearch` are answered here from the call alone
+// (the rest of the WHERE clause is ignored); the result has the subject-list variables.
+
+const TEXT_QUERY_IRI = 'http://jena.apache.org/text#query';
+const VECTOR_SEARCH_IRI = 'urn:x-sparkles:vectorSearch';
+const VECTOR_DT = 'urn:x-sparkles:vector';
+const XSD = 'http://www.w3.org/2001/XMLSchema#';
+const RDF_LANGSTRING = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#langString';
+const DEFAULT_GRAPH_IRI = 'urn:x-arq:DefaultGraph';
+/** Packed-vector budget in bytes (`MOCK_VECTOR_BUDGET=1000` to try the 507). */
+const VECTOR_BUDGET = Number(process.env.MOCK_VECTOR_BUDGET ?? Infinity);
+
+class QueryError extends Error {
+  constructor(status, message, extra = {}) {
+    super(message);
+    this.status = status;
+    this.extra = extra;
+  }
+}
+
+function textDocs(ds) {
+  const cfg = ds.text;
+  if (!cfg) return [];
+  const preds = cfg.predicates === 'all' ? null : new Set(cfg.predicates);
+  const include = cfg.graphs?.include ?? 'all';
+  const exclude = new Set(cfg.graphs?.exclude ?? []);
+  return ds.store.match().filter((q) => {
+    if (q.object.termType !== 'Literal') return false;
+    const dt = q.object.datatype.value;
+    if (dt !== XSD + 'string' && dt !== RDF_LANGSTRING) return false;
+    if (preds && !preds.has(q.predicate.value)) return false;
+    const g = q.graph.termType === 'DefaultGraph' ? DEFAULT_GRAPH_IRI : q.graph.value;
+    if (g === INFERRED.value || exclude.has(g)) return false;
+    return include === 'all' || include.includes(g);
+  });
+}
+
+const textState = (ds) => (ds.textBuilding ? 'stale' : 'ready');
+
+function textStatusJson(ds) {
+  const docs = textDocs(ds).length;
+  const head = headCommit(ds).seq;
+  return {
+    enabled: true,
+    state: textState(ds),
+    docs,
+    seq: ds.textBuilding ? Math.max(0, head - 1) : head,
+    storeSeq: head,
+    epoch: 1,
+    diskBytes: 4096 + docs * 180,
+    segments: 1,
+    config: { maxTextBytes: 262144, maxHits: 1000000, ...ds.text },
+    formatVersion: 1,
+    ...(ds.textRebuilt
+      ? { lastRebuild: { at: ds.textRebuilt.at, ms: ds.textRebuilt.ms, docs } }
+      : {}),
+    ...(ds.textBuilding ? { message: 'rebuild in progress' } : {}),
+  };
+}
+
+/** Find `(subjects) <fn> (args)` in a query; null when the function is not used. */
+function propertyCall(query, prefixed, iri) {
+  const fn = `(?:${prefixed.replace(':', '\\:')}|<${iri.replace(/[.#]/g, '\\$&')}>)`;
+  const m = new RegExp(`\\(([^()]*)\\)\\s*${fn}\\s*\\(((?:"(?:[^"\\\\]|\\\\.)*"|[^()"])*)\\)`).exec(
+    query,
+  );
+  if (!m) return null;
+  return { subjects: m[1].trim().split(/\s+/).filter(Boolean), args: tokenizeArgs(m[2]) };
+}
+
+/** Argument list tokens: IRIs, prefixed names, string literals (with @lang / ^^type), numbers. */
+function tokenizeArgs(src) {
+  const pfx = { ...PREFIXES, spk: 'urn:x-sparkles:' };
+  const out = [];
+  const re =
+    /\s*(?:<([^>]*)>|"((?:[^"\\]|\\.)*)"(?:@([\w-]+)|\^\^(?:<([^>]*)>|([\w-]*):([\w-]*)))?|(-?\d+(?:\.\d+)?)|([\w-]*):([\w.-]*))/y;
+  let m;
+  while (re.lastIndex < src.length && (m = re.exec(src))) {
+    if (m[1] != null) out.push({ kind: 'iri', value: m[1] });
+    else if (m[2] != null)
+      out.push({
+        kind: 'literal',
+        value: JSON.parse(`"${m[2].replace(/\\([^"\\/bfnrtu])/g, '\\\\$1')}"`),
+        lang: m[3],
+        datatype: m[4] ?? (m[5] != null ? pfx[m[5]] + m[6] : undefined),
+      });
+    else if (m[7] != null) out.push({ kind: 'number', value: Number(m[7]) });
+    else out.push({ kind: 'iri', value: (pfx[m[8]] ?? '') + m[9] });
+    if (!src.slice(re.lastIndex).trim()) break;
+  }
+  return out;
+}
+
+const fold = (s) =>
+  s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+const tokens = (s) =>
+  fold(s)
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+/** A small subset of the query syntax: terms, "phrases"(*), +/-, AND/OR, \-escapes. */
+function parseTextQuery(q) {
+  const clauses = [];
+  let i = 0;
+  let pendingAnd = false;
+  while (i < q.length) {
+    const c = q[i];
+    if (/[\s()]/.test(c)) {
+      i++;
+      continue;
+    }
+    let occur = 'should';
+    if (c === '+' || c === '-') {
+      occur = c === '+' ? 'must' : 'not';
+      i++;
+    }
+    let words;
+    let prefix = false;
+    if (q[i] === '"') {
+      const end = q.indexOf('"', i + 1);
+      if (end < 0) throw new QueryError(400, `text:query: Syntax Error: ${q}`);
+      words = tokens(q.slice(i + 1, end));
+      i = end + 1;
+      if (q[i] === '*') ((prefix = true), i++);
+      const slop = /^~\d+/.exec(q.slice(i));
+      if (slop) i += slop[0].length;
+    } else {
+      let w = '';
+      while (i < q.length && !/[\s()"]/.test(q[i])) {
+        if (q[i] === '\\' && i + 1 < q.length) {
+          w += q[i + 1];
+          i += 2;
+          continue;
+        }
+        if (q[i] === ':') throw new QueryError(400, `text:query: Field does not exist: '${w}'`);
+        w += q[i++];
+      }
+      if (w === 'AND' || w === 'OR') {
+        if (!clauses.length) throw new QueryError(400, `text:query: Syntax Error: ${q}`);
+        if (w === 'AND') {
+          if (clauses[clauses.length - 1].occur === 'should')
+            clauses[clauses.length - 1].occur = 'must';
+          pendingAnd = true;
+        }
+        continue;
+      }
+      if (w.endsWith('*')) ((prefix = true), (w = w.slice(0, -1)));
+      words = tokens(w);
+    }
+    if (!words.length) continue;
+    if (pendingAnd && occur === 'should') occur = 'must';
+    pendingAnd = false;
+    clauses.push({ occur, words, prefix });
+  }
+  if (pendingAnd) throw new QueryError(400, `text:query: Syntax Error: ${q}`);
+  return clauses;
+}
+
+function clauseMatches(clause, toks) {
+  const { words, prefix } = clause;
+  let n = 0;
+  for (let i = 0; i + words.length <= toks.length; i++) {
+    const ok = words.every((w, j) =>
+      prefix && j === words.length - 1 ? toks[i + j].startsWith(w) : toks[i + j] === w,
+    );
+    if (ok) n++;
+  }
+  return n;
+}
+
+function runTextQuery(ds, call) {
+  if (!ds.text)
+    throw new QueryError(
+      400,
+      'dataset has no full-text index; enable it with `sparkles text-index` or --text',
+    );
+  if (ds.textBuilding) {
+    const head = headCommit(ds).seq;
+    throw new QueryError(
+      503,
+      `full-text index of 'dataset' is stale (index seq ${head - 1}, data seq ${head}); retry later or rebuild it`,
+    );
+  }
+  const preds = call.args.filter((a) => a.kind === 'iri').map((a) => a.value);
+  const query = call.args.find((a) => a.kind === 'literal' && !/^lang:/.test(a.value));
+  if (!query) throw new QueryError(400, 'text:query: malformed argument list');
+  const limit = call.args.find((a) => a.kind === 'number')?.value ?? Infinity;
+  const lang =
+    call.args.find((a) => a.kind === 'literal' && /^lang:/.test(a.value))?.value.slice(5) ??
+    query.lang;
+  for (const p of preds)
+    if (ds.text.predicates !== 'all' && !ds.text.predicates.includes(p))
+      throw new QueryError(400, `text:query: <${p}> is not text-indexed`);
+  const clauses = parseTextQuery(query.value);
+  const docs = textDocs(ds).filter(
+    (q) =>
+      (!preds.length || preds.includes(q.predicate.value)) &&
+      (!lang || fold(q.object.language ?? '') === fold(lang)),
+  );
+  const hits = [];
+  for (const q of docs) {
+    const toks = tokens(q.object.value);
+    let score = 0;
+    let ok = true;
+    let any = false;
+    for (const c of clauses) {
+      const n = clauseMatches(c, toks);
+      if (c.occur === 'not' && n) ok = false;
+      if (c.occur === 'must' && !n) ok = false;
+      if (c.occur !== 'not' && n) {
+        any = true;
+        score += (n * (1 + c.words.length)) / Math.sqrt(toks.length);
+      }
+    }
+    if (ok && any) hits.push({ q, score });
+  }
+  hits.sort((a, b) => b.score - a.score || String(a.q.subject).localeCompare(String(b.q.subject)));
+  const slots = ['s', 'score', 'literal', 'graph', 'predicate'];
+  const rows = hits.slice(0, limit).map(({ q, score }) => {
+    const g = q.graph.termType === 'DefaultGraph' ? DEFAULT_GRAPH_IRI : q.graph.value;
+    const all = [
+      termJson(q.subject),
+      { type: 'literal', value: String(Math.round(score * 1e6) / 1e6), datatype: XSD + 'float' },
+      termJson(q.object),
+      { type: 'uri', value: g },
+      termJson(q.predicate),
+    ];
+    return call.subjects.map((_, i) => all[i] ?? null);
+  });
+  void slots;
+  return rows;
+}
+
+function parseVec(s) {
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) && v.length && v.every((x) => Number.isFinite(x)) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+const METRIC_FNS = {
+  cosine: (a, b) => {
+    let d = 0;
+    let na = 0;
+    let nb = 0;
+    for (let i = 0; i < a.length; i++) ((d += a[i] * b[i]), (na += a[i] ** 2), (nb += b[i] ** 2));
+    return d / Math.sqrt(na * nb);
+  },
+  dot: (a, b) => a.reduce((s, x, i) => s + x * b[i], 0),
+  euclidean: (a, b) => Math.sqrt(a.reduce((s, x, i) => s + (x - b[i]) ** 2, 0)),
+};
+
+function runVectorSearch(ds, call) {
+  const [pred, q, ...opts] = call.args;
+  if (pred?.kind !== 'iri' || !q)
+    throw new QueryError(400, 'spk:vectorSearch: expected (predicate query [k] [options])');
+  let k = 10;
+  let metric = 'cosine';
+  for (const o of opts) {
+    if (o.kind === 'number') k = o.value;
+    else if (o.kind === 'literal' && o.value.startsWith('metric:')) metric = o.value.slice(7);
+  }
+  if (!METRIC_FNS[metric])
+    throw new QueryError(400, `spk:vectorSearch: unknown metric "${metric}"`);
+  const rows = ds.store
+    .match(null, ox.namedNode(pred.value), null, null)
+    .filter((x) => x.object.termType === 'Literal' && x.object.datatype.value === VECTOR_DT);
+  let query;
+  if (q.kind === 'literal') {
+    query = parseVec(q.value);
+    if (!query) throw new QueryError(400, 'spk:vectorSearch: malformed vector literal');
+  } else {
+    const own = [
+      ...new Set(rows.filter((x) => x.subject.value === q.value).map((x) => x.object.value)),
+    ];
+    if (!own.length) return [];
+    if (own.length > 1)
+      throw new QueryError(
+        400,
+        `entity <${q.value}> has ${own.length} vectors for the predicate; pass a vector literal`,
+      );
+    query = parseVec(own[0]);
+    if (!query) throw new QueryError(400, "the entity's vector is not a valid spk:vector");
+  }
+  const vectors = rows.map((x) => ({ x, v: parseVec(x.object.value) })).filter((r) => r.v);
+  const same = vectors.filter((r) => r.v.length === query.length);
+  if (vectors.length && !same.length) {
+    const dims = [...new Set(vectors.map((r) => r.v.length))].sort((a, b) => a - b);
+    throw new QueryError(
+      400,
+      `dimension mismatch: the predicate has vectors of dimension ${dims.join(', ')}; query has ${query.length}`,
+    );
+  }
+  const bytes = vectors.reduce((n, r) => n + r.v.length * 4 + 16, 0);
+  if (bytes > VECTOR_BUDGET)
+    throw new QueryError(
+      507,
+      `query exceeds its memory budget: packed vectors need ${bytes} bytes, limit ${VECTOR_BUDGET}`,
+      { budget: 'memory', limit: VECTOR_BUDGET, requested: bytes },
+    );
+  const lower = metric === 'euclidean';
+  const scored = same
+    .map((r) => ({ x: r.x, score: METRIC_FNS[metric](query, r.v) }))
+    .filter((r) => Number.isFinite(r.score))
+    .sort(
+      (a, b) =>
+        (lower ? a.score - b.score : b.score - a.score) ||
+        a.x.subject.value.localeCompare(b.x.subject.value),
+    )
+    .slice(0, k);
+  return scored.map(({ x, score }) => {
+    const all = [
+      termJson(x.subject),
+      { type: 'literal', value: String(score), datatype: XSD + 'double' },
+      termJson(x.object),
+    ];
+    return call.subjects.map((_, i) => all[i] ?? null);
+  });
+}
+
+/** Answer a property-function query; false when the query uses neither function. */
+function handleSearchQuery(req, res, ds, p, query) {
+  const text = propertyCall(query, 'text:query', TEXT_QUERY_IRI);
+  const vector = text ? null : propertyCall(query, 'spk:vectorSearch', VECTOR_SEARCH_IRI);
+  if (!text && !vector) return false;
+  const t0 = performance.now();
+  const call = text ?? vector;
+  let rows;
+  try {
+    rows = text ? runTextQuery(ds, call) : runVectorSearch(ds, call);
+  } catch (e) {
+    if (e instanceof QueryError) fail(res, e.status, e.message, e.extra);
+    else fail(res, 400, String(e?.message ?? e));
+    return true;
+  }
+  const execMs = performance.now() - t0;
+  const vars = call.subjects.map((v) => v.replace(/^[?$]/, ''));
+  if (!String(req.headers.accept ?? '').includes('application/x-sparkles+json')) {
+    const bindings = rows.map((r) =>
+      Object.fromEntries(vars.flatMap((v, i) => (r[i] ? [[v, r[i]]] : []))),
+    );
+    send(res, 200, { head: { vars }, results: { bindings } }, 'application/sparql-results+json');
+    return true;
+  }
+  const cap = p.has('send') ? Math.max(0, Number(p.get('send'))) : Infinity;
+  send(
+    res,
+    200,
+    {
+      queryType: 'SELECT',
+      vars,
+      rows: rows.slice(0, cap),
+      meta: {
+        totalRows: rows.length,
+        sentRows: Math.min(rows.length, cap),
+        timing: {
+          parseMs: 0.08,
+          planMs: 0.05,
+          execMs: +execMs.toFixed(3),
+          serializeMs: 0.02,
+          totalMs: +(execMs + 0.15).toFixed(3),
+        },
+        plan: {
+          operator: text ? 'TextSearch' : 'VectorSearch',
+          description: text ? 'text:query' : 'spk:vectorSearch',
+          columns: call.subjects,
+          sortedOn: [],
+          estimatedRows: rows.length,
+          estimatedCost: rows.length,
+          actualRows: rows.length,
+          timeMs: +execMs.toFixed(3),
+          cached: false,
+          children: [],
+        },
+        commit: headCommit(ds).seq,
+        datasetId: ds.id,
+      },
+    },
+    'application/x-sparkles+json',
+    commitHeaders(ds),
+  );
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // SPARQL query endpoint
 
 const SELECT_FORMATS = {
@@ -496,6 +987,7 @@ function pickFormat(accept, candidates) {
 async function handleQuery(req, res, ds, p) {
   const query = p.get('query');
   if (!query) return fail(res, 400, 'Missing query parameter');
+  if (handleSearchQuery(req, res, ds, p, query)) return;
   const accept = String(req.headers.accept ?? '');
   const t0 = performance.now();
   let result;
@@ -590,26 +1082,59 @@ async function handleQuery(req, res, ds, p) {
           totalMs: +(parseMs + planMs + execMs + serializeMs).toFixed(3),
         },
         plan: plan(query, total, execMs, true),
+        commit: headCommit(ds).seq,
+        datasetId: ds.id,
       },
     },
     'application/x-sparkles+json',
+    commitHeaders(ds),
   );
 }
 
-function handleUpdate(res, ds, p) {
+function handleUpdate(req, res, ds, p) {
   const update = p.get('update');
   if (!update) return fail(res, 400, 'Missing update parameter');
-  const before = ds.store.size;
+  const t0 = performance.now();
+  const before = quadSet(ds);
   try {
     ds.store.update(update);
   } catch (e) {
     return send(res, 400, parseErr(e));
   }
-  const diff = ds.store.size - before;
-  if (diff > 0) ds.deltaInserts += diff;
-  else ds.deltaDeletes -= diff;
+  const receipt = commitWrite(ds, 'update', before);
+  ds.deltaInserts += receipt.committed ? receipt.commit.inserted : 0;
+  ds.deltaDeletes += receipt.committed ? receipt.commit.deleted : 0;
   ds.cache = { entries: 0, bytes: 0, hits: ds.cache.hits, misses: ds.cache.misses };
-  send(res, 200, `<html><body><p>Update succeeded</p></body></html>`, 'text/html');
+  const headers = commitHeaders(ds, receipt.commit.seq);
+  if (!wantsReceipt(req, p))
+    return send(
+      res,
+      200,
+      `<html><body><p>Update succeeded</p></body></html>`,
+      'text/html',
+      headers,
+    );
+  const ms = performance.now() - t0;
+  send(
+    res,
+    200,
+    {
+      inserted: receipt.committed ? receipt.commit.inserted : 0,
+      deleted: receipt.committed ? receipt.commit.deleted : 0,
+      operations: 1,
+      timing: {
+        parseMs: 0.05,
+        planMs: 0,
+        execMs: +ms.toFixed(3),
+        serializeMs: 0,
+        totalMs: +ms.toFixed(3),
+      },
+      memPeakBytes: 0,
+      ...receipt,
+    },
+    'application/x-sparkles+json',
+    headers,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +1174,8 @@ const EXT_FORMATS = {
   n3: 'text/n3',
 };
 
-async function handleUpload(req, res, ds) {
+async function handleUpload(req, res, ds, url) {
+  const before = quadSet(ds);
   const body = await readBody(req);
   const parts = parseMultipart(body, req.headers['content-type'] ?? '');
   const graph = parts
@@ -661,7 +1187,6 @@ async function handleUpload(req, res, ds) {
     const ext = part.filename.split('.').pop()?.toLowerCase() ?? '';
     const format = EXT_FORMATS[ext] ?? part.type;
     if (!format) return fail(res, 400, `Unknown RDF format for ${part.filename}`);
-    const before = ds.store.size;
     const text = part.data.toString('utf8');
     try {
       ds.store.load(text, { format, ...(graph ? { to_graph_name: ox.namedNode(graph) } : {}) });
@@ -670,10 +1195,15 @@ async function handleUpload(req, res, ds) {
     }
     for (const [, pfx, iri] of text.matchAll(/@prefix\s+([\w-]*):\s*<([^>]+)>/gi))
       ds.prefixes[pfx] = iri;
-    count += ds.store.size - before;
-    ds.deltaInserts += ds.store.size - before;
   }
-  send(res, 200, { count, tripleCount: count, quadCount: count });
+  const receipt = commitWrite(ds, 'upload', before, { bulk: true });
+  count = receipt.committed ? receipt.commit.inserted : 0;
+  ds.deltaInserts += count;
+  const out = { count, tripleCount: count, quadCount: count };
+  const headers = commitHeaders(ds, receipt.commit.seq);
+  if (wantsReceipt(req, url.searchParams))
+    return send(res, 200, { ...out, ...receipt }, 'application/x-sparkles+json', headers);
+  send(res, 200, out, 'application/json', headers);
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,12 +1697,16 @@ const server = http.createServer(async (req, res) => {
               const c = makeDataset(target, 'persistent');
               for (const q of ds.store.match()) c.store.add(q);
               c.baseQuads = c.store.size;
+              c.text = ds.text ? structuredClone(ds.text) : null;
+              c.textRebuilt = ds.text ? { at: new Date().toISOString(), ms: 12 } : null;
+              c.commits = [];
+              addCommit(c, 'create', 0, 0, { quads: c.store.size, bulk: true });
               c.reasoning = p.get('inferences') === 'drop' ? null : ds.reasoning;
               c.origin = {
                 originFormat: 1,
                 clonedAt: new Date().toISOString(),
                 source: { name: ds.name, version: 0, generation: 'gen-0001', quads: ds.store.size },
-                forkedFrom: { id: '00000000-0000-4000-8000-000000000000', seq: 0 },
+                forkedFrom: { id: ds.id, seq: headCommit(ds).seq },
                 inferences: c.reasoning ? 'copy' : 'drop',
               };
               return `cloned /${ds.name} at commit 0 (${c.store.size} quads) into /${target}`;
@@ -1268,8 +1802,10 @@ const server = http.createServer(async (req, res) => {
                 : { reasoning: null, head: 0 },
             );
           if (req.method === 'DELETE') {
+            const before = quadSet(ds);
             ds.store.update('DROP SILENT GRAPH <urn:sparkles:inferred>');
             ds.reasoning = null;
+            commitWrite(ds, 'reason-clear', before);
             return send(res, 200, { ok: true });
           }
           const p = await params(req, url);
@@ -1291,12 +1827,14 @@ const server = http.createServer(async (req, res) => {
                     : profile === 'owl-rl'
                       ? [...RDFS_RULES, ...OWL_RULES]
                       : RDFS_RULES;
+                const before = quadSet(ds);
                 for (let pass = 0; pass < 3; pass++) for (const r of rules) ds.store.update(r);
+                const receipt = commitWrite(ds, 'reason', before);
                 ds.reasoning = {
                   profile,
                   inferred: inferredCount(ds),
                   at: new Date().toISOString(),
-                  commit: 0,
+                  commit: receipt.commit.seq,
                   stale: false,
                   commitsSince: 0,
                 };
@@ -1305,6 +1843,117 @@ const server = http.createServer(async (req, res) => {
               3000,
             ),
           );
+        }
+        case 'commits': {
+          if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          const head = headCommit(ds);
+          const num = (k) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : null);
+          if (extra) {
+            const m = /^(?:commit:)?(\d+)$/.exec(extra);
+            const seq = extra === 'head' ? head.seq : m ? Number(m[1]) : NaN;
+            if (Number.isNaN(seq)) return fail(res, 400, `invalid commit reference '${extra}'`);
+            if (seq > head.seq)
+              return fail(res, 404, `no commit ${seq} in dataset ${name} (head is ${head.seq})`);
+            const c = ds.commits.find((x) => x.seq === seq);
+            if (!c)
+              return fail(res, 410, `commit metadata before ${seq + 1} is no longer retained`);
+            return send(res, 200, { dataset: name, datasetId: ds.id, commit: c });
+          }
+          const limit = Math.min(num('limit') ?? 50, 1000);
+          if (!(limit > 0)) return fail(res, 400, 'invalid commit range: limit=0');
+          const before = num('before');
+          const after = num('after');
+          if (before != null && after != null)
+            return fail(res, 400, 'invalid commit range: use either before or after');
+          const list =
+            after != null
+              ? ds.commits.filter((c) => c.seq > after).slice(0, limit)
+              : ds.commits
+                  .filter((c) => before == null || c.seq < before)
+                  .reverse()
+                  .slice(0, limit);
+          const last = list[list.length - 1];
+          const next = !last
+            ? null
+            : after != null
+              ? last.seq < head.seq
+                ? `/$/commits/${name}?after=${last.seq}&limit=${limit}`
+                : null
+              : last.seq > ds.firstRetained
+                ? `/$/commits/${name}?before=${last.seq}&limit=${limit}`
+                : null;
+          return send(
+            res,
+            200,
+            {
+              dataset: name,
+              datasetId: ds.id,
+              head: head.seq,
+              firstRetained: ds.firstRetained,
+              complete: true,
+              commits: list,
+              next,
+            },
+            'application/json',
+            commitHeaders(ds),
+          );
+        }
+        case 'text': {
+          if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          if (req.method === 'GET')
+            return send(res, 200, ds.text ? textStatusJson(ds) : { enabled: false });
+          if (req.method === 'DELETE') {
+            ds.text = null;
+            ds.textRebuilt = null;
+            res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
+            return res.end();
+          }
+          const building = () => {
+            ds.textBuilding = true;
+            const t0 = Date.now();
+            return startTask(
+              'text-rebuild',
+              ds,
+              () => {
+                ds.textBuilding = false;
+                ds.textRebuilt = { at: new Date().toISOString(), ms: Date.now() - t0 };
+                return `full-text index: ${textDocs(ds).length} documents`;
+              },
+              4000,
+            );
+          };
+          if (req.method === 'PUT') {
+            const body = (await readBody(req)).toString('utf8').trim();
+            let cfg = {};
+            try {
+              cfg = body ? JSON.parse(body) : {};
+            } catch (e) {
+              return fail(res, 400, `invalid text configuration: ${e.message}`);
+            }
+            const preds = cfg.predicates ?? 'all';
+            if (
+              preds !== 'all' &&
+              !(Array.isArray(preds) && preds.every((x) => typeof x === 'string'))
+            )
+              return fail(
+                res,
+                400,
+                `invalid text configuration: predicates: expected "all" or a list of IRIs, got ${JSON.stringify(preds)}`,
+              );
+            ds.text = {
+              predicates: preds,
+              graphs: { include: 'all', exclude: [], ...(cfg.graphs ?? {}) },
+              ...(cfg.maxTextBytes ? { maxTextBytes: cfg.maxTextBytes } : {}),
+              ...(cfg.maxHits ? { maxHits: cfg.maxHits } : {}),
+            };
+            return send(res, 202, building());
+          }
+          if (req.method === 'POST' && extra === 'rebuild') {
+            if (!ds.text) return fail(res, 400, 'full-text search is not enabled');
+            if (ds.textBuilding) return fail(res, 409, 'text index rebuild already running');
+            return send(res, 202, building());
+          }
+          break;
         }
         case 'tasks': {
           if (name) {
@@ -1322,13 +1971,13 @@ const server = http.createServer(async (req, res) => {
     const ds = datasets.get(seg[0] ?? '');
     if (!ds) return fail(res, 404, `No such dataset: ${seg[0] ?? ''}`);
     const op = seg[1] ?? '';
-    if (op === 'upload' && req.method === 'POST') return handleUpload(req, res, ds);
+    if (op === 'upload' && req.method === 'POST') return handleUpload(req, res, ds, url);
     const p = await params(req, url);
     if (['', 'sparql', 'query'].includes(op)) {
-      if (p.has('update')) return handleUpdate(res, ds, p);
+      if (p.has('update')) return handleUpdate(req, res, ds, p);
       return handleQuery(req, res, ds, p);
     }
-    if (op === 'update') return handleUpdate(res, ds, p);
+    if (op === 'update') return handleUpdate(req, res, ds, p);
     if (op === 'explain') {
       const query = p.get('query');
       if (!query) return fail(res, 400, 'Missing query parameter');

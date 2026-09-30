@@ -1,21 +1,33 @@
 <script lang="ts">
   import type { Term } from '$lib/api';
   import TermView from './TermView.svelte';
-  import { displayIri, shorten, XSD_STRING, type PrefixMap } from '$lib/rdf';
+  import {
+    abbreviateVector,
+    displayIri,
+    isVectorLiteral,
+    shorten,
+    XSD_STRING,
+    type PrefixMap,
+  } from '$lib/rdf';
 
   let {
     term,
     prefixes,
     onopen,
     full = false,
+    expandable = false,
   }: {
     term: Term | null | undefined;
     prefixes: PrefixMap;
     onopen?: (iri: string) => void;
     /** Show the full IRI instead of the prefixed form. */
     full?: boolean;
+    /** Vector literals can be clicked to show every component (else: in the tooltip). */
+    expandable?: boolean;
   } = $props();
 
+  const vector = $derived(isVectorLiteral(term));
+  let expanded = $state(false);
   const dt = $derived(
     term?.type === 'literal' && term.datatype && term.datatype !== XSD_STRING
       ? (shorten(term.datatype, prefixes) ?? term.datatype)
@@ -37,6 +49,19 @@
   {/if}
 {:else if term.type === 'bnode'}
   <span class="t-bnode">_:{term.value}</span>
+{:else if term.type === 'literal' && vector}
+  {#if expandable}
+    <button
+      class="vec t-literal"
+      class:open={expanded}
+      title={expanded ? 'Collapse' : term.value}
+      aria-expanded={expanded}
+      onclick={() => (expanded = !expanded)}
+      >{expanded ? term.value : abbreviateVector(term.value)}</button
+    >
+  {:else}
+    <span class="t-literal lit" title={term.value}>{abbreviateVector(term.value)}</span>
+  {/if}
 {:else if term.type === 'literal'}
   <span class="t-literal lit">{term.value}</span>{#if term['xml:lang']}<span class="meta"
       >@{term['xml:lang']}</span
@@ -60,8 +85,19 @@
     text-decoration: underline;
     text-underline-offset: 2px;
   }
-  .link:focus-visible {
+  .link:focus-visible,
+  .vec:focus-visible {
     box-shadow: var(--focus);
+  }
+  .vec {
+    all: unset;
+    cursor: pointer;
+    border-radius: 2px;
+    border-bottom: 1px dotted currentColor;
+  }
+  .vec.open {
+    border-bottom: 0;
+    word-break: break-all;
   }
   .meta {
     color: var(--text-3);

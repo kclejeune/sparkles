@@ -315,6 +315,34 @@ export function buildTurtle() {
   return out.join('\n\n');
 }
 
+/**
+ * Embeddings (`urn:x-sparkles:vector` literals) for the Explore page's Similar section:
+ * `ex:embedding` (8 dimensions) on every person and publication, people clustered in
+ * five groups; `ex:bioEmbedding` (4 dimensions) on every third person. `res:pub_0` has
+ * two embeddings and `res:pub_17` a malformed one. Computed without the PRNG so the rest
+ * of the data does not change.
+ */
+export function vectorTurtle() {
+  const round = (x) => Math.round(x * 10000) / 10000;
+  const vec = (xs) => `"[${xs.map(round).join(', ')}]"^^<urn:x-sparkles:vector>`;
+  const emb = (cluster, i, dim) =>
+    Array.from(
+      { length: dim },
+      (_, d) => Math.sin(cluster * 1.1 + d * 0.9) + 0.15 * Math.sin(i * 3.7 + d),
+    );
+  const out = [header];
+  first.forEach((f, i) => {
+    const id = `res:${slug(f + '_' + last[i])}`;
+    out.push(`${id} ex:embedding ${vec(emb(i % 5, i, 8))} .`);
+    if (i % 3 === 0) out.push(`${id} ex:bioEmbedding ${vec(emb(i % 2, i, 4))} .`);
+  });
+  for (let k = 0; k < 17; k++)
+    out.push(`res:pub_${k} ex:embedding ${vec(emb(k % 4, k + 40, 8))} .`);
+  out.push(`res:pub_0 ex:embedding ${vec(emb(3, 99, 8))} .`);
+  out.push(`res:pub_17 ex:embedding "[1, 2, x]"^^<urn:x-sparkles:vector> .`);
+  return out.join('\n');
+}
+
 export const provenanceTrig = `
 ${header}
 <http://example.org/graph/provenance> {
