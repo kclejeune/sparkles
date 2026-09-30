@@ -3241,11 +3241,13 @@ dependencies = [
 name = "sparkles-backup"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "chrono-tz",
  "croner",
  "futures",
+ "libc",
  "lz4_flex 0.14.0",
  "object_store",
  "serde",
