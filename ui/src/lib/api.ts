@@ -8,7 +8,16 @@ export type DatasetInfo = {
   type: DatasetType;
   endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string };
   quads: number;
-  reasoning: null | { profile: string; inferred: number; at: string };
+  reasoning: null | {
+    profile: string;
+    inferred: number;
+    at: string;
+    /** Commit the inferences were materialized at (null: unknown). */
+    commit?: number | null;
+    /** null: freshness unknown (legacy status). */
+    stale?: boolean | null;
+    commitsSince?: number | null;
+  };
 };
 
 export type ServerInfo = {
@@ -16,6 +25,8 @@ export type ServerInfo = {
   startedAt: string;
   uptimeSeconds: number;
   datasets: DatasetInfo[];
+  /** Absent on servers that predate it. */
+  readOnly?: boolean;
 };
 
 export type DatasetStats = {
@@ -33,6 +44,8 @@ export type DatasetStats = {
   cache: { entries: number; bytes: number; hits: number; misses: number };
   /** Query (sub)result cache; absent on servers that predate it. */
   resultCache?: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number };
+  /** Reasoning status; absent on servers that predate it. */
+  reasoning?: ReasoningStatus | null;
 };
 
 export type TaskKind = 'compact' | 'backup' | 'reason' | 'load';
@@ -83,6 +96,8 @@ export type SparklesResult = {
   boolean?: boolean;
   triples?: [Term, Term, Term][];
   meta: { totalRows: number; sentRows: number; timing: Timing; plan: PlanNode };
+  /** From the `Sparkles-Inferences` header: the result used outdated inferences. */
+  inferences?: InferencesNotice;
 };
 
 export type ExplainResult = { algebra: string; plan: PlanNode };
@@ -257,6 +272,8 @@ export async function query(
     signal: opts.signal,
   });
   const body = (await res.json()) as SparklesResult;
+  const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
+  if (inferences) body.inferences = inferences;
   return normalizeResult(body);
 }
 
@@ -454,4 +471,116 @@ export function errorMessage(e: unknown): string {
     return e.detail && e.detail !== e.message ? `${e.message}: ${e.detail}` : e.message;
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+// --- reasoning status and diagnostics -------------------------------------------
+
+/** `GET /$/reason/{ds}`: the recorded reasoning and whether it is up to date. */
+export type ReasoningStatus = {
+  profile: string;
+  inferred: number;
+  at: string;
+  /** Commit the inferences were materialized at (null: unknown, e.g. older status). */
+  commit: number | null;
+  head: number;
+  /** null: freshness unknown. */
+  stale: boolean | null;
+  commitsSince: number | null;
+  staleReason?: string;
+  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string };
+  warnings: string[];
+};
+
+/** Parsed `Sparkles-Inferences` response header (sent only when not fresh). */
+export type InferencesNotice = { stale: boolean | null; commitsSince: number | null };
+
+export function parseInferencesHeader(v: string | null): InferencesNotice | undefined {
+  if (!v) return undefined;
+  const [state, ...params] = v.split(';').map((p) => p.trim());
+  const since = params.find((p) => p.startsWith('commits-since='));
+  const n = since ? Number(since.slice('commits-since='.length)) : NaN;
+  return {
+    stale: state === 'stale' ? true : null,
+    commitsSince: Number.isFinite(n) ? n : null,
+  };
+}
+
+export async function reasonStatus(ds: string): Promise<ReasoningStatus | null> {
+  const body = await json<ReasoningStatus | { reasoning: null; head: number }>(
+    `/$/reason/${enc(ds)}`,
+  );
+  return body && 'profile' in body ? body : null;
+}
+
+/** Re-run the recorded profile (including custom rules). */
+export const rerunReasoning = (ds: string) =>
+  json<Task>(`/$/reason/${enc(ds)}`, jsonBody({ rerun: true }));
+
+export const DIAGNOSTIC_CHECKS = [
+  'nothing-member',
+  'disjoint-classes',
+  'all-disjoint-classes',
+  'same-different',
+  'functional-literal-conflict',
+  'thing-empty',
+  'unsatisfiable-class',
+] as const;
+export type DiagnosticCheck = (typeof DIAGNOSTIC_CHECKS)[number];
+
+export type DiagnosticsReport = {
+  diagnosticsFormat: 1;
+  dataset: string;
+  commit: number;
+  computedAt: string;
+  scope: {
+    graph: 'default';
+    inferences: {
+      included: boolean;
+      profile?: string;
+      stale?: boolean | null;
+      commitsSince?: number | null;
+    };
+    closure: 'subclass' | 'none';
+  };
+  status: 'violations-found' | 'none-found' | 'incomplete';
+  note: string;
+  checks: {
+    id: string;
+    rules: string[];
+    severity: 'inconsistency' | 'warning';
+    status: 'violations' | 'none' | 'truncated' | 'timeout' | 'error';
+    findings: number;
+    millis: number;
+    error?: string;
+  }[];
+  findings: {
+    check: string;
+    rule: string;
+    severity: 'inconsistency' | 'warning';
+    focus: Term;
+    evidence: Record<string, Term | Term[]>;
+    basis: 'asserted' | 'uses-inferences';
+    message: string;
+  }[];
+};
+
+export type DiagnosticsOptions = {
+  checks?: string[];
+  limit?: number;
+  reasoning?: boolean;
+  closure?: 'subclass' | 'none';
+  signal?: AbortSignal;
+};
+
+/** `GET /$/reason/{ds}/diagnostics`: OWL 2 RL inconsistency checks. */
+export function diagnostics(ds: string, opts: DiagnosticsOptions = {}): Promise<DiagnosticsReport> {
+  const p = new URLSearchParams();
+  if (opts.checks?.length) p.set('checks', opts.checks.join(','));
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.closure) p.set('closure', opts.closure);
+  const qs = p.toString();
+  return json<DiagnosticsReport>(`/$/reason/${enc(ds)}/diagnostics${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+  });
 }

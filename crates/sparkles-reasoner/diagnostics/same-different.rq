@@ -1,0 +1,11 @@
+# same-different: two individuals declared different that are the same through
+# owl:sameAs (OWL 2 RL eq-diff1, with eq-ref, eq-sym and eq-trans). This includes an
+# individual declared different from itself.
+#
+# The checker appends a LIMIT.
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?y WHERE {
+  ?x owl:differentFrom ?y .
+  ?x (owl:sameAs|^owl:sameAs)* ?y .
+}

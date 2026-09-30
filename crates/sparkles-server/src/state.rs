@@ -18,11 +18,35 @@ pub enum DbType {
     Mem,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The recorded reasoning status (`reasoning.json`, also embedded in the registry).
+/// Fields after `at` are absent from files written by older versions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReasoningInfo {
+    #[serde(default)]
+    pub reasoning_format: u32,
     pub profile: String,
     pub inferred: u64,
     pub at: String,
+    /// commit (`seq`) at which the inferences were materialized
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<u64>,
+    /// what `commit` counts: `"commit"` (the commit sequence)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_source: Option<String>,
+    /// the dataset `commit` belongs to
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_id: Option<String>,
+    /// rule text of profile `rules`, for re-runs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub millis: Option<u64>,
+    /// copied from a clone source whose inferences were already stale
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherited_stale: bool,
 }
 
 pub struct Dataset {
@@ -54,6 +78,9 @@ pub struct Task {
     pub id: String,
     pub kind: String,
     pub dataset: String,
+    /// the dataset a task creates (clone)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub state: String,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +102,8 @@ pub struct AppState {
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     pub allow_service: bool,
+    /// automatic re-materialization of stale inferences (`serve --auto-reason`)
+    pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -87,14 +116,46 @@ pub fn read_reasoning_file(root: &Path) -> Option<ReasoningInfo> {
     serde_json::from_slice(&std::fs::read(root.join("reasoning.json")).ok()?).ok()
 }
 
+/// Write (or remove) `reasoning.json` durably: temporary file, sync, rename, directory
+/// sync, so a crash leaves the old status or the new one, never a torn file.
 pub fn write_reasoning_file(root: &Path, info: Option<&ReasoningInfo>) -> Result<()> {
     let path = root.join("reasoning.json");
     match info {
-        Some(i) => std::fs::write(&path, serde_json::to_vec_pretty(i)?)?,
-        None => {
-            let _ = std::fs::remove_file(&path);
+        Some(i) => {
+            let mut i = i.clone();
+            i.reasoning_format = 2;
+            write_file_atomic(&path, &serde_json::to_vec_pretty(&i)?)?;
         }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => sync_dir(root)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        },
     }
+    Ok(())
+}
+
+/// Replace `path` durably (temporary file, sync, rename, directory sync).
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+/// Flush a directory's entries to stable storage (a no-op where directories cannot be
+/// opened for syncing).
+pub fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -142,6 +203,7 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: true,
+            auto_reason: None,
             manage: Mutex::new(()),
         };
         let reg_path = data_dir.join("config.json");
@@ -293,6 +355,7 @@ impl AppState {
             id: id.clone(),
             kind: kind.to_string(),
             dataset: dataset.to_string(),
+            target: None,
             state: "running".into(),
             started_at: now(),
             finished_at: None,

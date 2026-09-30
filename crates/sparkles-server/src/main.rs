@@ -5,6 +5,7 @@
 
 mod alloc;
 mod http;
+mod reasoning;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod state;
@@ -70,6 +71,14 @@ enum Cmd {
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
+        /// Re-materialize stale inferences automatically once a dataset has had no
+        /// commit for this many seconds (off by default; each run holds the writer lock)
+        #[arg(long, value_name = "SECS")]
+        auto_reason: Option<f64>,
+        /// With --auto-reason: run at the latest this many seconds after the inferences
+        /// became stale, even while writes continue (default: 12 x the debounce)
+        #[arg(long, value_name = "SECS", requires = "auto_reason")]
+        auto_reason_max_delay: Option<f64>,
     },
     /// Bulk load RDF files into a database (creates it if needed)
     Load {
@@ -154,17 +163,44 @@ enum Cmd {
         #[arg(long, default_value = "text")]
         format: String,
     },
-    /// Materialize inferences (rdfs, rdfs-simple, owl-rl or a Jena rules file)
+    /// Materialize inferences (rdfs, rdfs-simple, owl-rl or a Jena rules file), show
+    /// their status, or check the data for OWL 2 RL inconsistencies
     Infer {
         #[arg(long)]
         loc: PathBuf,
-        #[arg(long, default_value = "rdfs")]
-        profile: String,
+        /// rdfs (the default), rdfs-simple or owl-rl
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         rules: Option<PathBuf>,
         /// Remove materialized inferences instead
         #[arg(long)]
         clear: bool,
+        /// Print the reasoning status (are the inferences up to date?)
+        #[arg(long, conflicts_with_all = ["clear", "check", "profile", "rules"])]
+        status: bool,
+        /// Run the inconsistency checks (after materializing, when --profile or --rules
+        /// is given); exits with 1 when violations are found, 2 when incomplete
+        #[arg(long, conflicts_with = "clear")]
+        check: bool,
+        /// Comma-separated check ids (default: all)
+        #[arg(long, value_delimiter = ',', requires = "check")]
+        checks: Vec<String>,
+        /// Findings per check
+        #[arg(long, default_value_t = 100, requires = "check")]
+        limit: usize,
+        /// Check the asserted data only, without the materialized inferences
+        #[arg(long, requires = "check")]
+        no_inferences: bool,
+        /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
+        #[arg(long, default_value = "subclass", requires = "check")]
+        closure: String,
+        /// text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Timeout of the checks in seconds
+        #[arg(long, requires = "check")]
+        timeout: Option<f64>,
     },
     /// Validate a database (or data files) against a SHACL shapes graph; exits with
     /// status 1 when the data does not conform
@@ -304,11 +340,36 @@ fn main() -> Result<()> {
             read_only,
             no_service,
             idle_release_ms,
+            auto_reason,
+            auto_reason_max_delay,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
             st.allow_service = !no_service;
+            if let Some(secs) = auto_reason {
+                if !cfg!(feature = "reasoning") {
+                    bail!("--auto-reason: built without the `reasoning` feature");
+                }
+                if !(secs.is_finite() && secs >= 0.0) {
+                    bail!("--auto-reason expects a number of seconds");
+                }
+                let max = auto_reason_max_delay
+                    .filter(|m| m.is_finite() && *m >= 0.0)
+                    .map(Duration::from_secs_f64);
+                st.auto_reason = Some(reasoning::AutoReason::new(
+                    Duration::from_secs_f64(secs),
+                    max,
+                ));
+            }
             let st = Arc::new(st);
+            #[cfg(feature = "reasoning")]
+            if st.auto_reason.is_some() {
+                if st.read_only {
+                    tracing::warn!("--auto-reason has no effect on a read-only server");
+                } else {
+                    reasoning::spawn_auto_reason(st.clone());
+                }
+            }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
             }
@@ -513,6 +574,9 @@ fn main() -> Result<()> {
             println!("predicates      {}", g.stats.distinct_predicates);
             println!("objects         {}", g.stats.distinct_objects);
             println!("named graphs    {}", s.graph_ids()?.len());
+            if let Some(info) = state::read_reasoning_file(&loc) {
+                println!("reasoning       {}", reasoning::status_line(&info, &store));
+            }
             println!(
                 "disk            {:.1} MiB",
                 store.disk_bytes() as f64 / (1 << 20) as f64
@@ -540,43 +604,114 @@ fn main() -> Result<()> {
             profile,
             rules,
             clear,
+            status,
+            check,
+            checks,
+            limit,
+            no_inferences,
+            closure,
+            format,
+            timeout,
         } => {
+            use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+            // bad check options exit with 2, before any work
+            let closure = match Closure::parse(&closure) {
+                Some(c) => c,
+                None => {
+                    eprintln!("error: unknown closure '{closure}' (expected subclass or none)");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(bad) = diagnostics::select_checks(&checks) {
+                eprintln!("error: unknown diagnostics check '{bad}'");
+                std::process::exit(2);
+            }
+            if check && !(1..=diagnostics::MAX_LIMIT).contains(&limit) {
+                eprintln!(
+                    "error: --limit must be between 1 and {}",
+                    diagnostics::MAX_LIMIT
+                );
+                std::process::exit(2);
+            }
+            if !loc.join("CURRENT").exists() {
+                bail!("{} is not a Sparkles database (no CURRENT)", loc.display());
+            }
             let store = Store::open(&loc, opts)?;
+            if status {
+                return print_reasoning_status(&loc, &store, &format);
+            }
             if clear {
                 let n = sparkles_reasoner::clear(&store)?;
                 state::write_reasoning_file(&loc, None)?;
                 eprintln!("removed {n} inferred triples");
                 return Ok(());
             }
-            let profile = match rules {
-                Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
-                None => profile
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("unknown profile '{profile}'"))?,
-            };
-            let profile_name = profile.name().to_string();
-            let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
-            // lets `sparkles serve` pick the inferences up for this database
-            state::write_reasoning_file(
-                &loc,
-                Some(&state::ReasoningInfo {
-                    profile: profile_name,
-                    inferred: r.inferred,
-                    at: state::now(),
-                }),
-            )?;
-            eprintln!(
-                "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
-                r.inferred,
-                r.rules,
-                r.iterations,
-                r.millis,
-                sparkles_reasoner::INFERRED_GRAPH
-            );
-            for w in r.warnings {
-                eprintln!("warning: {w}");
+            if !check || profile.is_some() || rules.is_some() {
+                let profile = match rules {
+                    Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
+                    None => {
+                        let p = profile.as_deref().unwrap_or("rdfs");
+                        p.parse()
+                            .map_err(|_| anyhow::anyhow!("unknown profile '{p}'"))?
+                    }
+                };
+                let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
+                // lets `sparkles serve` pick the inferences up for this database
+                state::write_reasoning_file(
+                    &loc,
+                    Some(&reasoning::recorded(&profile, &r, &store)),
+                )?;
+                eprintln!(
+                    "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>",
+                    r.inferred,
+                    r.rules,
+                    r.iterations,
+                    r.millis,
+                    sparkles_reasoner::INFERRED_GRAPH
+                );
+                for w in r.warnings {
+                    eprintln!("warning: {w}");
+                }
             }
-            Ok(())
+            if !check {
+                return Ok(());
+            }
+            let info = state::read_reasoning_file(&loc);
+            let has_inferred = info.is_some()
+                || store
+                    .snapshot()
+                    .lookup_iri(sparkles_reasoner::INFERRED_GRAPH)
+                    .is_some();
+            let dopts = DiagnoseOptions {
+                checks,
+                limit,
+                inferences: has_inferred && !no_inferences,
+                closure,
+                timeout: timeout.map(Duration::from_secs_f64),
+                prefixes: store.prefixes().into_iter().collect(),
+            };
+            let name = loc
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "db".into());
+            let (report, j) =
+                match reasoning::diagnostics_json(&name, &store, info.as_ref(), &dopts) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        std::process::exit(2);
+                    }
+                };
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&j)?);
+            } else {
+                print_diagnostics(&report, &j);
+            }
+            std::process::exit(match report.status {
+                diagnostics::ReportStatus::NoneFound => 0,
+                diagnostics::ReportStatus::ViolationsFound => 1,
+                diagnostics::ReportStatus::Incomplete => 2,
+            });
         }
         #[cfg(not(feature = "shacl"))]
         Cmd::Shacl { .. } => bail!("built without the `shacl` feature"),
@@ -618,6 +753,103 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `sparkles infer --status`.
+#[cfg(feature = "reasoning")]
+fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) -> Result<()> {
+    let info = state::read_reasoning_file(loc);
+    if format == "json" {
+        let j = match &info {
+            Some(i) => reasoning::status_value(i, store, serde_json::json!({ "enabled": false })),
+            None => serde_json::json!({ "reasoning": null, "head": store.head_commit().seq }),
+        };
+        println!("{}", serde_json::to_string_pretty(&j)?);
+        return Ok(());
+    }
+    let head = store.head_commit().seq;
+    let Some(info) = info else {
+        println!("no materialized inferences (head commit {head})");
+        return Ok(());
+    };
+    let f = reasoning::freshness(&info, store, head);
+    println!("profile         {}", info.profile);
+    println!("inferred        {}", info.inferred);
+    println!("at              {}", info.at);
+    println!(
+        "commit          {}",
+        info.commit.map_or("unknown".to_string(), |c| c.to_string())
+    );
+    println!("head            {head}");
+    let state = match (f.stale, f.commits_since) {
+        (Some(false), _) => "up to date".to_string(),
+        (Some(true), Some(n)) => {
+            format!("STALE ({n} commit{} since)", if n == 1 { "" } else { "s" })
+        }
+        (Some(true), None) => format!("STALE ({})", f.reason.unwrap_or_default()),
+        (None, _) => format!("freshness unknown ({})", f.reason.unwrap_or_default()),
+    };
+    println!("status          {state}");
+    for w in &info.warnings {
+        println!("warning         {w}");
+    }
+    Ok(())
+}
+
+/// Text form of a diagnostics report.
+#[cfg(feature = "reasoning")]
+fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &serde_json::Value) {
+    use sparkles_reasoner::diagnostics::{Basis, CheckStatus, Severity};
+    for f in &r.findings {
+        let sev = if f.severity == Severity::Warning {
+            " [warning]"
+        } else {
+            ""
+        };
+        let basis = if f.basis == Basis::UsesInferences {
+            " (uses inferences)"
+        } else {
+            ""
+        };
+        println!("{:<14} {}{sev}{basis}", f.rule, f.message);
+    }
+    for c in &r.checks {
+        match c.status {
+            CheckStatus::Truncated => println!(
+                "{}: the first {} findings are shown; raise --limit for more",
+                c.id, c.findings
+            ),
+            CheckStatus::Timeout => println!("{}: timed out", c.id),
+            CheckStatus::Error => println!(
+                "{}: error: {}",
+                c.id,
+                c.error.as_deref().unwrap_or_default()
+            ),
+            _ => {}
+        }
+    }
+    let inf = &j["scope"]["inferences"];
+    let fresh = inf["stale"].as_bool() == Some(false);
+    if inf["included"] == true
+        && !fresh
+        && r.findings.iter().any(|f| f.basis == Basis::UsesInferences)
+    {
+        println!(
+            "note: the inferences are not known to be up to date; findings marked (uses inferences) may be outdated"
+        );
+    }
+    let n = r.findings.len();
+    let checks = r.checks.len();
+    println!(
+        "{}{} ({checks} check{}; this is not a full OWL consistency check)",
+        r.status.name(),
+        if n > 0 {
+            format!(": {n} finding{}", if n == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        },
+        if checks == 1 { "" } else { "s" }
+    );
 }
 
 /// A database directory, or the given files loaded into an in-memory store.

@@ -1,0 +1,24 @@
+# functional-literal-conflict: two literal values of a functional property that are
+# different data values (OWL 2 RL prp-fp, dt-diff and eq-diff1).
+#
+# Only literals whose value comparison is exact are considered: numbers, xsd:string,
+# xsd:boolean and language-tagged strings. `30` and `30.0` are the same value (no
+# finding); `30` and `31`, or `1` and "1" (disjoint value spaces), are different values.
+# A pair that `!=` cannot compare is a type error and is not reported, and literals of
+# other datatypes are left out, so the check can only under-report. IRI values only
+# entail owl:sameAs and are left to same-different.
+#
+# The checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ?x ?p ?v1 ?v2 WHERE {
+  ?p rdf:type owl:FunctionalProperty .
+  ?x ?p ?v1 .
+  ?x ?p ?v2 .
+  FILTER(isLiteral(?v1) && isLiteral(?v2))
+  FILTER(isNumeric(?v1) || LANG(?v1) != "" || DATATYPE(?v1) IN (xsd:string, xsd:boolean))
+  FILTER(isNumeric(?v2) || LANG(?v2) != "" || DATATYPE(?v2) IN (xsd:string, xsd:boolean))
+  FILTER(?v1 != ?v2)
+}

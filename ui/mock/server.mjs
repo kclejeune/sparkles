@@ -708,6 +708,38 @@ const server = http.createServer(async (req, res) => {
           );
         case 'reason': {
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          if (req.method === 'GET' && extra === 'diagnostics')
+            return send(res, 200, {
+              diagnosticsFormat: 1,
+              dataset: ds.name,
+              commit: 0,
+              computedAt: new Date().toISOString(),
+              scope: {
+                graph: 'default',
+                inferences: { included: !!ds.reasoning, stale: false, commitsSince: 0 },
+                closure: url.searchParams.get('closure') ?? 'subclass',
+              },
+              status: 'none-found',
+              note: "Checks a fixed subset of OWL 2 RL inconsistency rules; 'none-found' does not establish OWL consistency.",
+              checks: [],
+              findings: [],
+            });
+          if (req.method === 'GET')
+            return send(
+              res,
+              200,
+              ds.reasoning
+                ? {
+                    ...ds.reasoning,
+                    commit: 0,
+                    head: 0,
+                    stale: false,
+                    commitsSince: 0,
+                    auto: { enabled: false },
+                    warnings: [],
+                  }
+                : { reasoning: null, head: 0 },
+            );
           if (req.method === 'DELETE') {
             ds.store.update('DROP SILENT GRAPH <urn:sparkles:inferred>');
             ds.reasoning = null;
@@ -737,6 +769,9 @@ const server = http.createServer(async (req, res) => {
                   profile,
                   inferred: inferredCount(ds),
                   at: new Date().toISOString(),
+                  commit: 0,
+                  stale: false,
+                  commitsSince: 0,
                 };
                 return `Inferred ${ds.reasoning.inferred} triples (${profile})`;
               },

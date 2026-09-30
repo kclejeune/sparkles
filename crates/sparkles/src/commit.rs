@@ -191,7 +191,7 @@ impl Serialize for CommitInfo {
 
 /// The outcome of a write: the new commit, or the unchanged head when the write had no
 /// net effect.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub dataset_id: uuid::Uuid,

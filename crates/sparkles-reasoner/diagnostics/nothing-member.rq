@@ -1,0 +1,13 @@
+# nothing-member: an instance of owl:Nothing (OWL 2 RL cls-nothing2, with cax-sco).
+#
+# {TYPE} is replaced by `rdf:type` (closure=none) or `rdf:type/rdfs:subClassOf*`
+# (closure=subclass); the checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?type WHERE {
+  ?x {TYPE} owl:Nothing .
+  ?x rdf:type ?type .
+  ?type rdfs:subClassOf* owl:Nothing .
+}

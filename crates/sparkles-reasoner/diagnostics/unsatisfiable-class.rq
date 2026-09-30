@@ -1,0 +1,15 @@
+# unsatisfiable-class (warning): a class below owl:Nothing that has no members. It is
+# not an inconsistency by itself; members of such a class are reported by
+# nothing-member.
+#
+# {TYPE} is replaced by `rdf:type` (closure=none) or `rdf:type/rdfs:subClassOf*`
+# (closure=subclass); the checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?c WHERE {
+  ?c rdfs:subClassOf+ owl:Nothing .
+  FILTER(?c != owl:Nothing)
+  FILTER NOT EXISTS { ?x {TYPE} ?c }
+}

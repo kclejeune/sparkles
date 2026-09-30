@@ -12,6 +12,7 @@
 //! comparable to Jena's OWL Mini) or any Jena rule text ([`Profile::Rules`]).
 
 mod builtins;
+pub mod diagnostics;
 mod engine;
 mod graph;
 pub mod parser;
@@ -153,6 +154,9 @@ pub struct ReasonReport {
     pub inferred: u64,
     pub millis: u64,
     pub warnings: Vec<String>,
+    /// the commit that wrote the inferences, or the unchanged head (at which the data
+    /// was read) when the run changed nothing; `None` for [`infer`] (a dry run)
+    pub receipt: Option<sparkles::commit::Receipt>,
 }
 
 fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
@@ -327,7 +331,7 @@ pub fn materialize(
         // large batches are merged into a rebuilt index generation on commit
         txn.insert_bulk(added)?;
     }
-    txn.commit()?;
+    let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
     let report = ReasonReport {
         profile: profile.name().to_string(),
@@ -336,6 +340,7 @@ pub fn materialize(
         inferred: new_set.len() as u64,
         millis: t0.elapsed().as_millis() as u64,
         warnings,
+        receipt: Some(receipt),
     };
     tracing::info!(
         profile = %report.profile,
@@ -400,6 +405,7 @@ pub fn infer(
         inferred: out.len() as u64,
         millis: t0.elapsed().as_millis() as u64,
         warnings: d.warnings,
+        receipt: None,
     };
     Ok((out, report))
 }

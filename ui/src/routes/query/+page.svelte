@@ -740,6 +740,19 @@
         </div>
       {/if}
 
+      {#if outcome.result?.inferences && outcome.view !== 'explain'}
+        {@const inf = outcome.result.inferences}
+        <div class="notice warn">
+          <Icon name="alert" size={14} />
+          {inf.commitsSince != null
+            ? `Includes inferences that are ${fmtInt(inf.commitsSince)} commit${inf.commitsSince === 1 ? '' : 's'} out of date.`
+            : inf.stale
+              ? 'Includes inferences that are out of date.'
+              : 'Includes inferences whose freshness is unknown.'}
+          <a href={resolve('/datasets/[name]', { name: outcome.ds })}>Re-run reasoning</a>
+        </div>
+      {/if}
+
       <div class="rbody">
         {#if outcome.status === 'error' && outcome.error}
           {@const err = outcome.error}

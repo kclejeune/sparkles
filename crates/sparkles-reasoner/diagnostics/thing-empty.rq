@@ -1,0 +1,15 @@
+# thing-empty: an axiom that makes owl:Thing empty. The domain of an OWL interpretation
+# is never empty, so any such axiom is an inconsistency.
+#
+# The checker appends a LIMIT.
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?s ?p ?o WHERE {
+  VALUES (?s ?p ?o) {
+    (owl:Thing rdfs:subClassOf owl:Nothing)
+    (owl:Thing owl:equivalentClass owl:Nothing)
+    (owl:Nothing owl:equivalentClass owl:Thing)
+  }
+  ?s ?p ?o .
+}

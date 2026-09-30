@@ -1,0 +1,18 @@
+# all-disjoint-classes: an instance of two members of an owl:AllDisjointClasses axiom
+# (OWL 2 RL cax-adc).
+#
+# {TYPE} is replaced by `rdf:type` (closure=none) or `rdf:type/rdfs:subClassOf*`
+# (closure=subclass); the checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?d ?x ?c1 ?c2 WHERE {
+  ?d rdf:type owl:AllDisjointClasses ;
+     owl:members ?list .
+  ?list rdf:rest*/rdf:first ?c1 .
+  ?list rdf:rest*/rdf:first ?c2 .
+  FILTER(?c1 != ?c2)
+  ?x {TYPE} ?c1 .
+  ?x {TYPE} ?c2 .
+}
