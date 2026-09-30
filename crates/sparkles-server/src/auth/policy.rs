@@ -35,7 +35,7 @@ const QUEUE_PER_PERMIT: usize = 4;
 const MIN_PER_CLIENT: usize = 2;
 
 /// Named limits of [`Auth::throttle`]: tokens minted per owner, device logins started per
-/// client network, failed user-code lookups per session.
+/// client network, failed user-code lookups per client network and per owner.
 pub const MINT: &str = "mint";
 pub const DEVICE: &str = "device";
 pub const DEVICE_CODE: &str = "device-code";
@@ -56,7 +56,7 @@ fn per_minute(count: u32, burst: u32) -> crate::ratelimit::Limit {
 
 /// The throttle's limits under `policy`: its mint rate; 20 device logins per address,
 /// then two a minute (the pending grants of one address stay far below the server's cap);
-/// 20 unknown user codes per session, then two a minute.
+/// 20 unknown user codes per client network and per owner, then two a minute.
 fn throttle_config(policy: &Policy) -> crate::ratelimit::Config {
     let mut c = crate::ratelimit::Config {
         max_keys: Some(THROTTLE_KEYS),

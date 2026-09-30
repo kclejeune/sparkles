@@ -180,6 +180,39 @@ async fn device_refusals() {
     )
     .await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // per owner, not per session: another session of alice's has none left either
+    let (other, _) = password_session(&s, "alice").await;
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/auth/device/AAAA-AAAA",
+        &[("cookie", &other)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // and per client network: carol, from the same address, neither
+    let (carol, _) = password_session(&s, "carol").await;
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/auth/device/AAAA-AAAA",
+        &[("cookie", &carol)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // from another address, carol still can
+    let r = call_from(
+        &s.app,
+        Peer::Tcp("198.51.100.3:1".parse().unwrap()),
+        "GET",
+        "/$/auth/device/AAAA-AAAA",
+        &[("cookie", &carol)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
     // the token endpoint rejects nonsense
     let bad = form(&s.app, "/$/auth/token", "grant_type=password").await;
     assert_eq!(bad.json()["error"], "unsupported_grant_type");

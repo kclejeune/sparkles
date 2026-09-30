@@ -1353,7 +1353,11 @@ routes answer `404`.
   OIDC sessions, `proxy.logout_url` for proxy users.
 
 Sessions are kept in `<data>/auth/sessions.json` (hashed ids, 0600) and survive restarts;
-replacing `<data>/auth/session.key` signs everyone out.
+replacing `<data>/auth/session.key` signs everyone out. An owner (a user, an OIDC or
+proxy identity; a token login counts for the token's owner) keeps at most 50 sessions: a
+new one ends the owner's oldest. The server keeps at most 10,000; when full, the owner
+that holds the most loses its oldest, so that no one can sign the others out by opening
+sessions.
 
 ### API tokens
 
@@ -1501,7 +1505,8 @@ The auth layer has limits of its own, which answer `429` with `"limitClass": "au
 tokens minted per owner (`tokens_policy.mint_rate`, default `60/h`; `reason` `mint`),
 device logins started per client network (an IPv4 address or an IPv6 /48; 20, then two a
 minute, whether `preauth` is on or not; `device`) and
-unknown user codes per session (20, then two a minute; `device-code`). An owner has at
+unknown user codes per client network and per owner (20, then two a minute, whichever
+runs out first; `device-code`; each is also a failure for `preauth`). An owner has at
 most `tokens_policy.max_active_per_owner` unexpired tokens (default 100); minting another
 answers `409` until one is revoked or expires. At most max(1, cores / 2) argon2 password
 verifications run at once and four per permit wait (up to five seconds); a check beyond

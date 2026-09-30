@@ -931,19 +931,40 @@ async fn device_start(
     )
 }
 
-/// The key that bounds a principal's failed user-code lookups: its session.
-fn lookup_key(p: &Principal) -> ClientKey {
-    let k = p
-        .info
-        .session
-        .unwrap_or_else(|| crypto::sha256(p.id().as_bytes()));
-    ClientKey::principal(&crypto::hex(&k))
+/// The keys that bound failed user-code lookups: the client's network, and the
+/// principal's owner (whichever sessions and addresses it uses).
+fn lookup_keys(p: &Principal, addr: &Option<Extension<ClientAddr>>) -> [ClientKey; 2] {
+    [
+        network(addr).unwrap_or(ClientKey::Unknown),
+        ClientKey::principal(&p.rate_key()),
+    ]
+}
+
+/// Whether both keys have failed lookups left.
+#[allow(clippy::result_large_err)]
+fn lookups_left(auth: &Auth, keys: &[ClientKey; 2]) -> Result<(), Response> {
+    for k in keys {
+        auth.throttle.check(DEVICE_CODE, k)?;
+    }
+    Ok(())
+}
+
+/// An unknown user code: charged to both keys, and to the address's `preauth` budget.
+fn unknown_code(auth: &Auth, keys: [ClientKey; 2]) -> Response {
+    for k in keys {
+        auth.throttle.charge(DEVICE_CODE, k, 1);
+    }
+    failed(json_error(
+        StatusCode::NOT_FOUND,
+        "no such code, or it expired",
+    ))
 }
 
 /// `GET /$/auth/device/{user_code}` (interactive): the grant, for the approval page.
 async fn device_info(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
 ) -> Response {
     let auth = match auth_of(&st) {
@@ -951,8 +972,8 @@ async fn device_info(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     match auth.cli.lookup(&code, now) {
@@ -966,10 +987,7 @@ async fn device_info(
             }))
             .into_response(),
         ),
-        None => {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
-            json_error(StatusCode::NOT_FOUND, "no such code, or it expired")
-        }
+        None => unknown_code(&auth, keys),
     }
 }
 
@@ -987,6 +1005,7 @@ fn issued(token: &Zeroizing<String>, rec: &TokenRecord, p: &Principal, now: i64)
 async fn device_approve(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
     body: Bytes,
 ) -> Response {
@@ -995,13 +1014,13 @@ async fn device_approve(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     if !auth.cli.is_pending(&code, now) {
         if auth.cli.lookup(&code, now).is_none() {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
+            return unknown_code(&auth, keys);
         }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
@@ -1041,6 +1060,7 @@ async fn device_approve(
 async fn device_deny(
     State(st): St,
     Extension(p): Extension<Principal>,
+    addr: Option<Extension<ClientAddr>>,
     Path(code): Path<String>,
 ) -> Response {
     let auth = match auth_of(&st) {
@@ -1048,13 +1068,13 @@ async fn device_deny(
         Err(r) => return r,
     };
     let now = auth.now();
-    let key = lookup_key(&p);
-    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+    let keys = lookup_keys(&p, &addr);
+    if let Err(r) = lookups_left(&auth, &keys) {
         return r;
     }
     if !auth.cli.decide(&code, None, now) {
         if auth.cli.lookup(&code, now).is_none() {
-            auth.throttle.charge(DEVICE_CODE, key, 1);
+            return unknown_code(&auth, keys);
         }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }

@@ -58,6 +58,8 @@ pub use handlers::SESSION_COOKIE;
 pub use policy::Auth;
 #[cfg(all(test, feature = "auth"))]
 pub use policy::{hash_password, hash_password_with, new_token, token_hash};
+#[cfg(all(test, feature = "auth"))]
+pub use session::MAX_SESSIONS_PER_OWNER;
 #[cfg(feature = "auth")]
 pub use store::write_private;
 
