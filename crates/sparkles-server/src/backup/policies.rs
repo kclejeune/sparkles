@@ -143,8 +143,8 @@ impl Engine for ServerEngine {
         block_on(b, r.list(&filter))
     }
 
-    // TODO(merge): route through the server's backup task slots and its per-(dataset,
-    // repository) exclusion once they exist, so policy backups share them.
+    /// Through the server's backup path: the one-backup-per-(dataset, repository)
+    /// rule and a task slot per dataset.
     fn create(
         &self,
         st: &Arc<AppState>,
@@ -152,60 +152,29 @@ impl Engine for ServerEngine {
         dataset: &str,
         o: CreateOptions,
     ) -> Result<BackupSummary, BackupError> {
-        let b = backup_state(st)?;
-        let ds = st.get(dataset).ok_or_else(|| {
-            BackupError::new(Code::InvalidRequest, format!("no such dataset: {dataset}"))
-        })?;
-        if ds.kind == DbType::Mem {
-            return Err(BackupError::new(
-                Code::BackupUnsupported,
-                "in-memory datasets cannot be backed up",
-            ));
-        }
-        let r = b.repo(repo)?;
-        let capture = ds.store.backup_capture(&o.name)?;
-        drop(ds);
-        block_on(b, r.create(capture.into(), &o))
+        super::ops::create_for_policy(st, dataset, repo, o)
     }
 
     fn delete(&self, st: &Arc<AppState>, repo: &str, name: &str) -> Result<bool, BackupError> {
         let b = backup_state(st)?;
-        let r = b.repo(repo)?;
-        block_on(b, r.delete(name))
+        match block_on(b, super::ops::delete(st, b, repo, name, "policy retention")) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code() == Code::NoSuchBackup => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
-    // TODO(merge): the server's busy set of backups a restore or verify uses
-    fn busy(&self, _st: &Arc<AppState>, _repo: &str) -> HashSet<String> {
-        HashSet::new()
+    fn busy(&self, st: &Arc<AppState>, repo: &str) -> HashSet<String> {
+        backup_state(st).map_or_else(
+            |_| HashSet::new(),
+            |b| b.busy_backups(repo).into_iter().collect(),
+        )
     }
 
-    // TODO(merge): share the GC task of `POST /$/repositories/{repo}/gc`
+    /// The GC task of `POST /$/repositories/{repo}/gc`, with the default grace period.
     fn start_gc(&self, st: &Arc<AppState>, repo: &str) -> Result<String, BackupError> {
-        let b = backup_state(st)?.clone();
-        let r = b.repo(repo)?;
-        let name = repo.to_string();
-        let task = st.start_task_opts(
-            st.next_task_id(),
-            "backup-gc",
-            "",
-            Some(repo),
-            true,
-            move |h| {
-                let opts = GcOptions {
-                    ctl: Ctl::with_cancel(h.cancel_flag()),
-                    ..Default::default()
-                };
-                h.progress(0.05, "marking");
-                let report = block_on(&b, r.gc(&opts))?;
-                h.set_detail(serde_json::to_value(&report)?);
-                tracing::info!(target: "sparkles::backup", repository = name.as_str(),
-                    deleted = report.deleted, deleted_bytes = report.deleted_bytes, "gc after retention");
-                Ok(format!(
-                    "deleted {} blobs ({} bytes)",
-                    report.deleted, report.deleted_bytes
-                ))
-            },
-        );
+        let grace = GcOptions::default().grace;
+        let (task, _) = super::ops::start_gc(st, repo, false, grace, "policy retention".into())?;
         Ok(task.id)
     }
 }
@@ -335,6 +304,7 @@ impl Policies {
     }
 
     /// Replace the engine (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_engine(&self, engine: Arc<dyn Engine>) {
         *self.engine.write() = engine;
     }
@@ -750,8 +720,11 @@ impl Run<'_> {
         };
         if !cancelled && !disabled {
             self.h.progress(0.95, "retention");
-            run.retention = Some(self.retention(&*engine));
-            if p.gc_after_retention {
+            let retention = self.retention(&*engine);
+            // collecting is worth it only when retention deleted something
+            let deleted = !retention.deleted.is_empty();
+            run.retention = Some(retention);
+            if p.gc_after_retention && deleted {
                 run.gc = self.gc(&*engine);
             }
         }

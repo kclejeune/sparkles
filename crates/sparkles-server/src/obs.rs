@@ -667,9 +667,15 @@ impl Metrics {
     }
 
     /// The `dataset` label of a request to `dataset` (see [`Metrics::series`]).
-    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "otel", feature = "backup")), allow(dead_code))]
     pub fn dataset_label(&self, dataset: Option<&str>) -> String {
         self.series(dataset).0
+    }
+
+    /// `--metrics-max-datasets` (other capped labels, like backup repositories, share it).
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub fn max_datasets(&self) -> usize {
+        self.max_datasets
     }
 
     /// Drop a deleted dataset's series (a recreated name starts again at zero).

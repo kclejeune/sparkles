@@ -571,6 +571,9 @@ impl AppState {
         if let Some(t) = self.reserved_by(name) {
             bail!("dataset /{name} is being created by task {t}");
         }
+        if let Some(t) = self.restoring.lock().get(name) {
+            bail!("dataset /{name} is being restored by task {t}");
+        }
         let ds = self.open_dataset(name, kind, None)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
         if let Err(e) = self.save_registry_locked() {
@@ -592,6 +595,9 @@ impl AppState {
         }
         if let Some(t) = self.reserved_by(name) {
             bail!("dataset /{name} is being created by task {t}");
+        }
+        if let Some(t) = self.restoring.lock().get(name) {
+            bail!("dataset /{name} is being restored by task {t}");
         }
         let ds = self.open_dataset(name, kind, loc)?;
         let ds = Arc::new(Dataset {
@@ -627,7 +633,7 @@ impl AppState {
     /// replacement; the persisted registry keeps it (put it back with
     /// [`reattach`](Self::reattach)). `None` if there is no such dataset, or it is not a
     /// managed persistent one (`--loc`, `--mem`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
         let _guard = self.manage.lock();
         let mut map = self.datasets.write();
@@ -639,7 +645,7 @@ impl AppState {
 
     /// Open `databases/<name>` and register it under `name` again (after a swap, or to
     /// roll one back). Fails if the name is registered.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
         let _guard = self.manage.lock();
         if self.datasets.read().contains_key(name) {
@@ -666,6 +672,9 @@ impl AppState {
         let mut reserved = self.reserved.lock();
         if let Some(t) = reserved.get(name) {
             return Err(format!("dataset /{name} is being created by task {t}"));
+        }
+        if let Some(t) = self.restoring.lock().get(name) {
+            return Err(format!("dataset /{name} is being restored by task {t}"));
         }
         if self.data_dir.join("databases").join(name).exists() {
             return Err(format!(
@@ -826,6 +835,13 @@ pub struct Reservation {
     name: String,
 }
 
+impl Reservation {
+    /// The reserved dataset name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.state.reserved.lock().remove(&self.name);
@@ -852,21 +868,21 @@ impl TaskHandle {
         self.cancel.clone()
     }
 
-    // is_cancelled, set_detail, set_state: for the backup tasks (and tests until then)
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Whether a cancel request came in.
+    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
     /// The task's typed result (`detail`), visible while it runs and after.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
     pub fn set_detail(&self, detail: serde_json::Value) {
         self.update(|t| t.detail = Some(detail));
     }
 
     /// `queued` (waiting for a slot) or `running` (see [`task_state`]); the final
     /// state is set when the work returns.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
     pub fn set_state(&self, state: &str) {
         self.update(|t| t.state = state.to_string());
     }

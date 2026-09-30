@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::Request;
 use serde_json::{Value as J, json};
 use sparkles::store::StoreOptions;
-use sparkles_backup::{CommitRef, DatasetRef, RepoConfig, RepoStatus};
+use sparkles_backup::{CommitRef, DatasetRef, RepoConfig};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -355,17 +355,15 @@ fn setup_with(now: &str, dir: tempfile::TempDir, read_only: bool) -> T {
     for (name, readonly) in [("local", false), ("archive", true)] {
         b.registry.repos.write().insert(
             name.into(),
-            RepoEntry {
-                config: RepoConfig {
+            RepoEntry::new(
+                RepoConfig {
                     name: name.into(),
                     path: Some(format!("/srv/{name}")),
                     readonly,
                     ..Default::default()
                 },
-                source: ConfigSource::Api,
-                opened: None,
-                status: RepoStatus::default(),
-            },
+                ConfigSource::Api,
+            ),
         );
     }
     let clock = FakeClock::at(now);
@@ -996,25 +994,29 @@ async fn runs_apply_retention_and_collect_once_a_day() {
     };
     let first = run(&s);
     assert_eq!(first.datasets.len(), 1, "mem1 does not match d*");
+    assert_eq!(first.gc, None, "retention deleted nothing: no GC");
+    s.clock.set("2026-09-30T13:00:00Z");
+    let second = run(&s);
+    assert_eq!(second.retention.unwrap().deleted, ["p-ds-20260930t120000z"]);
     assert_eq!(
-        first.gc,
+        second.gc,
         Some(RunGc {
             task: "gc-1".into()
         })
     );
-    s.clock.set("2026-09-30T13:00:00Z");
-    let second = run(&s);
-    assert_eq!(second.retention.unwrap().deleted, ["p-ds-20260930t120000z"]);
-    assert_eq!(second.gc, None, "one GC per repository per 24 h");
-    s.clock.set("2026-10-01T12:00:01Z");
+    s.clock.set("2026-09-30T14:00:00Z");
     let third = run(&s);
+    assert_eq!(third.retention.unwrap().deleted, ["p-ds-20260930t130000z"]);
+    assert_eq!(third.gc, None, "one GC per repository per 24 h");
+    s.clock.set("2026-10-01T13:00:01Z");
+    let fourth = run(&s);
     assert_eq!(
-        third.gc,
+        fourth.gc,
         Some(RunGc {
             task: "gc-2".into()
         })
     );
-    assert_eq!(s.fake.names(), ["p-ds-20261001t120001z"]);
+    assert_eq!(s.fake.names(), ["p-ds-20261001t130001z"]);
 }
 
 #[tokio::test]
@@ -1217,9 +1219,9 @@ fn invalid_config_file_policies_stop_the_server() {
     assert!(format!("{e:#}").contains("backup policy nightly"), "{e:#}");
 }
 
-/// A real policy run against a `memory://` repository registered over HTTP.
+/// A real policy run against an `fs` repository registered over HTTP.
 #[tokio::test]
-#[ignore = "needs S2/S3"]
+#[ignore = "needs S2"]
 async fn end_to_end_policy_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut state =
@@ -1245,10 +1247,11 @@ async fn end_to_end_policy_run() {
             (status, serde_json::from_slice::<J>(&b).unwrap_or(J::Null))
         }
     };
+    let repo = tempfile::tempdir().unwrap();
     let (st_, j) = call(
         "POST",
         "/$/repositories",
-        json!({"name": "mem", "type": "memory"}),
+        json!({"name": "mem", "type": "fs", "path": repo.path()}),
     )
     .await;
     assert_eq!(st_, StatusCode::CREATED, "{j}");
