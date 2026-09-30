@@ -88,11 +88,6 @@ pub fn error_response(e: &BackupError) -> Response {
     r
 }
 
-/// `501 {error, code: "not-implemented"}` for a route whose handler is not built yet.
-pub fn not_implemented(what: &str) -> Response {
-    error_response(&BackupError::unsupported(what))
-}
-
 /// A failed request: its error response.
 pub struct Fail(Box<Response>);
 
@@ -158,20 +153,7 @@ fn query(uri: &Uri) -> BTreeMap<String, String> {
 
 /// `409 repository-read-only` for a write to a read-only repository.
 fn writable_repo(cfg: &RepoConfig) -> Result<(), Fail> {
-    if cfg.readonly {
-        return Err(BackupError::new(
-            Code::RepositoryReadOnly,
-            format!("repository \u{201c}{}\u{201d} is read-only", cfg.name),
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// A task's error for the task list (`code: message`; a cancellation stays one).
-fn task_error(e: BackupError) -> anyhow::Error {
-    let code = e.code();
-    anyhow::Error::new(e).context(code.as_str())
+    Ok(ops::writable(cfg)?)
 }
 
 /// The task `id` once it has started or queued (see `Slots::acquire`).
@@ -205,10 +187,6 @@ fn wire<T: serde::Serialize>(v: T) -> String {
         .ok()
         .and_then(|j| j.as_str().map(str::to_string))
         .unwrap_or_default()
-}
-
-fn mb(bytes: u64) -> String {
-    format!("{:.1}", bytes as f64 / 1e6)
 }
 
 /// The connection test report of a location that could not be opened.
@@ -320,6 +298,13 @@ async fn add_repository(
             return Err(BackupError::new(
                 Code::RepositoryExists,
                 format!("a repository named \u{201c}{name}\u{201d} exists"),
+            )
+            .into());
+        }
+        if b.registry.policies.read().contains_key(&name) {
+            return Err(BackupError::new(
+                Code::RepositoryExists,
+                format!("a policy is named \u{201c}{name}\u{201d}"),
             )
             .into());
         }
@@ -588,7 +573,8 @@ async fn verify_repository(State(st): St, Path(name): Path<String>, body: Bytes)
     let repo = name.clone();
     let task = st.start_task_opts(id, "backup-verify", "", Some(&name), true, move |h| {
         let _claim = claim;
-        let r = ops::verify(&st2, &repo, Vec::new(), req.level, h, Some(tx)).map_err(task_error)?;
+        let r = ops::verify(&st2, &repo, Vec::new(), req.level, h, Some(tx))
+            .map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&r)?);
         Ok(format!(
             "{}: {} backups ({})",
@@ -657,34 +643,8 @@ async fn gc_repository(
         return Err(BackupError::new(Code::InvalidConfig, "graceHours must be \u{2265} 0").into());
     }
     b.open_repo(&name).await?;
-    let id = st.next_task_id();
-    let claim = b.claim(
-        &id,
-        ClaimSpec {
-            repo: Some(name.clone()),
-            ..Default::default()
-        },
-    )?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let st2 = st.clone();
-    let repo = name.clone();
-    let principal = p.id();
-    let dry = req.dry_run;
-    let task = st.start_task_opts(id, "backup-gc", "", Some(&name), true, move |h| {
-        let _claim = claim;
-        let grace = Duration::from_secs_f64(hours * 3600.0);
-        let r = ops::gc(&st2, &repo, dry, grace, &principal, h, Some(tx)).map_err(task_error)?;
-        h.set_detail(serde_json::to_value(&r)?);
-        Ok(if dry {
-            format!(
-                "dry run: {} blobs ({} MB) can be deleted",
-                r.candidates,
-                mb(r.deleted_bytes)
-            )
-        } else {
-            format!("deleted {} blobs ({} MB)", r.deleted, mb(r.deleted_bytes))
-        })
-    });
+    let grace = Duration::from_secs_f64(hours * 3600.0);
+    let (task, rx) = ops::start_gc(&st, &name, req.dry_run, grace, p.id())?;
     Ok(accepted(started_task(&st, task, rx).await, None))
 }
 
@@ -876,7 +836,7 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
     let repo2 = repo.clone();
     let task = st.start_task_opts(id, "backup-create", &ds_name, Some(&name), true, move |h| {
         let _claim = claim;
-        let s = ops::create(&st2, &ds, &repo2, args, h, Some(tx)).map_err(task_error)?;
+        let s = ops::create(&st2, &ds, &repo2, args, h, Some(tx)).map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&s)?);
         Ok(format!(
             "backed up /{} at commit {} into {repo2}/{}",
@@ -1043,7 +1003,7 @@ async fn restore_backup(
     let t2 = target.clone();
     let task = st.start_task_opts(id, "backup-restore", &ds, Some(&target), true, move |h| {
         let _claim = claim;
-        let d = ops::restore(&st2, args, h, Some(tx)).map_err(task_error)?;
+        let d = ops::restore(&st2, args, h, Some(tx)).map_err(ops::task_error)?;
         h.set_detail(d);
         Ok(format!(
             "restored {name} into /{t2}{}",
@@ -1081,7 +1041,7 @@ async fn verify_backup(
     let task = st.start_task_opts(id, "backup-verify", &ds, Some(&name), true, move |h| {
         let _claim = claim;
         let r = ops::verify(&st2, &repo, vec![n2.clone()], req.level, h, Some(tx))
-            .map_err(task_error)?;
+            .map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&r)?);
         Ok(format!("{}: {n2} ({})", wire(r.status), wire(req.level)))
     });

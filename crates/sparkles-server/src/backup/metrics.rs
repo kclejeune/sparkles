@@ -16,8 +16,7 @@
 //! | `sparkles_backup_policy_last_success_timestamp_seconds`, `…_next_run_timestamp_seconds`, `…_consecutive_failures` | gauge | `policy` |
 //!
 //! Object requests are counted from the request totals that verification and GC
-//! reports carry. The policy series are fed by the scheduler
-//! ([`BackupMetrics::policy_run`], [`BackupMetrics::set_policy`]).
+//! reports carry. The policy series are rendered by `policies::render_metrics`.
 
 use crate::state::AppState;
 use parking_lot::Mutex;
@@ -109,16 +108,6 @@ impl Hist {
     }
 }
 
-/// Scheduler state of a policy, for the policy gauges.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PolicyGauges {
-    /// Unix seconds of the last successful run
-    pub last_success: Option<f64>,
-    /// Unix seconds of the next scheduled run
-    pub next_run: Option<f64>,
-    pub consecutive_failures: u32,
-}
-
 struct Inner {
     /// repositories with a label of their own
     named: BTreeSet<String>,
@@ -132,8 +121,6 @@ struct Inner {
     last_success: BTreeMap<(String, String), f64>,
     capture_lock: Hist,
     lock_conflicts: BTreeMap<String, u64>,
-    policy_runs: BTreeMap<(String, String), u64>,
-    policies: BTreeMap<String, PolicyGauges>,
 }
 
 /// The backup counters of a server (`BackupState::metrics`).
@@ -156,8 +143,6 @@ impl Default for BackupMetrics {
                 last_success: BTreeMap::new(),
                 capture_lock: Hist::new(&LOCK_BUCKETS),
                 lock_conflicts: BTreeMap::new(),
-                policy_runs: BTreeMap::new(),
-                policies: BTreeMap::new(),
             }),
         }
     }
@@ -246,31 +231,6 @@ impl BackupMetrics {
     /// The writer-lock hold time of a capture.
     pub fn capture_lock(&self, d: Duration) {
         self.inner.lock().capture_lock.observe(d);
-    }
-
-    /// Count a finished policy run (`result`: `ok`, `partial`, `failed`, `skipped`).
-    #[cfg_attr(not(test), allow(dead_code))] // the policy scheduler
-    pub fn policy_run(&self, policy: &str, result: &str) {
-        *self
-            .inner
-            .lock()
-            .policy_runs
-            .entry((policy.to_string(), result.to_string()))
-            .or_default() += 1;
-    }
-
-    /// Set the scheduler gauges of a policy (`None`: forget a removed policy).
-    #[cfg_attr(not(test), allow(dead_code))] // the policy scheduler
-    pub fn set_policy(&self, policy: &str, g: Option<PolicyGauges>) {
-        let mut m = self.inner.lock();
-        match g {
-            Some(g) => {
-                m.policies.insert(policy.to_string(), g);
-            }
-            None => {
-                m.policies.remove(policy);
-            }
-        }
     }
 }
 
@@ -435,47 +395,9 @@ pub fn render(st: &AppState, out: &mut String) {
         "Operations that gave up waiting for a repository lock.",
         &m.lock_conflicts,
     );
-    family(
-        o,
-        "sparkles_backup_policy_runs_total",
-        "counter",
-        "Backup policy runs by result.",
-    );
-    for ((p, res), n) in &m.policy_runs {
-        let _ = writeln!(
-            o,
-            "sparkles_backup_policy_runs_total{{policy=\"{}\",result=\"{}\"}} {n}",
-            esc(p),
-            esc(res)
-        );
-    }
-    let gauge =
-        |o: &mut String, name: &str, help: &str, f: &dyn Fn(&PolicyGauges) -> Option<f64>| {
-            family(o, name, "gauge", help);
-            for (p, g) in &m.policies {
-                if let Some(v) = f(g) {
-                    let _ = writeln!(o, "{name}{{policy=\"{}\"}} {v}", esc(p));
-                }
-            }
-        };
-    gauge(
-        o,
-        "sparkles_backup_policy_last_success_timestamp_seconds",
-        "Time of the last successful run of a policy (Unix seconds).",
-        &|g| g.last_success,
-    );
-    gauge(
-        o,
-        "sparkles_backup_policy_next_run_timestamp_seconds",
-        "Time of the next scheduled run of a policy (Unix seconds).",
-        &|g| g.next_run,
-    );
-    gauge(
-        o,
-        "sparkles_backup_policy_consecutive_failures",
-        "Failed runs of a policy since its last success.",
-        &|g| Some(f64::from(g.consecutive_failures)),
-    );
+    drop(m);
+    // the policy series
+    super::policies::render_metrics(st, o);
 }
 
 #[cfg(test)]
@@ -528,15 +450,6 @@ mod tests {
             Duration::from_secs(1),
         );
         m.capture_lock(Duration::from_micros(700));
-        m.policy_run("nightly", "ok");
-        m.set_policy(
-            "nightly",
-            Some(PolicyGauges {
-                last_success: Some(5.0),
-                next_run: None,
-                consecutive_failures: 0,
-            }),
-        );
         let mut o = String::new();
         render(&st, &mut o);
         for want in [
@@ -551,9 +464,6 @@ mod tests {
             "sparkles_backup_capture_lock_seconds_bucket{le=\"0.001\"} 1",
             "sparkles_backup_operation_duration_seconds_bucket{operation=\"create\",le=\"1\"} 2",
             "sparkles_backup_operation_duration_seconds_count{operation=\"create\"} 3",
-            "sparkles_backup_policy_runs_total{policy=\"nightly\",result=\"ok\"} 1",
-            "sparkles_backup_policy_last_success_timestamp_seconds{policy=\"nightly\"} 5",
-            "sparkles_backup_policy_consecutive_failures{policy=\"nightly\"} 0",
         ] {
             assert!(o.contains(want), "{want} missing in\n{o}");
         }
@@ -561,6 +471,5 @@ mod tests {
             o.contains("sparkles_backup_last_success_timestamp_seconds{dataset=\"ds\",repository=\"local\"}"),
             "{o}"
         );
-        assert!(!o.contains("policy_next_run_timestamp_seconds{"), "{o}");
     }
 }

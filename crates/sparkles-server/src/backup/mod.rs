@@ -9,13 +9,12 @@
 //! `Handle::block_on` on the server's runtime ([`BackupState::handle`]).
 //!
 //! What the policy scheduler builds on:
-//! * [`BackupState::registry`]: the policies (`Registry::policies`,
-//!   `Registry::save_policies`) and the repositories;
-//! * [`BackupState::claim`] (one running backup per dataset and repository, busy
-//!   backups) and [`BackupState::busy_backups`] (what retention must keep);
-//! * [`ops::create`], [`ops::delete`] and [`ops::gc`], the work of the tasks, which
-//!   take a task slot ([`Slots`]) each;
-//! * [`BackupState::metrics`] for the policy series.
+//! * [`BackupState::registry`]: the policies (`Registry::policies`) and the
+//!   repositories;
+//! * [`ops::create_for_policy`] (the one-backup-per-dataset-and-repository rule and
+//!   a task slot per dataset), [`ops::delete`], [`ops::start_gc`] (the GC task of
+//!   `POST /$/repositories/{repo}/gc`) and [`BackupState::busy_backups`] (what
+//!   retention must keep).
 
 pub mod cli;
 pub mod config;
@@ -40,6 +39,7 @@ pub use sparkles_backup::{BackupError, Repository};
 use sparkles_backup::{Code, OpenEnv, RepoConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -73,6 +73,8 @@ pub struct BackupState {
     pub stores: Mutex<BTreeMap<String, Arc<dyn ObjectStore>>>,
     /// `holder.server` of this server's locks: a hash of the data directory
     server_id: String,
+    /// policy scheduler state, run history, and the running policy tasks
+    pub policies: policies::Policies,
 }
 
 impl BackupState {
@@ -95,6 +97,7 @@ impl BackupState {
         }
         let registry = registry::Registry::load(&dir, file.as_ref())?;
         let max_tasks = max_tasks.max(1);
+        let policies = policies::Policies::load(&dir, &registry)?;
         Ok(BackupState {
             verified: registry::VerifyHistory::load(dir.join(registry::VERIFY_FILE)),
             dir,
@@ -108,6 +111,7 @@ impl BackupState {
             metrics: metrics::BackupMetrics::default(),
             stores: Mutex::new(BTreeMap::new()),
             server_id: server_id(data_dir),
+            policies,
         })
     }
 
@@ -117,11 +121,16 @@ impl BackupState {
         self.handle.get().cloned()
     }
 
-    /// Run `f` to completion on the server's runtime, from a task thread.
+    /// Run `f` to completion on the server's runtime, from a task thread (before
+    /// [`start`], on a runtime of its own: tests and tools).
     pub fn block_on<F: std::future::Future>(&self, f: F) -> Result<F::Output, BackupError> {
-        let h = self
-            .handle()
-            .ok_or_else(|| BackupError::internal("the backup runtime is not started"))?;
+        let Some(h) = self.handle() else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| BackupError::internal(format!("a runtime for backups: {e}")))?;
+            return Ok(rt.block_on(f));
+        };
         Ok(match Handle::try_current() {
             // a runtime thread (a test calling a task body directly) may not block on
             // its own runtime
@@ -472,28 +481,45 @@ impl Slots {
         started: Option<Started>,
     ) -> Result<Slot<'_>, BackupError> {
         let mut started = started;
-        let mut used = self.used.lock();
-        if *used >= self.max {
+        let waited = self.take(&h.cancel_flag(), || {
             h.set_state(task_state::QUEUED);
             h.progress(0.0, "waiting for a free backup task slot");
             if let Some(s) = started.take() {
                 let _ = s.send(());
             }
-            while *used >= self.max {
-                if h.is_cancelled() {
-                    return Err(BackupError::cancelled());
-                }
-                self.freed.wait_for(&mut used, Duration::from_millis(100));
-            }
+        })?;
+        if waited {
             h.set_state(task_state::RUNNING);
             h.progress(0.0, "starting");
         }
-        *used += 1;
-        drop(used);
         if let Some(s) = started {
             let _ = s.send(());
         }
         Ok(Slot { slots: self })
+    }
+
+    /// Take a slot for work inside a task that keeps its own state (a policy run backs
+    /// up its datasets one after another, each in a slot); `cancel` stops the wait.
+    pub fn acquire_quietly(&self, cancel: &AtomicBool) -> Result<Slot<'_>, BackupError> {
+        self.take(cancel, || {})?;
+        Ok(Slot { slots: self })
+    }
+
+    /// Take a slot, calling `queued` first if all are held; whether it waited.
+    fn take(&self, cancel: &AtomicBool, queued: impl FnOnce()) -> Result<bool, BackupError> {
+        let mut used = self.used.lock();
+        let waited = *used >= self.max;
+        if waited {
+            queued();
+            while *used >= self.max {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(BackupError::cancelled());
+                }
+                self.freed.wait_for(&mut used, Duration::from_millis(100));
+            }
+        }
+        *used += 1;
+        Ok(waited)
     }
 }
 

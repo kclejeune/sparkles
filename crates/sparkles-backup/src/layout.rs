@@ -101,7 +101,7 @@ pub fn valid_repo_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
 }
 
-/// Backup names: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the F06 snapshot grammar).
+/// Backup names: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` (the named-snapshot grammar).
 pub fn valid_backup_name(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()

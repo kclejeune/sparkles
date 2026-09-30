@@ -1,6 +1,7 @@
 //! The registry of repositories and policies: API entries persisted in
-//! `<data>/backup/repositories.json` and `policies.json` (written with
-//! `state::write_file_atomic`), plus the read-only entries of `--backup-config`.
+//! `<data>/backup/repositories.json` (written with `state::write_file_atomic`) and
+//! `policies.json` (the policies module's), plus the read-only entries of
+//! `--backup-config`.
 //! Repositories and policies share one namespace per kind across both sources: an API
 //! registration with a config name fails with `409 repository-exists` (or
 //! `policy-exists`).
@@ -9,8 +10,7 @@
 //! feeds `BackupSummary.verified`.
 //!
 //! For the policy scheduler and routes: [`Registry::policies`] holds every policy
-//! (config and API), [`Registry::save_policies`] writes the API ones back,
-//! [`Registry::replace_config`] swaps in a reloaded config file, and
+//! (config and API), [`Registry::replace_config`] swaps in a reloaded config file, and
 //! [`Registry::policy_users`] names the policies that back up into a repository.
 
 use super::config::ConfigFile;
@@ -29,8 +29,6 @@ use uuid::Uuid;
 
 /// `repositories.json`
 pub const REPOSITORIES_FILE: &str = "repositories.json";
-/// `policies.json`
-pub const POLICIES_FILE: &str = "policies.json";
 /// `verify.json`
 pub const VERIFY_FILE: &str = "verify.json";
 
@@ -114,8 +112,8 @@ pub struct PolicyEntry {
 pub struct Registry {
     pub repos: RwLock<BTreeMap<String, RepoEntry>>,
     pub policies: RwLock<BTreeMap<String, PolicyEntry>>,
-    /// serializes the writes of `repositories.json` and `policies.json`, so an older
-    /// snapshot never overwrites a newer one
+    /// serializes the writes of `repositories.json`, so an older snapshot never
+    /// overwrites a newer one
     saving: Mutex<()>,
 }
 
@@ -133,13 +131,6 @@ struct RepositoriesFile {
     version: u32,
     #[serde(default)]
     repositories: Vec<StoredRepo>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PoliciesFile {
-    version: u32,
-    #[serde(default)]
-    policies: Vec<PolicyConfig>,
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
@@ -175,15 +166,13 @@ impl Registry {
             }
         }
         let mut policies = BTreeMap::new();
-        if let Some(f) = read_json::<PoliciesFile>(&dir.join(POLICIES_FILE))? {
-            for p in f.policies {
-                let e = PolicyEntry {
-                    config: p,
-                    source: ConfigSource::Api,
-                };
-                if policies.insert(e.config.name.clone(), e).is_some() {
-                    bail!("{}: a policy is listed twice", POLICIES_FILE);
-                }
+        for p in super::policies::read_api_policies(dir)? {
+            let e = PolicyEntry {
+                config: p,
+                source: ConfigSource::Api,
+            };
+            if policies.insert(e.config.name.clone(), e).is_some() {
+                bail!("policies.json: a policy is listed twice");
             }
         }
         let reg = Registry {
@@ -266,13 +255,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Write the API entries back (`repositories.json`, `policies.json`).
-    #[cfg_attr(not(test), allow(dead_code))] // the policy routes
-    pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
-        self.save_repositories(dir)?;
-        self.save_policies(dir)
-    }
-
     /// Write `repositories.json` (the API repositories, with their ids).
     pub fn save_repositories(&self, dir: &Path) -> anyhow::Result<()> {
         let _g = self.saving.lock();
@@ -290,23 +272,6 @@ impl Registry {
                 .collect(),
         };
         write_json(dir, REPOSITORIES_FILE, &file)
-    }
-
-    /// Write `policies.json` (the API policies).
-    #[cfg_attr(not(test), allow(dead_code))] // the policy routes
-    pub fn save_policies(&self, dir: &Path) -> anyhow::Result<()> {
-        let _g = self.saving.lock();
-        let file = PoliciesFile {
-            version: 1,
-            policies: self
-                .policies
-                .read()
-                .values()
-                .filter(|e| e.source == ConfigSource::Api)
-                .map(|e| e.config.clone())
-                .collect(),
-        };
-        write_json(dir, POLICIES_FILE, &file)
     }
 
     /// The opened repository `name`, if it is registered and was opened
@@ -463,14 +428,12 @@ mod tests {
         let id = Uuid::new_v4();
         e.id = Some(id);
         reg.repos.write().insert("local".into(), e);
-        reg.save(dir.path()).unwrap();
+        reg.save_repositories(dir.path()).unwrap();
         let text = std::fs::read_to_string(dir.path().join(REPOSITORIES_FILE)).unwrap();
         assert!(
             text.contains("\"local\"") && !text.contains("\"cfg\""),
             "{text}"
         );
-        let pol = std::fs::read_to_string(dir.path().join(POLICIES_FILE)).unwrap();
-        assert!(!pol.contains("nightly"), "{pol}");
 
         let again = Registry::load(dir.path(), Some(&c)).unwrap();
         let repos = again.repos.read();
@@ -489,7 +452,7 @@ mod tests {
             "local".into(),
             RepoEntry::new(fs_repo("local", "/srv/r"), ConfigSource::Api),
         );
-        reg.save(dir.path()).unwrap();
+        reg.save_repositories(dir.path()).unwrap();
         let c = config("version = 1\n[repositories.local]\ntype = \"fs\"\npath = \"/srv/x\"\n");
         let e = Registry::load(dir.path(), Some(&c)).err().unwrap();
         assert!(format!("{e:#}").contains("\"local\""), "{e:#}");

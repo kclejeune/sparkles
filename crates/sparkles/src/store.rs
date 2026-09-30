@@ -625,6 +625,8 @@ struct WriterState {
     head: CommitInfo,
     /// a WAL or generation write failed after a commit started: refuse further writes
     poisoned: bool,
+    /// the store is being dropped: a backup lease released later must not collect
+    closed: bool,
 }
 
 /// Commit metadata for a transaction that is committed by rebuilding the generation.
@@ -641,27 +643,32 @@ type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
-    current: ArcSwap<Snapshot>,
-    writer: Mutex<WriterState>,
+    // `current`, `writer`, `catalog`, `clock` and `history` are shared (weakly) with
+    // backup lease guards, whose drop collects history without a `&Store`
+    current: Arc<ArcSwap<Snapshot>>,
+    writer: Arc<Mutex<WriterState>>,
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
     /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
     _lock: Option<File>,
     dataset_id: uuid::Uuid,
-    catalog: Mutex<Catalog>,
+    catalog: Arc<Mutex<Catalog>>,
     /// test hook replacing the wall clock (milliseconds since the epoch)
-    clock: Mutex<Option<Clock>>,
+    clock: Arc<Mutex<Option<Clock>>>,
     /// full-text index, when enabled for this dataset
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
     /// pins, retention, generations and materialized past states (persistent stores)
-    history: Option<Mutex<crate::history::HistoryState>>,
+    history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// write guard checked before every commit (write-time validation)
     guard: parking_lot::RwLock<Option<Arc<dyn crate::guard::CommitGuard>>>,
     /// told the outcome of every guard decision (metrics)
     guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
+    /// test hooks by failpoint name
+    #[cfg(any(test, feature = "failpoints"))]
+    failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
 }
 
 pub(crate) const WAL_INSERT: u8 = 1;
@@ -721,7 +728,7 @@ impl Store {
         };
         Store {
             root: None,
-            current: ArcSwap::from_pointee(Snapshot {
+            current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 generation: gen_,
                 delta: Delta::default(),
                 version: 0,
@@ -733,25 +740,28 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
                 historical: false,
-            }),
-            writer: Mutex::new(WriterState {
+            })),
+            writer: Arc::new(Mutex::new(WriterState {
                 wal: None,
                 next_bnode: 0,
                 head: root,
                 poisoned: false,
-            }),
+                closed: false,
+            })),
             cache,
             results,
             prefixes: Mutex::new(BTreeMap::new()),
             _lock: None,
             dataset_id,
-            catalog: Mutex::new(Catalog::memory(root, opts.memory_commit_ring)),
-            clock: Mutex::new(None),
+            catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
+            clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             history: None,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
+            #[cfg(any(test, feature = "failpoints"))]
+            failpoints: Default::default(),
             opts,
         }
     }
@@ -920,7 +930,7 @@ impl Store {
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
         let store = Store {
             root: Some(root.to_path_buf()),
-            current: ArcSwap::from_pointee(Snapshot {
+            current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 generation: gen_,
                 delta,
                 version,
@@ -932,25 +942,28 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
                 historical: false,
-            }),
-            writer: Mutex::new(WriterState {
+            })),
+            writer: Arc::new(Mutex::new(WriterState {
                 wal: Some(BufWriter::new(wal)),
                 next_bnode,
                 head,
                 poisoned: false,
-            }),
+                closed: false,
+            })),
             cache,
             results,
             prefixes: Mutex::new(prefixes),
             _lock: Some(lock),
             dataset_id,
-            catalog: Mutex::new(catalog),
-            clock: Mutex::new(None),
+            catalog: Arc::new(Mutex::new(catalog)),
+            clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
-            history: Some(Mutex::new(history)),
+            history: Some(Arc::new(Mutex::new(history))),
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
+            #[cfg(any(test, feature = "failpoints"))]
+            failpoints: Default::default(),
             opts,
         };
         store.collect_history(gen_no, head.seq);
@@ -980,30 +993,31 @@ impl Store {
     }
 
     /// Collect unneeded generations; call with the writer lock held (or at open).
+    /// Lock order: writer, then history, then catalog.
     fn collect_locked(&self, h: &mut crate::history::HistoryState, current: u32, head: u64) {
         let Some(root) = &self.root else { return };
-        let now = self.now_ms();
-        let needed = {
-            let cat = self.catalog.lock();
-            let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
-            h.needed(current, head, now, &ts, self.opts.history_max_generations)
-        };
-        let doomed: Vec<(u32, PathBuf)> = h
-            .gens
-            .iter()
-            .filter(|(no, _)| **no != current && !needed.contains_key(no))
-            .map(|(no, g)| (*no, g.dir.clone()))
-            .collect();
-        for (no, dir) in doomed {
-            h.open.retain(|(n, _)| *n != no);
-            h.cache.retain(|(k, _, _)| k.0 != no);
-            match crate::history::delete_generation(root, &dir) {
-                Ok(()) => {
-                    h.gens.remove(&no);
-                }
-                Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
-            }
-        }
+        collect_generations(
+            root,
+            self.now_ms(),
+            &self.catalog.lock(),
+            h,
+            current,
+            head,
+            self.opts.history_max_generations,
+        );
+    }
+
+    /// What a backup lease guard needs to collect history after it drops the lease.
+    pub(crate) fn collector(&self) -> Option<Collector> {
+        Some(Collector {
+            root: self.root.clone()?,
+            max_gens: self.opts.history_max_generations,
+            current: Arc::downgrade(&self.current),
+            writer: Arc::downgrade(&self.writer),
+            catalog: Arc::downgrade(&self.catalog),
+            clock: Arc::downgrade(&self.clock),
+            history: Arc::downgrade(self.history.as_ref()?),
+        })
     }
 
     fn history_gone(
@@ -1430,7 +1444,9 @@ impl Store {
                 bytes: g.bytes,
                 current: *no == current,
                 held_by: if *no == current {
-                    vec![Hold::Head]
+                    std::iter::once(Hold::Head)
+                        .chain(h.lease_holds(*no))
+                        .collect()
                 } else {
                     needed.get(no).cloned().unwrap_or_default()
                 },
@@ -2396,10 +2412,17 @@ impl Store {
         })
     }
 
-    /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to).
+    /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to) (or restored
+    /// from a backup under a new identity).
     pub fn forked_from(&self) -> Option<ForkedFrom> {
         let root = self.root.as_ref()?;
         commit::read_forked_from(root).ok().flatten()
+    }
+
+    /// `restoredFrom` of a database restored from a backup.
+    pub fn restored_from(&self) -> Option<commit::RestoredFrom> {
+        let root = self.root.as_ref()?;
+        commit::read_restored_from(root).ok().flatten()
     }
 
     /// Write all quads as N-Quads to `w`.
@@ -3056,6 +3079,106 @@ fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
 /// Estimated memory of a replayed delta (seven ordered sets of 32-byte keys).
 fn delta_bytes(d: &Delta) -> u64 {
     (d.inserts() + d.deletes()) as u64 * 7 * 64
+}
+
+/// Remove the generations history no longer needs (`current` is the current generation
+/// and `head` the latest commit); call with the writer lock held.
+fn collect_generations(
+    root: &Path,
+    now_ms: i64,
+    cat: &Catalog,
+    h: &mut crate::history::HistoryState,
+    current: u32,
+    head: u64,
+    max_gens: usize,
+) {
+    let needed = {
+        let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
+        h.needed(current, head, now_ms, &ts, max_gens)
+    };
+    let doomed: Vec<(u32, PathBuf)> = h
+        .gens
+        .iter()
+        .filter(|(no, _)| **no != current && !needed.contains_key(no))
+        .map(|(no, g)| (*no, g.dir.clone()))
+        .collect();
+    for (no, dir) in doomed {
+        h.open.retain(|(n, _)| *n != no);
+        h.cache.retain(|(k, _, _)| k.0 != no);
+        match crate::history::delete_generation(root, &dir) {
+            Ok(()) => {
+                h.gens.remove(&no);
+            }
+            Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
+        }
+    }
+}
+
+/// A persistent store's history collection, held weakly (by backup lease guards): it
+/// does nothing once the store is closed.
+pub(crate) struct Collector {
+    root: PathBuf,
+    max_gens: usize,
+    current: std::sync::Weak<ArcSwap<Snapshot>>,
+    writer: std::sync::Weak<Mutex<WriterState>>,
+    catalog: std::sync::Weak<Mutex<Catalog>>,
+    clock: std::sync::Weak<Mutex<Option<Clock>>>,
+    history: std::sync::Weak<Mutex<crate::history::HistoryState>>,
+}
+
+impl Collector {
+    /// Remove lease `id`, then collect if the writer is free right now.
+    pub(crate) fn release(&self, lease: u64) {
+        let Some(history) = self.history.upgrade() else {
+            return;
+        };
+        history.lock().leases.remove(&lease);
+        self.try_collect();
+    }
+
+    /// Collect unneeded generations if the store is open and its writer free (the next
+    /// collection point does it otherwise).
+    pub(crate) fn try_collect(&self) {
+        let (Some(writer), Some(current), Some(catalog), Some(clock), Some(history)) = (
+            self.writer.upgrade(),
+            self.current.upgrade(),
+            self.catalog.upgrade(),
+            self.clock.upgrade(),
+            self.history.upgrade(),
+        ) else {
+            return;
+        };
+        // the store's drop marks the writer closed under this lock, so the directory is
+        // still this store's (and locked) while the collection runs
+        let Some(w) = writer.try_lock() else { return };
+        if w.closed {
+            return;
+        }
+        let now = match &*clock.lock() {
+            Some(c) => c(),
+            None => commit::now_ms(),
+        };
+        let cur = commit::generation_number(&current.load().generation.name);
+        // lock order: writer, history, catalog
+        let mut h = history.lock();
+        collect_generations(
+            &self.root,
+            now,
+            &catalog.lock(),
+            &mut h,
+            cur,
+            w.head.seq,
+            self.max_gens,
+        );
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // a lease guard outliving the store must not collect in a directory that another
+        // process (or a restore's swap) may own next
+        self.writer.lock().closed = true;
+    }
 }
 
 /// The history state of a store being opened: pins and retention from

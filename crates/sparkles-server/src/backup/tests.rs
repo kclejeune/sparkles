@@ -792,7 +792,6 @@ async fn metrics_include_the_backup_families() {
         "# TYPE sparkles_backup_operations_total counter",
         "# TYPE sparkles_backup_last_success_timestamp_seconds gauge",
         "sparkles_backup_capture_lock_seconds_count 1",
-        "# TYPE sparkles_backup_policy_runs_total counter",
     ] {
         assert!(text.contains(f), "{f} missing");
     }

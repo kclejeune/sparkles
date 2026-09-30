@@ -3,11 +3,11 @@
 //! in the request. Claims ([`super::BackupState::claim`]) are the callers'.
 
 use super::metrics::{Operation, Outcome};
-use super::{BackupState, Started, swap};
-use crate::state::{AppState, Dataset, Reservation, TaskHandle};
+use super::{BackupState, ClaimSpec, Started, swap};
+use crate::state::{AppState, Dataset, DbType, Reservation, Task, TaskHandle};
 use serde_json::{Value as J, json};
 use sparkles_backup::{
-    BackupError, BackupSummary, Code, CreateOptions, Ctl, GcOptions, GcReport, LastGc,
+    BackupError, BackupSummary, Code, CreateOptions, Ctl, GcOptions, GcReport, LastGc, RepoConfig,
     RestoreOptions, RestoreRequest, Source, Verified, VerifyLevel, VerifyOptions, VerifyReport,
 };
 use std::sync::Arc;
@@ -92,6 +92,17 @@ fn reasoning_file(ds: &Dataset, seq: u64) -> Option<(String, Vec<u8>)> {
     ))
 }
 
+/// `409 repository-read-only` for a write to a read-only repository.
+pub fn writable(cfg: &RepoConfig) -> Result<(), BackupError> {
+    if cfg.readonly {
+        return Err(BackupError::new(
+            Code::RepositoryReadOnly,
+            format!("repository \u{201c}{}\u{201d} is read-only", cfg.name),
+        ));
+    }
+    Ok(())
+}
+
 /// Back up dataset `ds` into repository `repo` as `a.name`, in task `h` (which gets
 /// the progress; its cancel flag cancels). Waits for a task slot first.
 pub fn create(
@@ -104,11 +115,67 @@ pub fn create(
 ) -> Result<BackupSummary, BackupError> {
     let b = backup_state(st)?;
     let _slot = b.slots.acquire(h, started)?;
+    create_now(st, &b, ds, repo, a, ctl(h, 0.0, 1.0))
+}
+
+/// Back up dataset `dataset` into repository `repo` for a policy run, inside its
+/// `backup-policy` task: like any backup it may not run next to another backup of the
+/// same dataset into the same repository (`409 backup-in-progress`) and waits for a
+/// task slot (`o.ctl` cancels the wait).
+pub fn create_for_policy(
+    st: &Arc<AppState>,
+    dataset: &str,
+    repo: &str,
+    o: CreateOptions,
+) -> Result<BackupSummary, BackupError> {
+    let b = backup_state(st)?;
+    let ds = st.get(dataset).ok_or_else(|| {
+        BackupError::new(Code::InvalidRequest, format!("no such dataset: /{dataset}"))
+    })?;
+    if ds.kind == DbType::Mem {
+        return Err(BackupError::new(
+            Code::BackupUnsupported,
+            "in-memory datasets cannot be backed up yet",
+        ));
+    }
+    writable(&b.registry.config(repo)?)?;
+    // the claim names the policy's task
+    let task = o
+        .policy
+        .as_ref()
+        .and_then(|(p, _)| b.policies.running_task(p))
+        .unwrap_or_else(|| "policy".into());
+    let _claim = b.claim(
+        &task,
+        ClaimSpec {
+            create: Some((ds.name.clone(), repo.to_string())),
+            repo: Some(repo.to_string()),
+            ..Default::default()
+        },
+    )?;
+    let _slot = b.slots.acquire_quietly(&o.ctl.cancel)?;
+    let a = CreateArgs {
+        name: o.name,
+        note: o.note,
+        policy: o.policy,
+    };
+    create_now(st, &b, &ds, repo, a, o.ctl)
+}
+
+/// Back up now (the slot is held), counted and logged.
+fn create_now(
+    st: &AppState,
+    b: &Arc<BackupState>,
+    ds: &Arc<Dataset>,
+    repo: &str,
+    a: CreateArgs,
+    ctl: Ctl,
+) -> Result<BackupSummary, BackupError> {
     let t0 = Instant::now();
     let what = format!("backup {} of /{} into {repo}", a.name, ds.name);
     tracing::info!(target: "sparkles::backup", "{what}: started");
-    let r = create_in(&b, ds, repo, a, h);
-    count(st, &b, repo, Operation::Create, &r, t0);
+    let r = create_in(b, ds, repo, a, ctl);
+    count(st, b, repo, Operation::Create, &r, t0);
     log_end(&what, &r, t0);
     b.refresh_later(repo);
     r.map(|(s, _)| s)
@@ -119,10 +186,10 @@ fn create_in(
     ds: &Arc<Dataset>,
     repo_name: &str,
     a: CreateArgs,
-    h: &TaskHandle,
+    ctl: Ctl,
 ) -> Result<(BackupSummary, Outcome), BackupError> {
     let repo = b.repo(repo_name)?;
-    h.progress(0.02, &format!("capturing /{}", ds.name));
+    ctl.report(0.02, &format!("capturing /{}", ds.name));
     let cap = {
         let span = tracing::info_span!(
             "backup.capture",
@@ -149,7 +216,7 @@ fn create_in(
         policy: a.policy,
         dataset_name: ds.name.clone(),
         extra,
-        ctl: ctl(h, 0.0, 1.0),
+        ctl,
     };
     let s = b.block_on(repo.create(Source::from(cap), &o))??;
     // the manifest (cached by the create) has the blob counts
@@ -438,6 +505,57 @@ pub fn gc(
         b.refresh_later(repo);
     }
     r.map(|(g, _)| g)
+}
+
+/// Start a `backup-gc` task on repository `repo` (server-scoped, cancellable; the
+/// repository counts as in use while it runs): `409 repository-read-only`. The
+/// receiver is told once the task runs or queues. For `POST /$/repositories/{repo}/gc`
+/// and `gcAfterRetention`.
+pub fn start_gc(
+    st: &Arc<AppState>,
+    repo: &str,
+    dry_run: bool,
+    grace: Duration,
+    principal: String,
+) -> Result<(Task, tokio::sync::oneshot::Receiver<()>), BackupError> {
+    let b = backup_state(st)?;
+    writable(&b.registry.config(repo)?)?;
+    let id = st.next_task_id();
+    let claim = b.claim(
+        &id,
+        ClaimSpec {
+            repo: Some(repo.to_string()),
+            ..Default::default()
+        },
+    )?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let st2 = st.clone();
+    let name = repo.to_string();
+    let task = st.start_task_opts(id, "backup-gc", "", Some(repo), true, move |h| {
+        let _claim = claim;
+        let r = gc(&st2, &name, dry_run, grace, &principal, h, Some(tx)).map_err(task_error)?;
+        h.set_detail(serde_json::to_value(&r)?);
+        Ok(if dry_run {
+            format!(
+                "dry run: {} blobs ({} MB) can be deleted",
+                r.candidates,
+                mb(r.deleted_bytes)
+            )
+        } else {
+            format!("deleted {} blobs ({} MB)", r.deleted, mb(r.deleted_bytes))
+        })
+    });
+    Ok((task, rx))
+}
+
+/// A task's error for the task list (`code: message`; a cancellation stays one).
+pub fn task_error(e: BackupError) -> anyhow::Error {
+    let code = e.code();
+    anyhow::Error::new(e).context(code.as_str())
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / 1e6)
 }
 
 // ----------------------------------------------------------------- delete ------
