@@ -294,7 +294,8 @@ The copy has every quad of every graph (blank-node graph names and triple terms
 included), the same blank-node ids (`_:b<hex>` labels), the prefixes, and a freshly
 compacted index. It is a new lineage: a new dataset id and a root commit `0`, with the
 source's id and the copied commit kept as `forkedFrom`. Commit history, the WAL and
-caches are not copied. With `inferences=copy`, inferences that were fresh at the copied
+caches are not copied; full-text search stays enabled with the same configuration, and
+the clone builds its own index when it is first opened. With `inferences=copy`, inferences that were fresh at the copied
 commit are fresh in the clone; stale ones stay stale (`staleReason: "inherited from
 source at clone time"`), unknown ones stay unknown. Source updates continue during the
 clone and are not included.

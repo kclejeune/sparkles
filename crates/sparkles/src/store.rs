@@ -1587,6 +1587,25 @@ impl Store {
                 &serde_json::to_vec_pretty(&prefixes).unwrap(),
             )?;
         }
+        // full-text search stays on: the clone rebuilds its index when opened
+        #[cfg(feature = "text")]
+        let text_cfg = self
+            .text
+            .load()
+            .as_ref()
+            .map(|ti| serde_json::to_vec_pretty(ti.config()).unwrap());
+        #[cfg(not(feature = "text"))]
+        let text_cfg = match &self.root {
+            Some(root) => match std::fs::read(root.join("text.json")) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            },
+            None => None,
+        };
+        if let Some(cfg) = text_cfg {
+            write_atomic(&dir.join("text.json"), &cfg)?;
+        }
         // CURRENT last: the commit point of the new database
         write_atomic(&dir.join("CURRENT"), name.as_bytes())?;
         sync_dir(dir)?;

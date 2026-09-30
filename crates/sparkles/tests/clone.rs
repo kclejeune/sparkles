@@ -189,3 +189,33 @@ fn the_destination_must_be_absent_or_empty() {
     assert!(r.is_err());
     assert!(!gone.exists());
 }
+
+#[cfg(feature = "text")]
+#[test]
+fn clones_keep_full_text_search() {
+    use sparkles::text::{PredicateSet, TextConfig};
+    let tmp = tempfile::tempdir().unwrap();
+    let src = Store::open(&tmp.path().join("src"), StoreOptions::default()).unwrap();
+    src.load(&[Source::from_bytes(
+        b"<urn:a> <urn:label> \"quick brown fox\" .".to_vec(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let cfg = TextConfig {
+        predicates: PredicateSet::Only(vec!["urn:label".into()]),
+        ..TextConfig::default()
+    };
+    src.enable_text(cfg).unwrap();
+    let dst = tmp.path().join("dst");
+    src.clone_to(&dst, &CloneOptions::default()).unwrap();
+    let c = Store::open(&dst, StoreOptions::default()).unwrap();
+    assert!(c.text_enabled());
+    let q = "SELECT ?s { ?s <http://jena.apache.org/text#query> \"fox\" }";
+    assert_eq!(select(&c, q), ["<urn:a>"]);
+    let status = c.text_status().unwrap();
+    assert_eq!(
+        serde_json::to_value(status).unwrap()["config"]["predicates"],
+        serde_json::to_value(src.text_status().unwrap()).unwrap()["config"]["predicates"]
+    );
+}
