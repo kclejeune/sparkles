@@ -947,6 +947,8 @@ ex:PersonShape a sh:NodeShape ;
               refreshKey={taskKick}
               ondone={(t) => {
                 if (t.state === 'failed') toasts.push('error', `${t.kind} failed`, t.message);
+                else if (t.state === 'cancelled')
+                  toasts.push('info', `${t.kind} cancelled`, t.message);
                 else if (t.kind === 'clone' && t.target) {
                   toasts.push('success', `Cloned into /${t.target}`, t.message);
                   cloned = t.target;
