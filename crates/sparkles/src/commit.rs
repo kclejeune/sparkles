@@ -276,6 +276,56 @@ pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     Some(((days * 86400 + h * 3600 + mi * 60 + sec) * 1000) + ms)
 }
 
+/// Parse an RFC 3339 date-time with any offset (`Z`, `+02:00`, `-05:30`), to
+/// milliseconds; digits beyond milliseconds are truncated. A space where the offset's
+/// sign belongs is read as `+` (a `+` in a query string decodes to a space).
+pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || !matches!(b[10], b'T' | b't') || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let t = s.get(r)?;
+        t.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| t.parse().ok())?
+    };
+    let (_year, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if b[13] != b':' || b[16] != b':' || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    if h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut i = 19;
+    let mut ms = 0;
+    if b[i] == b'.' {
+        let start = i + 1;
+        i = start;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let frac = &s[start..i.min(start + 3)];
+        ms = frac.parse::<i64>().ok()? * 10i64.pow(3 - frac.len() as u32);
+    }
+    let offset_min = match b.get(i)? {
+        b'Z' | b'z' if i + 1 == b.len() => 0,
+        sign @ (b'+' | b'-' | b' ') if i + 6 == b.len() && b[i + 3] == b':' => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            let m = oh * 60 + om;
+            if *sign == b'-' { -m } else { m }
+        }
+        _ => return None,
+    };
+    let z = format!("{}Z", &s[..19]);
+    let base = parse_rfc3339_ms(&z)?;
+    Some(base + ms - offset_min * 60_000)
+}
+
 // ------------------------------------------------------------- dataset.json ------
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -716,6 +766,26 @@ impl Catalog {
     pub fn get(&self, seq: u64) -> Option<CommitInfo> {
         let i = seq.checked_sub(self.first)?;
         self.records.get(i as usize).copied()
+    }
+
+    /// The last retained commit at or before `ms` (timestamps never decrease).
+    pub fn at_time(&self, ms: i64) -> Option<CommitInfo> {
+        let i = self.records.partition_point(|c| c.timestamp_ms <= ms);
+        i.checked_sub(1).and_then(|i| self.records.get(i).copied())
+    }
+
+    /// The first retained record.
+    pub fn first(&self) -> Option<CommitInfo> {
+        self.records.front().copied()
+    }
+
+    /// The last commit made in generation `generation`, if the catalog has one.
+    pub fn last_in_generation(&self, generation: u32) -> Option<u64> {
+        self.records
+            .iter()
+            .rev()
+            .find(|c| c.generation == generation)
+            .map(|c| c.seq)
     }
 
     pub fn page(&self, range: CommitRange, limit: usize) -> CommitPage {

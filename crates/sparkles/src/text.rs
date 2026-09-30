@@ -896,6 +896,12 @@ mod imp {
     /// Evaluate a `text:query` call against the snapshot's text view.
     pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
         let snap = &ctx.snap;
+        if snap.historical {
+            return Err(Error::HistoryUnsupported(format!(
+                "full-text search is only available at the head; this query reads commit {}",
+                snap.commit
+            )));
+        }
         let Some(view) = &snap.text else {
             return Err(Error::invalid(
                 "dataset has no full-text index; enable it with `sparkles text-index` or --text",

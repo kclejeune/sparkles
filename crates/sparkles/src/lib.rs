@@ -2,6 +2,7 @@ pub mod builder;
 pub mod commit;
 pub mod dataset;
 pub mod error;
+pub mod history;
 pub mod id;
 pub mod index;
 pub mod io;

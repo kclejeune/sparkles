@@ -465,7 +465,7 @@ pub fn pad(prefix: &[u64], fill: u64) -> Key {
     k
 }
 
-fn next_uid() -> u64 {
+pub(crate) fn next_uid() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UID: AtomicU64 = AtomicU64::new(1);
     UID.fetch_add(1, Ordering::Relaxed)
