@@ -394,6 +394,18 @@ impl ConfigFile {
         self.policies.iter().map(|(n, p)| p.to_config(n)).collect()
     }
 
+    /// `cfg` with a named credential source replaced by its `[credentials.<name>]`
+    /// definition (what an offline command opens a config-file repository with).
+    pub fn resolve_credentials(&self, mut cfg: RepoConfig) -> Result<RepoConfig> {
+        if let Credentials::Named { name } = &cfg.credentials {
+            let Some(c) = self.credentials.get(name) else {
+                bail!("repository {:?}: no [credentials.{name}]", cfg.name);
+            };
+            cfg.credentials = c.clone().into();
+        }
+        Ok(cfg)
+    }
+
     /// The credential sources in API form.
     pub fn credential_sources(&self) -> BTreeMap<String, Credentials> {
         self.credentials
@@ -504,6 +516,9 @@ gc_after_retention = true
             Credentials::Env { .. }
         ));
         assert_eq!(f.api.fs_roots, ["/srv/backups"]);
+        let resolved = f.resolve_credentials(minio.clone()).unwrap();
+        assert!(matches!(resolved.credentials, Credentials::Env { .. }));
+        assert_eq!(f.resolve_credentials(local.clone()).unwrap(), *local);
         let p = &f.policy_configs()[0];
         assert_eq!(p.name, "nightly");
         assert_eq!(p.retention.min_count, 7);
