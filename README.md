@@ -313,6 +313,98 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
+### mise tasks
+
+[`mise.toml`](mise.toml) pins Node, pnpm and hyperfine; Rust comes from `rust-toolchain.toml`.
+It also defines the everyday tasks (`mise tasks` lists them all):
+
+```sh
+mise run build        # UI + release binary
+mise run serve        # build, then serve ./data on :3030
+mise run fmt          # cargo fmt + Prettier     (fmt:check for CI)
+mise run lint         # clippy -D warnings + svelte-check
+mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
+mise run ci           # fmt:check + lint + test
+mise run gen-data 1000000 target/bench-data/10m.nt
+mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
+mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
+```
+
+### Nix
+
+The flake (flake-parts + rust-overlay, using the toolchain from `rust-toolchain.toml`)
+provides:
+
+* **Packages:**
+  * `sparkles` (default): the binary with the UI embedded.
+  * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
+  * `sparkles-ui`: the static UI build.
+* **Other outputs:**
+  * `overlays.default`;
+  * a dev shell;
+  * `checks`, including a NixOS VM test of the module behind nginx;
+  * `nixosModules.default`.
+
+```sh
+nix run github:kclejeune/sparkles -- serve --data ./data
+nix build .#sparkles-cli
+nix flake check          # packages + NixOS VM test (Linux, needs KVM)
+```
+
+On NixOS, `services.sparkles` runs the server as a hardened systemd service. Its state
+lives in `/var/lib/sparkles` (the dataset registry, databases created from the UI or
+admin API, and backups). It can put an nginx virtual host in front of the server, which
+you then extend through the usual `services.nginx.virtualHosts.<name>` options:
+
+```nix
+{
+  inputs.sparkles.url = "github:kclejeune/sparkles";
+  outputs = { nixpkgs, sparkles, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      modules = [
+        sparkles.nixosModules.default
+        {
+          services.sparkles = {
+            enable = true;
+            datasets = {
+              wiki = { };                       # persistent: /var/lib/sparkles/declarative/wiki
+              scratch.type = "mem";
+              archive.path = "/srv/rdf/archive"; # an existing database directory
+            };
+            queryTimeout = 120;
+            resultCacheMb = 1024;
+            # readOnly = true; allowService = false; unionDefaultGraph = true;
+            nginx = {
+              enable = true;
+              virtualHost = "sparql.example.org";
+            };
+          };
+          # standard nginx semantics: TLS, auth, extra locations …
+          services.nginx.virtualHosts."sparql.example.org" = {
+            enableACME = true;
+            forceSSL = true;
+            basicAuthFile = "/run/secrets/sparkles-htpasswd"; # the server has no auth of its own
+          };
+          security.acme.acceptTerms = true;
+          security.acme.defaults.email = "admin@example.org";
+        }
+      ];
+    };
+  };
+}
+```
+
+The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
+`openFirewall`). The nginx location sets:
+
+* `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
+* proxy timeouts to `queryTimeout + 30` seconds;
+* request/response buffering off, so large uploads and results stream through.
+
+The CLI goes on the system path unless `installCli = false`. The server holds a lock on
+its databases, so for offline work (`sparkles load`, `compact`) stop the service first,
+or use the HTTP API.
+
 ## Testing
 
 ```sh
