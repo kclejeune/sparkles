@@ -858,22 +858,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
 
 [[package]]
-name = "oxiri"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b6bd0ef560f078e41ce2ebf370cce217e7fb2c3695ffa87541151c9de94e83a"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "oxjsonld"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a3e89e005662e60327027f45ec7cefd0472404e01831b5d83a3ac522cfabe0"
 dependencies = [
  "json-event-parser",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "ryu-js",
  "thiserror",
@@ -886,7 +877,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4be15186205eb60ddbdc2fb47cb25df472c7f399bbe119b68c0972b6b6dd46ea"
 dependencies = [
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "rand 0.9.5",
  "thiserror",
 ]
@@ -911,7 +902,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71853d12051879f3e424c6864e978f5f5cbecd8e86a9817adbccaefccac9d61d"
 dependencies = [
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "quick-xml",
  "thiserror",
@@ -934,7 +925,7 @@ checksum = "b1d0fe19fa62a6a102f85b052bbd86e3cdc3360cd6a338d01bab1a6743bf1d8e"
 dependencies = [
  "memchr",
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "thiserror",
 ]
@@ -1280,6 +1271,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -1416,6 +1409,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "ryu-js"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,6 +1526,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1618,7 +1629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef3c186ffb9bf2dde7c5edd5528583f309fcb819b5773cf0e313194a990304f"
 dependencies = [
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "peg",
  "rand 0.9.5",
@@ -1635,7 +1646,7 @@ dependencies = [
  "lz4_flex",
  "md-5",
  "memmap2",
- "oxiri 0.3.1",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",

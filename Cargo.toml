@@ -14,7 +14,7 @@ sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 oxrdf = "0.3"
 oxrdfio = "0.2"
 oxttl = "0.2"
-oxiri = "0.3"
+oxiri = "0.2"
 spargebra = "0.4"
 sparesults = "0.3"
 oxsdatatypes = "0.2"
@@ -44,7 +44,7 @@ axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.7", features = ["cors", "compression-full", "trace"] }
 clap = { version = "4", features = ["derive"] }
 rust-embed = "8"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "form"] }
 flate2 = "1"
 chrono = "0.4"
 

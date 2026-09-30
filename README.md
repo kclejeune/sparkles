@@ -62,13 +62,13 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 | Feature | Status |
 |---|---|
-| Value space: numeric promotion, comparisons, EBV, ORDER BY total order | 🚧 |
-| SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY / aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET | 🚧 |
-| Property paths | 🚧 |
-| Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | 🚧 |
-| SPARQL 1.1 Update | ⏳ |
-| SERVICE (federated query) | ⏳ |
-| Results: JSON, XML, CSV, TSV; RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ⏳ |
+| Value space: numeric promotion, comparisons, EBV, ORDER BY total order | ✅ |
+| SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY / aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET, EXISTS | ✅ |
+| Property paths (index-backed BFS for `p*`/`p+`/`p?`, bound-side traversal from join input) | ✅ |
+| Function library (SPARQL 1.1 built-ins, XSD casts, selected `fn:` / `afn:` / `math:`) | ✅ |
+| SPARQL 1.1 Update (INSERT/DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE; ADD/COPY/MOVE) | ✅ |
+| SERVICE (federated query, SILENT) | ✅ |
+| Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C SPARQL test suite runner (manifests from the Jena checkout) | ⏳ |
 
 ### Server (Fuseki equivalent), reasoning, UI
@@ -77,7 +77,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks) | ⏳ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax | ⏳ |
-| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser | 🚧 |
+| SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser (built against a mock; server integration pending) | 🚧 |
 
 ## Notable optimizations adopted from QLever
 
@@ -99,6 +99,14 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
   over interesting sort orders with a greedy fallback. Merge joins run on sorted
   scans.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
+* **Planner details.** Filters are placed as soon as their variables are bound. Scan
+  sizes are exact from block metadata (at most two block decodes). Join estimates use
+  per-predicate distinct subject/object statistics with QLever's 0.7 correction factor.
+  Merge joins use galloping for skewed inputs. `COUNT(*)` over a single pattern is
+  answered from index metadata. Transitive paths traverse from the bound side (index
+  lookups per frontier node) instead of materializing the closure.
+* **Executed-plan feedback.** Every query returns a runtime-information tree
+  (estimated vs. actual rows, time per operator), like `qlever-json`. The UI renders it.
 
 ## Divergences from Jena / QLever (decisions)
 
@@ -112,6 +120,10 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Blank nodes are stored ids and serialize as `_:b<hex>` | Labels round-trip through the protocol, like Jena's `<_:…>` handling. |
 | LZ4 instead of zstd for blocks; front coding instead of FSST for the vocabulary | Pure-Rust dependencies and very fast decoding. zstd/FSST remain a possible upgrade for compression ratio. |
 | RDF 1.2 triple terms not yet supported | They are not supported in the id space yet. `spargebra`/`oxrdf` support them behind the `rdf-12`/`sparql-12` features, and enabling those is planned. |
+| Canonical decimal output follows XSD 1.1 (`"4"^^xsd:decimal`), whereas Jena writes `"4.0"` | Comes from `oxsdatatypes`; the values are equal, so value-based result comparison is unaffected. |
+| SPARQL parsing and algebra via `spargebra` instead of a port of ARQ's JavaCC grammar | The algebra matches SPARQL 1.1 §18. ARQ syntax extensions (LET, `apf:` property functions, custom aggregates) are not supported. |
+| Filter placement and equality substitution happen in the planner rather than as ARQ-style algebra transforms | Same effect as `TransformFilterPlacement` / `TransformFilterEquality`, with one less pass over the algebra. |
+| `REDUCED` is a no-op | Allowed by the spec. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Building
