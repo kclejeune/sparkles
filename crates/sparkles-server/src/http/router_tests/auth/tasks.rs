@@ -40,6 +40,58 @@ async fn cancel_needs_admin_on_the_task_dataset() {
     assert_eq!(wait_done(&s.state, &id).await.state, "cancelled");
 }
 
+/// The route table's needs for the backup routes (their handlers add their own checks).
+#[cfg(feature = "backup")]
+#[tokio::test]
+async fn backup_routes_are_authorized() {
+    let s = auth_server();
+    let status = |m: &'static str, uri: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(&app, m, uri, &[("authorization", &b(user))], "")
+                .await
+                .status
+        }
+    };
+    let passed = StatusCode::NOT_IMPLEMENTED;
+    // the repository listing is open (and filtered by its handler)
+    assert_eq!(status("GET", "/$/repositories", "bob").await, passed);
+    for (m, uri) in [
+        ("POST", "/$/repositories"),
+        ("GET", "/$/repositories/local"),
+        ("GET", "/$/repositories/local/backups"),
+        ("POST", "/$/backup-policies/preview"),
+        ("GET", "/$/backup-policies"),
+    ] {
+        assert_eq!(
+            status(m, uri, "carol").await,
+            StatusCode::FORBIDDEN,
+            "{m} {uri}"
+        );
+        assert_eq!(status(m, uri, "alice").await, passed, "{m} {uri}");
+    }
+    // per-dataset routes: read to list and show, admin for the rest
+    assert_eq!(status("GET", "/$/backups/wiki", "bob").await, passed);
+    assert_eq!(
+        status("POST", "/$/backups/wiki", "bob").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(status("POST", "/$/backups/wiki", "carol").await, passed);
+    assert_eq!(
+        status("POST", "/$/backups/wiki/local/b1/restore", "bob").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status("DELETE", "/$/backups/wiki/local/b1", "carol").await,
+        passed
+    );
+    // a dataset carol cannot see stays hidden
+    assert_eq!(
+        status("GET", "/$/backups/secret/local/b1", "carol").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn server_scoped_tasks_are_for_server_admins() {
     let s = auth_server();

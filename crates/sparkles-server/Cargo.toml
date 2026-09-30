@@ -63,6 +63,8 @@ reqwest = { workspace = true, optional = true }
 rpassword = { version = "7", optional = true }
 # MCP server (`sparkles mcp`): the official Rust SDK, without its tool macros
 rmcp = { version = "~3.5", default-features = false, features = ["server", "transport-io"], optional = true }
+# backup repositories (feature `backup`)
+sparkles-backup = { workspace = true, optional = true }
 
 # malloc_trim (glibc), and statvfs for the free-space guard of spooled request bodies
 [target.'cfg(unix)'.dependencies]
@@ -75,7 +77,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 aws-lc-rs = "1"
 
 [features]
-default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth", "mcp"]
+default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth", "mcp", "backup"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -96,6 +98,9 @@ auth = [
 ]
 # Model Context Protocol server for LLM agents (`sparkles mcp`, stdio)
 mcp = ["dep:rmcp"]
+# backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
+# `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
+backup = ["dep:sparkles-backup", "dep:toml", "dep:uuid"]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]

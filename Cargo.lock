@@ -3321,6 +3321,7 @@ dependencies = [
  "sha2",
  "spargebra",
  "sparkles",
+ "sparkles-backup",
  "sparkles-reasoner",
  "sparkles-shacl",
  "subtle",

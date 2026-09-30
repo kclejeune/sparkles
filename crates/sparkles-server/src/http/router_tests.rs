@@ -14,6 +14,8 @@ use tower::ServiceExt;
 
 #[cfg(feature = "auth")]
 mod auth;
+#[cfg(feature = "backup")]
+mod backup;
 mod clone;
 #[cfg(feature = "reasoning")]
 mod reasoning;

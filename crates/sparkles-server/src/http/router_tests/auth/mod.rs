@@ -1496,6 +1496,8 @@ fn route_coverage() {
         include_str!("../../../http.rs"),
         include_str!("../../../auth/api.rs"),
         include_str!("../../../auth/handlers.rs"),
+        include_str!("../../../backup/http.rs"),
+        include_str!("../../../backup/policies.rs"),
     ];
     let mut body = String::new();
     for src in routers {

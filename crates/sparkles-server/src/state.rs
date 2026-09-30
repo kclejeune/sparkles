@@ -159,14 +159,23 @@ impl Task {
     }
 }
 
-/// Whether a task's error comes from a cancellation (`sparkles::Error::Cancelled`)
-/// anywhere in its chain.
+/// Whether a task's error comes from a cancellation (`sparkles::Error::Cancelled`, or
+/// a backup operation's `cancelled`) anywhere in its chain.
 fn rooted_in_cancel(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
-        matches!(
+        if matches!(
             c.downcast_ref::<sparkles::Error>(),
             Some(sparkles::Error::Cancelled)
-        )
+        ) {
+            return true;
+        }
+        #[cfg(feature = "backup")]
+        if c.downcast_ref::<sparkles_backup::BackupError>()
+            .is_some_and(|b| b.is_cancelled())
+        {
+            return true;
+        }
+        false
     })
 }
 
@@ -207,6 +216,9 @@ pub struct AppState {
     /// request naming one of them gets `503` + `Retry-After` (the router's restoring
     /// layer)
     pub restoring: Mutex<BTreeMap<String, String>>,
+    /// backup repositories and policies (`serve`; `None` for embedded use)
+    #[cfg(feature = "backup")]
+    pub backup: Option<Arc<crate::backup::BackupState>>,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -406,6 +418,8 @@ impl AppState {
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "backup")]
+            backup: None,
             manage: Mutex::new(()),
         };
         // clones that were being built when the server stopped are never registered
@@ -458,6 +472,8 @@ impl AppState {
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "backup")]
+            backup: None,
             manage: Mutex::new(()),
             rate_limit: None,
             auth: None,
@@ -605,6 +621,33 @@ impl AppState {
             std::fs::remove_dir_all(root)?;
         }
         Ok(true)
+    }
+
+    /// Take the registered persistent dataset `name` out of the map for an in-place
+    /// replacement; the persisted registry keeps it (put it back with
+    /// [`reattach`](Self::reattach)). `None` if there is no such dataset, or it is not a
+    /// managed persistent one (`--loc`, `--mem`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn detach_for_swap(&self, name: &str) -> Option<Arc<Dataset>> {
+        let _guard = self.manage.lock();
+        let mut map = self.datasets.write();
+        match map.get(name) {
+            Some(ds) if ds.kind == DbType::Persistent && !ds.ephemeral => map.remove(name),
+            _ => None,
+        }
+    }
+
+    /// Open `databases/<name>` and register it under `name` again (after a swap, or to
+    /// roll one back). Fails if the name is registered.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reattach(&self, name: &str) -> Result<Arc<Dataset>> {
+        let _guard = self.manage.lock();
+        if self.datasets.read().contains_key(name) {
+            bail!("dataset '{name}' already exists");
+        }
+        let ds = self.open_dataset(name, DbType::Persistent, None)?;
+        self.datasets.write().insert(name.to_string(), ds.clone());
+        Ok(ds)
     }
 
     /// The task creating dataset `name`, if one is.

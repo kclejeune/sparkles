@@ -122,7 +122,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(validation::get_validation)
                 .put(validation::put_validation)
                 .delete(validation::delete_validation),
-        )
+        );
+    // backup repositories, per-dataset backups and backup policies
+    #[cfg(feature = "backup")]
+    let app = app.merge(crate::backup::http::routes());
+    let app = app
         // a dataset being replaced in place answers 503 (inside the auth layer, so a
         // hidden dataset stays a 404)
         .layer(axum::middleware::from_fn_with_state(

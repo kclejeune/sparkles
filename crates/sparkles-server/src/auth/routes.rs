@@ -65,6 +65,25 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
+    // backup repositories (feature `backup`)
+    ("/$/repositories", &["GET", "POST"]),
+    ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
+    ("/$/repositories/{repo}/test", &["POST"]),
+    ("/$/repositories/{repo}/verify", &["POST"]),
+    ("/$/repositories/{repo}/backups", &["GET"]),
+    ("/$/repositories/{repo}/gc", &["POST"]),
+    ("/$/repositories/{repo}/locks", &["GET"]),
+    ("/$/repositories/{repo}/locks/{id}", &["DELETE"]),
+    ("/$/backups/{ds}", &["GET", "POST"]),
+    ("/$/backups/{ds}/{repo}/{backup}", &["GET", "DELETE"]),
+    ("/$/backups/{ds}/{repo}/{backup}/restore", &["POST"]),
+    ("/$/backups/{ds}/{repo}/{backup}/verify", &["POST"]),
+    ("/$/backup-policies", &["GET", "POST"]),
+    ("/$/backup-policies/preview", &["POST"]),
+    ("/$/backup-policies/{policy}", &["GET", "PUT", "DELETE"]),
+    ("/$/backup-policies/{policy}/run", &["POST"]),
+    ("/$/backup-policies/{policy}/retention", &["POST"]),
+    ("/$/backup-policies/{policy}/runs", &["GET"]),
     ("/$/auth/config", &["GET"]),
     ("/$/auth/login", &["POST"]),
     ("/$/auth/logout", &["POST"]),
@@ -181,6 +200,29 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/validation/{ds}" => Dataset(Admin),
+        // backups: the listing is filtered by the handler (names and types for dataset
+        // admins); a backup's handlers also check that it belongs to `{ds}`, and a
+        // restore needs admin on its target
+        "/$/repositories" if get => Caller,
+        "/$/repositories"
+        | "/$/repositories/{repo}"
+        | "/$/repositories/{repo}/test"
+        | "/$/repositories/{repo}/verify"
+        | "/$/repositories/{repo}/backups"
+        | "/$/repositories/{repo}/gc"
+        | "/$/repositories/{repo}/locks"
+        | "/$/repositories/{repo}/locks/{id}"
+        | "/$/backup-policies"
+        | "/$/backup-policies/preview"
+        | "/$/backup-policies/{policy}"
+        | "/$/backup-policies/{policy}/run"
+        | "/$/backup-policies/{policy}/retention"
+        | "/$/backup-policies/{policy}/runs" => Server(ServerPerm::ServerAdmin),
+        "/$/backups/{ds}" | "/$/backups/{ds}/{repo}/{backup}" if get => Dataset(Read),
+        "/$/backups/{ds}"
+        | "/$/backups/{ds}/{repo}/{backup}"
+        | "/$/backups/{ds}/{repo}/{backup}/restore"
+        | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
         "/{ds}/data" if get => Dataset(Read),
         "/{ds}/data" => Dataset(Write),
@@ -702,6 +744,59 @@ mod tests {
         assert_eq!(n(Method::POST, "/ds", "text/turtle"), w);
         assert_eq!(n(Method::PUT, "/ds", "text/turtle"), w);
         assert_eq!(n(Method::DELETE, "/ds", ""), w);
+    }
+
+    #[test]
+    fn backup_route_needs() {
+        let n = |m: Method, route: &str| need(route, &m, &"/x".parse().unwrap(), &h(&[]));
+        let admin = Some(Need::Server(ServerPerm::ServerAdmin));
+        assert_eq!(n(Method::GET, "/$/repositories"), Some(Need::Caller));
+        assert_eq!(n(Method::POST, "/$/repositories"), admin);
+        for route in [
+            "/$/repositories/{repo}",
+            "/$/repositories/{repo}/backups",
+            "/$/repositories/{repo}/locks",
+            "/$/backup-policies",
+            "/$/backup-policies/{policy}/runs",
+        ] {
+            assert_eq!(n(Method::GET, route), admin, "{route}");
+        }
+        for route in [
+            "/$/repositories/{repo}/test",
+            "/$/repositories/{repo}/verify",
+            "/$/repositories/{repo}/gc",
+            "/$/backup-policies/preview",
+            "/$/backup-policies/{policy}/run",
+            "/$/backup-policies/{policy}/retention",
+        ] {
+            assert_eq!(n(Method::POST, route), admin, "{route}");
+        }
+        assert_eq!(
+            n(Method::DELETE, "/$/repositories/{repo}/locks/{id}"),
+            admin
+        );
+        let read = Some(Need::Dataset(Level::Read));
+        let adm = Some(Need::Dataset(Level::Admin));
+        assert_eq!(n(Method::GET, "/$/backups/{ds}"), read);
+        assert_eq!(n(Method::POST, "/$/backups/{ds}"), adm);
+        assert_eq!(n(Method::GET, "/$/backups/{ds}/{repo}/{backup}"), read);
+        assert_eq!(n(Method::DELETE, "/$/backups/{ds}/{repo}/{backup}"), adm);
+        assert_eq!(
+            n(Method::POST, "/$/backups/{ds}/{repo}/{backup}/restore"),
+            adm
+        );
+        assert_eq!(
+            n(Method::POST, "/$/backups/{ds}/{repo}/{backup}/verify"),
+            adm
+        );
+        // the dataset of a backup route is its first parameter
+        let uri: Uri = "/$/backups/wiki/local/b1/restore".parse().unwrap();
+        assert_eq!(
+            ds_of("/$/backups/{ds}/{repo}/{backup}/restore", &uri).as_deref(),
+            Some("wiki")
+        );
+        // cancelling is checked by the handler
+        assert_eq!(n(Method::DELETE, "/$/tasks/{id}"), Some(Need::Caller));
     }
 
     #[test]
