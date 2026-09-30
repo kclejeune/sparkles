@@ -17,6 +17,7 @@ mod auth;
 #[cfg(feature = "backup")]
 mod backup;
 mod clone;
+mod cost;
 #[cfg(feature = "reasoning")]
 mod reasoning;
 mod tasks;

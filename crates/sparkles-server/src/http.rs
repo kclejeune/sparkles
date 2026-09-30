@@ -419,14 +419,19 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
 }
 
 /// Run `f` on a blocking thread, inside the request's span (so engine events carry the
-/// request id and engine spans are its children).
+/// request id and engine spans are its children). The thread holds the request's
+/// concurrency permits until `f` returns, even when the client is gone.
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
     let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || span.in_scope(f))
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    let held = crate::ratelimit::hold();
+    tokio::task::spawn_blocking(move || {
+        let _held = held;
+        span.in_scope(f)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 // ------------------------------------------------------------------ params ------
@@ -598,6 +603,42 @@ fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
         .or(st.limits.update_timeout)
 }
 
+/// A cancellation flag and the guard that sets it when dropped: kept in a handler's
+/// future, it stops the engine work of a request whose client disconnected.
+fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    (cancel.clone(), CancelOnDrop(cancel))
+}
+
+/// Options of a Graph Store write or an upload: write-time validation, the `timeout`
+/// parameter (capped at `--max-timeout`, else `--update-timeout`), and cancellation
+/// when the client disconnects (keep the returned guard in the handler's future). The
+/// deadline starts with [`WriteDeadline::start`], once the body has been received.
+fn body_write_options(
+    st: &AppState,
+    params: &Params,
+    headers: &HeaderMap,
+) -> ApiResult<(WriteDeadline, CancelOnDrop)> {
+    let timeout = update_timeout(st, params);
+    let mut opts = validation::write_options(st, params, headers, None)?;
+    let (cancel, guard) = cancel_on_drop();
+    opts.cancel = Some(cancel);
+    Ok((WriteDeadline { opts, timeout }, guard))
+}
+
+/// Write options whose deadline is not set yet (see [`body_write_options`]).
+struct WriteDeadline {
+    opts: sparkles::guard::WriteOptions,
+    timeout: Option<Duration>,
+}
+
+impl WriteDeadline {
+    fn start(mut self) -> (sparkles::guard::WriteOptions, Option<Duration>) {
+        self.opts.deadline = self.timeout.map(|t| std::time::Instant::now() + t);
+        (self.opts, self.timeout)
+    }
+}
+
 /// A `408` names the timeout that applied (`timeoutSeconds`).
 fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
     if e.0 == StatusCode::REQUEST_TIMEOUT
@@ -740,9 +781,8 @@ async fn query_endpoint(
     crate::auth::restrict(&mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
-    let cancel = Arc::new(AtomicBool::new(false));
-    opts.cancel = Some(cancel.clone());
-    let _cancel_on_drop = CancelOnDrop(cancel.clone());
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
+    opts.cancel = Some(cancel);
     let limit = st.limits.max_result_bytes;
     let sfmt = solutions_format(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
@@ -1252,6 +1292,11 @@ async fn update_endpoint(
     };
     crate::auth::restrict(&mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
+    // a client that disconnects drops this future: the update stops at its next check
+    // (or while it waits for the writer lock) and commits nothing
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
+    opts.cancel = Some(cancel.clone());
+    opts.write.cancel = Some(cancel);
     let wanted = receipt_wanted(&params, &headers);
     let timeout = opts.timeout;
     blocking(move || {
@@ -1774,9 +1819,9 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
-            let wopts =
-                validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
+            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
+            let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let graph = match &target {
                     Target::Named(iri) => Some(
@@ -1816,6 +1861,7 @@ async fn gsp(
                 )))
             })
             .await
+            .map_err(|e| with_timeout(e, timeout))
         }
         Method::DELETE => {
             if st.read_only {
@@ -1823,8 +1869,8 @@ async fn gsp(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
-            let wopts =
-                validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
+            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let clear = match &target {
@@ -1847,6 +1893,8 @@ async fn gsp(
                     &ds.store,
                     &clear,
                     &QueryOptions {
+                        timeout,
+                        cancel: wopts.cancel.clone(),
                         write: wopts,
                         ..Default::default()
                     },
@@ -1862,6 +1910,7 @@ async fn gsp(
                 )))
             })
             .await
+            .map_err(|e| with_timeout(e, timeout))
         }
         _ => Err(err(StatusCode::METHOD_NOT_ALLOWED, "unsupported method")),
     }
@@ -1881,7 +1930,7 @@ async fn upload(
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
-    let wopts = validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
+    let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -1966,6 +2015,7 @@ async fn upload(
     if files.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no files in upload"));
     }
+    let (wopts, timeout) = wopts.start();
     blocking(move || {
         let g = match graph {
             Some(g) => Some(
@@ -2002,6 +2052,7 @@ async fn upload(
         )))
     })
     .await
+    .map_err(|e| with_timeout(e, timeout))
 }
 
 // ------------------------------------------------------------------- admin ------
@@ -2820,6 +2871,18 @@ async fn shacl(
     let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
+    // a client that disconnects stops the validation at its next check
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
+    let max_bytes = st.limits.max_result_bytes;
+    let max_results = crate::shacl::max_results(&st.limits);
+    let too_large = move |requested: u64| -> ApiError {
+        Error::BudgetExceeded(sparkles::Budget {
+            kind: BudgetKind::ResultBytes,
+            limit: max_bytes.unwrap_or(u64::MAX),
+            requested,
+        })
+        .into()
+    };
     blocking(move || {
         let text = std::str::from_utf8(&body)
             .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
@@ -2837,13 +2900,21 @@ async fn shacl(
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
         let mut opts = crate::shacl::validate_options(&snap, &graph, inferred, use_inferred)?;
         opts.timeout = Some(timeout);
+        opts.cancel = Some(cancel);
+        opts.max_results = max_results;
+        opts.pool = crate::shacl::pool();
         let t = std::time::Instant::now();
         let _validate = tracing::info_span!("shacl.validate").entered();
         let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
             let msg = format!("{e:#}");
+            if let Some(r) = e.downcast_ref::<sparkles_shacl::TooManyResults>() {
+                // the report would be at least this large
+                return too_large((r.limit as u64 + 1) * crate::shacl::MIN_RESULT_BYTES);
+            }
             match e.downcast::<Error>() {
                 Ok(e) => ApiError::from(e),
                 Err(_) if msg.contains("timed out") => err(StatusCode::REQUEST_TIMEOUT, msg),
+                Err(_) if msg.contains("cancelled") => ApiError::from(Error::Cancelled),
                 Err(_) => err(StatusCode::BAD_REQUEST, msg),
             }
         })?;
@@ -2854,6 +2925,10 @@ async fn shacl(
             report.results.len()
         );
         let buf = crate::shacl::write_report(&report, rfmt)?;
+        drop(report);
+        if max_bytes.is_some_and(|m| buf.len() as u64 > m) {
+            return Err(too_large(buf.len() as u64));
+        }
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
         let resp = with_commit(resp, &ds, snap.commit);
         Ok(with_inferences(

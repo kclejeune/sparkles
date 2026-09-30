@@ -290,7 +290,9 @@ minute.
 Over a concurrency cap: `503 Service Unavailable` with `Retry-After: 1`, immediately;
 requests are never queued, so a saturated server sheds load instead of holding waiting
 requests. A request holds its concurrency slot until its response body has been sent
-(streamed Graph Store GETs included). The body uses the error format:
+(streamed Graph Store GETs included) and the work it started has ended: a client that
+disconnects cancels its query or write, and the slot is free once that work has
+stopped. The body uses the error format:
 
 ```json
 { "error": "too many query requests: retry in 2 s",
@@ -573,10 +575,13 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 Query parameters beyond the standard protocol:
 
 * `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`), capped
-  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates accept
-  it too, under the same cap (never below `--update-timeout`); without it they run under
-  `--update-timeout` (none by default). A timed-out update changes nothing. A `408` names
-  the timeout that applied in `timeoutSeconds`.
+  at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates,
+  Graph Store `PUT`/`POST`/`DELETE` and uploads accept it too, under the same cap (never
+  below `--update-timeout`; for a Graph Store write or an upload it starts once the body
+  has been received); without it they run under `--update-timeout` (none by default). A
+  timed-out write changes nothing. A `408` names the timeout that applied in
+  `timeoutSeconds`. A write whose client disconnects is cancelled (also while it waits for
+  the dataset's writer lock) and commits nothing; a commit that already started completes.
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
 * `nocache=true` — bypass the query result cache: nothing is read from or stored in it
@@ -998,6 +1003,11 @@ the shapes graph in the request body (Fuseki semantics):
   graph is also left out of `graph=union`.
 * **`timeout=<seconds>`**: as for queries (server default otherwise); `408` on timeout.
 * Supports SHACL Core and SHACL-SPARQL. Parse errors in the shapes graph → `400`.
+* **Budgets.** The report is bounded like a query result: `507` with `budget:
+  "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48 bytes each
+  (or in `--query-memory-mb` at an estimated 512 bytes each), or once its serialized form is
+  larger than `--max-result-mb`. Validations run in a pool of half the cores shared by all
+  `/{ds}/shacl` requests, and stop when their client disconnects.
 
 The response is the validation report (`200` whether or not the data conforms),
 negotiated via `Accept` or `format=`:

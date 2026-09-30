@@ -1758,6 +1758,54 @@ impl Store {
     /// [`write_as`](Self::write_as) with options for the write guard.
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
         let guard = self.writer.lock();
+        self.begin(guard, kind, opts)
+    }
+
+    /// [`write_with`](Self::write_with), but a write whose `opts` are cancelled or past
+    /// their deadline stops waiting for the writer lock (see
+    /// [`WriteOptions::check`](crate::guard::WriteOptions::check)).
+    pub fn try_write_with(
+        &self,
+        kind: CommitKind,
+        opts: crate::guard::WriteOptions,
+    ) -> Result<WriteTxn<'_>> {
+        let guard = self.lock_writer(&opts)?;
+        Ok(self.begin(guard, kind, opts))
+    }
+
+    /// The writer lock, waited for in slices while `o` can be cancelled or time out.
+    fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+        if o.cancel.is_none() && o.deadline.is_none() {
+            return Ok(self.writer.lock());
+        }
+        loop {
+            o.check()?;
+            if let Some(w) = self
+                .writer
+                .try_lock_for(std::time::Duration::from_millis(20))
+            {
+                return Ok(w);
+            }
+        }
+    }
+
+    /// What stops a rebuild into `dir` early: the write's cancellation and deadline.
+    fn build_interrupt(
+        &self,
+        o: Option<crate::guard::WriteOptions>,
+        dir: &Path,
+    ) -> Option<crate::builder::InterruptFn> {
+        let _ = dir;
+        let o = o.filter(|o| o.cancel.is_some() || o.deadline.is_some())?;
+        Some(Arc::new(move || o.check()))
+    }
+
+    fn begin<'a>(
+        &'a self,
+        guard: MutexGuard<'a, WriterState>,
+        kind: CommitKind,
+        opts: crate::guard::WriteOptions,
+    ) -> WriteTxn<'a> {
         let base = self.snapshot();
         WriteTxn {
             store: self,
@@ -1889,7 +1937,7 @@ impl Store {
     ) -> Result<Receipt> {
         let snap = self.snapshot();
         if snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold {
-            let mut w = self.writer.lock();
+            let mut w = self.lock_writer(o)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
             }
@@ -1904,13 +1952,17 @@ impl Store {
                 .rebuild_locked(&mut w, &snap, sources, &[], &[], Some(bulk), check)?
                 .1)
         } else {
-            let mut txn = self.write_with(kind, o.clone());
+            let mut txn = self.try_write_with(kind, o.clone())?;
             let mut prefixes = BTreeMap::new();
             for s in sources {
+                o.check()?;
                 let (quads, p) = crate::io::parse_to_vec(s)?;
                 prefixes.extend(p);
                 let mut labels = std::collections::HashMap::new();
-                for q in &quads {
+                for (i, q) in quads.iter().enumerate() {
+                    if i % 65_536 == 65_535 {
+                        o.check()?;
+                    }
                     let ids = txn.encode_quad(q, &mut labels)?;
                     txn.insert(ids)?;
                 }
@@ -1954,11 +2006,12 @@ impl Store {
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
         for s in sources {
+            o.check()?;
             let (quads, p) = crate::io::parse_to_vec(s)?;
             prefixes.extend(p);
             parsed.push(quads);
         }
-        let mut txn = self.write_with(kind, o.clone());
+        let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
             ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
@@ -1973,12 +2026,16 @@ impl Store {
             }
         };
         for g in graphs {
-            for k in view.scan_keys(Perm::Gspo, &[g.0])? {
+            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    o.check()?;
+                }
                 txn.delete(Perm::Gspo.to_quad(&k))?;
             }
         }
         let mut ids = Vec::new();
         for quads in &parsed {
+            o.check()?;
             let mut labels = std::collections::HashMap::new();
             for q in quads {
                 ids.push(txn.encode_quad(q, &mut labels)?);
@@ -2001,7 +2058,7 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<(u64, Receipt)> {
-        let mut w = self.writer.lock();
+        let mut w = self.lock_writer(o)?;
         if w.poisoned {
             return Err(Error::Poisoned);
         }
@@ -2091,18 +2148,40 @@ impl Store {
         };
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = w.next_bnode;
-        let builder = Builder::new(&dir, bopts)?;
-        write_snapshot(
-            &builder,
-            snap,
-            |q| Ok(!drop_graphs.contains(&q[3])),
-            extra_quads,
-        )?;
-        for s in extra {
-            builder.add_source(s)?;
-        }
-        builder.add_prefixes(self.prefixes());
-        let meta = builder.finish()?;
+        let wopts = check.as_ref().map(|(_, o)| (*o).clone());
+        let interrupt = self.build_interrupt(wopts.clone(), &dir);
+        let built = (|| {
+            let mut builder = Builder::new(&dir, bopts)?;
+            if let Some(i) = interrupt.clone() {
+                builder = builder.with_interrupt(i);
+            }
+            write_snapshot(
+                &builder,
+                snap,
+                |q| Ok(!drop_graphs.contains(&q[3])),
+                extra_quads,
+            )?;
+            for s in extra {
+                builder.add_source(s)?;
+            }
+            builder.add_prefixes(self.prefixes());
+            let meta = builder.finish()?;
+            // a write stopped while it was built publishes nothing
+            if let Some(i) = &interrupt {
+                i()?;
+            }
+            Ok(meta)
+        })();
+        let meta = match built {
+            Ok(m) => m,
+            Err(e) => {
+                // the unfinished generation's space is freed now, not at the next rebuild
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                return Err(e);
+            }
+        };
         let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
@@ -2881,6 +2960,8 @@ impl WriteTxn<'_> {
         if self.guard.poisoned {
             return Err(Error::Poisoned);
         }
+        // a write cancelled (its client gone) or past its deadline publishes nothing
+        self.opts.check()?;
         if self.bulk.is_empty() {
             if self.net_ins == 0 && self.net_del == 0 {
                 // no net change: no commit, nothing to validate
@@ -3468,6 +3549,85 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 
     fn src() -> Source {
         Source::from_bytes(TTL.as_bytes().to_vec(), RdfFormat::Turtle, None)
+    }
+
+    #[test]
+    fn cancelled_and_timed_out_writes_publish_nothing() {
+        use crate::guard::WriteOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        // every load a rebuild, so the bulk path is covered too
+        let bulk = StoreOptions {
+            bulk_threshold: 0,
+            ..Default::default()
+        };
+        let store = Store::open(&root, bulk).unwrap();
+        store.load(&[src()]).unwrap();
+        let head = store.head_commit().seq;
+        let gens = || std::fs::read_dir(&root).unwrap().count();
+        let before = gens();
+        let cancelled = WriteOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        let late = WriteOptions {
+            deadline: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        let more = || {
+            Source::from_bytes(
+                b"<http://ex.org/x> <http://ex.org/p> \"9\" .".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )
+        };
+        for o in [&cancelled, &late] {
+            let e = store.load_with(&[more()], CommitKind::Load, o).unwrap_err();
+            assert!(matches!(e, Error::Cancelled | Error::Timeout), "{e}");
+            let e = store
+                .replace_with(ReplaceTarget::All, &[more()], CommitKind::GspPut, o)
+                .unwrap_err();
+            assert!(matches!(e, Error::Cancelled | Error::Timeout), "{e}");
+        }
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(
+            gens(),
+            before,
+            "an interrupted rebuild leaves no generation"
+        );
+        drop(store);
+
+        // the transactional path, and the wait for the writer lock
+        let store = Arc::new(Store::open(&root, StoreOptions::default()).unwrap());
+        let e = store
+            .load_with(&[more()], CommitKind::Load, &cancelled)
+            .unwrap_err();
+        assert!(matches!(e, Error::Cancelled), "{e}");
+        let (held, release) = (
+            Arc::new(std::sync::Barrier::new(2)),
+            Arc::new(std::sync::Barrier::new(2)),
+        );
+        let holder = std::thread::spawn({
+            let (store, held, release) = (store.clone(), held.clone(), release.clone());
+            move || {
+                let _txn = store.write();
+                held.wait();
+                release.wait();
+            }
+        });
+        held.wait();
+        let o = WriteOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(50)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.try_write_with(CommitKind::Update, o).err(),
+            Some(Error::Timeout)
+        ));
+        release.wait();
+        holder.join().unwrap();
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(store.snapshot().len(), 5);
     }
 
     #[test]

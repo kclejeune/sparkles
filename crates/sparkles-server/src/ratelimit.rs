@@ -1231,7 +1231,8 @@ pub fn spawn_sweeper(rl: Arc<RateLimiter>, every: Duration) {
 }
 
 /// Requests in flight counted against a server-wide and a per-client cap, released
-/// when the response body is done.
+/// when the response body is done and the work started for the request has ended
+/// (see [`hold`]).
 struct Permits {
     server: Option<Arc<AtomicU32>>,
     client: Option<Arc<Slot>>,
@@ -1248,11 +1249,27 @@ impl Drop for Permits {
     }
 }
 
+tokio::task_local! {
+    /// The permits of the request whose handler runs in this task.
+    static HELD: Arc<Permits>;
+}
+
+/// A share of the current request's concurrency permits (nothing when no cap applies):
+/// work that can outlive the request's future (a blocking task keeps running after the
+/// client disconnects) keeps it until the work ends, so the caps count the work, not
+/// the connection.
+pub struct Held(#[allow(dead_code)] Option<Arc<Permits>>);
+
+/// Take a share of the current request's permits (see [`Held`]).
+pub fn hold() -> Held {
+    Held(HELD.try_with(Arc::clone).ok())
+}
+
 /// A response body that holds the request's permits until it is sent (streamed Graph
 /// Store GETs keep working after the handler returned).
 struct PermitBody {
     inner: Body,
-    _permits: Permits,
+    _permits: Arc<Permits>,
 }
 
 impl HttpBody for PermitBody {
@@ -1551,7 +1568,13 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
             }
         }
     }
-    let mut resp = next.run(req).await;
+    let held = permits.server.is_some() || permits.client.is_some();
+    let permits = Arc::new(permits);
+    let mut resp = if held {
+        HELD.scope(permits.clone(), next.run(req)).await
+    } else {
+        next.run(req).await
+    };
     if let Some(a) = admitted {
         let (mut remaining, mut reset) = (a.remaining, a.reset_secs);
         if p.failure_cost > 1
@@ -1568,7 +1591,7 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
         }
         rate_headers(resp.headers_mut(), p, remaining, reset);
     }
-    if permits.server.is_some() || permits.client.is_some() {
+    if held {
         resp = resp.map(|b| {
             Body::new(PermitBody {
                 inner: b,
