@@ -249,7 +249,6 @@ async fn a_backup_created_between_mark_and_sweep_keeps_its_blobs() {
 }
 
 #[tokio::test]
-#[ignore = "needs S2 (Source::from_closed_dir, Repository::create, Repository::verify)"]
 async fn a_real_backup_created_between_mark_and_sweep_verifies() {
     use crate::{CreateOptions, Source, VerifyLevel, VerifyOptions, VerifyStatus};
     let dir = tempfile::tempdir().unwrap();

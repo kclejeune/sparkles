@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 sparkles.workspace = true
-object_store.workspace = true
+object_store = { workspace = true, features = ["tokio"] }
+async-trait.workspace = true
+percent-encoding.workspace = true
 tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true
@@ -27,8 +29,6 @@ tracing.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-# test wrappers around object stores (the `ObjectStore` trait is an `async_trait`)
-async-trait = "0.1"
 tempfile.workspace = true
 
 [features]

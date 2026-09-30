@@ -66,6 +66,8 @@ pub async fn repo_with(store: Arc<dyn ObjectStore>, f: impl FnOnce(&mut RepoConf
         cache: ManifestCache::new(None),
         upload: Throttle::unlimited(),
         download: Throttle::unlimited(),
+        requests: Default::default(),
+        conditional: std::sync::atomic::AtomicU8::new(crate::repo::COND_UNKNOWN),
     }
 }
 

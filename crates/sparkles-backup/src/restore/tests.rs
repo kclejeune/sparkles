@@ -536,7 +536,6 @@ async fn verify_at_the_restore_level() {
 }
 
 #[tokio::test]
-#[ignore = "needs S2 (Repository::verify at the restore level calls verify_restore)"]
 async fn verify_at_the_restore_level_through_verify() {
     let (dir, repo, _) = setup().await;
     let o = VerifyOptions {
@@ -654,7 +653,6 @@ fn swap_dir_rolls_back_when_the_second_rename_fails() {
 /// Backups of a live store, taken while another thread commits, restore to exactly
 /// their captured commits.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs S1 (Store::backup_capture) and S2 (Repository::create)"]
 async fn backups_under_concurrent_writes_restore_to_their_commits() {
     use crate::{CreateOptions, Source};
     use sparkles::history::At;

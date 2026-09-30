@@ -3250,6 +3250,7 @@ dependencies = [
  "libc",
  "lz4_flex 0.14.0",
  "object_store",
+ "percent-encoding",
  "serde",
  "serde_json",
  "sha2",
