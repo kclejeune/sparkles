@@ -496,6 +496,39 @@ sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
 
+Backup repositories work offline too, on a stopped database (a server's own backups go
+through its HTTP API). `--repo` takes a name from the backup config file
+(`--backup-config FILE`, `$SPARKLES_BACKUP_CONFIG`, default
+`$XDG_CONFIG_HOME/sparkles/backup.toml`) or a URL: `file:///srv/backups/r`,
+`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true`, or `memory://`.
+Credentials never go in URLs; they come from the environment or a credentials file.
+Manifests are cached in `$XDG_CACHE_HOME/sparkles/backup/`, progress goes to stderr,
+Ctrl-C cancels, and every command takes `--format json` (or `--json`). Exit codes: 0 ok,
+1 errors, 2 warnings only (orphaned blobs in `repo verify`).
+
+```sh
+sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
+sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
+sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
+sparkles repo verify local --level data          # every backup, plus orphaned blobs
+sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
+sparkles repo locks local [--break ID]
+sparkles backup create  --loc db --repo local [--name N] [--note T]   # refused while a server has db open
+sparkles backup list    --repo file:///srv/backups/r [--dataset ds] [--policy P]
+sparkles backup show    --repo local b2
+sparkles backup verify  --repo local b2 --level restore   # exists | data | restore
+sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
+sparkles backup restore --repo local b2 --data /srv/sparkles --as ds  # into a stopped server
+sparkles backup delete  --repo local b1          # blobs go at the next gc
+sparkles backup policy list | show P | history P # policies of the config file
+sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin
+```
+
+`restore --identity auto|new|keep` picks the dataset id (`auto` keeps it unless a dataset
+of the target data directory has it) and `--check quick|full|none` the integrity check
+before the restored database is published. `restore --data` refuses while a server holds
+the data directory.
+
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
 ### Outbound requests (SERVICE and LOAD)
