@@ -143,8 +143,14 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
-        Kind::Scan(spec) => scan(ctx, spec, &n.vars)?,
-        Kind::RangeScan(spec, range) => range_scan(ctx, spec, range, &n.vars)?,
+        Kind::Scan(spec) => {
+            note = column_note(ctx, spec);
+            scan(ctx, spec, &n.vars)?
+        }
+        Kind::RangeScan(spec, range) => {
+            note = column_note(ctx, spec);
+            range_scan(ctx, spec, range, &n.vars)?
+        }
         Kind::GroupCountScan {
             spec,
             key: _,
@@ -303,7 +309,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             for i in 0..n.children.len() {
                 inputs.push(child(i, &mut infos)?);
             }
-            path(ctx, spec, *bound_from_left, inputs, &n.vars)?
+            let (t, sweeps) = path(ctx, spec, *bound_from_left, inputs, &n.vars)?;
+            if sweeps > 0 {
+                note = Some(format!(
+                    "[{sweeps} frontier levels expanded by index sweeps]"
+                ));
+            }
+            t
         }
         Kind::Service {
             endpoint,
@@ -352,6 +364,37 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
 }
 
 // ------------------------------------------------------------------ scans ------
+
+/// Key columns a scan reads: its variables, the graph (unless every graph passes) and
+/// the repeated-variable columns. The others are never decoded for whole blocks.
+fn scan_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
+    if !ctx.opt.selective_columns {
+        return crate::index::ALL_COLS;
+    }
+    let mut m: crate::index::ColMask = 0;
+    for &(c, _) in &spec.cols {
+        m |= 1 << c;
+    }
+    if !matches!(spec.graph, GraphFilter::All) {
+        m |= 1 << spec.graph_col;
+    }
+    for &(a, b) in &spec.eqs {
+        m |= (1 << a) | (1 << b);
+    }
+    m
+}
+
+/// EXPLAIN note naming the key columns a scan decodes, when it skips any.
+fn column_note(ctx: &Ctx, spec: &ScanSpec) -> Option<String> {
+    let m = scan_mask(ctx, spec);
+    (m != crate::index::ALL_COLS).then(|| {
+        let names: Vec<&str> = (0..4)
+            .filter(|c| m & (1 << c) != 0)
+            .map(|c| ["S", "P", "O", "G"][spec.perm.order()[c]])
+            .collect();
+        format!("[decodes {}]", names.join(""))
+    })
+}
 
 /// Whether every row of `b[s..e]` passes the scan's graph filter and repeated-variable
 /// checks, so the slice can be taken column-wise (for a default-graph query over a store
@@ -428,41 +471,44 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
         }
     };
     let mut last: Option<[u64; 4]> = None;
-    ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
-        let mut row = |k: &[u64; 4]| {
-            if !spec.graph.accepts(k[spec.graph_col]) || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
-            {
-                return;
-            }
-            if spec.dedup {
-                let mut proj = [0u64; 4];
-                for (i, &c) in kcs.iter().enumerate() {
-                    proj[i] = k[c];
-                }
-                if last == Some(proj) {
+    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
+    ctx.snap
+        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+            let mut row = |k: &[u64; 4]| {
+                if !spec.graph.accepts(k[spec.graph_col])
+                    || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                {
                     return;
                 }
-                last = Some(proj);
-            }
-            bump(k[kc], 1);
-        };
-        match chunk {
-            Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                let col = &b.cols[kc][s..e];
-                let mut i = 0;
-                while i < col.len() {
-                    let v = col[i];
-                    let run = run_len(&col[i..], v);
-                    bump(v, run as u64);
-                    i += run;
+                if spec.dedup {
+                    let mut proj = [0u64; 4];
+                    for (i, &c) in kcs.iter().enumerate() {
+                        proj[i] = k[c];
+                    }
+                    if last == Some(proj) {
+                        return;
+                    }
+                    last = Some(proj);
                 }
+                bump(k[kc], 1);
+            };
+            match chunk {
+                Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
+                    let col = &b.cols[kc][s..e];
+                    let mut i = 0;
+                    while i < col.len() {
+                        let v = col[i];
+                        let run = run_len(&col[i..], v);
+                        bump(v, run as u64);
+                        i += run;
+                    }
+                }
+                Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
+                Chunk::Row(k) => row(&k),
             }
-            Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
-            Chunk::Row(k) => row(&k),
-        }
-        ctx.check()?;
-        Ok(true)
-    })?;
+            ctx.check()?;
+            Ok(true)
+        })?;
     Ok((keys, counts))
 }
 
@@ -484,23 +530,26 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
     let kc = spec.cols[0].0;
     let mut n = 0u64;
     let mut last: Option<u64> = None;
-    ctx.snap.scan(spec.perm, &spec.prefix, |chunk| {
-        let mut row = |k: &[u64; 4]| {
-            if spec.graph.accepts(k[spec.graph_col]) && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])
-            {
-                n += runs(&[k[kc]], &mut last);
+    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
+    ctx.snap
+        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+            let mut row = |k: &[u64; 4]| {
+                if spec.graph.accepts(k[spec.graph_col])
+                    && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])
+                {
+                    n += runs(&[k[kc]], &mut last);
+                }
+            };
+            match chunk {
+                Chunk::Block(b, s, e) if block_passes(spec, b, s, e) => {
+                    n += runs(&b.cols[kc][s..e], &mut last)
+                }
+                Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
+                Chunk::Row(k) => row(&k),
             }
-        };
-        match chunk {
-            Chunk::Block(b, s, e) if block_passes(spec, b, s, e) => {
-                n += runs(&b.cols[kc][s..e], &mut last)
-            }
-            Chunk::Block(b, s, e) => (s..e).for_each(|i| row(&b.key(i))),
-            Chunk::Row(k) => row(&k),
-        }
-        ctx.check()?;
-        Ok(true)
-    })?;
+            ctx.check()?;
+            Ok(true)
+        })?;
     Ok(n)
 }
 
@@ -728,43 +777,44 @@ fn scan_into(
         }
         t.len += 1;
     };
-    ctx.snap.scan_between(spec.perm, lo, hi, |chunk| {
-        if t.len >= limit {
-            truncated = true;
-            return Ok(false);
-        }
-        match chunk {
-            Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                let e = e.min(s.saturating_add(limit - t.len));
-                for (c, &kc) in kcs.iter().enumerate() {
-                    t.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
+    ctx.snap
+        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+            if t.len >= limit {
+                truncated = true;
+                return Ok(false);
+            }
+            match chunk {
+                Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
+                    let e = e.min(s.saturating_add(limit - t.len));
+                    for (c, &kc) in kcs.iter().enumerate() {
+                        t.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
+                    }
+                    t.len += e - s;
+                    n += e - s;
                 }
-                t.len += e - s;
-                n += e - s;
-            }
-            Chunk::Block(b, s, e) => {
-                for i in s..e {
-                    row(&b.key(i), t);
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        row(&b.key(i), t);
+                    }
+                    n += e - s;
                 }
-                n += e - s;
+                Chunk::Row(k) => {
+                    row(&k, t);
+                    n += 1;
+                }
             }
-            Chunk::Row(k) => {
-                row(&k, t);
-                n += 1;
+            if n > 1 << 16 {
+                n = 0;
+                ctx.check()?;
+                ctx.check_rows(t.len())?;
             }
-        }
-        if n > 1 << 16 {
-            n = 0;
-            ctx.check()?;
-            ctx.check_rows(t.len())?;
-        }
-        if t.len >= limit {
-            // there may be more matching rows after this point
-            truncated = true;
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
+            if t.len >= limit {
+                // there may be more matching rows after this point
+                truncated = true;
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
     Ok(truncated)
 }
 
@@ -1933,9 +1983,90 @@ struct Graph<'a> {
     graph: GraphFilter,
     fwd: Option<FxHashMap<u64, Vec<u64>>>,
     bwd: Option<FxHashMap<u64, Vec<u64>>>,
+    /// frontier levels expanded by one sweep over the predicate's index range
+    sweeps: &'a std::cell::Cell<usize>,
 }
 
+/// A frontier at least `rows / SWEEP_RATIO` long is expanded by one merged pass over the
+/// predicate's rows instead of one index seek per node (a seek costs about as much as
+/// merging a few hundred rows).
+const SWEEP_RATIO: u64 = 512;
+
 impl Graph<'_> {
+    /// Neighbours of every node of a sorted, duplicate-free frontier (with duplicates),
+    /// for simple predicate paths: per-node seeks for a small frontier, otherwise one
+    /// pass over the predicate's index rows between the first and last frontier node,
+    /// merged with the frontier.
+    fn expand(&self, frontier: &[u64], forward: bool, out: &mut Vec<u64>) -> Result<()> {
+        let Some((p, rev)) = self.spec.simple else {
+            for &x in frontier {
+                out.extend(self.neighbours(x, forward)?);
+            }
+            return Ok(());
+        };
+        let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
+        let rows = self.ctx.snap.estimate(perm, &[p]);
+        if !self.ctx.opt.batched_paths
+            || frontier.len() < 64
+            || (frontier.len() as u64).saturating_mul(SWEEP_RATIO) < rows
+        {
+            for &x in frontier {
+                out.extend(self.neighbours(x, forward)?);
+            }
+            return Ok(());
+        }
+        self.sweeps.set(self.sweeps.get() + 1);
+        let gc = perm.col_of(crate::index::G);
+        let (first, last) = (frontier[0], frontier[frontier.len() - 1]);
+        let mut j = 0;
+        self.ctx.snap.scan_between_cols(
+            perm,
+            [p, first, 0, 0],
+            [p, last, u64::MAX, u64::MAX],
+            if self.ctx.opt.selective_columns {
+                (1 << 1) | (1 << 2) | (1 << gc)
+            } else {
+                crate::index::ALL_COLS
+            },
+            |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        let (keys, vals, gs) =
+                            (&b.cols[1][s..e], &b.cols[2][s..e], &b.cols[gc][s..e]);
+                        let mut i = 0;
+                        while i < keys.len() && j < frontier.len() {
+                            let (k, f) = (keys[i], frontier[j]);
+                            if k < f {
+                                // skip to the next frontier node
+                                i += keys[i..].partition_point(|&x| x < f);
+                            } else if k > f {
+                                j += frontier[j..].partition_point(|&x| x < k);
+                            } else {
+                                // the run may continue in the next chunk: `j` moves on only
+                                // once a larger key is seen
+                                while i < keys.len() && keys[i] == f {
+                                    if self.graph.accepts(gs[i]) {
+                                        out.push(vals[i]);
+                                    }
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        j += frontier[j..].partition_point(|&x| x < k[1]);
+                        if j < frontier.len() && frontier[j] == k[1] && self.graph.accepts(k[gc]) {
+                            out.push(k[2]);
+                        }
+                    }
+                }
+                Ok(j < frontier.len())
+            },
+        )?;
+        self.ctx.check()?;
+        Ok(())
+    }
+
     fn neighbours(&self, x: u64, forward: bool) -> Result<Vec<u64>> {
         if let Some((p, rev)) = self.spec.simple {
             let dir = forward != rev;
@@ -1943,7 +2074,13 @@ impl Graph<'_> {
             let perm = if dir { Perm::Pso } else { Perm::Pos };
             let gc = perm.col_of(crate::index::G);
             let mut out = Vec::new();
-            self.ctx.snap.scan(perm, &[p, x], |c| {
+            let mask = if self.ctx.opt.selective_columns {
+                (1 << 2) | (1 << gc)
+            } else {
+                crate::index::ALL_COLS
+            };
+            let (lo, hi) = (pad(&[p, x], 0), pad(&[p, x], u64::MAX));
+            self.ctx.snap.scan_between_cols(perm, lo, hi, mask, |c| {
                 match c {
                     Chunk::Block(b, s, e) => {
                         for i in s..e {
@@ -1980,16 +2117,18 @@ impl Graph<'_> {
         }
         let mut frontier = vec![start];
         let mut depth = 0;
+        let mut found = Vec::new();
         while !frontier.is_empty() {
             self.ctx.check()?;
             depth += 1;
             let mut next = Vec::new();
-            for x in frontier {
-                for y in self.neighbours(x, forward)? {
-                    if seen.insert(y) {
-                        out.push(y);
-                        next.push(y);
-                    }
+            frontier.sort_unstable();
+            found.clear();
+            self.expand(&frontier, forward, &mut found)?;
+            for &y in &found {
+                if seen.insert(y) {
+                    out.push(y);
+                    next.push(y);
                 }
             }
             if self.spec.max_one && depth >= 1 {
@@ -2058,7 +2197,7 @@ fn path(
     bound_from_left: bool,
     mut inputs: Vec<Table>,
     vars: &[VarId],
-) -> Result<Table> {
+) -> Result<(Table, usize)> {
     let left = if bound_from_left { inputs.pop() } else { None };
     let edges = inputs.pop();
     let graphs: Vec<(GraphFilter, Option<Id>)> = match spec.graph_var {
@@ -2091,6 +2230,7 @@ fn path(
         pvars.push(g);
     }
     let mut out = Table::new(pvars.clone());
+    let sweeps = std::cell::Cell::new(0);
     for (gf, gid) in graphs {
         let (fwd, bwd) = match (&edges, spec.edge_vars) {
             (Some(e), Some((a, b))) => {
@@ -2121,6 +2261,7 @@ fn path(
             graph: gf,
             fwd,
             bwd,
+            sweeps: &sweeps,
         };
         let push = |s: u64, o: u64, out: &mut Table| {
             let mut row = Vec::with_capacity(pvars.len());
@@ -2200,15 +2341,11 @@ fn path(
             }
         }
     }
-    let _ = pad;
-    match left {
-        Some(l) => {
-            let mut t = join_tables(ctx, &l, &out, &[], false)?;
-            t = t.project(vars);
-            Ok(t)
-        }
-        None => Ok(out.project(vars)),
-    }
+    let t = match left {
+        Some(l) => join_tables(ctx, &l, &out, &[], false)?.project(vars),
+        None => out.project(vars),
+    };
+    Ok((t, sweeps.get()))
 }
 
 // ---------------------------------------------------------------- service ------

@@ -581,3 +581,144 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
         solutions(&run(&s, q, Optimizations::NONE))
     );
 }
+
+// ---------------------------------------------------------- batched frontiers ------
+
+#[test]
+fn transitive_paths_expand_large_frontiers_by_sweeps() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");
+    let n = 60_000;
+    for i in 0..n {
+        // a sparse random-ish graph with average out-degree 2
+        trig.push_str(&format!(
+            "ex:n{i} ex:k ex:n{} , ex:n{} .\n",
+            (i * 7 + 3) % n,
+            (i * 13 + 11) % n
+        ));
+    }
+    // hubs with runs longer than an index block (32k rows): runs span chunk boundaries
+    for i in 0..40_000 {
+        trig.push_str(&format!(
+            "ex:n1 ex:k ex:h{i} .\nex:h{i} ex:k ex:n{} .\n",
+            (i * 31) % n
+        ));
+    }
+    // edges only in a named graph
+    for i in 0..500 {
+        trig.push_str(&format!(
+            "ex:g {{ ex:n{i} ex:k ex:x{i} . ex:x{i} ex:k ex:y{i} . }}\n"
+        ));
+    }
+    load(&s, &trig, RdfFormat::TriG);
+    let queries = [
+        "SELECT ?x WHERE { ex:n0 ex:k* ?x }",
+        "SELECT ?x WHERE { ex:n5 ex:k+ ?x }",
+        "SELECT ?x WHERE { ?x ex:k* ex:n9 }",
+        "SELECT ?x WHERE { ?x ex:k+ ex:n1 }",
+        "SELECT ?x WHERE { ex:n0 ^ex:k* ?x }",
+    ];
+    // the named graph alone only has short chains
+    same_rows(
+        &s,
+        "SELECT ?x WHERE { GRAPH <urn:x-arq:UnionGraph> { ex:n0 ex:k* ?x } }",
+    );
+    for q in queries {
+        let rows = same_answer(&s, q, "desc:frontier levels expanded by index sweeps");
+        assert!(rows.len() > 1000, "{q}: {}", rows.len());
+    }
+    // the delta: inserted edges (rows between base rows of a run) and deleted ones
+    update(
+        &s,
+        "INSERT DATA { ex:n1 ex:k ex:new1 . ex:new1 ex:k ex:new2 . ex:h7 ex:k ex:new3 } ; DELETE DATA { ex:h8 ex:k ex:n248 . ex:n3 ex:k ex:n24 }",
+    );
+    for q in queries {
+        same_answer(&s, q, "desc:frontier levels expanded by index sweeps");
+    }
+    // small frontiers keep per-node seeks
+    let r = run(&s, "SELECT ?x WHERE { ex:y3 ex:k* ?x }", Optimizations::ALL);
+    assert!(!has_desc(&r.plan, "index sweeps"));
+}
+
+// ------------------------------------------------------- selective decoding ------
+
+#[test]
+fn scans_decode_only_the_columns_they_read() {
+    let build = || {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..80_000 {
+            trig.push_str(&format!(
+                "ex:s{i} ex:p {} ; ex:q ex:o{} .\n",
+                i % 1000,
+                i % 77
+            ));
+            if i % 10 == 0 {
+                trig.push_str(&format!("ex:g {{ ex:s{i} ex:p {} }}\n", i % 5));
+            }
+        }
+        load(&s, &trig, RdfFormat::TriG);
+        s
+    };
+    let queries = [
+        ("SELECT ?s ?o WHERE { ?s ex:p ?o }", "[decodes SOG]"),
+        (
+            "SELECT ?s ?o WHERE { GRAPH ?g { ?s ex:p ?o } }",
+            "[decodes SOG]",
+        ),
+        (
+            "SELECT ?s WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s ex:q ex:o3 } }",
+            "[decodes SG]",
+        ),
+        ("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 70000", ""),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?a ex:q ?b . ?c ex:q ?b }",
+            "",
+        ),
+        ("SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ex:p ?o }", ""),
+        (
+            "SELECT ?o (COUNT(?s) AS ?n) WHERE { ?s ex:q ?o } GROUP BY ?o",
+            "",
+        ),
+    ];
+    let without = Optimizations {
+        selective_columns: false,
+        ..Optimizations::ALL
+    };
+    let (a, b) = (build(), build());
+    for (q, note) in queries {
+        let fast = run(&a, q, Optimizations::ALL);
+        if !note.is_empty() {
+            assert!(has_desc(&fast.plan, note), "{q}: {:#?}", fast.plan);
+        }
+    }
+    // the same work on a second store with whole blocks caches more bytes
+    for (q, _) in queries {
+        run(&b, q, without);
+    }
+    assert!(
+        a.cache().bytes() < b.cache().bytes(),
+        "{} vs {}",
+        a.cache().bytes(),
+        b.cache().bytes()
+    );
+    for (q, _) in queries {
+        assert_eq!(
+            solutions(&run(&a, q, Optimizations::ALL)),
+            solutions(&run(&a, q, without)),
+            "{q}"
+        );
+    }
+    // updates: the delta forces full-key merges in the touched ranges
+    update(
+        &a,
+        "INSERT DATA { ex:s5 ex:p 7 . ex:new ex:q ex:o3 } ; DELETE DATA { ex:s9 ex:p 9 }",
+    );
+    for (q, _) in queries {
+        assert_eq!(
+            solutions(&run(&a, q, Optimizations::ALL)),
+            solutions(&run(&a, q, without)),
+            "{q}"
+        );
+    }
+}

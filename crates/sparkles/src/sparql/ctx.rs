@@ -52,16 +52,19 @@ pub struct Optimizations {
     pub batched_paths: bool,
     /// ORDER BY one numeric variable with LIMIT ranks rounded keys first
     pub topk_prefilter: bool,
+    /// scans decode (and cache) only the key columns they read
+    pub selective_columns: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 6] = [
+    pub const NAMES: [&str; 7] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
         "metadata_counts",
         "batched_paths",
         "topk_prefilter",
+        "selective_columns",
     ];
 
     /// Everything on.
@@ -72,6 +75,7 @@ impl Optimizations {
         metadata_counts: true,
         batched_paths: true,
         topk_prefilter: true,
+        selective_columns: true,
     };
 
     /// Everything off: the generic operators only.
@@ -82,6 +86,7 @@ impl Optimizations {
         metadata_counts: false,
         batched_paths: false,
         topk_prefilter: false,
+        selective_columns: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -92,6 +97,7 @@ impl Optimizations {
             "metadata_counts" => &mut self.metadata_counts,
             "batched_paths" => &mut self.batched_paths,
             "topk_prefilter" => &mut self.topk_prefilter,
+            "selective_columns" => &mut self.selective_columns,
             _ => return None,
         })
     }

@@ -281,15 +281,35 @@ impl Snapshot {
         perm: Perm,
         lo: Key,
         hi: Key,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, f)
+    }
+
+    /// [`scan_between`](Self::scan_between) for a reader that only looks at the key
+    /// columns in `mask` of base blocks: the others may be left undecoded (and read as
+    /// 0). When the delta has changes in the range, every column is decoded, because
+    /// the merge compares full keys.
+    pub fn scan_between_cols(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        mask: crate::index::ColMask,
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
         let pi = perm.index();
         let mut ins = Delta::key_range(&self.delta.ins[pi], lo, hi).peekable();
         let mut del = Delta::key_range(&self.delta.del[pi], lo, hi).peekable();
+        let mask = if ins.peek().is_some() || del.peek().is_some() {
+            crate::index::ALL_COLS
+        } else {
+            mask
+        };
         let base = self.perm(perm);
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_key_range_until(&self.cache, &lo, &hi, |blk, s, e| {
+            let r = base.for_each_key_range_cols(&self.cache, &lo, &hi, mask, |blk, s, e| {
                 if stop {
                     return Ok(!stop);
                 }

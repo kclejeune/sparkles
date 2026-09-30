@@ -101,27 +101,40 @@ impl Perm {
     }
 }
 
-/// A decoded block: four columns of equal length.
+/// Set of key columns (bit `c` = column `c`) a reader needs from a block.
+pub type ColMask = u8;
+/// Every column.
+pub const ALL_COLS: ColMask = 0b1111;
+
+/// Mask of the leading key columns that decide whether a key lies in `[lo, hi]`: the
+/// columns after them are bounded by 0 and `u64::MAX`, which every key satisfies.
+pub fn bound_cols(lo: &Key, hi: &Key) -> ColMask {
+    let n = (0..4)
+        .rev()
+        .find(|&c| lo[c] != 0 || hi[c] != u64::MAX)
+        .map_or(0, |c| c + 1);
+    ((1u16 << n) - 1) as ColMask
+}
+
+/// A decoded block: four columns of equal length. Columns a reader did not ask for (see
+/// [`BlockCache::get_cols`]) are empty and read as 0 through [`Block::key`].
 pub struct Block {
-    pub cols: [Vec<u64>; 4],
+    pub cols: [Arc<[u64]>; 4],
+    rows: usize,
 }
 
 impl Block {
     #[inline]
     pub fn len(&self) -> usize {
-        self.cols[0].len()
+        self.rows
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     #[inline]
     pub fn key(&self, i: usize) -> Key {
-        [
-            self.cols[0][i],
-            self.cols[1][i],
-            self.cols[2][i],
-            self.cols[3][i],
-        ]
+        let c = |c: usize| self.cols[c].get(i).copied().unwrap_or(0);
+        [c(0), c(1), c(2), c(3)]
     }
     #[inline]
     fn cmp_prefix(&self, i: usize, prefix: &[u64]) -> std::cmp::Ordering {
@@ -133,11 +146,23 @@ impl Block {
         }
         std::cmp::Ordering::Equal
     }
-    /// Row range `[s, e)` whose keys lie in `[lo, hi]` (full-key comparison).
+    /// Row range `[s, e)` whose keys lie in `[lo, hi]`; needs the columns of
+    /// [`bound_cols`].
     pub fn key_range(&self, lo: &Key, hi: &Key) -> (usize, usize) {
         let n = self.len();
-        let s = partition(n, |i| self.key(i) < *lo);
-        let e = s + partition(n - s, |i| self.key(s + i) <= *hi);
+        let d = bound_cols(lo, hi).count_ones() as usize;
+        let lead = |i: usize| -> Key {
+            let mut k = [0; 4];
+            for (c, x) in k.iter_mut().enumerate().take(d) {
+                *x = self.cols[c][i];
+            }
+            k
+        };
+        let (mut l, mut h) = ([0; 4], [0; 4]);
+        l[..d].copy_from_slice(&lo[..d]);
+        h[..d].copy_from_slice(&hi[..d]);
+        let s = partition(n, |i| lead(i) < l);
+        let e = s + partition(n - s, |i| lead(s + i) <= h);
         (s, e)
     }
     /// Row range `[lo, hi)` whose keys start with `prefix`.
@@ -167,8 +192,9 @@ impl Block {
         }
         (start, lo)
     }
+    /// Bytes of the decoded columns held.
     pub fn bytes(&self) -> usize {
-        self.len() * 32
+        self.cols.iter().map(|c| c.len() * 8).sum()
     }
 }
 
@@ -397,18 +423,25 @@ impl PermIndex {
 
     pub fn decode_block(&self, b: usize) -> Result<Block> {
         let m = &self.blocks[b];
+        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        for (c, col) in cols.iter_mut().enumerate() {
+            *col = self.decode_col(b, c)?.into();
+        }
+        Ok(Block {
+            cols,
+            rows: m.rows as usize,
+        })
+    }
+
+    /// Decode one column of a block (columns are compressed separately).
+    pub fn decode_col(&self, b: usize, c: usize) -> Result<Vec<u64>> {
+        let m = &self.blocks[b];
         let data = self
             .data
             .as_ref()
             .ok_or_else(|| Error::Corrupt("no data".into()))?;
-        let mut off = m.offset as usize;
-        let mut cols: [Vec<u64>; 4] = Default::default();
-        for (col, &len) in cols.iter_mut().zip(&m.col_len) {
-            let len = len as usize;
-            *col = decode_column(&data[off..off + len], m.rows as usize)?;
-            off += len;
-        }
-        Ok(Block { cols })
+        let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
+        decode_column(&data[off..off + m.col_len[c] as usize], m.rows as usize)
     }
 
     /// Block index range `[lo, hi)` that may contain keys with this prefix
@@ -439,25 +472,32 @@ fn next_uid() -> u64 {
 }
 
 /// Process-wide cache of decoded blocks, weighted by bytes.
+/// Cache of decoded block columns, keyed by (permutation instance, block, column):
+/// readers decode and keep only the columns they use.
 pub struct BlockCache {
-    cache: quick_cache::sync::Cache<(u64, u32), Arc<Block>, BlockWeighter>,
+    cache: quick_cache::sync::Cache<(u64, u32, u8), Arc<[u64]>, BlockWeighter>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 struct BlockWeighter;
-impl quick_cache::Weighter<(u64, u32), Arc<Block>> for BlockWeighter {
-    fn weight(&self, _k: &(u64, u32), v: &Arc<Block>) -> u64 {
-        v.bytes().max(1) as u64
+impl quick_cache::Weighter<(u64, u32, u8), Arc<[u64]>> for BlockWeighter {
+    fn weight(&self, _k: &(u64, u32, u8), v: &Arc<[u64]>) -> u64 {
+        (v.len() * 8).max(1) as u64
     }
+}
+
+fn empty_col() -> Arc<[u64]> {
+    static EMPTY: std::sync::OnceLock<Arc<[u64]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
 }
 
 impl BlockCache {
     pub fn new(bytes: u64) -> BlockCache {
         BlockCache {
             cache: quick_cache::sync::Cache::with_weighter(
-                (bytes / (BLOCK_ROWS as u64 * 32)).max(16) as usize,
+                (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
                 bytes,
                 BlockWeighter,
             ),
@@ -466,17 +506,37 @@ impl BlockCache {
         }
     }
 
-    pub fn get(&self, idx: &PermIndex, b: usize) -> Result<Arc<Block>> {
-        let key = (idx.uid, b as u32);
-        if let Some(v) = self.cache.get(&key) {
-            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(v);
+    /// A block with all four columns.
+    pub fn get(&self, idx: &PermIndex, b: usize) -> Result<Block> {
+        self.get_cols(idx, b, ALL_COLS)
+    }
+
+    /// A block with the columns in `mask` (the others are empty).
+    pub fn get_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Result<Block> {
+        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        for (c, col) in cols.iter_mut().enumerate() {
+            if mask & (1 << c) == 0 {
+                continue;
+            }
+            let key = (idx.uid, b as u32, c as u8);
+            *col = match self.cache.get(&key) {
+                Some(v) => {
+                    self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    v
+                }
+                None => {
+                    self.misses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let v: Arc<[u64]> = idx.decode_col(b, c)?.into();
+                    self.cache.insert(key, v.clone());
+                    v
+                }
+            };
         }
-        self.misses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let blk = Arc::new(idx.decode_block(b)?);
-        self.cache.insert(key, blk.clone());
-        Ok(blk)
+        Ok(Block {
+            cols,
+            rows: idx.blocks[b].rows as usize,
+        })
     }
 
     pub fn bytes(&self) -> u64 {
@@ -526,7 +586,7 @@ impl PermIndex {
                 total += self.blocks[e].row_start + self.blocks[e].rows as u64 - m.row_start;
                 b = e + 1;
             } else {
-                let blk = cache.get(self, b)?;
+                let blk = cache.get_cols(self, b, bound_cols(&lo_key, &hi_key))?;
                 let (s, e) = blk.key_range(&lo_key, &hi_key);
                 total += (e - s) as u64;
                 b += 1;
@@ -588,13 +648,28 @@ impl PermIndex {
         cache: &BlockCache,
         lo_key: &Key,
         hi_key: &Key,
+        f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
+        self.for_each_key_range_cols(cache, lo_key, hi_key, ALL_COLS, f)
+    }
+
+    /// [`for_each_key_range_until`](Self::for_each_key_range_until) decoding only the
+    /// columns in `mask` (plus the leading columns needed to find a partial range).
+    pub fn for_each_key_range_cols(
+        &self,
+        cache: &BlockCache,
+        lo_key: &Key,
+        hi_key: &Key,
+        mask: ColMask,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
+        let bounds = bound_cols(lo_key, hi_key);
         for b in lo..hi {
             let m = &self.blocks[b];
-            let blk = cache.get(self, b)?;
-            let go_on = if m.first >= *lo_key && m.last <= *hi_key {
+            let whole = m.first >= *lo_key && m.last <= *hi_key;
+            let blk = cache.get_cols(self, b, if whole { mask } else { mask | bounds })?;
+            let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
                 let (s, e) = blk.key_range(lo_key, hi_key);
