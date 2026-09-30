@@ -160,6 +160,8 @@ pub struct Ctx {
     /// SERVICE fails with [`crate::Error::NotPermitted`] (see
     /// [`QueryOptions::forbid_service`](super::QueryOptions::forbid_service))
     pub forbid_service: bool,
+    /// network policy of SERVICE
+    pub outbound: crate::outbound::OutboundPolicy,
     /// consult / fill the store's result cache
     pub use_cache: bool,
     pub opt: Optimizations,
@@ -187,6 +189,7 @@ impl Ctx {
             mem_peak: AtomicU64::new(0),
             allow_service: true,
             forbid_service: false,
+            outbound: Default::default(),
             use_cache: true,
             opt: Optimizations::default(),
         }

@@ -8,6 +8,7 @@ use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{Block, O, P, Perm, S, pad};
+use crate::outbound::Failure;
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2477,10 +2478,6 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     let Some(oxrdf::Term::NamedNode(url)) = ctx.term(*id) else {
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| Error::Service(e.to_string()))?;
     // the host of the endpoint (no user info, no port)
     let host = oxiri::Iri::parse(url.as_str())
         .ok()
@@ -2502,49 +2499,46 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
         http.response.status_code = tracing::field::Empty,
     );
     let _entered = span.enter();
-    let resp = crate::outbound::apply(
-        client
-            .post(url.as_str())
-            .header(
-                "Accept",
-                "application/sparql-results+json, application/sparql-results+xml;q=0.8",
-            )
-            .form(&[("query", query)]),
-    )
-    .send()
-    .map_err(|e| Error::Service(e.to_string()))?;
-    span.record(
-        "http.response.status_code",
-        i64::from(resp.status().as_u16()),
-    );
-    if !resp.status().is_success() {
+    // within the query's deadline too
+    let timeout = ctx.deadline.map_or(ctx.outbound.timeout, |d| {
+        d.saturating_duration_since(Instant::now())
+    });
+    let resp = ctx
+        .outbound
+        .send(url.as_str(), timeout, |client, u| {
+            client
+                .post(u)
+                .header(
+                    "Accept",
+                    "application/sparql-results+json, application/sparql-results+xml;q=0.8",
+                )
+                .form(&[("query", query)])
+        })
+        .map_err(|f| match f {
+            Failure::Refused(m) => Error::NotPermitted(format!("SERVICE <{}>: {m}", url.as_str())),
+            Failure::Failed(m) => Error::Service(format!("<{}>: {m}", url.as_str())),
+        })?;
+    span.record("http.response.status_code", i64::from(resp.status.as_u16()));
+    if !resp.status.is_success() {
         return Err(Error::Service(format!(
             "{} returned {}",
             url.as_str(),
-            resp.status()
+            resp.status
         )));
     }
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let body = resp.bytes().map_err(|e| Error::Service(e.to_string()))?;
-    let fmt = if ct.contains("xml") {
+    let fmt = if resp.content_type.contains("xml") {
         sparesults::QueryResultsFormat::Xml
     } else {
         sparesults::QueryResultsFormat::Json
     };
+    // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
-    match parser
-        .for_slice(&body)
-        .map_err(|e| Error::Service(e.to_string()))?
-    {
-        sparesults::SliceQueryResultsParserOutput::Solutions(sols) => {
+    let failed = |e: &dyn std::fmt::Display| Error::Service(format!("<{}>: {e}", url.as_str()));
+    match parser.for_reader(resp.body).map_err(|e| failed(&e))? {
+        sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
-                let sol = sol.map_err(|e| Error::Service(e.to_string()))?;
+                let sol = sol.map_err(|e| failed(&e))?;
                 let row: Vec<Id> = vars
                     .iter()
                     .map(|v| {
@@ -2555,7 +2549,7 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
                 t.push_row(&row);
             }
         }
-        sparesults::SliceQueryResultsParserOutput::Boolean(_) => {}
+        sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}
     }
     Ok(t)
 }

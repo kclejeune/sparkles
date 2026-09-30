@@ -535,6 +535,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
         allow_service: st.allow_service,
+        outbound: st.outbound.clone(),
         default_graph_extra: if reasoning {
             vec![INFERRED_GRAPH.to_string()]
         } else {
@@ -1117,6 +1118,7 @@ async fn update_endpoint(
     crate::obs::log_query_text(&update);
     let mut opts = QueryOptions {
         allow_service: st.allow_service,
+        outbound: st.outbound.clone(),
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,

@@ -143,6 +143,8 @@ pub struct AppState {
     /// response compression
     pub http_compression: crate::compress::HttpCompression,
     pub allow_service: bool,
+    /// where SERVICE and `LOAD <http…>` may connect (`serve --outbound-*`)
+    pub outbound: sparkles::outbound::OutboundPolicy,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
     /// Per-request budgets.
@@ -303,6 +305,7 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: true,
+            outbound: Default::default(),
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             limits: Limits::default(),
             access_log: true,
@@ -357,6 +360,7 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: false,
+            outbound: Default::default(),
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             limits: Limits::default(),
             access_log: false,

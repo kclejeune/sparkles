@@ -181,6 +181,8 @@ fn open_state(
 ) -> (Arc<AppState>, Router) {
     let mut st = AppState::new(dir, StoreOptions::default(), Duration::from_secs(30)).unwrap();
     st.read_only = f.read_only;
+    // SERVICE and LOAD tests call a listener on 127.0.0.1
+    st.outbound.allow_private = true;
     if f.enabled {
         st.auth = Some(Arc::new(Auth::open(config, dir).unwrap().0));
     }

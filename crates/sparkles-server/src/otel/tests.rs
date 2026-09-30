@@ -69,9 +69,11 @@ struct Server {
 fn server() -> Server {
     pipeline();
     let dir = tempfile::tempdir().unwrap();
-    let st = Arc::new(
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
-    );
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    // SERVICE calls go to a stub on 127.0.0.1
+    st.outbound.allow_private = true;
+    let st = Arc::new(st);
     let ds = st.attach("ds", DbType::Mem, None).unwrap();
     ds.store
         .load(&[Source::from_bytes(
