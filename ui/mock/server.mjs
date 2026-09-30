@@ -297,7 +297,13 @@ function metricsSnapshot() {
         walBytes: ds.type === 'mem' ? 0 : (ds.deltaInserts + ds.deltaDeletes) * 33,
         diskBytes: st.diskBytes,
         resultRows: perDataset.get(ds.name) ?? 0,
-        budgetExceeded: { rows: 0, memory: 0, 'result-bytes': 0 },
+        budgetExceeded: {
+          rows: 0,
+          memory: 0,
+          'result-bytes': 0,
+          'decompressed-bytes': 0,
+          'outbound-bytes': 0,
+        },
         blockCache: {
           bytes: Math.min(2 ** 30, st.quads * 24),
           capacityBytes: 2 ** 30,

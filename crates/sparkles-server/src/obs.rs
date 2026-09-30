@@ -1066,7 +1066,7 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_budget_exceeded_total",
         "counter",
-        "Requests that exceeded a budget (rows, memory, result-bytes).",
+        "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes).",
     );
     for (ds, m) in &series {
         let ds = escape_label(ds);
