@@ -717,9 +717,15 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query response. Graph Store GET is streamed from one snapshot in 64 KiB chunks, so it
-  needs no budget and suits whole-dataset exports; an error after the first byte aborts
-  the transfer, so the client sees a truncated response rather than a status code.
+  query response. Graph Store GET has no such budget and suits whole-dataset exports.
+
+**Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
+of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
+gets its status code. A larger body is streamed in 64 KiB chunks as it is serialized, so
+server memory stays flat; an error after that point (e.g. the budget exceeded at 1.2 GiB)
+aborts the transfer, and the client sees a truncated response instead of a status code.
+A query result whose smallest encoding already exceeds the budget is refused with `507`
+before anything is sent. A client that disconnects stops the serialization.
 * `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
 
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`

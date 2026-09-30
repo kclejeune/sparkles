@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 mod schema;
+mod stream;
 
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
@@ -466,82 +467,111 @@ async fn query_endpoint(
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let prefixes = ds.store.prefixes();
-    blocking(move || {
-        let t = std::time::Instant::now();
-        let snap = ds.store.snapshot();
-        let seq = snap.commit;
-        let r = sparkles::sparql::query(snap, &query, &opts)?;
-        let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
-        let sparkles_doc =
-            sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
-        if let Some(l) = limit
-            && r.kind == QueryKind::Select
-        {
-            // refuse before serializing when even the smallest encoding is too large
-            let rows = send.map_or(r.len(), |s| s.min(r.len()));
-            let min = sfmt.min_bytes(rows, r.vars.len());
-            if min > l {
-                return Err(Error::BudgetExceeded(sparkles::Budget {
-                    kind: BudgetKind::ResultBytes,
-                    limit: l,
-                    requested: min,
-                })
-                .into());
-            }
+    let with_extra = !opts.default_graph_extra.is_empty();
+    let (r, seq) = blocking({
+        let ds = ds.clone();
+        move || {
+            let t = std::time::Instant::now();
+            let snap = ds.store.snapshot();
+            let seq = snap.commit;
+            let r = sparkles::sparql::query(snap, &query, &opts)?;
+            tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
+            Ok((r, seq))
         }
-        let ts = std::time::Instant::now();
-        let mut w = LimitedWriter::new(Vec::new(), limit, Some(cancel));
-        let ct: String = match r.kind {
-            _ if sparkles_doc => {
-                // Build the document once, then patch the serialization time into it.
-                let mut doc = results::sparkles_json(&r, send);
-                let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
-                if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
-                    let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
-                    timing.insert("serializeMs".into(), ser_ms.into());
-                    timing.insert("totalMs".into(), (total + ser_ms).into());
-                }
-                if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
-                    meta.insert("commit".into(), seq.into());
-                    meta.insert("datasetId".into(), ds.store.dataset_id().to_string().into());
-                }
-                serde_json::to_writer(&mut w, &doc).map_err(|e| w.classify(Error::Io(e.into())))?;
-                SolutionsFormat::Sparkles.media_type().into()
-            }
-            QueryKind::Select | QueryKind::Ask => {
-                results::write_solutions(&r, sfmt, &mut w, send).map_err(|e| w.classify(e))?;
-                sfmt.media_type().into()
-            }
-            _ => {
-                results::write_graph(&r, rfmt, &prefixes, &mut w).map_err(|e| w.classify(e))?;
-                results::rdf_media_type(rfmt).into()
-            }
-        };
-        let serialize_ms = ts.elapsed().as_secs_f64() * 1000.0;
-        tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-        let buf = w.into_inner();
-        let report = RequestReport {
-            operation: Some(Op::Query),
-            rows: Some(r.len() as u64),
-            response_bytes: Some(buf.len() as u64),
-            serialize_ms: Some(serialize_ms),
-            mem_peak_bytes: Some(r.mem_peak_bytes),
-            timing: Some(r.timing),
-            ..Default::default()
-        };
-        let resp = with_commit(
-            ([(header::CONTENT_TYPE, ct)], buf).into_response(),
-            &ds,
-            seq,
-        );
-        Ok(report.attach(with_inferences(
-            resp,
-            &ds,
-            !opts.default_graph_extra.is_empty(),
-            seq,
-        )))
     })
-    .await
+    .await?;
+    let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
+    let sparkles_doc =
+        sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
+    if let Some(l) = limit
+        && r.kind == QueryKind::Select
+    {
+        // refuse before serializing when even the smallest encoding is too large
+        let rows = send.map_or(r.len(), |s| s.min(r.len()));
+        let min = sfmt.min_bytes(rows, r.vars.len());
+        if min > l {
+            return Err(Error::BudgetExceeded(sparkles::Budget {
+                kind: BudgetKind::ResultBytes,
+                limit: l,
+                requested: min,
+            })
+            .into());
+        }
+    }
+    let ct: String = if sparkles_doc {
+        SolutionsFormat::Sparkles.media_type().into()
+    } else if is_graph {
+        results::rdf_media_type(rfmt).into()
+    } else {
+        sfmt.media_type().into()
+    };
+    let report = RequestReport {
+        operation: Some(Op::Query),
+        rows: Some(r.len() as u64),
+        mem_peak_bytes: Some(r.mem_peak_bytes),
+        timing: Some(r.timing.clone()),
+        ..Default::default()
+    };
+    let dataset_id = ds.store.dataset_id().to_string();
+    let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
+        if sparkles_doc {
+            // Build the document once, then patch the serialization time into it.
+            let ts = std::time::Instant::now();
+            let mut doc = results::sparkles_json(&r, send);
+            let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
+            if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
+                let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
+                timing.insert("serializeMs".into(), ser_ms.into());
+                timing.insert("totalMs".into(), (total + ser_ms).into());
+            }
+            if let Some(meta) = doc.pointer_mut("/meta").and_then(J::as_object_mut) {
+                meta.insert("commit".into(), seq.into());
+                meta.insert("datasetId".into(), dataset_id.into());
+            }
+            serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
+        } else if is_graph {
+            results::write_graph(&r, rfmt, &prefixes, w)
+        } else {
+            results::write_solutions(&r, sfmt, w, send)
+        }
+    };
+    let (metrics_st, name) = (st.clone(), ds.name.clone());
+    let body = stream::serialize(limit, write, move |end| {
+        metrics_st
+            .metrics
+            .add_response_bytes(Some(&name), Op::Query, end.bytes);
+        stream_end_log("query", &end);
+    })
+    .await?;
+    let (body, report) = match body {
+        stream::Serialized::Whole { body, serialize_ms } => {
+            let report = RequestReport {
+                response_bytes: Some(body.len() as u64),
+                serialize_ms: Some(serialize_ms),
+                ..report
+            };
+            (axum::body::Body::from(body), report)
+        }
+        stream::Serialized::Streamed(body) => (body, report),
+    };
+    let resp = with_commit(
+        ([(header::CONTENT_TYPE, ct)], body).into_response(),
+        &ds,
+        seq,
+    );
+    Ok(report.attach(with_inferences(resp, &ds, with_extra, seq)))
+}
+
+/// Log how a streamed response ended (its bytes are counted in the metrics).
+fn stream_end_log(what: &str, end: &stream::StreamEnd) {
+    let (bytes, ms) = (end.bytes, end.serialize_ms);
+    match &end.error {
+        None => tracing::debug!(bytes, serialize_ms = ms, "{what} stream finished"),
+        Some(_) if end.disconnected => {
+            tracing::debug!(bytes, "{what} stream: client disconnected")
+        }
+        Some(e) => tracing::warn!(bytes, "{what} stream aborted: {e}"),
+    }
 }
 
 fn params_wants_sparkles(h: &HeaderMap) -> bool {
@@ -938,140 +968,75 @@ fn gsp_target(params: &Params) -> Target {
     }
 }
 
-/// Size of the chunks of a streamed response body.
-const STREAM_CHUNK: usize = 64 << 10;
-
-/// A `Write` that hands [`STREAM_CHUNK`]-sized chunks to a streamed response body.
-/// Writes fail once the client has gone away.
-struct ChunkWriter {
-    tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
-    buf: Vec<u8>,
-    sent: u64,
-}
-
-impl ChunkWriter {
-    fn send(&mut self) -> std::io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_CHUNK));
-        self.sent += chunk.len() as u64;
-        self.tx
-            .blocking_send(Ok(Bytes::from(chunk)))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
-    }
-}
-
-impl std::io::Write for ChunkWriter {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(b);
-        if self.buf.len() >= STREAM_CHUNK {
-            self.send()?;
-        }
-        Ok(b.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
-/// snapshot, serialized on a blocking thread and streamed, so memory stays flat and no
-/// result-size budget applies. An error after the first byte aborts the response (the
-/// client sees a truncated transfer); a client disconnect stops the serialization.
-fn stream_graph(
+/// snapshot, serialized while scanning (see [`stream`]), so no result-size budget
+/// applies. Returns the body and, for a body returned whole, its bytes and quads.
+async fn graph_body(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
     snap: Arc<sparkles::store::Snapshot>,
     g: Option<Id>,
     fmt: RdfFormat,
-) -> axum::body::Body {
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _span = span.enter();
-        let mut w = ChunkWriter {
-            tx: tx.clone(),
-            buf: Vec::with_capacity(STREAM_CHUNK),
-            sent: 0,
-        };
+) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
+    let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = quads.clone();
+    let prefixes = ds.store.prefixes();
+    let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let mut ser = RdfSerializer::from_format(fmt);
         if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-            for (p, ns) in ds.store.prefixes() {
+            for (p, ns) in prefixes {
                 if let Ok(s) = ser.clone().with_prefix(p, ns) {
                     ser = s;
                 }
             }
         }
-        let mut quads = 0u64;
-        let written = (|| -> sparkles::Result<()> {
-            let mut s = ser.for_writer(&mut w);
-            let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
-            let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
-                if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
-                    if g.is_some() {
-                        s.serialize_triple(oxrdf::TripleRef::new(
-                            &q.subject,
-                            &q.predicate,
-                            &q.object,
-                        ))?;
-                    } else {
-                        s.serialize_quad(&q)?;
-                    }
-                    quads += 1;
+        let mut s = ser.for_writer(w);
+        let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
+        let mut n = 0u64;
+        let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
+            if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
+                if g.is_some() {
+                    s.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+                } else {
+                    s.serialize_quad(&q)?;
                 }
-                Ok(())
-            };
-            // serialize while scanning: nothing but the current block is held
-            snap.scan(Perm::Gspo, &prefix, |c| {
-                match c {
-                    Chunk::Block(b, start, end) => {
-                        for i in start..end {
-                            write(&b.key(i))?;
-                        }
-                    }
-                    Chunk::Row(k) => write(&k)?,
-                }
-                Ok(true)
-            })?;
-            s.finish()?;
+                n += 1;
+            }
             Ok(())
-        })()
-        .and_then(|()| Ok(w.send()?));
+        };
+        // serialize while scanning: nothing but the current block is held
+        snap.scan(Perm::Gspo, &prefix, |c| {
+            match c {
+                Chunk::Block(b, start, end) => {
+                    for i in start..end {
+                        write(&b.key(i))?;
+                    }
+                }
+                Chunk::Row(k) => write(&k)?,
+            }
+            Ok(true)
+        })?;
+        counted.store(n, std::sync::atomic::Ordering::Relaxed);
+        s.finish()?;
+        Ok(())
+    };
+    let name = ds.name.clone();
+    let body = stream::serialize(None, write, move |end| {
         st.metrics
-            .add_response_bytes(Some(&ds.name), Op::Gsp, w.sent);
-        match written {
-            Ok(()) => tracing::debug!(quads, bytes = w.sent, "graph store stream finished"),
-            Err(_) if tx.is_closed() => {
-                tracing::debug!(
-                    quads,
-                    bytes = w.sent,
-                    "graph store stream: client disconnected"
-                )
-            }
-            Err(e) => {
-                tracing::warn!(quads, bytes = w.sent, "graph store stream aborted: {e}");
-                let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-            }
+            .add_response_bytes(Some(&name), Op::Gsp, end.bytes);
+        stream_end_log("graph store", &end);
+    })
+    .await?;
+    Ok(match body {
+        stream::Serialized::Whole { body, .. } => {
+            let whole = (
+                body.len() as u64,
+                quads.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            (axum::body::Body::from(body), Some(whole))
         }
-    });
-    axum::body::Body::from_stream(ChunkStream(rx))
-}
-
-/// The receiving end of a [`ChunkWriter`] as a body stream. It keeps answering `None`
-/// after the end, since the compression layer polls once more.
-struct ChunkStream(tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>);
-
-impl futures_util::Stream for ChunkStream {
-    type Item = std::io::Result<Bytes>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
+        stream::Serialized::Streamed(body) => (body, None),
+    })
 }
 
 async fn gsp(
@@ -1112,14 +1077,19 @@ async fn gsp(
             .await?;
             let seq = snap.commit;
             let ct = [(header::CONTENT_TYPE, results::rdf_media_type(fmt))];
+            let mut report = RequestReport {
+                operation: Some(Op::Gsp),
+                ..Default::default()
+            };
             let resp = if head {
                 ct.into_response()
             } else {
-                (ct, stream_graph(st.clone(), ds.clone(), snap, g, fmt)).into_response()
-            };
-            let report = RequestReport {
-                operation: Some(Op::Gsp),
-                ..Default::default()
+                let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
+                if let Some((bytes, quads)) = whole {
+                    report.response_bytes = Some(bytes);
+                    report.rows = Some(quads);
+                }
+                (ct, body).into_response()
             };
             Ok(report.attach(with_commit(resp, &ds, seq)))
         }
