@@ -1621,7 +1621,7 @@ async fn graph_body(
         s.finish()?;
         Ok(())
     };
-    let limit = st.limits.max_result_bytes;
+    let limit = st.limits.max_export_bytes;
     let (name, st) = (ds.name.clone(), Arc::downgrade(&st));
     drop(ds);
     let body = stream::serialize(limit, write, move |end| {

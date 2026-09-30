@@ -253,8 +253,10 @@ pub fn valid_name(name: &str) -> bool {
 pub struct Limits {
     /// estimated memory of a query's (or update WHERE clause's) intermediate results
     pub query_memory_bytes: Option<u64>,
-    /// serialized body of query and Graph Store GET responses
+    /// serialized body of a query response
     pub max_result_bytes: Option<u64>,
+    /// serialized body of a Graph Store GET (a graph or whole-dataset export)
+    pub max_export_bytes: Option<u64>,
     /// rows of any intermediate result
     pub max_rows: usize,
     /// SPARQL updates without a `timeout` parameter (`None`: no limit, the default)
@@ -280,6 +282,7 @@ impl Default for Limits {
         Limits {
             query_memory_bytes: Some(8 << 30),
             max_result_bytes: Some(1 << 30),
+            max_export_bytes: None,
             max_rows: 200_000_000,
             update_timeout: None,
             max_decompressed_bytes: Some(64 << 30),
@@ -295,7 +298,8 @@ impl Default for Limits {
 
 impl Limits {
     /// `{timeoutSeconds, updateTimeoutSeconds, maxTimeoutSeconds, queryMemoryBytes,
-    /// maxResultBytes, maxRows, max…BodyBytes, maxUploadBytes}`; 0 means unlimited.
+    /// maxResultBytes, maxExportBytes, maxRows, max…BodyBytes, maxUploadBytes}`; 0 means
+    /// unlimited.
     pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
         let secs = |t: Option<std::time::Duration>| t.map_or(0.0, |t| t.as_secs_f64());
         serde_json::json!({
@@ -304,6 +308,7 @@ impl Limits {
             "maxTimeoutSeconds": secs(self.max_timeout.map(|m| m.max(timeout))),
             "queryMemoryBytes": self.query_memory_bytes.unwrap_or(0),
             "maxResultBytes": self.max_result_bytes.unwrap_or(0),
+            "maxExportBytes": self.max_export_bytes.unwrap_or(0),
             "maxRows": self.max_rows,
             "maxQueryBodyBytes": self.max_query_body_bytes.unwrap_or(0),
             "maxUpdateBodyBytes": self.max_update_body_bytes.unwrap_or(0),

@@ -386,10 +386,13 @@ enum Cmd {
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
         query_memory_mb: u64,
-        /// Budget for the serialized body of query and Graph Store GET responses, in MiB
-        /// (0: unlimited)
+        /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
+        /// Budget for the serialized body of a Graph Store GET (a graph or whole-dataset
+        /// export), in MiB (0: unlimited)
+        #[arg(long, default_value_t = 0)]
+        max_export_mb: u64,
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
@@ -579,6 +582,9 @@ enum Cmd {
         /// Allow plain http to a --server other than localhost
         #[arg(long)]
         insecure_http: bool,
+        // where SERVICE may connect in a local run (a --server applies its own policy)
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Run a SPARQL update against a database
     Update {
@@ -596,6 +602,9 @@ enum Cmd {
         /// Allow plain http to a --server other than localhost
         #[arg(long)]
         insecure_http: bool,
+        // where SERVICE and LOAD may connect in a local run (a --server applies its own)
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Write the database as N-Quads, to stdout or a file
     Dump {
@@ -1172,6 +1181,7 @@ fn run() -> Result<()> {
             metrics_max_datasets,
             query_memory_mb,
             max_result_mb,
+            max_export_mb,
             max_rows,
             update_timeout,
             vector_memory_mb,
@@ -1224,6 +1234,7 @@ fn run() -> Result<()> {
             st.limits = state::Limits {
                 query_memory_bytes: mib(query_memory_mb),
                 max_result_bytes: mib(max_result_mb),
+                max_export_bytes: mib(max_export_mb),
                 max_rows,
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
@@ -1454,6 +1465,7 @@ fn run() -> Result<()> {
             server,
             dataset,
             insecure_http,
+            outbound,
         } => {
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
@@ -1475,11 +1487,13 @@ fn run() -> Result<()> {
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             }
+            let outbound = outbound.local_policy()?;
             let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
                 max_memory_bytes: (memory_mb > 0).then_some(memory_mb << 20),
                 allow_service: true,
+                outbound,
                 prefixes: store.prefixes().into_iter().collect(),
                 ..Default::default()
             };
@@ -1540,6 +1554,7 @@ fn run() -> Result<()> {
             server,
             dataset,
             insecure_http,
+            outbound,
         } => {
             let u = match (update, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
@@ -1553,10 +1568,12 @@ fn run() -> Result<()> {
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             };
+            let outbound = outbound.local_policy()?;
             let store = open_for_write(&loc, opts, no_validate)?;
             let qopts = QueryOptions {
                 prefixes: store.prefixes().into_iter().collect(),
                 allow_service: true,
+                outbound,
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;

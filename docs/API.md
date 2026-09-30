@@ -37,7 +37,7 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
 
 ### Request ids and the access log
@@ -1145,8 +1145,9 @@ the request with `507 Insufficient Storage` and
   per value. It is checked before large intermediate results are built, so an oversized
   query fails fast. It is an estimate, not a limit on the process's memory.
 * `result-bytes` (`--max-result-mb`, default 1024): the serialized, uncompressed body of a
-  query or Graph Store GET response. A whole-dataset export larger than that needs a
-  higher budget (or `0`), or `sparkles dump` next to the server.
+  SPARQL query response. Graph Store GET (a graph or whole-dataset export) has its own
+  budget, `--max-export-mb`, unlimited (`0`) by default; past it the export fails the
+  same way and reports the same `result-bytes` budget.
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
@@ -1219,7 +1220,9 @@ grants and its roles'; there are no deny rules. `--read-only` still applies to e
 after authorization. `federate` does not open every URL: `SERVICE` and `LOAD <http…>`
 also follow the server's outbound policy (public addresses only unless
 `--outbound-allow-private` or `--outbound-allow`; see the README, Outbound requests), and a
-refused destination answers `403` as well.
+refused destination answers `403` as well. The local `sparkles query` and `sparkles update`
+(no server, no permissions) allow loopback and private destinations by default and take
+`--outbound-block-private` for the strict policy.
 
 A **token** never exceeds its owner: at each use its permissions are its scope
 intersected with its owner's current grants (or its parent token's, for a token minted
@@ -1512,7 +1515,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | largest `maxRows` / `maxBytes` of `sparql_query` |
 | `--max-concurrent N` | `4` | tool calls running at once; further calls wait (and their timeout runs) |
 | `--allow-service` | off | allow `SERVICE` in queries |
-| `--outbound-allow-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | off, none, `60`, `256` | where an allowed `SERVICE` may connect, as for `sparkles serve` |
+| `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | where an allowed `SERVICE` may connect, as for `sparkles serve` |
 | `--disable-tool NAME` | | do not offer a tool |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.

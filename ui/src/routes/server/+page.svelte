@@ -423,9 +423,15 @@
           <dd>{limit(limits.queryMemoryBytes)}</dd>
         </div>
         <div>
-          <dt>Result size</dt>
+          <dt>Query result size</dt>
           <dd>{limit(limits.maxResultBytes)}</dd>
         </div>
+        {#if limits.maxExportBytes !== undefined}
+          <div>
+            <dt>Graph Store export size</dt>
+            <dd>{limit(limits.maxExportBytes)}</dd>
+          </div>
+        {/if}
         <div>
           <dt>Intermediate rows</dt>
           <dd>{limits.maxRows ? fmtInt(limits.maxRows) : 'unlimited'}</dd>

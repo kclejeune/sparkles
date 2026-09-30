@@ -415,6 +415,7 @@ async fn server_info_lists_the_limits() {
             "maxTimeoutSeconds": 1800.0,
             "queryMemoryBytes": 8u64 << 30,
             "maxResultBytes": 0,
+            "maxExportBytes": 0,
             "maxRows": 200_000_000,
             "maxQueryBodyBytes": 16u64 << 20,
             "maxUpdateBodyBytes": 256u64 << 20,
@@ -526,17 +527,17 @@ async fn result_budget_fails_with_507() {
     // the Sparkles JSON format
     let r = get_with(&s.app, ALL, "accept", "application/x-sparkles+json").await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
-    // Graph Store GET too
+    // Graph Store GET has its own budget (unlimited by default)
     let r = get(&s.app, "/ds/data?default").await;
-    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
-    assert_eq!(r.json()["budget"], "result-bytes");
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.body.len() > 200);
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
             &m,
             r#"sparkles_budget_exceeded_total{dataset="ds",budget="result-bytes"}"#
         ),
-        Some(3.0),
+        Some(2.0),
         "{m}"
     );
     // `send` limits what is serialized

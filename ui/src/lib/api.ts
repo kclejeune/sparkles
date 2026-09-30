@@ -45,7 +45,10 @@ export type Limits = {
   /** The largest `timeout` a request may ask for; absent on servers that predate it. */
   maxTimeoutSeconds?: number;
   queryMemoryBytes: number;
+  /** The serialized body of a SPARQL query response. */
   maxResultBytes: number;
+  /** The serialized body of a Graph Store GET; absent on servers that predate it. */
+  maxExportBytes?: number;
   maxRows: number;
 };
 
