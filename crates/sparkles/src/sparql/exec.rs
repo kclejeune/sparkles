@@ -142,6 +142,23 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
+        Kind::CountJoin { algo, var } => {
+            let l = child(0, &mut infos)?;
+            let r = if l.is_empty() {
+                infos.push(describe(ctx, &n.children[1]));
+                Table::empty(n.children[1].vars.clone())
+            } else {
+                child(1, &mut infos)?
+            };
+            let c = if l.is_empty() || r.is_empty() {
+                0
+            } else {
+                join_count(ctx, &l, &r, *algo == JoinAlgo::Merge)?
+            };
+            let mut t = Table::new(vec![*var]);
+            t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
+            t
+        }
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
@@ -628,6 +645,36 @@ fn join_pairs(
         }
     }
     Ok(pairs)
+}
+
+/// Number of join results; merge joins on a single exact key count run products.
+fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
+    let lay = layout(l, r);
+    if merge && lay.shared.len() == 1 {
+        let (lk, rk) = lay.shared[0];
+        let lsorted = l.sorted.first().is_some_and(|v| l.col_of(*v) == Some(lk));
+        let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rk));
+        if lsorted && rsorted && !has_undef(l, lk) && !has_undef(r, rk) {
+            let (a, b) = (&l.cols[lk], &r.cols[rk]);
+            let (mut i, mut j, mut n) = (0usize, 0usize, 0u64);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    Ordering::Less => i = gallop(a, i, b[j]),
+                    Ordering::Greater => j = gallop(b, j, a[i]),
+                    Ordering::Equal => {
+                        let v = a[i];
+                        let ie = i + a[i..].partition_point(|x| *x == v);
+                        let je = j + b[j..].partition_point(|x| *x == v);
+                        n += ((ie - i) * (je - j)) as u64;
+                        i = ie;
+                        j = je;
+                    }
+                }
+            }
+            return Ok(n);
+        }
+    }
+    Ok(join_pairs(ctx, l, r, &lay, merge)?.len() as u64)
 }
 
 fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {

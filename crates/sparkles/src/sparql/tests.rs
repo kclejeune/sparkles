@@ -222,6 +222,17 @@ fn aggregates() {
     assert!(has_op(&r.plan, "CountFromIndex"));
     let r = q(
         &s,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?c }",
+    );
+    assert_eq!(strs(&r), ["1"]);
+    assert!(has_op(&r.plan, "CountJoin"));
+    let r = q(
+        &s,
+        "SELECT (COUNT(*) AS ?c) WHERE { ?a foaf:knows ?b . ?b foaf:name ?n }",
+    );
+    assert_eq!(strs(&r), ["3"]);
+    let r = q(
+        &s,
         "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o FILTER(false) }",
     );
     assert_eq!(strs(&r), ["0"]);

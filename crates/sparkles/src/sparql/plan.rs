@@ -150,6 +150,11 @@ pub enum Kind {
         aggs: Vec<(VarId, Agg)>,
     },
     /// `COUNT(*)` over a single scan answered from index metadata
+    /// `COUNT(*)` over a join: counts matching pairs without materializing them
+    CountJoin {
+        algo: JoinAlgo,
+        var: VarId,
+    },
     /// `GROUP BY ?k` + `COUNT` over a single scan sorted on ?k: counts runs in the index
     /// blocks without materializing the scan (QLever `computeGroupByObjectWithCount`)
     GroupCountScan {
@@ -276,6 +281,7 @@ impl Node {
             Kind::CountScan { .. } => "CountFromIndex",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
+            Kind::CountJoin { .. } => "CountJoin",
             Kind::Path { .. } => "TransitivePath",
             Kind::Service { .. } => "Service",
         }
@@ -1960,6 +1966,31 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         let mut n = Node::leaf(Kind::CountDistinctScan { spec, var }, vec![var], 1.0, desc);
         n.cost = child.est;
         return n;
+    }
+    // COUNT(*) over a plain join: count pairs
+    if keys.is_empty()
+        && aggs.len() == 1
+        && matches!(aggs[0].1.func, AggregateFunction::Count)
+        && aggs[0].1.expr.is_none()
+        && !aggs[0].1.distinct
+        && let Kind::Join { algo, .. } = &child.kind
+        && *algo != JoinAlgo::Cross
+    {
+        let var = aggs[0].0;
+        return Node {
+            kind: Kind::CountJoin {
+                algo: algo.clone(),
+                var,
+            },
+            vars: vec![var],
+            certain: vec![var],
+            sorted: Vec::new(),
+            est: 1.0,
+            cost: child.cost,
+            dist: [(var, 1.0)].into_iter().collect(),
+            desc: child.desc.clone(),
+            children: child.children,
+        };
     }
     // GROUP BY ?k with only COUNT(*) / COUNT(?v) over a single scan
     if keys.len() == 1
