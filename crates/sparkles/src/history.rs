@@ -297,6 +297,16 @@ pub(crate) fn write_file(
     )
 }
 
+/// Give `history.json` (if any) the dataset id `new` in place of `old` (a restore that
+/// takes a new identity; pins are by commit, which it keeps).
+pub(crate) fn reidentify_file(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> Result<()> {
+    if !root.join("history.json").exists() {
+        return Ok(());
+    }
+    let (pins, retention) = read_file(root, old)?;
+    write_file(root, new, &pins, retention)
+}
+
 // ------------------------------------------------------------ generation table ------
 
 /// One generation directory that belongs to this dataset.

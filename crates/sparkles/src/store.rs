@@ -2412,10 +2412,17 @@ impl Store {
         })
     }
 
-    /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to).
+    /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to) (or restored
+    /// from a backup under a new identity).
     pub fn forked_from(&self) -> Option<ForkedFrom> {
         let root = self.root.as_ref()?;
         commit::read_forked_from(root).ok().flatten()
+    }
+
+    /// `restoredFrom` of a database restored from a backup.
+    pub fn restored_from(&self) -> Option<commit::RestoredFrom> {
+        let root = self.root.as_ref()?;
+        commit::read_restored_from(root).ok().flatten()
     }
 
     /// Write all quads as N-Quads to `w`.

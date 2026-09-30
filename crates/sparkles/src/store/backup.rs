@@ -937,4 +937,121 @@ mod tests {
         assert_eq!(dump(&r), want);
         assert!(Store::open(&root, StoreOptions::default()).is_ok());
     }
+
+    /// A restore under a new identity: same commits and data, a new dataset id, the
+    /// source recorded as `forkedFrom`, and the sequence continuing at s + 1.
+    #[test]
+    fn reidentify_makes_a_new_lineage() {
+        use crate::commit::{CommitRange, ForkedFrom, reidentify};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        for i in 0..3 {
+            ins(&s, i);
+        }
+        s.create_snapshot("v2", &At::Commit(2), None).unwrap();
+        s.compact().unwrap();
+        ins(&s, 3);
+        let c = s.backup_capture("b").unwrap();
+        let out = dir.path().join("r");
+        c.write_to(&out).unwrap();
+        // a leased history.json too (backups leave it out; reidentify handles it)
+        std::fs::copy(root.join("history.json"), out.join("history.json")).unwrap();
+        let old = s.dataset_id();
+        let new = uuid::Uuid::new_v4();
+        let from = ForkedFrom {
+            id: old,
+            seq: c.commit.seq,
+        };
+        reidentify(&out, new, from).unwrap();
+        let (id, _) = crate::commit::read_catalog(&out.join("commits.bin"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, new);
+        let opts = crate::check::CheckOptions { quick: false };
+        let report = crate::check::check(&out, &opts).unwrap();
+        assert_ne!(report.status, crate::check::Status::Error);
+        let r = Store::open(&out, StoreOptions::default()).unwrap();
+        assert_eq!(r.dataset_id(), new);
+        assert_eq!(r.forked_from(), Some(from));
+        assert_eq!(r.head_commit(), c.commit);
+        assert_eq!(dump(&r), dump_at(&s, c.commit.seq));
+        let page = r.commits(CommitRange::Latest, 100);
+        assert_eq!(page.commits.len(), 5);
+        assert!(page.complete);
+        assert_eq!(page.commits, s.commits(CommitRange::Latest, 100).commits);
+        assert_eq!(r.named_snapshot("v2").unwrap().seq, 2);
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("dataset.json")).unwrap()).unwrap();
+        assert_eq!(info["origin"], "restore");
+        assert_eq!(info["id"], new.to_string());
+        ins(&r, 9);
+        assert_eq!(r.head_commit().seq, c.commit.seq + 1);
+        let receipt = update(
+            &r,
+            "INSERT DATA { <urn:z> <urn:p> 0 }",
+            &QueryOptions::default(),
+        );
+        assert!(receipt.is_ok());
+        assert_eq!(r.head_commit().seq, c.commit.seq + 2);
+        drop(r);
+        // and it opens again as the new lineage
+        let r = Store::open(&out, StoreOptions::default()).unwrap();
+        assert_eq!(r.dataset_id(), new);
+        assert_eq!(r.head_commit().seq, c.commit.seq + 2);
+    }
+
+    #[test]
+    fn reidentify_refuses_a_foreign_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        drop(Store::open(&a, StoreOptions::default()).unwrap());
+        drop(Store::open(&b, StoreOptions::default()).unwrap());
+        std::fs::copy(b.join("commits.bin"), a.join("commits.bin")).unwrap();
+        let from = crate::commit::ForkedFrom {
+            id: uuid::Uuid::new_v4(),
+            seq: 0,
+        };
+        let e = crate::commit::reidentify(&a, uuid::Uuid::new_v4(), from).unwrap_err();
+        assert!(matches!(e, Error::Corrupt(_)), "{e}");
+        assert!(
+            crate::commit::reidentify(&dir.path().join("none"), uuid::Uuid::new_v4(), from)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn restored_from_round_trips() {
+        use crate::commit::{RestoredFrom, read_restored_from, set_restored_from};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        ins(&s, 1);
+        assert_eq!(s.restored_from(), None);
+        let id = s.dataset_id();
+        drop(s);
+        assert_eq!(read_restored_from(&root).unwrap(), None);
+        let from = RestoredFrom {
+            repository: "offsite".into(),
+            backup: "wiki-20260930t140311z".into(),
+            dataset_id: uuid::Uuid::new_v4(),
+            seq: 41,
+        };
+        set_restored_from(&root, &from).unwrap();
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
+        assert_eq!(info["restoredFrom"]["backup"], "wiki-20260930t140311z");
+        assert_eq!(
+            info["restoredFrom"]["datasetId"],
+            from.dataset_id.to_string()
+        );
+        assert_eq!(read_restored_from(&root).unwrap(), Some(from.clone()));
+        // a new identity keeps it
+        let fork = crate::commit::ForkedFrom { id, seq: 1 };
+        crate::commit::reidentify(&root, uuid::Uuid::new_v4(), fork).unwrap();
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.restored_from(), Some(from));
+        assert_eq!(s.forked_from(), Some(fork));
+    }
 }

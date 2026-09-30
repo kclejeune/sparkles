@@ -347,6 +347,13 @@ struct DatasetFile {
         skip_serializing_if = "Option::is_none"
     )]
     forked_from: Option<ForkedFrom>,
+    /// the backup a restored dataset was made from
+    #[serde(
+        default,
+        rename = "restoredFrom",
+        skip_serializing_if = "Option::is_none"
+    )]
+    restored_from: Option<RestoredFrom>,
 }
 
 /// Where a cloned dataset came from: the source's dataset id and the commit (`seq`) of
@@ -380,21 +387,97 @@ pub struct RestoredFrom {
 ///
 /// Used by restores whose identity rule mints a new id; the directory must not be open.
 pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> Result<()> {
-    let _ = (root, new_id, forked_from);
-    Err(Error::unsupported("reidentify is not implemented yet"))
+    let mut ds = read_dataset(root)?
+        .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
+    let old_id = ds.id;
+    // every generation of the old lineage (a restore has only the current one)
+    for e in std::fs::read_dir(root)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let digits = name.strip_prefix("gen-").unwrap_or("");
+        if !e.file_type()?.is_dir()
+            || digits.is_empty()
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let path = e.path().join("commit.json");
+        let b = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut f: GenCommitFile = serde_json::from_slice(&b)
+            .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+        if f.dataset_id == old_id {
+            f.dataset_id = new_id;
+            crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())?;
+        }
+    }
+    // the catalog header (records carry no dataset id)
+    let catalog = root.join("commits.bin");
+    match std::fs::read(&catalog) {
+        Ok(mut buf) => match decode_header(&buf) {
+            Some((id, first)) if id == old_id => {
+                buf[..REC].copy_from_slice(&encode_header(new_id, first));
+                crate::store::write_atomic(&catalog, &buf)?;
+            }
+            Some((id, _)) => {
+                return Err(Error::Corrupt(format!(
+                    "{}: belongs to dataset {id}, not {old_id}",
+                    catalog.display()
+                )));
+            }
+            // rebuilt from the WAL and commit.json at the next open
+            None => {}
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    crate::history::reidentify_file(root, old_id, new_id)?;
+    // dataset.json last: its id is what the other files are checked against
+    ds.id = new_id;
+    ds.origin = "restore".to_string();
+    ds.created = rfc3339_ms(now_ms());
+    ds.forked_from = Some(forked_from);
+    write_dataset(root, &ds)?;
+    crate::store::sync_dir(root)
+}
+
+/// `restoredFrom` of `<root>/dataset.json`, if the database was restored from a backup.
+pub fn read_restored_from(root: &Path) -> Result<Option<RestoredFrom>> {
+    Ok(read_dataset(root)?.and_then(|f| f.restored_from))
+}
+
+/// Record in `<root>/dataset.json` (replaced atomically) the backup a restored database
+/// was made from. The directory must not be open.
+pub fn set_restored_from(root: &Path, from: &RestoredFrom) -> Result<()> {
+    let mut ds = read_dataset(root)?
+        .ok_or_else(|| Error::Invalid(format!("{} has no dataset.json", root.display())))?;
+    ds.restored_from = Some(from.clone());
+    write_dataset(root, &ds)
+}
+
+fn read_dataset(root: &Path) -> Result<Option<DatasetFile>> {
+    match std::fs::read(root.join("dataset.json")) {
+        Ok(b) => serde_json::from_slice(&b)
+            .map(Some)
+            .map_err(|e| Error::Corrupt(format!("dataset.json: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn write_dataset(root: &Path, ds: &DatasetFile) -> Result<()> {
+    crate::store::write_atomic(
+        &root.join("dataset.json"),
+        &serde_json::to_vec_pretty(ds).unwrap(),
+    )
 }
 
 /// `forkedFrom` of `<root>/dataset.json`, if the database is a clone.
 pub(crate) fn read_forked_from(root: &Path) -> Result<Option<ForkedFrom>> {
-    match std::fs::read(root.join("dataset.json")) {
-        Ok(b) => {
-            let f: DatasetFile = serde_json::from_slice(&b)
-                .map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-            Ok(f.forked_from)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(read_dataset(root)?.and_then(|f| f.forked_from))
 }
 
 /// `dataset.json` of a clone.
@@ -409,6 +492,7 @@ pub(crate) fn clone_dataset_file_bytes(
         created: rfc3339_ms(created_ms),
         origin: "clone".to_string(),
         forked_from: Some(from),
+        restored_from: None,
     })
     .unwrap()
 }
@@ -422,15 +506,7 @@ pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
 
 /// `<root>/dataset.json`: the dataset id, if the database has one yet.
 pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
-    match std::fs::read(root.join("dataset.json")) {
-        Ok(b) => {
-            let f: DatasetFile = serde_json::from_slice(&b)
-                .map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-            Ok(Some(f.id))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(read_dataset(root)?.map(|f| f.id))
 }
 
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
@@ -440,6 +516,7 @@ pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) 
         created: rfc3339_ms(created_ms),
         origin: origin.to_string(),
         forked_from: None,
+        restored_from: None,
     })
     .unwrap()
 }
