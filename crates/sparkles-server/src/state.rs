@@ -58,6 +58,32 @@ pub struct Dataset {
     pub ephemeral: bool,
     /// the last schema report served (`/$/schema/{ds}`), kept for its pagination cursors
     pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
+    /// write-time SHACL validation, when configured
+    pub validation: RwLock<Option<Arc<Validation>>>,
+}
+
+#[cfg(feature = "shacl")]
+pub type Validation = sparkles_shacl::guard::ShaclGuard;
+/// Placeholder: built without SHACL validation.
+#[cfg(not(feature = "shacl"))]
+pub struct Validation;
+
+/// Install a store's write-time validation from its `validation.json`. A configuration
+/// that cannot be loaded leaves the dataset refusing writes (the store fails closed).
+fn install_validation(store: &Store) -> Option<Arc<Validation>> {
+    #[cfg(feature = "shacl")]
+    match sparkles_shacl::guard::install(store) {
+        Ok(g) => return g,
+        Err(e) => tracing::error!(
+            "write-time validation of {}: {e:#}; writes are refused until it is fixed",
+            store
+                .root()
+                .map_or("(memory)".into(), |r| r.display().to_string())
+        ),
+    }
+    #[cfg(not(feature = "shacl"))]
+    let _ = store;
+    None
 }
 
 /// A computed schema report and what it was computed for.
@@ -112,6 +138,8 @@ pub struct AppState {
     pub store_opts: StoreOptions,
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
+    /// honor `validate=false` on writes (skips write-time validation)
+    pub allow_unvalidated_writes: bool,
     pub allow_service: bool,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
@@ -277,6 +305,7 @@ impl AppState {
             rate_limit: None,
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             auth: None,
+            allow_unvalidated_writes: false,
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
             manage: Mutex::new(()),
@@ -332,6 +361,7 @@ impl AppState {
             manage: Mutex::new(()),
             rate_limit: None,
             auth: None,
+            allow_unvalidated_writes: false,
         }
     }
 
@@ -347,6 +377,7 @@ impl AppState {
             }
         };
         let reasoning = store.root().and_then(read_reasoning_file);
+        let validation = install_validation(&store);
         Ok(Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -354,6 +385,7 @@ impl AppState {
             reasoning: RwLock::new(reasoning),
             ephemeral: loc.is_some(),
             schema_cache: Mutex::new(None),
+            validation: RwLock::new(validation),
         }))
     }
 

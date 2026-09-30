@@ -861,6 +861,57 @@ CLI: `sparkles infer --loc DB --status` prints the status; `sparkles infer --loc
 `--rules` is given) and exits with 0 (`none-found`), 1 (`violations-found`) or 2
 (`incomplete` or an error). `sparkles stats` shows a `reasoning` line.
 
+## Write-time validation
+
+A dataset can validate **every write** against SHACL shapes before it commits. The
+configuration lives in the database directory (`validation.json`):
+
+```json
+{ "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
+  "dataGraph": "default", "includeInferences": false,
+  "threshold": "violation", "timeoutSeconds": 10, "reportLimit": 100 }
+```
+
+| Field | Values | Default | Meaning |
+|---|---|---|---|
+| `mode` | `reject`, `warn`, `off` | — | `reject`: a write that leaves results at or above the threshold is not committed (`422`); `warn`: it commits, and the receipt and header report the findings |
+| `shapes` | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, read from the state being validated (so changes to them are validated, and must parse), or shapes given inline and copied to `validation-shapes.ttl` |
+| `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph; the shapes graphs are never part of it, and the inferred graph only with `includeInferences` |
+| `threshold` | `violation`, `warning`, `info` | `violation` | Results at or above it block |
+| `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | Budget per write (exceeding it fails the write with `408`); results carried in a report |
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/$/validation/{ds}` | `{ config, status }` (`status`: mode, shape count, the baseline of the last commit, counters, warnings) or `{ config: null }` |
+| PUT | `/$/validation/{ds}` | Set the configuration. The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the report. `400` for a bad configuration or shapes that do not parse |
+| DELETE | `/$/validation/{ds}` | Turn validation off (`204`) |
+
+**Writes** (update, Graph Store PUT/POST/DELETE, upload, and through the CLI `load`,
+`update`, `infer`, and bulk loads) are validated once per request, on the final state,
+before any byte is written; a write that touches neither the data graph nor the shapes
+graphs is skipped. Responses carry
+`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`,
+and receipts (`receipt=true`) include a `validation` object. A rejection is
+`422 Unprocessable Content`:
+
+```json
+{ "error": "SHACL validation failed: 2 blocking results (threshold violation); nothing was committed",
+  "validation": { "status": "rejected", "blocking": 2, "total": 3, "limit": 100, "truncated": false,
+                  "results": [ … ], "head": 41, "kind": "update" } }
+```
+
+or a Turtle `sh:ValidationReport` when the request's `Accept` names `text/turtle`. No
+commit number is used. `?validationLimit=N` bounds the results of one request.
+`?validate=false` (or `Sparkles-Validate: off`) skips validation only on a server started
+with `--allow-unvalidated-writes` (`403` otherwise); the CLI has `--no-validate`. A dataset
+whose `validation.json` cannot be loaded refuses writes (`501`) rather than accepting
+them unvalidated.
+
+CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`,
+`--status`, `--off`. A write rejected in the CLI exits with status 3. Cost: each validated
+write runs a full validation of the data graph (about 160 ms at 1M triples); writes that do
+not touch the data graph are free.
+
 ## SHACL validation
 
 `POST /{ds}/shacl?graph=default|union|<iri>` validates a data graph of the dataset against

@@ -63,6 +63,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
+    ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/auth/config", &["GET"]),
     ("/$/auth/login", &["POST"]),
     ("/$/auth/logout", &["POST"]),
@@ -160,6 +161,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
+        | "/$/validation/{ds}"
         | "/{ds}/prefixes"
             if get =>
         {
@@ -176,7 +178,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/cache/clear/{ds}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
-        | "/$/history/{ds}" => Dataset(Admin),
+        | "/$/history/{ds}"
+        | "/$/validation/{ds}" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
         "/{ds}/data" if get => Dataset(Read),
         "/{ds}/data" => Dataset(Write),

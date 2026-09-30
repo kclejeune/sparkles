@@ -25,6 +25,7 @@ use std::time::Duration;
 mod history;
 mod schema;
 mod stream;
+mod validation;
 
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
@@ -39,6 +40,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             crate::obs::X_REQUEST_ID.clone(),
             header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
             header::HeaderName::from_static(history::SPARKLES_AT),
+            header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
             header::HeaderName::from_static(history::SPARKLES_HEAD),
             header::HeaderName::from_static("memento-datetime"),
             header::LINK,
@@ -107,6 +109,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/history/{ds}",
             get(history::get_history).put(history::put_history),
         )
+        .route(
+            "/$/validation/{ds}",
+            get(validation::get_validation)
+                .put(validation::put_validation)
+                .delete(validation::delete_validation),
+        )
         .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new());
@@ -158,13 +166,29 @@ impl IntoResponse for ApiError {
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
         };
+        let mut body = self.1;
+        // a rejection's header and Turtle report travel beside the JSON body
+        let (vheader, turtle) = match body.as_object_mut() {
+            Some(o) => (o.remove("_validationHeader"), o.remove("_turtle")),
+            None => (None, None),
+        };
         let mut resp = RequestReport {
             outcome,
             budget,
             ..Default::default()
         }
-        .attach((self.0, Json(self.1.clone())).into_response());
-        resp.extensions_mut().insert(ErrorJson(self.1));
+        .attach((self.0, Json(body.clone())).into_response());
+        if let Some(h) = vheader.as_ref().and_then(J::as_str)
+            && let Ok(v) = header::HeaderValue::from_str(h)
+        {
+            resp.headers_mut()
+                .insert(validation::SPARKLES_VALIDATION, v);
+        }
+        if let Some(t) = turtle.as_ref().and_then(J::as_str) {
+            resp.extensions_mut()
+                .insert(validation::RejectionTurtle(t.to_string()));
+        }
+        resp.extensions_mut().insert(ErrorJson(body));
         resp
     }
 }
@@ -181,7 +205,26 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         .get(&crate::obs::X_REQUEST_ID)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // `Accept: text/turtle` (named explicitly) turns a rejection into a Turtle report
+    let turtle = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/turtle"));
     let mut resp = next.run(req).await;
+    if let Some(validation::RejectionTurtle(t)) = resp.extensions_mut().remove()
+        && turtle
+    {
+        resp.extensions_mut().remove::<ErrorJson>();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/turtle"),
+        );
+        resp.headers_mut()
+            .insert(header::CONTENT_LENGTH, t.len().into());
+        *resp.body_mut() = axum::body::Body::from(t);
+        return resp;
+    }
     add_request_id(&mut resp, id);
     resp
 }
@@ -222,11 +265,14 @@ impl From<Error> for ApiError {
             Error::HistoryGone(_) => StatusCode::GONE,
             Error::HistoryUnsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Error::Conflict(_) => StatusCode::CONFLICT,
+            Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
             Error::SparqlSyntax(_) => syntax_error_body(&msg),
             Error::HistoryGone(g) => history::gone_body(&g),
+            Error::Rejected(r) => return validation::rejection(&r),
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
@@ -890,6 +936,7 @@ fn write_response(
     wanted: bool,
 ) -> Response {
     crate::otel::commit(receipt);
+    let validation = receipt.validation.clone();
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
         if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
@@ -913,7 +960,10 @@ fn write_response(
             None => status.into_response(),
         }
     };
-    with_commit(r, ds, receipt.commit.seq)
+    validation::with_validation(
+        with_commit(r, ds, receipt.commit.seq),
+        validation.as_deref(),
+    )
 }
 
 /// Parse `N`, `commit:N` or `head` (resolved by the caller).
@@ -1063,6 +1113,7 @@ async fn update_endpoint(
         ..Default::default()
     };
     crate::auth::restrict(&mut opts, &p);
+    opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     let wanted = receipt_wanted(&params, &headers);
     blocking(move || {
         let t0 = crate::otel::start();
@@ -1383,6 +1434,8 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
+            let wopts =
+                validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
             let body = spool(body).await?;
             blocking(move || {
                 let graph = match &target {
@@ -1401,9 +1454,10 @@ async fn gsp(
                         None if matches!(target, Target::Dataset) => ReplaceTarget::All,
                         None => ReplaceTarget::Default,
                     };
-                    ds.store.replace_as(t, &[src], CommitKind::GspPut)?
+                    ds.store
+                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)?
                 } else {
-                    let r = ds.store.load_as(&[src], CommitKind::GspPost)?;
+                    let r = ds.store.load_with(&[src], CommitKind::GspPost, &wopts)?;
                     (if r.committed { r.commit.inserted } else { 0 }, r)
                 };
                 let status = if replace {
@@ -1428,6 +1482,8 @@ async fn gsp(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
+            let wopts =
+                validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let clear = match &target {
@@ -1449,7 +1505,10 @@ async fn gsp(
                 let stats = sparkles::sparql::update::update_as(
                     &ds.store,
                     &clear,
-                    &QueryOptions::default(),
+                    &QueryOptions {
+                        write: wopts,
+                        ..Default::default()
+                    },
                     sparkles::commit::CommitKind::GspDelete,
                 )?;
                 let receipt = stats.commit.clone().expect("update receipts");
@@ -1481,6 +1540,7 @@ async fn upload(
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
+    let wopts = validation::write_options(&st, &params, &headers, st.limits.update_timeout)?;
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -1576,7 +1636,7 @@ async fn upload(
             .collect::<Result<Vec<_>, _>>()?;
         let receipt = ds
             .store
-            .load_as(&sources, sparkles::commit::CommitKind::Upload)?;
+            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)?;
         let count = if receipt.committed {
             receipt.commit.inserted
         } else {
@@ -2379,6 +2439,8 @@ mod history_tests;
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(all(test, feature = "shacl"))]
+mod validation_tests;
 
 #[cfg(test)]
 mod spool_tests {
