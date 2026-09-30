@@ -284,19 +284,27 @@ Sparkles alone, one configuration at a time, same machine and harness
 (`scripts/bench.sh` with `ENGINES=sparkles SKIP_LOAD=1`, plus `hyperfine` and `oha`).
 Update times are end to end over HTTP (`curl`).
 
-| | Text search off | Text search on |
-|---|---:|---:|
-| Build the index (every string literal, `sparkles text-index`) | — | 8.9 s, 1.3 GiB peak RSS, 113 MB on disk |
-| 1-triple `INSERT DATA` (harness) | 9.2 ± 4.7 ms | 14.9 ± 7.1 ms |
-| 1,000-triple `INSERT DATA` | 21.6 ± 9.6 ms | 49.0 ± 2.3 ms |
-| `text:query ("Perlman" 10)`, top 10 with scores | — | 15.0 ± 1.0 ms |
-| `COUNT` of `text:query "Zurich"` (1,954 hits) | — | 25.5 ± 5.4 ms |
+The full-text index is committed lazily: a write stages its documents, and the next text
+query that needs them, a tick about once a second, or a batch of about 16,000 staged
+changes commits them. Measured against the build before that change, alternately, in one
+session:
 
-Before the index stopped syncing every commit to disk (it now syncs at most once a
-second, and replays the WAL after a crash), the same 1-triple insert took
-29.9 ± 0.8 ms with text search on, and 8.9 ± 4.0 ms off. The 1,000-triple batch cost
-about 27 ms more with text search on, both before and after that change: the rest is
-indexing and the index commit, not disk syncs.
+| | Text search off | Text search on, commit per write | Text search on, lazy commit |
+|---|---:|---:|---:|
+| Build the index (every string literal, `sparkles text-index`) | — | 9.1 s, 1.3 GiB peak RSS, 102 MB on disk | 8.0 s, 1.3 GiB peak RSS, 102 MB on disk |
+| 1,000-triple `INSERT DATA` | 24.4–26.0 ms (median) | 46.2 ± 7.7 ms | 28.4 ± 1.7 ms |
+| 1-triple `INSERT DATA` (harness) | 5.7–9.4 ms | 13.0 ± 5.2 ms | 6.7 ± 3.0 ms |
+| `text:query ("Perlman" 10)`, top 10 with scores | — | 14.2 ± 1.4 ms | 15.0 ± 0.7 ms |
+| `COUNT` of `text:query "Zurich"` (1,954 hits) | — | 29.9 ± 1.6 ms | 28.6 ± 0.8 ms |
+
+The text-off column is four alternating runs of the two builds on fresh servers (30 runs
+each; both builds' medians fall in 24.4–26.0 ms), so a 1,000-triple batch now costs about
+3 ms more with text search on instead of about 21 ms. Single-triple inserts vary by a few
+milliseconds between runs in both builds.
+
+Earlier, before the index stopped syncing every commit to disk (it syncs at most once a
+second and replays the WAL after a crash), the 1-triple insert took 29.9 ± 0.8 ms with
+text search on and 8.9 ± 4.0 ms off.
 
 Access logging and Prometheus metrics (the defaults) against `--no-access-log
 --no-metrics`: the sum of the 20 harness queries differs by 0.6% (1,248 vs 1,240 ms,
