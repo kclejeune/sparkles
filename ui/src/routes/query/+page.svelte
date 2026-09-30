@@ -132,6 +132,25 @@
     return 'table';
   }
 
+  // Latest Run/Explain per tab: a superseded execution must not touch the tab's outcome.
+  const latestRun: Record<string, number> = {};
+  let runSeq = 0;
+
+  /** Start an execution for a tab; the returned check is false once a newer one starts. */
+  function claim(tabId: string): () => boolean {
+    const id = ++runSeq;
+    latestRun[tabId] = id;
+    return () => latestRun[tabId] === id;
+  }
+
+  /** Add missing prefixes to the captured tab's text (only if the user has not edited it
+   * in the meantime) and return the text to execute. */
+  function withPrefixes(tab: QTab, text: string, dsName: string): string {
+    const fixed = addMissingPrefixes(text, app.prefixes(dsName));
+    if (fixed !== text && tab.query === text) tab.query = fixed;
+    return fixed;
+  }
+
   async function run() {
     const tabId = activeId;
     const dsName = ds;
@@ -139,15 +158,15 @@
       toasts.push('error', 'Choose a dataset first', 'Create one on the Datasets page.');
       return;
     }
+    // capture the tab and its text before awaiting: the user may switch tabs meanwhile
+    const tab = active;
+    const original = tab.query;
+    const owns = claim(tabId);
     outcomes[tabId]?.controller?.abort();
     await app.loadPrefixes(dsName);
-    let text = active.query;
-    const fixed = addMissingPrefixes(text, app.prefixes(dsName));
-    if (fixed !== text) {
-      setQuery(fixed);
-      text = fixed;
-    }
-    editor?.showError(undefined);
+    if (!owns()) return;
+    const text = withPrefixes(tab, original, dsName);
+    if (tabId === activeId) editor?.showError(undefined);
     const k = queryKind(text) ?? 'SELECT';
     const controller = new AbortController();
     const prevView = outcomes[tabId]?.view;
@@ -167,6 +186,10 @@
       if (k === 'UPDATE') {
         const result = await api.update(dsName, text, controller.signal);
         const ms = performance.now() - started;
+        // the update was applied either way; only the outcome display is ownership-bound
+        delete app.vocab[dsName];
+        void app.refreshDatasets();
+        if (!owns()) return;
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
@@ -183,8 +206,6 @@
             ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
             : `${dsName} in ${fmtMs(ms)}`,
         );
-        delete app.vocab[dsName];
-        void app.refreshDatasets();
       } else {
         const result = await api.query(dsName, text, {
           send: limit,
@@ -192,6 +213,7 @@
           signal: controller.signal,
         });
         const elapsed = performance.now() - started;
+        if (!owns()) return;
         // Keep the user's chosen view only when re-running the same kind of query.
         const sameKind = prevKind === result.queryType;
         const keep =
@@ -212,6 +234,7 @@
         autoPickColumns(result);
       }
     } catch (e) {
+      if (!owns()) return;
       if (e instanceof DOMException && e.name === 'AbortError') {
         delete outcomes[tabId];
         return;
@@ -233,14 +256,18 @@
     const tabId = activeId;
     const dsName = ds;
     if (!dsName) return;
+    const tab = active;
+    const original = tab.query;
+    const owns = claim(tabId);
+    outcomes[tabId]?.controller?.abort();
     await app.loadPrefixes(dsName);
-    const text = addMissingPrefixes(active.query, app.prefixes(dsName));
-    if (text !== active.query) setQuery(text);
+    if (!owns()) return;
+    const text = withPrefixes(tab, original, dsName);
     if (queryKind(text) === 'UPDATE') {
       toasts.push('info', 'Explain works for queries only', 'Updates have no query plan.');
       return;
     }
-    editor?.showError(undefined);
+    if (tabId === activeId) editor?.showError(undefined);
     const started = performance.now();
     // Keep a previous query result (its Table/Plan tabs stay usable), but not an update
     // confirmation or an error, which would otherwise take precedence over the plan.
@@ -253,8 +280,10 @@
     outcomes[tabId] = { ...base, status: 'running', view: 'explain' } as Outcome;
     try {
       const ex = await api.explain(dsName, text, { reasoning: reasoningFor(dsName) });
+      if (!owns()) return;
       outcomes[tabId] = { ...base, status: 'done', explain: ex, view: 'explain' } as Outcome;
     } catch (e) {
+      if (!owns()) return;
       outcomes[tabId] = {
         status: 'error',
         ds: dsName,
@@ -263,7 +292,8 @@
         view: 'explain',
         startedAt: started,
       };
-      if (e instanceof api.ApiError && e.line) editor?.showError(e.line, e.column);
+      if (e instanceof api.ApiError && e.line && tabId === activeId)
+        editor?.showError(e.line, e.column);
     }
   }
 

@@ -299,10 +299,31 @@ SELECT ?o ?label ?version ?comment WHERE {
     if (c) c.instances = Number(v(r.n) ?? 0);
   }
   const name = (c: ClassInfo) => (c.label ?? c.iri).toLowerCase();
+  const byRank = (a: ClassInfo, b: ClassInfo) =>
+    b.subs.length - a.subs.length || name(a).localeCompare(name(b));
   const roots = [...classes.values()]
     .filter((c) => c.supers.length === 0)
-    .sort((a, b) => b.subs.length - a.subs.length || name(a).localeCompare(name(b)))
+    .sort(byRank)
     .map((c) => c.iri);
+  // Classes on a subClassOf cycle (A ⊑ B ⊑ A, or A ⊑ A) all have superclasses, so a
+  // cycle with no ordinary root above it would be unreachable: promote one member of
+  // each such group to a root.
+  const reached = new Set<string>();
+  const visit = (iri: string) => {
+    const stack = [iri];
+    while (stack.length) {
+      const x = stack.pop()!;
+      if (reached.has(x)) continue;
+      reached.add(x);
+      stack.push(...(classes.get(x)?.subs ?? []));
+    }
+  };
+  roots.forEach(visit);
+  for (const c of [...classes.values()].sort(byRank)) {
+    if (reached.has(c.iri)) continue;
+    roots.push(c.iri);
+    visit(c.iri);
+  }
   for (const c of classes.values())
     c.subs.sort((a, b) => name(classes.get(a)!).localeCompare(name(classes.get(b)!)));
 

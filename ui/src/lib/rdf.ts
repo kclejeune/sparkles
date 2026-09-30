@@ -92,7 +92,8 @@ export function toSparql(t: Term): string {
       return v;
     }
     case 'triple':
-      return `<< ${toSparql(t.value.subject)} ${toSparql(t.value.predicate)} ${toSparql(t.value.object)} >>`;
+      // RDF 1.2 triple term; the bare `<< … >>` form is reification syntax, not a term
+      return `<<( ${toSparql(t.value.subject)} ${toSparql(t.value.predicate)} ${toSparql(t.value.object)} )>>`;
   }
 }
 

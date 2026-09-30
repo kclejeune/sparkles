@@ -40,8 +40,19 @@
   let selectedId = $state<string | null>(null);
   let showLiterals = $state(false);
   let hideTypes = $state(false);
-  let expanding = $state<Record<string, boolean>>({});
+  let expanding = $state<Record<string, number>>({});
   let detailCache = $state<Record<string, ex.Details | { error: string }>>({});
+  // Bumped whenever the graph is reset (refocus, clear, dataset switch): responses to
+  // requests started for an older graph are discarded instead of mutating the new one.
+  let graphGen = 1;
+
+  function resetGraph() {
+    graphGen++;
+    nodes = {};
+    edges = {};
+    expanding = {};
+    detailCache = {};
+  }
   let graphView: GraphView | undefined = $state();
 
   // --- graph model -----------------------------------------------------------
@@ -106,6 +117,8 @@
   async function expand(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
+    const gen = graphGen;
+    const stale = () => gen !== graphGen || nodes[id] !== n;
     if (nodeCount > MAX_NODES) {
       toasts.push(
         'error',
@@ -114,9 +127,10 @@
       );
       return;
     }
-    expanding[id] = true;
+    expanding[id] = gen;
     try {
       const { out, inc, label } = await ex.neighbours(ds, n.iri);
+      if (stale()) return;
       if (label) n.label = label;
       for (const nb of out) {
         const lit = nb.term.type === 'literal';
@@ -140,16 +154,14 @@
         );
       }
     } catch (e) {
-      toasts.error(`Could not expand ${n.label}`, e);
+      if (!stale()) toasts.error(`Could not expand ${n.label}`, e);
     } finally {
-      delete expanding[id];
+      if (expanding[id] === gen) delete expanding[id];
     }
   }
 
   async function focusOn(iri: string, label?: string, fromUrl = false) {
-    nodes = {};
-    edges = {};
-    detailCache = {};
+    resetGraph();
     const n = ensureNode({ type: 'uri', value: iri }, label);
     focusId = n.id;
     selectedId = n.id;
@@ -177,11 +189,14 @@
   async function loadDetails(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || detailCache[id]) return;
+    const gen = graphGen;
+    let d: ex.Details | { error: string };
     try {
-      detailCache[id] = await ex.details(ds, n.iri);
+      d = await ex.details(ds, n.iri);
     } catch (e) {
-      detailCache[id] = { error: api.errorMessage(e) };
+      d = { error: api.errorMessage(e) };
     }
+    if (gen === graphGen && nodes[id] === n) detailCache[id] = d;
   }
 
   function removeNode(id: string) {
@@ -207,8 +222,7 @@
   }
 
   function clearGraph() {
-    nodes = {};
-    edges = {};
+    resetGraph();
     focusId = null;
     selectedId = null;
     syncUrl(null);
@@ -441,8 +455,7 @@
       void loadStarters(name);
       if (!first) {
         // Dataset switched in the sidebar: start over.
-        nodes = {};
-        edges = {};
+        resetGraph();
         focusId = null;
         selectedId = null;
         schema = null;
@@ -643,7 +656,7 @@
                 <button
                   class="btn sm"
                   onclick={() => expand(n.id)}
-                  disabled={n.expanded || expanding[n.id]}
+                  disabled={n.expanded || expanding[n.id] !== undefined}
                 >
                   {#if expanding[n.id]}<span class="spinner"></span>{:else}<Icon
                       name="expand"
