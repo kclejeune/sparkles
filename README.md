@@ -92,6 +92,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
+| MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits; `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
 | Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries stop when their client disconnects | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, server page with readiness, request and cache panels, schema browser on `/$/schema` (graph selection, inference toggle, observed counts and object kinds next to declarations), commit history and write receipts, full-text search (index admin panel, ranked `text:query` search in Explore), vector similarity ("Similar" in the explorer, compact vector literals); embedded in the server binary; Vitest unit tests, and a mock server for UI development | ✅ |
@@ -190,7 +191,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 |---|---|---|
 | History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog (metadata only); no time travel or history queries yet, and no data history after compaction |
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | ✗ none (run behind a proxy) |
-| Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL and the Rust API only; JSON-LD as an RDF format only |
+| Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL, the Rust API and an MCP server (stdio, read-only tools); JSON-LD as an RDF format only |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |
 | Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk |
 | Reasoning | at query time (RDFS / OWL 2 QL rewriting, OWL 2 RL / Datalog with a fact budget) | materialized (RDFS, OWL 2 RL, Jena rules) |
@@ -522,6 +523,45 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so for offline work (`sparkles load`, `compact`) stop the service first,
 or use the HTTP API.
+
+## MCP server (LLM agents)
+
+`sparkles mcp` serves databases, or RDF files loaded into memory, to an MCP host
+(Claude Desktop, Claude Code, IDE agents, …) over stdin/stdout:
+
+```sh
+sparkles mcp --loc /data/books                 # a database directory (name: books)
+sparkles mcp --loc books=/data/books --loc films=/data/films
+sparkles mcp --data a.ttl b.nt --name demo     # files, in one in-memory dataset
+```
+
+Host configuration (`claude_desktop_config.json`, or a project's `.mcp.json` for Claude
+Code; `claude mcp add sparkles -- sparkles mcp --loc /data/books` does the same):
+
+```json
+{
+  "mcpServers": {
+    "sparkles": { "command": "sparkles", "args": ["mcp", "--loc", "/data/books"] }
+  }
+}
+```
+
+The tools are read-only: `list_datasets`, `describe_schema`, `sparql_query`,
+`explain_query`, `describe_resource` and `list_commits` (schemas in
+[`docs/API.md`](docs/API.md#mcp-server)). Results are sized for a model's context:
+query rows come back as a compact table with the dataset's prefixes (100 rows / 64 KiB by
+default), every truncation is announced with the exact total and how to continue, and
+data values are escaped so they cannot pass for table structure or status lines. Every
+result names the commit it read; passing it back as `atCommit` keeps a multi-call
+exploration on one snapshot (the server holds the last 4 commits read per dataset for 10
+minutes).
+
+Every call runs under the query timeout (30 s by default, `--timeout` is the maximum),
+a memory budget (`--query-memory-mb`, default 2048) and the intermediate-row cap, at
+most `--max-concurrent` (4) at a time. SERVICE is off unless `--allow-service`: a
+prompt-injected model could otherwise send data to any URL. `--disable-tool NAME`
+removes a tool. A database held by a running `sparkles serve` is refused (the lock);
+only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 
 ## Testing
 

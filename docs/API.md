@@ -746,3 +746,127 @@ it was.
 `limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
 includes `memPeakBytes`, and `meta.memory.peakBytes` in `application/x-sparkles+json` reports
 the peak estimate of a query.
+
+## MCP server
+
+`sparkles mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+(JSON-RPC 2.0, one message per line) on stdin/stdout. It is not an HTTP endpoint; this
+section documents it here because it exposes the same engine.
+
+```
+sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
+             [--allow-service] [--timeout SECS] [--query-memory-mb N] [--max-rows N]
+             [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
+             [--disable-tool NAME]... [--schema-max-entries N]
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--loc [NAME=]PATH` | | a database directory (repeatable); the name defaults to the directory's name |
+| `--data FILE…`, `--name` | `data` | RDF files loaded into one in-memory dataset |
+| `--timeout SECS` | `60` | largest `timeoutSeconds` a call may ask for (calls default to 30) |
+| `--query-memory-mb N` | `2048` | memory budget of every call's queries (`0`: unlimited) |
+| `--max-rows N` | `200000000` | rows of any intermediate result |
+| `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | largest `maxRows` / `maxBytes` of `sparql_query` |
+| `--max-concurrent N` | `4` | tool calls running at once; further calls wait (and their timeout runs) |
+| `--allow-service` | off | allow `SERVICE` in queries |
+| `--disable-tool NAME` | | do not offer a tool |
+
+The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
+
+**Protocol.** Revisions `2026-07-28` (stateless: `server/discover`, the protocol
+version and client capabilities in each request's `_meta`) and the legacy `initialize`
+handshake of `2025-11-25` and `2025-06-18`; an unknown revision gets `-32022` with
+`data.supported`. Capabilities: `{"tools": {}}`. `server/discover` and `tools/list`
+are cacheable for an hour (`ttlMs: 3600000`, `cacheScope: "public"`): the tool set is
+fixed for the life of the process. `notifications/cancelled` stops the referenced call
+(no response is sent for it). The server's `instructions` describe the workflow
+(`list_datasets` → `describe_schema` → `sparql_query`) and that tool results are
+untrusted data.
+
+### Tools
+
+Tools appear in this order. All are read-only
+(`annotations: {"readOnlyHint": true, "openWorldHint": false}`; `sparql_query` is
+open-world when SERVICE is allowed). Common arguments:
+
+* `dataset`: a name from `list_datasets`; optional when the server has one dataset.
+* `atCommit` (integer): read the snapshot of that commit (see below).
+* `reasoning` (boolean): include materialized inferences (default: when the dataset
+  has them).
+* IRIs may be given as `<http://…>`, `http://…`, a prefixed name (`ex:alice`, with the
+  dataset's prefixes) or, in `describe_resource`, a blank node label `_:b…`.
+
+| Tool | Arguments (besides the common ones) | Result |
+|---|---|---|
+| `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
+| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?}], next, prefixes}`. The summary lists the largest classes and predicates; `classes`/`predicates` page through all entries in IRI order |
+| `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | one text block: a table or a JSON document (below); no `structuredContent` |
+| `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`; `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. Warnings: `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows), `service-disabled` |
+| `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, prefixes}`; each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others |
+| `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
+
+Every tool except `sparql_query` declares an `outputSchema` and returns
+`structuredContent` plus the same object as one compact JSON text block. `tools/list`
+has the complete JSON Schemas.
+
+**Terms** in results use Turtle/SPARQL syntax, so they can be pasted into queries:
+`ex:alice` (a dataset prefix whose namespace fits), `<http://…>`, `_:b1f`, `"text"`,
+`"text"@en`, `"x"^^xsd:date`, bare `42` / `1.5` / `true` for canonical integers, decimals
+and booleans, and `<<( s p o )>>`. Inside quotes, `\`, `"`, line breaks, TAB, other
+control characters and U+2028/U+2029 are escaped, so a term is always one line. A lexical
+form or IRI longer than `maxTermChars` characters is cut, with the cut marked outside the
+quotes: `"Lorem ipsum"…(+4519 chars)`. `prefixes` lists the prefixes a result used.
+Labels come from `rdfs:label`, `skos:prefLabel`, `schema:name`, `foaf:name` and
+`dcterms:title`, in that priority, preferring the requested language, then no language.
+
+**`sparql_query` tables.**
+
+```
+# SELECT · rows 1–100 of 12345 (TRUNCATED: maxRows=100) · commit 42
+PREFIX ex: <http://ex.org/>
+?s	?name
+ex:alice	"Alice"@en
+…
+# more: call sparql_query with the same query, offset=100, atCommit=42
+```
+
+The first line has the query type, the rows shown, the total (`of ≥N` with
+`exactTotal: false`, which stops after `offset+maxRows+1` solutions), the truncation
+reason, the commit and `· N terms shortened`. Cells are separated by TAB and an unbound
+variable is an empty cell; CONSTRUCT and DESCRIBE rows are `s p o .`; ASK is `true` or
+`false`. Rows stop at `maxRows`, or before the row that would take the whole text past
+`maxBytes` bytes. Status lines start with `#`, which no rendered term can. `format: "json"`
+gives `{dataset, commit, queryType, vars, rows: [[term | null]], boolean?, total | null,
+offset, returned, truncated: null | {reason: "maxRows"|"maxBytes", next: {offset,
+atCommit}}, termsShortened, prefixes, elapsedMs}`, also bounded by `maxBytes`.
+
+**Snapshots.** A call without `atCommit` reads the head and names its commit. With
+`atCommit`, the call reads that commit if it is the head or still held: the server
+keeps the last 4 commits read per dataset (32 overall) for 10 minutes after their last
+use. Otherwise the call fails with `unknown-commit` ("commit 38 is no longer held (head
+is 42); rerun without atCommit …", or "commit 57 does not exist …"). All internal queries
+of one call read one snapshot, and `describe_schema` cursors are bound to theirs.
+
+### Errors
+
+A failed call is a result with `isError: true`, one text block `"<message>\nHint:
+<remedy>"` and `_meta["io.github.kclejeune.sparkles/error"] = {code, status, budget?}`
+(`status` is the equivalent HTTP status):
+
+| code | status | when |
+|---|---|---|
+| `bad-argument` | 400 | an argument outside its schema (unknown field, out of range, bad IRI) |
+| `unknown-dataset` | 404 | no such dataset, or `dataset` omitted on a server with several (the hint lists them) |
+| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes) |
+| `not-a-query` | 400 | SPARQL Update sent to `sparql_query` |
+| `timeout` | 408 | the call's timeout passed |
+| `budget-memory`, `budget-rows` | 507 | a query budget was exceeded |
+| `service-disabled` | 403 | a query uses SERVICE and it is not allowed |
+| `unknown-commit` | 404 / 410 | `atCommit` in the future / no longer held |
+| `stale-cursor` | 409 / 400 | a schema cursor whose snapshot is gone / a malformed cursor |
+| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors |
+| `text-unavailable`, `write-failed`, `unsupported` | 503, 503, 501 | as over HTTP |
+| `internal` | 500 | anything else ("internal error (request id …)", logged at ERROR) |
+
+An unknown tool is a protocol error (`-32602`, "Unknown tool: NAME").
