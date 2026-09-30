@@ -306,8 +306,9 @@ pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryR
 }
 
 /// `SELECT *`: spargebra projects variables in sorted order; Jena (and users) expect the
-/// order of first appearance in the query text.
-fn select_star_order(q: &str, r: &mut QueryResult) {
+/// order of first appearance in the query text. [`query`] applies this; callers of
+/// [`execute_query`] apply it themselves.
+pub fn select_star_order(q: &str, r: &mut QueryResult) {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE
         .get_or_init(|| regex::Regex::new(r"(?is)\bselect\s+(distinct\s+|reduced\s+)?\*").unwrap());

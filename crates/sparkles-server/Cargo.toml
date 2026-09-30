@@ -60,6 +60,8 @@ zeroize = { version = "1", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
 reqwest = { workspace = true, optional = true }
 rpassword = { version = "7", optional = true }
+# MCP server (`sparkles mcp`): the official Rust SDK, without its tool macros
+rmcp = { version = "~3.5", default-features = false, features = ["server", "transport-io"], optional = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"
@@ -71,7 +73,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 aws-lc-rs = "1"
 
 [features]
-default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth"]
+default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth", "mcp"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -90,6 +92,8 @@ auth = [
     "dep:jsonwebtoken",
     "dep:reqwest",
 ]
+# Model Context Protocol server for LLM agents (`sparkles mcp`, stdio)
+mcp = ["dep:rmcp"]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
