@@ -31,6 +31,24 @@ impl SolutionsFormat {
             SolutionsFormat::Sparkles => "application/x-sparkles+json",
         }
     }
+    /// A lower bound of the serialized size of `rows` solutions of `vars` variables (any
+    /// of which may be unbound), for refusing a response over its size budget before
+    /// serializing it.
+    pub fn min_bytes(self, rows: usize, vars: usize) -> u64 {
+        let per_row = match self {
+            // separators and the line end
+            SolutionsFormat::Tsv => vars.max(1),
+            SolutionsFormat::Csv => vars + 1,
+            // `{}`
+            SolutionsFormat::Json => 2,
+            // `<result/>`
+            SolutionsFormat::Xml => 9,
+            // `[null,…]`
+            SolutionsFormat::Sparkles => 5 * vars + 1,
+        };
+        (rows as u64).saturating_mul(per_row as u64)
+    }
+
     /// Parse a media type or Fuseki `format=` short name.
     pub fn from_name(s: &str) -> Option<SolutionsFormat> {
         let base = s.split(';').next()?.trim().to_ascii_lowercase();

@@ -85,6 +85,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SHACL Core + SHACL-SPARQL validation (`sparkles-shacl`): W3C suite **98/98** Core, **20/20** SPARQL; parallel, index-backed | ✅ |
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
+| Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
+| Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries stop when their client disconnects | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser (built against a mock; server integration pending) | 🚧 |
 
 ## Performance
@@ -146,7 +148,7 @@ feature gaps are:
 | SPARQL parser | JavaCC grammar | `spargebra`, which fails 7 W3C syntax/eval tests (see `tests/w3c-known-failures.txt`) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD only) |
 | Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` endpoint | ✗ none |
-| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); no metrics; datasets are configured by CLI flags / admin API only; prefixes are read-only |
+| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | ✗ no auth or ACLs (run behind a proxy); Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes are read-only |
 | SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
 | Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
 
@@ -378,6 +380,26 @@ Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data
 `/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`
 (see `docs/API.md`). `--mem NAME` adds an in-memory dataset, `--loc NAME=PATH` serves an
 existing database.
+
+Operations: `/$/ping` is the liveness check and `/$/ready` the readiness check (`503`
+once shutdown starts on SIGINT or SIGTERM); `/$/metrics` serves Prometheus metrics.
+Every response carries an `X-Request-Id`, and each request is logged once under the
+`sparkles::access` target. Other `serve` options:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--timeout S` | `60` | default query and update timeout in seconds (`timeout=` per request) |
+| `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
+| `--max-result-mb N` | `1024` | budget for the body of a query or Graph Store GET response (`0`: unlimited) |
+| `--max-rows N` | `200000000` | rows of any intermediate result |
+| `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
+| `--no-access-log` | | no per-request log lines |
+| `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |
+| `--metrics-max-datasets N` | `100` | datasets with their own metric labels (the rest share `$other`) |
+
+Over-budget requests fail with `507` and a JSON body naming the budget; the query stops as
+soon as its client disconnects. `sparkles query --memory-mb N` applies the memory budget
+on the command line (unlimited by default).
 
 Command line tools (Jena `tdb2.*` / `arq` equivalents):
 

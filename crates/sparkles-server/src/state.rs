@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,12 @@ pub struct AppState {
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     pub allow_service: bool,
+    /// Per-request budgets.
+    pub limits: Limits,
+    /// Emit one `sparkles::access` event per request.
+    pub access_log: bool,
+    pub metrics: crate::obs::Metrics,
+    phase: AtomicU8,
     /// Serializes dataset management (create / attach / delete / registry saves) so a
     /// name is reserved atomically and an older registry snapshot can never overwrite
     /// a newer one.
@@ -124,6 +130,39 @@ pub fn valid_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
+/// Per-request budgets of the server (`None`: unlimited).
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// estimated memory of a query's (or update WHERE clause's) intermediate results
+    pub query_memory_bytes: Option<u64>,
+    /// serialized body of query and Graph Store GET responses
+    pub max_result_bytes: Option<u64>,
+    /// rows of any intermediate result
+    pub max_rows: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            query_memory_bytes: Some(8 << 30),
+            max_result_bytes: Some(1 << 30),
+            max_rows: 200_000_000,
+        }
+    }
+}
+
+impl Limits {
+    /// `{timeoutSeconds, queryMemoryBytes, maxResultBytes, maxRows}`; 0 means unlimited.
+    pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
+        serde_json::json!({
+            "timeoutSeconds": timeout.as_secs_f64(),
+            "queryMemoryBytes": self.query_memory_bytes.unwrap_or(0),
+            "maxResultBytes": self.max_result_bytes.unwrap_or(0),
+            "maxRows": self.max_rows,
+        })
+    }
+}
+
 impl AppState {
     pub fn new(
         data_dir: &Path,
@@ -142,6 +181,10 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: true,
+            limits: Limits::default(),
+            access_log: true,
+            metrics: crate::obs::Metrics::new(true, 100),
+            phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             manage: Mutex::new(()),
         };
         let reg_path = data_dir.join("config.json");
@@ -217,6 +260,14 @@ impl AppState {
         Ok(())
     }
 
+    pub fn phase(&self) -> crate::obs::Phase {
+        crate::obs::Phase::from_u8(self.phase.load(Ordering::SeqCst))
+    }
+
+    pub fn set_phase(&self, p: crate::obs::Phase) {
+        self.phase.store(p as u8, Ordering::SeqCst);
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<Dataset>> {
         self.datasets.read().get(name).cloned()
     }
@@ -266,6 +317,7 @@ impl AppState {
             self.datasets.write().insert(name.to_string(), ds);
             return Err(e);
         }
+        self.metrics.forget(name);
         if ds.kind == DbType::Persistent
             && !ds.ephemeral
             && let Some(root) = ds.store.root()
