@@ -4,10 +4,13 @@
 #
 #   scripts/bench.sh [N_PEOPLE] [WORKDIR]
 #
-# All three engines are queried over HTTP (SPARQL protocol, TSV results) so JVM start-up
-# is not measured. QLever's result cache is cleared in hyperfine's --prepare step (outside
-# the timed region) and Sparkles runs with its result cache disabled (--result-cache-mb 0),
-# so repeated runs measure execution rather than cache hits; Fuseki has no result cache.
+# All engines are queried over HTTP (SPARQL protocol, TSV results) so JVM start-up is not
+# measured. No engine may answer from a result cache: Sparkles runs with
+# --result-cache-mb 0, QLever with --cache-max-size-single-entry 0B (and its cache is also
+# cleared before every timed run), and Fuseki and Fluree have none. Before timing, every
+# engine's answer to every query is fingerprinted (scripts/bench-answers.py) and
+# compared: an engine whose answer differs in value from the majority is footnoted and
+# not ranked. Timed samples that fail are reported as errors, with the failure count.
 # Results go to WORKDIR/results/*.{md,json} and a combined
 # WORKDIR/results/summary.md.
 #
@@ -16,6 +19,7 @@
 # aarch64, macOS) unless FLUREE points at one.
 # Env: WARMUP (default 2), RUNS (default 10), SKIP_LOAD=1 to reuse existing indexes,
 # SKIP_QUERIES=1 to reuse existing per-query results (re-runs updates/throughput/RSS),
+# ANSWERS_ONLY=1 to re-check answers and rebuild the summary without timing anything,
 # ENGINES="sparkles jena qlever fluree" (default) to run a subset. Results are merged per engine
 # into existing results/*.json, so e.g. ENGINES=qlever re-measures only QLever and keeps
 # the other engines' numbers. QUERIES="name …" limits the row check and timings to those
@@ -28,7 +32,9 @@ WARMUP=${WARMUP:-2}
 RUNS=${RUNS:-10}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
+# absolute, so "$WORK/..." paths stay valid after the cd below
 mkdir -p "$WORK/results" "$WORK/queries"
+WORK=$(cd "$WORK" && pwd)
 cd "$WORK"
 
 nixbin() { # nixbin <pkg> <bin>
@@ -121,25 +127,26 @@ SPORT=3931; JPORT=3933; QPORT=3932; FPORT=3934
 PIDS=()
 trap '[ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null; true' EXIT
 wait_for() { for _ in $(seq 1 240); do curl -sf "$1" >/dev/null 2>&1 && return 0; sleep 0.5; done; echo "timeout waiting for $1" >&2; exit 1; }
-# per engine: result name, query endpoint, update command, port (for RSS)
+# per engine: result name, query endpoint, update command (printf template taking the
+# update file under queries/), port (for RSS)
 declare -A NAME URL UPDATE PORT
 if has sparkles; then
   "$SPARKLES" --result-cache-mb 0 serve --data sparkles-server --loc bench="$WORK/sparkles.db" --port $SPORT --timeout 600 > sparkles.log 2>&1 &
   PIDS+=($!); wait_for "localhost:$SPORT/\$/ping"
   NAME[sparkles]=sparkles; URL[sparkles]=localhost:$SPORT/bench/sparql; PORT[sparkles]=$SPORT
-  UPDATE[sparkles]="curl -sf -o /dev/null --data-urlencode update@queries/_update.ru localhost:$SPORT/bench/update"
+  UPDATE[sparkles]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$SPORT/bench/update"
 fi
 if has jena; then
   JVM_ARGS="-Xmx8G" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
   PIDS+=($!); wait_for "localhost:$JPORT/\$/ping"
   NAME[jena]=jena-fuseki; URL[jena]=localhost:$JPORT/bench/sparql; PORT[jena]=$JPORT
-  UPDATE[jena]="curl -sf -o /dev/null --data-urlencode update@queries/_update.ru localhost:$JPORT/bench/update"
+  UPDATE[jena]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$JPORT/bench/update"
 fi
 if has qlever; then
-  (cd qlever-index && exec "$QSERVER" -i bench -p $QPORT -m 8G -c 2G -s 600s -a bench -j 16 > server.log 2>&1) &
+  (cd qlever-index && exec "$QSERVER" -i bench -p $QPORT -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
   PIDS+=($!); wait_for "localhost:$QPORT/?cmd=stats"
   NAME[qlever]=qlever; URL[qlever]=localhost:$QPORT/; PORT[qlever]=$QPORT
-  UPDATE[qlever]="curl -sf -o /dev/null --data-urlencode update@queries/_update.ru --data-urlencode access-token=bench localhost:$QPORT/"
+  UPDATE[qlever]="curl -sf -o /dev/null --data-urlencode update@queries/%s --data-urlencode access-token=bench localhost:$QPORT/"
 fi
 if has fluree; then
   # property-path traversal is capped at 1M visited nodes by default (knows-reach at 10M)
@@ -147,7 +154,7 @@ if has fluree; then
     exec "$FLUREE" server run --listen-addr 127.0.0.1:$FPORT --storage-path "$WORK/fluree/.fluree/storage" --log-level warn > ../fluree.log 2>&1) &
   PIDS+=($!); wait_for "localhost:$FPORT/health"
   NAME[fluree]=fluree; URL[fluree]=localhost:$FPORT/v1/fluree/query/bench:main; PORT[fluree]=$FPORT
-  UPDATE[fluree]="curl -sf -o /dev/null --data-urlencode update@queries/_update.ru localhost:$FPORT/v1/fluree/update/bench:main"
+  UPDATE[fluree]="curl -sf -o /dev/null --data-urlencode update@queries/%s localhost:$FPORT/v1/fluree/update/bench:main"
 fi
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
@@ -182,18 +189,31 @@ add lang-filter    'SELECT (COUNT(*) AS ?c) WHERE { ?d ex:title ?t FILTER(LANGMA
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
 }
-# sanity check: every engine must answer every query with the same number of rows;
-# an engine that errors (HTTP failure) is reported as "error" instead of a time
+# the update-latency triple (named graph, see below): removed before the answer check and
+# after the update timing, so every engine is compared on exactly the loaded data
+T='GRAPH <http://example.org/bench/g> { <http://example.org/bench/s> <http://example.org/bench/p> "v" }'
+printf 'INSERT DATA { %s }' "$T" > queries/_update.ru
+printf 'DELETE DATA { %s }' "$T" > queries/_delete.ru
+printf 'ASK { %s }' "$T" > queries/_ask.rq
+for e in $ENGINES; do eval "$(printf "${UPDATE[$e]}" _delete.ru)" || true; done
+
+# answer check: every engine's answer to every query is fingerprinted (row count, exact
+# RDF terms, numeric values) into results/answers.json; the summary compares engines. An
+# engine that errors (HTTP failure) is reported as "error" instead of a time. LIMIT
+# without ORDER BY may legitimately return different solutions: row counts only.
+COUNT_ONLY="export-500k"
 echo; printf '%-16s' rows; for e in $ENGINES; do printf ' %12s' "${NAME[$e]}"; done; echo
 for n in "${NAMES[@]}"; do
   selected "$n" || continue
-  rows() { curl -sf --max-time "${MAX_TIME:-300}" -H 'Accept: text/tab-separated-values' --data-urlencode "query@queries/$n.rq" "$1" > "rows.$$.tsv" && tail -n +2 "rows.$$.tsv" | wc -l || echo error; }
-  printf '%-16s' "$n"; kv=()
-  for e in $ENGINES; do r=$(rows "${URL[$e]}"); printf ' %12s' "$r"; kv+=("${NAME[$e]}=$r"); done; echo
-  setj results/rows.json "$n" "${kv[@]}"
+  flag=(); [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
+  printf '%-16s' "$n"
+  for e in $ENGINES; do
+    r=$(python3 "$ROOT/scripts/bench-answers.py" "${URL[$e]}" "queries/$n.rq" results/answers.json "$n" "${NAME[$e]}" "${flag[@]}")
+    printf ' %12s' "$r"
+  done; echo
 done
-rm -f "rows.$$.tsv"
 
+if [ -z "${ANSWERS_ONLY:-}" ]; then
 # clears QLever's result cache before every run (a no-op without QLever)
 CLEAR="true"; has qlever && CLEAR="curl -sf -o /dev/null 'localhost:$QPORT/?cmd=clear-cache&access-token=bench'"
 for n in "${NAMES[@]}"; do
@@ -208,18 +228,34 @@ for n in "${NAMES[@]}"; do
 done
 
 # ------------------------------------------------------------------------ update latency
-# a single-triple INSERT DATA (idempotent, so every run does the same work), into a named
-# graph so the persisted triple never shows up in the default-graph queries above
-printf '%s' 'INSERT DATA { GRAPH <http://example.org/bench/g> { <http://example.org/bench/s> <http://example.org/bench/p> "v" } }' > queries/_update.ru
+# a single-triple INSERT DATA of a triple that is not present: an untimed --prepare deletes
+# it before every run, so every timed request performs a real insertion. It goes into a
+# named graph so it never shows up in the default-graph queries above. Durability is each
+# engine's default: Sparkles fsyncs its WAL, TDB2 commits durably, QLever keeps updates
+# in memory only, and Fluree commits to its log (see docs/BENCHMARKS.md).
+ask() { curl -sf --max-time 30 -H 'Accept: application/sparql-results+json' --data-urlencode query@queries/_ask.rq "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["boolean"])' 2>/dev/null || echo error; }
 echo; echo "== update-latency"
-ucmd() { echo "${UPDATE[$1]}"; }
-mapfile -d '' ARGS < <(engine_args ucmd)
-hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
-  "${ARGS[@]}" --export-json results/update-latency.new.json
-merge results/update-latency.new.json results/update-latency.json
+ARGS=()
+for e in $ENGINES; do
+  # the mutation must be observable, or the engine's timings would measure a no-op
+  eval "$(printf "${UPDATE[$e]}" _delete.ru)"; a=$(ask "${URL[$e]}")
+  eval "$(printf "${UPDATE[$e]}" _update.ru)"; b=$(ask "${URL[$e]}")
+  if [ "$a" != False ] || [ "$b" != True ]; then
+    echo "${NAME[$e]}: insert/delete not observable (before=$a after=$b); skipping its update timing" >&2
+    continue
+  fi
+  ARGS+=(--prepare "$(printf "${UPDATE[$e]}" _delete.ru)" --command-name "${NAME[$e]}" "$(printf "${UPDATE[$e]}" _update.ru)")
+done
+if [ ${#ARGS[@]} -gt 0 ]; then
+  hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    "${ARGS[@]}" --export-json results/update-latency.new.json
+  merge results/update-latency.new.json results/update-latency.json
+fi
+for e in $ENGINES; do eval "$(printf "${UPDATE[$e]}" _delete.ru)" || true; done
 
 # ------------------------------------------------------------------- concurrent throughput
-# 160 star-join requests from 16 parallel clients
+# 160 star-join requests from 16 parallel clients (all engines without result caches, so
+# every request executes the query)
 CONC=${CONC:-16}; NREQ=${NREQ:-160}
 par() { echo "seq $NREQ | xargs -P $CONC -I{} $(q "$1" star-join)"; }
 echo; echo "== throughput ($NREQ requests, $CONC clients)"
@@ -235,6 +271,7 @@ rss() { local pid; pid=$(ss -ltnp 2>/dev/null | grep ":$1 " | sed -n 's/.*pid=\(
 kv=(); for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss "${PORT[$e]}")"); done
 setj results/rss.json "" "${kv[@]}"
 echo; echo "RSS (MiB) after the run: $(cat results/rss.json)"
+fi # ANSWERS_ONLY
 
 # ---------------------------------------------------------------------------- summary
 python3 - "$WORK/results" "${NAMES[@]}" <<'EOF'
@@ -250,31 +287,60 @@ for n in names + ["update-latency", "throughput"]:
 cmds = [c for c in ORDER if c in seen] + sorted(seen - set(ORDER))
 out = ["| query | " + " | ".join(f"{c} (ms)" for c in cmds) + " |", "|---|" + "---:|" * len(cmds)]
 def fmt(r): return f"{r['mean']*1000:.1f} ± {r['stddev']*1000:.1f}"
-def failed(r): return r is None or any(e != 0 for e in r.get("exit_codes", []))
-def row(label, rs, bad=frozenset(), f=fmt, better=min, key=lambda r: r["mean"], err="error", mark=frozenset()):
-    ok = {c: rs[c] for c in cmds if c in rs and c not in bad and not failed(rs[c])}
-    best = better(ok, key=lambda c: key(ok[c])) if ok else None
+def nfailed(r): return sum(1 for e in r.get("exit_codes", []) if e != 0)
+def row(label, rs, bad=frozenset(), f=fmt, better=min, key=lambda r: r["mean"], err="error",
+        mark=None, unranked=frozenset()):
+    mark = mark or {}
+    ok = {c: rs[c] for c in cmds if c in rs and c not in bad and nfailed(rs[c]) == 0}
+    rank = {c: r for c, r in ok.items() if c not in unranked}
+    best = better(rank, key=lambda c: key(rank[c])) if rank else None
     cells = []
     for c in cmds:
         if c not in rs: cells.append("—")
-        elif c not in ok: cells.append(err)
-        else: cells.append(("**%s**" if c == best else "%s") % f(ok[c]) + (" †" if c in mark else ""))
+        elif c in bad: cells.append(err)
+        elif c not in ok:
+            k = nfailed(rs[c]); cells.append(f"{err} ({k}/{len(rs[c].get('exit_codes', []))} runs failed)")
+        else: cells.append(("**%s**" if c == best else "%s") % f(ok[c]) + mark.get(c, ""))
     out.append(f"| {label} | " + " | ".join(cells) + " |")
+def majority(vals):
+    """the value most engines agree on, if at least two do"""
+    vs = list(vals.values())
+    if not vs: return None
+    ref = max(set(vs), key=vs.count)
+    return ref if vs.count(ref) > 1 else None
 lr = load(f"{d}/load.json")
 if lr:
     row("**load** (s)", {c: lr[LOADNAME.get(c, c)] for c in cmds if LOADNAME.get(c, c) in lr}, f=lambda r: f"{r['mean']:.2f}")
+answers = json.load(open(f"{d}/answers.json")) if os.path.exists(f"{d}/answers.json") else {}
 rows = json.load(open(f"{d}/rows.json")) if os.path.exists(f"{d}/rows.json") else {}
 notes = []
 for n in names:
-    rn = rows.get(n, {})
-    counts = {c: v for c, v in rn.items() if v != "error"}
-    # an engine returning a different row count than the majority gets a footnote
-    ref = max(set(counts.values()), key=list(counts.values()).count) if counts else None
-    bad = {c for c, v in rn.items() if v == "error"}
-    wrong = {c for c, v in counts.items() if v != ref and list(counts.values()).count(ref) > 1}
     rs = load(f"{d}/{n}.json")
-    row(n, rs, bad, err="error", mark=wrong)
-    notes += [f"† `{n}`: {c} returned {rn[c]} rows, the majority {ref}" for c in sorted(wrong)]
+    if n in answers:
+        an = answers[n]
+        bad = {c for c, v in an.items() if v["rows"] == "error"}
+        ok = {c: v for c, v in an.items() if c not in bad}
+        # value-level disagreement with the majority: shown, footnoted, not ranked
+        by_value = {c: v.get("value", v["rows"]) for c, v in ok.items()}
+        ref = majority(by_value)
+        wrong = {c for c, v in by_value.items() if ref is not None and v != ref}
+        # same values but different RDF terms (lexical forms): footnoted, still ranked
+        same = {c: v["exact"] for c, v in ok.items() if c not in wrong and "exact" in v}
+        eref = majority(same)
+        lexical = {c for c, v in same.items() if eref is not None and v != eref}
+        mark = {c: " †" for c in wrong} | {c: " ‡" for c in lexical}
+        row(n, rs, bad, err="error", mark=mark, unranked=wrong)
+        notes += [f"† `{n}`: {c} returned a different answer ({an[c]['rows']} rows) than the majority; not ranked" for c in sorted(wrong)]
+        notes += [f"‡ `{n}`: {c} returned equal values as different RDF terms (numeric datatype or lexical form)" for c in sorted(lexical)]
+    else:
+        # older runs recorded row counts only
+        rn = rows.get(n, {})
+        counts = {c: v for c, v in rn.items() if v != "error"}
+        ref = majority(counts)
+        bad = {c for c, v in rn.items() if v == "error"}
+        wrong = {c for c, v in counts.items() if ref is not None and v != ref}
+        row(n, rs, bad, err="error", mark={c: " †" for c in wrong})
+        notes += [f"† `{n}`: {c} returned {rn[c]} rows, the majority {ref}" for c in sorted(wrong)]
 rs = load(f"{d}/update-latency.json")
 if rs: row("**update** (1-triple INSERT DATA)", rs)
 rs = load(f"{d}/throughput.json")

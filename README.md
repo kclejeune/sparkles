@@ -90,33 +90,36 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 ## Performance
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). It compares Jena/Fuseki, QLever and
-Fluree using hyperfine over HTTP with result caches off, and checks every engine's row
-count before timing.
+Fluree using hyperfine over HTTP, with every result cache off and each engine measured
+on its own. Before timing, it checks that all engines return the same answers.
 
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
 | Bulk load | **0.8 s** (Fluree 1.4, QLever 1.5, TDB2 4.3) | **6.1 s** (QLever 9.1, Fluree 10.2, TDB2 42.6) |
-| Fastest of the four | 13 of 20 queries | 11 of 20 queries |
-| Loses to QLever | `range-topk` 1.4×, `minus` ≈ | `range-topk` 1.8×, `types-grouped` 1.7×, `two-hop-count` 1.7×, `minus` ≈ |
-| Loses to Fluree | `two-hop-count` 2.8×, `lang-filter` 1.6×, `order-by-full` ≈ | `lang-filter` 3.1×, `two-hop-count` 2.7×, `knows-reach` 1.6×, `count-all` ≈ |
-| vs. Fuseki | 1.3–19× faster; Fuseki errors on `foaf:knows*` | 1.4–180× faster |
-| Update latency (1 triple) | 10 ms (**Fluree 7.6**, QLever 14, Fuseki 24) | 14 ms (**Fluree 7.7**, QLever 18, Fuseki 20) |
-| Throughput, 16 clients | **657 q/s** (QLever 505, Fluree 472, Fuseki 58) | **116 q/s** (QLever 57, Fluree 54, Fuseki 5) |
-| Server memory | 176 MiB (QLever 172, Fluree 1.8 GiB, Fuseki 1.9 GiB) | 824 MiB (**QLever 293**, Fluree 2.3 GiB, Fuseki 3.7 GiB) |
+| Fastest of the four | 18 of 20 queries | 9 of 20 queries |
+| Loses to QLever | `range-topk` 1.9× | `range-topk` 5.0×, `minus` 1.9×, `group-avg` 1.6×, `two-hop-count` 1.6×, `optional-count` 1.4×, `types-grouped` ≈ |
+| Loses to Fluree | `two-hop-count` 1.5×, `distinct-obj` ≈ | `two-hop-count` 2.4×, `contains` 2.4×, `distinct-obj` 2.3×, `knows-reach` 1.75×, `lang-filter` 1.2×, `count-all` ≈ |
+| vs. Fuseki | 1.8–34× faster; Fuseki errors on `foaf:knows*` | 1.8–400× faster |
+| Update latency (1 triple, real insert) | **6.4 ms** (Fluree 6.5, QLever 11.8, Fuseki 41.7) | 10.9 ms (**Fluree 6.8**, QLever 15.8, Fuseki 38.6) |
+| Throughput, 16 clients | **898 q/s** (Fluree 497, QLever 408, Fuseki 53) | **144 q/s** (QLever 57, Fluree 51, Fuseki 7) |
+| Server memory | 229 MiB (**QLever 225**, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 1.6 GiB (**QLever 362 MiB**, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
 
-Fluree was OOM-killed (26 GB) on `optional-chain` at 10.5M, and is 2–39× slower than
-Sparkles on general joins, OPTIONAL, subqueries and grouping.
+Against QLever at 10.5M, Sparkles wins 14 of 20 queries, several by 8–17×
+(`distinct-obj`, `regex-iri`, `contains`, `lang-filter`). Fluree is 1.6–61× slower
+than Sparkles on general joins, OPTIONAL, subqueries, grouping and sorting, and was
+OOM-killed (26 GB) on `optional-chain` at 10.5M.
 
 Where Sparkles still loses on performance:
-* **Range filters:** QLever skips blocks on range FILTERs.
-* **Metadata-only GROUP BY:** QLever answers these faster at 10M.
-* **Large two-way joins:** QLever pipelines them lazily.
-* **Fluree's shape-specific fast paths:**
-  * language tags stored per row;
-  * count-only join plans.
-* **Update latency:** Fluree commits faster (its re-indexing runs in the background).
+* **Range filters:** QLever skips blocks on range FILTERs (5× on `range-topk` at 10.5M).
+* **Joins and grouping at scale:** at 10.5M, QLever is 1.4–1.9× faster on OPTIONAL,
+  MINUS, GROUP BY with AVG and two-hop counts.
+* **Count-only joins and single-predicate scans:** Fluree is 1.2–2.4× faster at 10.5M
+  on `two-hop-count`, `contains`, `distinct-obj` and `lang-filter`, and 1.75× on the
+  `foaf:knows*` traversal.
+* **Update latency:** Fluree commits faster at 10.5M (it indexes in the background).
 * **Memory:** Sparkles materializes every intermediate result and buffers whole
-  responses.
+  responses. Its RSS after the concurrent throughput test also includes heap that
+  glibc retains (672 MiB with a fixed mmap threshold, against 1.6 GiB by default).
 * **Untested ground:** nothing above 10.5M triples, cold caches, standard benchmarks
   (LUBM/BSBM/WatDiv) and sustained update workloads. QLever's design targets billions
   of triples.
@@ -181,18 +184,17 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 | Reasoning | at query time (RDFS / OWL 2 QL rewriting, OWL 2 RL / Datalog with a fact budget) | materialized (RDFS, OWL 2 RL, Jena rules) |
 
 Where Sparkles is ahead:
-* **Conformance.** It passes the W3C SPARQL 1.1 suites in full. Fluree's own register
-  lists 184 known SPARQL failures, including RDF 1.2 triple terms and base direction.
-  Its SHACL passes 81/98 of Core against 98/98 + 20/20 here, and its TSV output is not
-  W3C-formatted.
+* **Conformance.** Sparkles passes the W3C SPARQL 1.1 suites in full and the SHACL
+  Core and SHACL-SPARQL suites (98/98, 20/20). We have not run Fluree's conformance
+  ourselves. Its TSV output is not W3C-formatted.
 * **Jena/Fuseki compatibility.** Fuseki endpoints and `/$/` admin, the Jena-style CLI
   and rules, and external `SERVICE` federation (Fluree federates only between its own
   ledgers).
 * **Index design.**
   * Fluree keeps 4 index orders against Sparkles' 7.
   * Its planner is greedy; Sparkles' is dynamic-programming.
-  * It re-indexes after nearly every commit; Sparkles folds updates into a delta and
-    compacts periodically.
+  * It indexes in the background once uncommitted changes pass a threshold. Sparkles
+    folds updates into an in-memory delta and compacts on request.
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the head-to-head numbers.
 
