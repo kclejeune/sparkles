@@ -13,6 +13,7 @@ mod http;
 mod mcp;
 mod obs;
 mod otel;
+mod outbound;
 mod ratelimit;
 mod reasoning;
 #[cfg(feature = "auth")]
@@ -354,6 +355,8 @@ enum Cmd {
         /// Disable federated SERVICE calls
         #[arg(long)]
         no_service: bool,
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
@@ -1071,6 +1074,7 @@ fn run() -> Result<()> {
             timeout,
             read_only,
             no_service,
+            outbound,
             idle_release_ms,
             text,
             schema_max_entries,
@@ -1103,6 +1107,7 @@ fn run() -> Result<()> {
             st.auth = auth;
             st.read_only = read_only;
             st.allow_service = !no_service;
+            st.outbound = outbound.policy()?;
             st.schema_max_entries = schema_max_entries;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(

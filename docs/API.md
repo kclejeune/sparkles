@@ -1125,7 +1125,10 @@ Server permissions: `metrics` (`/$/metrics`, the full `/$/ready` list), `federat
 (`SERVICE` and `LOAD <http…>`), and `server-admin` (everything: `admin` on every dataset,
 create datasets, every token, `LOAD <file:…>`). Grants are a union of a principal's own
 grants and its roles'; there are no deny rules. `--read-only` still applies to everyone,
-after authorization.
+after authorization. `federate` does not open every URL: `SERVICE` and `LOAD <http…>`
+also follow the server's outbound policy (public addresses only unless
+`--outbound-allow-private` or `--outbound-allow`; see the README, Outbound requests), and a
+refused destination answers `403` as well.
 
 A **token** never exceeds its owner: at each use its permissions are its scope
 intersected with its owner's current grants (or its parent token's, for a token minted
@@ -1402,6 +1405,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | largest `maxRows` / `maxBytes` of `sparql_query` |
 | `--max-concurrent N` | `4` | tool calls running at once; further calls wait (and their timeout runs) |
 | `--allow-service` | off | allow `SERVICE` in queries |
+| `--outbound-allow-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | off, none, `60`, `256` | where an allowed `SERVICE` may connect, as for `sparkles serve` |
 | `--disable-tool NAME` | | do not offer a tool |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
