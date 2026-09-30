@@ -487,3 +487,104 @@ async fn result_cache_nocache_and_clear() {
     .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------------------
+// regressions from the implementation review
+// ---------------------------------------------------------------------------------------
+
+async fn select_rows(app: &Router, query: &str) -> usize {
+    let r = send(
+        app,
+        Request::post("/ds/sparql")
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::from(query.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["results"]["bindings"].as_array().unwrap().len()
+}
+
+#[tokio::test]
+async fn graph_store_put_keeps_the_graph_on_invalid_input() {
+    let s = server();
+    let put = |body: &'static str| {
+        Request::put("/ds/data?graph=http://example.org/g1")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let count = "SELECT * WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }";
+    assert_eq!(select_rows(&s.app, count).await, 2);
+    let r = send(
+        &s.app,
+        put("<http://example.org/n> <http://example.org/p> 1 . this is not turtle"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(
+        select_rows(&s.app, count).await,
+        2,
+        "graph must be unchanged"
+    );
+    let r = send(
+        &s.app,
+        put("<http://example.org/n> <http://example.org/p> 1 ."),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(select_rows(&s.app, count).await, 1);
+}
+
+#[tokio::test]
+async fn read_only_server_rejects_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    state.read_only = true;
+    let state = Arc::new(state);
+    state.attach("ds", DbType::Mem, None).unwrap();
+    let app = router(state.clone());
+    let r = send(
+        &app,
+        Request::post("/$/compact/ds").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(state.tasks.lock().is_empty(), "no task may be scheduled");
+}
+
+#[test]
+fn concurrent_dataset_management_is_serialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    // distinct names: every creation reported successful survives a restart
+    let handles: Vec<_> = (0..30)
+        .map(|i| {
+            let st = state.clone();
+            std::thread::spawn(move || st.create(&format!("d{i}"), DbType::Mem).is_ok())
+        })
+        .collect();
+    assert!(handles.into_iter().all(|h| h.join().unwrap()));
+    // the same name: exactly one creation wins
+    let handles: Vec<_> = (0..12)
+        .map(|_| {
+            let st = state.clone();
+            std::thread::spawn(move || st.create("same", DbType::Mem).is_ok())
+        })
+        .collect();
+    let won = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(won, 1);
+    drop(state);
+    let reopened =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let names: Vec<String> = reopened.datasets.read().keys().cloned().collect();
+    assert_eq!(names.len(), 31, "{names:?}");
+}

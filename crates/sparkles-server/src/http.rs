@@ -15,6 +15,7 @@ use sparkles::index::Perm;
 use sparkles::io::Source;
 use sparkles::sparql::results::{self, SolutionsFormat};
 use sparkles::sparql::{QueryKind, QueryOptions};
+use sparkles::store::ReplaceTarget;
 use sparkles::{Error, id::Id};
 use std::sync::Arc;
 use std::time::Duration;
@@ -595,18 +596,20 @@ async fn gsp(
                     ),
                     _ => None,
                 };
-                if replace {
-                    let clear = match &target {
-                        Target::Default => "CLEAR SILENT DEFAULT".to_string(),
-                        Target::Named(iri) => format!("CLEAR SILENT GRAPH <{iri}>"),
-                        Target::Dataset => "CLEAR SILENT ALL".to_string(),
+                let src = Source::from_bytes(body.to_vec(), format, graph.clone());
+                let count = if replace {
+                    // parse first, then clear and insert atomically
+                    let t = match graph {
+                        Some(g) => ReplaceTarget::Named(g),
+                        None if matches!(target, Target::Dataset) => ReplaceTarget::All,
+                        None => ReplaceTarget::Default,
                     };
-                    sparkles::sparql::update::update(&ds.store, &clear, &QueryOptions::default())?;
-                }
-                let before = ds.store.snapshot().len();
-                let src = Source::from_bytes(body.to_vec(), format, graph);
-                ds.store.load(&[src])?;
-                let count = ds.store.snapshot().len().saturating_sub(before);
+                    ds.store.replace(t, &[src])?
+                } else {
+                    let before = ds.store.snapshot().len();
+                    ds.store.load(&[src])?;
+                    ds.store.snapshot().len().saturating_sub(before)
+                };
                 let status = if replace {
                     StatusCode::OK
                 } else {
@@ -993,6 +996,9 @@ async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>>
 }
 
 async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
     let ds = dataset(&st, &name)?;
     let task = st.start_task("compact", &name, move |h| {
         h.progress(0.1, "rebuilding index");

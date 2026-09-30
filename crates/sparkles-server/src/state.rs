@@ -5,6 +5,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sparkles::store::{Store, StoreOptions};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +75,10 @@ pub struct AppState {
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     pub allow_service: bool,
+    /// Serializes dataset management (create / attach / delete / registry saves) so a
+    /// name is reserved atomically and an older registry snapshot can never overwrite
+    /// a newer one.
+    manage: Mutex<()>,
 }
 
 /// Reasoning status is kept inside the database directory (`reasoning.json`) so it
@@ -137,6 +142,7 @@ impl AppState {
             default_timeout,
             read_only: false,
             allow_service: true,
+            manage: Mutex::new(()),
         };
         let reg_path = data_dir.join("config.json");
         if reg_path.exists() {
@@ -176,7 +182,15 @@ impl AppState {
         }))
     }
 
+    /// Persist the registry of managed datasets.
     pub fn save_registry(&self) -> Result<()> {
+        let _guard = self.manage.lock();
+        self.save_registry_locked()
+    }
+
+    /// Write `config.json` durably (temporary file, sync, rename, directory sync). The
+    /// caller holds `manage`, so the snapshot taken here is the newest one written.
+    fn save_registry_locked(&self) -> Result<()> {
         let reg = Registry {
             datasets: self
                 .datasets
@@ -192,8 +206,14 @@ impl AppState {
         };
         let path = self.data_dir.join("config.json");
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&reg)?)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serde_json::to_vec_pretty(&reg)?)?;
+            f.sync_all()?;
+        }
         std::fs::rename(tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.data_dir)?.sync_all()?;
         Ok(())
     }
 
@@ -205,12 +225,17 @@ impl AppState {
         if !valid_name(name) {
             bail!("invalid dataset name '{name}'");
         }
+        let _guard = self.manage.lock();
         if self.datasets.read().contains_key(name) {
             bail!("dataset '{name}' already exists");
         }
         let ds = self.open_dataset(name, kind, None)?;
         self.datasets.write().insert(name.to_string(), ds.clone());
-        self.save_registry()?;
+        if let Err(e) = self.save_registry_locked() {
+            // not reported as created, so it must not stay registered
+            self.datasets.write().remove(name);
+            return Err(e);
+        }
         Ok(ds)
     }
 
@@ -218,6 +243,10 @@ impl AppState {
     pub fn attach(&self, name: &str, kind: DbType, loc: Option<&Path>) -> Result<Arc<Dataset>> {
         if !valid_name(name) {
             bail!("invalid dataset name '{name}'");
+        }
+        let _guard = self.manage.lock();
+        if self.datasets.read().contains_key(name) {
+            bail!("dataset '{name}' already exists");
         }
         let ds = self.open_dataset(name, kind, loc)?;
         let ds = Arc::new(Dataset {
@@ -229,10 +258,14 @@ impl AppState {
     }
 
     pub fn delete(&self, name: &str) -> Result<bool> {
+        let _guard = self.manage.lock();
         let Some(ds) = self.datasets.write().remove(name) else {
             return Ok(false);
         };
-        self.save_registry()?;
+        if let Err(e) = self.save_registry_locked() {
+            self.datasets.write().insert(name.to_string(), ds);
+            return Err(e);
+        }
         if ds.kind == DbType::Persistent
             && !ds.ephemeral
             && let Some(root) = ds.store.root()
