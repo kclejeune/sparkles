@@ -162,6 +162,9 @@ pub struct Ctx {
     pub forbid_service: bool,
     /// network policy of SERVICE
     pub outbound: crate::outbound::OutboundPolicy,
+    /// what the SERVICE calls (and, in an update, the LOADs) of the request have spent
+    /// of the policy's totals
+    pub outbound_budget: Arc<crate::outbound::RequestBudget>,
     /// consult / fill the store's result cache
     pub use_cache: bool,
     pub opt: Optimizations,
@@ -190,6 +193,7 @@ impl Ctx {
             allow_service: true,
             forbid_service: false,
             outbound: Default::default(),
+            outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             opt: Optimizations::default(),
         }

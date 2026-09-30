@@ -355,7 +355,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
-| POST/PUT | `/{ds}/prefixes`           | Bind `prefix` to `uri` (query, form or JSON body `{prefix, uri}`); `400` for an invalid name or IRI. Prefixes are metadata: no commit is made. |
+| POST/PUT | `/{ds}/prefixes`           | Bind `prefix` to `uri` (query, form or JSON body `{prefix, uri}`); `400` for an invalid name or IRI (names up to 256 bytes, IRIs up to 4096), or for a new prefix once the dataset has `--max-prefixes` (1000; replacing one is fine). Prefixes of loaded data are added up to the same limit. Prefixes are metadata: no commit is made. |
 | DELETE | `/{ds}/prefixes?prefix=p`    | Remove a binding (`204`, or `404` if unbound). |
 
 ```ts
@@ -1152,6 +1152,11 @@ the request with `507 Insufficient Storage` and
   SPARQL query response. Graph Store GET (a graph or whole-dataset export) has its own
   budget, `--max-export-mb`, unlimited (`0`) by default; past it the export fails the
   same way and reports the same `result-bytes` budget.
+* `outbound-bytes` (`--outbound-request-max-mb`, default 4 × `--outbound-max-mb`, 1024):
+  the bytes all the SERVICE calls and `LOAD <http…>` of one query or update receive (a
+  compressed `LOAD` counts once decompressed). An update that exceeds it commits nothing;
+  `SILENT` does not hide it. Their summed time has a total as well
+  (`--outbound-request-timeout`, default 4 × `--outbound-timeout`, 240 s).
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
@@ -1219,7 +1224,8 @@ Per dataset, by name or `*` pattern (`"team-*"`): `read` < `write` < `admin`.
 
 Server permissions: `metrics` (`/$/metrics`, the full `/$/ready` list), `federate`
 (`SERVICE` and `LOAD <http…>`), and `server-admin` (everything: `admin` on every dataset,
-create datasets, every token, `LOAD <file:…>`). Grants are a union of a principal's own
+create datasets, every token, `LOAD <file:…>`, which also needs `serve --load-dir` and
+reads only files under it). Grants are a union of a principal's own
 grants and its roles'; there are no deny rules. `--read-only` still applies to everyone,
 after authorization. `federate` does not open every URL: `SERVICE` and `LOAD <http…>`
 also follow the server's outbound policy (public addresses only unless

@@ -598,7 +598,17 @@ pub struct StoreOptions {
     pub max_snapshots: usize,
     /// Allow writes to a dataset that requires a write guard without installing one.
     pub unvalidated_writes: bool,
+    /// Prefixes per dataset (0: unlimited): [`Store::set_prefix`] refuses a new one
+    /// past it, and the prefixes of loaded data stop being added.
+    pub max_prefixes: usize,
 }
+
+/// Default of [`StoreOptions::max_prefixes`].
+pub const DEFAULT_MAX_PREFIXES: usize = 1000;
+/// Longest prefix name, in bytes.
+pub const MAX_PREFIX_NAME_BYTES: usize = 256;
+/// Longest prefix IRI, in bytes.
+pub const MAX_PREFIX_IRI_BYTES: usize = 4096;
 
 impl Default for StoreOptions {
     fn default() -> Self {
@@ -614,6 +624,7 @@ impl Default for StoreOptions {
             history_max_generations: 8,
             max_snapshots: 256,
             unvalidated_writes: false,
+            max_prefixes: DEFAULT_MAX_PREFIXES,
         }
     }
 }
@@ -1684,14 +1695,34 @@ impl Store {
         self.prefixes.lock().clone()
     }
 
+    /// Add the prefixes of loaded data, keeping the ones already defined. Past
+    /// [`StoreOptions::max_prefixes`], or with a name or IRI past its length limit, a
+    /// prefix is left out (the data is not refused over its prefixes).
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) -> Result<()> {
         if p.is_empty() {
             return Ok(());
         }
         let mut cur = self.prefixes.lock();
         let before = cur.len();
+        let mut skipped = 0usize;
         for (k, v) in p {
-            cur.entry(k).or_insert(v);
+            if cur.contains_key(&k) {
+                continue;
+            }
+            if self.prefixes_full(cur.len())
+                || k.len() > MAX_PREFIX_NAME_BYTES
+                || v.len() > MAX_PREFIX_IRI_BYTES
+            {
+                skipped += 1;
+                continue;
+            }
+            cur.insert(k, v);
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "{skipped} prefixes of the loaded data were not added (at most {} per dataset, names of {MAX_PREFIX_NAME_BYTES} bytes, IRIs of {MAX_PREFIX_IRI_BYTES})",
+                self.opts.max_prefixes
+            );
         }
         if cur.len() != before
             && let Some(root) = &self.root
@@ -1704,16 +1735,28 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or replace) one prefix. Prefixes are metadata: no commit is made.
+    /// Set (or replace) one prefix. Prefixes are metadata: no commit is made. A new
+    /// prefix past [`StoreOptions::max_prefixes`] is refused.
     pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
-        if !valid_prefix_name(prefix) {
+        if prefix.len() > MAX_PREFIX_NAME_BYTES || !valid_prefix_name(prefix) {
             return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
+        }
+        if iri.len() > MAX_PREFIX_IRI_BYTES {
+            return Err(Error::invalid(format!(
+                "prefix IRI longer than {MAX_PREFIX_IRI_BYTES} bytes"
+            )));
         }
         oxrdf::NamedNode::new(iri)
             .map_err(|e| Error::invalid(format!("invalid IRI {iri:?}: {e}")))?;
         let mut cur = self.prefixes.lock();
         if cur.get(prefix).map(String::as_str) == Some(iri) {
             return Ok(());
+        }
+        if !cur.contains_key(prefix) && self.prefixes_full(cur.len()) {
+            return Err(Error::invalid(format!(
+                "the dataset has {} prefixes, the most allowed; remove one first",
+                cur.len()
+            )));
         }
         let mut next = cur.clone();
         next.insert(prefix.to_string(), iri.to_string());
@@ -1733,6 +1776,11 @@ impl Store {
         self.save_prefixes(&next)?;
         *cur = next;
         Ok(true)
+    }
+
+    /// Whether `n` prefixes leave no room for another.
+    fn prefixes_full(&self, n: usize) -> bool {
+        self.opts.max_prefixes > 0 && n >= self.opts.max_prefixes
     }
 
     fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {

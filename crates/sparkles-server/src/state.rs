@@ -196,6 +196,8 @@ pub struct AppState {
     pub allow_service: bool,
     /// where SERVICE and `LOAD <http…>` may connect (`serve --outbound-*`)
     pub outbound: sparkles::outbound::OutboundPolicy,
+    /// which files `LOAD <file:…>` may read (`serve --load-dir`; none without it)
+    pub file_loads: sparkles::sparql::FileLoads,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
     /// Per-request budgets.
@@ -406,6 +408,7 @@ impl AppState {
             read_only: false,
             allow_service: true,
             outbound: Default::default(),
+            file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             limits: Limits::default(),
             access_log: true,
@@ -464,6 +467,7 @@ impl AppState {
             read_only: false,
             allow_service: false,
             outbound: Default::default(),
+            file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             limits: Limits::default(),
             access_log: false,

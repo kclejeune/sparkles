@@ -571,7 +571,7 @@ struct OpMetrics {
 pub struct DsMetrics {
     ops: [OpMetrics; 8],
     result_rows: AtomicU64,
-    budget: [AtomicU64; 4],
+    budget: [AtomicU64; 5],
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
 }
 
@@ -581,6 +581,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::Memory => 1,
         BudgetKind::ResultBytes => 2,
         BudgetKind::DecompressedBytes => 3,
+        BudgetKind::OutboundBytes => 4,
     }
 }
 

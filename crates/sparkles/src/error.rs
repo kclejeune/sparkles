@@ -67,14 +67,18 @@ pub enum BudgetKind {
     ResultBytes,
     /// bytes of a decompressed input (a compressed request body or upload)
     DecompressedBytes,
+    /// bytes received by the outbound calls (SERVICE, `LOAD <http…>`) of one SPARQL
+    /// request, summed over its calls
+    OutboundBytes,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 4] = [
+    pub const ALL: [BudgetKind; 5] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
         BudgetKind::DecompressedBytes,
+        BudgetKind::OutboundBytes,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -83,6 +87,7 @@ impl BudgetKind {
             BudgetKind::Memory => "memory",
             BudgetKind::ResultBytes => "result-bytes",
             BudgetKind::DecompressedBytes => "decompressed-bytes",
+            BudgetKind::OutboundBytes => "outbound-bytes",
         }
     }
 }
@@ -117,6 +122,11 @@ impl std::fmt::Display for Budget {
             BudgetKind::DecompressedBytes => write!(
                 f,
                 "decompressed input exceeds the limit of {}",
+                human_bytes(self.limit)
+            ),
+            BudgetKind::OutboundBytes => write!(
+                f,
+                "the outbound requests (SERVICE, LOAD) of this request exceed their total of {}",
                 human_bytes(self.limit)
             ),
         }
