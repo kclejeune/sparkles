@@ -163,7 +163,7 @@ pub(crate) fn deterministic(e: &Expr) -> bool {
 
 /// A cache key plus the generated variable names it abstracts over.
 ///
-/// Generated variables (spargebra's random 32-hex names for aggregates and anonymous
+/// Generated variables (spargebra's random names for aggregates and anonymous
 /// patterns, the planner's hidden `" _N"` / blank-node variables) differ on every parse;
 /// they are replaced by positional placeholders so identical queries share entries.
 pub struct CacheKey {
@@ -191,9 +191,11 @@ impl CacheKey {
 
 fn anon_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    // `?` + a generated variable name, not followed by further name characters
+    // `?` + a generated variable name, not followed by further name characters.
+    // spargebra formats a random u128 with `{:x}` (no zero padding), so the hex names
+    // are up to 32 digits long; ≤ 16 digits has probability 2^-64.
     RE.get_or_init(|| {
-        regex::Regex::new(r"\?([0-9a-f]{32}| _\d+| bn\d+_[A-Za-z0-9_.-]+)([^A-Za-z0-9_]|$)")
+        regex::Regex::new(r"\?([0-9a-f]{17,32}| _\d+| bn\d+_[A-Za-z0-9_.-]+)([^A-Za-z0-9_]|$)")
             .unwrap()
     })
 }
@@ -308,4 +310,25 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
     }
     s.push(')');
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::anon_regex;
+
+    #[test]
+    fn generated_names_without_zero_padding_are_recognized() {
+        // `format!("{:x}", u128)` drops leading zeros: 1 in 16 names is shorter than 32
+        for name in [
+            "747f263623102c9077294cf98085481f",
+            "4b0701a3941a6fac1867cf67729c4f",
+            "1234567890abcdef1",
+        ] {
+            let text = format!("(Bind [?c := ?{name}] {{?t}})");
+            let c = anon_regex().captures(&text).expect(name);
+            assert_eq!(&c[1], name);
+        }
+        // ordinary short variable names are left alone
+        assert!(anon_regex().captures("(Bind [?c := ?abc] {?t})").is_none());
+    }
 }
