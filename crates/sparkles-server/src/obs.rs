@@ -572,7 +572,7 @@ pub struct DsMetrics {
     ops: [OpMetrics; 8],
     result_rows: AtomicU64,
     budget: [AtomicU64; 4],
-    rate_limited: [AtomicU64; 4],
+    rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -1072,7 +1072,8 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
-    if st.rate_limit.is_some() {
+    let throttle = crate::auth::throttle(st);
+    if st.rate_limit.is_some() || throttle.is_some() {
         family(
             &mut o,
             "sparkles_rate_limited_total",
@@ -1090,6 +1091,12 @@ pub fn render_prometheus(st: &AppState) -> String {
                 );
             }
         }
+        let limiters: Vec<(&str, &crate::ratelimit::RateLimiter)> =
+            [("requests", st.rate_limit.as_deref()), ("auth", throttle)]
+                .into_iter()
+                .filter_map(|(l, rl)| Some((l, rl?)))
+                .collect();
+        crate::ratelimit::render_metrics(&mut o, &limiters);
     }
 
     let validation = validation_totals(st);

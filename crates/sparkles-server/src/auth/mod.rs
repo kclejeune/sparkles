@@ -43,7 +43,7 @@ mod tokens;
 
 pub use api::{
     PrincipalKeyer, cors_layer, flush, load, render_metrics, restrict, routes, server_json,
-    spawn_reload_on_sighup,
+    spawn_reload_on_sighup, throttle,
 };
 pub use proxy::Peer;
 pub use routes::{AuthReport, Denied, forbidden, middleware};
@@ -441,6 +441,16 @@ impl Principal {
     /// limiters and audit records key on.
     pub fn id(&self) -> String {
         self.log_name().unwrap_or_else(|| "local".into())
+    }
+
+    /// The key of per-client rate limits: the owner of a minted token or a session
+    /// (`user:bob`), so that all the credentials of one owner share one budget; else
+    /// [`Principal::id`] (a static token of the configuration is a client of its own).
+    pub fn rate_key(&self) -> String {
+        match &self.info.owner {
+            Some(o) if !self.info.static_token => o.log_name(),
+            _ => self.id(),
+        }
     }
 
     /// `anonymous`, `user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`; `None` when auth is

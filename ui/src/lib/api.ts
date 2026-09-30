@@ -94,7 +94,7 @@ export type Outcome =
   | 'rate_limited'
   | 'denied'
   | 'rejected';
-export type LimitClass = 'auth' | 'query' | 'update' | 'admin';
+export type LimitClass = 'auth' | 'query' | 'update' | 'admin' | 'preauth';
 export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
 
 type CacheStats = {

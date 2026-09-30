@@ -1193,6 +1193,8 @@ fn run() -> Result<()> {
                 file: rate_limit_config,
                 flags: rate_limit,
                 trusted_proxies: rate_limit_trusted_proxy,
+                // with auth, the pre-authentication limit is on by default
+                auth: st.auth.is_some(),
             };
             if let Some(cfg) = limit_sources.load()? {
                 // signed-in callers are limited per principal, others per address

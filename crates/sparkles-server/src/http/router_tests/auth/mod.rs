@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod cli_grants;
+mod limits;
 mod oidc;
 mod proxy;
 mod sessions;

@@ -2,12 +2,13 @@
 //! CLI grants (device codes, loopback codes and the token endpoint).
 
 use super::grants::{Issued, Poll};
-use super::policy::{Failure, MINT_VIA, Policy};
+use super::policy::{DEVICE, DEVICE_CODE, Failure, MINT, MINT_VIA, Policy};
 use super::routes::json_error;
 use super::session::Method;
 use super::store::rfc3339;
 use super::tokens::{Client, TokenRecord};
 use super::{Auth, Identity, Kind, Level, Principal, Scheme, Scope, ServerPerm, crypto};
+use crate::ratelimit::{Admission, ClientKey};
 use crate::state::AppState;
 use axum::Router;
 use axum::body::Bytes;
@@ -225,7 +226,12 @@ fn session_cookie(auth: &Auth, h: &HeaderMap, raw: &str, max_age: i64) -> Header
 }
 
 /// `POST /$/auth/login` with `{user, password}` or `{token}`: a session cookie.
-async fn login(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
+async fn login(
+    State(st): St,
+    adm: Option<Extension<Admission>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let auth = match auth_of(&st) {
         Ok(a) => a,
         Err(r) => return r,
@@ -239,7 +245,8 @@ async fn login(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
     let now = auth.now();
     let invalid = || json_error(StatusCode::UNAUTHORIZED, "invalid credentials");
     let (method, who, token_id, expires) = match (b.user, b_password, b_token) {
-        (Some(user), Some(pw), None) => match auth.check_password(&user, &pw).await {
+        (Some(user), Some(pw), None) => match auth.check_password(&user, &pw, adm.as_deref()).await
+        {
             Ok(Some(_)) => (
                 Method::Password,
                 Identity {
@@ -258,6 +265,13 @@ async fn login(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
                     failure: Failure::Invalid,
                 });
                 return invalid();
+            }
+            Err(e) if e.failure == Failure::Limited => {
+                auth.count_failure(e);
+                match adm {
+                    Some(Extension(a)) => return a.refusal(),
+                    None => return json_error(StatusCode::TOO_MANY_REQUESTS, "too many failures"),
+                }
             }
             Err(_) => {
                 auth.count_login(Method::Password, "error");
@@ -625,6 +639,9 @@ fn mint(
         Kind::Token => p.info.token_id.clone(),
         _ => None,
     };
+    // per owner, whichever credential mints: a rate, and a cap on unexpired tokens
+    auth.throttle
+        .acquire(MINT, ClientKey::principal(&owner.log_name()), 1)?;
     let token = Zeroizing::new(super::policy::new_token());
     let rec = TokenRecord {
         id: super::tokens::new_id(),
@@ -639,12 +656,27 @@ fn mint(
         client,
         last_used: None,
     };
-    if let Err(e) = auth.tokens.insert(rec.clone(), now) {
-        tracing::error!("cannot store the token: {e:#}");
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot store the token",
-        ));
+    match auth
+        .tokens
+        .insert_within(rec.clone(), now, policy.max_tokens_per_owner)
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "at most {} active tokens per owner: revoke unused tokens first",
+                    policy.max_tokens_per_owner
+                ),
+            ));
+        }
+        Err(e) => {
+            tracing::error!("cannot store the token: {e:#}");
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot store the token",
+            ));
+        }
     }
     if let Some(i) = MINT_VIA.iter().position(|v| *v == via) {
         auth.metrics.minted[i].fetch_add(1, Ordering::Relaxed);
@@ -822,11 +854,22 @@ async fn revoke_by_owner(
 // ---------------------------------------------------------------- device grants ------
 
 /// `POST /$/auth/device` (RFC 8628 §3.1)
-async fn device_start(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
+async fn device_start(
+    State(st): St,
+    adm: Option<Extension<Admission>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let auth = match auth_of(&st) {
         Ok(a) => a,
         Err(r) => return r,
     };
+    // per client address (known with the pre-authentication limit on)
+    if let Some(Extension(a)) = &adm
+        && let Err(r) = auth.throttle.acquire(DEVICE, a.client().clone(), 1)
+    {
+        return r;
+    }
     let m = body_map(&headers, &body).unwrap_or_default();
     let field = |k: &str| -> String {
         m.get(k)
@@ -856,11 +899,13 @@ async fn device_start(State(st): St, headers: HeaderMap, body: Bytes) -> Respons
     )
 }
 
-/// The key that bounds a principal's failed user-code lookups.
-fn lookup_key(p: &Principal) -> [u8; 32] {
-    p.info
+/// The key that bounds a principal's failed user-code lookups: its session.
+fn lookup_key(p: &Principal) -> ClientKey {
+    let k = p
+        .info
         .session
-        .unwrap_or_else(|| crypto::sha256(p.id().as_bytes()))
+        .unwrap_or_else(|| crypto::sha256(p.id().as_bytes()));
+    ClientKey::principal(&crypto::hex(&k))
 }
 
 /// `GET /$/auth/device/{user_code}` (interactive): the grant, for the approval page.
@@ -875,10 +920,10 @@ async fn device_info(
     };
     let now = auth.now();
     let key = lookup_key(&p);
-    if !auth.cli.lookups_allowed(&key, now) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "too many unknown codes");
+    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+        return r;
     }
-    match auth.cli.lookup(&code, &key, now) {
+    match auth.cli.lookup(&code, now) {
         Some(i) => no_store(
             axum::Json(json!({
                 "userCode": i.user_code,
@@ -889,7 +934,10 @@ async fn device_info(
             }))
             .into_response(),
         ),
-        None => json_error(StatusCode::NOT_FOUND, "no such code, or it expired"),
+        None => {
+            auth.throttle.charge(DEVICE_CODE, key, 1);
+            json_error(StatusCode::NOT_FOUND, "no such code, or it expired")
+        }
     }
 }
 
@@ -916,11 +964,13 @@ async fn device_approve(
     };
     let now = auth.now();
     let key = lookup_key(&p);
-    if !auth.cli.lookups_allowed(&key, now) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, "too many unknown codes");
+    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+        return r;
     }
     if !auth.cli.is_pending(&code, now) {
-        let _ = auth.cli.lookup(&code, &key, now);
+        if auth.cli.lookup(&code, now).is_none() {
+            auth.throttle.charge(DEVICE_CODE, key, 1);
+        }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
     let body: MintBody = if body.is_empty() {
@@ -966,8 +1016,14 @@ async fn device_deny(
         Err(r) => return r,
     };
     let now = auth.now();
+    let key = lookup_key(&p);
+    if let Err(r) = auth.throttle.check(DEVICE_CODE, &key) {
+        return r;
+    }
     if !auth.cli.decide(&code, None, now) {
-        let _ = auth.cli.lookup(&code, &lookup_key(&p), now);
+        if auth.cli.lookup(&code, now).is_none() {
+            auth.throttle.charge(DEVICE_CODE, key, 1);
+        }
         return json_error(StatusCode::NOT_FOUND, "no such code, or it expired");
     }
     let prefix: String = code.chars().take(4).collect();

@@ -1,4 +1,5 @@
-//! Rate and concurrency limits per request class and client.
+//! Rate and concurrency limits per request class and client: the one limiter of the
+//! server, which the auth layer's own throttles use too.
 //!
 //! Requests fall into four classes by their matched route and method ([`Class`]):
 //! `auth` (everything under `/$/auth/`), `query`, `update` and `admin`; health checks,
@@ -6,6 +7,13 @@
 //! class (optionally overridden per dataset) has a [`Limit`]: a request rate with a burst,
 //! enforced per client with GCRA (the "virtual scheduling" form of a token bucket, one
 //! `u64` per client), and caps on the requests in flight, server-wide and per client.
+//!
+//! Enforcement has two stages. [`admit`] runs before authentication and applies the
+//! `preauth` limit: a budget of authentication failures per client address, so that
+//! password guessing and the hashing it costs are bounded before any credential is
+//! checked (the auth layer reserves the cost of a failure through [`Admission`] before
+//! it verifies a password). [`limit`] runs after authentication and applies the class
+//! limits, keyed by [`ClientKeyer`] (the signed-in owner with auth).
 //!
 //! * Over the rate: `429 Too Many Requests` with `Retry-After`.
 //! * Over a concurrency cap: `503 Service Unavailable` with `Retry-After: 1`, at once
@@ -15,12 +23,18 @@
 //! Responses of rate-limited classes carry `RateLimit-Policy` and `RateLimit` in the
 //! structured-field syntax of draft-ietf-httpapi-ratelimit-headers-11.
 //!
+//! Limits that code charges by name rather than by route ([`Config::named`]: token mints
+//! per owner, failed device-code lookups, …) share the buckets, responses and metrics.
+//!
 //! Clients are keyed by [`ClientKeyer`]: the peer address by default (IPv6 by its /64),
 //! or the address a trusted proxy reports in `Forwarded` / `X-Forwarded-For`. The client
 //! state lives in a bounded cache ([`quick_cache`], sharded, frequency-aware eviction):
 //! a flood of new keys evicts other rarely seen keys, never clients with requests in
-//! flight, and memory stays at about `max_keys` × 100 bytes. Idle buckets (fully
-//! refilled, nothing in flight) carry no information and are dropped by [`RateLimiter::sweep`].
+//! flight, and memory stays at about `max_keys` × 100 bytes. An evicted client that
+//! still owed time is remembered in a smaller penalty cache, so churning the cache does
+//! not forgive its debt. Idle buckets (fully refilled, nothing in flight) carry no
+//! information and are dropped by [`RateLimiter::sweep`]. A reload keeps the state of
+//! policies whose name did not change (buckets and requests in flight).
 
 use crate::obs::{Outcome, RequestReport};
 use arc_swap::ArcSwap;
@@ -31,7 +45,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,10 +66,19 @@ pub enum Class {
     Update,
     /// `/$/…` mutations (dataset management, compaction, backups, reasoning, …)
     Admin,
+    /// every request, before authentication: authentication failures per address
+    PreAuth,
 }
 
 impl Class {
-    pub const ALL: [Class; 4] = [Class::Auth, Class::Query, Class::Update, Class::Admin];
+    pub const COUNT: usize = 5;
+    pub const ALL: [Class; Class::COUNT] = [
+        Class::Auth,
+        Class::Query,
+        Class::Update,
+        Class::Admin,
+        Class::PreAuth,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -63,6 +86,7 @@ impl Class {
             Class::Query => "query",
             Class::Update => "update",
             Class::Admin => "admin",
+            Class::PreAuth => "preauth",
         }
     }
 
@@ -196,9 +220,23 @@ pub struct Limit {
     pub failure_cost: Option<u32>,
 }
 
+/// The `preauth` limit with authentication on and none configured: 30 failures a minute
+/// per address, 60 at once.
+pub const DEFAULT_PREAUTH: &str = "30/min,burst=60";
+
 impl Limit {
     fn is_unlimited(&self) -> bool {
         self.rate.is_none() && self.concurrency.is_none() && self.client_concurrency.is_none()
+    }
+
+    /// `preauth` and named limits count requests or failures, not requests in flight.
+    fn check_rate_only(&self, what: &str) -> Result<(), String> {
+        if self.concurrency.is_some() || self.client_concurrency.is_some() {
+            return Err(format!(
+                "{what}: only a rate, burst and failure-cost apply (no concurrency)"
+            ));
+        }
+        Ok(())
     }
 
     /// `RATE[,burst=N][,concurrency=N][,client-concurrency=N][,failure-cost=N]` or `off`.
@@ -237,7 +275,7 @@ impl Limit {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    /// per class: `auth`, `query`, `update`, `admin`
+    /// per class: `auth`, `query`, `update`, `admin`, `preauth`
     #[serde(default)]
     pub classes: BTreeMap<String, Limit>,
     /// per dataset and class; replaces the class limit on that dataset
@@ -248,7 +286,13 @@ pub struct Config {
     pub trusted_proxies: Vec<String>,
     /// clients tracked at most (default 100000)
     pub max_keys: Option<usize>,
+    /// limits charged by code under a name ([`RateLimiter::acquire`]), not by route
+    /// (with what they count, for their error message: `tokens minted`)
+    #[serde(skip)]
+    pub named: BTreeMap<&'static str, (Limit, &'static str)>,
 }
+
+const CLASSES: &str = "auth, query, update, admin or preauth";
 
 impl Config {
     /// Apply one `--rate-limit CLASS[@DATASET]=LIMIT` flag.
@@ -261,10 +305,21 @@ impl Config {
             Some((c, d)) => (c.trim(), Some(d.trim())),
             None => (target.trim(), None),
         };
-        if Class::parse(class).is_none() {
-            return Err(format!(
-                "--rate-limit '{spec}': unknown class '{class}' (auth, query, update or admin)"
-            ));
+        match Class::parse(class) {
+            None => {
+                return Err(format!(
+                    "--rate-limit '{spec}': unknown class '{class}' ({CLASSES})"
+                ));
+            }
+            Some(Class::PreAuth) if ds.is_some() => {
+                return Err(format!(
+                    "--rate-limit '{spec}': preauth applies to every request, not per dataset"
+                ));
+            }
+            Some(Class::PreAuth) => limit
+                .check_rate_only("preauth")
+                .map_err(|e| format!("--rate-limit '{spec}': {e}"))?,
+            Some(_) => {}
         }
         match ds {
             Some(d) => {
@@ -291,10 +346,15 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        let check = |m: &BTreeMap<String, Limit>| -> anyhow::Result<()> {
+        let check = |m: &BTreeMap<String, Limit>, per_dataset: bool| -> anyhow::Result<()> {
             for (c, l) in m {
-                if Class::parse(c).is_none() {
-                    anyhow::bail!("unknown rate-limit class '{c}' (auth, query, update or admin)");
+                match Class::parse(c) {
+                    None => anyhow::bail!("unknown rate-limit class '{c}' ({CLASSES})"),
+                    Some(Class::PreAuth) if per_dataset => {
+                        anyhow::bail!("preauth applies to every request, not per dataset")
+                    }
+                    Some(Class::PreAuth) => l.check_rate_only(c).map_err(anyhow::Error::msg)?,
+                    Some(_) => {}
                 }
                 if l.burst.is_some() && l.rate.is_none() {
                     anyhow::bail!("{c}: burst needs a rate");
@@ -302,9 +362,9 @@ impl Config {
             }
             Ok(())
         };
-        check(&self.classes)?;
+        check(&self.classes, false)?;
         for m in self.datasets.values() {
-            check(m)?;
+            check(m, true)?;
         }
         TrustedProxies::parse(&self.trusted_proxies).map_err(anyhow::Error::msg)?;
         Ok(())
@@ -317,6 +377,7 @@ impl Config {
                 .datasets
                 .values()
                 .all(|m| m.values().all(Limit::is_unlimited))
+            && self.named.values().all(|(l, _)| l.is_unlimited())
     }
 }
 
@@ -451,8 +512,7 @@ fn forwarded_hops(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
 pub enum ClientKey {
     /// an address (IPv4, or the /64 of an IPv6 address)
     Ip(u128),
-    /// an authenticated principal
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// an authenticated principal (or another key a named limit counts by)
     Principal(Arc<str>),
     /// no address known (in-process requests): one shared key
     Unknown,
@@ -466,7 +526,6 @@ impl ClientKey {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn principal(name: &str) -> ClientKey {
         ClientKey::Principal(name.into())
     }
@@ -530,36 +589,44 @@ impl Clock {
 
 // --------------------------------------------------------------------- GCRA ------
 
-/// One policy: a class, optionally on one dataset.
+/// One policy: a class, optionally on one dataset, or a named limit.
+#[derive(Clone)]
 struct Policy {
     class: Class,
-    /// `query` or `query@ds`, for the headers
+    /// `query`, `query@ds`, `preauth` or a named limit's name, for the headers; a reload
+    /// keeps the state of a policy whose name stays
     name: String,
+    /// what a named limit counts, for its error message (`tokens minted`)
+    what: Option<&'static str>,
+    /// the key of its client state ([`Registry`])
+    id: u32,
     /// nanoseconds between requests at the sustained rate, and the burst
     gcra: Option<(u64, u32)>,
     rate: Option<Rate>,
     concurrency: Option<u32>,
     client_concurrency: Option<u32>,
     failure_cost: u32,
+    /// requests in flight server-wide (the same counter under every configuration)
+    inflight: Arc<AtomicU32>,
 }
 
 impl Policy {
-    fn new(class: Class, dataset: Option<&str>, l: &Limit) -> Policy {
+    fn new(class: Class, name: String, (id, inflight): (u32, Arc<AtomicU32>), l: &Limit) -> Policy {
         let gcra = l.rate.map(|r| {
             let t = u64::try_from(r.period.as_nanos()).unwrap_or(u64::MAX) / u64::from(r.count);
             (t.max(1), l.burst.unwrap_or(r.count))
         });
         Policy {
             class,
-            name: match dataset {
-                Some(d) => format!("{}@{d}", class.as_str()),
-                None => class.as_str().to_string(),
-            },
+            name,
+            what: None,
+            id,
             gcra,
             rate: l.rate,
             concurrency: l.concurrency,
             client_concurrency: l.client_concurrency,
             failure_cost: l.failure_cost.unwrap_or(1),
+            inflight,
         }
     }
 
@@ -576,13 +643,20 @@ struct Slot {
     inflight: AtomicU32,
 }
 
-/// The state after a request was admitted: tokens left and seconds until full.
+/// A client's standing: tokens left and seconds until full.
 struct Admitted {
     remaining: u64,
     reset_secs: u64,
 }
 
 impl Slot {
+    fn with_tat(tat: u64) -> Slot {
+        Slot {
+            tat: AtomicU64::new(tat),
+            inflight: AtomicU32::new(0),
+        }
+    }
+
     /// Charge `cost` requests; `Err(wait)` when over the limit (nothing is charged).
     fn acquire(&self, now: u64, (t, burst): (u64, u32), cost: u32) -> Result<Admitted, u64> {
         let tau = t.saturating_mul(u64::from(burst));
@@ -610,6 +684,22 @@ impl Slot {
         }
     }
 
+    /// Whether `cost` more requests would be admitted now; `Err(wait)` when not (nothing
+    /// is charged either way).
+    fn check(&self, now: u64, (t, burst): (u64, u32), cost: u32) -> Result<(), u64> {
+        let tau = t.saturating_mul(u64::from(burst));
+        let new = self
+            .tat
+            .load(Ordering::Relaxed)
+            .max(now)
+            .saturating_add(t.saturating_mul(u64::from(cost)));
+        if new - now > tau {
+            Err(new - now - tau)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Charge without a check (failed-auth weighting).
     fn charge(&self, now: u64, t: u64, cost: u32) {
         let inc = t.saturating_mul(u64::from(cost));
@@ -618,6 +708,24 @@ impl Slot {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.max(now).saturating_add(inc))
             });
+    }
+
+    /// Give back a charge that turned out not to be owed (a reservation).
+    fn refund(&self, t: u64, cost: u32) {
+        let dec = t.saturating_mul(u64::from(cost));
+        let _ = self
+            .tat
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(dec))
+            });
+    }
+
+    fn standing(&self, now: u64, (t, burst): (u64, u32)) -> Admitted {
+        let debt = self.tat.load(Ordering::Relaxed).saturating_sub(now);
+        Admitted {
+            remaining: t.saturating_mul(u64::from(burst)).saturating_sub(debt) / t,
+            reset_secs: debt.div_ceil(1_000_000_000),
+        }
     }
 
     fn idle(&self, now: u64) -> bool {
@@ -631,14 +739,29 @@ struct SlotKey {
     client: ClientKey,
 }
 
-/// Clients with requests in flight are never evicted.
-#[derive(Clone, Default)]
-struct PinBusy;
+/// Debts of evicted clients: the TAT they left behind.
+type Penalties = quick_cache::sync::Cache<SlotKey, u64>;
 
-impl quick_cache::Lifecycle<SlotKey, Arc<Slot>> for PinBusy {
+/// Clients with requests in flight are never evicted; an evicted client that still owes
+/// time leaves its TAT in the penalty cache, where its next request finds it.
+#[derive(Clone)]
+struct Evict {
+    clock: Clock,
+    penalties: Arc<Penalties>,
+    evictions: Arc<AtomicU64>,
+}
+
+impl quick_cache::Lifecycle<SlotKey, Arc<Slot>> for Evict {
     type RequestState = ();
     fn is_pinned(&self, _: &SlotKey, v: &Arc<Slot>) -> bool {
         v.inflight.load(Ordering::Relaxed) > 0
+    }
+    fn on_evict(&self, _: &mut (), key: SlotKey, v: Arc<Slot>) {
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        let tat = v.tat.load(Ordering::Relaxed);
+        if tat > self.clock.now() {
+            self.penalties.insert(key, tat);
+        }
     }
 }
 
@@ -647,48 +770,21 @@ type Slots = quick_cache::sync::Cache<
     Arc<Slot>,
     quick_cache::UnitWeighter,
     quick_cache::DefaultHashBuilder,
-    PinBusy,
+    Evict,
 >;
 
-/// One configuration's compiled policies and state (replaced wholesale on reload).
-struct Inner {
-    policies: Vec<Policy>,
-    by_class: [Option<u32>; 4],
-    by_dataset: BTreeMap<String, [Option<u32>; 4]>,
-    /// requests in flight per policy, server-wide
-    inflight: Vec<AtomicU32>,
-    trusted: TrustedProxies,
+/// The client state of a limiter's policies: slots in a bounded cache, and the debts of
+/// evicted clients in a cache an eighth of its size.
+struct Buckets {
     slots: Slots,
+    penalties: Arc<Penalties>,
+    evictions: Arc<AtomicU64>,
+    max_keys: usize,
 }
 
-pub const DEFAULT_MAX_KEYS: usize = 100_000;
-
-impl Inner {
-    fn new(cfg: &Config) -> Result<Inner, String> {
-        let mut policies = Vec::new();
-        let mut add = |class: Class, ds: Option<&str>, l: &Limit| -> Option<u32> {
-            if l.is_unlimited() {
-                return None;
-            }
-            policies.push(Policy::new(class, ds, l));
-            Some((policies.len() - 1) as u32)
-        };
-        let mut by_class = [None; 4];
-        for (c, l) in &cfg.classes {
-            let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
-            by_class[class.index()] = add(class, None, l);
-        }
-        let mut by_dataset = BTreeMap::new();
-        for (ds, m) in &cfg.datasets {
-            // a dataset override for one class leaves the others at the class limit
-            let mut per = by_class;
-            for (c, l) in m {
-                let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
-                per[class.index()] = add(class, Some(ds), l);
-            }
-            by_dataset.insert(ds.clone(), per);
-        }
-        let max_keys = cfg.max_keys.unwrap_or(DEFAULT_MAX_KEYS).max(16);
+impl Buckets {
+    fn new(max_keys: usize, clock: &Clock, evictions: Arc<AtomicU64>) -> Result<Buckets, String> {
+        let penalties = Arc::new(Penalties::new((max_keys / 8).max(16)));
         let slots = Slots::with_options(
             quick_cache::OptionsBuilder::new()
                 .estimated_items_capacity(max_keys)
@@ -697,15 +793,146 @@ impl Inner {
                 .map_err(|e| format!("{e:?}"))?,
             quick_cache::UnitWeighter,
             Default::default(),
-            PinBusy,
+            Evict {
+                clock: clock.clone(),
+                penalties: penalties.clone(),
+                evictions: evictions.clone(),
+            },
         );
+        Ok(Buckets {
+            slots,
+            penalties,
+            evictions,
+            max_keys,
+        })
+    }
+
+    /// A client's state when it has any (tracked, or a debt left at eviction); nothing is
+    /// stored for a client that has none.
+    fn get(&self, key: &SlotKey) -> Option<Arc<Slot>> {
+        self.slots.get(key).or_else(|| {
+            self.penalties
+                .get(key)
+                .map(|tat| Arc::new(Slot::with_tat(tat)))
+        })
+    }
+
+    /// A client's state, created (with the debt it left at eviction) when not tracked.
+    fn slot(&self, key: SlotKey) -> Arc<Slot> {
+        match self.slots.get_or_insert_with(&key, || {
+            let tat = self.penalties.remove(&key).map_or(0, |(_, t)| t);
+            Ok::<_, ()>(Arc::new(Slot::with_tat(tat)))
+        }) {
+            Ok(s) => s,
+            Err(()) => unreachable!(),
+        }
+    }
+
+    /// Drop idle clients and paid debts; returns how many clients were dropped.
+    fn sweep(&self, now: u64) -> usize {
+        let before = self.slots.len();
+        self.slots.retain(|_, s| !s.idle(now));
+        self.penalties.retain(|_, tat| *tat > now);
+        before.saturating_sub(self.slots.len())
+    }
+
+    /// The same clients in caches of another size (a reload that changed `maxKeys`).
+    fn resized(&self, max_keys: usize, clock: &Clock) -> Result<Buckets, String> {
+        let b = Buckets::new(max_keys, clock, self.evictions.clone())?;
+        for (k, tat) in self.penalties.iter() {
+            b.penalties.insert(k, tat);
+        }
+        for (k, s) in self.slots.iter() {
+            b.slots.insert(k, s);
+        }
+        Ok(b)
+    }
+}
+
+/// Policy ids and server-wide in-flight counters by policy name, kept across reloads.
+#[derive(Default)]
+struct Registry(parking_lot::Mutex<HashMap<String, (u32, Arc<AtomicU32>)>>);
+
+impl Registry {
+    fn get(&self, name: &str) -> (u32, Arc<AtomicU32>) {
+        let mut m = self.0.lock();
+        let next = m.len() as u32;
+        m.entry(name.to_string())
+            .or_insert_with(|| (next, Arc::default()))
+            .clone()
+    }
+}
+
+/// One configuration's compiled policies (replaced on reload; the client state and the
+/// in-flight counters carry over).
+#[derive(Clone)]
+struct Inner {
+    policies: Vec<Policy>,
+    by_class: [Option<u32>; Class::COUNT],
+    by_dataset: BTreeMap<String, [Option<u32>; Class::COUNT]>,
+    named: HashMap<&'static str, u32>,
+    trusted: TrustedProxies,
+    buckets: Arc<Buckets>,
+}
+
+pub const DEFAULT_MAX_KEYS: usize = 100_000;
+
+impl Inner {
+    fn new(
+        cfg: &Config,
+        reg: &Registry,
+        prev: Option<&Inner>,
+        clock: &Clock,
+        evictions: &Arc<AtomicU64>,
+    ) -> Result<Inner, String> {
+        let mut policies = Vec::new();
+        let mut add = |class: Class, name: String, l: &Limit| -> Option<u32> {
+            if l.is_unlimited() {
+                return None;
+            }
+            let ids = reg.get(&name);
+            policies.push(Policy::new(class, name, ids, l));
+            Some((policies.len() - 1) as u32)
+        };
+        let mut by_class = [None; Class::COUNT];
+        for (c, l) in &cfg.classes {
+            let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
+            by_class[class.index()] = add(class, class.as_str().to_string(), l);
+        }
+        let mut by_dataset = BTreeMap::new();
+        for (ds, m) in &cfg.datasets {
+            // a dataset override for one class leaves the others at the class limit
+            let mut per = by_class;
+            for (c, l) in m {
+                let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
+                per[class.index()] = add(class, format!("{}@{ds}", class.as_str()), l);
+            }
+            by_dataset.insert(ds.clone(), per);
+        }
+        let mut named = HashMap::new();
+        for (name, (l, _)) in &cfg.named {
+            if let Some(i) = add(Class::Auth, name.to_string(), l) {
+                named.insert(*name, i);
+            }
+        }
+        for (name, (_, what)) in &cfg.named {
+            if let Some(&i) = named.get(name) {
+                policies[i as usize].what = Some(*what);
+            }
+        }
+        let max_keys = cfg.max_keys.unwrap_or(DEFAULT_MAX_KEYS).max(16);
+        let buckets = match prev {
+            Some(p) if p.buckets.max_keys == max_keys => p.buckets.clone(),
+            Some(p) => Arc::new(p.buckets.resized(max_keys, clock)?),
+            None => Arc::new(Buckets::new(max_keys, clock, evictions.clone())?),
+        };
         Ok(Inner {
-            inflight: policies.iter().map(|_| AtomicU32::new(0)).collect(),
             policies,
             by_class,
             by_dataset,
+            named,
             trusted: TrustedProxies::parse(&cfg.trusted_proxies)?,
-            slots,
+            buckets,
         })
     }
 
@@ -715,15 +942,10 @@ impl Inner {
             .map_or(self.by_class[class.index()], |p| p[class.index()])
     }
 
-    fn slot(&self, policy: u32, client: ClientKey) -> Arc<Slot> {
-        let key = SlotKey { policy, client };
-        match self
-            .slots
-            .get_or_insert_with(&key, || Ok::<_, ()>(Arc::new(Slot::default())))
-        {
-            Ok(s) => s,
-            Err(()) => unreachable!(),
-        }
+    /// A named limit with a rate.
+    fn named(&self, name: &str) -> Option<(&Policy, (u64, u32))> {
+        let p = &self.policies[*self.named.get(name)? as usize];
+        Some((p, p.gcra?))
     }
 }
 
@@ -732,54 +954,207 @@ impl Inner {
 /// Rate and concurrency limits of a server; shared by every request.
 pub struct RateLimiter {
     inner: ArcSwap<Inner>,
+    registry: Registry,
+    evictions: Arc<AtomicU64>,
     clock: Clock,
     keyer: Arc<dyn ClientKeyer>,
 }
 
+/// The size of a limiter's client state (the `sparkles_rate_limit_*` metrics).
+pub struct Stats {
+    /// clients tracked, over all policies
+    pub keys: u64,
+    pub max_keys: u64,
+    /// clients evicted to stay within `max_keys`
+    pub evictions: u64,
+    /// evicted clients whose debt is remembered
+    pub penalties: u64,
+}
+
 impl RateLimiter {
     pub fn new(cfg: &Config) -> Result<RateLimiter, String> {
+        let registry = Registry::default();
+        let evictions = Arc::default();
+        let clock = Clock::System(Instant::now());
+        let inner = Inner::new(cfg, &registry, None, &clock, &evictions)?;
         Ok(RateLimiter {
-            inner: ArcSwap::from_pointee(Inner::new(cfg)?),
-            clock: Clock::System(Instant::now()),
+            inner: ArcSwap::from_pointee(inner),
+            registry,
+            evictions,
+            clock,
             keyer: Arc::new(PeerKeyer),
         })
     }
 
-    /// Replace the clock (tests).
+    /// Replace the clock (tests); the client state starts afresh.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_clock(mut self, clock: Clock) -> RateLimiter {
+        let mut inner = Inner::clone(&self.inner.load());
+        if let Ok(b) = Buckets::new(inner.buckets.max_keys, &clock, self.evictions.clone()) {
+            inner.buckets = Arc::new(b);
+        }
+        self.inner = ArcSwap::from_pointee(inner);
         self.clock = clock;
         self
     }
 
     /// Replace how clients are keyed (e.g. by authenticated principal).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_keyer(mut self, keyer: Arc<dyn ClientKeyer>) -> RateLimiter {
         self.keyer = keyer;
         self
     }
 
-    /// Switch to a new configuration. Client state starts afresh; requests in flight
-    /// finish under (and release) the old one.
+    /// Switch to a new configuration. A policy whose name stays keeps its client state:
+    /// debts are not forgiven, and requests already in flight count against the new
+    /// concurrency caps (a lower cap admits nothing until they drop below it). Requests
+    /// in flight finish under the configuration they started with.
     pub fn reload(&self, cfg: &Config) -> Result<(), String> {
-        self.inner.store(Arc::new(Inner::new(cfg)?));
+        let prev = self.inner.load_full();
+        let next = Inner::new(
+            cfg,
+            &self.registry,
+            Some(&prev),
+            &self.clock,
+            &self.evictions,
+        )?;
+        self.inner.store(Arc::new(next));
         Ok(())
     }
 
-    /// Drop the state of idle clients (bucket full again, nothing in flight); returns
-    /// how many were dropped.
+    /// Drop the state of idle clients (bucket full again, nothing in flight) and paid
+    /// debts; returns how many clients were dropped.
     pub fn sweep(&self) -> usize {
-        let inner = self.inner.load();
-        let now = self.clock.now();
-        let before = inner.slots.len();
-        inner.slots.retain(|_, s| !s.idle(now));
-        before.saturating_sub(inner.slots.len())
+        self.inner.load().buckets.sweep(self.clock.now())
     }
 
     /// Clients currently tracked (over all policies).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn tracked(&self) -> usize {
-        self.inner.load().slots.len()
+        self.inner.load().buckets.slots.len()
+    }
+
+    pub fn stats(&self) -> Stats {
+        let inner = self.inner.load();
+        let b = &inner.buckets;
+        Stats {
+            keys: b.slots.len() as u64,
+            max_keys: b.max_keys as u64,
+            evictions: b.evictions.load(Ordering::Relaxed),
+            penalties: b.penalties.len() as u64,
+        }
+    }
+
+    /// Charge `cost` to `client` under the named limit `name` (nothing to do when it is
+    /// not configured); over the limit, nothing is charged and the `429` to answer is
+    /// returned.
+    #[allow(clippy::result_large_err)]
+    pub fn acquire(
+        &self,
+        name: &'static str,
+        client: ClientKey,
+        cost: u32,
+    ) -> Result<(), Response> {
+        let inner = self.inner.load();
+        let Some((p, g)) = inner.named(name) else {
+            return Ok(());
+        };
+        let slot = inner.buckets.slot(SlotKey {
+            policy: p.id,
+            client,
+        });
+        match slot.acquire(self.clock.now(), g, cost) {
+            Ok(_) => Ok(()),
+            Err(wait) => Err(reject(
+                p,
+                StatusCode::TOO_MANY_REQUESTS,
+                secs_ceil(wait),
+                name,
+                0,
+            )),
+        }
+    }
+
+    /// Whether the named limit admits one more for `client`, without charging it.
+    #[allow(clippy::result_large_err)]
+    pub fn check(&self, name: &'static str, client: &ClientKey) -> Result<(), Response> {
+        let inner = self.inner.load();
+        let Some((p, g)) = inner.named(name) else {
+            return Ok(());
+        };
+        let key = SlotKey {
+            policy: p.id,
+            client: client.clone(),
+        };
+        match inner
+            .buckets
+            .get(&key)
+            .map(|s| s.check(self.clock.now(), g, 1))
+        {
+            Some(Err(wait)) => Err(reject(
+                p,
+                StatusCode::TOO_MANY_REQUESTS,
+                secs_ceil(wait),
+                name,
+                0,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Charge `cost` to `client` under the named limit without a check (a failure found
+    /// after the fact; [`RateLimiter::check`] refuses the next request).
+    pub fn charge(&self, name: &'static str, client: ClientKey, cost: u32) {
+        let inner = self.inner.load();
+        if let Some((p, (t, _))) = inner.named(name) {
+            inner
+                .buckets
+                .slot(SlotKey {
+                    policy: p.id,
+                    client,
+                })
+                .charge(self.clock.now(), t, cost);
+        }
+    }
+}
+
+/// The `sparkles_rate_limit_*` families of some limiters (label `limiter`), in the
+/// Prometheus text format.
+pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
+    use std::fmt::Write;
+    type Field = fn(&Stats) -> u64;
+    let stats: Vec<(&str, Stats)> = limiters.iter().map(|(l, rl)| (*l, rl.stats())).collect();
+    let families: [(&str, &str, &str, Field); 4] = [
+        (
+            "sparkles_rate_limit_keys",
+            "gauge",
+            "Clients a rate limiter tracks, over all its policies.",
+            |s| s.keys,
+        ),
+        (
+            "sparkles_rate_limit_max_keys",
+            "gauge",
+            "Clients a rate limiter tracks at most (maxKeys).",
+            |s| s.max_keys,
+        ),
+        (
+            "sparkles_rate_limit_evictions_total",
+            "counter",
+            "Tracked clients evicted to stay within maxKeys.",
+            |s| s.evictions,
+        ),
+        (
+            "sparkles_rate_limit_penalties",
+            "gauge",
+            "Evicted clients whose unpaid debt is remembered.",
+            |s| s.penalties,
+        ),
+    ];
+    for (name, kind, help, f) in families {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+        for (l, s) in &stats {
+            let _ = writeln!(o, "{name}{{limiter=\"{l}\"}} {}", f(s));
+        }
     }
 }
 
@@ -790,6 +1165,8 @@ pub struct Sources {
     pub file: Option<std::path::PathBuf>,
     pub flags: Vec<String>,
     pub trusted_proxies: Vec<String>,
+    /// authentication is on: `preauth` defaults to [`DEFAULT_PREAUTH`]
+    pub auth: bool,
 }
 
 impl Sources {
@@ -805,6 +1182,11 @@ impl Sources {
         }
         cfg.trusted_proxies
             .extend(self.trusted_proxies.iter().cloned());
+        let preauth = Class::PreAuth.as_str();
+        if self.auth && !cfg.classes.contains_key(preauth) {
+            let l = Limit::parse(DEFAULT_PREAUTH).map_err(anyhow::Error::msg)?;
+            cfg.classes.insert(preauth.to_string(), l);
+        }
         cfg.validate()?;
         Ok((self.file.is_some() || !cfg.is_empty()).then_some(cfg))
     }
@@ -851,14 +1233,14 @@ pub fn spawn_sweeper(rl: Arc<RateLimiter>, every: Duration) {
 /// Requests in flight counted against a server-wide and a per-client cap, released
 /// when the response body is done.
 struct Permits {
-    server: Option<(Arc<Inner>, u32)>,
+    server: Option<Arc<AtomicU32>>,
     client: Option<Arc<Slot>>,
 }
 
 impl Drop for Permits {
     fn drop(&mut self) {
-        if let Some((inner, p)) = &self.server {
-            inner.inflight[*p as usize].fetch_sub(1, Ordering::Relaxed);
+        if let Some(n) = &self.server {
+            n.fetch_sub(1, Ordering::Relaxed);
         }
         if let Some(s) = &self.client {
             s.inflight.fetch_sub(1, Ordering::Relaxed);
@@ -897,6 +1279,18 @@ fn secs_ceil(nanos: u64) -> u64 {
     nanos.div_ceil(1_000_000_000).max(1)
 }
 
+/// Add a member to a structured-field list header: a response may carry the policies of
+/// both stages.
+fn put_member(h: &mut HeaderMap, name: &'static str, member: String) {
+    let v = match h.get(name).and_then(|v| v.to_str().ok()) {
+        Some(old) => format!("{old}, {member}"),
+        None => member,
+    };
+    if let Ok(v) = HeaderValue::from_str(&v) {
+        h.insert(name, v);
+    }
+}
+
 /// `RateLimit-Policy: "query";q=100;w=1` and `RateLimit: "query";r=57;t=1`
 /// (draft-ietf-httpapi-ratelimit-headers-11).
 fn rate_headers(h: &mut HeaderMap, p: &Policy, remaining: u64, reset: u64) {
@@ -907,12 +1301,12 @@ fn rate_headers(h: &mut HeaderMap, p: &Policy, remaining: u64, reset: u64) {
         rate.count,
         rate.period.as_secs().max(1)
     );
-    if let Ok(v) = HeaderValue::from_str(&policy) {
-        h.insert("ratelimit-policy", v);
-    }
-    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\";r={remaining};t={reset}", p.name)) {
-        h.insert("ratelimit", v);
-    }
+    put_member(h, "ratelimit-policy", policy);
+    put_member(
+        h,
+        "ratelimit",
+        format!("\"{}\";r={remaining};t={reset}", p.name),
+    );
 }
 
 fn reject(
@@ -923,7 +1317,11 @@ fn reject(
     remaining: u64,
 ) -> Response {
     let class = p.class.as_str();
-    let msg = if status == StatusCode::TOO_MANY_REQUESTS {
+    let msg = if let Some(what) = p.what {
+        format!("too many {what}: retry in {retry} s")
+    } else if p.class == Class::PreAuth {
+        format!("too many failed authentications: retry in {retry} s")
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
         format!("too many {class} requests: retry in {retry} s")
     } else {
         format!("too many concurrent {class} requests: retry in {retry} s")
@@ -949,8 +1347,159 @@ fn reject(
     .attach(resp)
 }
 
-/// The middleware (`from_fn_with_state`), inside `obs::observe` so limited requests
-/// are logged and counted.
+// ------------------------------------------------------ before authentication ------
+
+/// Marks a response as an authentication failure for the `preauth` limit when its
+/// status does not say so (an invalid session cookie is ignored, not refused).
+#[derive(Clone, Copy, Debug)]
+pub struct AuthFailed;
+
+/// Whether authentication or authorization failed: a 401 or 403, or the auth layer's
+/// report of bad credentials or a refusal (a hidden dataset's 404, a busy password check).
+fn auth_failed(r: &Response) -> bool {
+    matches!(r.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        || r.extensions().get::<AuthFailed>().is_some()
+        || r.extensions()
+            .get::<crate::auth::AuthReport>()
+            // `limited`: refused by this very limit, not a failure of its own
+            .is_some_and(|a| a.denied.is_some() || a.error.is_some_and(|e| e != "limited"))
+}
+
+/// A request's standing under the `preauth` limit (in the request extensions): the auth
+/// layer reserves the cost of a failure before it verifies a password, so concurrent
+/// guesses cannot all start hashing before the first of them has failed.
+#[derive(Clone)]
+pub struct Admission(Arc<AdmissionState>);
+
+struct AdmissionState {
+    inner: Arc<Inner>,
+    policy: u32,
+    client: ClientKey,
+    clock: Clock,
+    reserved: AtomicU32,
+}
+
+impl Admission {
+    /// The client address the request is counted against.
+    pub fn client(&self) -> &ClientKey {
+        &self.0.client
+    }
+
+    /// Charge a failure now, before an expensive credential check; it is given back when
+    /// the request does not fail. `false`: the address has no failures left (answer
+    /// [`Admission::refusal`]).
+    pub fn reserve(&self) -> bool {
+        let a = &self.0;
+        let p = &a.inner.policies[a.policy as usize];
+        let Some(g) = p.gcra else { return true };
+        if a.reserved.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let slot = a.inner.buckets.slot(SlotKey {
+            policy: p.id,
+            client: a.client.clone(),
+        });
+        let ok = slot.acquire(a.clock.now(), g, p.failure_cost).is_ok();
+        if ok {
+            a.reserved.store(p.failure_cost, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// The `429` of a request whose reservation failed.
+    pub fn refusal(&self) -> Response {
+        let a = &self.0;
+        let p = &a.inner.policies[a.policy as usize];
+        let key = SlotKey {
+            policy: p.id,
+            client: a.client.clone(),
+        };
+        let wait = match (p.gcra, a.inner.buckets.get(&key)) {
+            (Some(g), Some(s)) => s.check(a.clock.now(), g, p.failure_cost).err(),
+            _ => None,
+        };
+        reject(
+            p,
+            StatusCode::TOO_MANY_REQUESTS,
+            wait.map_or(1, secs_ceil),
+            "failures",
+            0,
+        )
+    }
+}
+
+/// The first stage (`from_fn_with_state`, outside the auth layer and inside
+/// `obs::observe` and CORS): refuses an address that spent its `preauth` budget of
+/// authentication failures before any credential is checked, and charges each failure
+/// (`failure-cost`, default 1) to the address. An address without failures costs a cache
+/// lookup; nothing is stored for it. Without a limiter it does nothing.
+pub async fn admit(
+    State(rl): State<Option<Arc<RateLimiter>>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(rl) = rl else {
+        return next.run(req).await;
+    };
+    let inner = rl.inner.load_full();
+    let Some(pi) = inner.by_class[Class::PreAuth.index()] else {
+        return next.run(req).await;
+    };
+    let p = &inner.policies[pi as usize];
+    let Some(g) = p.gcra else {
+        return next.run(req).await;
+    };
+    let client = PeerKeyer.key(Class::PreAuth, &req, &inner.trusted);
+    if client == ClientKey::Unknown {
+        // no address (the Unix socket, in-process requests): one shared budget would let
+        // any client lock out all the others
+        return next.run(req).await;
+    }
+    let key = SlotKey {
+        policy: p.id,
+        client: client.clone(),
+    };
+    if let Some(s) = inner.buckets.get(&key)
+        && let Err(wait) = s.check(rl.clock.now(), g, 1)
+    {
+        return reject(
+            p,
+            StatusCode::TOO_MANY_REQUESTS,
+            secs_ceil(wait),
+            "failures",
+            0,
+        );
+    }
+    let adm = Admission(Arc::new(AdmissionState {
+        inner: inner.clone(),
+        policy: pi,
+        client,
+        clock: rl.clock.clone(),
+        reserved: AtomicU32::new(0),
+    }));
+    req.extensions_mut().insert(adm.clone());
+    let mut resp = next.run(req).await;
+    let reserved = adm.0.reserved.load(Ordering::Relaxed);
+    if auth_failed(&resp) {
+        let slot = inner.buckets.slot(key);
+        let now = rl.clock.now();
+        let rest = p.failure_cost.saturating_sub(reserved);
+        if rest > 0 {
+            slot.charge(now, g.0, rest);
+        }
+        let s = slot.standing(now, g);
+        rate_headers(resp.headers_mut(), p, s.remaining, s.reset_secs);
+    } else if reserved > 0 {
+        inner.buckets.slot(key).refund(g.0, reserved);
+    }
+    resp
+}
+
+// ------------------------------------------------------- after authentication ------
+
+/// The second stage (`from_fn_with_state`, inside the auth layer, which puts the
+/// principal in the request, and inside `obs::observe`, so limited requests are logged
+/// and counted): the class limits.
 pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
     let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
     let Some(class) = classify(route, req.method(), req.uri(), req.headers()) else {
@@ -962,17 +1511,20 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
         return next.run(req).await;
     };
     let p = &inner.policies[pi as usize];
-    let slot = p
-        .needs_slot()
-        .then(|| inner.slot(pi, rl.keyer.key(class, &req, &inner.trusted)));
+    let slot = p.needs_slot().then(|| {
+        inner.buckets.slot(SlotKey {
+            policy: p.id,
+            client: rl.keyer.key(class, &req, &inner.trusted),
+        })
+    });
     let mut permits = Permits {
         server: None,
         client: None,
     };
     // concurrency first: it is released on rejection, a rate token is not
     if let Some(max) = p.concurrency {
-        let n = inner.inflight[pi as usize].fetch_add(1, Ordering::Relaxed);
-        permits.server = Some((inner.clone(), pi));
+        let n = p.inflight.fetch_add(1, Ordering::Relaxed);
+        permits.server = Some(p.inflight.clone());
         if n >= max {
             return reject(p, StatusCode::SERVICE_UNAVAILABLE, 1, "concurrency", 0);
         }
@@ -1007,13 +1559,12 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
                 resp.status(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             )
-            && let (Some((t, burst)), Some(s)) = (p.gcra, &slot)
+            && let (Some(g), Some(s)) = (p.gcra, &slot)
         {
             let now = rl.clock.now();
-            s.charge(now, t, p.failure_cost - 1);
-            let debt = s.tat.load(Ordering::Relaxed).saturating_sub(now);
-            remaining = (t * u64::from(burst)).saturating_sub(debt) / t;
-            reset = debt.div_ceil(1_000_000_000);
+            s.charge(now, g.0, p.failure_cost - 1);
+            let st = s.standing(now, g);
+            (remaining, reset) = (st.remaining, st.reset_secs);
         }
         rate_headers(resp.headers_mut(), p, remaining, reset);
     }
