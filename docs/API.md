@@ -1103,8 +1103,9 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
 | `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
 | `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
-| `--max-upload-mb` | `65536` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
-| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory, and an N-Quads backup in the data directory (0: no check) |
+| `--max-upload-mb` | `4096` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
+| `--min-free-disk-mb` | `1024` | free space a spooled request body must leave in the temporary directory, and a commit, rebuild, clone or N-Quads backup on the data directory's file system (0: no check) |
+| `--max-mem-dataset-mb` | `4096` | largest in-memory (`dbType=mem`) dataset; a commit that would grow one past it fails with `507` (0: none) |
 
 **Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
 `Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
@@ -1122,12 +1123,20 @@ refused before anything is read), so no more than the ceiling is held; past it t
 fails with `413`. A form POST to `/{ds}` may hold either operation, so it is read up to
 the larger of the query and update ceilings. Graph Store PUT/POST (also through `/{ds}`)
 and `/{ds}/upload` are the bulk endpoints: their bodies stream to a temporary file instead,
-up to `--max-upload-mb` (default 65536, i.e. 64 GiB; counted after HTTP decompression;
-`0`: unlimited), else `413`. Files compressed inside the body are capped separately by
+up to `--max-upload-mb` (default 4096, i.e. 4 GiB, the body limit of the bundled NixOS
+nginx virtual host; counted after HTTP decompression; `0`: unlimited), else `413`. Files compressed inside the body are capped separately by
 `--max-decompressed-mb` as they are parsed. Before a spooled body is written to the
 temporary directory (every 64 MiB), the server checks that the file system keeps
-`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`. Storage quotas per
-dataset do not exist yet.
+`--min-free-disk-mb` free (default 1024; `0`: no check), else `507`.
+
+**Storage.** A commit to a persistent dataset is refused with `507 {code: "storage-full"}`
+when it would leave less than `--min-free-disk-mb` free on the data directory's file
+system (measured with `statvfs`, cached for a second between small commits); a rebuild
+(large load, compaction) or clone checks it while it builds and stops, removing what it
+wrote, once the file system goes below it. Nothing is committed either way. An in-memory
+dataset (`dbType=mem`) holds at most `--max-mem-dataset-mb` (default 4096, estimated from
+its index files, delta and vocabulary): a commit that would grow it past that fails the
+same way; deletes always pass. Storage quotas per dataset do not exist yet.
 
 **Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
 `auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs

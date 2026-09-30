@@ -598,6 +598,12 @@ pub struct StoreOptions {
     pub max_snapshots: usize,
     /// Allow writes to a dataset that requires a write guard without installing one.
     pub unvalidated_writes: bool,
+    /// Persistent stores: refuse a commit (and stop a rebuild) that would leave less free
+    /// space than this on the store's file system ([`Error::StorageFull`]).
+    pub min_free_disk_bytes: Option<u64>,
+    /// In-memory stores: refuse a commit that would make the data larger than this
+    /// (estimated: index files plus the in-memory delta and vocabulary).
+    pub max_memory_bytes: Option<u64>,
 }
 
 impl Default for StoreOptions {
@@ -614,6 +620,8 @@ impl Default for StoreOptions {
             history_max_generations: 8,
             max_snapshots: 256,
             unvalidated_writes: false,
+            min_free_disk_bytes: None,
+            max_memory_bytes: None,
         }
     }
 }
@@ -1789,15 +1797,67 @@ impl Store {
         }
     }
 
-    /// What stops a rebuild into `dir` early: the write's cancellation and deadline.
+    /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
+    /// the free disk space the store keeps.
     fn build_interrupt(
         &self,
         o: Option<crate::guard::WriteOptions>,
         dir: &Path,
     ) -> Option<crate::builder::InterruptFn> {
-        let _ = dir;
-        let o = o.filter(|o| o.cancel.is_some() || o.deadline.is_some())?;
-        Some(Arc::new(move || o.check()))
+        let o = o.filter(|o| o.cancel.is_some() || o.deadline.is_some());
+        let reserve = self.root.as_ref().and(self.opts.min_free_disk_bytes);
+        if o.is_none() && reserve.is_none() {
+            return None;
+        }
+        let dir = dir.to_path_buf();
+        Some(Arc::new(move || {
+            if let Some(o) = &o {
+                o.check()?;
+            }
+            match reserve {
+                Some(r) => crate::disk::check_reserve(&dir, r, 0, false),
+                None => Ok(()),
+            }
+        }))
+    }
+
+    /// Persistent stores keep [`StoreOptions::min_free_disk_bytes`] free: `StorageFull`
+    /// when writing `need` more bytes would go below it.
+    fn check_disk(&self, need: u64) -> Result<()> {
+        match (&self.root, self.opts.min_free_disk_bytes) {
+            (Some(root), Some(reserve)) => crate::disk::check_reserve(root, reserve, need, true),
+            _ => Ok(()),
+        }
+    }
+
+    /// Before `quads` parsed quads are encoded into a transaction of an in-memory store
+    /// (which adds their terms to its vocabulary even if the commit is refused later):
+    /// `StorageFull` when their delta alone would pass the limit.
+    fn check_memory_before(&self, quads: usize) -> Result<()> {
+        if self.root.is_some() || self.opts.max_memory_bytes.is_none() {
+            return Ok(());
+        }
+        let snap = self.snapshot();
+        let now = snap.generation.disk_bytes()
+            + delta_bytes(&snap.delta)
+            + snap.generation.dvocab.with(|v| v.bytes()) as u64;
+        self.check_memory(now + quads as u64 * DELTA_QUAD_BYTES)
+    }
+
+    /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
+    /// when a commit would make the data about `size` bytes.
+    fn check_memory(&self, size: u64) -> Result<()> {
+        match self.opts.max_memory_bytes {
+            Some(max) if self.root.is_none() && size > max => {
+                let h = crate::error::human_bytes;
+                Err(Error::StorageFull(format!(
+                    "the in-memory dataset would grow to about {}, over its limit of {}",
+                    h(size),
+                    h(max)
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn begin<'a>(
@@ -1957,6 +2017,7 @@ impl Store {
             for s in sources {
                 o.check()?;
                 let (quads, p) = crate::io::parse_to_vec(s)?;
+                self.check_memory_before(quads.len())?;
                 prefixes.extend(p);
                 let mut labels = std::collections::HashMap::new();
                 for (i, q) in quads.iter().enumerate() {
@@ -2011,6 +2072,7 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
+        self.check_memory_before(parsed.iter().map(Vec::len).sum())?;
         let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
@@ -2169,6 +2231,9 @@ impl Store {
             // a write stopped while it was built publishes nothing
             if let Some(i) = &interrupt {
                 i()?;
+            }
+            if bulk.is_some() {
+                self.check_memory(dir_size(&dir))?;
             }
             Ok(meta)
         })();
@@ -2375,7 +2440,14 @@ impl Store {
         let gdir = dir.join(name);
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = next_bnode;
-        let builder = Builder::new(&gdir, bopts)?;
+        let mut builder = Builder::new(&gdir, bopts)?;
+        // the clone's file system keeps the same free space as this store's
+        if let Some(reserve) = self.opts.min_free_disk_bytes {
+            let gdir = gdir.clone();
+            builder = builder.with_interrupt(Arc::new(move || {
+                crate::disk::check_reserve(&gdir, reserve, 0, false)
+            }));
+        }
         let total = snap.len().max(1);
         let (mut seen, mut graphs, mut last_graph) = (0u64, 0u64, None);
         report(0.0, "copying quads");
@@ -3024,6 +3096,18 @@ impl WriteTxn<'_> {
                 validation: None,
             });
         }
+        // nothing is written when the disk (or an in-memory store's limit) has no room
+        self.store
+            .check_disk((self.log.len() as u64 + 1) * WAL_REC as u64)?;
+        if self.net_ins > 0
+            && self.store.root.is_none()
+            && self.store.opts.max_memory_bytes.is_some()
+        {
+            let size = gen_.disk_bytes()
+                + delta_bytes(&self.delta)
+                + gen_.dvocab.with(|v| v.bytes()) as u64;
+            self.store.check_memory(size)?;
+        }
         gen_.dvocab.sync()?;
         let c = CommitInfo {
             seq: head.seq + 1,
@@ -3157,9 +3241,12 @@ fn dump_snapshot(snap: &Snapshot, w: impl Write) -> Result<u64> {
     Ok(n)
 }
 
-/// Estimated memory of a replayed delta (seven ordered sets of 32-byte keys).
+/// Estimated memory of one quad of a delta (seven ordered sets of 32-byte keys).
+const DELTA_QUAD_BYTES: u64 = 7 * 64;
+
+/// Estimated memory of a (replayed) delta.
 fn delta_bytes(d: &Delta) -> u64 {
-    (d.inserts() + d.deletes()) as u64 * 7 * 64
+    (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
 }
 
 /// Remove the generations history no longer needs (`current` is the current generation
@@ -3549,6 +3636,66 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 
     fn src() -> Source {
         Source::from_bytes(TTL.as_bytes().to_vec(), RdfFormat::Turtle, None)
+    }
+
+    #[test]
+    fn commits_keep_the_disk_reserve_and_the_memory_limit() {
+        let many = |n: usize| {
+            let mut nt = String::new();
+            for i in 0..n {
+                nt.push_str(&format!(
+                    "<http://ex.org/s{i}> <http://ex.org/p> \"{i}\" .\n"
+                ));
+            }
+            Source::from_bytes(nt.into_bytes(), RdfFormat::NTriples, None)
+        };
+        let full = |e: Error| assert!(matches!(e, Error::StorageFull(_)), "{e}");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        Store::open(&root, StoreOptions::default())
+            .unwrap()
+            .load(&[src()])
+            .unwrap();
+        // a reserve no disk has: small commits, rebuilds and compaction are refused
+        let opts = StoreOptions {
+            min_free_disk_bytes: Some(u64::MAX / 2),
+            ..Default::default()
+        };
+        let store = Store::open(&root, opts).unwrap();
+        let head = store.head_commit().seq;
+        let entries = || std::fs::read_dir(&root).unwrap().count();
+        let before = entries();
+        full(store.load(&[many(10)]).unwrap_err());
+        full(store.load(&[many(300_000)]).unwrap_err());
+        full(store.compact().unwrap_err());
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(store.snapshot().len(), 5);
+        assert_eq!(entries(), before, "no unfinished generation is left behind");
+        drop(store);
+        // a reserve the disk keeps
+        let opts = StoreOptions {
+            min_free_disk_bytes: Some(1),
+            ..Default::default()
+        };
+        Store::open(&root, opts).unwrap().load(&[many(10)]).unwrap();
+
+        // in memory: growth past the limit is refused, whichever path the write takes
+        let opts = StoreOptions {
+            max_memory_bytes: Some(64 << 10),
+            ..Default::default()
+        };
+        let mem = Store::in_memory(opts.clone());
+        full(mem.load(&[many(20_000)]).unwrap_err());
+        assert!(mem.snapshot().is_empty());
+        mem.load(&[many(10)]).unwrap();
+        full(mem.load(&[many(5_000)]).unwrap_err());
+        assert_eq!(mem.snapshot().len(), 10);
+        // shrinking is always allowed
+        let mut t = mem.write();
+        let k = mem.snapshot().scan_keys(Perm::Spo, &[]).unwrap()[0];
+        assert!(t.delete(Perm::Spo.to_quad(&k)).unwrap());
+        t.commit().unwrap();
+        assert_eq!(mem.snapshot().len(), 9);
     }
 
     #[test]

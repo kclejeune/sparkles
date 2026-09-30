@@ -3206,6 +3206,7 @@ dependencies = [
  "flate2",
  "imbl",
  "ipnet",
+ "libc",
  "lz4_flex 0.14.0",
  "md-5",
  "memmap2",

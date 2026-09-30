@@ -478,3 +478,55 @@ async fn a_second_task_of_a_kind_is_refused_while_one_waits() {
     wait_done(&s.state, &busy).await;
     wait_state(&s.state, &id, task_state::DONE).await;
 }
+
+#[tokio::test]
+async fn commits_that_would_fill_the_disk_or_memory_get_507() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = StoreOptions {
+        // more than any disk keeps free
+        min_free_disk_bytes: Some(u64::MAX / 2),
+        max_memory_bytes: Some(64 << 10),
+        ..Default::default()
+    };
+    let st = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
+    st.create("disk", DbType::Persistent).unwrap();
+    st.create("mem", DbType::Mem).unwrap();
+    let app = router(st.clone());
+    let small = "<http://example.org/a> <http://example.org/p> \"1\" .";
+    let mut large = String::new();
+    for i in 0..5000 {
+        large.push_str(&format!(
+            "<http://example.org/s{i}> <http://example.org/p> \"{i}\" .\n"
+        ));
+    }
+    let writes = [
+        post(
+            "/disk/update",
+            UPDATE,
+            "INSERT DATA { <http://example.org/a> <http://example.org/p> 1 }",
+        ),
+        put("/disk/data?default", "application/n-triples", small),
+        post("/disk/upload", "application/n-triples", small),
+        put("/mem/data?default", "application/n-triples", &large),
+    ];
+    for req in writes {
+        let what = format!("{} {}", req.method(), req.uri());
+        let r = send(&app, req).await;
+        assert_eq!(
+            r.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{what}: {}",
+            r.text()
+        );
+        assert_eq!(r.json()["code"], "storage-full", "{what}");
+    }
+    assert_eq!(st.get("disk").unwrap().store.head_commit().seq, 0);
+    assert!(st.get("mem").unwrap().store.snapshot().is_empty());
+    // an in-memory dataset below its limit takes writes
+    let r = send(
+        &app,
+        put("/mem/data?default", "application/n-triples", small),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+}

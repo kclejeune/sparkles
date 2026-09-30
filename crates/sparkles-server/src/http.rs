@@ -341,6 +341,7 @@ impl From<Error> for ApiError {
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             Error::NotPermitted(_) => StatusCode::FORBIDDEN,
+            Error::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::HistoryGone(_) => StatusCode::GONE,
             Error::HistoryUnsupported(_) => StatusCode::NOT_IMPLEMENTED,
@@ -354,6 +355,7 @@ impl From<Error> for ApiError {
             Error::HistoryGone(g) => history::gone_body(&g),
             Error::Rejected(r) => return validation::rejection(&r),
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
+            Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -1580,27 +1582,8 @@ impl BodyBudget {
     }
 }
 
-/// Free space for an unprivileged user on the file system of `dir`.
-#[cfg(unix)]
-fn free_disk_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
-    let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `s` is valid for writes; statvfs initializes
-    // it when it returns 0
-    if unsafe { libc::statvfs(path.as_ptr(), s.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: initialized by the successful call above
-    let s = unsafe { s.assume_init() };
-    #[allow(clippy::unnecessary_cast)] // the field types differ between platforms
-    Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
-}
-
-#[cfg(not(unix))]
-fn free_disk_bytes(_: &std::path::Path) -> std::io::Result<u64> {
-    Ok(u64::MAX)
-}
+/// Free space for an unprivileged user on the file system of a directory.
+use sparkles::disk::free_bytes as free_disk_bytes;
 
 /// Read a request body, spooling it to a temporary file once it passes
 /// [`SPOOL_AFTER`] bytes, so a large upload is never held in memory whole. Large

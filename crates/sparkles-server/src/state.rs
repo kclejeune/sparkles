@@ -347,7 +347,7 @@ impl Default for Limits {
             max_query_body_bytes: Some(16 << 20),
             max_update_body_bytes: Some(256 << 20),
             max_admin_body_bytes: Some(16 << 20),
-            max_upload_bytes: Some(64 << 30),
+            max_upload_bytes: Some(4 << 30),
             min_free_disk_bytes: Some(1 << 30),
             max_timeout: Some(std::time::Duration::from_secs(1800)),
         }
