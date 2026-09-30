@@ -119,6 +119,52 @@ pub async fn memory_repo() -> (Repository, Arc<InMemory>) {
     (open_on(mem.clone(), &memory_config("mem")).await, mem)
 }
 
+/// A source of made-up files (not a database: for the upload mechanics only), of a
+/// fresh dataset id at commit 1 of `gen-0001`.
+pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
+    Source {
+        dataset_id: uuid::Uuid::new_v4(),
+        commit: sparkles::commit::CommitInfo {
+            seq: 1,
+            timestamp_ms: 1_790_000_000_000,
+            kind: sparkles::commit::CommitKind::Update,
+            inserted: 1,
+            deleted: 0,
+            quads: 1,
+            generation: 1,
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+        },
+        generation: "gen-0001".into(),
+        index_format: sparkles::builder::FORMAT_VERSION,
+        files: files
+            .into_iter()
+            .map(|(path, kind, bytes)| CapturedFile {
+                path: path.to_string(),
+                kind,
+                len: bytes.len() as u64,
+                src: FileSource::Bytes(Arc::from(bytes)),
+            })
+            .collect(),
+        lock_hold: Duration::ZERO,
+        lease: LeaseGuard::none(),
+    }
+}
+
+/// `n` incompressible bytes (xorshift), different for each `seed`.
+pub fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect()
+}
+
 pub fn opts(name: &str, dataset: &str) -> CreateOptions {
     CreateOptions {
         name: name.to_string(),
