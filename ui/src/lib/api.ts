@@ -6,7 +6,7 @@ export type DatasetType = 'persistent' | 'mem';
 export type DatasetInfo = {
   name: string;
   type: DatasetType;
-  endpoints: { query: string; update: string; gsp: string; upload: string };
+  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string };
   quads: number;
   reasoning: null | { profile: string; inferred: number; at: string };
 };
@@ -29,7 +29,10 @@ export type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[];
   classes: { iri: string; instances: number }[];
   diskBytes: number;
+  /** Decoded-block cache. */
   cache: { entries: number; bytes: number; hits: number; misses: number };
+  /** Query (sub)result cache; absent on servers that predate it. */
+  resultCache?: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number };
 };
 
 export type TaskKind = 'compact' | 'backup' | 'reason' | 'load';
@@ -180,6 +183,10 @@ export const backup = (ds: string) => json<Task>(`/$/backup/${enc(ds)}`, { metho
 export const reason = (ds: string, profile: ReasonProfile, rules?: string) =>
   json<Task>(`/$/reason/${enc(ds)}`, jsonBody(profile === 'rules' ? { profile, rules } : { profile }));
 
+/** Drop the dataset's cached query results (`POST /$/cache/clear/{ds}`, a Sparkles extension). */
+export const clearResultCache = (ds: string) =>
+  json<{ cleared: number; bytes: number }>(`/$/cache/clear/${enc(ds)}`, { method: 'POST' });
+
 export const dropInferences = (ds: string) => json<unknown>(`/$/reason/${enc(ds)}`, { method: 'DELETE' });
 
 export async function listTasks(): Promise<Task[]> {
@@ -200,11 +207,14 @@ export type QueryOptions = {
   send?: number;
   timeout?: number;
   reasoning?: boolean;
+  /** Bypass the server's result cache. */
+  nocache?: boolean;
   signal?: AbortSignal;
 };
 
 function queryParams(opts: QueryOptions): string {
   const p = new URLSearchParams();
+  if (opts.nocache) p.set('nocache', 'true');
   if (opts.send != null) p.set('send', String(opts.send));
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
@@ -289,6 +299,55 @@ function normalizeResult(r: SparklesResult): SparklesResult {
     plan: undefined as unknown as PlanNode,
   };
   return r;
+}
+
+// --- SHACL --------------------------------------------------------------------
+
+/** One `sh:ValidationResult` in the compact JSON report of `/{ds}/shacl`. */
+export type ShaclResult = {
+  focusNode: Term;
+  resultPath: Term | { type: 'path'; value: string } | null;
+  value: Term | null;
+  sourceShape: Term;
+  sourceConstraintComponent: Term;
+  sourceConstraint?: Term;
+  severity: Term;
+  messages: string[];
+};
+
+export type ShaclReport = { conforms: boolean; results: ShaclResult[] };
+
+export type ShaclOptions = {
+  /** `default`, `union` or a graph IRI. */
+  graph?: string;
+  /** Include materialized inferences (server default: yes, when present). */
+  reasoning?: boolean;
+  signal?: AbortSignal;
+};
+
+function shaclRequest(ds: string, shapes: string, accept: string, opts: ShaclOptions): Promise<Response> {
+  const p = new URLSearchParams();
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  const qs = p.toString();
+  return request(`/${enc(ds)}/shacl${qs ? `?${qs}` : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/turtle', Accept: accept },
+    body: shapes,
+    signal: opts.signal,
+  });
+}
+
+/** Validate a data graph against a Turtle shapes graph; compact JSON report. */
+export async function shacl(ds: string, shapes: string, opts: ShaclOptions = {}): Promise<ShaclReport> {
+  const res = await shaclRequest(ds, shapes, 'application/json', opts);
+  return (await res.json()) as ShaclReport;
+}
+
+/** Same validation, report in an RDF syntax (e.g. `text/turtle`) for download. */
+export async function shaclRaw(ds: string, shapes: string, accept: string, opts: ShaclOptions = {}): Promise<Blob> {
+  const res = await shaclRequest(ds, shapes, accept, opts);
+  return res.blob();
 }
 
 // --- upload -------------------------------------------------------------------

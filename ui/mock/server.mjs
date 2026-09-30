@@ -512,6 +512,7 @@ function stats(ds) {
     classes,
     diskBytes: ds.type === 'mem' ? 0 : ds.store.size * 38 + terms * 21 + 65536,
     cache: ds.cache,
+    resultCache: { enabled: true, ...ds.cache },
   };
 }
 

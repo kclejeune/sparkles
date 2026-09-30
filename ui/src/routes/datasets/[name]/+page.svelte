@@ -4,11 +4,13 @@
   import { page } from '$app/state';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
-  import { fmtBytes, fmtCompact, fmtInt, fmtRelative } from '$lib/format';
-  import { displayIri } from '$lib/rdf';
+  import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative } from '$lib/format';
+  import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
+  import { load, save } from '$lib/storage';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import Icon from '$components/Icon.svelte';
   import TaskList from '$components/TaskList.svelte';
+  import TermView from '$components/TermView.svelte';
 
   const name = $derived(page.params.name ?? '');
   const info = $derived(app.datasets.find((d) => d.name === name));
@@ -126,12 +128,139 @@
     }
   }
 
+  // result cache
+  let clearingCache = $state(false);
+  async function clearCache() {
+    clearingCache = true;
+    try {
+      const r = await api.clearResultCache(name);
+      toasts.push('success', 'Result cache cleared', r ? `${fmtInt(r.cleared)} entries, ${fmtBytes(r.bytes)}` : undefined);
+      void loadStats();
+    } catch (e) {
+      toasts.error('Could not clear the result cache', e);
+    } finally {
+      clearingCache = false;
+    }
+  }
+
+  // SHACL validation
+  const DEFAULT_SHAPES = `@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix ex:   <http://example.org/> .
+
+# Every ex:Person (subclasses included) has exactly one string name
+# and exactly one integer age between 0 and 150.
+ex:PersonShape a sh:NodeShape ;
+  sh:targetClass ex:Person ;
+  sh:property [
+    sh:path foaf:name ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+  ] ;
+  sh:property [
+    sh:path foaf:age ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:datatype xsd:integer ;
+    sh:minInclusive 0 ; sh:maxInclusive 150 ;
+  ] .`;
+  const shapesKey = $derived(`sparkles.shacl.${name}`);
+  let shapes = $state(DEFAULT_SHAPES);
+  let shaclGraph = $state('default');
+  let useInferences = $state(true);
+  let validating = $state(false);
+  let downloadingReport = $state(false);
+  let report = $state<api.ShaclReport | null>(null);
+  let reportMs = $state(0);
+  let shaclError = $state<string | null>(null);
+  let resultsShown = $state(50);
+  let shaclCtl: AbortController | null = null;
+
+  $effect(() => {
+    // per-dataset shapes draft
+    shapes = load(shapesKey, DEFAULT_SHAPES);
+    shaclGraph = 'default';
+    report = null;
+    shaclError = null;
+  });
+
+  // dataset prefixes plus those declared in the shapes graph, for the results table
+  const reportPrefixes = $derived.by(() => {
+    const p: Record<string, string> = { ...prefixes };
+    for (const m of shapes.matchAll(/@prefix\s+([A-Za-z][\w.-]*|):\s*<([^>\s]*)>/gi)) p[m[1]] ??= m[2];
+    return p;
+  });
+  // Focus nodes: prefixed name if possible, else namespace + rest (e.g. "ex:person/7"),
+  // so the distinguishing tail of the IRI stays visible in a narrow column.
+  const nsList = $derived(Object.entries(reportPrefixes).filter(([, ns]) => ns).sort((a, b) => b[1].length - a[1].length));
+  function focusLabel(iri: string): string {
+    const short = displayIri(iri, reportPrefixes);
+    if (short !== iri) return short;
+    const hit = nsList.find(([, ns]) => iri.startsWith(ns) && iri.length > ns.length);
+    return hit ? `${hit[0]}:${iri.slice(hit[1].length)}` : iri;
+  }
+  const namedGraphs = $derived((stats?.graphs ?? []).flatMap((g) => (g.name == null ? [] : [g.name])));
+  const shaclOpts = () => ({ graph: shaclGraph, reasoning: info?.reasoning ? useInferences : undefined });
+
+  async function validate() {
+    shaclCtl?.abort();
+    shaclCtl = new AbortController();
+    validating = true;
+    shaclError = null;
+    save(shapesKey, shapes);
+    const t0 = performance.now();
+    try {
+      report = await api.shacl(name, shapes, { ...shaclOpts(), signal: shaclCtl.signal });
+      reportMs = performance.now() - t0;
+      resultsShown = 50;
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) {
+        shaclError = api.errorMessage(e);
+        report = null;
+      }
+    } finally {
+      validating = false;
+      shaclCtl = null;
+    }
+  }
+
+  async function downloadReport() {
+    downloadingReport = true;
+    try {
+      const blob = await api.shaclRaw(name, shapes, 'text/turtle', shaclOpts());
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name.replace(/[^\w.-]+/g, '_')}-shacl-report.ttl`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      toasts.error('Could not download the report', e);
+    } finally {
+      downloadingReport = false;
+    }
+  }
+
+  const SH = WELL_KNOWN.sh;
+  const termText = (t: api.Term): string => (t.type === 'triple' ? 'triple term' : t.value);
+  const shName = (t: api.Term): string =>
+    t.type !== 'uri' ? termText(t) : t.value.startsWith(SH) ? t.value.slice(SH.length) : localName(t.value);
+  const componentName = (t: api.Term) => shName(t).replace(/ConstraintComponent$/, '');
+  const severityClass = (t: api.Term) => {
+    const s = shName(t);
+    return s === 'Violation' ? 'danger' : s === 'Warning' ? 'warn' : 'iri';
+  };
+  const severityCounts = $derived.by(() => {
+    const m = new Map<string, number>();
+    for (const r of report?.results ?? []) m.set(shName(r.severity), (m.get(shName(r.severity)) ?? 0) + 1);
+    return [...m].map(([k, n]) => `${fmtInt(n)} ${k.toLowerCase()}${n === 1 ? '' : 's'}`).join(', ');
+  });
+
   // --- derived visuals ------------------------------------------------------
   const maxPred = $derived(Math.max(1, ...(stats?.predicates.map((p) => p.count) ?? [1])));
   const maxClass = $derived(Math.max(1, ...(stats?.classes.map((c) => c.instances) ?? [1])));
-  const hitRate = $derived(
-    stats && stats.cache.hits + stats.cache.misses > 0 ? stats.cache.hits / (stats.cache.hits + stats.cache.misses) : null,
-  );
+  const rate = (c: { hits: number; misses: number } | undefined) =>
+    c && c.hits + c.misses > 0 ? `${((c.hits / (c.hits + c.misses)) * 100).toFixed(1)}%` : '—';
   const delta = $derived.by(() => {
     if (!stats) return null;
     const total = Math.max(stats.baseQuads + stats.deltaInserts, 1);
@@ -242,15 +371,118 @@
                   : 'Everything is in the sorted base index. Nothing to compact.'}
               </p>
             {/if}
-            <div class="cache">
-              <div><span class="faint">Result cache</span> <strong>{fmtInt(stats.cache.entries)}</strong> entries, {fmtBytes(stats.cache.bytes)}</div>
-              <div>
-                <span class="faint">Hit rate</span>
-                <strong>{hitRate == null ? '—' : `${(hitRate * 100).toFixed(1)}%`}</strong>
-                <span class="faint">({fmtInt(stats.cache.hits)} hits, {fmtInt(stats.cache.misses)} misses)</span>
+            <div class="caches">
+              {#if stats.resultCache}
+                {@const rc = stats.resultCache}
+                <div class="cache">
+                  <span class="cname">Result cache</span>
+                  {#if rc.enabled}
+                    <span><strong>{fmtInt(rc.entries)}</strong> entries, {fmtBytes(rc.bytes)}</span>
+                    <span><span class="faint">hit rate</span> <strong>{rate(rc)}</strong> <span class="faint">({fmtInt(rc.hits)} hits, {fmtInt(rc.misses)} misses)</span></span>
+                  {:else}
+                    <span class="faint">disabled (<span class="mono">--result-cache-mb 0</span>)</span>
+                  {/if}
+                  <span class="spacer"></span>
+                  <button class="btn sm" onclick={clearCache} disabled={clearingCache || !rc.enabled || rc.entries === 0}
+                    title="Drop cached query results for this dataset">
+                    {#if clearingCache}<span class="spinner"></span>{:else}<Icon name="trash" size={12} />{/if} Clear cache
+                  </button>
+                </div>
+              {/if}
+              <div class="cache">
+                <span class="cname">Block cache</span>
+                <span><strong>{fmtInt(stats.cache.entries)}</strong> blocks, {fmtBytes(stats.cache.bytes)}</span>
+                <span><span class="faint">hit rate</span> <strong>{rate(stats.cache)}</strong> <span class="faint">({fmtInt(stats.cache.hits)} hits, {fmtInt(stats.cache.misses)} misses)</span></span>
               </div>
             </div>
           </div>
+        </section>
+
+        <!-- SHACL validation -->
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Validate (SHACL)</h2>
+            <span class="spacer"></span>
+            {#if report}
+              <span class="badge {report.conforms ? 'ok' : 'danger'}">
+                <Icon name={report.conforms ? 'check' : 'alert'} size={12} />
+                {report.conforms ? 'Conforms' : 'Does not conform'}
+              </span>
+            {/if}
+          </div>
+          <div class="panel-body shacl">
+            <textarea class="textarea mono" rows="12" bind:value={shapes} spellcheck="false" aria-label="Shapes graph (Turtle)"></textarea>
+            <div class="row shacl-opts">
+              <label class="inline">
+                <span class="faint">Data graph</span>
+                <select class="select" bind:value={shaclGraph} aria-label="Data graph">
+                  <option value="default">Default graph</option>
+                  <option value="union">Union of all graphs</option>
+                  {#each namedGraphs as g (g)}
+                    <option value={g}>{displayIri(g, prefixes)}</option>
+                  {/each}
+                </select>
+              </label>
+              {#if info?.reasoning}
+                <label class="inline check" title="Validate the data together with the materialized inferences">
+                  <input type="checkbox" bind:checked={useInferences} /> Use inferences
+                </label>
+              {/if}
+              <span class="spacer"></span>
+              <button class="btn" onclick={downloadReport} disabled={downloadingReport || !shapes.trim()} title="Validate and download the report as Turtle">
+                {#if downloadingReport}<span class="spinner"></span>{:else}<Icon name="download" size={13} />{/if} Report (.ttl)
+              </button>
+              {#if validating}
+                <button class="btn" onclick={() => shaclCtl?.abort()}>Cancel</button>
+              {/if}
+              <button class="btn primary" onclick={validate} disabled={validating || !shapes.trim()}>
+                {#if validating}<span class="spinner"></span>{:else}<Icon name="check" size={14} />{/if} Validate
+              </button>
+            </div>
+            {#if shaclError}<div class="error-box"><strong>Validation failed.</strong> {shaclError}</div>{/if}
+            {#if report}
+              <p class="faint note">
+                {#if report.conforms}
+                  The data graph conforms to the shapes ({fmtMs(reportMs)}).
+                {:else}
+                  {fmtInt(report.results.length)} result{report.results.length === 1 ? '' : 's'}: {severityCounts} ({fmtMs(reportMs)}).
+                {/if}
+              </p>
+            {/if}
+          </div>
+          {#if report && report.results.length}
+            <div class="shacl-results">
+              <table class="data">
+                <thead>
+                  <tr><th>Focus node</th><th>Path</th><th>Value</th><th>Constraint</th><th>Severity</th><th>Message</th></tr>
+                </thead>
+                <tbody>
+                  {#each report.results.slice(0, resultsShown) as r, i (i)}
+                    <tr>
+                      <td class="mono cell">
+                        {#if r.focusNode.type === 'uri'}
+                          {@const iri = r.focusNode.value}
+                          <a class="focus t-iri" href={explore(iri)} title="{iri}  (open in Explore)">{focusLabel(iri)}</a>
+                        {:else}
+                          <TermView term={r.focusNode} prefixes={reportPrefixes} />
+                        {/if}
+                      </td>
+                      <td class="mono cell">
+                        {#if r.resultPath?.type === 'path'}<span class="t-iri">{r.resultPath.value}</span>{:else}<TermView term={r.resultPath} prefixes={reportPrefixes} />{/if}
+                      </td>
+                      <td class="mono cell"><TermView term={r.value} prefixes={reportPrefixes} /></td>
+                      <td class="cell" title={termText(r.sourceConstraintComponent)}>{componentName(r.sourceConstraintComponent)}</td>
+                      <td><span class="badge {severityClass(r.severity)}">{shName(r.severity)}</span></td>
+                      <td class="cell msg" title={r.messages.join('\n')}>{r.messages[0] ?? ''}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+              {#if report.results.length > resultsShown}
+                <button class="btn ghost sm more" onclick={() => (resultsShown += 100)}>Show more ({fmtInt(report.results.length - resultsShown)} hidden)</button>
+              {/if}
+            </div>
+          {/if}
         </section>
 
         <!-- predicates -->
@@ -530,6 +762,10 @@
     gap: 16px;
     min-width: 0;
   }
+  /* grid items default to their min-content width; keep wide tables inside the track */
+  .col > section {
+    min-width: 0;
+  }
   .storage {
     display: grid;
     gap: 10px;
@@ -578,13 +814,96 @@
   .note {
     font-size: var(--fs-sm);
   }
-  .cache {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px 24px;
+  .caches {
+    display: grid;
+    gap: 6px;
     padding-top: 10px;
     border-top: 1px solid var(--border);
     font-size: var(--fs-sm);
+  }
+  .cache {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    min-height: 26px;
+  }
+  .cache .cname {
+    color: var(--text-2);
+    min-width: 88px;
+  }
+  .cache strong {
+    font-variant-numeric: tabular-nums;
+  }
+  .shacl {
+    display: grid;
+    gap: 10px;
+  }
+  .shacl textarea {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    resize: vertical;
+  }
+  .shacl-opts {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-sm);
+    min-width: 0;
+  }
+  .inline .select {
+    max-width: 260px;
+  }
+  .inline.check input {
+    accent-color: var(--iri);
+    margin: 0;
+  }
+  .shacl-results {
+    border-top: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  .shacl-results table {
+    table-layout: fixed;
+    min-width: 560px;
+  }
+  .shacl-results th:nth-child(1) {
+    width: 22%;
+  }
+  .shacl-results th:nth-child(2),
+  .shacl-results th:nth-child(3) {
+    width: 14%;
+  }
+  .shacl-results th:nth-child(4) {
+    width: 15%;
+  }
+  .shacl-results th:nth-child(5) {
+    width: 11%;
+  }
+  .shacl-results .cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .shacl-results .focus {
+    color: var(--iri);
+    text-decoration: none;
+  }
+  .shacl-results .focus:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .shacl-results .msg {
+    color: var(--text-2);
+  }
+  .badge.warn {
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: var(--warn);
   }
   table.bars td {
     height: 30px;
