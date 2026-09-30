@@ -15,7 +15,14 @@
   import Icon from '$components/Icon.svelte';
   import TermView from '$components/TermView.svelte';
 
-  type ENode = { id: string; term: Term; iri: string; label: string; expanded: boolean; lit: boolean };
+  type ENode = {
+    id: string;
+    term: Term;
+    iri: string;
+    label: string;
+    expanded: boolean;
+    lit: boolean;
+  };
   type EEdge = GEdge & { lit: boolean };
 
   const RDFS_COMMENT = 'http://www.w3.org/2000/01/rdf-schema#comment';
@@ -24,7 +31,9 @@
   const ds = $derived(app.current);
   const prefixes = $derived(app.prefixes(ds));
 
-  let tab = $state<'graph' | 'schema'>(page.url.searchParams.get('tab') === 'schema' ? 'schema' : 'graph');
+  let tab = $state<'graph' | 'schema'>(
+    page.url.searchParams.get('tab') === 'schema' ? 'schema' : 'graph',
+  );
   let nodes = $state<Record<string, ENode>>({});
   let edges = $state<Record<string, EEdge>>({});
   let focusId = $state<string | null>(null);
@@ -49,7 +58,9 @@
         expanded: n.expanded,
       })),
   );
-  const gEdges = $derived(Object.values(edges).filter((e) => (showLiterals || !e.lit) && (!hideTypes || !e.isType)));
+  const gEdges = $derived(
+    Object.values(edges).filter((e) => (showLiterals || !e.lit) && (!hideTypes || !e.isType)),
+  );
   const nodeCount = $derived(Object.keys(nodes).length);
 
   function labelFor(t: Term, label?: string) {
@@ -66,7 +77,14 @@
       if (label && existing.label !== label && term.type === 'uri') existing.label = label;
       return existing;
     }
-    const n: ENode = { id, term, iri: term.type === 'uri' ? term.value : '', label: labelFor(term, label), expanded: false, lit: term.type === 'literal' };
+    const n: ENode = {
+      id,
+      term,
+      iri: term.type === 'uri' ? term.value : '',
+      label: labelFor(term, label),
+      expanded: false,
+      lit: term.type === 'literal',
+    };
     nodes[id] = n;
     return nodes[id];
   }
@@ -74,14 +92,26 @@
   function addEdge(s: string, p: string, o: string, lit: boolean) {
     const id = `${s}|${p}|${o}`;
     if (edges[id]) return;
-    edges[id] = { id, source: s, target: o, label: shortLabel(p, prefixes), title: p, isType: p === RDF_TYPE, lit };
+    edges[id] = {
+      id,
+      source: s,
+      target: o,
+      label: shortLabel(p, prefixes),
+      title: p,
+      isType: p === RDF_TYPE,
+      lit,
+    };
   }
 
   async function expand(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
     if (nodeCount > MAX_NODES) {
-      toasts.push('error', 'Graph is getting large', `Over ${MAX_NODES} nodes. Remove some or refocus before expanding.`);
+      toasts.push(
+        'error',
+        'Graph is getting large',
+        `Over ${MAX_NODES} nodes. Remove some or refocus before expanding.`,
+      );
       return;
     }
     expanding[id] = true;
@@ -103,7 +133,11 @@
       }
       n.expanded = true;
       if (out.length >= 100 || inc.length >= 100) {
-        toasts.push('info', 'Showing the first 100 edges each way', 'Open the resource in Query to see everything.');
+        toasts.push(
+          'info',
+          'Showing the first 100 edges each way',
+          'Open the resource in Query to see everything.',
+        );
       }
     } catch (e) {
       toasts.error(`Could not expand ${n.label}`, e);
@@ -151,7 +185,9 @@
   }
 
   function removeNode(id: string) {
-    const keep = Object.fromEntries(Object.entries(edges).filter(([, e]) => e.source !== id && e.target !== id));
+    const keep = Object.fromEntries(
+      Object.entries(edges).filter(([, e]) => e.source !== id && e.target !== id),
+    );
     edges = keep;
     const { [id]: _removed, ...rest } = nodes;
     void _removed;
@@ -200,7 +236,8 @@
     if (!detail || 'error' in detail) return [];
     const by: Record<string, Term[]> = {};
     for (const { p, o } of detail.props) (by[p] ??= []).push(o);
-    const order = (p: string) => (p === RDF_TYPE ? 0 : ex.LABEL_IRIS.includes(p) ? 1 : p === RDFS_COMMENT ? 2 : 3);
+    const order = (p: string) =>
+      p === RDF_TYPE ? 0 : ex.LABEL_IRIS.includes(p) ? 1 : p === RDFS_COMMENT ? 2 : 3;
     return Object.entries(by).sort((a, b) => order(a[0]) - order(b[0]) || a[0].localeCompare(b[0]));
   });
   const types = $derived(grouped.find(([p]) => p === RDF_TYPE)?.[1] ?? []);
@@ -252,7 +289,8 @@
       try {
         hits = await ex.search(ds!, q, ctl.signal);
       } catch (e) {
-        if (!(e instanceof DOMException && e.name === 'AbortError')) searchErr = api.errorMessage(e);
+        if (!(e instanceof DOMException && e.name === 'AbortError'))
+          searchErr = api.errorMessage(e);
       } finally {
         if (searchCtl === ctl) searching = false;
       }
@@ -349,7 +387,8 @@
     // Open every ancestor so the class is visible in the tree.
     const next = new Set(openClasses);
     const walk = (c: string, seen: Set<string>) => {
-      for (const s of schema!.classes.get(c)?.supers ?? []) if (!seen.has(s)) (seen.add(s), next.add(s), walk(s, seen));
+      for (const s of schema!.classes.get(c)?.supers ?? [])
+        if (!seen.has(s)) (seen.add(s), next.add(s), walk(s, seen));
     };
     walk(iri, new Set());
     openClasses = next;
@@ -369,7 +408,11 @@
   const propMatches = $derived.by(() => {
     if (!schema) return [];
     const f = propFilter.trim().toLowerCase();
-    return f ? schema.properties.filter((p) => (p.label ?? '').toLowerCase().includes(f) || p.iri.toLowerCase().includes(f)) : schema.properties;
+    return f
+      ? schema.properties.filter(
+          (p) => (p.label ?? '').toLowerCase().includes(f) || p.iri.toLowerCase().includes(f),
+        )
+      : schema.properties;
   });
   const cls = $derived(selectedClass && schema ? schema.classes.get(selectedClass) : undefined);
   const clsProps = $derived.by(() => {
@@ -411,7 +454,8 @@
   });
 
   $effect(() => {
-    if (tab === 'schema' && ds && schemaFor !== ds && !schemaLoading) untrack(() => loadSchema(ds!));
+    if (tab === 'schema' && ds && schemaFor !== ds && !schemaLoading)
+      untrack(() => loadSchema(ds!));
   });
 
   // React to ?iri= changes (e.g. clicking an IRI on the Query page).
@@ -468,7 +512,14 @@
       {#if searchOpen && query.trim().length >= 2}
         <div class="results" id="search-results" role="listbox">
           {#each options as o, i (o.iri + (o.direct ? '!' : ''))}
-            <button role="option" aria-selected={i === active} class="hit" class:active={i === active} onmouseenter={() => (active = i)} onclick={() => pick(o)}>
+            <button
+              role="option"
+              aria-selected={i === active}
+              class="hit"
+              class:active={i === active}
+              onmouseenter={() => (active = i)}
+              onclick={() => pick(o)}
+            >
               {#if o.direct}
                 <Icon name="target" size={14} />
                 <span>Open <span class="mono t-iri">{displayIri(o.iri, prefixes)}</span></span>
@@ -486,8 +537,15 @@
       {/if}
     </div>
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" aria-selected={tab === 'graph'} onclick={() => setTab('graph')}><Icon name="graph" size={14} /> Graph</button>
-      <button class="tab" role="tab" aria-selected={tab === 'schema'} onclick={() => setTab('schema')}><Icon name="tree" size={14} /> Schema</button>
+      <button class="tab" role="tab" aria-selected={tab === 'graph'} onclick={() => setTab('graph')}
+        ><Icon name="graph" size={14} /> Graph</button
+      >
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={tab === 'schema'}
+        onclick={() => setTab('schema')}><Icon name="tree" size={14} /> Schema</button
+      >
     </div>
   </header>
 
@@ -501,17 +559,25 @@
     <div class="split">
       <div class="canvas">
         <div class="gtools">
-          <label class="row check"><input type="checkbox" bind:checked={showLiterals} /> Literals</label>
-          <label class="row check"><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label>
+          <label class="row check"
+            ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
+          >
+          <label class="row check"
+            ><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label
+          >
           <span class="spacer"></span>
           <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
-          {#if nodeCount}<button class="btn sm ghost" onclick={clearGraph}><Icon name="trash" size={13} /> Clear</button>{/if}
+          {#if nodeCount}<button class="btn sm ghost" onclick={clearGraph}
+              ><Icon name="trash" size={13} /> Clear</button
+            >{/if}
         </div>
         {#if nodeCount === 0}
           <div class="start">
             <Icon name="explore" size={26} />
             <h2>Start from a resource</h2>
-            <p class="muted">Search above, paste an IRI, or pick a class to start from one of its instances.</p>
+            <p class="muted">
+              Search above, paste an IRI, or pick a class to start from one of its instances.
+            </p>
             {#if starters.length}
               <div class="chips">
                 {#each starters as s (s.iri)}
@@ -522,13 +588,24 @@
                 {/each}
               </div>
             {/if}
-            <button class="btn sm" onclick={() => setTab('schema')}><Icon name="tree" size={13} /> Browse the schema</button>
+            <button class="btn sm" onclick={() => setTab('schema')}
+              ><Icon name="tree" size={13} /> Browse the schema</button
+            >
           </div>
         {:else}
           <div class="cy-host">
-            <GraphView bind:this={graphView} nodes={gNodes} edges={gEdges} selected={selectedId} onselect={select} onexpand={expand} />
+            <GraphView
+              bind:this={graphView}
+              nodes={gNodes}
+              edges={gEdges}
+              selected={selectedId}
+              onselect={select}
+              onexpand={expand}
+            />
           </div>
-          <div class="hint faint">Double-click a node to load its neighbours. Blue-ringed nodes are expanded.</div>
+          <div class="hint faint">
+            Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
+          </div>
         {/if}
       </div>
 
@@ -550,7 +627,11 @@
             {#if types.length}
               <div class="types">
                 {#each types as t (termKey(t))}
-                  <button class="badge iri" onclick={() => t.type === 'uri' && (setTab('schema'), revealClass(t.value))} title="Show class in schema">
+                  <button
+                    class="badge iri"
+                    onclick={() => t.type === 'uri' && (setTab('schema'), revealClass(t.value))}
+                    title="Show class in schema"
+                  >
                     {t.type === 'uri' ? shortLabel(t.value, prefixes) : t.value}
                   </button>
                 {/each}
@@ -559,15 +640,31 @@
             {#if comment?.length}<p class="comment">{ex.pickLabel(comment)}</p>{/if}
             {#if n.term.type === 'uri'}
               <div class="side-actions">
-                <button class="btn sm" onclick={() => expand(n.id)} disabled={n.expanded || expanding[n.id]}>
-                  {#if expanding[n.id]}<span class="spinner"></span>{:else}<Icon name="expand" size={13} />{/if}
+                <button
+                  class="btn sm"
+                  onclick={() => expand(n.id)}
+                  disabled={n.expanded || expanding[n.id]}
+                >
+                  {#if expanding[n.id]}<span class="spinner"></span>{:else}<Icon
+                      name="expand"
+                      size={13}
+                    />{/if}
                   {n.expanded ? 'Expanded' : 'Expand'}
                 </button>
                 {#if focusId !== n.id}
-                  <button class="btn sm" onclick={() => focusOn(n.iri, n.label)}><Icon name="target" size={13} /> Focus</button>
+                  <button class="btn sm" onclick={() => focusOn(n.iri, n.label)}
+                    ><Icon name="target" size={13} /> Focus</button
+                  >
                 {/if}
-                <button class="btn sm" onclick={() => describeInQuery(n.iri)}><Icon name="query" size={13} /> Describe</button>
-                <button class="btn sm ghost icon" title="Remove from graph" aria-label="Remove from graph" onclick={() => removeNode(n.id)}>
+                <button class="btn sm" onclick={() => describeInQuery(n.iri)}
+                  ><Icon name="query" size={13} /> Describe</button
+                >
+                <button
+                  class="btn sm ghost icon"
+                  title="Remove from graph"
+                  aria-label="Remove from graph"
+                  onclick={() => removeNode(n.id)}
+                >
                   <Icon name="x" size={13} />
                 </button>
               </div>
@@ -577,7 +674,9 @@
           {#if n.term.type === 'literal'}
             <div class="side-body"><pre class="literal">{n.term.value}</pre></div>
           {:else if n.term.type !== 'uri'}
-            <div class="side-body faint">Blank nodes can only be explored through their neighbours.</div>
+            <div class="side-body faint">
+              Blank nodes can only be explored through their neighbours.
+            </div>
           {:else if !detail}
             <div class="side-body row faint"><span class="spinner"></span> Loading properties…</div>
           {:else if 'error' in detail}
@@ -596,10 +695,16 @@
                       <td>
                         {#each values.slice(0, 20) as o (termKey(o))}
                           <div class="val">
-                            <TermView term={o} {prefixes} onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })} />
+                            <TermView
+                              term={o}
+                              {prefixes}
+                              onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })}
+                            />
                           </div>
                         {/each}
-                        {#if values.length > 20}<div class="faint">+{values.length - 20} more</div>{/if}
+                        {#if values.length > 20}<div class="faint">
+                            +{values.length - 20} more
+                          </div>{/if}
                       </td>
                     </tr>
                   {/each}
@@ -617,14 +722,21 @@
                     {#each detail.incoming.slice(0, 100) as r (termKey(r.s) + r.p)}
                       <tr>
                         <td class="inc-s">
-                          <TermView term={r.s} {prefixes} onopen={(iri) => addLinked(n.id, r.p, { type: 'uri', value: iri }, true)} />
+                          <TermView
+                            term={r.s}
+                            {prefixes}
+                            onopen={(iri) =>
+                              addLinked(n.id, r.p, { type: 'uri', value: iri }, true)}
+                          />
                         </td>
                         <th title={r.p}><span class="t-iri">{displayIri(r.p, prefixes)}</span></th>
                       </tr>
                     {/each}
                   </tbody>
                 </table>
-                {#if detail.incomingTotal > 100}<p class="faint more-note">Showing 100 of {fmtInt(detail.incomingTotal)}.</p>{/if}
+                {#if detail.incomingTotal > 100}<p class="faint more-note">
+                    Showing 100 of {fmtInt(detail.incomingTotal)}.
+                  </p>{/if}
               {/if}
             </div>
           {/if}
@@ -649,10 +761,20 @@
         {/if}
         <div class="schema-tools">
           <div class="tabs" role="tablist">
-            <button class="tab" role="tab" aria-selected={schemaView === 'classes'} onclick={() => (schemaView = 'classes')}>
+            <button
+              class="tab"
+              role="tab"
+              aria-selected={schemaView === 'classes'}
+              onclick={() => (schemaView = 'classes')}
+            >
               Classes <span class="count">{schema ? schema.classes.size : ''}</span>
             </button>
-            <button class="tab" role="tab" aria-selected={schemaView === 'properties'} onclick={() => (schemaView = 'properties')}>
+            <button
+              class="tab"
+              role="tab"
+              aria-selected={schemaView === 'properties'}
+              onclick={() => (schemaView = 'properties')}
+            >
               Properties <span class="count">{schema ? schema.properties.length : ''}</span>
             </button>
           </div>
@@ -662,7 +784,12 @@
           {:else}
             <input class="input sm" placeholder="Filter properties" bind:value={propFilter} />
           {/if}
-          <button class="btn sm ghost icon" title="Reload schema" aria-label="Reload schema" onclick={() => ds && loadSchema(ds)}>
+          <button
+            class="btn sm ghost icon"
+            title="Reload schema"
+            aria-label="Reload schema"
+            onclick={() => ds && loadSchema(ds)}
+          >
             <Icon name="refresh" size={13} />
           </button>
         </div>
@@ -670,16 +797,37 @@
           {#if schemaLoading && !schema}
             <div class="empty"><span class="spinner"></span> Reading the ontology…</div>
           {:else if schemaErr}
-            <div class="pad"><div class="error-box"><strong>Could not load the schema.</strong> {schemaErr}</div></div>
+            <div class="pad">
+              <div class="error-box"><strong>Could not load the schema.</strong> {schemaErr}</div>
+            </div>
           {:else if schema}
             {#if schemaView === 'classes'}
               {#if schema.classes.size === 0}
-                <div class="empty">No classes found. Declare some with owl:Class or rdfs:subClassOf, or type your resources with rdf:type.</div>
+                <div class="empty">
+                  No classes found. Declare some with owl:Class or rdfs:subClassOf, or type your
+                  resources with rdf:type.
+                </div>
               {:else if classMatches}
-                <ClassTree {schema} iris={classMatches} {prefixes} open={new Set()} selected={selectedClass} onselect={(i) => (selectedClass = i)} ontoggle={revealClass} />
+                <ClassTree
+                  {schema}
+                  iris={classMatches}
+                  {prefixes}
+                  open={new Set()}
+                  selected={selectedClass}
+                  onselect={(i) => (selectedClass = i)}
+                  ontoggle={revealClass}
+                />
               {:else}
                 <div class="legend faint"><span>Class</span><span>subclasses, instances</span></div>
-                <ClassTree {schema} iris={schema.roots} {prefixes} open={openClasses} selected={selectedClass} onselect={(i) => (selectedClass = i)} ontoggle={toggleClass} />
+                <ClassTree
+                  {schema}
+                  iris={schema.roots}
+                  {prefixes}
+                  open={openClasses}
+                  selected={selectedClass}
+                  onselect={(i) => (selectedClass = i)}
+                  ontoggle={toggleClass}
+                />
               {/if}
             {:else}
               <table class="data plist">
@@ -691,18 +839,27 @@
                         <div class="pname">{p.label ?? shortLabel(p.iri, prefixes)}</div>
                         <div class="mono faint small">{displayIri(p.iri, prefixes)}</div>
                       </td>
-                      <td>{#each p.kinds as k (k)}<span class="badge">{kindName(k)}</span> {/each}</td>
+                      <td
+                        >{#each p.kinds as k (k)}<span class="badge">{kindName(k)}</span>
+                        {/each}</td
+                      >
                       <td>
                         {#each p.domains as d (d)}
-                          <button class="cls-link" onclick={() => revealClass(d)} title={d}>{classLabel(d)}</button>
+                          <button class="cls-link" onclick={() => revealClass(d)} title={d}
+                            >{classLabel(d)}</button
+                          >
                         {:else}<span class="faint">—</span>{/each}
                       </td>
                       <td>
                         {#each p.ranges as r (r)}
                           {#if schema.classes.has(r)}
-                            <button class="cls-link" onclick={() => revealClass(r)} title={r}>{classLabel(r)}</button>
+                            <button class="cls-link" onclick={() => revealClass(r)} title={r}
+                              >{classLabel(r)}</button
+                            >
                           {:else}
-                            <span class="mono t-literal small" title={r}>{shortLabel(r, prefixes)}</span>
+                            <span class="mono t-literal small" title={r}
+                              >{shortLabel(r, prefixes)}</span
+                            >
                           {/if}
                         {:else}<span class="faint">—</span>{/each}
                       </td>
@@ -722,39 +879,57 @@
           <div class="side-head">
             <div class="side-title">
               <h2>{cls.label ?? shortLabel(cls.iri, prefixes)}</h2>
-              <button class="iri-line mono" onclick={() => copy(cls.iri)} title="Copy IRI">{cls.iri} <Icon name="copy" size={12} /></button>
+              <button class="iri-line mono" onclick={() => copy(cls.iri)} title="Copy IRI"
+                >{cls.iri} <Icon name="copy" size={12} /></button
+              >
             </div>
             {#if cls.comment}<p class="comment">{cls.comment}</p>{/if}
             <div class="side-actions">
-              <button class="btn sm" onclick={() => sampleOf(cls.iri)} disabled={!cls.instances}><Icon name="explore" size={13} /> Explore an instance</button>
-              <button class="btn sm" onclick={() => focusOn(cls.iri, cls.label)}><Icon name="graph" size={13} /> Class as graph</button>
+              <button class="btn sm" onclick={() => sampleOf(cls.iri)} disabled={!cls.instances}
+                ><Icon name="explore" size={13} /> Explore an instance</button
+              >
+              <button class="btn sm" onclick={() => focusOn(cls.iri, cls.label)}
+                ><Icon name="graph" size={13} /> Class as graph</button
+              >
             </div>
           </div>
           <div class="side-body scroll">
             <dl class="facts">
-              <dt>Instances</dt><dd>{fmtInt(cls.instances)}</dd>
-              <dt>Declared</dt><dd>{cls.declared ? 'yes' : 'no, only used'}</dd>
+              <dt>Instances</dt>
+              <dd>{fmtInt(cls.instances)}</dd>
+              <dt>Declared</dt>
+              <dd>{cls.declared ? 'yes' : 'no, only used'}</dd>
             </dl>
             <h3 class="sub">Superclasses</h3>
             <div class="chips left">
-              {#each cls.supers as s (s)}<button class="cls-link" onclick={() => revealClass(s)}>{classLabel(s)}</button>{:else}<span class="faint">None (root class)</span>{/each}
+              {#each cls.supers as s (s)}<button class="cls-link" onclick={() => revealClass(s)}
+                  >{classLabel(s)}</button
+                >{:else}<span class="faint">None (root class)</span>{/each}
             </div>
             <h3 class="sub">Subclasses</h3>
             <div class="chips left">
-              {#each cls.subs as s (s)}<button class="cls-link" onclick={() => revealClass(s)}>{classLabel(s)}</button>{:else}<span class="faint">None</span>{/each}
+              {#each cls.subs as s (s)}<button class="cls-link" onclick={() => revealClass(s)}
+                  >{classLabel(s)}</button
+                >{:else}<span class="faint">None</span>{/each}
             </div>
-            <h3 class="sub">Properties with this domain <span class="faint">{clsProps.domain.length}</span></h3>
+            <h3 class="sub">
+              Properties with this domain <span class="faint">{clsProps.domain.length}</span>
+            </h3>
             {#each clsProps.domain as p (p.iri)}
               <div class="prop-line">
                 <span class="t-iri mono">{displayIri(p.iri, prefixes)}</span>
                 <span class="faint">→</span>
-                {#each p.ranges as r (r)}<span class="mono small">{shortLabel(r, prefixes)}</span>{:else}<span class="faint">any</span>{/each}
+                {#each p.ranges as r (r)}<span class="mono small">{shortLabel(r, prefixes)}</span
+                  >{:else}<span class="faint">any</span>{/each}
               </div>
             {:else}<p class="faint">None declared.</p>{/each}
-            <h3 class="sub">Properties with this range <span class="faint">{clsProps.range.length}</span></h3>
+            <h3 class="sub">
+              Properties with this range <span class="faint">{clsProps.range.length}</span>
+            </h3>
             {#each clsProps.range as p (p.iri)}
               <div class="prop-line">
-                {#each p.domains as d (d)}<span class="mono small">{shortLabel(d, prefixes)}</span>{:else}<span class="faint">any</span>{/each}
+                {#each p.domains as d (d)}<span class="mono small">{shortLabel(d, prefixes)}</span
+                  >{:else}<span class="faint">any</span>{/each}
                 <span class="faint">→</span>
                 <span class="t-iri mono">{displayIri(p.iri, prefixes)}</span>
               </div>

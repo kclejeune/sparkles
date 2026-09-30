@@ -4,7 +4,8 @@
    Term colours carry meaning everywhere: IRI = cobalt, literal = teal, bnode = violet, variable = rose. */
 
 :root {
-  --font-ui: 'Instrument Sans Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-ui:
+    'Instrument Sans Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
   --fs-xs: 11px;
@@ -291,7 +292,8 @@ pre,
 .select {
   padding-right: 24px;
   appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%),
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-3) 50%),
     linear-gradient(135deg, var(--text-3) 50%, transparent 50%);
   background-position:
     calc(100% - 13px) 12px,

@@ -5,14 +5,27 @@
   cytoscape.use(fcose);
 
   export type GNodeKind = 'iri' | 'literal' | 'bnode' | 'triple';
-  export type GNode = { id: string; label: string; kind: GNodeKind; title?: string; focus?: boolean; expanded?: boolean };
-  export type GEdge = { id: string; source: string; target: string; label: string; title?: string; isType?: boolean };
+  export type GNode = {
+    id: string;
+    label: string;
+    kind: GNodeKind;
+    title?: string;
+    focus?: boolean;
+    expanded?: boolean;
+  };
+  export type GEdge = {
+    id: string;
+    source: string;
+    target: string;
+    label: string;
+    title?: string;
+    isType?: boolean;
+  };
 </script>
 
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import Icon from './Icon.svelte';
-
 
   let {
     nodes,
@@ -91,13 +104,35 @@
           'text-max-width': '180px',
         },
       },
-      { selector: 'node[kind = "bnode"]', style: { 'background-color': bnode, width: 12, height: 12 } },
+      {
+        selector: 'node[kind = "bnode"]',
+        style: { 'background-color': bnode, width: 12, height: 12 },
+      },
       { selector: 'node[kind = "triple"]', style: { shape: 'diamond', 'background-color': text2 } },
-      { selector: 'node[?expanded]', style: { 'border-color': iri, 'border-width': 2, 'background-opacity': 0.55 } },
-      { selector: 'node[?focus]', style: { width: 26, height: 26, 'border-color': spark, 'border-width': 3, 'font-weight': 600 } },
+      {
+        selector: 'node[?expanded]',
+        style: { 'border-color': iri, 'border-width': 2, 'background-opacity': 0.55 },
+      },
+      {
+        selector: 'node[?focus]',
+        style: {
+          width: 26,
+          height: 26,
+          'border-color': spark,
+          'border-width': 3,
+          'font-weight': 600,
+        },
+      },
       {
         selector: 'node:selected',
-        style: { 'border-color': spark, 'border-width': 3, 'overlay-opacity': 0, 'underlay-color': spark, 'underlay-opacity': 0.18, 'underlay-padding': 5 },
+        style: {
+          'border-color': spark,
+          'border-width': 3,
+          'overlay-opacity': 0,
+          'underlay-color': spark,
+          'underlay-opacity': 0.18,
+          'underlay-padding': 5,
+        },
       },
       {
         selector: 'edge',
@@ -123,7 +158,13 @@
       { selector: 'edge.quiet', style: { 'text-opacity': 0 } },
       {
         selector: 'edge:selected, edge.hl',
-        style: { 'line-color': spark, 'target-arrow-color': spark, width: 2, color: text, 'text-opacity': 1 },
+        style: {
+          'line-color': spark,
+          'target-arrow-color': spark,
+          width: 2,
+          color: text,
+          'text-opacity': 1,
+        },
       },
       { selector: '.faded', style: { opacity: 0.25 } },
     ];
@@ -144,7 +185,14 @@
     }),
     edge: (e: GEdge): ElementDefinition => ({
       group: 'edges',
-      data: { id: e.id, source: e.source, target: e.target, label: e.label, title: e.title, isType: !!e.isType },
+      data: {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        label: e.label,
+        title: e.title,
+        isType: !!e.isType,
+      },
     }),
   };
 
@@ -176,7 +224,9 @@
     if (!cy) return;
     const wasEmpty = cy.nodes().length === 0;
     const wantNodes = new Map(nodes.map((n) => [n.id, n]));
-    const wantEdges = new Map(edges.filter((e) => wantNodes.has(e.source) && wantNodes.has(e.target)).map((e) => [e.id, e]));
+    const wantEdges = new Map(
+      edges.filter((e) => wantNodes.has(e.source) && wantNodes.has(e.target)).map((e) => [e.id, e]),
+    );
     let added = 0;
     cy.batch(() => {
       cy!.elements().forEach((el) => {
@@ -186,16 +236,28 @@
       for (const n of wantNodes.values()) {
         const existing = cy!.getElementById(n.id);
         if (existing.nonempty()) {
-          existing.data({ label: n.label, kind: n.kind, focus: !!n.focus, expanded: !!n.expanded, title: n.title, w: Math.min(190, n.label.length * 6 + 14) });
+          existing.data({
+            label: n.label,
+            kind: n.kind,
+            focus: !!n.focus,
+            expanded: !!n.expanded,
+            title: n.title,
+            w: Math.min(190, n.label.length * 6 + 14),
+          });
         } else {
           const el = cy!.add(toEl.node(n));
           added++;
           // Seed position next to an existing neighbour so incremental layouts stay calm.
           const neighbour = edges.find((e) => e.target === n.id || e.source === n.id);
-          const other = neighbour ? cy!.getElementById(neighbour.source === n.id ? neighbour.target : neighbour.source) : null;
+          const other = neighbour
+            ? cy!.getElementById(neighbour.source === n.id ? neighbour.target : neighbour.source)
+            : null;
           if (other && other.nonempty() && other.id() !== n.id) {
             const p = other.position();
-            el.position({ x: p.x + (Math.random() - 0.5) * 120, y: p.y + (Math.random() - 0.5) * 120 });
+            el.position({
+              x: p.x + (Math.random() - 0.5) * 120,
+              y: p.y + (Math.random() - 0.5) * 120,
+            });
           }
         }
       }
@@ -250,7 +312,10 @@
     sync();
 
     themeObserver = new MutationObserver(restyle);
-    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme'],
+    });
     media = matchMedia('(prefers-color-scheme: dark)');
     media.addEventListener('change', restyle);
   });
@@ -302,8 +367,12 @@
     <div class="empty-overlay">{emptyText}</div>
   {/if}
   <div class="controls">
-    <button class="btn sm icon" title="Fit to view" aria-label="Fit to view" onclick={fit}><Icon name="fit" size={14} /></button>
-    <button class="btn sm icon" title="Re-run layout" aria-label="Re-run layout" onclick={relayout}><Icon name="refresh" size={14} /></button>
+    <button class="btn sm icon" title="Fit to view" aria-label="Fit to view" onclick={fit}
+      ><Icon name="fit" size={14} /></button
+    >
+    <button class="btn sm icon" title="Re-run layout" aria-label="Re-run layout" onclick={relayout}
+      ><Icon name="refresh" size={14} /></button
+    >
   </div>
 </div>
 
@@ -314,7 +383,11 @@
     height: 100%;
     min-height: 200px;
     background-color: var(--surface);
-    background-image: radial-gradient(circle, color-mix(in srgb, var(--text-3) 22%, transparent) 1px, transparent 1px);
+    background-image: radial-gradient(
+      circle,
+      color-mix(in srgb, var(--text-3) 22%, transparent) 1px,
+      transparent 1px
+    );
     background-size: 18px 18px;
   }
   .cy {

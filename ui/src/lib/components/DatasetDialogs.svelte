@@ -67,27 +67,48 @@
   <form id="create-ds" onsubmit={create} class="form">
     <label class="field">
       Name
-      <input class="input mono" bind:value={name} placeholder="my-dataset" autocomplete="off" required {@attach (el) => el.focus()} />
+      <input
+        class="input mono"
+        bind:value={name}
+        placeholder="my-dataset"
+        autocomplete="off"
+        required
+        {@attach (el) => el.focus()}
+      />
       <span class="hint" class:bad={name && (!validName || exists)}>
-        {#if name && !validName}Use letters, digits, “_”, “-” or “.”.{:else if exists}A dataset with this name already exists.{:else}Served at <span class="mono">/{name || 'name'}/sparql</span>{/if}
+        {#if name && !validName}Use letters, digits, “_”, “-” or “.”.{:else if exists}A dataset with
+          this name already exists.{:else}Served at <span class="mono"
+            >/{name || 'name'}/sparql</span
+          >{/if}
       </span>
     </label>
     <fieldset class="types">
       <legend>Storage</legend>
       <label class="opt" class:sel={type === 'persistent'}>
         <input type="radio" bind:group={type} value="persistent" />
-        <span><strong>Persistent</strong><span class="muted">Indexed on disk. Survives restarts.</span></span>
+        <span
+          ><strong>Persistent</strong><span class="muted">Indexed on disk. Survives restarts.</span
+          ></span
+        >
       </label>
       <label class="opt" class:sel={type === 'mem'}>
         <input type="radio" bind:group={type} value="mem" />
-        <span><strong>In-memory</strong><span class="muted">Fast scratch space. Gone on restart.</span></span>
+        <span
+          ><strong>In-memory</strong><span class="muted">Fast scratch space. Gone on restart.</span
+          ></span
+        >
       </label>
     </fieldset>
     {#if error}<div class="error-box">{error}</div>{/if}
   </form>
   {#snippet actions()}
     <button class="btn" onclick={() => (createOpen = false)}>Cancel</button>
-    <button class="btn primary" type="submit" form="create-ds" disabled={busy || !validName || exists}>
+    <button
+      class="btn primary"
+      type="submit"
+      form="create-ds"
+      disabled={busy || !validName || exists}
+    >
       {#if busy}<span class="spinner"></span>{/if} Create dataset
     </button>
   {/snippet}
@@ -103,17 +124,27 @@
   }}
 >
   <p>
-    This permanently removes <strong class="mono">{deleteTarget}</strong> and all of its files. Queries against
+    This permanently removes <strong class="mono">{deleteTarget}</strong> and all of its files.
+    Queries against
     <span class="mono">/{deleteTarget}</span> will return 404.
   </p>
   <label class="field">
     Type the dataset name to confirm
-    <input class="input mono" bind:value={confirmText} placeholder={deleteTarget ?? ''} autocomplete="off" />
+    <input
+      class="input mono"
+      bind:value={confirmText}
+      placeholder={deleteTarget ?? ''}
+      autocomplete="off"
+    />
   </label>
   {#if error}<div class="error-box">{error}</div>{/if}
   {#snippet actions()}
     <button class="btn" onclick={() => (deleteTarget = null)}>Cancel</button>
-    <button class="btn danger solid" onclick={remove} disabled={busy || confirmText !== deleteTarget}>
+    <button
+      class="btn danger solid"
+      onclick={remove}
+      disabled={busy || confirmText !== deleteTarget}
+    >
       {#if busy}<span class="spinner"></span>{/if} Delete {deleteTarget}
     </button>
   {/snippet}

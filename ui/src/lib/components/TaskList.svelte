@@ -63,7 +63,9 @@
 </script>
 
 {#if error}
-  <div class="error-box"><strong>Could not load tasks.</strong> <span class="muted">{error}</span></div>
+  <div class="error-box">
+    <strong>Could not load tasks.</strong> <span class="muted">{error}</span>
+  </div>
 {:else if loaded && shown.length === 0}
   <p class="faint none">No tasks yet. Compact, backup and reasoning jobs show up here.</p>
 {:else}
@@ -75,13 +77,19 @@
         {#if !dataset}<span class="ds mono">{t.dataset}</span>{/if}
         <span class="msg" title={t.message}>
           {#if t.state === 'running'}
-            <span class="progress"><span style:width="{Math.round((t.progress ?? 0) * 100)}%"></span></span>
-            <span class="faint">{t.progress != null ? `${Math.round(t.progress * 100)}%` : 'running'}</span>
+            <span class="progress"
+              ><span style:width="{Math.round((t.progress ?? 0) * 100)}%"></span></span
+            >
+            <span class="faint"
+              >{t.progress != null ? `${Math.round(t.progress * 100)}%` : 'running'}</span
+            >
           {:else}
             {t.message ?? t.state}
           {/if}
         </span>
-        <span class="when faint" title={t.finishedAt ?? t.startedAt}>{fmtRelative(t.finishedAt ?? t.startedAt, now)}</span>
+        <span class="when faint" title={t.finishedAt ?? t.startedAt}
+          >{fmtRelative(t.finishedAt ?? t.startedAt, now)}</span
+        >
       </li>
     {/each}
   </ul>

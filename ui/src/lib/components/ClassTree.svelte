@@ -35,10 +35,19 @@
     {#if c && !path.includes(iri)}
       {@const kids = c.subs.filter((s) => !path.includes(s))}
       {@const isOpen = open.has(iri)}
-      <li role="treeitem" aria-expanded={kids.length ? isOpen : undefined} aria-selected={selected === iri}>
+      <li
+        role="treeitem"
+        aria-expanded={kids.length ? isOpen : undefined}
+        aria-selected={selected === iri}
+      >
         <div class="node" class:sel={selected === iri} style:padding-left="{depth * 16 + 4}px">
           {#if kids.length}
-            <button class="twisty" class:open={isOpen} aria-label={isOpen ? 'Collapse' : 'Expand'} onclick={() => ontoggle(iri)}>
+            <button
+              class="twisty"
+              class:open={isOpen}
+              aria-label={isOpen ? 'Collapse' : 'Expand'}
+              onclick={() => ontoggle(iri)}
+            >
               <Icon name="chevron" size={12} />
             </button>
           {:else}
@@ -48,11 +57,25 @@
             <span class="name">{c.label ?? shortLabel(iri, prefixes)}</span>
             {#if c.label}<span class="iri">{shortLabel(iri, prefixes)}</span>{/if}
           </button>
-          {#if kids.length}<span class="kids faint" title="{kids.length} subclasses">{kids.length}</span>{/if}
-          <span class="count" class:zero={!c.instances} title="{c.instances} instances">{fmtCompact(c.instances)}</span>
+          {#if kids.length}<span class="kids faint" title="{kids.length} subclasses"
+              >{kids.length}</span
+            >{/if}
+          <span class="count" class:zero={!c.instances} title="{c.instances} instances"
+            >{fmtCompact(c.instances)}</span
+          >
         </div>
         {#if kids.length && isOpen}
-          <ClassTree {schema} iris={kids} {prefixes} {open} {selected} {onselect} {ontoggle} depth={depth + 1} path={[...path, iri]} />
+          <ClassTree
+            {schema}
+            iris={kids}
+            {prefixes}
+            {open}
+            {selected}
+            {onselect}
+            {ontoggle}
+            depth={depth + 1}
+            path={[...path, iri]}
+          />
         {/if}
       </li>
     {/if}

@@ -53,7 +53,8 @@
     });
   });
 
-  const NUMERIC = /#(integer|decimal|double|float|long|int|short|byte|nonNegativeInteger|positiveInteger|unsignedInt|unsignedLong)$/;
+  const NUMERIC =
+    /#(integer|decimal|double|float|long|int|short|byte|nonNegativeInteger|positiveInteger|unsignedInt|unsignedLong)$/;
 
   function sortKey(t: Term | null): number | string | null {
     if (!t) return null;
@@ -61,7 +62,11 @@
       const n = Number(t.value);
       if (!Number.isNaN(n)) return n;
     }
-    return t.type === 'uri' ? displayTerm(t, prefixes) : t.type === 'triple' ? toSparql(t) : t.value;
+    return t.type === 'uri'
+      ? displayTerm(t, prefixes)
+      : t.type === 'triple'
+        ? toSparql(t)
+        : t.value;
   }
 
   const order = $derived.by(() => {
@@ -83,7 +88,9 @@
   });
 
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
-  const end = $derived(Math.min(rows.length, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN));
+  const end = $derived(
+    Math.min(rows.length, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN),
+  );
   const visible = $derived(order.slice(start, end));
   const rnWidth = $derived(Math.max(44, String(rows.length).length * 8 + 20));
   const template = $derived(`${rnWidth}px ${widths.map((w) => `${w}px`).join(' ')} minmax(0, 1fr)`);
@@ -100,7 +107,12 @@
     const text = t.type === 'literal' ? t.value : t.type === 'uri' ? t.value : toSparql(t);
     try {
       await navigator.clipboard.writeText(text);
-      toasts.push('success', 'Copied to clipboard', text.length > 80 ? text.slice(0, 80) + '…' : text, 1600);
+      toasts.push(
+        'success',
+        'Copied to clipboard',
+        text.length > 80 ? text.slice(0, 80) + '…' : text,
+        1600,
+      );
     } catch (e) {
       toasts.error('Could not copy', e);
     }
@@ -136,12 +148,21 @@
   <div class="head" style:grid-template-columns={template} style:min-width="{totalW}px" role="row">
     <div class="cell rn" role="columnheader">#</div>
     {#each vars as v, c (v + c)}
-      <div class="cell th" role="columnheader" aria-sort={sort?.col === c ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>
+      <div
+        class="cell th"
+        role="columnheader"
+        aria-sort={sort?.col === c ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}
+      >
         <button class="sort" onclick={() => toggleSort(c)} title="Sort by ?{v}">
           <span class="t-var">?{v}</span>
           {#if sort?.col === c}<span class="arrow">{sort.dir === 1 ? '↑' : '↓'}</span>{/if}
         </button>
-        <span class="resize" role="separator" aria-orientation="vertical" onpointerdown={(e) => startResize(e, c)}></span>
+        <span
+          class="resize"
+          role="separator"
+          aria-orientation="vertical"
+          onpointerdown={(e) => startResize(e, c)}
+        ></span>
       </div>
     {/each}
     <div class="cell filler"></div>
@@ -150,13 +171,23 @@
     <div class="window" style:transform="translateY({start * ROW_H}px)">
       {#each visible as ri, k (ri)}
         {@const row = rows[ri]}
-        <div class="tr" class:odd={(start + k) % 2 === 1} style:grid-template-columns={template} role="row">
+        <div
+          class="tr"
+          class:odd={(start + k) % 2 === 1}
+          style:grid-template-columns={template}
+          role="row"
+        >
           <div class="cell rn" role="rowheader">{ri + 1}</div>
           {#each row as term, c (c)}
             <div class="cell td" role="gridcell">
               <span class="val"><TermView {term} {prefixes} {onopen} /></span>
               {#if term}
-                <button class="copy" title="Copy value" aria-label="Copy value" onclick={() => copy(term)}>
+                <button
+                  class="copy"
+                  title="Copy value"
+                  aria-label="Copy value"
+                  onclick={() => copy(term)}
+                >
                   <Icon name="copy" size={12} />
                 </button>
               {/if}

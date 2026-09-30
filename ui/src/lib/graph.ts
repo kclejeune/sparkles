@@ -69,7 +69,11 @@ export function triplesToGraph(
   triples.forEach(([s, p, o], i) => {
     const isType = p.type === 'uri' && p.value === RDF_TYPE;
     if (opts.hideTypes && isType) return;
-    if (o.type === 'literal' && (opts.hideLiterals || (p.type === 'uri' && LABEL_PREDICATES.has(p.value) && labels.has(termKey(s))))) {
+    if (
+      o.type === 'literal' &&
+      (opts.hideLiterals ||
+        (p.type === 'uri' && LABEL_PREDICATES.has(p.value) && labels.has(termKey(s))))
+    ) {
       // Label literals are already shown as the node label.
       if (opts.hideLiterals || labels.get(termKey(s)) === o.value) {
         ensure(s, termKey(s));

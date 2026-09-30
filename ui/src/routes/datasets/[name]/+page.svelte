@@ -100,7 +100,9 @@
 
   function addFiles(list: FileList | null | undefined) {
     if (!list) return;
-    const incoming = [...list].filter((f) => !files.some((x) => x.name === f.name && x.size === f.size));
+    const incoming = [...list].filter(
+      (f) => !files.some((x) => x.name === f.name && x.size === f.size),
+    );
     files = [...files, ...incoming];
   }
 
@@ -116,12 +118,18 @@
         onProgress: (p) => (progress = p.total ? p.loaded / p.total : 0),
         signal: uploadCtl.signal,
       })) as { count?: number; tripleCount?: number; quadCount?: number } | string;
-      const n = typeof res === 'object' ? (res.quadCount ?? res.tripleCount ?? res.count) : undefined;
-      toasts.push('success', `Uploaded ${files.length} file${files.length === 1 ? '' : 's'}`, n != null ? `${fmtInt(n)} quads added` : undefined);
+      const n =
+        typeof res === 'object' ? (res.quadCount ?? res.tripleCount ?? res.count) : undefined;
+      toasts.push(
+        'success',
+        `Uploaded ${files.length} file${files.length === 1 ? '' : 's'}`,
+        n != null ? `${fmtInt(n)} quads added` : undefined,
+      );
       files = [];
       refreshAll();
     } catch (e) {
-      if (!(e instanceof DOMException && e.name === 'AbortError')) uploadError = api.errorMessage(e);
+      if (!(e instanceof DOMException && e.name === 'AbortError'))
+        uploadError = api.errorMessage(e);
     } finally {
       uploading = false;
       uploadCtl = null;
@@ -134,7 +142,11 @@
     clearingCache = true;
     try {
       const r = await api.clearResultCache(name);
-      toasts.push('success', 'Result cache cleared', r ? `${fmtInt(r.cleared)} entries, ${fmtBytes(r.bytes)}` : undefined);
+      toasts.push(
+        'success',
+        'Result cache cleared',
+        r ? `${fmtInt(r.cleared)} entries, ${fmtBytes(r.bytes)}` : undefined,
+      );
       void loadStats();
     } catch (e) {
       toasts.error('Could not clear the result cache', e);
@@ -187,20 +199,30 @@ ex:PersonShape a sh:NodeShape ;
   // dataset prefixes plus those declared in the shapes graph, for the results table
   const reportPrefixes = $derived.by(() => {
     const p: Record<string, string> = { ...prefixes };
-    for (const m of shapes.matchAll(/@prefix\s+([A-Za-z][\w.-]*|):\s*<([^>\s]*)>/gi)) p[m[1]] ??= m[2];
+    for (const m of shapes.matchAll(/@prefix\s+([A-Za-z][\w.-]*|):\s*<([^>\s]*)>/gi))
+      p[m[1]] ??= m[2];
     return p;
   });
   // Focus nodes: prefixed name if possible, else namespace + rest (e.g. "ex:person/7"),
   // so the distinguishing tail of the IRI stays visible in a narrow column.
-  const nsList = $derived(Object.entries(reportPrefixes).filter(([, ns]) => ns).sort((a, b) => b[1].length - a[1].length));
+  const nsList = $derived(
+    Object.entries(reportPrefixes)
+      .filter(([, ns]) => ns)
+      .sort((a, b) => b[1].length - a[1].length),
+  );
   function focusLabel(iri: string): string {
     const short = displayIri(iri, reportPrefixes);
     if (short !== iri) return short;
     const hit = nsList.find(([, ns]) => iri.startsWith(ns) && iri.length > ns.length);
     return hit ? `${hit[0]}:${iri.slice(hit[1].length)}` : iri;
   }
-  const namedGraphs = $derived((stats?.graphs ?? []).flatMap((g) => (g.name == null ? [] : [g.name])));
-  const shaclOpts = () => ({ graph: shaclGraph, reasoning: info?.reasoning ? useInferences : undefined });
+  const namedGraphs = $derived(
+    (stats?.graphs ?? []).flatMap((g) => (g.name == null ? [] : [g.name])),
+  );
+  const shaclOpts = () => ({
+    graph: shaclGraph,
+    reasoning: info?.reasoning ? useInferences : undefined,
+  });
 
   async function validate() {
     shaclCtl?.abort();
@@ -244,7 +266,11 @@ ex:PersonShape a sh:NodeShape ;
   const SH = WELL_KNOWN.sh;
   const termText = (t: api.Term): string => (t.type === 'triple' ? 'triple term' : t.value);
   const shName = (t: api.Term): string =>
-    t.type !== 'uri' ? termText(t) : t.value.startsWith(SH) ? t.value.slice(SH.length) : localName(t.value);
+    t.type !== 'uri'
+      ? termText(t)
+      : t.value.startsWith(SH)
+        ? t.value.slice(SH.length)
+        : localName(t.value);
   const componentName = (t: api.Term) => shName(t).replace(/ConstraintComponent$/, '');
   const severityClass = (t: api.Term) => {
     const s = shName(t);
@@ -252,8 +278,11 @@ ex:PersonShape a sh:NodeShape ;
   };
   const severityCounts = $derived.by(() => {
     const m = new Map<string, number>();
-    for (const r of report?.results ?? []) m.set(shName(r.severity), (m.get(shName(r.severity)) ?? 0) + 1);
-    return [...m].map(([k, n]) => `${fmtInt(n)} ${k.toLowerCase()}${n === 1 ? '' : 's'}`).join(', ');
+    for (const r of report?.results ?? [])
+      m.set(shName(r.severity), (m.get(shName(r.severity)) ?? 0) + 1);
+    return [...m]
+      .map(([k, n]) => `${fmtInt(n)} ${k.toLowerCase()}${n === 1 ? '' : 's'}`)
+      .join(', ');
   });
 
   // --- derived visuals ------------------------------------------------------
@@ -286,13 +315,16 @@ ex:PersonShape a sh:NodeShape ;
     app.setDataset(name);
     goto(resolve('/query'));
   }
-  const explore = (iri: string) => `${resolve('/explore')}?ds=${encodeURIComponent(name)}&iri=${encodeURIComponent(iri)}`;
+  const explore = (iri: string) =>
+    `${resolve('/explore')}?ds=${encodeURIComponent(name)}&iri=${encodeURIComponent(iri)}`;
 </script>
 
 <svelte:head><title>{name} | Sparkles</title></svelte:head>
 
 <div class="page">
-  <nav class="crumbs"><a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><span>{name}</span></nav>
+  <nav class="crumbs">
+    <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><span>{name}</span>
+  </nav>
 
   <header class="head">
     <div class="title">
@@ -317,12 +349,18 @@ ex:PersonShape a sh:NodeShape ;
       }}><Icon name="query" size={14} /> Query</button
     >
     <a class="btn" href={explore('')}><Icon name="explore" size={14} /> Explore</a>
-    <button class="btn danger" onclick={() => (deleteTarget = name)}><Icon name="trash" size={14} /> Delete</button>
+    <button class="btn danger" onclick={() => (deleteTarget = name)}
+      ><Icon name="trash" size={14} /> Delete</button
+    >
   </header>
 
   {#if statsError}
     <div class="error-box">
-      <strong>{statsError instanceof api.ApiError && statsError.status === 404 ? `No dataset named “${name}”.` : 'Could not load statistics.'}</strong>
+      <strong
+        >{statsError instanceof api.ApiError && statsError.status === 404
+          ? `No dataset named “${name}”.`
+          : 'Could not load statistics.'}</strong
+      >
       <span class="muted">{api.errorMessage(statsError)}</span>
     </div>
   {/if}
@@ -330,12 +368,30 @@ ex:PersonShape a sh:NodeShape ;
   {#if stats}
     <!-- headline numbers -->
     <dl class="figures panel">
-      <div><dt>Quads</dt><dd>{fmtInt(stats.quads)}</dd></div>
-      <div><dt>Terms</dt><dd>{fmtInt(stats.terms)}</dd></div>
-      <div><dt>Graphs</dt><dd>{fmtInt(stats.graphs.length)}</dd></div>
-      <div><dt>Predicates</dt><dd>{fmtInt(stats.predicates.length)}{stats.predicates.length >= 100 ? '+' : ''}</dd></div>
-      <div><dt>Classes</dt><dd>{fmtInt(stats.classes.length)}{stats.classes.length >= 100 ? '+' : ''}</dd></div>
-      <div><dt>On disk</dt><dd>{info?.type === 'mem' ? 'in memory' : fmtBytes(stats.diskBytes)}</dd></div>
+      <div>
+        <dt>Quads</dt>
+        <dd>{fmtInt(stats.quads)}</dd>
+      </div>
+      <div>
+        <dt>Terms</dt>
+        <dd>{fmtInt(stats.terms)}</dd>
+      </div>
+      <div>
+        <dt>Graphs</dt>
+        <dd>{fmtInt(stats.graphs.length)}</dd>
+      </div>
+      <div>
+        <dt>Predicates</dt>
+        <dd>{fmtInt(stats.predicates.length)}{stats.predicates.length >= 100 ? '+' : ''}</dd>
+      </div>
+      <div>
+        <dt>Classes</dt>
+        <dd>{fmtInt(stats.classes.length)}{stats.classes.length >= 100 ? '+' : ''}</dd>
+      </div>
+      <div>
+        <dt>On disk</dt>
+        <dd>{info?.type === 'mem' ? 'in memory' : fmtBytes(stats.diskBytes)}</dd>
+      </div>
     </dl>
 
     <div class="cols">
@@ -345,25 +401,46 @@ ex:PersonShape a sh:NodeShape ;
           <div class="panel-head">
             <h2>Storage</h2>
             <span class="spacer"></span>
-            <button class="btn sm" onclick={() => startTask('Compaction', () => api.compact(name))} disabled={acting != null || !delta?.dirty}
-              title={delta?.dirty ? 'Merge pending updates into a freshly sorted base index' : 'Nothing to compact'}>
+            <button
+              class="btn sm"
+              onclick={() => startTask('Compaction', () => api.compact(name))}
+              disabled={acting != null || !delta?.dirty}
+              title={delta?.dirty
+                ? 'Merge pending updates into a freshly sorted base index'
+                : 'Nothing to compact'}
+            >
               <Icon name="layers" size={13} /> Compact
             </button>
-            <button class="btn sm" onclick={() => startTask('Backup', () => api.backup(name))} disabled={acting != null}>
+            <button
+              class="btn sm"
+              onclick={() => startTask('Backup', () => api.backup(name))}
+              disabled={acting != null}
+            >
               <Icon name="archive" size={13} /> Backup
             </button>
           </div>
           <div class="panel-body storage">
             {#if delta}
-              <div class="stack" role="img" aria-label="Base {stats.baseQuads} quads, {stats.deltaInserts} inserted, {stats.deltaDeletes} deleted">
+              <div
+                class="stack"
+                role="img"
+                aria-label="Base {stats.baseQuads} quads, {stats.deltaInserts} inserted, {stats.deltaDeletes} deleted"
+              >
                 <span class="base" style:width="{delta.base}%"></span>
                 <span class="del" style:width="{delta.del}%"></span>
                 <span class="ins" style:width="{delta.ins}%"></span>
               </div>
               <div class="stack-legend">
-                <span><i class="base"></i>Base index <strong>{fmtInt(stats.baseQuads)}</strong></span>
-                <span><i class="ins"></i>Inserted since compaction <strong>+{fmtInt(stats.deltaInserts)}</strong></span>
-                <span><i class="del"></i>Deleted <strong>−{fmtInt(stats.deltaDeletes)}</strong></span>
+                <span
+                  ><i class="base"></i>Base index <strong>{fmtInt(stats.baseQuads)}</strong></span
+                >
+                <span
+                  ><i class="ins"></i>Inserted since compaction
+                  <strong>+{fmtInt(stats.deltaInserts)}</strong></span
+                >
+                <span
+                  ><i class="del"></i>Deleted <strong>−{fmtInt(stats.deltaDeletes)}</strong></span
+                >
               </div>
               <p class="faint note">
                 {delta.dirty
@@ -378,21 +455,43 @@ ex:PersonShape a sh:NodeShape ;
                   <span class="cname">Result cache</span>
                   {#if rc.enabled}
                     <span><strong>{fmtInt(rc.entries)}</strong> entries, {fmtBytes(rc.bytes)}</span>
-                    <span><span class="faint">hit rate</span> <strong>{rate(rc)}</strong> <span class="faint">({fmtInt(rc.hits)} hits, {fmtInt(rc.misses)} misses)</span></span>
+                    <span
+                      ><span class="faint">hit rate</span> <strong>{rate(rc)}</strong>
+                      <span class="faint">({fmtInt(rc.hits)} hits, {fmtInt(rc.misses)} misses)</span
+                      ></span
+                    >
                   {:else}
-                    <span class="faint">disabled (<span class="mono">--result-cache-mb 0</span>)</span>
+                    <span class="faint"
+                      >disabled (<span class="mono">--result-cache-mb 0</span>)</span
+                    >
                   {/if}
                   <span class="spacer"></span>
-                  <button class="btn sm" onclick={clearCache} disabled={clearingCache || !rc.enabled || rc.entries === 0}
-                    title="Drop cached query results for this dataset">
-                    {#if clearingCache}<span class="spinner"></span>{:else}<Icon name="trash" size={12} />{/if} Clear cache
+                  <button
+                    class="btn sm"
+                    onclick={clearCache}
+                    disabled={clearingCache || !rc.enabled || rc.entries === 0}
+                    title="Drop cached query results for this dataset"
+                  >
+                    {#if clearingCache}<span class="spinner"></span>{:else}<Icon
+                        name="trash"
+                        size={12}
+                      />{/if} Clear cache
                   </button>
                 </div>
               {/if}
               <div class="cache">
                 <span class="cname">Block cache</span>
-                <span><strong>{fmtInt(stats.cache.entries)}</strong> blocks, {fmtBytes(stats.cache.bytes)}</span>
-                <span><span class="faint">hit rate</span> <strong>{rate(stats.cache)}</strong> <span class="faint">({fmtInt(stats.cache.hits)} hits, {fmtInt(stats.cache.misses)} misses)</span></span>
+                <span
+                  ><strong>{fmtInt(stats.cache.entries)}</strong> blocks, {fmtBytes(
+                    stats.cache.bytes,
+                  )}</span
+                >
+                <span
+                  ><span class="faint">hit rate</span> <strong>{rate(stats.cache)}</strong>
+                  <span class="faint"
+                    >({fmtInt(stats.cache.hits)} hits, {fmtInt(stats.cache.misses)} misses)</span
+                  ></span
+                >
               </div>
             </div>
           </div>
@@ -411,7 +510,12 @@ ex:PersonShape a sh:NodeShape ;
             {/if}
           </div>
           <div class="panel-body shacl">
-            <textarea class="textarea mono" rows="12" bind:value={shapes} spellcheck="false" aria-label="Shapes graph (Turtle)"></textarea>
+            <textarea
+              class="textarea mono"
+              rows="12"
+              bind:value={shapes}
+              spellcheck="false"
+              aria-label="Shapes graph (Turtle)"></textarea>
             <div class="row shacl-opts">
               <label class="inline">
                 <span class="faint">Data graph</span>
@@ -424,28 +528,50 @@ ex:PersonShape a sh:NodeShape ;
                 </select>
               </label>
               {#if info?.reasoning}
-                <label class="inline check" title="Validate the data together with the materialized inferences">
+                <label
+                  class="inline check"
+                  title="Validate the data together with the materialized inferences"
+                >
                   <input type="checkbox" bind:checked={useInferences} /> Use inferences
                 </label>
               {/if}
               <span class="spacer"></span>
-              <button class="btn" onclick={downloadReport} disabled={downloadingReport || !shapes.trim()} title="Validate and download the report as Turtle">
-                {#if downloadingReport}<span class="spinner"></span>{:else}<Icon name="download" size={13} />{/if} Report (.ttl)
+              <button
+                class="btn"
+                onclick={downloadReport}
+                disabled={downloadingReport || !shapes.trim()}
+                title="Validate and download the report as Turtle"
+              >
+                {#if downloadingReport}<span class="spinner"></span>{:else}<Icon
+                    name="download"
+                    size={13}
+                  />{/if} Report (.ttl)
               </button>
               {#if validating}
                 <button class="btn" onclick={() => shaclCtl?.abort()}>Cancel</button>
               {/if}
-              <button class="btn primary" onclick={validate} disabled={validating || !shapes.trim()}>
-                {#if validating}<span class="spinner"></span>{:else}<Icon name="check" size={14} />{/if} Validate
+              <button
+                class="btn primary"
+                onclick={validate}
+                disabled={validating || !shapes.trim()}
+              >
+                {#if validating}<span class="spinner"></span>{:else}<Icon
+                    name="check"
+                    size={14}
+                  />{/if} Validate
               </button>
             </div>
-            {#if shaclError}<div class="error-box"><strong>Validation failed.</strong> {shaclError}</div>{/if}
+            {#if shaclError}<div class="error-box">
+                <strong>Validation failed.</strong>
+                {shaclError}
+              </div>{/if}
             {#if report}
               <p class="faint note">
                 {#if report.conforms}
                   The data graph conforms to the shapes ({fmtMs(reportMs)}).
                 {:else}
-                  {fmtInt(report.results.length)} result{report.results.length === 1 ? '' : 's'}: {severityCounts} ({fmtMs(reportMs)}).
+                  {fmtInt(report.results.length)} result{report.results.length === 1 ? '' : 's'}: {severityCounts}
+                  ({fmtMs(reportMs)}).
                 {/if}
               </p>
             {/if}
@@ -454,7 +580,11 @@ ex:PersonShape a sh:NodeShape ;
             <div class="shacl-results">
               <table class="data">
                 <thead>
-                  <tr><th>Focus node</th><th>Path</th><th>Value</th><th>Constraint</th><th>Severity</th><th>Message</th></tr>
+                  <tr
+                    ><th>Focus node</th><th>Path</th><th>Value</th><th>Constraint</th><th
+                      >Severity</th
+                    ><th>Message</th></tr
+                  >
                 </thead>
                 <tbody>
                   {#each report.results.slice(0, resultsShown) as r, i (i)}
@@ -462,24 +592,39 @@ ex:PersonShape a sh:NodeShape ;
                       <td class="mono cell">
                         {#if r.focusNode.type === 'uri'}
                           {@const iri = r.focusNode.value}
-                          <a class="focus t-iri" href={explore(iri)} title="{iri}  (open in Explore)">{focusLabel(iri)}</a>
+                          <a
+                            class="focus t-iri"
+                            href={explore(iri)}
+                            title="{iri}  (open in Explore)">{focusLabel(iri)}</a
+                          >
                         {:else}
                           <TermView term={r.focusNode} prefixes={reportPrefixes} />
                         {/if}
                       </td>
                       <td class="mono cell">
-                        {#if r.resultPath?.type === 'path'}<span class="t-iri">{r.resultPath.value}</span>{:else}<TermView term={r.resultPath} prefixes={reportPrefixes} />{/if}
+                        {#if r.resultPath?.type === 'path'}<span class="t-iri"
+                            >{r.resultPath.value}</span
+                          >{:else}<TermView term={r.resultPath} prefixes={reportPrefixes} />{/if}
                       </td>
-                      <td class="mono cell"><TermView term={r.value} prefixes={reportPrefixes} /></td>
-                      <td class="cell" title={termText(r.sourceConstraintComponent)}>{componentName(r.sourceConstraintComponent)}</td>
-                      <td><span class="badge {severityClass(r.severity)}">{shName(r.severity)}</span></td>
+                      <td class="mono cell"
+                        ><TermView term={r.value} prefixes={reportPrefixes} /></td
+                      >
+                      <td class="cell" title={termText(r.sourceConstraintComponent)}
+                        >{componentName(r.sourceConstraintComponent)}</td
+                      >
+                      <td
+                        ><span class="badge {severityClass(r.severity)}">{shName(r.severity)}</span
+                        ></td
+                      >
                       <td class="cell msg" title={r.messages.join('\n')}>{r.messages[0] ?? ''}</td>
                     </tr>
                   {/each}
                 </tbody>
               </table>
               {#if report.results.length > resultsShown}
-                <button class="btn ghost sm more" onclick={() => (resultsShown += 100)}>Show more ({fmtInt(report.results.length - resultsShown)} hidden)</button>
+                <button class="btn ghost sm more" onclick={() => (resultsShown += 100)}
+                  >Show more ({fmtInt(report.results.length - resultsShown)} hidden)</button
+                >
               {/if}
             </div>
           {/if}
@@ -496,14 +641,23 @@ ex:PersonShape a sh:NodeShape ;
           {:else}
             <table class="data bars">
               <thead>
-                <tr><th>Predicate</th><th class="num">Triples</th><th class="num" title="Distinct subjects">Subj.</th><th class="num" title="Distinct objects">Obj.</th></tr>
+                <tr
+                  ><th>Predicate</th><th class="num">Triples</th><th
+                    class="num"
+                    title="Distinct subjects">Subj.</th
+                  ><th class="num" title="Distinct objects">Obj.</th></tr
+                >
               </thead>
               <tbody>
                 {#each stats.predicates.slice(0, predShown) as p (p.iri)}
                   <tr>
                     <td class="bar-cell">
                       <span class="bar" style:width="{(p.count / maxPred) * 100}%"></span>
-                      <button class="linkish t-iri mono" title="{p.iri}  (click to query)" onclick={() => queryPredicate(p.iri)}>{displayIri(p.iri, prefixes)}</button>
+                      <button
+                        class="linkish t-iri mono"
+                        title="{p.iri}  (click to query)"
+                        onclick={() => queryPredicate(p.iri)}>{displayIri(p.iri, prefixes)}</button
+                      >
                     </td>
                     <td class="num">{fmtInt(p.count)}</td>
                     <td class="num faint">{fmtCompact(p.distinctSubjects)}</td>
@@ -513,7 +667,9 @@ ex:PersonShape a sh:NodeShape ;
               </tbody>
             </table>
             {#if stats.predicates.length > predShown}
-              <button class="btn ghost sm more" onclick={() => (predShown += 25)}>Show more ({stats.predicates.length - predShown} hidden)</button>
+              <button class="btn ghost sm more" onclick={() => (predShown += 25)}
+                >Show more ({stats.predicates.length - predShown} hidden)</button
+              >
             {/if}
           {/if}
         </section>
@@ -534,16 +690,26 @@ ex:PersonShape a sh:NodeShape ;
                   <tr>
                     <td class="bar-cell">
                       <span class="bar cls" style:width="{(c.instances / maxClass) * 100}%"></span>
-                      <button class="linkish t-iri mono" title="{c.iri}  (click to list instances)" onclick={() => queryClass(c.iri)}>{displayIri(c.iri, prefixes)}</button>
+                      <button
+                        class="linkish t-iri mono"
+                        title="{c.iri}  (click to list instances)"
+                        onclick={() => queryClass(c.iri)}>{displayIri(c.iri, prefixes)}</button
+                      >
                     </td>
                     <td class="num">{fmtInt(c.instances)}</td>
-                    <td class="num"><a class="faint" href={explore(c.iri)} title="Open in Explore"><Icon name="explore" size={13} /></a></td>
+                    <td class="num"
+                      ><a class="faint" href={explore(c.iri)} title="Open in Explore"
+                        ><Icon name="explore" size={13} /></a
+                      ></td
+                    >
                   </tr>
                 {/each}
               </tbody>
             </table>
             {#if stats.classes.length > classShown}
-              <button class="btn ghost sm more" onclick={() => (classShown += 25)}>Show more ({stats.classes.length - classShown} hidden)</button>
+              <button class="btn ghost sm more" onclick={() => (classShown += 25)}
+                >Show more ({stats.classes.length - classShown} hidden)</button
+              >
             {/if}
           {/if}
         </section>
@@ -575,16 +741,31 @@ ex:PersonShape a sh:NodeShape ;
             >
               <Icon name="upload" size={20} />
               <span><strong>Drop RDF files</strong> or click to choose</span>
-              <span class="faint">Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD. Format comes from the file extension.</span>
+              <span class="faint"
+                >Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD. Format comes from the file
+                extension.</span
+              >
             </div>
-            <input bind:this={fileInput} type="file" multiple accept={ACCEPT} hidden onchange={(e) => addFiles(e.currentTarget.files)} />
+            <input
+              bind:this={fileInput}
+              type="file"
+              multiple
+              accept={ACCEPT}
+              hidden
+              onchange={(e) => addFiles(e.currentTarget.files)}
+            />
             {#if files.length}
               <ul class="files">
                 {#each files as f, i (f.name + f.size)}
                   <li>
                     <span class="mono">{f.name}</span>
                     <span class="faint">{fmtBytes(f.size)}</span>
-                    <button class="btn ghost icon sm" aria-label="Remove {f.name}" disabled={uploading} onclick={() => (files = files.filter((_, j) => j !== i))}>
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Remove {f.name}"
+                      disabled={uploading}
+                      onclick={() => (files = files.filter((_, j) => j !== i))}
+                    >
                       <Icon name="x" size={12} />
                     </button>
                   </li>
@@ -592,23 +773,36 @@ ex:PersonShape a sh:NodeShape ;
               </ul>
             {/if}
             <label class="field">
-              Target graph <span class="faint">(optional; default graph when empty, ignored for quad formats)</span>
-              <input class="input mono" bind:value={graph} placeholder="http://example.org/graph/…" />
+              Target graph <span class="faint"
+                >(optional; default graph when empty, ignored for quad formats)</span
+              >
+              <input
+                class="input mono"
+                bind:value={graph}
+                placeholder="http://example.org/graph/…"
+              />
             </label>
             {#if uploading}
               <div class="progress"><span style:width="{Math.round(progress * 100)}%"></span></div>
               <div class="row faint">
                 <span class="spinner"></span>
-                {progress < 1 ? `Sending ${Math.round(progress * 100)}%` : 'Parsing and indexing on the server…'}
+                {progress < 1
+                  ? `Sending ${Math.round(progress * 100)}%`
+                  : 'Parsing and indexing on the server…'}
                 <span class="spacer"></span>
                 <button class="btn sm" onclick={() => uploadCtl?.abort()}>Cancel</button>
               </div>
             {/if}
-            {#if uploadError}<div class="error-box"><strong>Upload failed.</strong> {uploadError}</div>{/if}
+            {#if uploadError}<div class="error-box">
+                <strong>Upload failed.</strong>
+                {uploadError}
+              </div>{/if}
             <div class="row">
               <span class="spacer"></span>
               <button class="btn primary" disabled={!files.length || uploading} onclick={doUpload}>
-                <Icon name="upload" size={14} /> Upload {files.length ? `${files.length} file${files.length === 1 ? '' : 's'}` : ''}
+                <Icon name="upload" size={14} /> Upload {files.length
+                  ? `${files.length} file${files.length === 1 ? '' : 's'}`
+                  : ''}
               </button>
             </div>
           </div>
@@ -620,7 +814,11 @@ ex:PersonShape a sh:NodeShape ;
             <h2>Reasoning</h2>
             <span class="spacer"></span>
             {#if info?.reasoning}
-              <span class="faint">{info.reasoning.profile}, {fmtInt(info.reasoning.inferred)} inferred, {fmtRelative(info.reasoning.at)}</span>
+              <span class="faint"
+                >{info.reasoning.profile}, {fmtInt(info.reasoning.inferred)} inferred, {fmtRelative(
+                  info.reasoning.at,
+                )}</span
+              >
             {/if}
           </div>
           <div class="panel-body reason">
@@ -633,11 +831,19 @@ ex:PersonShape a sh:NodeShape ;
               {/each}
             </div>
             {#if profile === 'rules'}
-              <textarea class="textarea" rows="7" bind:value={rules} spellcheck="false" aria-label="Custom rules"></textarea>
+              <textarea
+                class="textarea"
+                rows="7"
+                bind:value={rules}
+                spellcheck="false"
+                aria-label="Custom rules"></textarea>
             {/if}
             <div class="row">
               <button class="btn" onclick={dropInf} disabled={dropping || !info?.reasoning}>
-                {#if dropping}<span class="spinner"></span>{:else}<Icon name="trash" size={13} />{/if} Drop inferences
+                {#if dropping}<span class="spinner"></span>{:else}<Icon
+                    name="trash"
+                    size={13}
+                  />{/if} Drop inferences
               </button>
               <span class="spacer"></span>
               <button
@@ -653,14 +859,19 @@ ex:PersonShape a sh:NodeShape ;
 
         <!-- graphs -->
         <section class="panel">
-          <div class="panel-head"><h2>Graphs</h2><span class="faint">{stats.graphs.length}</span></div>
+          <div class="panel-head">
+            <h2>Graphs</h2>
+            <span class="faint">{stats.graphs.length}</span>
+          </div>
           <table class="data">
             <thead><tr><th>Graph</th><th class="num">Quads</th></tr></thead>
             <tbody>
               {#each stats.graphs as g (g.name ?? '')}
                 <tr>
                   <td class="mono gname" title={g.name ?? 'Default graph'}>
-                    {#if g.name == null}<span class="muted">default graph</span>{:else}<span class="t-iri">{displayIri(g.name, prefixes)}</span>{/if}
+                    {#if g.name == null}<span class="muted">default graph</span>{:else}<span
+                        class="t-iri">{displayIri(g.name, prefixes)}</span
+                      >{/if}
                   </td>
                   <td class="num">{fmtInt(g.quads)}</td>
                 </tr>
@@ -673,11 +884,15 @@ ex:PersonShape a sh:NodeShape ;
         <section class="panel">
           <div class="panel-head"><h2>Tasks</h2></div>
           <div class="panel-body">
-            <TaskList dataset={name} refreshKey={taskKick} ondone={(t) => {
-              if (t.state === 'failed') toasts.push('error', `${t.kind} failed`, t.message);
-              else toasts.push('success', `${t.kind} finished`, t.message);
-              refreshAll();
-            }} />
+            <TaskList
+              dataset={name}
+              refreshKey={taskKick}
+              ondone={(t) => {
+                if (t.state === 'failed') toasts.push('error', `${t.kind} failed`, t.message);
+                else toasts.push('success', `${t.kind} finished`, t.message);
+                refreshAll();
+              }}
+            />
           </div>
         </section>
       </div>

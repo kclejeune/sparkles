@@ -1,6 +1,7 @@
 const nf = new Intl.NumberFormat('en-US');
 
-export const fmtInt = (n: number | null | undefined) => (n == null || Number.isNaN(n) ? '—' : nf.format(Math.round(n)));
+export const fmtInt = (n: number | null | undefined) =>
+  n == null || Number.isNaN(n) ? '—' : nf.format(Math.round(n));
 
 export function fmtCompact(n: number): string {
   if (n < 0) return '—';
@@ -95,7 +96,8 @@ function parseSse(src: string): Sexp[] {
         while (j < src.length && src[j] !== c) j += src[j] === '\\' ? 2 : 1;
         j++;
       }
-      while (j < src.length && !/[\s()]/.test(src[j])) j = src[j] === '<' && iriEnd(j) > 0 ? iriEnd(j) : j + 1;
+      while (j < src.length && !/[\s()]/.test(src[j]))
+        j = src[j] === '<' && iriEnd(j) > 0 ? iriEnd(j) : j + 1;
       stack[stack.length - 1].push(src.slice(i, j));
       i = j;
     }

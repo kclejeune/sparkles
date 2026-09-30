@@ -31,12 +31,15 @@
       {full ? term.value : displayIri(term.value, prefixes)}
     </button>
   {:else}
-    <span class="t-iri" title={term.value}>{full ? term.value : displayIri(term.value, prefixes)}</span>
+    <span class="t-iri" title={term.value}
+      >{full ? term.value : displayIri(term.value, prefixes)}</span
+    >
   {/if}
 {:else if term.type === 'bnode'}
   <span class="t-bnode">_:{term.value}</span>
 {:else if term.type === 'literal'}
-  <span class="t-literal lit">{term.value}</span>{#if term['xml:lang']}<span class="meta">@{term['xml:lang']}</span
+  <span class="t-literal lit">{term.value}</span>{#if term['xml:lang']}<span class="meta"
+      >@{term['xml:lang']}</span
     >{:else if dt}<span class="meta" title={term.datatype}>^^{dt}</span>{/if}
 {:else}
   <span class="quoted"

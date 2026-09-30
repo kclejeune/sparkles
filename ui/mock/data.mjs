@@ -65,34 +65,158 @@ const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
 const pickN = (arr, n) => {
   const copy = [...arr];
   const out = [];
-  while (out.length < n && copy.length) out.push(copy.splice(Math.floor(rnd() * copy.length), 1)[0]);
+  while (out.length < n && copy.length)
+    out.push(copy.splice(Math.floor(rnd() * copy.length), 1)[0]);
   return out;
 };
 
-const first = ['Ada', 'Grace', 'Alan', 'Barbara', 'Edsger', 'Margaret', 'Donald', 'Frances', 'Tim', 'Radia',
-  'Ken', 'Leslie', 'Niklaus', 'Karen', 'John', 'Shafi', 'Dennis', 'Hedy', 'Linus', 'Sophie', 'Guido', 'Anita',
-  'Bjarne', 'Lynn', 'Yukihiro', 'Adele', 'Robin', 'Mary', 'Jim', 'Carla', 'Ole', 'Joan', 'Tony', 'Ivan', 'Jean',
-  'Katherine', 'Whitfield', 'Evelyn', 'Rasmus', 'Fran'];
-const last = ['Lovelace', 'Hopper', 'Turing', 'Liskov', 'Dijkstra', 'Hamilton', 'Knuth', 'Allen', 'Berners-Lee',
-  'Perlman', 'Thompson', 'Lamport', 'Wirth', 'Spärck Jones', 'McCarthy', 'Goldwasser', 'Ritchie', 'Lamarr',
-  'Torvalds', 'Wilson', 'van Rossum', 'Borg', 'Stroustrup', 'Conway', 'Matsumoto', 'Goldberg', 'Milner', 'Shaw',
-  'Gray', 'Ellis', 'Dahl', 'Clarke', 'Hoare', 'Sutherland', 'Sammet', 'Johnson', 'Diffie', 'Boyd', 'Lerdorf', 'Bilas'];
+const first = [
+  'Ada',
+  'Grace',
+  'Alan',
+  'Barbara',
+  'Edsger',
+  'Margaret',
+  'Donald',
+  'Frances',
+  'Tim',
+  'Radia',
+  'Ken',
+  'Leslie',
+  'Niklaus',
+  'Karen',
+  'John',
+  'Shafi',
+  'Dennis',
+  'Hedy',
+  'Linus',
+  'Sophie',
+  'Guido',
+  'Anita',
+  'Bjarne',
+  'Lynn',
+  'Yukihiro',
+  'Adele',
+  'Robin',
+  'Mary',
+  'Jim',
+  'Carla',
+  'Ole',
+  'Joan',
+  'Tony',
+  'Ivan',
+  'Jean',
+  'Katherine',
+  'Whitfield',
+  'Evelyn',
+  'Rasmus',
+  'Fran',
+];
+const last = [
+  'Lovelace',
+  'Hopper',
+  'Turing',
+  'Liskov',
+  'Dijkstra',
+  'Hamilton',
+  'Knuth',
+  'Allen',
+  'Berners-Lee',
+  'Perlman',
+  'Thompson',
+  'Lamport',
+  'Wirth',
+  'Spärck Jones',
+  'McCarthy',
+  'Goldwasser',
+  'Ritchie',
+  'Lamarr',
+  'Torvalds',
+  'Wilson',
+  'van Rossum',
+  'Borg',
+  'Stroustrup',
+  'Conway',
+  'Matsumoto',
+  'Goldberg',
+  'Milner',
+  'Shaw',
+  'Gray',
+  'Ellis',
+  'Dahl',
+  'Clarke',
+  'Hoare',
+  'Sutherland',
+  'Sammet',
+  'Johnson',
+  'Diffie',
+  'Boyd',
+  'Lerdorf',
+  'Bilas',
+];
 
 const cities = [
-  ['Berlin', 'DE', 52.52, 13.405], ['Lisbon', 'PT', 38.72, -9.14], ['Montréal', 'CA', 45.5, -73.57],
-  ['Kyoto', 'JP', 35.01, 135.77], ['Nairobi', 'KE', -1.29, 36.82], ['Portland', 'US', 45.52, -122.68],
+  ['Berlin', 'DE', 52.52, 13.405],
+  ['Lisbon', 'PT', 38.72, -9.14],
+  ['Montréal', 'CA', 45.5, -73.57],
+  ['Kyoto', 'JP', 35.01, 135.77],
+  ['Nairobi', 'KE', -1.29, 36.82],
+  ['Portland', 'US', 45.52, -122.68],
 ];
 const companies = [
-  ['Tessellate', 1998], ['Quadrant Labs', 2011], ['Northwind Graph', 2004], ['Lattice & Co', 2016],
+  ['Tessellate', 1998],
+  ['Quadrant Labs', 2011],
+  ['Northwind Graph', 2004],
+  ['Lattice & Co', 2016],
 ];
-const universities = ['Institute of Formal Methods', 'Polytechnic of the North', 'Open Semantics University'];
+const universities = [
+  'Institute of Formal Methods',
+  'Polytechnic of the North',
+  'Open Semantics University',
+];
 const teams = ['Storage', 'Query Engine', 'Reasoner', 'Web UI', 'Ingest', 'Research'];
-const projects = ['Sparkles', 'Permutation Index', 'Delta Merge', 'OWL-RL Rules', 'Cardinality Estimator', 'Result Cache'];
-const skills = ['Rust', 'SPARQL', 'OWL', 'Query optimization', 'Compression', 'Svelte', 'Distributed systems', 'Datalog'];
-const pubWords = ['Efficient', 'Scalable', 'Incremental', 'Compressed', 'Adaptive', 'Sorted', 'Join', 'Index',
-  'Permutations', 'Reasoning', 'for', 'over', 'Knowledge Graphs', 'RDF', 'Triple Stores', 'Datalog'];
+const projects = [
+  'Sparkles',
+  'Permutation Index',
+  'Delta Merge',
+  'OWL-RL Rules',
+  'Cardinality Estimator',
+  'Result Cache',
+];
+const skills = [
+  'Rust',
+  'SPARQL',
+  'OWL',
+  'Query optimization',
+  'Compression',
+  'Svelte',
+  'Distributed systems',
+  'Datalog',
+];
+const pubWords = [
+  'Efficient',
+  'Scalable',
+  'Incremental',
+  'Compressed',
+  'Adaptive',
+  'Sorted',
+  'Join',
+  'Index',
+  'Permutations',
+  'Reasoning',
+  'for',
+  'over',
+  'Knowledge Graphs',
+  'RDF',
+  'Triple Stores',
+  'Datalog',
+];
 
-const slug = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9]+/g, '_');
+const slug = (s) =>
+  s
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, '_');
 const lit = (s) => JSON.stringify(s);
 
 export function buildTurtle() {
@@ -107,21 +231,38 @@ export function buildTurtle() {
       foaf:homepage <https://${slug(name).toLowerCase()}.example> .`);
   }
   for (const u of universities) {
-    out.push(`res:${slug(u)} a ex:University ; rdfs:label ${lit(u)}@en ; ex:basedIn res:${slug(pick(cities)[0])} .`);
+    out.push(
+      `res:${slug(u)} a ex:University ; rdfs:label ${lit(u)}@en ; ex:basedIn res:${slug(pick(cities)[0])} .`,
+    );
   }
   teams.forEach((t, i) => {
     const company = companies[i % companies.length][0];
-    out.push(`res:team_${slug(t)} a ex:Team ; rdfs:label ${lit(t + ' team')}@en ; ex:partOf res:${slug(company)} .`);
+    out.push(
+      `res:team_${slug(t)} a ex:Team ; rdfs:label ${lit(t + ' team')}@en ; ex:partOf res:${slug(company)} .`,
+    );
   });
   projects.forEach((p) => {
     out.push(`res:project_${slug(p)} a ex:Project ; rdfs:label ${lit(p)} ;
       dcterms:description ${lit('Work on ' + p.toLowerCase() + ' for the Sparkles engine.')}@en .`);
   });
-  skills.forEach((s) => out.push(`res:skill_${slug(s)} a ex:Skill ; skos:prefLabel ${lit(s)}@en .`));
+  skills.forEach((s) =>
+    out.push(`res:skill_${slug(s)} a ex:Skill ; skos:prefLabel ${lit(s)}@en .`),
+  );
 
-  const people = first.map((f, i) => ({ id: `res:${slug(f + '_' + last[i])}`, name: `${f} ${last[i]}`, i }));
+  const people = first.map((f, i) => ({
+    id: `res:${slug(f + '_' + last[i])}`,
+    name: `${f} ${last[i]}`,
+    i,
+  }));
   for (const p of people) {
-    const role = p.i % 9 === 0 ? 'ex:Manager' : p.i % 4 === 0 ? 'ex:Researcher' : p.i % 3 === 0 ? 'ex:Employee' : 'ex:Engineer';
+    const role =
+      p.i % 9 === 0
+        ? 'ex:Manager'
+        : p.i % 4 === 0
+          ? 'ex:Researcher'
+          : p.i % 3 === 0
+            ? 'ex:Employee'
+            : 'ex:Engineer';
     const company = pick(companies)[0];
     const lines = [
       `${p.id} a ${role}`,
@@ -133,19 +274,33 @@ export function buildTurtle() {
       `foaf:mbox <mailto:${slug(first[p.i]).toLowerCase()}@${slug(company).toLowerCase()}.example>`,
       `ex:basedIn res:${slug(pick(cities)[0])}`,
       `ex:memberOf res:team_${slug(pick(teams))}`,
-      `ex:hasSkill ${pickN(skills, 1 + Math.floor(rnd() * 3)).map((s) => `res:skill_${slug(s)}`).join(', ')}`,
-      `ex:contributesTo ${pickN(projects, 1 + Math.floor(rnd() * 2)).map((s) => `res:project_${slug(s)}`).join(', ')}`,
-      `foaf:knows ${pickN(people.filter((q) => q !== p), 2 + Math.floor(rnd() * 4)).map((q) => q.id).join(', ')}`,
+      `ex:hasSkill ${pickN(skills, 1 + Math.floor(rnd() * 3))
+        .map((s) => `res:skill_${slug(s)}`)
+        .join(', ')}`,
+      `ex:contributesTo ${pickN(projects, 1 + Math.floor(rnd() * 2))
+        .map((s) => `res:project_${slug(s)}`)
+        .join(', ')}`,
+      `foaf:knows ${pickN(
+        people.filter((q) => q !== p),
+        2 + Math.floor(rnd() * 4),
+      )
+        .map((q) => q.id)
+        .join(', ')}`,
     ];
     if (role !== 'ex:Researcher') {
       lines.push(`ex:worksFor res:${slug(company)}`);
       lines.push(`ex:salary "${(60000 + Math.floor(rnd() * 90) * 1000).toFixed(2)}"^^xsd:decimal`);
-      lines.push(`ex:startDate "${2008 + Math.floor(rnd() * 17)}-0${1 + Math.floor(rnd() * 9)}-1${Math.floor(rnd() * 9)}"^^xsd:date`);
+      lines.push(
+        `ex:startDate "${2008 + Math.floor(rnd() * 17)}-0${1 + Math.floor(rnd() * 9)}-1${Math.floor(rnd() * 9)}"^^xsd:date`,
+      );
     } else {
       lines.push(`ex:alumnusOf res:${slug(pick(universities))}`);
     }
     if (role === 'ex:Manager') lines.push(`ex:manages res:team_${slug(pick(teams))}`);
-    if (p.i % 5 === 0) lines.push(`rdfs:comment ${lit(`${first[p.i]} likes sorted permutations.`)}@en, ${lit(`${first[p.i]} aime les permutations triées.`)}@fr`);
+    if (p.i % 5 === 0)
+      lines.push(
+        `rdfs:comment ${lit(`${first[p.i]} likes sorted permutations.`)}@en, ${lit(`${first[p.i]} aime les permutations triées.`)}@fr`,
+      );
     out.push(lines.join(' ;\n  ') + ' .');
   }
 

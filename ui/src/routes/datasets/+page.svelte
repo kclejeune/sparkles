@@ -31,14 +31,17 @@
     <div>
       <h1>Datasets</h1>
       <p class="muted">
-        {app.datasets.length} dataset{app.datasets.length === 1 ? '' : 's'}, {fmtInt(total)} quads in total
+        {app.datasets.length} dataset{app.datasets.length === 1 ? '' : 's'}, {fmtInt(total)} quads in
+        total
       </p>
     </div>
     <span class="spacer"></span>
     <button class="btn" onclick={refresh} disabled={refreshing}>
       <Icon name="refresh" size={14} /> Refresh
     </button>
-    <button class="btn primary" onclick={() => (createOpen = true)}><Icon name="plus" size={14} /> New dataset</button>
+    <button class="btn primary" onclick={() => (createOpen = true)}
+      ><Icon name="plus" size={14} /> New dataset</button
+    >
   </header>
 
   {#if app.datasetsError}
@@ -46,62 +49,71 @@
   {/if}
 
   {#if !(app.datasetsError && app.datasets.length === 0)}
-  <section class="panel">
-    {#if app.datasetsLoaded && app.datasets.length === 0}
-      <div class="empty">
-        <Icon name="database" size={24} />
-        <p>No datasets yet.</p>
-        <button class="btn primary" onclick={() => (createOpen = true)}><Icon name="plus" size={14} /> Create your first dataset</button>
-      </div>
-    {:else}
-      <table class="data">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Storage</th>
-            <th class="num">Quads</th>
-            <th>Reasoning</th>
-            <th>Endpoint</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each app.datasets as d (d.name)}
-            <tr class:current={d.name === app.current}>
-              <td>
-                <a class="name" href={detail(d.name)}>{d.name}</a>
-                {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
-              </td>
-              <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
-              <td class="num">{fmtInt(d.quads)}</td>
-              <td>
-                {#if d.reasoning}
-                  <span class="badge ok">{d.reasoning.profile}</span>
-                  <span class="faint">+{fmtInt(d.reasoning.inferred)} inferred, {fmtRelative(d.reasoning.at)}</span>
-                {:else}
-                  <span class="faint">off</span>
-                {/if}
-              </td>
-              <td><span class="mono faint">{d.endpoints?.query ?? `/${d.name}/sparql`}</span></td>
-              <td class="actions">
-                <button
-                  class="btn sm"
-                  onclick={() => {
-                    app.setDataset(d.name);
-                    goto(resolve('/query'));
-                  }}><Icon name="query" size={13} /> Query</button
-                >
-                <a class="btn sm" href={detail(d.name)}>Details</a>
-                <button class="btn sm icon danger" aria-label="Delete {d.name}" title="Delete {d.name}" onclick={() => (deleteTarget = d.name)}>
-                  <Icon name="trash" size={13} />
-                </button>
-              </td>
+    <section class="panel">
+      {#if app.datasetsLoaded && app.datasets.length === 0}
+        <div class="empty">
+          <Icon name="database" size={24} />
+          <p>No datasets yet.</p>
+          <button class="btn primary" onclick={() => (createOpen = true)}
+            ><Icon name="plus" size={14} /> Create your first dataset</button
+          >
+        </div>
+      {:else}
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Storage</th>
+              <th class="num">Quads</th>
+              <th>Reasoning</th>
+              <th>Endpoint</th>
+              <th></th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
-    {/if}
-  </section>
+          </thead>
+          <tbody>
+            {#each app.datasets as d (d.name)}
+              <tr class:current={d.name === app.current}>
+                <td>
+                  <a class="name" href={detail(d.name)}>{d.name}</a>
+                  {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
+                </td>
+                <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
+                <td class="num">{fmtInt(d.quads)}</td>
+                <td>
+                  {#if d.reasoning}
+                    <span class="badge ok">{d.reasoning.profile}</span>
+                    <span class="faint"
+                      >+{fmtInt(d.reasoning.inferred)} inferred, {fmtRelative(d.reasoning.at)}</span
+                    >
+                  {:else}
+                    <span class="faint">off</span>
+                  {/if}
+                </td>
+                <td><span class="mono faint">{d.endpoints?.query ?? `/${d.name}/sparql`}</span></td>
+                <td class="actions">
+                  <button
+                    class="btn sm"
+                    onclick={() => {
+                      app.setDataset(d.name);
+                      goto(resolve('/query'));
+                    }}><Icon name="query" size={13} /> Query</button
+                  >
+                  <a class="btn sm" href={detail(d.name)}>Details</a>
+                  <button
+                    class="btn sm icon danger"
+                    aria-label="Delete {d.name}"
+                    title="Delete {d.name}"
+                    onclick={() => (deleteTarget = d.name)}
+                  >
+                    <Icon name="trash" size={13} />
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </section>
   {/if}
 
   <section class="panel">

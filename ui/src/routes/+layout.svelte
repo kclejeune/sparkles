@@ -32,7 +32,9 @@
 
   function linkFor(href: string) {
     const base = resolve(href as '/query');
-    return href === '/explore' && app.current ? `${base}?ds=${encodeURIComponent(app.current)}` : base;
+    return href === '/explore' && app.current
+      ? `${base}?ds=${encodeURIComponent(app.current)}`
+      : base;
   }
 
   function cycleTheme() {
@@ -45,7 +47,8 @@
     const pingTimer = setInterval(() => app.ping(), 10_000);
     const dsTimer = setInterval(() => app.refreshDatasets(), 30_000);
     const onDoc = (e: MouseEvent) => {
-      if (switcherOpen && switcherEl && !switcherEl.contains(e.target as Node)) switcherOpen = false;
+      if (switcherOpen && switcherEl && !switcherEl.contains(e.target as Node))
+        switcherOpen = false;
     };
     document.addEventListener('mousedown', onDoc);
     return () => {
@@ -76,7 +79,9 @@
         onkeydown={(e) => e.key === 'Escape' && (switcherOpen = false)}
       >
         <Icon name="database" size={14} />
-        <span class="ds-name">{app.current ?? (app.datasetsLoaded ? 'No dataset' : 'Loading…')}</span>
+        <span class="ds-name"
+          >{app.current ?? (app.datasetsLoaded ? 'No dataset' : 'Loading…')}</span
+        >
         {#if currentInfo}<span class="ds-count">{fmtCompact(currentInfo.quads)}</span>{/if}
         <Icon name="chevronDown" size={14} />
       </button>
@@ -93,7 +98,8 @@
               }}
             >
               <span class="ds-item-name">{d.name}</span>
-              <span class="faint ds-item-meta">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span>
+              <span class="faint ds-item-meta">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span
+              >
               <span class="ds-count">{fmtCompact(d.quads)}</span>
             </button>
           {:else}
@@ -108,7 +114,11 @@
 
     <nav>
       {#each nav as item (item.href)}
-        <a href={linkFor(item.href)} class:active={isActive(item.href)} aria-current={isActive(item.href) ? 'page' : undefined}>
+        <a
+          href={linkFor(item.href)}
+          class:active={isActive(item.href)}
+          aria-current={isActive(item.href) ? 'page' : undefined}
+        >
           <Icon name={item.icon} size={16} />
           <span>{item.label}</span>
         </a>
@@ -120,16 +130,28 @@
     <div class="foot">
       <div
         class="status"
-        title={app.online ? `Server reachable (${app.lastPingMs?.toFixed(0)} ms)` : 'Server unreachable'}
+        title={app.online
+          ? `Server reachable (${app.lastPingMs?.toFixed(0)} ms)`
+          : 'Server unreachable'}
       >
         <span class="dot" class:on={app.online === true} class:off={app.online === false}></span>
         <span>
           {#if app.online === null}Connecting…{:else if app.online}Connected{:else}Offline{/if}
         </span>
-        {#if app.online && app.lastPingMs != null}<span class="faint">{app.lastPingMs.toFixed(0)} ms</span>{/if}
+        {#if app.online && app.lastPingMs != null}<span class="faint"
+            >{app.lastPingMs.toFixed(0)} ms</span
+          >{/if}
       </div>
-      <button class="btn ghost icon sm" onclick={cycleTheme} title="Theme: {app.theme}" aria-label="Theme: {app.theme}">
-        <Icon name={app.theme === 'light' ? 'sun' : app.theme === 'dark' ? 'moon' : 'monitor'} size={15} />
+      <button
+        class="btn ghost icon sm"
+        onclick={cycleTheme}
+        title="Theme: {app.theme}"
+        aria-label="Theme: {app.theme}"
+      >
+        <Icon
+          name={app.theme === 'light' ? 'sun' : app.theme === 'dark' ? 'moon' : 'monitor'}
+          size={15}
+        />
       </button>
     </div>
   </aside>

@@ -97,7 +97,12 @@ export const app = new AppState();
 
 // --- toasts -------------------------------------------------------------------
 
-export type Toast = { id: number; kind: 'info' | 'success' | 'error'; text: string; detail?: string };
+export type Toast = {
+  id: number;
+  kind: 'info' | 'success' | 'error';
+  text: string;
+  detail?: string;
+};
 
 class Toasts {
   items = $state<Toast[]>([]);

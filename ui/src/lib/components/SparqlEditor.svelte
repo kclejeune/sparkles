@@ -1,6 +1,12 @@
 <script lang="ts">
   import { closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
-  import { defaultKeymap, history, historyKeymap, indentWithTab, toggleComment } from '@codemirror/commands';
+  import {
+    defaultKeymap,
+    history,
+    historyKeymap,
+    indentWithTab,
+    toggleComment,
+  } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
   import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
   import { EditorState, Prec, type Extension } from '@codemirror/state';
@@ -39,7 +45,12 @@
   let currentId = '';
 
   const theme = EditorView.theme({
-    '&': { height: '100%', fontSize: '13px', backgroundColor: 'var(--surface)', color: 'var(--text)' },
+    '&': {
+      height: '100%',
+      fontSize: '13px',
+      backgroundColor: 'var(--surface)',
+      color: 'var(--text)',
+    },
     '.cm-scroller': { fontFamily: 'var(--font-mono)', lineHeight: '1.6' },
     '.cm-content': { caretColor: 'var(--spark)', padding: '8px 0' },
     '.cm-cursor': { borderLeftColor: 'var(--spark)', borderLeftWidth: '2px' },
@@ -55,10 +66,19 @@
     '.cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection': {
       backgroundColor: 'color-mix(in srgb, var(--iri) 22%, transparent) !important',
     },
-    '.cm-matchingBracket': { backgroundColor: 'var(--spark-soft)', outline: '1px solid var(--spark)' },
+    '.cm-matchingBracket': {
+      backgroundColor: 'var(--spark-soft)',
+      outline: '1px solid var(--spark)',
+    },
     '.cm-selectionMatch': { backgroundColor: 'color-mix(in srgb, var(--iri) 12%, transparent)' },
-    '.cm-error-line': { backgroundColor: 'var(--danger-soft)', boxShadow: 'inset 3px 0 0 var(--danger)' },
-    '.cm-error-mark': { textDecoration: 'underline wavy var(--danger)', textUnderlineOffset: '3px' },
+    '.cm-error-line': {
+      backgroundColor: 'var(--danger-soft)',
+      boxShadow: 'inset 3px 0 0 var(--danger)',
+    },
+    '.cm-error-mark': {
+      textDecoration: 'underline wavy var(--danger)',
+      textUnderlineOffset: '3px',
+    },
     '.cm-placeholder': { color: 'var(--text-3)' },
     '.cm-tooltip': {
       backgroundColor: 'var(--surface)',
@@ -67,15 +87,28 @@
       boxShadow: 'var(--shadow-pop)',
       overflow: 'hidden',
     },
-    '.cm-tooltip-autocomplete > ul': { fontFamily: 'var(--font-mono)', fontSize: '12px', maxHeight: '260px' },
+    '.cm-tooltip-autocomplete > ul': {
+      fontFamily: 'var(--font-mono)',
+      fontSize: '12px',
+      maxHeight: '260px',
+    },
     '.cm-tooltip-autocomplete > ul > li': { padding: '2px 8px !important', lineHeight: '1.6' },
     '.cm-tooltip-autocomplete > ul > li[aria-selected]': {
       backgroundColor: 'color-mix(in srgb, var(--iri) 18%, transparent)',
       color: 'var(--text)',
     },
-    '.cm-completionDetail': { color: 'var(--text-3)', fontStyle: 'normal', marginLeft: '12px', fontSize: '11px' },
+    '.cm-completionDetail': {
+      color: 'var(--text-3)',
+      fontStyle: 'normal',
+      marginLeft: '12px',
+      fontSize: '11px',
+    },
     '.cm-completionIcon': { opacity: '0.55', width: '1em' },
-    '.cm-panels': { backgroundColor: 'var(--surface-2)', color: 'var(--text)', borderColor: 'var(--border)' },
+    '.cm-panels': {
+      backgroundColor: 'var(--surface-2)',
+      color: 'var(--text)',
+      borderColor: 'var(--border)',
+    },
     '.cm-panel input, .cm-panel button': { fontFamily: 'var(--font-ui)' },
     '.cm-textfield': {
       backgroundColor: 'var(--surface)',
@@ -110,7 +143,14 @@
       closeBrackets(),
       highlightSelectionMatches(),
       cmPlaceholder(placeholder),
-      keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap, indentWithTab]),
+      keymap.of([
+        ...closeBracketsKeymap,
+        ...defaultKeymap,
+        ...searchKeymap,
+        ...historyKeymap,
+        ...completionKeymap,
+        indentWithTab,
+      ]),
       sparql(completion),
       theme,
       EditorView.updateListener.of((u) => {
@@ -139,7 +179,9 @@
       states.set(currentId, view.state);
       currentId = id;
       const st = stateFor(id, v);
-      view.setState(st.doc.toString() === v ? st : EditorState.create({ doc: v, extensions: extensions() }));
+      view.setState(
+        st.doc.toString() === v ? st : EditorState.create({ doc: v, extensions: extensions() }),
+      );
     } else if (view.state.doc.toString() !== v) {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v } });
     }

@@ -4,7 +4,11 @@
   import { shorten, type PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
 
-  let { plan, executed = true, prefixes = {} }: { plan: PlanNode; executed?: boolean; prefixes?: PrefixMap } = $props();
+  let {
+    plan,
+    executed = true,
+    prefixes = {},
+  }: { plan: PlanNode; executed?: boolean; prefixes?: PrefixMap } = $props();
 
   /**
    * Operator description for display: `<iri>` as a prefixed name where a prefix matches,
@@ -17,19 +21,29 @@
       .replace(/\?([0-9a-f]{32})\b/g, (_, h: string) => `?_${h.slice(0, 6)}`);
   }
 
-  type Flat = { node: PlanNode; id: string; depth: number; self: number; hasKids: boolean; last: boolean[] };
+  type Flat = {
+    node: PlanNode;
+    id: string;
+    depth: number;
+    self: number;
+    hasKids: boolean;
+    last: boolean[];
+  };
 
   let collapsed = $state(new Set<string>());
   let mode = $state<'tree' | 'flame'>('tree');
   let hovered = $state<string | null>(null);
 
-  const selfTime = (n: PlanNode) => Math.max(0, n.timeMs - n.children.reduce((a, c) => a + (c.timeMs || 0), 0));
+  const selfTime = (n: PlanNode) =>
+    Math.max(0, n.timeMs - n.children.reduce((a, c) => a + (c.timeMs || 0), 0));
 
   const all = $derived.by(() => {
     const out: Flat[] = [];
     const walk = (n: PlanNode, id: string, depth: number, last: boolean[]) => {
       out.push({ node: n, id, depth, self: selfTime(n), hasKids: n.children.length > 0, last });
-      n.children.forEach((c, i) => walk(c, `${id}.${i}`, depth + 1, [...last, i === n.children.length - 1]));
+      n.children.forEach((c, i) =>
+        walk(c, `${id}.${i}`, depth + 1, [...last, i === n.children.length - 1]),
+      );
     };
     walk(plan, '0', 0, []);
     return out;
@@ -41,7 +55,10 @@
   const hot = $derived.by(() => {
     if (!executed) return new Map<string, number>();
     const total = plan.timeMs || 1;
-    const ranked = [...all].sort((a, b) => b.self - a.self).filter((r) => r.self / total > 0.05).slice(0, 3);
+    const ranked = [...all]
+      .sort((a, b) => b.self - a.self)
+      .filter((r) => r.self / total > 0.05)
+      .slice(0, 3);
     return new Map(ranked.map((r, i) => [r.id, i]));
   });
 
@@ -91,10 +108,20 @@
 <div class="plan">
   <div class="toolbar">
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" aria-selected={mode === 'tree'} onclick={() => (mode = 'tree')}>
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={mode === 'tree'}
+        onclick={() => (mode = 'tree')}
+      >
         <Icon name="tree" size={14} /> Tree
       </button>
-      <button class="tab" role="tab" aria-selected={mode === 'flame'} onclick={() => (mode = 'flame')}>
+      <button
+        class="tab"
+        role="tab"
+        aria-selected={mode === 'flame'}
+        onclick={() => (mode = 'flame')}
+      >
         <Icon name="layers" size={14} /> Flame
       </button>
     </div>
@@ -125,10 +152,19 @@
         <div class="tr" class:hot={h != null} class:est={!executed} data-rank={h}>
           <div class="op" style:padding-left="{r.depth * 18 + 6}px">
             {#each r.last as isLast, d (d)}
-              <span class="guide" style:left="{d * 18 + 14}px" class:end={isLast && d === r.last.length - 1}></span>
+              <span
+                class="guide"
+                style:left="{d * 18 + 14}px"
+                class:end={isLast && d === r.last.length - 1}
+              ></span>
             {/each}
             {#if r.hasKids}
-              <button class="twisty" class:open={!collapsed.has(r.id)} onclick={() => toggle(r.id)} aria-label="Toggle children">
+              <button
+                class="twisty"
+                class:open={!collapsed.has(r.id)}
+                onclick={() => toggle(r.id)}
+                aria-label="Toggle children"
+              >
                 <Icon name="chevron" size={12} />
               </button>
             {:else}
@@ -136,20 +172,32 @@
             {/if}
             <span class="name">{r.node.operator}</span>
             <span class="desc" title={r.node.description}>{desc(r.node.description)}</span>
-            {#if r.node.cached}<span class="badge ok" title="Served from the result cache">cached</span>{/if}
+            {#if r.node.cached}<span class="badge ok" title="Served from the result cache"
+                >cached</span
+              >{/if}
             {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
           </div>
           <span class="num faint">{fmtCompact(r.node.estimatedRows)}</span>
           {#if executed}
-            <span class="num" class:mis={mis != null} title={mis ? `Off by ${mis.toFixed(0)}× vs estimate` : undefined}>
+            <span
+              class="num"
+              class:mis={mis != null}
+              title={mis ? `Off by ${mis.toFixed(0)}× vs estimate` : undefined}
+            >
               {r.node.actualRows < 0 ? '—' : fmtInt(r.node.actualRows)}
             </span>
             <span class="num">{fmtMs(r.self)}</span>
             <span class="num faint">{fmtMs(r.node.timeMs)}</span>
           {/if}
-          <div class="bar" title={executed ? `${fmtMs(r.node.timeMs)} total, ${fmtMs(r.self)} self` : `cost ${fmtInt(r.node.estimatedCost)}`}>
+          <div
+            class="bar"
+            title={executed
+              ? `${fmtMs(r.node.timeMs)} total, ${fmtMs(r.self)} self`
+              : `cost ${fmtInt(r.node.estimatedCost)}`}
+          >
             <span class="total" style:width="{(metric(r.node) / rootMetric) * 100}%"></span>
-            {#if executed}<span class="self" style:width="{(r.self / rootMetric) * 100}%"></span>{/if}
+            {#if executed}<span class="self" style:width="{(r.self / rootMetric) * 100}%"
+              ></span>{/if}
           </div>
         </div>
       {/each}
@@ -181,13 +229,23 @@
           <strong>{hoveredNode.operator}</strong>
           <span class="mono">{desc(hoveredNode.description)}</span>
           <span class="muted">
-            est {fmtInt(hoveredNode.estimatedRows)} rows{#if hoveredNode.actualRows >= 0}, actual {fmtInt(hoveredNode.actualRows)}{/if}{#if executed},
+            est {fmtInt(hoveredNode.estimatedRows)} rows{#if hoveredNode.actualRows >= 0}, actual {fmtInt(
+                hoveredNode.actualRows,
+              )}{/if}{#if executed},
               {fmtMs(hoveredNode.timeMs)} total, {fmtMs(selfTime(hoveredNode))} self{/if}
           </span>
-          {#if hoveredNode.columns.length}<span class="faint mono">→ {hoveredNode.columns.join(' ')}</span>{/if}
-          {#if hoveredNode.sortedOn.length}<span class="faint">sorted on <span class="mono">{hoveredNode.sortedOn.join(', ')}</span></span>{/if}
+          {#if hoveredNode.columns.length}<span class="faint mono"
+              >→ {hoveredNode.columns.join(' ')}</span
+            >{/if}
+          {#if hoveredNode.sortedOn.length}<span class="faint"
+              >sorted on <span class="mono">{hoveredNode.sortedOn.join(', ')}</span></span
+            >{/if}
         {:else}
-          <span class="faint">Hover a box for details. Width is proportional to {executed ? 'wall time' : 'estimated cost'}.</span>
+          <span class="faint"
+            >Hover a box for details. Width is proportional to {executed
+              ? 'wall time'
+              : 'estimated cost'}.</span
+          >
         {/if}
       </div>
     </div>

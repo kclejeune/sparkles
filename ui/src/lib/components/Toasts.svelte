@@ -6,7 +6,10 @@
 <div class="toasts" role="status" aria-live="polite">
   {#each toasts.items as t (t.id)}
     <div class="toast {t.kind}">
-      <Icon name={t.kind === 'error' ? 'alert' : t.kind === 'success' ? 'check' : 'info'} size={15} />
+      <Icon
+        name={t.kind === 'error' ? 'alert' : t.kind === 'success' ? 'check' : 'info'}
+        size={15}
+      />
       <div class="text">
         <div>{t.text}</div>
         {#if t.detail}<div class="detail">{t.detail}</div>{/if}

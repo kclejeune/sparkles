@@ -68,7 +68,10 @@ LIMIT 25`,
 export type Neighbour = { predicate: string; term: Term; label?: string; incoming: boolean };
 
 /** Outgoing and incoming edges of a resource (LIMIT 100 each). */
-export async function neighbours(ds: string, iri: string): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
+export async function neighbours(
+  ds: string,
+  iri: string,
+): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
   const node = sparqlIri(iri);
   const [outRows, incRows] = await Promise.all([
     api.select(
@@ -94,13 +97,21 @@ LIMIT 100`,
       opts,
     ),
   ]);
-  const out = outRows.filter((r) => r.p && r.o).map((r) => ({ predicate: v(r.p)!, term: r.o!, label: v(r.label), incoming: false }));
-  const inc = incRows.filter((r) => r.p && r.s).map((r) => ({ predicate: v(r.p)!, term: r.s!, label: v(r.label), incoming: true }));
+  const out = outRows
+    .filter((r) => r.p && r.o)
+    .map((r) => ({ predicate: v(r.p)!, term: r.o!, label: v(r.label), incoming: false }));
+  const inc = incRows
+    .filter((r) => r.p && r.s)
+    .map((r) => ({ predicate: v(r.p)!, term: r.s!, label: v(r.label), incoming: true }));
   const label = pickLabel(out.filter((n) => LABEL_IRIS.includes(n.predicate)).map((n) => n.term));
   return { out, inc, label };
 }
 
-export type Details = { props: { p: string; o: Term }[]; incoming: { s: Term; p: string }[]; incomingTotal: number };
+export type Details = {
+  props: { p: string; o: Term }[];
+  incoming: { s: Term; p: string }[];
+  incomingTotal: number;
+};
 
 export async function details(ds: string, iri: string): Promise<Details> {
   const node = sparqlIri(iri);
@@ -225,7 +236,11 @@ SELECT DISTINCT ?c ?super ?label ?comment ?declared WHERE {
 LIMIT 20000`,
       { send: 20000, ...asserted },
     ),
-    api.select(ds, `SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c } GROUP BY ?c LIMIT 5000`, { send: 5000 }),
+    api.select(
+      ds,
+      `SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c } GROUP BY ?c LIMIT 5000`,
+      { send: 5000 },
+    ),
     api.select(
       ds,
       `${P}
@@ -288,14 +303,20 @@ SELECT ?o ?label ?version ?comment WHERE {
     .filter((c) => c.supers.length === 0)
     .sort((a, b) => b.subs.length - a.subs.length || name(a).localeCompare(name(b)))
     .map((c) => c.iri);
-  for (const c of classes.values()) c.subs.sort((a, b) => name(classes.get(a)!).localeCompare(name(classes.get(b)!)));
+  for (const c of classes.values())
+    c.subs.sort((a, b) => name(classes.get(a)!).localeCompare(name(classes.get(b)!)));
 
   const props = new Map<string, PropertyInfo & { _labels: Term[] }>();
   for (const r of propRows) {
     if (!r.p) continue;
     let p = props.get(v(r.p)!);
-    if (!p) props.set(v(r.p)!, (p = { iri: v(r.p)!, kinds: [], domains: [], ranges: [], supers: [], _labels: [] }));
-    const add = (arr: string[], t?: Term) => t && t.type === 'uri' && !arr.includes(t.value) && arr.push(t.value);
+    if (!p)
+      props.set(
+        v(r.p)!,
+        (p = { iri: v(r.p)!, kinds: [], domains: [], ranges: [], supers: [], _labels: [] }),
+      );
+    const add = (arr: string[], t?: Term) =>
+      t && t.type === 'uri' && !arr.includes(t.value) && arr.push(t.value);
     add(p.kinds, r.kind);
     add(p.domains, r.domain);
     add(p.ranges, r.range);
@@ -311,6 +332,8 @@ SELECT ?o ?label ?version ?comment WHERE {
     classes,
     roots,
     properties,
-    ontology: o?.o ? { iri: v(o.o)!, label: v(o.label), version: v(o.version), comment: v(o.comment) } : undefined,
+    ontology: o?.o
+      ? { iri: v(o.o)!, label: v(o.label), version: v(o.version), comment: v(o.comment) }
+      : undefined,
   };
 }

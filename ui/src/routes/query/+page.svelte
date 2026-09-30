@@ -37,12 +37,20 @@
   const STORE_KEY = 'sparkles.queryTabs';
   const LIMITS = [1_000, 10_000, 100_000, 1_000_000];
 
-  const saved = load<{ tabs: QTab[]; active: string; limit?: number; editorH?: number; inferences?: boolean }>(STORE_KEY, {
+  const saved = load<{
+    tabs: QTab[];
+    active: string;
+    limit?: number;
+    editorH?: number;
+    inferences?: boolean;
+  }>(STORE_KEY, {
     tabs: [],
     active: '',
   });
   let tabs = $state<QTab[]>(
-    Array.isArray(saved.tabs) && saved.tabs.length ? saved.tabs : [{ id: newId(), title: 'Query 1', query: DEFAULT_QUERY }],
+    Array.isArray(saved.tabs) && saved.tabs.length
+      ? saved.tabs
+      : [{ id: newId(), title: 'Query 1', query: DEFAULT_QUERY }],
   );
   let activeId = $state(tabs.some((t) => t.id === saved.active) ? saved.active : tabs[0].id);
   let limit = $state(LIMITS.includes(saved.limit ?? 0) ? saved.limit! : 10_000);
@@ -146,25 +154,51 @@
     const prevKind = outcomes[tabId]?.result?.queryType;
     const started = performance.now();
     const reasoning = reasoningFor(dsName);
-    outcomes[tabId] = { status: 'running', ds: dsName, kind: k, view: prevView ?? 'table', startedAt: started, controller, reasoning };
+    outcomes[tabId] = {
+      status: 'running',
+      ds: dsName,
+      kind: k,
+      view: prevView ?? 'table',
+      startedAt: started,
+      controller,
+      reasoning,
+    };
     try {
       if (k === 'UPDATE') {
         const result = await api.update(dsName, text, controller.signal);
         const ms = performance.now() - started;
-        outcomes[tabId] = { status: 'done', ds: dsName, kind: k, updated: { ms, result }, view: 'table', startedAt: started, elapsed: ms };
+        outcomes[tabId] = {
+          status: 'done',
+          ds: dsName,
+          kind: k,
+          updated: { ms, result },
+          view: 'table',
+          startedAt: started,
+          elapsed: ms,
+        };
         toasts.push(
           'success',
           'Update applied',
-          result ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}` : `${dsName} in ${fmtMs(ms)}`,
+          result
+            ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
+            : `${dsName} in ${fmtMs(ms)}`,
         );
         delete app.vocab[dsName];
         void app.refreshDatasets();
       } else {
-        const result = await api.query(dsName, text, { send: limit, reasoning, signal: controller.signal });
+        const result = await api.query(dsName, text, {
+          send: limit,
+          reasoning,
+          signal: controller.signal,
+        });
         const elapsed = performance.now() - started;
         // Keep the user's chosen view only when re-running the same kind of query.
         const sameKind = prevKind === result.queryType;
-        const keep = sameKind && prevView && prevView !== 'explain' && (prevView !== 'graph' || result.queryType !== 'ASK');
+        const keep =
+          sameKind &&
+          prevView &&
+          prevView !== 'explain' &&
+          (prevView !== 'graph' || result.queryType !== 'ASK');
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
@@ -182,8 +216,16 @@
         delete outcomes[tabId];
         return;
       }
-      outcomes[tabId] = { status: 'error', ds: dsName, kind: k, error: e as Error, view: 'table', startedAt: started };
-      if (e instanceof api.ApiError && e.line && tabId === activeId) editor?.showError(e.line, e.column);
+      outcomes[tabId] = {
+        status: 'error',
+        ds: dsName,
+        kind: k,
+        error: e as Error,
+        view: 'table',
+        startedAt: started,
+      };
+      if (e instanceof api.ApiError && e.line && tabId === activeId)
+        editor?.showError(e.line, e.column);
     }
   }
 
@@ -203,13 +245,24 @@
     // Keep a previous query result (its Table/Plan tabs stay usable), but not an update
     // confirmation or an error, which would otherwise take precedence over the plan.
     const prev = outcomes[tabId]?.result ? outcomes[tabId] : undefined;
-    const base = { ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }), updated: undefined, error: undefined };
+    const base = {
+      ...(prev ?? { ds: dsName, kind: 'EXPLAIN', startedAt: started }),
+      updated: undefined,
+      error: undefined,
+    };
     outcomes[tabId] = { ...base, status: 'running', view: 'explain' } as Outcome;
     try {
       const ex = await api.explain(dsName, text, { reasoning: reasoningFor(dsName) });
       outcomes[tabId] = { ...base, status: 'done', explain: ex, view: 'explain' } as Outcome;
     } catch (e) {
-      outcomes[tabId] = { status: 'error', ds: dsName, kind: 'EXPLAIN', error: e as Error, view: 'explain', startedAt: started };
+      outcomes[tabId] = {
+        status: 'error',
+        ds: dsName,
+        kind: 'EXPLAIN',
+        error: e as Error,
+        view: 'explain',
+        startedAt: started,
+      };
       if (e instanceof api.ApiError && e.line) editor?.showError(e.line, e.column);
     }
   }
@@ -272,7 +325,9 @@
       ? triplesToGraph(graphTriples, prefixes, { hideTypes, hideLiterals, maxNodes })
       : { nodes: [], edges: [], truncated: false, totalNodes: 0 },
   );
-  const hasTypeEdges = $derived(graphTriples.some(([, p]) => p.type === 'uri' && p.value === RDF_TYPE));
+  const hasTypeEdges = $derived(
+    graphTriples.some(([, p]) => p.type === 'uri' && p.value === RDF_TYPE),
+  );
 
   // --- raw / downloads -------------------------------------------------------
 
@@ -308,7 +363,9 @@
     downloading = fmt.label;
     try {
       const reasoning = outcome?.reasoning ?? reasoningFor(dsName);
-      const blob = await api.queryRaw(dsName, active.query, fmt.accept, { reasoning: reasoning ?? undefined });
+      const blob = await api.queryRaw(dsName, active.query, fmt.accept, {
+        reasoning: reasoning ?? undefined,
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -326,7 +383,9 @@
 
   async function copyRaw() {
     try {
-      await navigator.clipboard.writeText(JSON.stringify(outcome?.result ?? outcome?.explain, null, 2));
+      await navigator.clipboard.writeText(
+        JSON.stringify(outcome?.result ?? outcome?.explain, null, 2),
+      );
       toasts.push('success', 'Copied JSON', undefined, 1500);
     } catch (e) {
       toasts.error('Could not copy', e);
@@ -339,7 +398,8 @@
     e.preventDefault();
     const y0 = e.clientY;
     const h0 = editorH;
-    const move = (ev: PointerEvent) => (editorH = Math.min(Math.max(h0 + ev.clientY - y0, 100), window.innerHeight - 200));
+    const move = (ev: PointerEvent) =>
+      (editorH = Math.min(Math.max(h0 + ev.clientY - y0, 100), window.innerHeight - 200));
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
@@ -360,7 +420,12 @@
         ]
       : [],
   );
-  const phaseTotal = $derived(Math.max(phases.reduce((a, p) => a + (p.ms || 0), 0), 1e-9));
+  const phaseTotal = $derived(
+    Math.max(
+      phases.reduce((a, p) => a + (p.ms || 0), 0),
+      1e-9,
+    ),
+  );
 
   // Elapsed ticker while running
   let now = $state(performance.now());
@@ -377,7 +442,11 @@
       addTab(query, title);
     }
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !(e.target as HTMLElement)?.closest?.('.cm-editor')) {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key === 'Enter' &&
+        !(e.target as HTMLElement)?.closest?.('.cm-editor')
+      ) {
         e.preventDefault();
         run();
       }
@@ -435,10 +504,17 @@
             {t.title}
           </button>
         {/if}
-        <button class="qtab-x" aria-label="Close {t.title}" onclick={() => closeTab(t.id)}><Icon name="x" size={12} /></button>
+        <button class="qtab-x" aria-label="Close {t.title}" onclick={() => closeTab(t.id)}
+          ><Icon name="x" size={12} /></button
+        >
       </div>
     {/each}
-    <button class="btn ghost icon sm add" aria-label="New query tab" title="New query tab" onclick={() => addTab()}>
+    <button
+      class="btn ghost icon sm add"
+      aria-label="New query tab"
+      title="New query tab"
+      onclick={() => addTab()}
+    >
       <Icon name="plus" size={14} />
     </button>
   </div>
@@ -452,7 +528,12 @@
     </span>
     <span class="spacer"></span>
     <div class="examples">
-      <button class="btn sm" aria-haspopup="menu" aria-expanded={examplesOpen} onclick={() => (examplesOpen = !examplesOpen)}>
+      <button
+        class="btn sm"
+        aria-haspopup="menu"
+        aria-expanded={examplesOpen}
+        onclick={() => (examplesOpen = !examplesOpen)}
+      >
         Examples <Icon name="chevronDown" size={13} />
       </button>
       {#if examplesOpen}
@@ -469,7 +550,9 @@
     {#if reasoningInfo && kind !== 'UPDATE'}
       <label
         class="limit inf"
-        title="Include the {fmtInt(reasoningInfo.inferred)} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
+        title="Include the {fmtInt(
+          reasoningInfo.inferred,
+        )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
       >
         <input type="checkbox" bind:checked={inferences} />
         <span>Use inferences</span>
@@ -481,7 +564,12 @@
         {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
       </select>
     </label>
-    <button class="btn sm" onclick={runExplain} disabled={!ds || kind === 'UPDATE'} title="Show algebra and plan without running">
+    <button
+      class="btn sm"
+      onclick={runExplain}
+      disabled={!ds || kind === 'UPDATE'}
+      title="Show algebra and plan without running"
+    >
       <Icon name="plan" size={14} /> Explain
     </button>
     {#if outcome?.status === 'running' && outcome.controller}
@@ -496,10 +584,23 @@
   </div>
 
   <div class="editor-wrap">
-    <SparqlEditor bind:this={editor} docId={active.id} value={active.query} onchange={setQuery} onrun={run} {completion} />
+    <SparqlEditor
+      bind:this={editor}
+      docId={active.id}
+      value={active.query}
+      onchange={setQuery}
+      onrun={run}
+      {completion}
+    />
   </div>
 
-  <div class="splitter" role="separator" aria-orientation="horizontal" aria-label="Resize editor" onpointerdown={startSplit}></div>
+  <div
+    class="splitter"
+    role="separator"
+    aria-orientation="horizontal"
+    aria-label="Resize editor"
+    onpointerdown={startSplit}
+  ></div>
 
   <!-- results -->
   <section class="results" aria-label="Results">
@@ -507,64 +608,105 @@
       <div class="empty">
         <Icon name="query" size={22} />
         <p>Run a query to see results here.</p>
-        <p class="faint">{isMac ? '⌘' : 'Ctrl'}+Enter runs the query. Type a prefix like <span class="mono">foaf:</span> for completions; missing PREFIX lines are added for you.</p>
+        <p class="faint">
+          {isMac ? '⌘' : 'Ctrl'}+Enter runs the query. Type a prefix like
+          <span class="mono">foaf:</span> for completions; missing PREFIX lines are added for you.
+        </p>
       </div>
     {:else}
       {#if outcome.result || outcome.explain || outcome.status === 'running'}
-      <div class="rbar">
-        <div class="tabs" role="tablist">
-          {#if outcome.result || (outcome.status === 'running' && outcome.view !== 'explain')}
-            <button class="tab" role="tab" aria-selected={outcome.view === 'table'} onclick={() => setView('table')}>
-              <Icon name="table" size={14} /> Table
-              {#if outcome.result?.meta}<span class="count">{fmtInt(outcome.result.meta.totalRows)}</span>{/if}
-            </button>
-            {#if outcome.result?.queryType !== 'ASK'}
-              <button class="tab" role="tab" aria-selected={outcome.view === 'graph'} onclick={() => setView('graph')}>
-                <Icon name="graph" size={14} /> Graph
+        <div class="rbar">
+          <div class="tabs" role="tablist">
+            {#if outcome.result || (outcome.status === 'running' && outcome.view !== 'explain')}
+              <button
+                class="tab"
+                role="tab"
+                aria-selected={outcome.view === 'table'}
+                onclick={() => setView('table')}
+              >
+                <Icon name="table" size={14} /> Table
+                {#if outcome.result?.meta}<span class="count"
+                    >{fmtInt(outcome.result.meta.totalRows)}</span
+                  >{/if}
+              </button>
+              {#if outcome.result?.queryType !== 'ASK'}
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={outcome.view === 'graph'}
+                  onclick={() => setView('graph')}
+                >
+                  <Icon name="graph" size={14} /> Graph
+                </button>
+              {/if}
+              <button
+                class="tab"
+                role="tab"
+                aria-selected={outcome.view === 'plan'}
+                onclick={() => setView('plan')}
+              >
+                <Icon name="plan" size={14} /> Plan
+              </button>
+              <button
+                class="tab"
+                role="tab"
+                aria-selected={outcome.view === 'raw'}
+                onclick={() => setView('raw')}
+              >
+                <Icon name="code" size={14} /> Raw
               </button>
             {/if}
-            <button class="tab" role="tab" aria-selected={outcome.view === 'plan'} onclick={() => setView('plan')}>
-              <Icon name="plan" size={14} /> Plan
-            </button>
-            <button class="tab" role="tab" aria-selected={outcome.view === 'raw'} onclick={() => setView('raw')}>
-              <Icon name="code" size={14} /> Raw
-            </button>
+            {#if outcome.explain || outcome.view === 'explain'}
+              <button
+                class="tab"
+                role="tab"
+                aria-selected={outcome.view === 'explain'}
+                onclick={() => setView('explain')}
+              >
+                <Icon name="zap" size={14} /> Explain
+              </button>
+            {/if}
+          </div>
+          {#if outcome.reasoning === false && outcome.view !== 'explain'}
+            <span
+              class="badge"
+              title="Ran with reasoning=false: materialized inferences were excluded"
+              >no inferences</span
+            >
           {/if}
-          {#if outcome.explain || outcome.view === 'explain'}
-            <button class="tab" role="tab" aria-selected={outcome.view === 'explain'} onclick={() => setView('explain')}>
-              <Icon name="zap" size={14} /> Explain
-            </button>
+          <span class="spacer"></span>
+          {#if outcome.status === 'running'}
+            <span class="row faint"
+              ><span class="spinner"></span> Running {fmtMs(now - outcome.startedAt)}</span
+            >
+          {:else if timing && outcome.view !== 'explain'}
+            <div class="timing" title="Server-side timing">
+              <div class="tbar">
+                {#each phases as ph (ph.key)}
+                  <span
+                    style:width="{(ph.ms / phaseTotal) * 100}%"
+                    style:background={ph.color}
+                    title="{ph.key} {fmtMs(ph.ms)}"
+                  ></span>
+                {/each}
+              </div>
+              <div class="tlegend">
+                {#each phases as ph (ph.key)}
+                  <span><i style:background={ph.color}></i>{ph.key} {fmtMs(ph.ms)}</span>
+                {/each}
+                <strong>{fmtMs(timing.totalMs)}</strong>
+              </div>
+            </div>
           {/if}
         </div>
-        {#if outcome.reasoning === false && outcome.view !== 'explain'}
-          <span class="badge" title="Ran with reasoning=false: materialized inferences were excluded">no inferences</span>
-        {/if}
-        <span class="spacer"></span>
-        {#if outcome.status === 'running'}
-          <span class="row faint"><span class="spinner"></span> Running {fmtMs(now - outcome.startedAt)}</span>
-        {:else if timing && outcome.view !== 'explain'}
-          <div class="timing" title="Server-side timing">
-            <div class="tbar">
-              {#each phases as ph (ph.key)}
-                <span style:width="{(ph.ms / phaseTotal) * 100}%" style:background={ph.color} title="{ph.key} {fmtMs(ph.ms)}"></span>
-              {/each}
-            </div>
-            <div class="tlegend">
-              {#each phases as ph (ph.key)}
-                <span><i style:background={ph.color}></i>{ph.key} {fmtMs(ph.ms)}</span>
-              {/each}
-              <strong>{fmtMs(timing.totalMs)}</strong>
-            </div>
-          </div>
-        {/if}
-      </div>
       {/if}
 
       {#if outcome.result && outcome.result.meta.sentRows < outcome.result.meta.totalRows && outcome.view !== 'explain'}
         <div class="notice">
           <Icon name="info" size={14} />
-          Showing the first {fmtInt(outcome.result.meta.sentRows)} of {fmtInt(outcome.result.meta.totalRows)} results. Raise the row
-          limit or download the full result from Raw.
+          Showing the first {fmtInt(outcome.result.meta.sentRows)} of {fmtInt(
+            outcome.result.meta.totalRows,
+          )} results. Raise the row limit or download the full result from Raw.
         </div>
       {/if}
 
@@ -575,8 +717,14 @@
             <div class="error-box">
               <strong>{err.message}</strong>
               {#if err instanceof api.ApiError && err.line}
-                <span class="muted">at line {err.line}{#if err.column}, column {err.column}{/if}</span>
-                <button class="btn sm ghost" onclick={() => editor?.showError((err as api.ApiError).line, (err as api.ApiError).column)}>
+                <span class="muted"
+                  >at line {err.line}{#if err.column}, column {err.column}{/if}</span
+                >
+                <button
+                  class="btn sm ghost"
+                  onclick={() =>
+                    editor?.showError((err as api.ApiError).line, (err as api.ApiError).column)}
+                >
                   Show in editor
                 </button>
               {/if}
@@ -602,7 +750,9 @@
                 <div class="sub-head">Algebra <span class="faint">(SSE)</span></div>
                 <pre class="mono">{formatSse(outcome.explain.algebra)}</pre>
               </div>
-              <div class="explain-plan"><PlanView plan={outcome.explain.plan} executed={false} {prefixes} /></div>
+              <div class="explain-plan">
+                <PlanView plan={outcome.explain.plan} executed={false} {prefixes} />
+              </div>
             </div>
           {:else}
             <div class="empty"><span class="spinner"></span></div>
@@ -617,7 +767,12 @@
               </div>
             {:else if r.triples}
               {#if r.triples.length}
-                <ResultTable vars={['subject', 'predicate', 'object']} rows={r.triples} {prefixes} onopen={openIri} />
+                <ResultTable
+                  vars={['subject', 'predicate', 'object']}
+                  rows={r.triples}
+                  {prefixes}
+                  onopen={openIri}
+                />
               {:else}
                 <div class="empty">The query matched no triples.</div>
               {/if}
@@ -626,7 +781,10 @@
             {:else}
               <div class="empty">
                 <p>No results.</p>
-                <p class="faint">The pattern matched nothing in <strong>{outcome.ds}</strong>. Check IRIs and prefixes, or try the Explain view.</p>
+                <p class="faint">
+                  The pattern matched nothing in <strong>{outcome.ds}</strong>. Check IRIs and
+                  prefixes, or try the Explain view.
+                </p>
               </div>
             {/if}
           {:else if outcome.view === 'graph'}
@@ -635,7 +793,9 @@
                 {#if r.queryType === 'SELECT'}
                   {#each ['s', 'p', 'o'] as const as role (role)}
                     <label class="row">
-                      <span class="faint">{role === 's' ? 'Subject' : role === 'p' ? 'Predicate' : 'Object'}</span>
+                      <span class="faint"
+                        >{role === 's' ? 'Subject' : role === 'p' ? 'Predicate' : 'Object'}</span
+                      >
                       <select class="select sm" bind:value={gCols[role]}>
                         <option value="">{role === 'p' ? '(column name)' : '—'}</option>
                         {#each r.vars ?? [] as v (v)}<option value={v}>?{v}</option>{/each}
@@ -646,11 +806,14 @@
                 <label class="row check" class:disabled={!hasTypeEdges}>
                   <input type="checkbox" bind:checked={hideTypes} disabled={!hasTypeEdges} /> Hide rdf:type
                 </label>
-                <label class="row check"><input type="checkbox" bind:checked={hideLiterals} /> Hide literals</label>
+                <label class="row check"
+                  ><input type="checkbox" bind:checked={hideLiterals} /> Hide literals</label
+                >
                 <label class="row">
                   <span class="faint">Max nodes</span>
                   <select class="select sm" bind:value={maxNodes}>
-                    {#each [100, 250, 400, 1000, 2500] as n (n)}<option value={n}>{n}</option>{/each}
+                    {#each [100, 250, 400, 1000, 2500] as n (n)}<option value={n}>{n}</option
+                      >{/each}
                   </select>
                 </label>
                 <span class="spacer"></span>
@@ -659,7 +822,8 @@
               {#if graph.truncated}
                 <div class="notice warn">
                   <Icon name="alert" size={14} />
-                  Showing {graph.nodes.length} of {fmtInt(graph.totalNodes)} nodes. Large graphs are hard to read; add a LIMIT or raise Max nodes.
+                  Showing {graph.nodes.length} of {fmtInt(graph.totalNodes)} nodes. Large graphs are hard
+                  to read; add a LIMIT or raise Max nodes.
                 </div>
               {/if}
               <div class="gcanvas">
@@ -667,10 +831,14 @@
                   nodes={graph.nodes}
                   edges={graph.edges}
                   onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
-                  emptyText={r.queryType === 'SELECT' ? 'Pick subject and object columns to draw a graph' : 'No triples to draw'}
+                  emptyText={r.queryType === 'SELECT'
+                    ? 'Pick subject and object columns to draw a graph'
+                    : 'No triples to draw'}
                 />
               </div>
-              <div class="ghint faint">Double-click an IRI node to open it in Explore. Hover highlights its neighbourhood.</div>
+              <div class="ghint faint">
+                Double-click an IRI node to open it in Explore. Hover highlights its neighbourhood.
+              </div>
             </div>
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
@@ -684,15 +852,22 @@
                 <span class="faint">Download full result</span>
                 {#each r.queryType === 'CONSTRUCT' || r.queryType === 'DESCRIBE' ? GRAPH_DL : SELECT_DL as f (f.label)}
                   <button class="btn sm" onclick={() => download(f)} disabled={downloading != null}>
-                    {#if downloading === f.label}<span class="spinner"></span>{:else}<Icon name="download" size={13} />{/if}
+                    {#if downloading === f.label}<span class="spinner"></span>{:else}<Icon
+                        name="download"
+                        size={13}
+                      />{/if}
                     {f.label}
                   </button>
                 {/each}
                 <span class="spacer"></span>
-                <button class="btn sm ghost" onclick={copyRaw}><Icon name="copy" size={13} /> Copy JSON</button>
+                <button class="btn sm ghost" onclick={copyRaw}
+                  ><Icon name="copy" size={13} /> Copy JSON</button
+                >
               </div>
               {#if (r.rows?.length ?? 0) > 500 || (r.triples?.length ?? 0) > 500}
-                <div class="notice">Pretty-printing the first 500 rows. Downloads contain everything.</div>
+                <div class="notice">
+                  Pretty-printing the first 500 rows. Downloads contain everything.
+                </div>
               {/if}
               <pre class="json mono">{rawJson}</pre>
             </div>

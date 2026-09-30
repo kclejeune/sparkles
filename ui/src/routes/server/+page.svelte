@@ -46,7 +46,13 @@
       <p class="muted">{origin}</p>
     </div>
     <span class="spacer"></span>
-    <button class="btn" onclick={() => { load(); app.ping(); }}><Icon name="refresh" size={14} /> Refresh</button>
+    <button
+      class="btn"
+      onclick={() => {
+        load();
+        app.ping();
+      }}><Icon name="refresh" size={14} /> Refresh</button
+    >
   </header>
 
   {#if error}
@@ -61,10 +67,15 @@
     <div class="pulse" class:on={app.online} class:off={app.online === false}></div>
     <div class="grow">
       <div class="big">
-        {#if app.online === null}Checking…{:else if app.online}Up for {fmtDuration(uptime)}{:else}Unreachable{/if}
+        {#if app.online === null}Checking…{:else if app.online}Up for {fmtDuration(
+            uptime,
+          )}{:else}Unreachable{/if}
       </div>
       <div class="muted">
-        {[info ? `Started ${fmtTime(info.startedAt)}` : '', app.lastPingMs != null ? `ping ${app.lastPingMs.toFixed(0)} ms` : '']
+        {[
+          info ? `Started ${fmtTime(info.startedAt)}` : '',
+          app.lastPingMs != null ? `ping ${app.lastPingMs.toFixed(0)} ms` : '',
+        ]
           .filter(Boolean)
           .join(', ')}
       </div>
@@ -74,17 +85,35 @@
 
   {#if info}
     <dl class="kv panel">
-      <div><dt>Version</dt><dd class="mono">{info.version}</dd></div>
-      <div><dt>Started</dt><dd>{fmtTime(info.startedAt)}</dd></div>
-      <div><dt>Uptime</dt><dd>{fmtDuration(uptime)}</dd></div>
-      <div><dt>Datasets</dt><dd>{info.datasets.length}</dd></div>
-      <div><dt>Quads served</dt><dd>{fmtInt(totalQuads)}</dd></div>
+      <div>
+        <dt>Version</dt>
+        <dd class="mono">{info.version}</dd>
+      </div>
+      <div>
+        <dt>Started</dt>
+        <dd>{fmtTime(info.startedAt)}</dd>
+      </div>
+      <div>
+        <dt>Uptime</dt>
+        <dd>{fmtDuration(uptime)}</dd>
+      </div>
+      <div>
+        <dt>Datasets</dt>
+        <dd>{info.datasets.length}</dd>
+      </div>
+      <div>
+        <dt>Quads served</dt>
+        <dd>{fmtInt(totalQuads)}</dd>
+      </div>
     </dl>
 
     <section class="panel">
       <div class="panel-head"><h2>Endpoints</h2></div>
       <table class="data">
-        <thead><tr><th>Dataset</th><th>Query</th><th>Update</th><th>Graph store</th><th>Upload</th></tr></thead>
+        <thead
+          ><tr><th>Dataset</th><th>Query</th><th>Update</th><th>Graph store</th><th>Upload</th></tr
+          ></thead
+        >
         <tbody>
           {#each info.datasets as d (d.name)}
             <tr>

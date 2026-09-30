@@ -10,26 +10,135 @@ import {
   type CompletionContext,
   type CompletionResult,
 } from '@codemirror/autocomplete';
-import { HighlightStyle, StreamLanguage, syntaxHighlighting, type StringStream } from '@codemirror/language';
+import {
+  HighlightStyle,
+  StreamLanguage,
+  syntaxHighlighting,
+  type StringStream,
+} from '@codemirror/language';
 import { EditorState, StateEffect, StateField, type Extension } from '@codemirror/state';
 import { Decoration, EditorView, type DecorationSet } from '@codemirror/view';
 import { tags as t } from '@lezer/highlight';
 import { declaredPrefixes, shorten, type PrefixMap } from './rdf';
 
 export const KEYWORDS = [
-  'BASE', 'PREFIX', 'SELECT', 'DISTINCT', 'REDUCED', 'AS', 'CONSTRUCT', 'DESCRIBE', 'ASK', 'FROM', 'NAMED',
-  'WHERE', 'ORDER', 'BY', 'ASC', 'DESC', 'LIMIT', 'OFFSET', 'VALUES', 'OPTIONAL', 'GRAPH', 'SERVICE', 'SILENT',
-  'BIND', 'UNDEF', 'MINUS', 'UNION', 'FILTER', 'GROUP', 'HAVING', 'EXISTS', 'NOT', 'IN', 'LOAD', 'CLEAR',
-  'DROP', 'CREATE', 'ADD', 'MOVE', 'COPY', 'INSERT', 'DELETE', 'DATA', 'WITH', 'USING', 'DEFAULT', 'ALL', 'INTO', 'TO',
+  'BASE',
+  'PREFIX',
+  'SELECT',
+  'DISTINCT',
+  'REDUCED',
+  'AS',
+  'CONSTRUCT',
+  'DESCRIBE',
+  'ASK',
+  'FROM',
+  'NAMED',
+  'WHERE',
+  'ORDER',
+  'BY',
+  'ASC',
+  'DESC',
+  'LIMIT',
+  'OFFSET',
+  'VALUES',
+  'OPTIONAL',
+  'GRAPH',
+  'SERVICE',
+  'SILENT',
+  'BIND',
+  'UNDEF',
+  'MINUS',
+  'UNION',
+  'FILTER',
+  'GROUP',
+  'HAVING',
+  'EXISTS',
+  'NOT',
+  'IN',
+  'LOAD',
+  'CLEAR',
+  'DROP',
+  'CREATE',
+  'ADD',
+  'MOVE',
+  'COPY',
+  'INSERT',
+  'DELETE',
+  'DATA',
+  'WITH',
+  'USING',
+  'DEFAULT',
+  'ALL',
+  'INTO',
+  'TO',
 ];
 
 export const FUNCTIONS = [
-  'STR', 'LANG', 'LANGMATCHES', 'DATATYPE', 'BOUND', 'IRI', 'URI', 'BNODE', 'RAND', 'ABS', 'CEIL', 'FLOOR',
-  'ROUND', 'CONCAT', 'STRLEN', 'UCASE', 'LCASE', 'ENCODE_FOR_URI', 'CONTAINS', 'STRSTARTS', 'STRENDS',
-  'STRBEFORE', 'STRAFTER', 'YEAR', 'MONTH', 'DAY', 'HOURS', 'MINUTES', 'SECONDS', 'TIMEZONE', 'TZ', 'NOW',
-  'UUID', 'STRUUID', 'MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512', 'COALESCE', 'IF', 'STRLANG', 'STRDT',
-  'SAMETERM', 'ISIRI', 'ISURI', 'ISBLANK', 'ISLITERAL', 'ISNUMERIC', 'REGEX', 'SUBSTR', 'REPLACE', 'COUNT',
-  'SUM', 'MIN', 'MAX', 'AVG', 'SAMPLE', 'GROUP_CONCAT', 'SEPARATOR', 'TRIPLE', 'SUBJECT', 'PREDICATE', 'OBJECT', 'ISTRIPLE',
+  'STR',
+  'LANG',
+  'LANGMATCHES',
+  'DATATYPE',
+  'BOUND',
+  'IRI',
+  'URI',
+  'BNODE',
+  'RAND',
+  'ABS',
+  'CEIL',
+  'FLOOR',
+  'ROUND',
+  'CONCAT',
+  'STRLEN',
+  'UCASE',
+  'LCASE',
+  'ENCODE_FOR_URI',
+  'CONTAINS',
+  'STRSTARTS',
+  'STRENDS',
+  'STRBEFORE',
+  'STRAFTER',
+  'YEAR',
+  'MONTH',
+  'DAY',
+  'HOURS',
+  'MINUTES',
+  'SECONDS',
+  'TIMEZONE',
+  'TZ',
+  'NOW',
+  'UUID',
+  'STRUUID',
+  'MD5',
+  'SHA1',
+  'SHA256',
+  'SHA384',
+  'SHA512',
+  'COALESCE',
+  'IF',
+  'STRLANG',
+  'STRDT',
+  'SAMETERM',
+  'ISIRI',
+  'ISURI',
+  'ISBLANK',
+  'ISLITERAL',
+  'ISNUMERIC',
+  'REGEX',
+  'SUBSTR',
+  'REPLACE',
+  'COUNT',
+  'SUM',
+  'MIN',
+  'MAX',
+  'AVG',
+  'SAMPLE',
+  'GROUP_CONCAT',
+  'SEPARATOR',
+  'TRIPLE',
+  'SUBJECT',
+  'PREDICATE',
+  'OBJECT',
+  'ISTRIPLE',
 ];
 
 const KW = new Set(KEYWORDS);
@@ -96,7 +205,10 @@ export const sparqlLanguage = StreamLanguage.define<St>({
   name: 'sparql',
   startState: () => ({ inLongString: null }),
   token: tokenBase,
-  languageData: { commentTokens: { line: '#' }, closeBrackets: { brackets: ['(', '[', '{', '"', "'", '<'] } },
+  languageData: {
+    commentTokens: { line: '#' },
+    closeBrackets: { brackets: ['(', '[', '{', '"', "'", '<'] },
+  },
   tokenTable: {
     function: t.function(t.variableName),
     namespace: t.namespace,
@@ -191,7 +303,10 @@ function sparqlCompletions(data: CompletionData) {
     if (/\bPREFIX\s+$/i.test(before)) {
       return {
         from,
-        options: Object.entries(prefixes).map(([p, ns]) => ({ label: `${p}: <${ns}>`, type: 'namespace' })),
+        options: Object.entries(prefixes).map(([p, ns]) => ({
+          label: `${p}: <${ns}>`,
+          type: 'namespace',
+        })),
       };
     }
     const options: Completion[] = [
@@ -203,7 +318,10 @@ function sparqlCompletions(data: CompletionData) {
         detail: ns,
         boost: 2,
         apply: (view: EditorView, _c: Completion, f: number, t: number) => {
-          view.dispatch({ changes: { from: f, to: t, insert: `${p}:` }, selection: { anchor: f + p.length + 1 } });
+          view.dispatch({
+            changes: { from: f, to: t, insert: `${p}:` },
+            selection: { anchor: f + p.length + 1 },
+          });
           ensurePrefix(view, p, ns);
           // Re-open completion for the local part.
           queueMicrotask(() => startCompletion(view));
@@ -232,9 +350,12 @@ function sparqlCompletions(data: CompletionData) {
   };
 }
 
-
 export function sparqlCompletion(data: CompletionData): Extension {
-  return autocompletion({ override: [sparqlCompletions(data)], activateOnTyping: true, maxRenderedOptions: 80 });
+  return autocompletion({
+    override: [sparqlCompletions(data)],
+    activateOnTyping: true,
+    maxRenderedOptions: 80,
+  });
 }
 
 // --- error line -----------------------------------------------------------------
@@ -277,9 +398,20 @@ export function highlightError(view: EditorView, line: number | undefined, colum
   }
   const ln = Math.min(Math.max(1, line), view.state.doc.lines);
   const pos = view.state.doc.line(ln).from;
-  view.dispatch({ effects: [setErrorLocation.of({ line, column }), EditorView.scrollIntoView(pos, { y: 'center' })] });
+  view.dispatch({
+    effects: [
+      setErrorLocation.of({ line, column }),
+      EditorView.scrollIntoView(pos, { y: 'center' }),
+    ],
+  });
 }
 
 export function sparql(data: CompletionData): Extension {
-  return [sparqlLanguage, syntaxHighlighting(sparqlHighlight), sparqlCompletion(data), errorField, EditorState.tabSize.of(2)];
+  return [
+    sparqlLanguage,
+    syntaxHighlighting(sparqlHighlight),
+    sparqlCompletion(data),
+    errorField,
+    EditorState.tabSize.of(2),
+  ];
 }

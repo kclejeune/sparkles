@@ -57,7 +57,12 @@ function info(ds) {
   return {
     name: ds.name,
     type: ds.type,
-    endpoints: { query: `${base}/sparql`, update: `${base}/update`, gsp: `${base}/data`, upload: `${base}/upload` },
+    endpoints: {
+      query: `${base}/sparql`,
+      update: `${base}/update`,
+      gsp: `${base}/data`,
+      upload: `${base}/upload`,
+    },
     quads: ds.store.size,
     reasoning: ds.reasoning,
   };
@@ -113,11 +118,19 @@ function termJson(t) {
     case 'Literal': {
       const o = { type: 'literal', value: t.value };
       if (t.language) o['xml:lang'] = t.language;
-      else if (t.datatype && t.datatype.value !== 'http://www.w3.org/2001/XMLSchema#string') o.datatype = t.datatype.value;
+      else if (t.datatype && t.datatype.value !== 'http://www.w3.org/2001/XMLSchema#string')
+        o.datatype = t.datatype.value;
       return o;
     }
     case 'Quad':
-      return { type: 'triple', value: { subject: termJson(t.subject), predicate: termJson(t.predicate), object: termJson(t.object) } };
+      return {
+        type: 'triple',
+        value: {
+          subject: termJson(t.subject),
+          predicate: termJson(t.predicate),
+          object: termJson(t.object),
+        },
+      };
     default:
       return { type: 'literal', value: String(t.value) };
   }
@@ -126,7 +139,9 @@ function termJson(t) {
 function parseErr(e) {
   const msg = String(e?.message ?? e);
   const m = /(?:at|line)\s+(\d+):(\d+)/.exec(msg);
-  return m ? { error: 'Parse error', detail: msg, line: Number(m[1]), column: Number(m[2]) } : { error: 'Parse error', detail: msg };
+  return m
+    ? { error: 'Parse error', detail: msg, line: Number(m[1]), column: Number(m[2]) }
+    : { error: 'Parse error', detail: msg };
 }
 
 function queryOptions(ds, p) {
@@ -146,8 +161,9 @@ function queryOptions(ds, p) {
 
 function stripNoise(q) {
   return q
-    .replace(/("""[\s\S]*?"""|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(<[^<>"{}|^`\\\s]*>)|(#[^\n]*)/g, (m, str, iri) =>
-      str ? '"…"' : iri ? iri : '',
+    .replace(
+      /("""[\s\S]*?"""|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')|(<[^<>"{}|^`\\\s]*>)|(#[^\n]*)/g,
+      (m, str, iri) => (str ? '"…"' : iri ? iri : ''),
     )
     .replace(/\b(PREFIX\s+[\w-]*:\s*<[^>]*>|BASE\s+<[^>]*>)/gi, '')
     .trim();
@@ -185,14 +201,24 @@ function plan(query, totalRows, execMs, executed) {
   const n = (x) => (executed ? Math.max(0, Math.round(x)) : -1);
   let budget = Math.max(execMs, 0.05);
   const scans = pats.map(([s, p, o], i) => {
-    const perm = !isVar(s) ? 'SPO' : !isVar(p) && !isVar(o) ? 'POS' : !isVar(p) ? 'PSO' : !isVar(o) ? 'OSP' : 'SPO';
+    const perm = !isVar(s)
+      ? 'SPO'
+      : !isVar(p) && !isVar(o)
+        ? 'POS'
+        : !isVar(p)
+          ? 'PSO'
+          : !isVar(o)
+            ? 'OSP'
+            : 'SPO';
     const est = !isVar(s) ? 8 : !isVar(o) ? 40 : !isVar(p) ? 400 : 5000;
     const rows = Math.max(totalRows, 1) * (1 + ((i * 37) % 5));
     return {
       operator: 'IndexScan',
       description: `${perm} ${s} ${p} ${o}`,
       columns: [s, p, o].filter(isVar),
-      sortedOn: [perm === 'SPO' ? s : perm === 'POS' || perm === 'PSO' ? (perm === 'POS' ? o : s) : o].filter(isVar),
+      sortedOn: [
+        perm === 'SPO' ? s : perm === 'POS' || perm === 'PSO' ? (perm === 'POS' ? o : s) : o,
+      ].filter(isVar),
       estimatedRows: est,
       estimatedCost: est,
       actualRows: n(Math.min(rows, est * 3)),
@@ -203,12 +229,24 @@ function plan(query, totalRows, execMs, executed) {
   });
   let node =
     scans.length === 0
-      ? { operator: 'Values', description: 'single empty row', columns: [], sortedOn: [], estimatedRows: 1, estimatedCost: 1, actualRows: n(1), timeMs: 0, cached: false, children: [] }
+      ? {
+          operator: 'Values',
+          description: 'single empty row',
+          columns: [],
+          sortedOn: [],
+          estimatedRows: 1,
+          estimatedCost: 1,
+          actualRows: n(1),
+          timeMs: 0,
+          cached: false,
+          children: [],
+        }
       : scans[0];
   for (let i = 1; i < scans.length; i++) {
     const right = scans[i];
     const shared = node.columns.filter((c) => right.columns.includes(c));
-    const merge = shared.length && node.sortedOn[0] === shared[0] && right.sortedOn[0] === shared[0];
+    const merge =
+      shared.length && node.sortedOn[0] === shared[0] && right.sortedOn[0] === shared[0];
     node = {
       operator: shared.length ? (merge ? 'MergeJoin' : 'HashJoin') : 'CartesianProduct',
       description: shared.length ? `on ${shared.join(', ')}` : 'no shared variables',
@@ -260,7 +298,9 @@ function sse(query) {
   const q = stripNoise(query);
   const filter = /FILTER\s*\(([^)]*)\)/i.exec(q);
   if (filter) out = `(filter (${filter[1].trim()})\n  ${out.replace(/\n/g, '\n  ')})`;
-  const vars = /SELECT\s+(?:DISTINCT\s+)?(.*?)\s*(?:WHERE|FROM|\{)/is.exec(q)?.[1]?.match(/[?$]\w+/g);
+  const vars = /SELECT\s+(?:DISTINCT\s+)?(.*?)\s*(?:WHERE|FROM|\{)/is
+    .exec(q)?.[1]
+    ?.match(/[?$]\w+/g);
   if (vars) out = `(project (${vars.join(' ')})\n  ${out.replace(/\n/g, '\n  ')})`;
   const limit = /\bLIMIT\s+(\d+)/i.exec(q);
   if (limit) out = `(slice _ ${limit[1]}\n  ${out.replace(/\n/g, '\n  ')})`;
@@ -315,13 +355,23 @@ async function handleQuery(req, res, ds, p) {
   const sparkles = accept.includes('application/x-sparkles+json') || fmtParam === 'sparkles';
   if (!sparkles) {
     // Standard content negotiation.
-    const isGraph = Array.isArray(result) && (result.length === 0 ? /^\s*(CONSTRUCT|DESCRIBE)/im.test(stripNoise(query)) : !(result[0] instanceof Map));
+    const isGraph =
+      Array.isArray(result) &&
+      (result.length === 0
+        ? /^\s*(CONSTRUCT|DESCRIBE)/im.test(stripNoise(query))
+        : !(result[0] instanceof Map));
     if (isGraph) {
-      const fmt = GRAPH_FORMATS[fmtParam] ?? pickFormat(accept, Object.values(GRAPH_FORMATS)) ?? 'text/turtle';
+      const fmt =
+        GRAPH_FORMATS[fmtParam] ??
+        pickFormat(accept, Object.values(GRAPH_FORMATS)) ??
+        'text/turtle';
       const out = ds.store.query(query, { ...queryOptions(ds, p), results_format: fmt });
       return send(res, 200, out, fmt);
     }
-    const fmt = SELECT_FORMATS[fmtParam] ?? pickFormat(accept, Object.values(SELECT_FORMATS)) ?? 'application/sparql-results+json';
+    const fmt =
+      SELECT_FORMATS[fmtParam] ??
+      pickFormat(accept, Object.values(SELECT_FORMATS)) ??
+      'application/sparql-results+json';
     const out = ds.store.query(query, { ...queryOptions(ds, p), results_format: fmt });
     return send(res, 200, out, fmt);
   }
@@ -333,17 +383,30 @@ async function handleQuery(req, res, ds, p) {
   if (typeof result === 'boolean') {
     body = { queryType: 'ASK', boolean: result, total: 1 };
   } else if (result.length && !(result[0] instanceof Map)) {
-    const triples = result.map((q) => [termJson(q.subject), termJson(q.predicate), termJson(q.object)]);
+    const triples = result.map((q) => [
+      termJson(q.subject),
+      termJson(q.predicate),
+      termJson(q.object),
+    ]);
     body = {
       queryType: /^\s*DESCRIBE/im.test(stripNoise(query)) ? 'DESCRIBE' : 'CONSTRUCT',
       triples: triples.slice(0, cap),
       total: triples.length,
     };
   } else if (/^\s*(CONSTRUCT|DESCRIBE)/im.test(stripNoise(query))) {
-    body = { queryType: /^\s*DESCRIBE/im.test(stripNoise(query)) ? 'DESCRIBE' : 'CONSTRUCT', triples: [], total: 0 };
+    body = {
+      queryType: /^\s*DESCRIBE/im.test(stripNoise(query)) ? 'DESCRIBE' : 'CONSTRUCT',
+      triples: [],
+      total: 0,
+    };
   } else {
     // Use the JSON serializer for projection order, then reshape into rows.
-    const json = JSON.parse(ds.store.query(query, { ...queryOptions(ds, p), results_format: 'application/sparql-results+json' }));
+    const json = JSON.parse(
+      ds.store.query(query, {
+        ...queryOptions(ds, p),
+        results_format: 'application/sparql-results+json',
+      }),
+    );
     const vars = json.head.vars;
     const rows = json.results.bindings.map((b) => vars.map((v) => b[v] ?? null));
     body = { queryType: 'SELECT', vars, rows: rows.slice(0, cap), total: rows.length };
@@ -353,21 +416,26 @@ async function handleQuery(req, res, ds, p) {
   const sent = rest.rows?.length ?? rest.triples?.length ?? 1;
   const parseMs = 0.05 + query.length / 20000;
   const planMs = 0.1 + extractPatterns(query).length * 0.04;
-  send(res, 200, {
-    ...rest,
-    meta: {
-      totalRows: total,
-      sentRows: sent,
-      timing: {
-        parseMs: +parseMs.toFixed(3),
-        planMs: +planMs.toFixed(3),
-        execMs: +execMs.toFixed(3),
-        serializeMs: +serializeMs.toFixed(3),
-        totalMs: +(parseMs + planMs + execMs + serializeMs).toFixed(3),
+  send(
+    res,
+    200,
+    {
+      ...rest,
+      meta: {
+        totalRows: total,
+        sentRows: sent,
+        timing: {
+          parseMs: +parseMs.toFixed(3),
+          planMs: +planMs.toFixed(3),
+          execMs: +execMs.toFixed(3),
+          serializeMs: +serializeMs.toFixed(3),
+          totalMs: +(parseMs + planMs + execMs + serializeMs).toFixed(3),
+        },
+        plan: plan(query, total, execMs, true),
       },
-      plan: plan(query, total, execMs, true),
     },
-  }, 'application/x-sparkles+json');
+    'application/x-sparkles+json',
+  );
 }
 
 function handleUpdate(res, ds, p) {
@@ -413,14 +481,23 @@ function parseMultipart(body, contentType) {
 }
 
 const EXT_FORMATS = {
-  ttl: 'text/turtle', nt: 'application/n-triples', nq: 'application/n-quads', trig: 'application/trig',
-  rdf: 'application/rdf+xml', owl: 'application/rdf+xml', xml: 'application/rdf+xml', n3: 'text/n3',
+  ttl: 'text/turtle',
+  nt: 'application/n-triples',
+  nq: 'application/n-quads',
+  trig: 'application/trig',
+  rdf: 'application/rdf+xml',
+  owl: 'application/rdf+xml',
+  xml: 'application/rdf+xml',
+  n3: 'text/n3',
 };
 
 async function handleUpload(req, res, ds) {
   const body = await readBody(req);
   const parts = parseMultipart(body, req.headers['content-type'] ?? '');
-  const graph = parts.find((x) => x.name === 'graph' && !x.filename)?.data.toString('utf8').trim();
+  const graph = parts
+    .find((x) => x.name === 'graph' && !x.filename)
+    ?.data.toString('utf8')
+    .trim();
   let count = 0;
   for (const part of parts.filter((x) => x.filename)) {
     const ext = part.filename.split('.').pop()?.toLowerCase() ?? '';
@@ -433,7 +510,8 @@ async function handleUpload(req, res, ds) {
     } catch (e) {
       return send(res, 400, { ...parseErr(e), error: `Failed to parse ${part.filename}` });
     }
-    for (const [, pfx, iri] of text.matchAll(/@prefix\s+([\w-]*):\s*<([^>]+)>/gi)) ds.prefixes[pfx] = iri;
+    for (const [, pfx, iri] of text.matchAll(/@prefix\s+([\w-]*):\s*<([^>]+)>/gi))
+      ds.prefixes[pfx] = iri;
     count += ds.store.size - before;
     ds.deltaInserts += ds.store.size - before;
   }
@@ -444,7 +522,14 @@ async function handleUpload(req, res, ds) {
 // tasks
 
 function startTask(kind, ds, work, durationMs = 2500) {
-  const task = { id: String(taskSeq++), kind, dataset: ds.name, state: 'running', startedAt: new Date().toISOString(), progress: 0 };
+  const task = {
+    id: String(taskSeq++),
+    kind,
+    dataset: ds.name,
+    state: 'running',
+    startedAt: new Date().toISOString(),
+    progress: 0,
+  };
   tasks.unshift(task);
   const steps = 10;
   let i = 0;
@@ -489,17 +574,30 @@ function inferredCount(ds) {
 function stats(ds) {
   const q = (s) => ds.store.query(s, { use_default_graph_as_union: true });
   const num = (t) => Number(t?.value ?? 0);
-  const graphs = [{ name: null, quads: ds.store.match(null, null, null, ox.defaultGraph()).length }];
-  for (const b of ds.store.query('SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY DESC(?n)')) {
+  const graphs = [
+    { name: null, quads: ds.store.match(null, null, null, ox.defaultGraph()).length },
+  ];
+  for (const b of ds.store.query(
+    'SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY DESC(?n)',
+  )) {
     graphs.push({ name: b.get('g').value, quads: num(b.get('n')) });
   }
   const predicates = q(
     'SELECT ?p (COUNT(*) AS ?n) (COUNT(DISTINCT ?s) AS ?ds) (COUNT(DISTINCT ?o) AS ?do) WHERE { ?s ?p ?o } GROUP BY ?p ORDER BY DESC(?n) LIMIT 100',
-  ).map((b) => ({ iri: b.get('p').value, count: num(b.get('n')), distinctSubjects: num(b.get('ds')), distinctObjects: num(b.get('do')) }));
-  const classes = q('SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c FILTER(isIRI(?c)) } GROUP BY ?c ORDER BY DESC(?n) LIMIT 100').map(
-    (b) => ({ iri: b.get('c').value, instances: num(b.get('n')) }),
+  ).map((b) => ({
+    iri: b.get('p').value,
+    count: num(b.get('n')),
+    distinctSubjects: num(b.get('ds')),
+    distinctObjects: num(b.get('do')),
+  }));
+  const classes = q(
+    'SELECT ?c (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ?c FILTER(isIRI(?c)) } GROUP BY ?c ORDER BY DESC(?n) LIMIT 100',
+  ).map((b) => ({ iri: b.get('c').value, instances: num(b.get('n')) }));
+  const terms = num(
+    q(
+      'SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { { ?t ?p ?o } UNION { ?s ?t ?o } UNION { ?s ?p ?t } }',
+    )[0]?.get('n'),
   );
-  const terms = num(q('SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { { ?t ?p ?o } UNION { ?s ?t ?o } UNION { ?s ?p ?t } }')[0]?.get('n'));
   return {
     name: ds.name,
     quads: ds.store.size,
@@ -524,11 +622,18 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = decodeURIComponent(url.pathname);
   const seg = path.split('/').filter(Boolean);
-  const log = () => console.log(`${new Date().toISOString().slice(11, 19)} ${req.method} ${req.url?.slice(0, 120)} → ${res.statusCode}`);
+  const log = () =>
+    console.log(
+      `${new Date().toISOString().slice(11, 19)} ${req.method} ${req.url?.slice(0, 120)} → ${res.statusCode}`,
+    );
   res.on('finish', log);
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': '*' });
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': '*',
+      });
       return res.end();
     }
     if (seg[0] === '$') {
@@ -546,14 +651,19 @@ const server = http.createServer(async (req, res) => {
           });
         case 'datasets': {
           if (!name) {
-            if (req.method === 'GET') return send(res, 200, { datasets: [...datasets.values()].map(info) });
+            if (req.method === 'GET')
+              return send(res, 200, { datasets: [...datasets.values()].map(info) });
             if (req.method === 'POST') {
               const p = await params(req, url);
               const dbName = String(p.get('dbName') ?? '').replace(/^\//, '');
               const dbType = String(p.get('dbType') ?? 'mem');
-              if (!/^[A-Za-z0-9_.-]+$/.test(dbName)) return fail(res, 400, 'Invalid dataset name', { detail: 'Use letters, digits, "_", "-" or "."' });
+              if (!/^[A-Za-z0-9_.-]+$/.test(dbName))
+                return fail(res, 400, 'Invalid dataset name', {
+                  detail: 'Use letters, digits, "_", "-" or "."',
+                });
               if (datasets.has(dbName)) return fail(res, 409, `Dataset "${dbName}" already exists`);
-              if (!['mem', 'persistent'].includes(dbType)) return fail(res, 400, 'dbType must be "mem" or "persistent"');
+              if (!['mem', 'persistent'].includes(dbType))
+                return fail(res, 400, 'dbType must be "mem" or "persistent"');
               return send(res, 201, info(makeDataset(dbName, dbType)));
             }
             break;
@@ -574,15 +684,28 @@ const server = http.createServer(async (req, res) => {
           return send(res, 200, { prefixes: ds.prefixes });
         case 'compact':
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
-          return send(res, 200, startTask('compact', ds, () => {
-            ds.baseQuads = ds.store.size;
-            ds.deltaInserts = 0;
-            ds.deltaDeletes = 0;
-            return `Merged delta into base (${ds.baseQuads} quads)`;
-          }));
+          return send(
+            res,
+            200,
+            startTask('compact', ds, () => {
+              ds.baseQuads = ds.store.size;
+              ds.deltaInserts = 0;
+              ds.deltaDeletes = 0;
+              return `Merged delta into base (${ds.baseQuads} quads)`;
+            }),
+          );
         case 'backup':
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
-          return send(res, 200, startTask('backup', ds, () => `Wrote backups/${ds.name}_${new Date().toISOString().slice(0, 10)}.nq.gz`, 1500));
+          return send(
+            res,
+            200,
+            startTask(
+              'backup',
+              ds,
+              () => `Wrote backups/${ds.name}_${new Date().toISOString().slice(0, 10)}.nq.gz`,
+              1500,
+            ),
+          );
         case 'reason': {
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
           if (req.method === 'DELETE') {
@@ -592,14 +715,34 @@ const server = http.createServer(async (req, res) => {
           }
           const p = await params(req, url);
           const profile = String(p.get('profile') ?? 'rdfs');
-          if (!['rdfs', 'owl-rl', 'rules'].includes(profile)) return fail(res, 400, `Unknown profile "${profile}"`);
-          if (profile === 'rules' && !String(p.get('rules') ?? '').trim()) return fail(res, 400, 'Custom rules are empty');
-          return send(res, 200, startTask('reason', ds, () => {
-            const rules = profile === 'rules' ? [String(p.get('rules'))] : profile === 'owl-rl' ? [...RDFS_RULES, ...OWL_RULES] : RDFS_RULES;
-            for (let pass = 0; pass < 3; pass++) for (const r of rules) ds.store.update(r);
-            ds.reasoning = { profile, inferred: inferredCount(ds), at: new Date().toISOString() };
-            return `Inferred ${ds.reasoning.inferred} triples (${profile})`;
-          }, 3000));
+          if (!['rdfs', 'owl-rl', 'rules'].includes(profile))
+            return fail(res, 400, `Unknown profile "${profile}"`);
+          if (profile === 'rules' && !String(p.get('rules') ?? '').trim())
+            return fail(res, 400, 'Custom rules are empty');
+          return send(
+            res,
+            200,
+            startTask(
+              'reason',
+              ds,
+              () => {
+                const rules =
+                  profile === 'rules'
+                    ? [String(p.get('rules'))]
+                    : profile === 'owl-rl'
+                      ? [...RDFS_RULES, ...OWL_RULES]
+                      : RDFS_RULES;
+                for (let pass = 0; pass < 3; pass++) for (const r of rules) ds.store.update(r);
+                ds.reasoning = {
+                  profile,
+                  inferred: inferredCount(ds),
+                  at: new Date().toISOString(),
+                };
+                return `Inferred ${ds.reasoning.inferred} triples (${profile})`;
+              },
+              3000,
+            ),
+          );
         }
         case 'tasks': {
           if (name) {
@@ -628,7 +771,9 @@ const server = http.createServer(async (req, res) => {
       const query = p.get('query');
       if (!query) return fail(res, 400, 'Missing query parameter');
       try {
-        ds.store.query(query.replace(/\bLIMIT\s+\d+/i, '') + (/\bLIMIT\b/i.test(query) ? '' : ''), { use_default_graph_as_union: true });
+        ds.store.query(query.replace(/\bLIMIT\s+\d+/i, '') + (/\bLIMIT\b/i.test(query) ? '' : ''), {
+          use_default_graph_as_union: true,
+        });
       } catch (e) {
         return send(res, 400, parseErr(e));
       }
@@ -639,9 +784,19 @@ const server = http.createServer(async (req, res) => {
         const graph = url.searchParams.get('graph');
         if (graph || url.searchParams.has('default')) {
           const from = graph ? ox.namedNode(graph) : ox.defaultGraph();
-          return send(res, 200, ds.store.dump({ format: 'text/turtle', from_graph_name: from }), 'text/turtle');
+          return send(
+            res,
+            200,
+            ds.store.dump({ format: 'text/turtle', from_graph_name: from }),
+            'text/turtle',
+          );
         }
-        return send(res, 200, ds.store.dump({ format: 'application/n-quads' }), 'application/n-quads');
+        return send(
+          res,
+          200,
+          ds.store.dump({ format: 'application/n-quads' }),
+          'application/n-quads',
+        );
       }
       return fail(res, 405, 'Only GET is mocked for the Graph Store Protocol');
     }
@@ -653,5 +808,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`sparkles mock listening on http://localhost:${PORT}  (datasets: ${[...datasets.keys()].join(', ')})`);
+  console.log(
+    `sparkles mock listening on http://localhost:${PORT}  (datasets: ${[...datasets.keys()].join(', ')})`,
+  );
 });

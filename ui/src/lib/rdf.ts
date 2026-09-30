@@ -134,7 +134,9 @@ export function isUpdate(q: string): boolean {
   return !s || u.index < s.index;
 }
 
-export function queryKind(q: string): 'SELECT' | 'ASK' | 'CONSTRUCT' | 'DESCRIBE' | 'UPDATE' | null {
+export function queryKind(
+  q: string,
+): 'SELECT' | 'ASK' | 'CONSTRUCT' | 'DESCRIBE' | 'UPDATE' | null {
   if (isUpdate(q)) return 'UPDATE';
   const m = QUERY_RE.exec(stripQueryNoise(q));
   return m ? (m[1].toUpperCase() as 'SELECT') : null;

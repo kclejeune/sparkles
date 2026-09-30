@@ -42,7 +42,9 @@
   {#if open}
     <div class="head">
       <h2 id="modal-title">{title}</h2>
-      <button class="btn ghost icon sm" onclick={close} aria-label="Close"><Icon name="x" size={14} /></button>
+      <button class="btn ghost icon sm" onclick={close} aria-label="Close"
+        ><Icon name="x" size={14} /></button
+      >
     </div>
     <div class="body">{@render children()}</div>
     {#if actions}<div class="actions">{@render actions()}</div>{/if}

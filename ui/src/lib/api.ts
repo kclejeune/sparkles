@@ -66,7 +66,13 @@ export type PlanNode = {
   children: PlanNode[];
 };
 
-export type Timing = { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
+export type Timing = {
+  parseMs: number;
+  planMs: number;
+  execMs: number;
+  serializeMs: number;
+  totalMs: number;
+};
 
 export type QueryType = 'SELECT' | 'ASK' | 'CONSTRUCT' | 'DESCRIBE';
 
@@ -89,7 +95,11 @@ export class ApiError extends Error {
   detail?: string;
   line?: number;
   column?: number;
-  constructor(status: number, message: string, extra: { detail?: string; line?: number; column?: number } = {}) {
+  constructor(
+    status: number,
+    message: string,
+    extra: { detail?: string; line?: number; column?: number } = {},
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
@@ -113,7 +123,11 @@ async function toError(res: Response): Promise<ApiError> {
   try {
     const body = JSON.parse(text);
     if (body && typeof body.error === 'string') {
-      return new ApiError(res.status, body.error, { detail: body.detail, line: body.line, column: body.column });
+      return new ApiError(res.status, body.error, {
+        detail: body.detail,
+        line: body.line,
+        column: body.column,
+      });
     }
   } catch {
     /* not JSON */
@@ -135,7 +149,10 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
 }
 
 async function json<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await request(path, { ...init, headers: { Accept: 'application/json', ...(init.headers ?? {}) } });
+  const res = await request(path, {
+    ...init,
+    headers: { Accept: 'application/json', ...(init.headers ?? {}) },
+  });
   const text = await res.text();
   if (!text) return undefined as T;
   try {
@@ -172,7 +189,8 @@ export const getDataset = (ds: string) => json<DatasetInfo>(`/$/datasets/${enc(d
 export const createDataset = (dbName: string, dbType: DatasetType) =>
   json<unknown>('/$/datasets', jsonBody({ dbName, dbType }));
 
-export const deleteDataset = (ds: string) => json<unknown>(`/$/datasets/${enc(ds)}`, { method: 'DELETE' });
+export const deleteDataset = (ds: string) =>
+  json<unknown>(`/$/datasets/${enc(ds)}`, { method: 'DELETE' });
 
 export const datasetStats = (ds: string) => json<DatasetStats>(`/$/stats/${enc(ds)}`);
 
@@ -181,13 +199,17 @@ export const compact = (ds: string) => json<Task>(`/$/compact/${enc(ds)}`, { met
 export const backup = (ds: string) => json<Task>(`/$/backup/${enc(ds)}`, { method: 'POST' });
 
 export const reason = (ds: string, profile: ReasonProfile, rules?: string) =>
-  json<Task>(`/$/reason/${enc(ds)}`, jsonBody(profile === 'rules' ? { profile, rules } : { profile }));
+  json<Task>(
+    `/$/reason/${enc(ds)}`,
+    jsonBody(profile === 'rules' ? { profile, rules } : { profile }),
+  );
 
 /** Drop the dataset's cached query results (`POST /$/cache/clear/{ds}`, a Sparkles extension). */
 export const clearResultCache = (ds: string) =>
   json<{ cleared: number; bytes: number }>(`/$/cache/clear/${enc(ds)}`, { method: 'POST' });
 
-export const dropInferences = (ds: string) => json<unknown>(`/$/reason/${enc(ds)}`, { method: 'DELETE' });
+export const dropInferences = (ds: string) =>
+  json<unknown>(`/$/reason/${enc(ds)}`, { method: 'DELETE' });
 
 export async function listTasks(): Promise<Task[]> {
   const body = await json<Task[] | { tasks: Task[] }>('/$/tasks');
@@ -223,7 +245,11 @@ function queryParams(opts: QueryOptions): string {
 }
 
 /** Run a query and get the rich UI result format (rows + timing + plan). */
-export async function query(ds: string, sparql: string, opts: QueryOptions = {}): Promise<SparklesResult> {
+export async function query(
+  ds: string,
+  sparql: string,
+  opts: QueryOptions = {},
+): Promise<SparklesResult> {
   const res = await request(`/${enc(ds)}/sparql${queryParams(opts)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/sparql-query', Accept: SPARKLES_JSON },
@@ -235,7 +261,12 @@ export async function query(ds: string, sparql: string, opts: QueryOptions = {})
 }
 
 /** Run a query with an arbitrary Accept header and return the raw response body. */
-export async function queryRaw(ds: string, sparql: string, accept: string, opts: QueryOptions = {}): Promise<Blob> {
+export async function queryRaw(
+  ds: string,
+  sparql: string,
+  accept: string,
+  opts: QueryOptions = {},
+): Promise<Blob> {
   const res = await request(`/${enc(ds)}/sparql${queryParams(opts)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/sparql-query', Accept: accept },
@@ -246,9 +277,18 @@ export async function queryRaw(ds: string, sparql: string, accept: string, opts:
 }
 
 /** Response of `/{ds}/update`: quad counts and server-side timing. */
-export type UpdateResult = { inserted: number; deleted: number; operations: number; timing?: Timing };
+export type UpdateResult = {
+  inserted: number;
+  deleted: number;
+  operations: number;
+  timing?: Timing;
+};
 
-export async function update(ds: string, sparql: string, signal?: AbortSignal): Promise<UpdateResult | null> {
+export async function update(
+  ds: string,
+  sparql: string,
+  signal?: AbortSignal,
+): Promise<UpdateResult | null> {
   const res = await request(`/${enc(ds)}/update`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/sparql-update', Accept: 'application/json' },
@@ -286,7 +326,9 @@ export async function select(
 ): Promise<Record<string, Term | undefined>[]> {
   const r = await query(ds, sparql, opts);
   const vars = r.vars ?? [];
-  return (r.rows ?? []).map((row) => Object.fromEntries(vars.map((v, i) => [v, row[i] ?? undefined])));
+  return (r.rows ?? []).map((row) =>
+    Object.fromEntries(vars.map((v, i) => [v, row[i] ?? undefined])),
+  );
 }
 
 function normalizeResult(r: SparklesResult): SparklesResult {
@@ -325,7 +367,12 @@ export type ShaclOptions = {
   signal?: AbortSignal;
 };
 
-function shaclRequest(ds: string, shapes: string, accept: string, opts: ShaclOptions): Promise<Response> {
+function shaclRequest(
+  ds: string,
+  shapes: string,
+  accept: string,
+  opts: ShaclOptions,
+): Promise<Response> {
   const p = new URLSearchParams();
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
@@ -339,13 +386,22 @@ function shaclRequest(ds: string, shapes: string, accept: string, opts: ShaclOpt
 }
 
 /** Validate a data graph against a Turtle shapes graph; compact JSON report. */
-export async function shacl(ds: string, shapes: string, opts: ShaclOptions = {}): Promise<ShaclReport> {
+export async function shacl(
+  ds: string,
+  shapes: string,
+  opts: ShaclOptions = {},
+): Promise<ShaclReport> {
   const res = await shaclRequest(ds, shapes, 'application/json', opts);
   return (await res.json()) as ShaclReport;
 }
 
 /** Same validation, report in an RDF syntax (e.g. `text/turtle`) for download. */
-export async function shaclRaw(ds: string, shapes: string, accept: string, opts: ShaclOptions = {}): Promise<Blob> {
+export async function shaclRaw(
+  ds: string,
+  shapes: string,
+  accept: string,
+  opts: ShaclOptions = {},
+): Promise<Blob> {
   const res = await shaclRequest(ds, shapes, accept, opts);
   return res.blob();
 }
@@ -367,7 +423,8 @@ export function upload(
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/${enc(ds)}/upload`);
     xhr.setRequestHeader('Accept', 'application/json');
-    xhr.upload.onprogress = (e) => opts.onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 });
+    xhr.upload.onprogress = (e) =>
+      opts.onProgress?.({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 });
     xhr.onerror = () => reject(new ApiError(0, 'Upload failed: network error'));
     xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
     xhr.onload = () => {
@@ -393,7 +450,8 @@ export function upload(
 }
 
 export function errorMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.detail && e.detail !== e.message ? `${e.message}: ${e.detail}` : e.message;
+  if (e instanceof ApiError)
+    return e.detail && e.detail !== e.message ? `${e.message}: ${e.detail}` : e.message;
   if (e instanceof Error) return e.message;
   return String(e);
 }
