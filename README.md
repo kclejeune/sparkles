@@ -444,13 +444,15 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
 | `--max-timeout S` | `1800` | largest `timeout=` a query or update may ask for (`0`: unlimited; never below `--timeout` / `--update-timeout`) |
 | `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
-| `--max-result-mb N` | `1024` | budget for the body of a query or Graph Store GET response (`0`: unlimited) |
+| `--max-result-mb N` | `1024` | budget for the body of a SPARQL query response (`0`: unlimited) |
+| `--max-export-mb N` | `0` | budget for the body of a Graph Store GET, i.e. a graph or whole-dataset export (`0`: unlimited) |
 | `--max-rows N` | `200000000` | rows of any intermediate result |
 | `--max-query-body-mb N` | `16` | largest SPARQL query body (also explain and `/shacl` shapes); `413` past it (`0`: unlimited) |
 | `--max-update-body-mb N` | `256` | largest SPARQL update body; bulk data goes through the Graph Store or `/upload` (`0`: unlimited) |
 | `--max-admin-body-mb N` | `16` | largest `/$/…` or prefix-change body (`0`: unlimited); `/$/auth/*` bodies are capped at 64 KiB |
 | `--max-upload-mb N` | `65536` | largest Graph Store write or upload body, streamed to a temporary file and counted after HTTP decompression (`0`: unlimited) |
-| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free (`0`: no check) || `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
+| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free (`0`: no check) |
+| `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |
 | `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |

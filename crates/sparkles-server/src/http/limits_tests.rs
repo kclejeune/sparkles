@@ -274,8 +274,26 @@ async fn timeouts_are_capped_and_reported() {
 }
 
 #[tokio::test]
-async fn graph_store_reads_have_the_result_budget() {
-    let (_d, st, app) = server(|st| st.limits.max_result_bytes = Some(1000));
+async fn graph_store_reads_have_the_export_budget() {
+    // the query result budget does not apply to exports, which are unlimited by default
+    let (_d, _st, app) = server(|st| st.limits.max_result_bytes = Some(1000));
+    assert_eq!(export_limit(&app).await, 0);
+    let r = send(
+        &app,
+        post("/c/data?default", "application/n-triples", ntriples(100)),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    for uri in ["/c/data", "/c/data?default", "/c/get", "/c?format=nt"] {
+        let r = send(&app, get(uri)).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+    }
+    let q = "/c/sparql?query=SELECT%20*%20%7B%3Fs%20%3Fp%20%3Fo%7D&format=tsv";
+    let r = send(&app, get(q)).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+
+    let (_d, st, app) = server(|st| st.limits.max_export_bytes = Some(1000));
+    assert_eq!(export_limit(&app).await, 1000);
     let r = send(
         &app,
         post("/c/data?default", "application/n-triples", ntriples(100)),
@@ -305,7 +323,7 @@ async fn graph_store_reads_have_the_result_budget() {
     let r = send(&app, get("/c/data?default&format=nt")).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     // a streamed read is cut off at the budget: the transfer is aborted
-    let (_d, st, app) = server(|st| st.limits.max_result_bytes = Some(1536 << 10));
+    let (_d, st, app) = server(|st| st.limits.max_export_bytes = Some(1536 << 10));
     let big = ntriples(60_000);
     assert!(big.len() > 2 << 20);
     let r = send(&app, post("/c/data", "application/n-triples", big)).await;
@@ -318,6 +336,12 @@ async fn graph_store_reads_have_the_result_budget() {
             .await
             .is_err()
     );
+}
+
+/// `maxExportBytes` of `/$/server`.
+async fn export_limit(app: &Router) -> u64 {
+    let r = send(app, get("/$/server")).await;
+    json_of(&r)["limits"]["maxExportBytes"].as_u64().unwrap()
 }
 
 #[tokio::test]

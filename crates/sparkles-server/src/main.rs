@@ -386,10 +386,13 @@ enum Cmd {
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
         query_memory_mb: u64,
-        /// Budget for the serialized body of query and Graph Store GET responses, in MiB
-        /// (0: unlimited)
+        /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
+        /// Budget for the serialized body of a Graph Store GET (a graph or whole-dataset
+        /// export), in MiB (0: unlimited)
+        #[arg(long, default_value_t = 0)]
+        max_export_mb: u64,
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
@@ -1172,6 +1175,7 @@ fn run() -> Result<()> {
             metrics_max_datasets,
             query_memory_mb,
             max_result_mb,
+            max_export_mb,
             max_rows,
             update_timeout,
             vector_memory_mb,
@@ -1224,6 +1228,7 @@ fn run() -> Result<()> {
             st.limits = state::Limits {
                 query_memory_bytes: mib(query_memory_mb),
                 max_result_bytes: mib(max_result_mb),
+                max_export_bytes: mib(max_export_mb),
                 max_rows,
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
