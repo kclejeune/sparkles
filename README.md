@@ -35,7 +35,7 @@ interactive querying.
 | Path | Role | Jena analogue |
 |---|---|---|
 | `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db |
-| `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, forward chaining *(planned)* | jena-core `reasoner` |
+| `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
 | `ui/` | SvelteKit management / query / graph-exploration UI *(in progress)* | jena-fuseki-ui |
 
@@ -47,7 +47,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 | Feature | Status |
 |---|---|
-| 64-bit tagged ids, inline `xsd:integer` / `xsd:double` / `xsd:boolean` | ✅ |
+| 64-bit tagged ids, inline `xsd:integer` / `xsd:decimal` / `xsd:double` / `xsd:boolean` / `xsd:dateTime` / `xsd:date` (canonical forms only) | ✅ |
+| Bulk write path: large update/inference batches are merged into a rebuilt generation (atomic `CURRENT` switch) | ✅ |
 | Sorted, front-coded, mmapped base vocabulary; append-only delta vocabulary | ✅ |
 | 7 permutations (SPO SOP PSO POS OSP OPS GSPO), 32k-row compressed blocks | ✅ |
 | Parallel bulk loader (Turtle / N-Triples / N-Quads / TriG / RDF/XML / JSON-LD, `.gz`) | ✅ |
@@ -77,8 +78,15 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
 | Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`) | ✅ |
-| RDFS / OWL 2 RL materialization, Jena rule syntax | ⏳ |
+| RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
 | SvelteKit UI: datasets, query editor, results table/graph/plan, explorer, schema browser (built against a mock; server integration pending) | 🚧 |
+
+## Performance
+
+See `docs/BENCHMARKS.md`. On 1.05M triples, Sparkles bulk-loads in 0.9 s (QLever 1.4 s,
+Jena TDB2 4.4 s) and is the fastest of the three on 7 of 11 queries over HTTP. It is
+within 1–2× of QLever on the rest. It is 1.2–15× faster than Fuseki on every query
+except `contains`, where the two are within noise.
 
 ## Notable optimizations adopted from QLever
 
@@ -127,6 +135,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | `REDUCED` is a no-op | Allowed by the spec. |
 | `GRAPH ?g { P }` binds `?g` as a scan column when `P` is a plain join group; otherwise `P` is evaluated per named graph and joined with `?g`, like Jena's `OpGraph` | The fast path covers the common case, and the fallback keeps SPARQL scoping exact (e.g. OPTIONAL or MINUS inside GRAPH). |
 | `GROUP_CONCAT` always returns a simple literal | Spec behaviour; Jena keeps a common language tag. |
+| Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates. Backward (LP) rules are not supported. |
+| `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Building & running
