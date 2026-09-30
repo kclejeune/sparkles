@@ -112,6 +112,35 @@ fn rejects_rebinding_in_scope_variable() {
 }
 
 #[test]
+fn result_cache_reuses_subtrees() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let text = "SELECT ?t (COUNT(?p) AS ?c) WHERE { ?p a ?t . ?p foaf:name ?n } GROUP BY ?t";
+    let a = q(&s, text);
+    let b = q(&s, text);
+    assert_eq!(strs(&a), strs(&b));
+    assert!(has_cached(&b.plan), "second run should hit the cache");
+    assert!(s.result_cache().hits() > 0);
+    // an update invalidates (new snapshot version)
+    update::update(&s, "INSERT DATA { <http://ex.org/z> a <http://xmlns.com/foaf/0.1/Person> ; <http://xmlns.com/foaf/0.1/name> \"Z\" }", &QueryOptions::default()).unwrap();
+    let c = q(&s, text);
+    assert!(!has_cached(&c.plan));
+    assert_ne!(strs(&a), strs(&c));
+}
+
+fn has_cached(p: &PlanInfo) -> bool {
+    p.cached || p.children.iter().any(has_cached)
+}
+
+#[test]
 fn bgp_join() {
     let s = store();
     let r = q(

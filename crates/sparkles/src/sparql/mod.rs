@@ -1,5 +1,6 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
+pub mod cache;
 pub mod ctx;
 pub mod exec;
 pub mod expr;
@@ -41,6 +42,8 @@ pub struct QueryOptions {
     /// Graphs merged into the store's default graph when the query does not specify a
     /// dataset (used for the materialized-inference overlay).
     pub default_graph_extra: Vec<String>,
+    /// Bypass the result cache (read and write).
+    pub no_cache: bool,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
 }
@@ -180,6 +183,7 @@ fn make_ctx(
         ctx.max_rows = m;
     }
     ctx.allow_service = opts.allow_service;
+    ctx.use_cache = !opts.no_cache;
     ctx.base_iri = base.cloned();
     let resolve = |iris: &[String]| -> Vec<Id> { iris.iter().map(|i| ctx.graph_id(i)).collect() };
     let mut ds = DatasetSpec::default();

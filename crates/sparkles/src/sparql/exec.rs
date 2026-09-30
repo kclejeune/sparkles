@@ -57,8 +57,44 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
     }
 }
 
+/// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
+/// value tables) bypass it; everything else is looked up and stored.
 pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     ctx.check()?;
+    let results = &ctx.snap.results;
+    let cacheable = ctx.use_cache
+        && results.enabled()
+        && !matches!(
+            n.kind,
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty | Kind::CountScan { .. }
+        );
+    let key = if cacheable {
+        super::cache::key(n, ctx)
+    } else {
+        None
+    };
+    if let Some(k) = &key {
+        let start = Instant::now();
+        if let Some(t) = results.get(k, ctx) {
+            let mut info = describe(ctx, n);
+            info.actual_rows = t.len() as i64;
+            info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+            info.cached = true;
+            info.children.clear();
+            return Ok((t, info));
+        }
+    }
+    let (t, info) = execute_uncached(ctx, n)?;
+    if let Some(k) = key {
+        // only worth caching when recomputation is not trivially cheap
+        if info.time_ms >= results.min_ms {
+            results.put(k, &t, ctx);
+        }
+    }
+    Ok((t, info))
+}
+
+fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     let start = Instant::now();
     let mut infos = Vec::new();
     let child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {

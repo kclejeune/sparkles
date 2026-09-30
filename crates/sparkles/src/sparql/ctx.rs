@@ -48,6 +48,8 @@ pub struct Ctx {
     /// Maximum number of rows any intermediate result may have (memory guard).
     pub max_rows: usize,
     pub allow_service: bool,
+    /// consult / fill the store's result cache
+    pub use_cache: bool,
 }
 
 impl Ctx {
@@ -68,6 +70,7 @@ impl Ctx {
             var_names: RwLock::new(Vec::new()),
             max_rows: 200_000_000,
             allow_service: true,
+            use_cache: true,
         }
     }
 

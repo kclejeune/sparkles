@@ -130,6 +130,8 @@ pub struct Snapshot {
     pub delta: Delta,
     pub version: u64,
     pub cache: Arc<BlockCache>,
+    /// query result cache shared by all snapshots of the store
+    pub results: Arc<crate::sparql::cache::ResultCache>,
     /// delta-vocabulary size visible to this snapshot
     pub dvocab_len: u64,
     pub union_default_graph: bool,
@@ -441,6 +443,10 @@ pub fn parse_bnode_label(label: &str) -> Option<Id> {
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub cache_bytes: u64,
+    /// Budget for cached query (sub)results; 0 disables the cache.
+    pub result_cache_bytes: u64,
+    /// Only results that took at least this long (ms) to compute are cached.
+    pub result_cache_min_ms: f64,
     pub union_default_graph: bool,
     pub build: BuildOptions,
     /// Loads smaller than this many quads go through the transactional delta; larger
@@ -452,6 +458,8 @@ impl Default for StoreOptions {
     fn default() -> Self {
         StoreOptions {
             cache_bytes: 1 << 30,
+            result_cache_bytes: 512 << 20,
+            result_cache_min_ms: 1.0,
             union_default_graph: false,
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
@@ -470,6 +478,7 @@ pub struct Store {
     current: ArcSwap<Snapshot>,
     writer: Mutex<WriterState>,
     cache: Arc<BlockCache>,
+    results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
 }
 
@@ -482,6 +491,10 @@ impl Store {
     /// A fresh in-memory store (Jena `DatasetGraphFactory.createTxnMem()` equivalent).
     pub fn in_memory(opts: StoreOptions) -> Store {
         let cache = Arc::new(BlockCache::new(opts.cache_bytes));
+        let results = Arc::new(crate::sparql::cache::ResultCache::new(
+            opts.result_cache_bytes,
+            opts.result_cache_min_ms,
+        ));
         let gen_ = Arc::new(Generation::empty(DeltaVocab::in_memory()));
         Store {
             root: None,
@@ -490,6 +503,7 @@ impl Store {
                 delta: Delta::default(),
                 version: 0,
                 cache: cache.clone(),
+                results: results.clone(),
                 dvocab_len: 0,
                 union_default_graph: opts.union_default_graph,
             }),
@@ -498,6 +512,7 @@ impl Store {
                 next_bnode: 0,
             }),
             cache,
+            results,
             prefixes: Mutex::new(BTreeMap::new()),
             opts,
         }
@@ -516,6 +531,10 @@ impl Store {
         let name = std::fs::read_to_string(&current_file)?.trim().to_string();
         let gen_ = Generation::open(&root.join(&name), &name, true)?;
         let cache = Arc::new(BlockCache::new(opts.cache_bytes));
+        let results = Arc::new(crate::sparql::cache::ResultCache::new(
+            opts.result_cache_bytes,
+            opts.result_cache_min_ms,
+        ));
         let mut next_bnode = gen_.meta.next_bnode;
         let mut prefixes = gen_.meta.prefixes.clone();
         if let Ok(p) = std::fs::read(root.join("prefixes.json"))
@@ -538,6 +557,7 @@ impl Store {
                 delta: Delta::default(),
                 version: 0,
                 cache: cache.clone(),
+                results: results.clone(),
                 dvocab_len: u64::MAX,
                 union_default_graph: false,
             };
@@ -582,6 +602,7 @@ impl Store {
                 delta,
                 version,
                 cache: cache.clone(),
+                results: results.clone(),
                 dvocab_len,
                 union_default_graph: opts.union_default_graph,
             }),
@@ -590,6 +611,7 @@ impl Store {
                 next_bnode,
             }),
             cache,
+            results,
             prefixes: Mutex::new(prefixes),
             opts,
         })
@@ -606,6 +628,9 @@ impl Store {
     }
     pub fn cache(&self) -> &Arc<BlockCache> {
         &self.cache
+    }
+    pub fn result_cache(&self) -> &Arc<crate::sparql::cache::ResultCache> {
+        &self.results
     }
 
     /// Current read snapshot.
@@ -789,6 +814,7 @@ impl Store {
             delta: Delta::default(),
             version: snap.version + 1,
             cache: self.cache.clone(),
+            results: self.results.clone(),
             dvocab_len,
             union_default_graph: self.opts.union_default_graph,
         }));
@@ -896,6 +922,7 @@ impl WriteTxn<'_> {
             delta: self.delta.clone(),
             version: self.base.version,
             cache: self.base.cache.clone(),
+            results: self.base.results.clone(),
             dvocab_len: self.base.generation.dvocab.len(),
             union_default_graph: self.base.union_default_graph,
         }
@@ -1079,6 +1106,7 @@ impl WriteTxn<'_> {
             delta: std::mem::take(&mut self.delta),
             version,
             cache: self.base.cache.clone(),
+            results: self.base.results.clone(),
             dvocab_len: gen_.dvocab.len(),
             union_default_graph: self.base.union_default_graph,
         }));
