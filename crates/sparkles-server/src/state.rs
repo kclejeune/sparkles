@@ -219,6 +219,8 @@ pub struct Limits {
     pub max_result_bytes: Option<u64>,
     /// rows of any intermediate result
     pub max_rows: usize,
+    /// SPARQL updates without a `timeout` parameter (`None`: no limit, the default)
+    pub update_timeout: Option<std::time::Duration>,
 }
 
 impl Default for Limits {
@@ -227,15 +229,18 @@ impl Default for Limits {
             query_memory_bytes: Some(8 << 30),
             max_result_bytes: Some(1 << 30),
             max_rows: 200_000_000,
+            update_timeout: None,
         }
     }
 }
 
 impl Limits {
-    /// `{timeoutSeconds, queryMemoryBytes, maxResultBytes, maxRows}`; 0 means unlimited.
+    /// `{timeoutSeconds, updateTimeoutSeconds, queryMemoryBytes, maxResultBytes, maxRows}`;
+    /// 0 means unlimited.
     pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
         serde_json::json!({
             "timeoutSeconds": timeout.as_secs_f64(),
+            "updateTimeoutSeconds": self.update_timeout.map_or(0.0, |t| t.as_secs_f64()),
             "queryMemoryBytes": self.query_memory_bytes.unwrap_or(0),
             "maxResultBytes": self.max_result_bytes.unwrap_or(0),
             "maxRows": self.max_rows,

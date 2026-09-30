@@ -32,7 +32,7 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxRows: number };
 ```
 
 ### Request ids and the access log
@@ -340,8 +340,9 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
 Query parameters beyond the standard protocol:
 
-* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`); updates
-  accept it too.
+* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`). Updates
+  accept it too; without it they run under `--update-timeout` (none by default). A timed-out
+  update changes nothing.
 * `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
 * `reasoning=true|false` — include materialized inferences (default `true` if present).
 * `nocache=true` — bypass the query result cache: nothing is read from or stored in it

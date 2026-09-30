@@ -411,11 +411,35 @@ async fn server_info_lists_the_limits() {
         j["limits"],
         serde_json::json!({
             "timeoutSeconds": 30.0,
+            "updateTimeoutSeconds": 0.0,
             "queryMemoryBytes": 8u64 << 30,
             "maxResultBytes": 0,
             "maxRows": 200_000_000,
         })
     );
+}
+
+#[tokio::test]
+async fn updates_have_their_own_timeout() {
+    let update = |uri: &str| {
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from("INSERT DATA { <urn:t> <urn:p> 1 }"))
+            .unwrap()
+    };
+    // the query timeout does not apply to updates
+    let s = server_with(|st| st.default_timeout = Duration::from_nanos(1));
+    let r = send(&s.app, update("/ds/update")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // --update-timeout does, and a timed-out update changes nothing
+    let s = server_with(|st| st.limits.update_timeout = Some(Duration::from_nanos(1)));
+    let before = s.state.get("ds").unwrap().store.snapshot().len();
+    let r = send(&s.app, update("/ds/update")).await;
+    assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", r.text());
+    assert_eq!(s.state.get("ds").unwrap().store.snapshot().len(), before);
+    // an explicit timeout= overrides it
+    let r = send(&s.app, update("/ds/update?timeout=30")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
 
 // ---------------------------------------------------------------------- budgets ------

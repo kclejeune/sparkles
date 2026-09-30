@@ -367,6 +367,17 @@ fn timeout_param(st: &AppState, params: &Params) -> Duration {
         .unwrap_or(st.default_timeout)
 }
 
+/// The `timeout` parameter of an update, else the server's update timeout (none by
+/// default).
+fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
+    params
+        .get("timeout")
+        .and_then(|t| t.parse::<f64>().ok())
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map(Duration::from_secs_f64)
+        .or(st.limits.update_timeout)
+}
+
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     let timeout = timeout_param(st, params);
     let reasoning =
@@ -831,7 +842,7 @@ async fn update_endpoint(
     crate::obs::log_query_text(&update);
     let opts = QueryOptions {
         allow_service: st.allow_service,
-        timeout: Some(timeout_param(&st, &params)),
+        timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         ..Default::default()

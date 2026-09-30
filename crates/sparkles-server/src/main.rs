@@ -108,6 +108,9 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
+        /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
+        #[arg(long, default_value_t = 0.0)]
+        update_timeout: f64,
         /// Re-materialize stale inferences automatically once a dataset has had no
         /// commit for this many seconds (off by default; each run holds the writer lock)
         #[arg(long, value_name = "SECS")]
@@ -555,6 +558,7 @@ fn main() -> Result<()> {
             query_memory_mb,
             max_result_mb,
             max_rows,
+            update_timeout,
             auto_reason,
             auto_reason_max_delay,
         } => {
@@ -569,6 +573,8 @@ fn main() -> Result<()> {
                 query_memory_bytes: mib(query_memory_mb),
                 max_result_bytes: mib(max_result_mb),
                 max_rows,
+                update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
+                    .then(|| Duration::from_secs_f64(update_timeout)),
             };
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {

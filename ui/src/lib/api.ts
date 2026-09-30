@@ -29,6 +29,8 @@ export type DatasetInfo = {
 /** Per-request budgets of the server; 0 means unlimited. */
 export type Limits = {
   timeoutSeconds: number;
+  /** Absent on servers that predate it. */
+  updateTimeoutSeconds?: number;
   queryMemoryBytes: number;
   maxResultBytes: number;
   maxRows: number;
