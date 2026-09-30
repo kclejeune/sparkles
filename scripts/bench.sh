@@ -148,10 +148,11 @@ PIDS=()
 # on exit, also stop whatever listens on a selected engine's port: `fuseki-server` is a
 # wrapper script whose JVM outlives it
 stop_all() {
-  [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2> /dev/null
+  # a server may exit between the two kills: a failed kill must not fail the run (set -e)
+  [ ${#PIDS[@]} -gt 0 ] && { kill "${PIDS[@]}" 2> /dev/null || true; }
   for p in "${PORT[@]}"; do
     pid=$(ss -ltnp 2> /dev/null | grep ":$p " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
-    [ -n "$pid" ] && kill "$pid" 2> /dev/null
+    [ -n "$pid" ] && { kill "$pid" 2> /dev/null || true; }
   done
   true
 }

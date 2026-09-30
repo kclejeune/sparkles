@@ -42,7 +42,7 @@ stop_server() {
     SPID=
   fi
   pid=$(ss -ltnp 2> /dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)
-  [ -n "$pid" ] && kill "$pid" 2> /dev/null
+  [ -n "$pid" ] && { kill "$pid" 2> /dev/null || true; }
   true
 }
 trap stop_server EXIT
