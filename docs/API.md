@@ -681,14 +681,17 @@ SELECT ?s ?score ?label WHERE {
 * **Analyzer**: tokens split on non-alphanumeric characters, lowercased and ASCII-folded
   (`café` matches `cafe`).
 * **Consistency**: indexes are updated in the same commit as the data, so a query sees
-  the text of its own snapshot. If an index is behind (a failed update, a rebuild in
-  progress), text queries return `503` until it is rebuilt. They never return stale
-  results.
+  the text of its own snapshot, including the writes just before it. A write only stages
+  its documents; the index commit (a new segment) happens at the next text query that
+  needs it, or about once a second, so a burst of writes shares one. If an index is
+  behind (a failed update, a rebuild in progress), text queries return `503` until it is
+  rebuilt. They never return stale results.
 * **Durability**: index commits are not fsynced; the write-ahead log is the durable
   record. The index is checkpointed (synced) about once a second while writes continue,
   before compaction and on close. After a crash, an index with unsynced changes
-  (`text.dirty` next to it) is checksum-verified and caught up from the WAL; it is
-  rebuilt only if it is damaged or older than the WAL.
+  (`text.dirty` next to it) is checksum-verified and caught up from the WAL (which also
+  restores what was only staged); it is rebuilt only if it is damaged or older than the
+  WAL.
 * **Errors**: `400` for malformed calls, unparseable query strings, predicates that
   are not indexed, and datasets without an index. `501` if the server was built without
   the `text` feature.

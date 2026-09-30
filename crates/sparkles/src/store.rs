@@ -1613,8 +1613,17 @@ impl Store {
     #[doc(hidden)]
     pub fn fail_next_text_commit(&self) {
         if let Some(ti) = self.text.load_full() {
-            ti.fail_next_commit
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ti.fail_next_commit();
+        }
+    }
+
+    /// Test hook: pause (or resume) the full-text index's background tick, so staged
+    /// documents stay uncommitted until a search, compaction or close.
+    #[cfg(feature = "text")]
+    #[doc(hidden)]
+    pub fn set_text_ticks(&self, on: bool) {
+        if let Some(ti) = self.text.load_full() {
+            ti.set_ticks(on);
         }
     }
 
