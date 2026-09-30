@@ -118,6 +118,48 @@ export async function textSearch(
   return textHits(rows);
 }
 
+/**
+ * Predicates typed one per line (or separated by spaces/commas) as full IRIs, `<IRIs>`
+ * or prefixed names. Returns the IRIs in order without duplicates, and the entries that
+ * are neither.
+ */
+export function parsePredicateList(
+  text: string,
+  prefixes: Record<string, string>,
+): { iris: string[]; bad: string[] } {
+  const iris: string[] = [];
+  const bad: string[] = [];
+  for (const raw of text.split(/[\s,]+/)) {
+    const t = raw.trim();
+    if (!t) continue;
+    let iri: string | null = null;
+    const angled = /^<([^<>\s]+)>$/.exec(t);
+    const pn = /^([A-Za-z][\w.-]*)?:([^\s<>]*)$/.exec(t);
+    if (angled) iri = angled[1];
+    else if (pn && prefixes[pn[1] ?? ''] != null) iri = prefixes[pn[1] ?? ''] + pn[2];
+    else if (/^[a-z][a-z0-9+.-]*:[^\s<>"]+$/i.test(t)) iri = t;
+    if (!iri || !/^[a-z][a-z0-9+.-]*:/i.test(iri)) bad.push(t);
+    else if (!iris.includes(iri)) iris.push(iri);
+  }
+  return { iris, bad };
+}
+
+/** Predicates that usually hold text, offered first when configuring the index. */
+export const TEXT_PREDICATES = [
+  'http://www.w3.org/2000/01/rdf-schema#label',
+  'http://www.w3.org/2000/01/rdf-schema#comment',
+  'http://www.w3.org/2004/02/skos/core#prefLabel',
+  'http://www.w3.org/2004/02/skos/core#altLabel',
+  'http://www.w3.org/2004/02/skos/core#definition',
+  'http://purl.org/dc/terms/title',
+  'http://purl.org/dc/terms/description',
+  'http://purl.org/dc/elements/1.1/title',
+  'http://purl.org/dc/elements/1.1/description',
+  'http://xmlns.com/foaf/0.1/name',
+  'http://schema.org/name',
+  'http://schema.org/description',
+];
+
 /** A plain-words explanation of a failed text search, by status. */
 export function textErrorHint(e: unknown): { title: string; hint?: string } {
   if (!(e instanceof api.ApiError)) return { title: api.errorMessage(e) };

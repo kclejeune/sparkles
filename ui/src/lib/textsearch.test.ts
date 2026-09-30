@@ -4,6 +4,7 @@ import {
   buildTextQuery,
   DEFAULT_GRAPH,
   escapeTextQuery,
+  parsePredicateList,
   sparqlLiteral,
   textErrorHint,
   textHits,
@@ -91,6 +92,31 @@ describe('textHits', () => {
     expect(hits[1].graph).toBeUndefined();
     expect(hits[1].predicate).toBe('http://ex/label');
     expect(hits[1].score).toBe(1.5);
+  });
+});
+
+describe('parsePredicateList', () => {
+  const prefixes = { rdfs: 'http://www.w3.org/2000/01/rdf-schema#', '': 'http://ex/' };
+
+  it('accepts IRIs, <IRIs> and prefixed names, one per line or comma separated', () => {
+    const r = parsePredicateList(
+      'rdfs:label\n<http://purl.org/dc/terms/title>, http://schema.org/name\n:local\n\nrdfs:label',
+      prefixes,
+    );
+    expect(r.iris).toEqual([
+      'http://www.w3.org/2000/01/rdf-schema#label',
+      'http://purl.org/dc/terms/title',
+      'http://schema.org/name',
+      'http://ex/local',
+    ]);
+    expect(r.bad).toEqual([]);
+  });
+
+  it('reports entries that are not IRIs', () => {
+    expect(parsePredicateList('label unknown:x <relative>', prefixes).bad).toEqual([
+      'label',
+      '<relative>',
+    ]);
   });
 });
 

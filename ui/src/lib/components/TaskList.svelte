@@ -67,7 +67,9 @@
     <strong>Could not load tasks.</strong> <span class="muted">{error}</span>
   </div>
 {:else if loaded && shown.length === 0}
-  <p class="faint none">No tasks yet. Compact, backup and reasoning jobs show up here.</p>
+  <p class="faint none">
+    No tasks yet. Compact, backup, reasoning and full-text index jobs show up here.
+  </p>
 {:else}
   <ul class="tasks">
     {#each shown as t (t.id)}
@@ -108,7 +110,7 @@
   }
   li {
     display: grid;
-    grid-template-columns: 10px 64px auto 1fr auto;
+    grid-template-columns: 10px 84px auto 1fr auto;
     align-items: center;
     gap: 10px;
     padding: 7px 0;
@@ -170,9 +172,9 @@
     transition: width 0.3s;
   }
   li:has(.ds) {
-    grid-template-columns: 10px 64px auto 1fr auto;
+    grid-template-columns: 10px 84px auto 1fr auto;
   }
   li:not(:has(.ds)) {
-    grid-template-columns: 10px 64px 1fr auto;
+    grid-template-columns: 10px 84px 1fr auto;
   }
 </style>

@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
+  import { receiptSummary } from '$lib/commits';
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { triplesToGraph, type Triple } from '$lib/graph';
@@ -192,10 +193,14 @@
         };
         toasts.push(
           'success',
-          'Update applied',
-          result
-            ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
-            : `${dsName} in ${fmtMs(ms)}`,
+          result?.receipt && !result.receipt.committed
+            ? 'Update applied, no change'
+            : 'Update applied',
+          result?.receipt
+            ? `${dsName}: ${receiptSummary(result.receipt)} in ${fmtMs(ms)}`
+            : result
+              ? `${dsName}: +${fmtInt(result.inserted)} / −${fmtInt(result.deleted)} quads in ${fmtMs(ms)}`
+              : `${dsName} in ${fmtMs(ms)}`,
         );
       } else {
         const result = await api.query(dsName, text, {
@@ -696,6 +701,15 @@
             >
           {/if}
           <span class="spacer"></span>
+          {#if outcome.result?.meta.commit != null && outcome.view !== 'explain'}
+            <span
+              class="badge commit"
+              title="The result was read at commit {outcome.result.meta
+                .commit} of {outcome.ds}{outcome.result.meta.datasetId
+                ? ` (dataset id ${outcome.result.meta.datasetId})`
+                : ''}">commit {outcome.result.meta.commit}</span
+            >
+          {/if}
           {#if outcome.status === 'running'}
             <span class="row faint"
               ><span class="spinner"></span> Running {fmtMs(now - outcome.startedAt)}</span
@@ -777,6 +791,19 @@
           <div class="empty">
             <Icon name="check" size={22} />
             <p>Update applied to <strong>{outcome.ds}</strong> in {fmtMs(outcome.updated.ms)}.</p>
+            {#if outcome.updated.result?.receipt}
+              {@const r = outcome.updated.result.receipt}
+              {#if r.committed}
+                <p class="receipt">
+                  <span class="badge iri" title="{r.commit.ref} · {r.commit.timestamp}"
+                    >{receiptSummary(r)}</span
+                  >
+                  <span class="faint">{fmtInt(r.commit.quads)} quads after</span>
+                </p>
+              {:else}
+                <p class="faint">{receiptSummary(r)}.</p>
+              {/if}
+            {/if}
             {#if outcome.updated.result}
               {@const u = outcome.updated.result}
               <p class="faint">
@@ -1175,6 +1202,16 @@
   .notice.warn {
     color: var(--warn);
     background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+  }
+  .badge.commit {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    margin-right: 10px;
+  }
+  .receipt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .timing {
     display: flex;
