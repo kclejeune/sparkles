@@ -39,6 +39,8 @@ pub struct BackupState {
     /// the server's runtime, set by [`start`] once it exists
     handle: OnceLock<Handle>,
     pub registry: registry::Registry,
+    /// policy scheduler state, run history, and the running policy tasks
+    pub policies: policies::Policies,
 }
 
 impl BackupState {
@@ -57,12 +59,14 @@ impl BackupState {
             None => None,
         };
         let registry = registry::Registry::load(&dir, file.as_ref())?;
+        let policies = policies::Policies::load(&dir, &registry)?;
         Ok(BackupState {
             dir,
             config_path,
             max_tasks: max_tasks.max(1),
             handle: OnceLock::new(),
             registry,
+            policies,
         })
     }
 
