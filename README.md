@@ -108,6 +108,11 @@ except `contains`, where the two are within noise.
   over interesting sort orders with a greedy fallback. Merge joins run on sorted
   scans.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
+* **Result cache.** Executed subtrees are cached under a canonical plan key plus the
+  snapshot version, so updates invalidate naturally. Results with query-local terms or
+  non-deterministic functions are skipped. Each operator reports `cached` in the plan.
+* **GROUP BY + COUNT from index runs.** When the group key is a scan's sort column,
+  counts come from runs in the blocks without materializing the scan.
 * **Planner details.** Filters are placed as soon as their variables are bound. Scan
   sizes are exact from block metadata (at most two block decodes). Join estimates use
   per-predicate distinct subject/object statistics with QLever's 0.7 correction factor.
