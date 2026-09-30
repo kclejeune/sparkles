@@ -8,13 +8,21 @@
 //!   could answer differently);
 //! - each redirect hop is checked the same way, up to a number of hops;
 //! - a connect timeout and a total timeout, and a ceiling on the response body enforced
-//!   while it streams in.
+//!   while it streams in;
+//! - a budget over all the requests of one SPARQL request ([`RequestBudget`]): the bytes
+//!   they receive and the time they take, summed.
 //!
 //! By default only public unicast addresses may be contacted: loopback, private
 //! (RFC 1918), shared (100.64.0.0/10), link-local (among them the 169.254.169.254
 //! metadata service), unique-local, multicast and the other special-purpose ranges are
 //! refused, also in their IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms.
-//! [`OutboundPolicy::allow_private`] and [`OutboundPolicy::allow`] open them up.
+//! [`OutboundPolicy::allow_private`] opens the private ranges, and an address or network
+//! in [`OutboundPolicy::allow`] opens the addresses it covers; a host name in the
+//! allowlist does not open non-public addresses.
+//!
+//! Error messages name what the caller sent (the URL, its host) but never an address a
+//! name resolved to or the underlying connection error: those are logged (target
+//! `sparkles::outbound`) for the operator.
 //!
 //! An embedder can also install one process-wide hook adding headers to every request,
 //! for example to propagate W3C Trace Context (`traceparent`) from the current
@@ -28,6 +36,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +51,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 << 20;
 /// Default number of redirects followed.
 pub const DEFAULT_MAX_REDIRECTS: usize = 5;
+/// Default bytes all the outbound requests of one SPARQL request may receive: four
+/// full-size responses.
+pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 4 * DEFAULT_MAX_RESPONSE_BYTES;
+/// Default time all the outbound requests of one SPARQL request may take, summed.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(4 * 60);
 
 /// Resolves host names for outbound requests.
 pub trait Resolver: Send + Sync {
@@ -62,8 +76,10 @@ impl Resolver for SystemResolver {
 /// a CIDR network.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Allow {
-    /// This host name; it may resolve to any address, private ones included (the
-    /// entry vouches for the name).
+    /// This host name, at public addresses (private ones too with
+    /// [`OutboundPolicy::allow_private`]); a name resolving to a non-public address
+    /// also needs a [`Allow::Net`] entry covering that address, so a hijacked or
+    /// misconfigured name never reaches the metadata service.
     Host(String),
     /// Subdomains of this name (`*.example.org`, not `example.org` itself); their
     /// addresses must still be public unless [`OutboundPolicy::allow_private`].
@@ -134,10 +150,10 @@ pub enum AddrClass {
     /// A public unicast address.
     Public,
     /// Loopback, private and the other non-public unicast ranges: contacted with
-    /// [`OutboundPolicy::allow_private`] or an allowlist entry that covers them.
+    /// [`OutboundPolicy::allow_private`] or an allowlist network that covers them.
     Private(&'static str),
     /// Link-local (the cloud metadata service), multicast, broadcast, unspecified and
-    /// reserved addresses: contacted only with an allowlist entry that covers them.
+    /// reserved addresses: contacted only with an allowlist network that covers them.
     Restricted(&'static str),
 }
 
@@ -220,9 +236,8 @@ fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 pub struct OutboundPolicy {
     /// Contact [`AddrClass::Private`] addresses (loopback, RFC 1918, …).
     pub allow_private: bool,
-    /// When non-empty, only these destinations are contacted. A [`Allow::Host`] or
-    /// [`Allow::Net`] entry also admits non-public addresses; [`Allow::Subdomains`]
-    /// does not.
+    /// When non-empty, only these destinations are contacted. An [`Allow::Net`] entry
+    /// also admits the non-public addresses it covers; name entries do not.
     pub allow: Vec<Allow>,
     /// Time to establish a connection.
     pub connect_timeout: Duration,
@@ -232,6 +247,12 @@ pub struct OutboundPolicy {
     pub max_response_bytes: u64,
     /// Redirects followed; every hop is checked like the first URL.
     pub max_redirects: usize,
+    /// Bytes all the requests of one SPARQL request may receive (see
+    /// [`RequestBudget`]); past it the request fails with
+    /// [`BudgetKind::OutboundBytes`](crate::error::BudgetKind::OutboundBytes).
+    pub max_request_bytes: u64,
+    /// Time all the requests of one SPARQL request may take, summed.
+    pub request_timeout: Duration,
     pub resolver: Arc<dyn Resolver>,
 }
 
@@ -244,6 +265,8 @@ impl Default for OutboundPolicy {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_redirects: DEFAULT_MAX_REDIRECTS,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             resolver: Arc::new(SystemResolver),
         }
     }
@@ -258,6 +281,8 @@ impl fmt::Debug for OutboundPolicy {
             .field("timeout", &self.timeout)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_redirects", &self.max_redirects)
+            .field("max_request_bytes", &self.max_request_bytes)
+            .field("request_timeout", &self.request_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -269,12 +294,107 @@ pub enum Failure {
     Refused(String),
     /// The request failed: bad URL, network error, timeout, oversized response.
     Failed(String),
+    /// The SPARQL request's outbound byte budget is spent.
+    Budget(crate::error::Budget),
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failure::Refused(m) | Failure::Failed(m) => f.write_str(m),
+            Failure::Budget(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl Failure {
+    /// The engine error of a failed `what` (`SERVICE <url>`, `LOAD <url>`): a refusal is
+    /// [`Error::NotPermitted`](crate::Error::NotPermitted), a spent budget
+    /// [`Error::BudgetExceeded`](crate::Error::BudgetExceeded), and a failure what
+    /// `failed` makes of its message.
+    pub(crate) fn into_error(
+        self,
+        what: &str,
+        failed: impl FnOnce(String) -> crate::Error,
+    ) -> crate::Error {
+        match self {
+            Failure::Refused(m) => crate::Error::NotPermitted(format!("{what}: {m}")),
+            Failure::Failed(m) => failed(m),
+            Failure::Budget(b) => crate::Error::BudgetExceeded(b),
+        }
+    }
+}
+
+/// What the outbound requests of one SPARQL request (a query, or an update with all its
+/// operations) have used of the policy's [`max_request_bytes`] and [`request_timeout`]:
+/// every SERVICE call and `LOAD` of the request draws on the same budget, so many small
+/// requests cannot add up to more than one large one may.
+///
+/// Bytes are counted as responses stream in; time from the start of each request to the
+/// end of its body (calls running at once each count their own time).
+///
+/// [`max_request_bytes`]: OutboundPolicy::max_request_bytes
+/// [`request_timeout`]: OutboundPolicy::request_timeout
+#[derive(Debug)]
+pub struct RequestBudget {
+    max_bytes: u64,
+    max_time: Duration,
+    bytes: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl RequestBudget {
+    /// A fresh budget under `policy`'s totals.
+    pub fn new(policy: &OutboundPolicy) -> Arc<RequestBudget> {
+        Arc::new(RequestBudget {
+            max_bytes: policy.max_request_bytes,
+            max_time: policy.request_timeout,
+            bytes: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+        })
+    }
+
+    /// Bytes received so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Time the requests took so far, summed.
+    pub fn time(&self) -> Duration {
+        Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+
+    fn remaining_time(&self) -> Duration {
+        self.max_time.saturating_sub(self.time())
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.max_bytes.saturating_sub(self.bytes())
+    }
+
+    fn spend_time(&self, d: Duration) {
+        let n = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let _ = self
+            .nanos
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                Some(t.saturating_add(n))
+            });
+    }
+
+    /// Count `n` more bytes; the exceeded budget once past the total.
+    fn spend_bytes(&self, n: u64) -> Result<(), crate::error::Budget> {
+        let used = self.bytes.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+        if used > self.max_bytes {
+            return Err(self.exceeded(used));
+        }
+        Ok(())
+    }
+
+    fn exceeded(&self, requested: u64) -> crate::error::Budget {
+        crate::error::Budget {
+            kind: crate::error::BudgetKind::OutboundBytes,
+            limit: self.max_bytes,
+            requested,
         }
     }
 }
@@ -313,12 +433,12 @@ impl OutboundPolicy {
 
     /// Resolve a host name and check every address; the addresses to connect to.
     pub fn check_host(&self, host: &str) -> Result<Vec<IpAddr>, Failure> {
-        let addrs = self
-            .resolver
-            .resolve(host)
-            .map_err(|e| Failure::Failed(format!("cannot resolve {host}: {e}")))?;
+        let addrs = self.resolver.resolve(host).map_err(|e| {
+            tracing::info!(target: "sparkles::outbound", host, error = %e, "cannot resolve");
+            Failure::Failed(format!("cannot resolve {host}"))
+        })?;
         if addrs.is_empty() {
-            return Err(Failure::Failed(format!("{host} has no addresses")));
+            return Err(Failure::Failed(format!("cannot resolve {host}")));
         }
         self.check_addrs(Some(host), &addrs)?;
         Ok(addrs)
@@ -338,13 +458,11 @@ impl OutboundPolicy {
 
     /// Check the addresses of a destination (`host`: its name, `None` for an IP
     /// literal). Any refused address refuses the destination.
+    ///
+    /// The refusal of a name does not say what it resolved to (an internal name's
+    /// address is not the caller's business); the address and its kind are logged.
     fn check_addrs(&self, host: Option<&str>, addrs: &[IpAddr]) -> Result<(), Failure> {
         let h = host.map(|h| h.trim_end_matches('.').to_ascii_lowercase());
-        if let Some(h) = &h
-            && self.allow.contains(&Allow::Host(h.clone()))
-        {
-            return Ok(());
-        }
         let by_name = h.as_deref().is_some_and(|h| self.names_allow(h));
         for &ip in addrs {
             let v4 = match ip {
@@ -363,7 +481,15 @@ impl OutboundPolicy {
                 AddrClass::Private(_) if self.allow_private => {}
                 AddrClass::Private(what) | AddrClass::Restricted(what) => {
                     return Err(Failure::Refused(match &h {
-                        Some(h) => format!("{h} resolves to {ip}, a {what} address"),
+                        Some(h) => {
+                            tracing::warn!(
+                                target: "sparkles::outbound",
+                                host = %h,
+                                address = %ip,
+                                "refused: {h} resolves to {ip}, a {what} address"
+                            );
+                            format!("{h} is refused by the outbound policy")
+                        }
                         None => format!("{ip} is a {what} address"),
                     }));
                 }
@@ -375,64 +501,99 @@ impl OutboundPolicy {
         Ok(())
     }
 
-    /// Send the request `build` makes for `url`, within `timeout` (at most the policy's),
-    /// and return the response once its headers are in.
+    /// Send the request `build` makes for `url`, within `timeout` (at most the policy's,
+    /// and at most what is left of `budget`), and return the response once its headers
+    /// are in. The response's time and bytes are counted in `budget`.
     pub(crate) fn send(
         &self,
+        budget: &Arc<RequestBudget>,
         url: &str,
         timeout: Duration,
         build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
     ) -> Result<Response, Failure> {
         let u = self.check_url(url)?;
-        let timeout = timeout.min(self.timeout);
-        let refused = Arc::new(Mutex::new(None));
+        let own = timeout.min(self.timeout);
+        let left = budget.remaining_time();
+        if left.is_zero() {
+            return Err(Failure::Failed(out_of_time(budget.max_time)));
+        }
+        let timeout = own.min(left);
+        // the message of a timeout: this request's, or the whole SPARQL request's
+        let late = if left < own {
+            out_of_time(budget.max_time)
+        } else {
+            timed_out(timeout)
+        };
+        let failed = Arc::new(Mutex::new(None));
         let client = self
-            .client(&refused)
-            .map_err(|e| Failure::Failed(chain(&e)))?;
+            .client(&failed)
+            .map_err(|e| Failure::Failed(hidden(url, "the request could not be built", &e)))?;
         let start = Instant::now();
         let resp = apply(build(&client, u)).timeout(timeout).send();
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                if let Some(m) = refused.lock().take() {
-                    return Err(Failure::Refused(m));
+                budget.spend_time(start.elapsed());
+                // a refused or unresolvable name, in words fit for the caller
+                if let Some(f) = failed.lock().take() {
+                    return Err(f);
                 }
                 if e.is_timeout() || start.elapsed() >= timeout {
-                    return Err(Failure::Failed(timed_out(timeout)));
+                    return Err(Failure::Failed(late));
                 }
-                return Err(Failure::Failed(chain(&e)));
+                // redirect errors are the policy's own words (hops, schemes)
+                if e.is_redirect() {
+                    return Err(Failure::Failed(chain(&e)));
+                }
+                let what = if e.is_connect() {
+                    "cannot connect"
+                } else {
+                    "the request failed"
+                };
+                return Err(Failure::Failed(hidden(url, what, &e)));
             }
         };
         let limit = self.max_response_bytes;
-        if resp.content_length().is_some_and(|n| n > limit) {
-            return Err(Failure::Failed(too_large(limit)));
+        let body = Body {
+            resp,
+            read: 0,
+            limit,
+            budget: Some(budget.clone()),
+            spent: budget.clone(),
+            start,
+            deadline: start + timeout,
+            late,
+        };
+        if let Some(n) = body.resp.content_length() {
+            if n > limit {
+                return Err(Failure::Failed(too_large(limit)));
+            }
+            if n > budget.remaining_bytes() {
+                return Err(Failure::Budget(budget.exceeded(budget.bytes() + n)));
+            }
         }
-        let content_type = resp
+        let content_type = body
+            .resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let status = body.resp.status();
         Ok(Response {
-            status: resp.status(),
+            status,
             content_type,
-            body: Body {
-                resp,
-                read: 0,
-                limit,
-                deadline: start + timeout,
-                timeout,
-            },
+            body,
         })
     }
 
     /// A client that resolves (and so connects) only through the policy, checks every
-    /// redirect, and records a refusal in `refused`.
+    /// redirect, and records a refusal or a failed lookup in `failed`.
     fn client(
         &self,
-        refused: &Arc<Mutex<Option<String>>>,
+        failed: &Arc<Mutex<Option<Failure>>>,
     ) -> reqwest::Result<reqwest::blocking::Client> {
-        let (p, slot, max) = (self.clone(), refused.clone(), self.max_redirects);
+        let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
         let redirect = reqwest::redirect::Policy::custom(move |a| {
             if a.previous().len() > max {
                 return a.error(format!("more than {max} redirects"));
@@ -442,7 +603,7 @@ impl OutboundPolicy {
                 Err(f) => {
                     let m = format!("redirect to {}: {f}", a.url());
                     if matches!(f, Failure::Refused(_)) {
-                        *slot.lock() = Some(m.clone());
+                        *slot.lock() = Some(Failure::Refused(m.clone()));
                     }
                     a.error(m)
                 }
@@ -456,7 +617,7 @@ impl OutboundPolicy {
             .no_proxy()
             .dns_resolver(Arc::new(Pinned {
                 policy: self.clone(),
-                refused: refused.clone(),
+                failed: failed.clone(),
             }))
             .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -469,22 +630,21 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// checked addresses, and only those, to the connector.
 struct Pinned {
     policy: OutboundPolicy,
-    refused: Arc<Mutex<Option<String>>>,
+    failed: Arc<Mutex<Option<Failure>>>,
 }
 
 impl reqwest::dns::Resolve for Pinned {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let (policy, refused) = (self.policy.clone(), self.refused.clone());
+        let (policy, failed) = (self.policy.clone(), self.failed.clone());
         let host = name.as_str().to_string();
         Box::pin(async move {
             let checked = tokio::task::spawn_blocking(move || policy.check_host(&host)).await?;
             let r: Result<reqwest::dns::Addrs, BoxError> = match checked {
                 Ok(addrs) => Ok(Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)))),
                 Err(f) => {
-                    if let Failure::Refused(m) = &f {
-                        *refused.lock() = Some(m.clone());
-                    }
-                    Err(f.to_string().into())
+                    let m = f.to_string();
+                    *failed.lock() = Some(f);
+                    Err(m.into())
                 }
             };
             r
@@ -498,6 +658,29 @@ fn not_allowed(host: &str) -> Failure {
 
 fn timed_out(timeout: Duration) -> String {
     format!("no complete response within {}", secs(timeout))
+}
+
+fn out_of_time(total: Duration) -> String {
+    format!(
+        "the outbound requests (SERVICE, LOAD) of this request took longer than their total of {}",
+        secs(total)
+    )
+}
+
+/// A failure message that keeps the error's details (addresses, OS errors) out of what
+/// the caller sees; they are logged.
+fn hidden(url: &str, what: &str, e: &dyn std::error::Error) -> String {
+    // without the credentials a URL may carry
+    let url = Url::parse(url).map_or_else(
+        |_| String::new(),
+        |mut u| {
+            let _ = u.set_password(None);
+            let _ = u.set_username("");
+            u.to_string()
+        },
+    );
+    tracing::warn!(target: "sparkles::outbound", url, error = %chain(e), "{what}");
+    what.to_string()
 }
 
 fn too_large(limit: u64) -> String {
@@ -535,22 +718,37 @@ pub(crate) struct Response {
     pub body: Body,
 }
 
-/// A response body under the policy's byte ceiling and deadline.
+/// A response body under the policy's byte ceiling and deadline, counted in the SPARQL
+/// request's budget. Its read errors carry a message fit for the caller; a spent byte
+/// budget is an [`Error::BudgetExceeded`](crate::Error::BudgetExceeded) inside the
+/// `io::Error` (see [`crate::codec::io_error`]).
 pub(crate) struct Body {
     resp: reqwest::blocking::Response,
     read: u64,
     limit: u64,
+    /// counts the bytes read (`None`: the reader counts them itself)
+    budget: Option<Arc<RequestBudget>>,
+    /// counts the time until the body is dropped
+    spent: Arc<RequestBudget>,
+    start: Instant,
     deadline: Instant,
-    timeout: Duration,
+    /// the message of a timeout
+    late: String,
 }
 
 impl Body {
-    /// The whole body.
-    pub fn bytes(mut self) -> Result<Vec<u8>, Failure> {
-        let mut out = Vec::new();
-        self.read_to_end(&mut out)
-            .map_err(|e| Failure::Failed(e.to_string()))?;
-        Ok(out)
+    /// Stop counting the bytes read in the budget: the caller counts them after
+    /// decompression instead (a compressed `LOAD`).
+    pub fn uncounted(mut self) -> (Body, Arc<RequestBudget>) {
+        self.budget = None;
+        let b = self.spent.clone();
+        (self, b)
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        self.spent.spend_time(self.start.elapsed());
     }
 }
 
@@ -558,25 +756,45 @@ impl Read for Body {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let late = |d: Instant| Instant::now() >= d;
         if late(self.deadline) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                timed_out(self.timeout),
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, self.late.clone()));
         }
         let n = match self.resp.read(buf) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::TimedOut || late(self.deadline) => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, self.late.clone()));
+            }
+            Err(e) => {
+                let url = self.resp.url().to_string();
                 return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    timed_out(self.timeout),
+                    e.kind(),
+                    hidden(&url, "the connection failed while reading the response", &e),
                 ));
             }
-            Err(e) => return Err(e),
         };
         self.read += n as u64;
         if self.read > self.limit {
             return Err(io::Error::other(too_large(self.limit)));
         }
+        if let Some(b) = &self.budget {
+            b.spend_bytes(n as u64)
+                .map_err(|b| io::Error::other(crate::Error::BudgetExceeded(b)))?;
+        }
+        Ok(n)
+    }
+}
+
+/// A reader whose bytes are counted in a SPARQL request's outbound budget.
+pub(crate) struct Counted<R> {
+    pub inner: R,
+    pub budget: Arc<RequestBudget>,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.budget
+            .spend_bytes(n as u64)
+            .map_err(|b| io::Error::other(crate::Error::BudgetExceeded(b)))?;
         Ok(n)
     }
 }
@@ -787,29 +1005,28 @@ mod tests {
             ("empty.test", &[]),
         ]);
         assert_eq!(p.check_host("public.test").unwrap().len(), 2);
-        for (h, msg) in [
-            (
-                "local.test",
-                "local.test resolves to 127.0.0.1, a loopback address",
-            ),
-            ("lan.test", "a private address"),
-            ("metadata.test", "a link-local (cloud metadata) address"),
-            ("ula.test", "a unique local address"),
-            ("ll6.test", "a link-local address"),
-            ("mapped.test", "::ffff:10.0.0.1, a private address"),
-            ("mixed.test", "10.0.0.1, a private address"),
-            ("mixed6.test", "::1, a loopback address"),
+        // refused names do not tell what they resolve to
+        for (h, ip) in [
+            ("local.test", "127.0.0.1"),
+            ("lan.test", "192.168.7.7"),
+            ("metadata.test", "169.254.169.254"),
+            ("ula.test", "fd00::1"),
+            ("ll6.test", "fe80::1"),
+            ("mapped.test", "10.0.0.1"),
+            ("mixed.test", "10.0.0.1"),
+            ("mixed6.test", "::1"),
         ] {
             let m = refused(p.check_host(h));
-            assert!(m.contains(msg), "{h}: {m}");
+            assert_eq!(m, format!("{h} is refused by the outbound policy"));
+            assert!(!m.contains(ip), "{h}: {m}");
         }
         assert!(matches!(
             p.check_host("empty.test"),
-            Err(Failure::Failed(_))
+            Err(Failure::Failed(m)) if m == "cannot resolve empty.test"
         ));
         assert!(matches!(
             p.check_host("nxdomain.test"),
-            Err(Failure::Failed(m)) if m.contains("cannot resolve")
+            Err(Failure::Failed(m)) if m == "cannot resolve nxdomain.test"
         ));
         // allow_private opens private ranges, not link-local ones
         let open = OutboundPolicy {
@@ -825,8 +1042,8 @@ mod tests {
         ] {
             assert!(open.check_host(h).is_ok(), "{h}");
         }
-        assert!(refused(open.check_host("metadata.test")).contains("link-local"));
-        assert!(refused(open.check_host("ll6.test")).contains("link-local"));
+        assert!(refused(open.check_host("metadata.test")).contains("refused"));
+        assert!(refused(open.check_host("ll6.test")).contains("refused"));
         assert!(refused(open.check_url("http://169.254.169.254/")).contains("metadata"));
     }
 
@@ -875,6 +1092,7 @@ mod tests {
             ..policy(&[
                 ("sparql.example.org", &["93.184.216.34"]),
                 ("local.test", &["127.0.0.1", "::1"]),
+                ("v6-local.test", &["::1"]),
                 ("a.lod.example", &["93.184.216.35"]),
                 ("private.lod.example", &["10.9.9.9"]),
                 ("lan.lod.example", &["10.1.2.3"]),
@@ -884,17 +1102,25 @@ mod tests {
                 ("half-in-net.test", &["10.1.200.1", "10.2.0.1"]),
             ])
         };
-        // named hosts, whatever they resolve to
+        // named hosts at public addresses, or at addresses a network entry covers
         assert!(p.check_host("sparql.example.org").is_ok());
-        assert!(p.check_host("Local.Test.").is_ok());
+        assert!(p.check_host("V6-Local.Test.").is_ok());
+        assert_eq!(
+            refused(p.check_host("Local.Test.")),
+            "local.test is refused by the outbound policy"
+        );
         // subdomains, public addresses only (unless covered by a network)
         assert!(p.check_host("a.lod.example").is_ok());
-        assert!(refused(p.check_host("private.lod.example")).contains("private address"));
+        assert!(
+            refused(p.check_host("private.lod.example")).contains("refused by the outbound policy")
+        );
         assert!(p.check_host("lan.lod.example").is_ok());
         assert!(refused(p.check_host("lod.example")).contains("not in the outbound allowlist"));
         // names covered by a network, entirely
         assert!(p.check_host("in-net.test").is_ok());
-        assert!(refused(p.check_host("half-in-net.test")).contains("10.2.0.1, a private address"));
+        assert!(
+            refused(p.check_host("half-in-net.test")).contains("refused by the outbound policy")
+        );
         assert!(refused(p.check_host("other.example")).contains("not in the outbound allowlist"));
         // IP literals
         assert!(p.check_url("http://10.1.3.4:8890/sparql").is_ok());
@@ -911,6 +1137,8 @@ mod tests {
         assert!(
             refused(open.check_host("half-in-net.test")).contains("not in the outbound allowlist")
         );
+        // with private addresses open, a named host reaches them
+        assert!(open.check_host("local.test").is_ok());
         assert!(refused(p.check_url("http://8.8.8.8/")).contains("not in the outbound allowlist"));
         // still only http(s)
         assert!(matches!(
@@ -924,5 +1152,40 @@ mod tests {
         };
         assert!(refused(names.check_url("http://other.example/")).contains("allowlist"));
         assert!(names.check_url("https://sparql.example.org/sparql").is_ok());
+    }
+
+    /// A host name in the allowlist vouches for the name, not for the addresses it
+    /// resolves to: link-local ones (the metadata service) need a network entry, even
+    /// with private addresses open.
+    #[test]
+    fn allowed_names_do_not_open_link_local_addresses() {
+        let base = policy(&[
+            ("partner.test", &["169.254.169.254"]),
+            ("partner6.test", &["2606:2800::1", "fe80::1"]),
+        ]);
+        for allow_private in [false, true] {
+            let p = OutboundPolicy {
+                allow_private,
+                allow: vec![
+                    "partner.test".parse().unwrap(),
+                    "partner6.test".parse().unwrap(),
+                ],
+                ..base.clone()
+            };
+            let m = refused(p.check_host("partner.test"));
+            assert_eq!(m, "partner.test is refused by the outbound policy");
+            assert!(!m.contains("169.254"), "{m}");
+            let m = refused(p.check_host("partner6.test"));
+            assert!(!m.contains("fe80"), "{m}");
+        }
+        // the operator lists the address explicitly
+        let p = OutboundPolicy {
+            allow: vec![
+                "partner.test".parse().unwrap(),
+                "169.254.169.254".parse().unwrap(),
+            ],
+            ..base
+        };
+        assert!(p.check_host("partner.test").is_ok());
     }
 }

@@ -8,7 +8,6 @@ use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{Block, O, P, Perm, S, pad};
-use crate::outbound::Failure;
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -334,8 +333,9 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             silent,
         } => match service(ctx, endpoint, query, &n.vars) {
             Ok(t) => t,
-            // SILENT hides failures of the remote service, not a refusal
-            Err(Error::NotPermitted(m)) => return Err(Error::NotPermitted(m)),
+            // SILENT hides failures of the remote service, not a refusal or a spent
+            // budget
+            Err(e @ (Error::NotPermitted(_) | Error::BudgetExceeded(_))) => return Err(e),
             Err(_) if *silent => Table::unit(),
             Err(e) => return Err(e),
         },
@@ -2505,7 +2505,7 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     });
     let resp = ctx
         .outbound
-        .send(url.as_str(), timeout, |client, u| {
+        .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
             client
                 .post(u)
                 .header(
@@ -2514,9 +2514,10 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
                 )
                 .form(&[("query", query)])
         })
-        .map_err(|f| match f {
-            Failure::Refused(m) => Error::NotPermitted(format!("SERVICE <{}>: {m}", url.as_str())),
-            Failure::Failed(m) => Error::Service(format!("<{}>: {m}", url.as_str())),
+        .map_err(|f| {
+            f.into_error(&format!("SERVICE <{}>", url.as_str()), |m| {
+                Error::Service(format!("<{}>: {m}", url.as_str()))
+            })
         })?;
     span.record("http.response.status_code", i64::from(resp.status.as_u16()));
     if !resp.status.is_success() {
@@ -2534,11 +2535,18 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
-    let failed = |e: &dyn std::fmt::Display| Error::Service(format!("<{}>: {e}", url.as_str()));
-    match parser.for_reader(resp.body).map_err(|e| failed(&e))? {
+    let failed = |e: sparesults::QueryResultsParseError| match e {
+        // a spent budget, or the body's own words (timeout, size, connection)
+        sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
+            Error::Io(e) => Error::Service(format!("<{}>: {e}", url.as_str())),
+            e => e,
+        },
+        e => Error::Service(format!("<{}>: {e}", url.as_str())),
+    };
+    match parser.for_reader(resp.body).map_err(failed)? {
         sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
             for sol in sols {
-                let sol = sol.map_err(|e| failed(&e))?;
+                let sol = sol.map_err(failed)?;
                 let row: Vec<Id> = vars
                     .iter()
                     .map(|v| {

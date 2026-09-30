@@ -24,8 +24,6 @@ pub mod ops;
 pub mod policies;
 pub mod recover;
 pub mod registry;
-// the scheduler's clock is used once it schedules
-#[allow(dead_code)]
 pub mod scheduler;
 pub mod swap;
 #[cfg(test)]
@@ -33,10 +31,11 @@ mod tests;
 
 use crate::state::{AppState, TaskHandle, task_state};
 use anyhow::Context;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
+use sparkles::outbound::OutboundPolicy;
 use sparkles_backup::object_store::ObjectStore;
 pub use sparkles_backup::{BackupError, Repository};
-use sparkles_backup::{Code, OpenEnv, RepoConfig};
+use sparkles_backup::{Code, ConfigSource, Credentials, OpenEnv, RepoConfig, RepoType};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +54,14 @@ pub struct BackupState {
     pub dir: PathBuf,
     /// the server's data directory (`fs` repositories may not lie inside it)
     pub data_dir: PathBuf,
+    /// directories no `fs` repository may lie in: the data directory, and the
+    /// directories of the server's config files
+    pub forbid: Vec<PathBuf>,
+    /// where repositories registered through the API may connect (the server's
+    /// `--outbound-*` policy, set by [`start`])
+    pub outbound: RwLock<OutboundPolicy>,
+    /// backup tasks admitted and not finished (running or waiting for a slot)
+    admitted: Mutex<usize>,
     /// `serve --backup-config`
     pub config_path: Option<PathBuf>,
     /// `serve --backup-max-tasks`: backup, restore, verify and GC tasks running at once
@@ -98,10 +105,17 @@ impl BackupState {
         let registry = registry::Registry::load(&dir, file.as_ref())?;
         let max_tasks = max_tasks.max(1);
         let policies = policies::Policies::load(&dir, &registry)?;
+        let mut forbid = vec![data_dir.to_path_buf()];
+        if let Some(d) = config_path.as_deref().and_then(config_dir) {
+            forbid.push(d);
+        }
         Ok(BackupState {
             verified: registry::VerifyHistory::load(dir.join(registry::VERIFY_FILE)),
             dir,
             data_dir: data_dir.to_path_buf(),
+            forbid,
+            outbound: RwLock::new(OutboundPolicy::default()),
+            admitted: Mutex::new(0),
             config_path,
             max_tasks,
             handle: OnceLock::new(),
@@ -150,17 +164,133 @@ impl BackupState {
         self.block_on(self.open_repo(name))?
     }
 
+    /// Also keep `fs` repositories out of the directory of config file `file` (the
+    /// auth config).
+    pub fn forbid_config_dir(&mut self, file: &Path) {
+        if let Some(d) = config_dir(file) {
+            self.forbid.push(d);
+        }
+    }
+
     /// How repository `cfg` is opened on this server; `init` creates the marker of an
-    /// empty location.
-    pub fn open_env(&self, cfg: &RepoConfig, init: bool) -> OpenEnv {
+    /// empty location. Repositories registered through the API connect only where the
+    /// server's outbound policy allows.
+    pub fn open_env(&self, cfg: &RepoConfig, source: ConfigSource, init: bool) -> OpenEnv {
         OpenEnv {
             cache_dir: Some(self.dir.join("cache")),
-            forbid_under: vec![self.data_dir.clone()],
+            forbid_under: self.forbid.clone(),
             init,
             server_id: self.server_id.clone(),
             store: self.stores.lock().get(&cfg.name).cloned(),
+            outbound: (source == ConfigSource::Api).then(|| self.outbound.read().clone()),
             ..Default::default()
         }
+    }
+
+    /// The configuration to open repository `cfg` with: checked against what the
+    /// config file allows API registrations ([`check_api`](Self::check_api)), and
+    /// with a named credential source replaced by its definition (`400 invalid-config`
+    /// if there is none).
+    pub fn prepare(
+        &self,
+        cfg: &RepoConfig,
+        source: ConfigSource,
+    ) -> Result<RepoConfig, BackupError> {
+        if source == ConfigSource::Api {
+            self.check_api(cfg)?;
+        }
+        let mut cfg = cfg.clone();
+        if let Credentials::Named { name } = &cfg.credentials {
+            cfg.credentials = self
+                .registry
+                .api
+                .read()
+                .credentials
+                .get(name)
+                .cloned()
+                .ok_or_else(|| no_credential_source(name))?;
+        }
+        Ok(cfg)
+    }
+
+    /// What a repository registered through the API may be: `fs` under one of
+    /// `[api] fs_roots` (when set); `s3` with a credential source the config file
+    /// names, never environment variables, files or the default provider chain of the
+    /// caller's choosing (they would send the server's secrets, or read its files, for
+    /// an endpoint the caller picked); not `gcs` or `azure`, which use the server's
+    /// ambient credentials (config file only). `400 invalid-config` naming the field.
+    pub fn check_api(&self, cfg: &RepoConfig) -> Result<(), BackupError> {
+        let api = self.registry.api.read();
+        let refuse = |field: &str, msg: String| {
+            Err(
+                BackupError::new(Code::InvalidConfig, format!("{field}: {msg}"))
+                    .with("field", field),
+            )
+        };
+        match cfg.kind {
+            RepoType::Fs => {
+                let path = Path::new(cfg.path.as_deref().unwrap_or(""));
+                if !api.fs_roots.is_empty()
+                    && !api
+                        .fs_roots
+                        .iter()
+                        .any(|root| sparkles_backup::repo::is_within(path, root))
+                {
+                    let roots: Vec<String> = api
+                        .fs_roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect();
+                    return refuse(
+                        "path",
+                        format!(
+                            "repositories registered through the API must lie under {}",
+                            roots.join(" or ")
+                        ),
+                    );
+                }
+            }
+            RepoType::S3 => match &cfg.credentials {
+                Credentials::Named { name } if api.credentials.contains_key(name) => {}
+                Credentials::Named { name } => return Err(no_credential_source(name)),
+                _ => {
+                    return refuse(
+                        "credentials",
+                        "repositories registered through the API use a credential source \
+                         defined in the server's backup config file: {\"source\": \"named\", \
+                         \"name\": …}"
+                            .into(),
+                    );
+                }
+            },
+            RepoType::Gcs | RepoType::Azure => {
+                return refuse(
+                    "type",
+                    format!(
+                        "{} repositories use the server's own credentials and are defined in its backup config file",
+                        cfg.kind.as_str()
+                    ),
+                );
+            }
+            RepoType::Memory => {}
+        }
+        Ok(())
+    }
+
+    /// Admit a backup task (create, restore, verify or GC) started by a request: at
+    /// most [`QUEUE_PER_SLOT`] wait per `--backup-max-tasks` slot, beyond those that
+    /// run; `503 too-many-tasks` otherwise. Move the admission into the task.
+    pub fn admit(self: &Arc<Self>) -> Result<Admission, BackupError> {
+        let mut n = self.admitted.lock();
+        let limit = self.max_tasks * (1 + QUEUE_PER_SLOT);
+        if *n >= limit {
+            return Err(BackupError::new(
+                Code::TooManyTasks,
+                format!("{limit} backup tasks run or wait already; try again later"),
+            ));
+        }
+        *n += 1;
+        Ok(Admission { b: self.clone() })
     }
 
     /// Open (or return the opened) repository `name`, updating its status. A
@@ -168,7 +298,7 @@ impl BackupState {
     /// location that lost its marker is reported, not re-created), and its marker must
     /// keep the id first seen.
     pub async fn open_repo(&self, name: &str) -> Result<Arc<Repository>, BackupError> {
-        let (cfg, known) = {
+        let (cfg, known, source) = {
             let repos = self.registry.repos.read();
             let e = repos
                 .get(name)
@@ -176,10 +306,14 @@ impl BackupState {
             if let Some(r) = &e.opened {
                 return Ok(r.clone());
             }
-            (e.config.clone(), e.id)
+            (e.config.clone(), e.id, e.source)
         };
-        let env = self.open_env(&cfg, known.is_none() && !cfg.readonly);
-        let r = match Repository::open(&cfg, &env).await {
+        let env = self.open_env(&cfg, source, known.is_none() && !cfg.readonly);
+        let opened = match self.prepare(&cfg, source) {
+            Ok(c) => Repository::open(&c, &env).await,
+            Err(e) => Err(e),
+        };
+        let r = match opened {
             Ok(r) if known.is_some_and(|k| k != r.id()) => Err(BackupError::new(
                 Code::RepositoryUnavailable,
                 format!(
@@ -343,7 +477,6 @@ impl BackupState {
 
     /// The backups of repository `repo` that a restore or verification uses now
     /// (retention keeps them until its next evaluation).
-    #[cfg_attr(not(test), allow(dead_code))] // policy retention
     pub fn busy_backups(&self, repo: &str) -> BTreeSet<String> {
         self.claims
             .lock()
@@ -379,6 +512,36 @@ impl BackupState {
     pub fn target_busy(&self, ds: &str) -> Option<String> {
         self.claims.lock().targets.get(ds).cloned()
     }
+}
+
+/// Backup tasks that may wait per `--backup-max-tasks` slot (see [`BackupState::admit`]).
+pub const QUEUE_PER_SLOT: usize = 4;
+
+/// An admitted backup task; released on drop.
+pub struct Admission {
+    b: Arc<BackupState>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        *self.b.admitted.lock() -= 1;
+    }
+}
+
+fn no_credential_source(name: &str) -> BackupError {
+    BackupError::new(
+        Code::InvalidConfig,
+        format!(
+            "credentials.name: no credential source {name:?} in the server's backup config file"
+        ),
+    )
+    .with("field", "credentials.name")
+}
+
+/// The directory of a config file, canonicalized when it exists.
+fn config_dir(file: &Path) -> Option<PathBuf> {
+    let dir = std::path::absolute(file).ok()?.parent()?.to_path_buf();
+    Some(std::fs::canonicalize(&dir).unwrap_or(dir))
 }
 
 /// What a task claims (see [`BackupState::claim`]).
@@ -539,6 +702,19 @@ fn validate_file(f: &config::ConfigFile, data_dir: &Path) -> anyhow::Result<()> 
         r.validate(&[data_dir.to_path_buf()])
             .map_err(|e| anyhow::anyhow!("repository {:?}: {e}", r.name))?;
     }
+    for (name, c) in f.credential_sources() {
+        // (checked as the credentials of an s3 repository)
+        let probe = RepoConfig {
+            name: name.clone(),
+            kind: RepoType::S3,
+            bucket: Some("b".into()),
+            credentials: c,
+            ..Default::default()
+        };
+        probe
+            .validate(&[])
+            .map_err(|e| anyhow::anyhow!("credentials {name:?}: {e}"))?;
+    }
     Ok(())
 }
 
@@ -600,7 +776,6 @@ pub const DATA_LOCK: &str = "sparkles-server.lock";
 
 /// Whether a server holds the data directory's lock now (for offline commands that
 /// write into it).
-#[cfg_attr(not(test), allow(dead_code))] // `sparkles backup restore --data`
 pub fn data_dir_in_use(data_dir: &Path) -> bool {
     match std::fs::File::open(data_dir.join(DATA_LOCK)) {
         Ok(f) => matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
@@ -615,6 +790,7 @@ pub fn data_dir_in_use(data_dir: &Path) -> bool {
 pub fn start(st: &Arc<AppState>, h: &Handle) {
     let Some(b) = &st.backup else { return };
     let _ = b.handle.set(h.clone());
+    *b.outbound.write() = st.outbound.clone();
     tracing::debug!(target: "sparkles::backup", max_tasks = b.max_tasks, "backup tasks enabled");
     let names: Vec<String> = b.registry.repos.read().keys().cloned().collect();
     for name in names {

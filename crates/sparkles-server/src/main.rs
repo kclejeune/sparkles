@@ -62,6 +62,10 @@ struct Cli {
     /// Named snapshots per dataset
     #[arg(long, global = true, default_value_t = 256)]
     max_snapshots: usize,
+    /// Prefixes per dataset (0: unlimited); a new one past it is refused, and loaded
+    /// data stops adding its prefixes
+    #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
+    max_prefixes: usize,
     /// Write without write-time SHACL validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
@@ -366,6 +370,10 @@ enum Cmd {
         no_service: bool,
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
+        /// Let `LOAD <file:…>` read the files under this directory (and nothing else);
+        /// without it, the server refuses file loads
+        #[arg(long, value_name = "DIR")]
+        load_dir: Option<PathBuf>,
         /// Return free heap memory to the OS after this many idle milliseconds (0: never)
         #[arg(long, default_value_t = 1000)]
         idle_release_ms: u64,
@@ -884,6 +892,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         history_cache_bytes: cli.history_cache_mb << 20,
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
+        max_prefixes: cli.max_prefixes,
         ..Default::default()
     }
 }
@@ -1225,6 +1234,7 @@ fn run() -> Result<()> {
             read_only,
             no_service,
             outbound,
+            load_dir,
             idle_release_ms,
             text,
             schema_max_entries,
@@ -1300,15 +1310,16 @@ fn run() -> Result<()> {
             }
             #[cfg(feature = "backup")]
             {
-                st.backup = Some(Arc::new(backup::BackupState::new(
-                    &data,
-                    backup_config,
-                    backup_max_tasks,
-                )?));
+                let mut b = backup::BackupState::new(&data, backup_config, backup_max_tasks)?;
+                if let Some(f) = &auth_config {
+                    b.forbid_config_dir(f);
+                }
+                st.backup = Some(Arc::new(b));
             }
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.outbound = outbound.policy()?;
+            st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.schema_max_entries = schema_max_entries;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(

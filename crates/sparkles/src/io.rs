@@ -104,6 +104,55 @@ impl Source {
     }
 }
 
+/// The compression of a stream, detected like [`Source::codec`] (magic bytes, then the
+/// name `path`, which may be a URL path), and the bytes read from `r` to tell: they come
+/// before the rest of `r`.
+pub fn sniff_codec(r: &mut impl Read, path: Option<&Path>, name: &str) -> Result<(Codec, Vec<u8>)> {
+    let mut head = [0u8; 4];
+    let mut n = 0;
+    while n < head.len() {
+        match r.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(crate::codec::io_error(e)),
+        }
+    }
+    let (codec, warning) = Codec::detect(None, &head[..n], path)?;
+    if let Some(w) = warning {
+        tracing::warn!("{w}");
+    }
+    if !codec.supported() {
+        return Err(Error::Unsupported(format!(
+            "{name}: built without {}",
+            codec.name()
+        )));
+    }
+    Ok((codec, head[..n].to_vec()))
+}
+
+/// `ser` with these prefixes (for the formats that use them), leaving out the ones
+/// whose IRI does not parse. Each prefix is added in place: the serializer is not copied
+/// once per prefix.
+pub fn with_prefixes(
+    mut ser: oxrdfio::RdfSerializer,
+    prefixes: impl IntoIterator<Item = (String, String)>,
+) -> oxrdfio::RdfSerializer {
+    if !matches!(
+        ser.format(),
+        RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml
+    ) {
+        return ser;
+    }
+    for (p, ns) in prefixes {
+        if oxiri::Iri::parse(ns.as_str()).is_err() {
+            continue;
+        }
+        ser = ser.with_prefix(p, ns).expect("a checked IRI");
+    }
+    ser
+}
+
 /// Guess the format (and compression) from a file name like `data.ttl.gz` or
 /// `data.nq.zst`.
 pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
@@ -284,4 +333,33 @@ pub fn standard_prefixes() -> BTreeMap<String, String> {
     .into_iter()
     .map(|(a, b)| (a.to_string(), b.to_string()))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializers_take_every_valid_prefix() {
+        let many = (0..5000).map(|i| (format!("p{i}"), format!("http://p{i}.example/")));
+        let bad = [("bad".to_string(), "not an IRI".to_string())];
+        for format in [RdfFormat::Turtle, RdfFormat::TriG, RdfFormat::RdfXml] {
+            let ser = with_prefixes(
+                oxrdfio::RdfSerializer::from_format(format),
+                many.clone().chain(bad.clone()),
+            );
+            let mut w = ser.for_writer(Vec::new());
+            let s = oxrdf::NamedNodeRef::new_unchecked("http://p4999.example/s");
+            w.serialize_triple(oxrdf::TripleRef::new(s, s, s)).unwrap();
+            let out = String::from_utf8(w.finish().unwrap()).unwrap();
+            assert!(out.contains("p4999"), "{format}");
+            assert!(!out.contains("bad"), "{format}");
+        }
+        // formats without prefixes are left as they are
+        let ser = with_prefixes(
+            oxrdfio::RdfSerializer::from_format(RdfFormat::NTriples),
+            many,
+        );
+        assert_eq!(ser.format(), RdfFormat::NTriples);
+    }
 }

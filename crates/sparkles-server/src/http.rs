@@ -290,27 +290,37 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
 /// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
 /// place (an in-place restore takes the dataset out of service for the swap), so
 /// clients see the old state, the new one, or a retryable error, never a 404.
+///
+/// A request that passes holds the dataset until its handler answers: the swap waits
+/// for such requests before it takes the dataset out of the map, so a handler never
+/// looks up a dataset that went missing after this check.
 async fn restoring_guard(
     State(st): St,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let task = {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str());
+    let Some(ds) = crate::obs::ds_param(route, req.uri()) else {
+        return next.run(req).await;
+    };
+    let checked = {
         let restoring = st.restoring.lock();
-        if restoring.is_empty() {
-            None
-        } else {
-            let route = req
-                .extensions()
-                .get::<axum::extract::MatchedPath>()
-                .map(|m| m.as_str());
-            crate::obs::ds_param(route, req.uri())
-                .and_then(|ds| restoring.get(&ds).map(|t| (ds, t.clone())))
+        match restoring.get(&ds) {
+            Some(t) => Err(t.clone()),
+            // taken under the lock: a swap that starts later waits for this request
+            None => Ok(st.get(&ds)),
         }
     };
-    match task {
-        None => next.run(req).await,
-        Some((ds, task)) => {
+    match checked {
+        Ok(held) => {
+            let resp = next.run(req).await;
+            drop(held);
+            resp
+        }
+        Err(task) => {
             let body = json!({
                 "error": format!("dataset /{ds} is being restored (task {task})"),
                 "code": "dataset-restoring",
@@ -1299,6 +1309,7 @@ async fn update_endpoint(
     let mut opts = QueryOptions {
         allow_service: st.allow_service,
         outbound: st.outbound.clone(),
+        file_loads: st.file_loads.clone(),
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
@@ -1673,14 +1684,7 @@ async fn graph_body(
     let snap = snap.without_cache_fill();
     let prefixes = ds.store.prefixes();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
-        let mut ser = RdfSerializer::from_format(fmt);
-        if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-            for (p, ns) in prefixes {
-                if let Ok(s) = ser.clone().with_prefix(p, ns) {
-                    ser = s;
-                }
-            }
-        }
+        let ser = sparkles::io::with_prefixes(RdfSerializer::from_format(fmt), prefixes);
         let mut s = ser.for_writer(w);
         let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
         let mut n = 0u64;
@@ -2880,21 +2884,35 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
     p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
 }
 
-/// A task as `p` sees it: without `server-admin`, absolute paths in its message are cut
-/// to their last component (`backup written to …/wiki_2026-01-01.nq.gz`).
+/// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
+/// the strings of its `detail` are cut to their last component (`backup written to
+/// …/wiki_2026-01-01.nq.gz`).
 fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
     let mut t = t.clone();
-    if !p.has(crate::auth::ServerPerm::ServerAdmin)
-        && let Some(m) = &t.message
-    {
-        t.message = Some(redact_paths(m));
+    if !p.has(crate::auth::ServerPerm::ServerAdmin) {
+        if let Some(m) = &t.message {
+            t.message = Some(redact_paths(m));
+        }
+        if let Some(d) = &mut t.detail {
+            redact_json_paths(d);
+        }
     }
     t
 }
 
+/// [`redact_paths`] on every string of a JSON value.
+pub(crate) fn redact_json_paths(v: &mut J) {
+    match v {
+        J::String(s) => *s = redact_paths(s),
+        J::Array(a) => a.iter_mut().for_each(redact_json_paths),
+        J::Object(o) => o.values_mut().for_each(redact_json_paths),
+        _ => {}
+    }
+}
+
 /// `msg` with every absolute path (a word starting with `/` and holding another `/`)
 /// cut to `…/` and its last component.
-fn redact_paths(msg: &str) -> String {
+pub(crate) fn redact_paths(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     while let Some(i) = rest.find('/') {

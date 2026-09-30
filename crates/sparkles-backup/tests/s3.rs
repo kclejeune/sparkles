@@ -39,7 +39,7 @@ async fn s3_semantics() {
     let t = repo.test().await.unwrap();
     assert!(t.ok && t.conditional_writes, "{t:?}");
 
-    // A2, A3
+    // a first and an incremental backup
     repo.create(closed_source(&a), &opts("b1", "a"))
         .await
         .unwrap();
@@ -56,7 +56,7 @@ async fn s3_semantics() {
         m2.stats
     );
 
-    // A7: a second handle racing for a taken name
+    // a second handle racing for a taken name
     let other = Repository::open(&cfg, &OpenEnv::default()).await.unwrap();
     assert_eq!(other.id(), repo.id());
     let e = other
@@ -65,7 +65,7 @@ async fn s3_semantics() {
         .unwrap_err();
     assert_eq!(e.code(), Code::BackupExists);
 
-    // A10
+    // verification finds a missing blob
     let v = repo
         .verify(
             &[],
@@ -95,7 +95,7 @@ async fn s3_semantics() {
         .unwrap();
     assert_eq!(v.backups[0].missing, [id]);
 
-    // A19
+    // deleting a backup keeps its blobs
     assert!(repo.delete("b1").await.unwrap());
     let names: Vec<String> = repo
         .list(&ListFilter::default())

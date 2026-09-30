@@ -101,7 +101,12 @@ export type Outcome =
   | 'denied'
   | 'rejected';
 export type LimitClass = 'auth' | 'query' | 'update' | 'admin' | 'preauth';
-export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
+export type BudgetKind =
+  | 'rows'
+  | 'memory'
+  | 'result-bytes'
+  | 'decompressed-bytes'
+  | 'outbound-bytes';
 
 type CacheStats = {
   bytes: number;
@@ -292,7 +297,14 @@ export class ApiError extends Error {
 
 function budgetOf(body: Record<string, unknown>): Budget | undefined {
   const kind = body.budget;
-  if (kind !== 'rows' && kind !== 'memory' && kind !== 'result-bytes') return undefined;
+  if (
+    kind !== 'rows' &&
+    kind !== 'memory' &&
+    kind !== 'result-bytes' &&
+    kind !== 'decompressed-bytes' &&
+    kind !== 'outbound-bytes'
+  )
+    return undefined;
   return { kind, limit: Number(body.limit ?? 0), requested: Number(body.requested ?? 0) };
 }
 
@@ -305,6 +317,10 @@ export function budgetHint(b: Budget): string {
       return `The query needs too much memory (limit ${fmtBytes(b.limit)}). Narrow the query or make its patterns more selective.`;
     case 'rows':
       return `An intermediate result is too large (limit ${fmtInt(b.limit)} rows). Narrow the query.`;
+    case 'decompressed-bytes':
+      return `The request body is too large once decompressed (limit ${fmtBytes(b.limit)}). Send less data per request.`;
+    case 'outbound-bytes':
+      return `SERVICE calls and LOADs downloaded too much in total (limit ${fmtBytes(b.limit)}). Fetch less remote data per request.`;
   }
 }
 

@@ -39,6 +39,7 @@ use object_store::path::Path as Key;
 use object_store::{
     ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, PutResult,
 };
+use sparkles::outbound::OutboundPolicy;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -287,6 +288,10 @@ impl RepoConfig {
                 if b.is_empty() || b.contains('/') {
                     return Err(invalid("bucket", "required, without `/`"));
                 }
+                // (the bucket and the region become part of the service's host name)
+                if b.len() > 255 || !b.bytes().all(host_part) {
+                    return Err(invalid("bucket", "use letters, digits, `.`, `_` and `-`"));
+                }
                 let prefix = self.prefix.as_deref().unwrap_or("").trim_matches('/');
                 if !prefix.is_empty()
                     && prefix
@@ -297,6 +302,11 @@ impl RepoConfig {
                 }
             }
             RepoType::Memory => {}
+        }
+        if let Some(r) = &self.region
+            && (r.is_empty() || r.len() > 64 || !r.bytes().all(|c| c != b'.' && host_part(c)))
+        {
+            return Err(invalid("region", "use letters, digits, `_` and `-`"));
         }
         if let Some(e) = &self.endpoint {
             let (scheme, rest) = e
@@ -349,6 +359,14 @@ impl RepoConfig {
                     return Err(invalid("credentials.path", "must be absolute"));
                 }
             }
+            Credentials::Named { name } => {
+                if !layout::valid_repo_name(name) {
+                    return Err(invalid(
+                        "credentials.name",
+                        "not a credential source name ([a-z0-9][a-z0-9_-]{0,63})",
+                    ));
+                }
+            }
         }
         if self.max_concurrency == Some(0) {
             return Err(invalid("maxConcurrency", "must be at least 1"));
@@ -369,9 +387,14 @@ impl RepoConfig {
     }
 }
 
+/// A byte of a bucket name or a region: letters, digits, `.`, `_` and `-`.
+fn host_part(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-')
+}
+
 /// Whether `p` is `dir` or inside it: compared lexically, and again with both
 /// canonicalized (symbolic links) when they exist.
-fn is_within(p: &Path, dir: &Path) -> bool {
+pub fn is_within(p: &Path, dir: &Path) -> bool {
     fn norm(p: &Path) -> PathBuf {
         let mut out = PathBuf::new();
         for c in p.components() {
@@ -419,13 +442,84 @@ fn is_within(p: &Path, dir: &Path) -> bool {
 /// (`maxConcurrency`) and a `PrefixStore` for a prefix. Credentials files are read here
 /// (so rotation works); their contents never appear in errors.
 pub fn build_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
+    build_store_with(cfg, None)
+}
+
+/// [`build_store`], with the network destinations of `s3`, `gcs` and `azure`
+/// repositories under `outbound` (see [`OpenEnv::outbound`]): the endpoint (or the
+/// service's host) is checked now, and every connection resolves its host through the
+/// policy, so it reaches only addresses the policy allows (a later DNS answer cannot
+/// point it elsewhere). A refused destination is `400 invalid-config`.
+pub fn build_store_with(
+    cfg: &RepoConfig,
+    outbound: Option<&OutboundPolicy>,
+) -> Result<Arc<dyn ObjectStore>> {
+    if let Some(p) = outbound
+        && matches!(cfg.kind, RepoType::S3 | RepoType::Gcs | RepoType::Azure)
+    {
+        check_destination(cfg, p)?;
+    }
     let base: Arc<dyn ObjectStore> = match cfg.kind {
         RepoType::Memory => Arc::new(object_store::memory::InMemory::new()),
         RepoType::Fs => fs_store(cfg)?,
-        RepoType::S3 => s3_store(cfg)?,
-        RepoType::Gcs | RepoType::Azure => cloud_store(cfg)?,
+        RepoType::S3 => s3_store(cfg, outbound)?,
+        RepoType::Gcs | RepoType::Azure => cloud_store(cfg, outbound)?,
     };
     Ok(limited(base, cfg.concurrency()))
+}
+
+/// Check the endpoint of a repository against an outbound policy: its scheme and
+/// address, and the addresses its host name resolves to now (connections are checked
+/// again as they are made, see [`PolicyResolver`]). Without an endpoint the service's
+/// own host is resolved when connecting.
+fn check_destination(cfg: &RepoConfig, p: &OutboundPolicy) -> Result<()> {
+    let Some(e) = &cfg.endpoint else {
+        return Ok(());
+    };
+    let refused = |f: sparkles::outbound::Failure| {
+        invalid(
+            "endpoint",
+            format!("the server's outbound policy refuses it: {f}"),
+        )
+    };
+    let url = p.check_url(e).map_err(refused)?;
+    // an address was checked by `check_url`; a name is resolved
+    if let Some(host) = url.host_str()
+        && host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+    {
+        p.check_host(host).map_err(refused)?;
+    }
+    Ok(())
+}
+
+/// Resolves the host names of a repository's connections through an outbound policy
+/// (every address must be allowed; the connection goes to exactly those addresses).
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+#[derive(Debug)]
+struct PolicyResolver(std::panic::AssertUnwindSafe<OutboundPolicy>);
+
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+impl PolicyResolver {
+    /// Client options whose connections resolve through `p`.
+    fn options(p: &OutboundPolicy) -> object_store::ClientOptions {
+        object_store::ClientOptions::new().with_dns_resolver(Arc::new(PolicyResolver(
+            std::panic::AssertUnwindSafe(p.clone()),
+        )))
+    }
+}
+
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+impl object_store::client::DnsResolver for PolicyResolver {
+    fn resolve(&self, host: &str) -> object_store::client::DnsFuture {
+        let (p, host) = (self.0.0.clone(), host.to_string());
+        Box::pin(async move {
+            let checked = tokio::task::spawn_blocking(move || p.check_host(&host)).await?;
+            checked.map_err(|f| f.to_string().into())
+        })
+    }
 }
 
 fn limited(store: Arc<dyn ObjectStore>, n: usize) -> Arc<dyn ObjectStore> {
@@ -466,7 +560,7 @@ fn fs_store(_: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
 }
 
 #[cfg(feature = "s3")]
-fn s3_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
+fn s3_store(cfg: &RepoConfig, outbound: Option<&OutboundPolicy>) -> Result<Arc<dyn ObjectStore>> {
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut};
     let mut b = match &cfg.credentials {
         Credentials::Default => AmazonS3Builder::from_env(),
@@ -516,6 +610,12 @@ fn s3_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
             }
             b
         }
+        Credentials::Named { name } => {
+            return Err(invalid(
+                "credentials.name",
+                format!("the credential source {name:?} is defined by the server, not here"),
+            ));
+        }
     };
     if !matches!(cfg.credentials, Credentials::Default) && cfg.region.is_none() {
         // `from_env` reads the region itself; explicit credentials start from `new`
@@ -525,6 +625,10 @@ fn s3_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
         {
             b = b.with_region(r);
         }
+    }
+    if let Some(p) = outbound {
+        // (fresh client options: no proxy from the environment's AWS_* settings either)
+        b = b.with_client_options(PolicyResolver::options(p));
     }
     b = b
         .with_bucket_name(cfg.bucket.clone().unwrap_or_default())
@@ -562,17 +666,25 @@ fn s3_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
 }
 
 #[cfg(not(feature = "s3"))]
-fn s3_store(_: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
+fn s3_store(_: &RepoConfig, _: Option<&OutboundPolicy>) -> Result<Arc<dyn ObjectStore>> {
     Err(invalid(
         "type",
         "s3 repositories are not built into this binary",
     ))
 }
 
-fn cloud_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
+#[cfg_attr(not(any(feature = "gcs", feature = "azure")), allow(unused_variables))]
+fn cloud_store(
+    cfg: &RepoConfig,
+    outbound: Option<&OutboundPolicy>,
+) -> Result<Arc<dyn ObjectStore>> {
     #[cfg(feature = "gcs")]
     if cfg.kind == RepoType::Gcs {
-        let gcs = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+        let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env();
+        if let Some(p) = outbound {
+            b = b.with_client_options(PolicyResolver::options(p));
+        }
+        let gcs = b
             .with_bucket_name(cfg.bucket.clone().unwrap_or_default())
             .with_retry(object_store::RetryConfig::default())
             .build()
@@ -581,7 +693,11 @@ fn cloud_store(cfg: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
     }
     #[cfg(feature = "azure")]
     if cfg.kind == RepoType::Azure {
-        let az = object_store::azure::MicrosoftAzureBuilder::from_env()
+        let mut b = object_store::azure::MicrosoftAzureBuilder::from_env();
+        if let Some(p) = outbound {
+            b = b.with_client_options(PolicyResolver::options(p));
+        }
+        let az = b
             .with_container_name(cfg.bucket.clone().unwrap_or_default())
             .with_retry(object_store::RetryConfig::default())
             .build()
@@ -644,7 +760,7 @@ impl Repository {
                 instrumented::LOCAL_ATTEMPTS,
             ),
             None => {
-                let s = build_store(cfg)?;
+                let s = build_store_with(cfg, env.outbound.as_ref())?;
                 let attempts = match cfg.kind {
                     // the HTTP client retries (RetryConfig)
                     RepoType::S3 | RepoType::Gcs | RepoType::Azure => 1,

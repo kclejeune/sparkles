@@ -18,6 +18,7 @@ mod auth;
 mod backup;
 mod clone;
 mod cost;
+mod loads;
 mod open;
 #[cfg(feature = "reasoning")]
 mod reasoning;

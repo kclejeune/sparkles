@@ -497,9 +497,14 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--outbound-allow HOST_OR_CIDR` | | contact only these destinations (repeatable) |
 | `--outbound-timeout S` | `60` | total time of one outbound request, until the end of its response |
 | `--outbound-max-mb N` | `256` | largest outbound response, decompressed |
+| `--outbound-request-max-mb N` | 4 × `--outbound-max-mb` (`1024`) | bytes all the SERVICE calls and LOADs of one query or update may receive (`507` past it) |
+| `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | time all the SERVICE calls and LOADs of one query or update may take, summed |
+| `--load-dir DIR` | | let `LOAD <file:…>` read the regular files under `DIR` (symbolic links resolved, nothing outside it); without it the server refuses file loads |
+| `--max-prefixes N` | `1000` | prefixes per dataset (global flag; `0`: unlimited); a new one past it is refused with `400`, and loaded data stops adding its prefixes |
 
-Over-budget requests fail with `507` and a JSON body naming the budget; a query or write
-stops as soon as its client disconnects (a write then commits nothing). `sparkles query --memory-mb N` applies the memory budget
+Over-budget requests fail with `507` and a JSON body naming the budget (`outbound-bytes` for
+the outbound total); a query or write stops as soon as its client disconnects (a write then
+commits nothing). `sparkles query --memory-mb N` applies the memory budget
 on the command line (unlimited by default).
 
 Command line tools (Jena `tdb2.*` / `arq` equivalents):
@@ -555,6 +560,24 @@ of the target data directory has it) and `--check quick|full|none` the integrity
 before the restored database is published. `restore --data` refuses while a server holds
 the data directory.
 
+A server (`sparkles serve --backup-config FILE`) also takes repositories registered through
+its API and UI (`POST /$/repositories`), under the operator's limits from that file. Their
+credentials only name a source defined there, never environment variables, files or the
+instance's default chain of the caller's choosing; their S3 endpoints go through the
+outbound policy below (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
+`--outbound-allow-private`); `fs` ones stay out of the data directory and the config
+files' directories, and under `[api] fs_roots` when it is set:
+
+```toml
+[credentials.minio]              # named by {"source": "named", "name": "minio"}
+source = "env"
+access_key_id_var = "MINIO_ACCESS_KEY"
+secret_access_key_var = "MINIO_SECRET_KEY"
+
+[api]
+fs_roots = ["/srv/backups"]
+```
+
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
 ### Outbound requests (SERVICE and LOAD)
@@ -577,11 +600,25 @@ local `sparkles query` and `sparkles update` follow it too, with a different def
 * every redirect hop is checked the same way (at most 5 hops);
 * a 10 s connect timeout, a total timeout (`--outbound-timeout`, default 60 s, and never
   past the query's own timeout), and a response ceiling counted as the body streams in and,
-  for a compressed `LOAD`, after decompression (`--outbound-max-mb`, default 256).
+  for a compressed `LOAD`, after decompression (`--outbound-max-mb`, default 256);
+* one budget for all the SERVICE calls and LOADs of a query or update, so that many
+  requests cannot add up to more than a few large ones: the bytes they receive
+  (`--outbound-request-max-mb`, by default 4 × `--outbound-max-mb`; a compressed `LOAD`
+  counts its decompressed bytes) and the time they take, summed
+  (`--outbound-request-timeout`, by default 4 × `--outbound-timeout`). Past the bytes the
+  request fails with `507` (`"budget": "outbound-bytes"`) and an update commits nothing;
+  past the time the next call gets only what is left and then fails like a timeout;
+* a `LOAD` is parsed as its response streams in, not buffered first.
 
 A refused destination fails with `403` before any connection is made, and `SILENT` does
-not hide it (it hides failures of the remote side, such as timeouts). Proxy environment
-variables (`HTTP_PROXY`, …) are ignored for these requests.
+not hide it (it hides failures of the remote side, such as timeouts), nor a spent budget.
+Proxy environment variables (`HTTP_PROXY`, …) are ignored for these requests.
+
+Error messages name the URL and its host but not what the host resolved to, nor the
+connection's own error: a refused name answers `… is refused by the outbound policy`, a
+failed connection `cannot connect`. The server logs the details (target
+`sparkles::outbound`: the resolved address and its kind, the OS error), so an operator can
+tell why while a caller cannot map internal names to addresses.
 
 `--outbound-allow-private` opens loopback, private, shared and unique-local addresses, for
 example a local Fuseki during development:
@@ -593,10 +630,14 @@ sparkles serve --data ./data --outbound-allow-private
 
 Link-local addresses, the metadata service among them, stay refused. In production,
 prefer an allowlist: with `--outbound-allow` (repeatable) only the listed destinations are
-contacted. An entry is a host name (`--outbound-allow localhost`), which may resolve to
-any address; `*.example.org`, the subdomains of a name, on public addresses only; or an
-address or CIDR network (`--outbound-allow 10.20.0.0/16`), any address in it. `sparkles
-mcp` takes the same flags. Library users set `QueryOptions::outbound`
+contacted. An entry is a host name (`--outbound-allow sparql.example.org`) or
+`*.example.org`, the subdomains of a name, both at public addresses (private ones too with
+`--outbound-allow-private`); or an address or CIDR network (`--outbound-allow
+10.20.0.0/16`), any address in it, private and link-local ones included. A name vouches
+for the name, not for its addresses: to reach a name that resolves to a private or
+link-local address, list that address or network as well (`--outbound-allow
+fuseki.internal --outbound-allow 10.20.0.0/16`), so a hijacked or mistyped DNS record
+never opens the metadata service. `sparkles mcp` takes the same flags. Library users set `QueryOptions::outbound`
 (`sparkles::outbound::OutboundPolicy`, same defaults); the default refusal of non-public
 addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
 
@@ -615,6 +656,14 @@ sparkles query --data local.ttl --outbound-block-private --query untrusted.rq
 
 With `--server`, the request runs on that server under its own policy, and these flags
 do not apply.
+
+**Local files.** `LOAD <file:…>` over HTTP needs `server-admin` (with authentication on)
+and `serve --load-dir DIR`: the file must be a regular file under `DIR` once `..` and
+symbolic links are resolved (a link inside `DIR` may point elsewhere inside it). Without
+the flag the server refuses file loads (`403`); `DIR` may not hold the data directory.
+The local `sparkles update` reads any file its user can. Library users set
+`QueryOptions::file_loads` (`FileLoads::Anywhere` by default, `FileLoads::under(dir)`, or
+`FileLoads::Disabled`).
 
 ### Checking a database
 

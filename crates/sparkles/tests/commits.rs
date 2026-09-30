@@ -388,6 +388,65 @@ fn library_receipts() {
     assert_eq!(json["datasetId"], ds.dataset_id().to_string());
 }
 
+/// A dataset holds at most `max_prefixes` prefixes: a new one past it is refused, the
+/// prefixes of loaded data stop being added, and names and IRIs have a length limit.
+#[test]
+fn prefixes_are_capped() {
+    use sparkles::store::{MAX_PREFIX_IRI_BYTES, MAX_PREFIX_NAME_BYTES};
+    assert_eq!(StoreOptions::default().max_prefixes, 1000);
+    let s = Store::in_memory(StoreOptions {
+        max_prefixes: 3,
+        ..Default::default()
+    });
+    for i in 0..3 {
+        s.set_prefix(&format!("p{i}"), &format!("http://p{i}.example/"))
+            .unwrap();
+    }
+    let e = s.set_prefix("p3", "http://p3.example/").unwrap_err();
+    assert!(
+        matches!(&e, sparkles::Error::Invalid(m) if m.contains("the most allowed")),
+        "{e:?}"
+    );
+    // replacing or removing one still works
+    s.set_prefix("p0", "http://other.example/").unwrap();
+    assert!(s.remove_prefix("p1").unwrap());
+    s.set_prefix("p3", "http://p3.example/").unwrap();
+    assert!(s.remove_prefix("p3").unwrap());
+    // the prefixes of loaded data fill the room left, and no more
+    s.add_prefixes(
+        [("a", "http://a.example/"), ("b", "http://b.example/")]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into(),
+    )
+    .unwrap();
+    assert_eq!(s.prefixes().keys().collect::<Vec<_>>(), ["a", "p0", "p2"]);
+    // lengths
+    let s = Store::in_memory(StoreOptions::default());
+    let long = "a".repeat(MAX_PREFIX_NAME_BYTES + 1);
+    assert!(s.set_prefix(&long, "http://x.example/").is_err());
+    let iri = format!("http://x.example/{}", "a".repeat(MAX_PREFIX_IRI_BYTES));
+    assert!(s.set_prefix("x", &iri).is_err());
+    s.add_prefixes(
+        [
+            (long, "http://x.example/".to_string()),
+            ("x".to_string(), iri),
+        ]
+        .into(),
+    )
+    .unwrap();
+    assert!(s.prefixes().is_empty());
+    // 0: unlimited
+    let s = Store::in_memory(StoreOptions {
+        max_prefixes: 0,
+        ..Default::default()
+    });
+    for i in 0..1500 {
+        s.set_prefix(&format!("p{i}"), &format!("http://p{i}.example/"))
+            .unwrap();
+    }
+    assert_eq!(s.prefixes().len(), 1500);
+}
+
 #[test]
 fn prefix_changes_persist_without_commits() {
     let dir = tempfile::tempdir().unwrap();

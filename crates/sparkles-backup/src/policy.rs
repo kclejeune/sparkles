@@ -722,7 +722,7 @@ mod tests {
         }
     }
 
-    // A23: `*/10` with the clock at 12:05 → 12:10, then 12:20
+    // `*/10` with the clock at 12:05 → 12:10, then 12:20
     #[test]
     fn every_ten_minutes() {
         let s = sched("*/10 * * * *");
@@ -752,7 +752,7 @@ mod tests {
         );
     }
 
-    // A25: `30 2 * * *` in Europe/Berlin from 2026-10-24
+    // `30 2 * * *` in Europe/Berlin from 2026-10-24
     #[test]
     fn berlin_fall_back_runs_once() {
         let s = sched("30 2 * * *");
@@ -777,7 +777,7 @@ mod tests {
         );
     }
 
-    // A25: 2027-03-28, 02:30 does not exist in Berlin → 03:00 CEST
+    // 2027-03-28, 02:30 does not exist in Berlin → 03:00 CEST
     #[test]
     fn berlin_spring_forward_runs_after_the_gap() {
         let s = sched("30 2 * * *");
@@ -888,7 +888,7 @@ mod tests {
         );
     }
 
-    // A25: `every 6h` → 00:00Z, 06:00Z, … whatever the start and zone
+    // `every 6h` → 00:00Z, 06:00Z, … whatever the start and zone
     #[test]
     fn every_six_hours_counts_from_the_epoch() {
         let s = sched("every 6h");
@@ -917,7 +917,7 @@ mod tests {
         );
     }
 
-    // A24: an hourly policy, last run 09:00, back at 12:40
+    // an hourly policy, last run 09:00, back at 12:40
     #[test]
     fn missed_runs() {
         let s = sched("0 * * * *");
@@ -1159,7 +1159,7 @@ mod tests {
         v.iter().map(|b| b.name.as_str()).collect()
     }
 
-    // A26
+    // retention by count and age, never touching other backups
     #[test]
     fn retention_by_count_and_age() {
         let now = t("2026-09-30T12:00:00Z");

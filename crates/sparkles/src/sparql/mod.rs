@@ -50,8 +50,11 @@ pub struct QueryOptions {
     pub forbid_service: bool,
     /// Refuse `LOAD <http…>` with [`Error::NotPermitted`].
     pub forbid_remote_load: bool,
-    /// Refuse `LOAD <file:…>` with [`Error::NotPermitted`].
+    /// Refuse `LOAD <file:…>` with [`Error::NotPermitted`] (the caller lacks the
+    /// permission; see [`file_loads`](Self::file_loads) for what may be read at all).
     pub forbid_file_load: bool,
+    /// Which files `LOAD <file:…>` may read (any, by default).
+    pub file_loads: FileLoads,
     /// Where SERVICE and `LOAD <http…>` may connect, with their timeouts and response
     /// ceiling (the default refuses loopback, private and link-local destinations); a
     /// refused destination fails with [`Error::NotPermitted`].
@@ -70,6 +73,34 @@ pub struct QueryOptions {
     pub prefixes: Vec<(String, String)>,
     /// Executor optimizations in effect (all on by default; see [`Optimizations`]).
     pub optimizations: Option<Optimizations>,
+}
+
+/// Which files `LOAD <file:…>` may read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FileLoads {
+    /// Any file the process can read (the local command line, embedders).
+    #[default]
+    Anywhere,
+    /// Regular files under this directory: the file's path, with `..` and symbolic
+    /// links resolved, must be inside the directory's canonical path (see
+    /// [`FileLoads::under`]).
+    Under(std::path::PathBuf),
+    /// None: `LOAD <file:…>` fails with [`Error::NotPermitted`].
+    Disabled,
+}
+
+impl FileLoads {
+    /// [`FileLoads::Under`] a directory, canonicalized (it must exist).
+    pub fn under(dir: &std::path::Path) -> Result<FileLoads> {
+        let d = std::fs::canonicalize(dir)?;
+        if !d.is_dir() {
+            return Err(Error::invalid(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        Ok(FileLoads::Under(d))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -214,6 +245,7 @@ fn make_ctx(
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;
     ctx.outbound = opts.outbound.clone();
+    ctx.outbound_budget = crate::outbound::RequestBudget::new(&opts.outbound);
     ctx.use_cache = !opts.no_cache;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;

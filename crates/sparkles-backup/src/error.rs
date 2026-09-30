@@ -62,6 +62,8 @@ pub enum Code {
     RepositoryUnavailable,
     /// the commit catalog could not be flushed at capture (503, retryable)
     CatalogLagging,
+    /// as many backup tasks as the server takes run or wait already (503, retryable)
+    TooManyTasks,
     /// the operation was cancelled (a task ends `cancelled`)
     Cancelled,
     /// a restored store whose head or quad count differs from the manifest (500)
@@ -71,7 +73,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub const ALL: [Code; 34] = [
+    pub const ALL: [Code; 35] = [
         Code::InvalidName,
         Code::InvalidConfig,
         Code::InvalidRequest,
@@ -103,6 +105,7 @@ impl Code {
         Code::NotImplemented,
         Code::RepositoryUnavailable,
         Code::CatalogLagging,
+        Code::TooManyTasks,
         Code::Cancelled,
         Code::RestoreMismatch,
         Code::Internal,
@@ -141,6 +144,7 @@ impl Code {
             Code::NotImplemented => "not-implemented",
             Code::RepositoryUnavailable => "repository-unavailable",
             Code::CatalogLagging => "catalog-lagging",
+            Code::TooManyTasks => "too-many-tasks",
             Code::Cancelled => "cancelled",
             Code::RestoreMismatch => "restore-mismatch",
             Code::Internal => "internal",
@@ -174,7 +178,7 @@ impl Code {
             Code::BackupUnsupported | Code::NotImplemented => 501,
             Code::RepositoryUnavailable => 502,
             // like the engine's `Cancelled` (a query cancelled by shutdown)
-            Code::CatalogLagging | Code::Cancelled => 503,
+            Code::CatalogLagging | Code::TooManyTasks | Code::Cancelled => 503,
             Code::RestoreMismatch | Code::Internal => 500,
         }
     }
@@ -293,14 +297,51 @@ pub fn redact_urls(msg: &str) -> String {
     out
 }
 
+/// Drop the response body a backend error quotes, keeping the status and an S3 error
+/// code (`<Code>AccessDenied</Code>`) if the body has one: what an endpoint answered
+/// must not reach clients (a misconfigured or hostile endpoint may be some other
+/// service).
+pub fn redact_bodies(msg: &str) -> String {
+    const STATUS: &str = "Server returned non-2xx status code: ";
+    const RESPONSE: &str = "Server returned error response";
+    let (head, body) = if let Some(i) = msg.find(STATUS) {
+        let rest = &msg[i + STATUS.len()..];
+        // "404 Not Found: <body>"
+        let end = rest.find(": ").unwrap_or(rest.len());
+        (
+            format!("{}{}", &msg[..i + STATUS.len()], &rest[..end]),
+            &rest[end..],
+        )
+    } else if let Some(i) = msg.find(RESPONSE) {
+        (
+            msg[..i + RESPONSE.len()].to_string(),
+            &msg[i + RESPONSE.len()..],
+        )
+    } else {
+        return msg.to_string();
+    };
+    let code = body
+        .split_once("<Code>")
+        .and_then(|(_, r)| r.split_once("</Code>"))
+        .map(|(c, _)| c)
+        .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric()));
+    match code {
+        Some(c) => format!("{head} ({c})"),
+        None => head,
+    }
+}
+
 impl From<object_store::Error> for BackupError {
-    /// Backend errors are `repository-unavailable` (502), without URL query strings.
-    /// Callers that expect `NotFound` or `AlreadyExists` match on the
-    /// `object_store::Error` before converting.
+    /// Backend errors are `repository-unavailable` (502), without URL query strings or
+    /// response bodies ([`redact_bodies`]). Callers that expect `NotFound` or
+    /// `AlreadyExists` match on the `object_store::Error` before converting.
     fn from(e: object_store::Error) -> BackupError {
         BackupError::new(
             Code::RepositoryUnavailable,
-            format!("repository unavailable: {}", redact_urls(&e.to_string())),
+            format!(
+                "repository unavailable: {}",
+                redact_bodies(&redact_urls(&e.to_string()))
+            ),
         )
     }
 }
@@ -364,5 +405,26 @@ mod tests {
             "(http://h:9000/a), and s3://b/p"
         );
         assert_eq!(redact_urls("no url"), "no url");
+    }
+
+    #[test]
+    fn response_bodies_are_not_quoted() {
+        assert_eq!(
+            redact_bodies(
+                "Generic S3 error: Error performing GET http://h/k in 2ms - Server returned non-2xx status code: 403 Forbidden: <Error><Code>AccessDenied</Code><Message>secret stuff</Message></Error>"
+            ),
+            "Generic S3 error: Error performing GET http://h/k in 2ms - Server returned non-2xx status code: 403 Forbidden (AccessDenied)"
+        );
+        assert_eq!(
+            redact_bodies(
+                "Error performing PUT x - Server returned non-2xx status code: 500 Internal Server Error: {\"internal\": \"data\"}"
+            ),
+            "Error performing PUT x - Server returned non-2xx status code: 500 Internal Server Error"
+        );
+        assert_eq!(
+            redact_bodies("Server returned error response: <html>metadata</html>"),
+            "Server returned error response"
+        );
+        assert_eq!(redact_bodies("connection refused"), "connection refused");
     }
 }
