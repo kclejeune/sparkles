@@ -229,9 +229,11 @@ Jena/Fuseki wins no query at 1.05M. Its one advantage is that it streams results
   B+trees in place. Sparkles keeps updates in an in-memory delta: large batches trigger
   a full rebuild, and many small commits grow the delta until `compact`. Sustained
   mixed read/write workloads have not been measured.
-* **Text search, spatial queries, inference-time reasoning.** Sparkles has none of these
-  (see the README), so they were not benchmarked. Jena's `jena-text` / GeoSPARQL and
-  QLever's text and spatial joins have no Sparkles counterpart.
+* **Text search against other engines, spatial queries, inference-time reasoning.**
+  Sparkles' full-text index is measured on its own below; it was not compared with
+  Jena's `jena-text` or QLever's text joins. Sparkles has no spatial queries or
+  inference-time reasoning, so GeoSPARQL and backward-chaining workloads were not
+  benchmarked.
 * **Result-cache benefit.** All runs had caches off. With the cache on, repeated
   queries are mostly served from memory, which is not a fair comparison.
 
@@ -242,3 +244,35 @@ Jena/Fuseki wins no query at 1.05M. Its one advantage is that it streams results
 | RDFS materialization, 1.0M → 2.75M inferred triples | 3.9 s end to end |
 | SHACL validation, 20 shapes, 1.05M triples, 48,428 results (`mise run bench:shacl 100000`) | 164 ms parallel, 741 ms sequential |
 | `ASK { ?s ?p ?o }` / `SELECT * … LIMIT 100` at 10.5M (early termination) | 1.9 ms / 1.8 ms |
+
+### Full-text index and observability (10.5M triples)
+
+Sparkles alone, one configuration at a time, same machine and harness
+(`scripts/bench.sh` with `ENGINES=sparkles SKIP_LOAD=1`, plus `hyperfine` and `oha`).
+Update times are end to end over HTTP (`curl`).
+
+| | Text search off | Text search on |
+|---|---:|---:|
+| Build the index (every string literal, `sparkles text-index`) | — | 8.9 s, 1.3 GiB peak RSS, 113 MB on disk |
+| 1-triple `INSERT DATA` (harness) | 9.2 ± 4.7 ms | 14.9 ± 7.1 ms |
+| 1,000-triple `INSERT DATA` | 21.6 ± 9.6 ms | 49.0 ± 2.3 ms |
+| `text:query ("Perlman" 10)`, top 10 with scores | — | 15.0 ± 1.0 ms |
+| `COUNT` of `text:query "Zurich"` (1,954 hits) | — | 25.5 ± 5.4 ms |
+
+Before the index stopped syncing every commit to disk (it now syncs at most once a
+second, and replays the WAL after a crash), the same 1-triple insert took
+29.9 ± 0.8 ms with text search on, and 8.9 ± 4.0 ms off. The 1,000-triple batch cost
+about 27 ms more with text search on, both before and after that change: the rest is
+indexing and the index commit, not disk syncs.
+
+Access logging and Prometheus metrics (the defaults) against `--no-access-log
+--no-metrics`: the sum of the 20 harness queries differs by 0.6% (1,248 vs 1,240 ms,
+within run-to-run noise; single queries vary by up to ±50% in both directions at
+these sizes). Under load (`oha`, 16 connections, two alternating rounds each):
+
+| | Logs and metrics on | Off |
+|---|---:|---:|
+| `ASK {}`, 50,000 requests | 71,034 / 70,175 req/s, p99 0.63 / 0.67 ms | 69,776 / 68,782 req/s, p99 0.63 / 0.66 ms |
+| star join, 1,000 requests | 103 / 103 req/s, p50 155 / 156 ms | 104 / 100 req/s, p50 154 / 159 ms |
+
+No measurable overhead.
