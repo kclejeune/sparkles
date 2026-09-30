@@ -675,12 +675,21 @@ async fn writes_return_commits_and_reads_name_them() {
     assert_eq!(j["commit"]["kind"], "update");
     assert_eq!(j["commit"]["inserted"], 2);
 
-    // the default body is unchanged
+    // the default body carries no commit fields
     let (r, h) = sparql_update(&s.app, "INSERT DATA { <urn:c> <urn:p> 3 }", None).await;
     assert_eq!(r.content_type, "application/json");
     let mut keys: Vec<String> = r.json().as_object().unwrap().keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, ["deleted", "inserted", "operations", "timing"]);
+    assert_eq!(
+        keys,
+        [
+            "deleted",
+            "inserted",
+            "memPeakBytes",
+            "operations",
+            "timing"
+        ]
+    );
     assert_eq!(commit_header(&h), 3);
 
     // no change: no commit

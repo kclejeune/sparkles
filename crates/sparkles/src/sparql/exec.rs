@@ -133,9 +133,12 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
 fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     let start = Instant::now();
     let mut infos = Vec::new();
+    // the children's tables count against the memory budget until this operator is done
+    let held = ctx.charge(0)?;
     let child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
         let (t, info) = execute(ctx, &n.children[i])?;
         infos.push(info);
+        held.add(t.mem_bytes())?;
         Ok(t)
     };
     // runtime detail for EXPLAIN (which variant of the operator ran)
@@ -175,6 +178,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 info.actual_rows = runs.0.len() as i64;
                 info.time_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 infos.push(info);
+                held.add(super::ctx::table_bytes(runs.0.len(), 2))?;
                 sides.push(runs);
             }
             let ((lk, lc), (rk, rc)) = (&sides[0], &sides[1]);
@@ -255,7 +259,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let mut out = Table::new(n.vars.clone());
             for i in 0..n.children.len() {
                 out.append(child(i, &mut infos)?);
-                ctx.check_rows(out.len())?;
+                ctx.check_output(out.len(), out.width())?;
             }
             out
         }
@@ -266,6 +270,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::Extend(v, e) => {
             let mut t = child(0, &mut infos)?;
+            ctx.check_output(t.len(), 1)?;
             let col = compute_column(ctx, &t, e)?;
             t.vars.push(*v);
             t.cols.push(col);
@@ -273,6 +278,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::Sort(vars) => {
             let mut t = child(0, &mut infos)?;
+            // sorting copies the rows
+            ctx.check_output(t.len(), t.width())?;
             t.sort_by_vars(vars);
             t
         }
@@ -294,6 +301,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             // input is computed with early termination
             let (t, info, _) = execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
             infos.push(info);
+            held.add(t.mem_bytes())?;
             t.slice(*offset, Some(*limit))
         }
         Kind::Slice { offset, limit } => child(0, &mut infos)?.slice(*offset, *limit),
@@ -346,7 +354,9 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         table.sorted = n.sorted.clone();
     }
     ctx.check()?;
-    ctx.check_rows(table.len())?;
+    // the inputs are gone (or became the output): only the output is alive now
+    drop(held);
+    ctx.check_output(table.len(), table.width())?;
     let info = PlanInfo {
         operator: n.operator().to_string(),
         description: match note {
@@ -464,12 +474,14 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut keys: Vec<Id> = Vec::new();
     let mut counts: Vec<u64> = Vec::new();
+    let runs = std::cell::Cell::new(0usize);
     let mut bump = |k: u64, n: u64| {
         if keys.last() == Some(&Id(k)) {
             *counts.last_mut().unwrap() += n;
         } else {
             keys.push(Id(k));
             counts.push(n);
+            runs.set(keys.len());
         }
     };
     let mut last: Option<[u64; 4]> = None;
@@ -509,6 +521,8 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
                 Chunk::Row(k) => row(&k),
             }
             ctx.check()?;
+            // a key and a count per run
+            ctx.check_output(runs.get(), 2)?;
             Ok(true)
         })?;
     Ok((keys, counts))
@@ -625,6 +639,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
                 1
             };
             let (other, oinfo) = execute(ctx, &n.children[1 - lim])?;
+            let _held = ctx.charge(other.mem_bytes())?;
             if other.is_empty() {
                 let mut e = Table::empty(n.vars.clone());
                 e.sorted.clear();
@@ -668,6 +683,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
                 complete &= c_complete;
                 infos.push(info);
                 out.append(t);
+                ctx.check_output(out.len(), out.width())?;
             }
             finish(out, infos, complete)
         }
@@ -701,7 +717,8 @@ fn scan_limited(
     let cap = usize::try_from(bound)
         .unwrap_or(usize::MAX)
         .min(limit.unwrap_or(usize::MAX))
-        .min(ctx.max_rows.saturating_add(1));
+        .min(ctx.max_rows.saturating_add(1))
+        .min(ctx.rows_within_budget(vars.len()).saturating_add(1));
     for c in &mut t.cols {
         c.reserve_exact(cap);
     }
@@ -737,7 +754,7 @@ fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> 
                 t.append(part);
             }
         }
-        ctx.check_rows(t.len())?;
+        ctx.check_output(t.len(), t.width())?;
     }
     Ok(t)
 }
@@ -808,7 +825,7 @@ fn scan_into(
             if n > 1 << 16 {
                 n = 0;
                 ctx.check()?;
-                ctx.check_rows(t.len())?;
+                ctx.check_output(t.len(), t.width())?;
             }
             if t.len >= limit {
                 // there may be more matching rows after this point
@@ -914,9 +931,11 @@ fn join_pairs(
     merge: bool,
 ) -> Result<Vec<(u32, u32)>> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
+    // a pair per output row now, the materialized row later
+    let w = lay.vars.len() + 1;
     if lay.shared.is_empty() {
         // the product size is known up front: reject it before allocating anything
-        ctx.check_rows(l.len().saturating_mul(r.len()))?;
+        ctx.check_output(l.len().saturating_mul(r.len()), w)?;
         for i in 0..l.len() {
             if i % 1024 == 0 {
                 ctx.check()?;
@@ -924,7 +943,7 @@ fn join_pairs(
             for j in 0..r.len() {
                 pairs.push((i as u32, j as u32));
             }
-            ctx.check_rows(pairs.len())?;
+            ctx.check_output(pairs.len(), w)?;
         }
         return Ok(pairs);
     }
@@ -946,7 +965,7 @@ fn join_pairs(
                     pairs.push((i as u32, j as u32));
                 }
             }
-            ctx.check_rows(pairs.len())?;
+            ctx.check_output(pairs.len(), w)?;
         }
         return Ok(pairs);
     }
@@ -962,7 +981,7 @@ fn join_pairs(
             steps += 1;
             if steps.is_multiple_of(4096) {
                 ctx.check()?;
-                ctx.check_rows(pairs.len())?;
+                ctx.check_output(pairs.len(), w)?;
             }
             match a[i].cmp(&b[j]) {
                 Ordering::Less => i = gallop(a, i, b[j]),
@@ -976,12 +995,12 @@ fn join_pairs(
                     // expanded; otherwise the budget is checked while expanding
                     let run = (ie - i).saturating_mul(je - j);
                     if lay.shared.len() == 1 {
-                        ctx.check_rows(pairs.len().saturating_add(run))?;
+                        ctx.check_output(pairs.len().saturating_add(run), w)?;
                     }
                     for ii in i..ie {
                         if (ii - i) % 1024 == 1023 {
                             ctx.check()?;
-                            ctx.check_rows(pairs.len())?;
+                            ctx.check_output(pairs.len(), w)?;
                         }
                         for jj in j..je {
                             if lay.shared.len() == 1 || compatible(l, r, ii, jj, &lay.shared) {
@@ -1022,11 +1041,11 @@ fn join_pairs(
         for (pi, v) in pt.cols[pcols[0]].iter().enumerate() {
             if pi % 65536 == 0 {
                 ctx.check()?;
-                ctx.check_rows(pairs.len())?;
+                ctx.check_output(pairs.len(), w)?;
             }
             if let Some(m) = map.get(v) {
                 if m.len() > 1024 {
-                    ctx.check_rows(pairs.len().saturating_add(m.len()))?;
+                    ctx.check_output(pairs.len().saturating_add(m.len()), w)?;
                 }
                 for &bi in m {
                     emit(bi as usize, pi, &mut pairs);
@@ -1044,13 +1063,13 @@ fn join_pairs(
         for pi in 0..pt.len() {
             if pi % 65536 == 0 {
                 ctx.check()?;
-                ctx.check_rows(pairs.len())?;
+                ctx.check_output(pairs.len(), w)?;
             }
             key.clear();
             key.extend(pcols.iter().map(|&c| pt.cols[c][pi]));
             if let Some(m) = map.get(&key) {
                 if m.len() > 1024 {
-                    ctx.check_rows(pairs.len().saturating_add(m.len()))?;
+                    ctx.check_output(pairs.len().saturating_add(m.len()), w)?;
                 }
                 for &bi in m {
                     emit(bi as usize, pi, &mut pairs);
@@ -1147,13 +1166,13 @@ fn unpack(
 fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {
     let lay = layout(l, r);
     let pairs = join_pairs(ctx, l, r, &lay, merge)?;
-    ctx.check_rows(pairs.len())?;
+    ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
     Ok(materialize(l, r, &lay, &pairs))
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
-    ctx.check_rows(l.len().saturating_mul(r.len()))?;
     let lay = layout(l, r);
+    ctx.check_output(l.len().saturating_mul(r.len()), lay.vars.len() + 1)?;
     let pairs = join_pairs(ctx, l, r, &lay, false)?;
     Ok(materialize(l, r, &lay, &pairs))
 }
@@ -1519,6 +1538,7 @@ fn order_by(
     {
         // the candidates keep their relative order, so ties break as in the full sort
         prefiltered = Some(cand.len());
+        ctx.check_output(cand.len(), t.width())?;
         t = t.take_rows(&cand);
     }
     Ok((order_by_rows(ctx, t, keys, limit)?, prefiltered))
@@ -1578,6 +1598,7 @@ fn order_by_rows(
         _ => idx.par_sort_by(cmp),
     }
     ctx.check()?;
+    ctx.check_output(idx.len(), t.width())?;
     Ok(t.take_rows(&idx))
 }
 
@@ -1617,6 +1638,10 @@ fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<
     let mut order: Vec<Vec<Id>> = Vec::new();
     let mut groups: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
     for i in 0..t.len() {
+        if i % 65_536 == 0 {
+            ctx.check()?;
+            ctx.check_output(order.len(), keys.len() + aggs.len())?;
+        }
         let key: Vec<Id> = kcols
             .iter()
             .map(|c| c.map_or(Id::UNDEF, |c| t.cols[c][i]))
@@ -1834,6 +1859,7 @@ fn group_incremental(
     for i in 0..t.len() {
         if i % 65_536 == 0 {
             ctx.check()?;
+            ctx.check_output(order.len(), keys.len() + aggs.len())?;
         }
         let g = match kcol {
             None => 0,
@@ -2137,7 +2163,7 @@ impl Graph<'_> {
                 break;
             }
             frontier = next;
-            self.ctx.check_rows(out.len())?;
+            self.ctx.check_output(out.len(), 1)?;
         }
         Ok(out)
     }
@@ -2338,7 +2364,7 @@ fn path(
                     for y in g.reach(x, true)? {
                         push(x, y, &mut out);
                     }
-                    ctx.check_rows(out.len())?;
+                    ctx.check_output(out.len(), out.width())?;
                 }
             }
         }

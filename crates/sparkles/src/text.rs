@@ -852,9 +852,12 @@ mod imp {
         };
         ctx.check()?;
         if spec.limit.is_none() && hits.len() > max {
-            return Err(Error::MemoryLimit(format!(
-                "text:query matched more than {max} documents; add a limit"
-            )));
+            // more hits than a search may return without a limit
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Rows,
+                limit: max as u64,
+                requested: hits.len() as u64,
+            }));
         }
         // columns
         let mut t = Table::new(vars.to_vec());

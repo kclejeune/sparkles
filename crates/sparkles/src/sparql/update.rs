@@ -33,6 +33,8 @@ pub struct UpdateStats {
     /// JSON body
     #[serde(skip)]
     pub commit: Option<crate::commit::Receipt>,
+    /// Peak estimated memory of the WHERE evaluations (the largest of any operation).
+    pub mem_peak_bytes: u64,
 }
 
 pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
@@ -90,7 +92,7 @@ pub fn update_as(
 }
 
 /// Limits and context shared by every operation of one update request: one deadline for
-/// the whole request, its cancellation flag and row budget, and the parsed BASE.
+/// the whole request, its cancellation flag, row and memory budgets, and the parsed BASE.
 struct Request<'a> {
     opts: &'a QueryOptions,
     deadline: Option<Instant>,
@@ -122,6 +124,9 @@ impl Request<'_> {
         }
         if let Some(m) = self.opts.max_rows {
             ctx.max_rows = m;
+        }
+        if let Some(m) = self.opts.max_memory_bytes {
+            ctx.mem_limit = m;
         }
         ctx.allow_service = self.opts.allow_service;
         if let Some(o) = self.opts.optimizations {
@@ -206,6 +211,7 @@ fn run_op(
             }
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;
+            stats.mem_peak_bytes = stats.mem_peak_bytes.max(ctx.mem_peak());
             let map = table.var_map(ctx.nvars());
             let get = |ctx: &Ctx, name: &str, i: usize| -> Option<Id> {
                 let c = map.get(ctx.var(name) as usize).copied().flatten()?;

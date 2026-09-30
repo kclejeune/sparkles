@@ -63,15 +63,15 @@ impl ResultCache {
         self.cache.is_some()
     }
 
-    /// Look up a cached result. The request's row budget applies before the columns are
-    /// copied, exactly as it would to recomputing the result.
+    /// Look up a cached result. The request's row and memory budgets apply before the
+    /// columns are copied, exactly as they would to recomputing the result.
     pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> crate::error::Result<Option<Table>> {
         let Some(c) = self.cache.as_ref() else {
             return Ok(None);
         };
         Ok(match c.get(&key.key) {
             Some(e) => {
-                ctx.check_rows(e.len)?;
+                ctx.check_output(e.len, e.cols.len())?;
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 let vars: Vec<VarId> = e.vars.iter().map(|n| ctx.var(key.resolve(n))).collect();
                 let sorted: Vec<VarId> = e.sorted.iter().map(|n| ctx.var(key.resolve(n))).collect();

@@ -1,5 +1,6 @@
 //! HTTP layer: SPARQL 1.1 Protocol, Graph Store Protocol, Fuseki `/$/` admin API.
 
+use crate::obs::{CancelOnDrop, Op, Outcome, RequestReport};
 #[cfg(feature = "reasoning")]
 use crate::state::ReasoningInfo;
 use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
@@ -11,13 +12,15 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde_json::{Value as J, json};
+use sparkles::BudgetKind;
 use sparkles::index::Perm;
 use sparkles::io::Source;
-use sparkles::sparql::results::{self, SolutionsFormat};
+use sparkles::sparql::results::{self, LimitedWriter, SolutionsFormat};
 use sparkles::sparql::{QueryKind, QueryOptions};
 use sparkles::store::ReplaceTarget;
 use sparkles::{Error, id::Id};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 mod schema;
@@ -30,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let cors = tower_http::cors::CorsLayer::very_permissive().expose_headers([
         header::HeaderName::from_static(SPARKLES_COMMIT),
         header::HeaderName::from_static(SPARKLES_DATASET_ID),
+        crate::obs::X_REQUEST_ID.clone(),
     ]);
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
@@ -38,6 +42,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/{*path}", get(crate::ui::serve))
         .route("/$/ping", get(ping).post(ping))
         .route("/$/server", get(server_info))
+        .route("/$/metrics", get(crate::obs::metrics_endpoint))
+        .route("/$/ready", get(crate::obs::ready_endpoint))
+        .route("/$/ready/{ds}", get(crate::obs::ready_dataset))
         .route("/$/datasets", get(list_datasets).post(create_dataset))
         .route("/$/datasets/{ds}", get(get_dataset).delete(delete_dataset))
         .route("/$/stats/{ds}", get(stats))
@@ -70,7 +77,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(8 << 30))
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(cors)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(crate::obs::MakeSpan)
+                .on_request(())
+                // the access log is written by `obs::observe`
+                .on_response(()),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::obs::observe,
+        ))
         .layer(axum::middleware::from_fn(crate::alloc::track))
         .with_state(state)
 }
@@ -81,7 +98,25 @@ pub struct ApiError(StatusCode, J);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(self.1)).into_response()
+        // engine errors with an outcome of their own have their own status codes (see
+        // `From<Error>`): 408 timeout, 503 cancelled, 507 with a `budget` field
+        let budget = self
+            .1
+            .get("budget")
+            .and_then(J::as_str)
+            .and_then(|b| BudgetKind::ALL.into_iter().find(|k| k.as_str() == b));
+        let outcome = match self.0 {
+            StatusCode::REQUEST_TIMEOUT => Some(Outcome::Timeout),
+            StatusCode::SERVICE_UNAVAILABLE => Some(Outcome::Cancelled),
+            StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
+            _ => None,
+        };
+        RequestReport {
+            outcome,
+            budget,
+            ..Default::default()
+        }
+        .attach((self.0, Json(self.1)).into_response())
     }
 }
 
@@ -99,15 +134,20 @@ impl From<Error> for ApiError {
             Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
-            Error::MemoryLimit(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = if let Error::SparqlSyntax(_) = e {
-            syntax_error_body(&msg)
-        } else {
-            json!({ "error": msg })
+        let body = match e {
+            Error::SparqlSyntax(_) => syntax_error_body(&msg),
+            Error::BudgetExceeded(b) => json!({
+                "error": msg,
+                "budget": b.kind,
+                "limit": b.limit,
+                "requested": b.requested,
+            }),
+            _ => json!({ "error": msg }),
         };
         ApiError(status, body)
     }
@@ -329,6 +369,8 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         params.get("reasoning").is_none_or(|v| v != "false") && ds.reasoning.read().is_some();
     QueryOptions {
         timeout: Some(timeout),
+        max_rows: Some(st.limits.max_rows),
+        max_memory_bytes: st.limits.query_memory_bytes,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
@@ -397,7 +439,14 @@ async fn query_endpoint(
         }
         return Err(err(StatusCode::BAD_REQUEST, "missing 'query' parameter"));
     }
-    let opts = query_options(&st, &ds, &params);
+    crate::obs::log_query_text(&query);
+    let mut opts = query_options(&st, &ds, &params);
+    // a client that disconnects drops this future: the flag stops the query at its
+    // next check
+    let cancel = Arc::new(AtomicBool::new(false));
+    opts.cancel = Some(cancel.clone());
+    let _cancel_on_drop = CancelOnDrop(cancel.clone());
+    let limit = st.limits.max_result_bytes;
     let sfmt = solutions_format(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
@@ -407,14 +456,29 @@ async fn query_endpoint(
         let snap = ds.store.snapshot();
         let seq = snap.commit;
         let r = sparkles::sparql::query(snap, &query, &opts)?;
-        let mut buf = Vec::new();
         let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
+        let sparkles_doc =
+            sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
+        if let Some(l) = limit
+            && r.kind == QueryKind::Select
+        {
+            // refuse before serializing when even the smallest encoding is too large
+            let rows = send.map_or(r.len(), |s| s.min(r.len()));
+            let min = sfmt.min_bytes(rows, r.vars.len());
+            if min > l {
+                return Err(Error::BudgetExceeded(sparkles::Budget {
+                    kind: BudgetKind::ResultBytes,
+                    limit: l,
+                    requested: min,
+                })
+                .into());
+            }
+        }
+        let ts = std::time::Instant::now();
+        let mut w = LimitedWriter::new(Vec::new(), limit, Some(cancel));
         let ct: String = match r.kind {
-            _ if sfmt == SolutionsFormat::Sparkles
-                && (!is_graph || params_wants_sparkles(&headers)) =>
-            {
+            _ if sparkles_doc => {
                 // Build the document once, then patch the serialization time into it.
-                let ts = std::time::Instant::now();
                 let mut doc = results::sparkles_json(&r, send);
                 let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
                 if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
@@ -426,25 +490,35 @@ async fn query_endpoint(
                     meta.insert("commit".into(), seq.into());
                     meta.insert("datasetId".into(), ds.store.dataset_id().to_string().into());
                 }
-                serde_json::to_writer(&mut buf, &doc)
-                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                serde_json::to_writer(&mut w, &doc).map_err(|e| w.classify(Error::Io(e.into())))?;
                 SolutionsFormat::Sparkles.media_type().into()
             }
             QueryKind::Select | QueryKind::Ask => {
-                results::write_solutions(&r, sfmt, &mut buf, send)?;
+                results::write_solutions(&r, sfmt, &mut w, send).map_err(|e| w.classify(e))?;
                 sfmt.media_type().into()
             }
             _ => {
-                results::write_graph(&r, rfmt, &prefixes, &mut buf)?;
+                results::write_graph(&r, rfmt, &prefixes, &mut w).map_err(|e| w.classify(e))?;
                 results::rdf_media_type(rfmt).into()
             }
         };
+        let serialize_ms = ts.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-        Ok(with_commit(
+        let buf = w.into_inner();
+        let report = RequestReport {
+            operation: Some(Op::Query),
+            rows: Some(r.len() as u64),
+            response_bytes: Some(buf.len() as u64),
+            serialize_ms: Some(serialize_ms),
+            mem_peak_bytes: Some(r.mem_peak_bytes),
+            timing: Some(r.timing),
+            ..Default::default()
+        };
+        Ok(report.attach(with_commit(
             ([(header::CONTENT_TYPE, ct)], buf).into_response(),
             &ds,
             seq,
-        ))
+        )))
     })
     .await
 }
@@ -744,8 +818,12 @@ async fn update_endpoint(
     if update.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "missing 'update' parameter"));
     }
+    crate::obs::log_query_text(&update);
     let opts = QueryOptions {
         allow_service: st.allow_service,
+        timeout: Some(timeout_param(&st, &params)),
+        max_rows: Some(st.limits.max_rows),
+        max_memory_bytes: st.limits.query_memory_bytes,
         ..Default::default()
     };
     let wanted = receipt_wanted(&params, &headers);
@@ -757,14 +835,20 @@ async fn update_endpoint(
             sparkles::commit::CommitKind::Update,
         )?;
         let receipt = stats.commit.expect("update receipts");
+        let report = RequestReport {
+            operation: Some(Op::Update),
+            rows: Some(stats.inserted + stats.deleted),
+            mem_peak_bytes: Some(stats.mem_peak_bytes),
+            ..Default::default()
+        };
         let body = serde_json::to_value(&stats).unwrap();
-        Ok(write_response(
+        Ok(report.attach(write_response(
             &ds,
             StatusCode::OK,
             Some(body),
             &receipt,
             wanted,
-        ))
+        )))
     })
     .await
 }
@@ -804,6 +888,15 @@ async fn explain(
 
 // ------------------------------------------------------ Graph Store Protocol ------
 
+/// Report of a write: its operation and the quads it changed.
+fn write_report(op: Op, quads: u64) -> RequestReport {
+    RequestReport {
+        operation: Some(op),
+        rows: Some(quads),
+        ..Default::default()
+    }
+}
+
 enum Target {
     Default,
     Named(String),
@@ -840,6 +933,7 @@ async fn gsp(
             let quads = matches!(target, Target::Dataset);
             let fmt = rdf_format(&params, &headers, quads);
             let head = method == Method::HEAD;
+            let limit = st.limits.max_result_bytes;
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let seq = snap.commit;
@@ -855,7 +949,8 @@ async fn gsp(
                     ),
                     Target::Dataset => None,
                 };
-                let mut buf = Vec::new();
+                let mut w = LimitedWriter::new(Vec::new(), limit, None);
+                let mut quads = 0u64;
                 if !head {
                     let mut ser = RdfSerializer::from_format(fmt);
                     if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
@@ -865,29 +960,56 @@ async fn gsp(
                             }
                         }
                     }
-                    let mut w = ser.for_writer(&mut buf);
-                    let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
-                    for k in snap.scan_keys(Perm::Gspo, &prefix)? {
-                        if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)) {
-                            if g.is_some() {
-                                w.serialize_triple(oxrdf::TripleRef::new(
-                                    &q.subject,
-                                    &q.predicate,
-                                    &q.object,
-                                ))
-                                .map_err(Error::Io)?;
-                            } else {
-                                w.serialize_quad(&q).map_err(Error::Io)?;
+                    let written = (|| -> sparkles::Result<()> {
+                        let mut s = ser.for_writer(&mut w);
+                        let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
+                        for k in snap.scan_keys(Perm::Gspo, &prefix)? {
+                            if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)) {
+                                if g.is_some() {
+                                    s.serialize_triple(oxrdf::TripleRef::new(
+                                        &q.subject,
+                                        &q.predicate,
+                                        &q.object,
+                                    ))?;
+                                } else {
+                                    s.serialize_quad(&q)?;
+                                }
+                                quads += 1;
                             }
                         }
+                        s.finish()?;
+                        Ok(())
+                    })();
+                    if let Err(e) = written {
+                        return Err(match w.classify(e) {
+                            Error::BudgetExceeded(b) => ApiError(
+                                StatusCode::INSUFFICIENT_STORAGE,
+                                json!({
+                                    "error": format!(
+                                        "{b}; use POST /$/backup/{} or `sparkles dump` for full exports",
+                                        ds.name
+                                    ),
+                                    "budget": b.kind,
+                                    "limit": b.limit,
+                                    "requested": b.requested,
+                                }),
+                            ),
+                            e => e.into(),
+                        });
                     }
-                    w.finish().map_err(Error::Io)?;
                 }
-                Ok(with_commit(
+                let buf = w.into_inner();
+                let report = RequestReport {
+                    operation: Some(Op::Gsp),
+                    rows: Some(quads),
+                    response_bytes: Some(buf.len() as u64),
+                    ..Default::default()
+                };
+                Ok(report.attach(with_commit(
                     ([(header::CONTENT_TYPE, results::rdf_media_type(fmt))], buf).into_response(),
                     &ds,
                     seq,
-                ))
+                )))
             })
             .await
         }
@@ -934,7 +1056,13 @@ async fn gsp(
                     StatusCode::CREATED
                 };
                 let body = json!({ "count": count, "tripleCount": count, "quadCount": count });
-                Ok(write_response(&ds, status, Some(body), &receipt, wanted))
+                Ok(write_report(Op::Gsp, count).attach(write_response(
+                    &ds,
+                    status,
+                    Some(body),
+                    &receipt,
+                    wanted,
+                )))
             })
             .await
         }
@@ -968,13 +1096,13 @@ async fn gsp(
                     sparkles::commit::CommitKind::GspDelete,
                 )?;
                 let receipt = stats.commit.expect("update receipts");
-                Ok(write_response(
+                Ok(write_report(Op::Gsp, stats.deleted).attach(write_response(
                     &ds,
                     StatusCode::NO_CONTENT,
                     None,
                     &receipt,
                     wanted,
-                ))
+                )))
             })
             .await
         }
@@ -1088,13 +1216,13 @@ async fn upload(
         };
         drop(tmp);
         let body = json!({ "count": count, "tripleCount": count, "quadCount": count });
-        Ok(write_response(
+        Ok(write_report(Op::Upload, count).attach(write_response(
             &ds,
             StatusCode::OK,
             Some(body),
             &receipt,
             wanted,
-        ))
+        )))
     })
     .await
 }
@@ -1154,6 +1282,7 @@ async fn server_info(State(st): St) -> Json<J> {
         "startedAt": st.started_at,
         "uptimeSeconds": uptime_secs(&st),
         "datasets": datasets,
+        "limits": st.limits.json(st.default_timeout),
     }))
 }
 
@@ -1581,6 +1710,8 @@ async fn shacl() -> ApiResult {
     ))
 }
 
+#[cfg(test)]
+mod obs_tests;
 #[cfg(test)]
 mod router_tests;
 

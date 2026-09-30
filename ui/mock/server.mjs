@@ -70,8 +70,165 @@ function info(ds) {
 
 function send(res, status, body, type = 'application/json') {
   const data = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': type, 'Access-Control-Allow-Origin': '*' });
+  res.writeHead(status, {
+    'Content-Type': type,
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Expose-Headers': 'X-Request-Id',
+    'X-Request-Id': res.requestId ?? '',
+  });
   res.end(data);
+}
+
+// ---------------------------------------------------------------------------
+// observability: request ids, readiness and a metrics registry fed by the mock's own
+// traffic (health checks, metrics and the UI are not counted, as on the server)
+
+const BOOT = Math.floor(Math.random() * 0xffffffff)
+  .toString(16)
+  .padStart(8, '0');
+let requestSeq = 0;
+const nextRequestId = () => `${BOOT}-${(++requestSeq).toString(16).padStart(12, '0')}`;
+
+const BUCKETS = [
+  0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300,
+];
+const OUTCOMES = ['ok', 'client_error', 'error', 'timeout', 'cancelled', 'budget'];
+const LIMITS = {
+  timeoutSeconds: 60,
+  queryMemoryBytes: 8 * 2 ** 30,
+  maxResultBytes: 2 ** 30,
+  maxRows: 200_000_000,
+};
+/** @type {Map<string, any>} */
+const series = new Map();
+const active = {
+  query: 0,
+  update: 0,
+  gsp: 0,
+  upload: 0,
+  shacl: 0,
+  explain: 0,
+  admin: 0,
+  other: 0,
+};
+
+function classify(seg, method, url) {
+  if (seg[0] === '$') {
+    if (['ping', 'ready', 'metrics'].includes(seg[1])) return null;
+    return { op: 'admin', ds: datasets.has(seg[2]) ? seg[2] : '$none' };
+  }
+  if (!seg.length || seg[0] === 'ui') return null;
+  const ds = datasets.has(seg[0]) ? seg[0] : '$none';
+  const op = seg[1] ?? '';
+  if (['sparql', 'query'].includes(op)) return { op: 'query', ds };
+  if (['update', 'upload', 'shacl', 'explain'].includes(op)) return { op, ds };
+  if (['data', 'get'].includes(op)) return { op: 'gsp', ds };
+  if (op === '')
+    return {
+      op: url.searchParams.has('update') ? 'update' : method === 'GET' ? 'query' : 'gsp',
+      ds,
+    };
+  return { op: 'other', ds };
+}
+
+function record(c, status, seconds) {
+  const key = `${c.ds}\u0000${c.op}`;
+  let s = series.get(key);
+  if (!s) {
+    s = {
+      dataset: c.ds,
+      operation: c.op,
+      outcomes: Object.fromEntries(OUTCOMES.map((o) => [o, 0])),
+      buckets: new Array(BUCKETS.length + 1).fill(0),
+      sumSeconds: 0,
+      responseBytes: 0,
+    };
+    series.set(key, s);
+  }
+  const outcome =
+    status === 408
+      ? 'timeout'
+      : status === 507
+        ? 'budget'
+        : status >= 500
+          ? 'error'
+          : status >= 400
+            ? 'client_error'
+            : 'ok';
+  s.outcomes[outcome]++;
+  const i = BUCKETS.findIndex((b) => seconds <= b);
+  s.buckets[i < 0 ? BUCKETS.length : i]++;
+  s.sumSeconds += seconds;
+}
+
+function metricsSnapshot() {
+  const requests = [...series.values()].map((s) => {
+    let acc = 0;
+    const buckets = s.buckets.map((n) => (acc += n));
+    return { ...s, buckets, count: acc };
+  });
+  const perDataset = new Map();
+  for (const r of requests) {
+    if (r.operation === 'query')
+      perDataset.set(r.dataset, (perDataset.get(r.dataset) ?? 0) + r.count * 42);
+  }
+  return {
+    formatVersion: 1,
+    version: VERSION,
+    uptimeSeconds: (Date.now() - startedAt.getTime()) / 1000,
+    ready: true,
+    processResidentBytes: process.memoryUsage().rss,
+    limits: LIMITS,
+    bucketBounds: BUCKETS,
+    active,
+    requests,
+    datasets: [...datasets.values()].map((ds) => {
+      const st = stats(ds);
+      const lookups = ds.cache.hits + ds.cache.misses;
+      return {
+        name: ds.name,
+        quads: ds.store.size,
+        deltaInserts: ds.deltaInserts,
+        deltaDeletes: ds.deltaDeletes,
+        walBytes: ds.type === 'mem' ? 0 : (ds.deltaInserts + ds.deltaDeletes) * 33,
+        diskBytes: st.diskBytes,
+        resultRows: perDataset.get(ds.name) ?? 0,
+        budgetExceeded: { rows: 0, memory: 0, 'result-bytes': 0 },
+        blockCache: {
+          bytes: Math.min(2 ** 30, st.quads * 24),
+          capacityBytes: 2 ** 30,
+          entries: Math.ceil(st.quads / 32768) * 4,
+          hits: lookups * 9,
+          misses: lookups + 12,
+        },
+        resultCache: {
+          enabled: true,
+          bytes: ds.cache.bytes,
+          capacityBytes: 512 * 2 ** 20,
+          entries: ds.cache.entries,
+          hits: ds.cache.hits,
+          misses: ds.cache.misses,
+        },
+      };
+    }),
+  };
+}
+
+function readyInfo() {
+  return {
+    status: 'ready',
+    ready: true,
+    uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
+    datasets: [...datasets.values()].map((ds) => ({
+      name: ds.name,
+      type: ds.type,
+      state: 'open',
+      ready: true,
+      ...(ds.type === 'persistent' ? { generation: 'gen-0001' } : {}),
+      walBytes: ds.type === 'mem' ? 0 : (ds.deltaInserts + ds.deltaDeletes) * 33,
+      deltaQuads: ds.deltaInserts + ds.deltaDeletes,
+    })),
+  };
 }
 
 function fail(res, status, error, extra = {}) {
@@ -930,10 +1087,20 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = decodeURIComponent(url.pathname);
   const seg = path.split('/').filter(Boolean);
-  const log = () =>
+  const incoming = String(req.headers['x-request-id'] ?? '');
+  res.requestId = /^[A-Za-z0-9._:-]{1,128}$/.test(incoming) ? incoming : nextRequestId();
+  const counted = req.method === 'OPTIONS' ? null : classify(seg, req.method, url);
+  const t0 = performance.now();
+  if (counted) active[counted.op]++;
+  const log = () => {
     console.log(
       `${new Date().toISOString().slice(11, 19)} ${req.method} ${req.url?.slice(0, 120)} → ${res.statusCode}`,
     );
+    if (counted) {
+      active[counted.op]--;
+      record(counted, res.statusCode, (performance.now() - t0) / 1000);
+    }
+  };
   res.on('finish', log);
   try {
     if (req.method === 'OPTIONS') {
@@ -950,12 +1117,24 @@ const server = http.createServer(async (req, res) => {
       switch (what) {
         case 'ping':
           return send(res, 200, new Date().toISOString(), 'text/plain');
+        case 'ready': {
+          const r = readyInfo();
+          if (!name) return send(res, 200, r);
+          const d = r.datasets.find((x) => x.name === name);
+          return d
+            ? send(res, 200, { ...r, datasets: [d] })
+            : fail(res, 404, `No such dataset: ${name}`);
+        }
+        case 'metrics':
+          if (url.searchParams.get('format') === 'json') return send(res, 200, metricsSnapshot());
+          return send(res, 200, '# metrics: see ?format=json in the mock\n', 'text/plain');
         case 'server':
           return send(res, 200, {
             version: VERSION,
             startedAt: startedAt.toISOString(),
             uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
             datasets: [...datasets.values()].map(info),
+            limits: LIMITS,
           });
         case 'datasets': {
           if (!name) {

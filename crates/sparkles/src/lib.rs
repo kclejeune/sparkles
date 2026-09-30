@@ -14,4 +14,4 @@ pub mod vector;
 pub mod vocab;
 
 pub use dataset::{Dataset, GraphView, Solution, Solutions, Transaction};
-pub use error::{Error, Result};
+pub use error::{Budget, BudgetKind, Error, Result};

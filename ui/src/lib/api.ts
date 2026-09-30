@@ -1,6 +1,8 @@
 // Typed client for the Sparkles HTTP API (see docs/API.md — the source of truth).
 // All paths are absolute from the server root; the UI itself lives under /ui/.
 
+import { fmtBytes, fmtInt } from './format';
+
 export type DatasetType = 'persistent' | 'mem';
 
 export type DatasetInfo = {
@@ -11,11 +13,91 @@ export type DatasetInfo = {
   reasoning: null | { profile: string; inferred: number; at: string };
 };
 
+/** Per-request budgets of the server; 0 means unlimited. */
+export type Limits = {
+  timeoutSeconds: number;
+  queryMemoryBytes: number;
+  maxResultBytes: number;
+  maxRows: number;
+};
+
 export type ServerInfo = {
   version: string;
   startedAt: string;
   uptimeSeconds: number;
   datasets: DatasetInfo[];
+  /** Absent on servers that predate budgets. */
+  limits?: Limits;
+};
+
+/** `GET /$/ready` (the same document with status 503 when not ready). */
+export type ReadyInfo = {
+  status: 'starting' | 'ready' | 'draining' | 'degraded';
+  ready: boolean;
+  uptimeSeconds: number;
+  datasets: {
+    name: string;
+    type: DatasetType;
+    state: 'open' | 'opening' | 'failed';
+    ready: boolean;
+    generation?: string;
+    walBytes: number;
+    deltaQuads: number;
+    error?: string;
+  }[];
+};
+
+export type Operation =
+  'query' | 'update' | 'gsp' | 'upload' | 'shacl' | 'explain' | 'admin' | 'other';
+export type Outcome = 'ok' | 'client_error' | 'error' | 'timeout' | 'cancelled' | 'budget';
+export type BudgetKind = 'rows' | 'memory' | 'result-bytes';
+
+type CacheStats = {
+  bytes: number;
+  capacityBytes: number;
+  entries: number;
+  hits: number;
+  misses: number;
+};
+
+/** `GET /$/metrics?format=json`: the metrics registry as JSON. */
+export type MetricsSnapshot = {
+  formatVersion: 1;
+  version: string;
+  uptimeSeconds: number;
+  ready: boolean;
+  processResidentBytes: number | null;
+  limits: Limits;
+  /** Histogram upper bounds in seconds, without +Inf. */
+  bucketBounds: number[];
+  /** Requests in progress per operation. */
+  active: Record<Operation, number>;
+  requests: RequestSeries[];
+  datasets: {
+    name: string;
+    quads: number;
+    deltaInserts: number;
+    deltaDeletes: number;
+    walBytes: number;
+    diskBytes: number;
+    resultRows: number;
+    budgetExceeded: Record<BudgetKind, number> | null;
+    blockCache: CacheStats;
+    resultCache: CacheStats & { enabled: boolean };
+  }[];
+};
+
+/** Counters of one (dataset, operation) pair. */
+export type RequestSeries = {
+  /** A dataset name, `$none` (no existing dataset) or `$other` (beyond the label cap). */
+  dataset: string;
+  operation: Operation;
+  outcomes: Record<Outcome, number>;
+  count: number;
+  sumSeconds: number;
+  /** Cumulative counts per histogram bucket; the last (+Inf) equals `count`. */
+  buckets: number[];
+  responseBytes: number;
 };
 
 export type DatasetStats = {
@@ -82,12 +164,30 @@ export type SparklesResult = {
   rows?: (Term | null)[][];
   boolean?: boolean;
   triples?: [Term, Term, Term][];
-  meta: { totalRows: number; sentRows: number; timing: Timing; plan: PlanNode };
+  meta: {
+    totalRows: number;
+    sentRows: number;
+    timing: Timing;
+    plan: PlanNode;
+    /** Peak estimated memory of intermediate results; absent on older servers. */
+    memory?: { peakBytes: number };
+  };
 };
 
 export type ExplainResult = { algebra: string; plan: PlanNode };
 
 export type ReasonProfile = 'rdfs' | 'owl-rl' | 'rules';
+
+/** A budget a request exceeded (the body of a `507`). */
+export type Budget = { kind: BudgetKind; limit: number; requested: number };
+
+type ApiErrorExtra = {
+  detail?: string;
+  line?: number;
+  column?: number;
+  requestId?: string;
+  budget?: Budget;
+};
 
 /** Error shape for non-2xx responses: `{ error, detail?, line?, column? }`. */
 export class ApiError extends Error {
@@ -95,17 +195,36 @@ export class ApiError extends Error {
   detail?: string;
   line?: number;
   column?: number;
-  constructor(
-    status: number,
-    message: string,
-    extra: { detail?: string; line?: number; column?: number } = {},
-  ) {
+  /** The server's `X-Request-Id` for this request, to find it in the server log. */
+  requestId?: string;
+  budget?: Budget;
+  constructor(status: number, message: string, extra: ApiErrorExtra = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.detail = extra.detail;
     this.line = extra.line;
     this.column = extra.column;
+    this.requestId = extra.requestId;
+    this.budget = extra.budget;
+  }
+}
+
+function budgetOf(body: Record<string, unknown>): Budget | undefined {
+  const kind = body.budget;
+  if (kind !== 'rows' && kind !== 'memory' && kind !== 'result-bytes') return undefined;
+  return { kind, limit: Number(body.limit ?? 0), requested: Number(body.requested ?? 0) };
+}
+
+/** What to do about an exceeded budget, in plain words. */
+export function budgetHint(b: Budget): string {
+  switch (b.kind) {
+    case 'result-bytes':
+      return `Result too large (limit ${fmtBytes(b.limit)}). Add a LIMIT or narrow the query.`;
+    case 'memory':
+      return `The query needs too much memory (limit ${fmtBytes(b.limit)}). Narrow the query or make its patterns more selective.`;
+    case 'rows':
+      return `An intermediate result is too large (limit ${fmtInt(b.limit)} rows). Narrow the query.`;
   }
 }
 
@@ -114,6 +233,7 @@ export const SPARKLES_JSON = 'application/x-sparkles+json';
 const enc = encodeURIComponent;
 
 async function toError(res: Response): Promise<ApiError> {
+  const requestId = res.headers.get('X-Request-Id') ?? undefined;
   let text = '';
   try {
     text = await res.text();
@@ -127,13 +247,15 @@ async function toError(res: Response): Promise<ApiError> {
         detail: body.detail,
         line: body.line,
         column: body.column,
+        requestId,
+        budget: budgetOf(body),
       });
     }
   } catch {
     /* not JSON */
   }
   const fallback = text.trim().slice(0, 500) || res.statusText || 'Request failed';
-  return new ApiError(res.status, `${res.status} ${fallback}`);
+  return new ApiError(res.status, `${res.status} ${fallback}`, { requestId });
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -176,6 +298,23 @@ export async function ping(signal?: AbortSignal): Promise<string> {
 }
 
 export const serverInfo = () => json<ServerInfo>('/$/server');
+
+/** Readiness; resolves with the document for `503` (not ready) as well. */
+export async function ready(signal?: AbortSignal): Promise<ReadyInfo> {
+  let res: Response;
+  try {
+    res = await fetch('/$/ready', { signal, cache: 'no-store' });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') throw e;
+    throw new ApiError(0, 'Cannot reach the Sparkles server', { detail: String(e) });
+  }
+  if (res.status !== 200 && res.status !== 503) throw await toError(res);
+  return (await res.json()) as ReadyInfo;
+}
+
+/** The metrics registry as JSON (`404` when the server runs with `--no-metrics`). */
+export const metricsSnapshot = (signal?: AbortSignal) =>
+  json<MetricsSnapshot>('/$/metrics?format=json', { signal, cache: 'no-store' });
 
 // --- datasets -----------------------------------------------------------------
 
@@ -595,6 +734,7 @@ export function upload(
           detail: b?.detail,
           line: b?.line,
           column: b?.column,
+          requestId: xhr.getResponseHeader('X-Request-Id') ?? undefined,
         }),
       );
     };

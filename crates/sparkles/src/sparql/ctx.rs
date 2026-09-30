@@ -3,7 +3,7 @@
 
 use super::table::VarId;
 use super::value::Value;
-use crate::error::{Error, Result};
+use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::store::{Snapshot, bnode_for, parse_bnode_label};
 use crate::vocab::AppendVocab;
@@ -149,6 +149,13 @@ pub struct Ctx {
     pub var_names: RwLock<Vec<String>>,
     /// Maximum number of rows any intermediate result may have (memory guard).
     pub max_rows: usize,
+    /// Budget for the estimated bytes of intermediate results alive at once
+    /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
+    pub mem_limit: u64,
+    /// estimated bytes of the tables currently held by running operators
+    mem_live: AtomicU64,
+    /// highest estimate seen (held tables plus an output under construction)
+    mem_peak: AtomicU64,
     pub allow_service: bool,
     /// consult / fill the store's result cache
     pub use_cache: bool,
@@ -172,6 +179,9 @@ impl Ctx {
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
             max_rows: 200_000_000,
+            mem_limit: u64::MAX,
+            mem_live: AtomicU64::new(0),
+            mem_peak: AtomicU64::new(0),
             allow_service: true,
             use_cache: true,
             opt: Optimizations::default(),
@@ -191,14 +201,80 @@ impl Ctx {
         Ok(())
     }
 
+    /// The row limit of intermediate results.
+    #[inline]
     pub fn check_rows(&self, n: usize) -> Result<()> {
         if n > self.max_rows {
-            return Err(Error::MemoryLimit(format!(
-                "intermediate result of {n} rows exceeds the limit of {}",
-                self.max_rows
-            )));
+            return Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Rows,
+                limit: self.max_rows as u64,
+                requested: n as u64,
+            }));
         }
         Ok(())
+    }
+
+    // --------------------------------------------------------------- memory ------
+
+    /// Before an operator produces (or grows its output to) `rows` rows of `width`
+    /// columns: the row limit, and the memory budget for the tables held now plus that
+    /// output. Runs before the output is allocated where the size is known up front, so
+    /// a query over budget fails fast. Records the peak estimate.
+    #[inline]
+    pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
+        self.check_rows(rows)?;
+        let need = self
+            .mem_live
+            .load(Ordering::Relaxed)
+            .saturating_add(table_bytes(rows, width));
+        self.note_peak(need);
+        if need > self.mem_limit {
+            return Err(self.memory_exceeded(need));
+        }
+        Ok(())
+    }
+
+    /// Hold `bytes` of estimated memory until the returned guard drops (see
+    /// [`Charge::add`]).
+    pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {
+        let c = Charge {
+            ctx: self,
+            bytes: std::cell::Cell::new(0),
+        };
+        c.add(bytes)?;
+        Ok(c)
+    }
+
+    /// The highest memory estimate of this context so far.
+    pub fn mem_peak(&self) -> u64 {
+        self.mem_peak.load(Ordering::Relaxed)
+    }
+
+    /// How many rows of `width` columns fit in what is left of the memory budget (for
+    /// capping up-front reservations; the output is still checked as it grows).
+    pub fn rows_within_budget(&self, width: usize) -> usize {
+        if self.mem_limit == u64::MAX {
+            return usize::MAX;
+        }
+        let left = self
+            .mem_limit
+            .saturating_sub(self.mem_live.load(Ordering::Relaxed));
+        usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
+    }
+
+    #[inline]
+    fn note_peak(&self, bytes: u64) {
+        if bytes > self.mem_peak.load(Ordering::Relaxed) {
+            self.mem_peak.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn memory_exceeded(&self, requested: u64) -> Error {
+        Error::BudgetExceeded(Budget {
+            kind: BudgetKind::Memory,
+            limit: self.mem_limit,
+            requested,
+        })
     }
 
     // ------------------------------------------------------------ variables ------
@@ -363,6 +439,50 @@ impl Ctx {
 
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
+    }
+}
+
+/// Estimated bytes of `rows` rows of `width` ids (a row of a zero-width table still
+/// counts as one id).
+#[inline]
+pub fn table_bytes(rows: usize, width: usize) -> u64 {
+    (rows as u64).saturating_mul(width.max(1) as u64 * 8)
+}
+
+/// Estimated memory held by a running operator (its input tables), released when the
+/// guard drops, also while an error unwinds.
+pub struct Charge<'a> {
+    ctx: &'a Ctx,
+    bytes: std::cell::Cell<u64>,
+}
+
+impl Charge<'_> {
+    /// Hold `bytes` more; fails (holding nothing more) when that would exceed the
+    /// context's memory budget.
+    pub fn add(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let ctx = self.ctx;
+        let live = ctx
+            .mem_live
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if live > ctx.mem_limit {
+            ctx.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(ctx.memory_exceeded(live));
+        }
+        self.bytes.set(self.bytes.get() + bytes);
+        ctx.note_peak(live);
+        Ok(())
+    }
+}
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.ctx
+            .mem_live
+            .fetch_sub(self.bytes.get(), Ordering::Relaxed);
     }
 }
 

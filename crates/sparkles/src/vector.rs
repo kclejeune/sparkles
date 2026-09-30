@@ -315,12 +315,12 @@ impl GenerationVectors {
         let bytes: u64 = by_dim.values().map(Segment::bytes).sum();
         let used = self.used_bytes();
         if used + bytes > budget {
-            return Err(Error::MemoryLimit(format!(
-                "vectors of predicate {p:#x} need {} MiB; {} MiB of the {} MiB vector budget are free",
-                bytes >> 20,
-                budget.saturating_sub(used) >> 20,
-                budget >> 20
-            )));
+            // the packed vectors of every predicate share one budget
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Memory,
+                limit: budget,
+                requested: used + bytes,
+            }));
         }
         let pv = Arc::new(PredicateVectors {
             by_dim,

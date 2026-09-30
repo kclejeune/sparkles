@@ -102,21 +102,30 @@ export type Toast = {
   kind: 'info' | 'success' | 'error';
   text: string;
   detail?: string;
+  /** The server's request id of a failed request, to look it up in the server log. */
+  requestId?: string;
 };
 
 class Toasts {
   items = $state<Toast[]>([]);
   #seq = 0;
-  push(kind: Toast['kind'], text: string, detail?: string, ttl = kind === 'error' ? 8000 : 3500) {
+  push(
+    kind: Toast['kind'],
+    text: string,
+    detail?: string,
+    ttl = kind === 'error' ? 8000 : 3500,
+    requestId?: string,
+  ) {
     const id = ++this.#seq;
-    this.items.push({ id, kind, text, detail });
+    this.items.push({ id, kind, text, detail, requestId });
     setTimeout(() => this.dismiss(id), ttl);
   }
   dismiss(id: number) {
     this.items = this.items.filter((t) => t.id !== id);
   }
   error(text: string, e?: unknown) {
-    this.push('error', text, e ? api.errorMessage(e) : undefined);
+    const requestId = e instanceof api.ApiError ? e.requestId : undefined;
+    this.push('error', text, e ? api.errorMessage(e) : undefined, undefined, requestId);
   }
 }
 

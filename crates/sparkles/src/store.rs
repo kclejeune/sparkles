@@ -1532,6 +1532,14 @@ impl Store {
             None => 0,
         }
     }
+
+    /// Size of the current generation's write-ahead log (0 for an in-memory store): one
+    /// `stat`, without the writer lock, so buffered records may not be counted yet.
+    pub fn wal_bytes(&self) -> u64 {
+        let Some(root) = &self.root else { return 0 };
+        let wal = root.join(&self.snapshot().generation.name).join("wal.log");
+        std::fs::metadata(wal).map_or(0, |m| m.len())
+    }
 }
 
 pub(crate) fn dir_size(p: &Path) -> u64 {

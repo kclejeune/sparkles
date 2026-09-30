@@ -5,6 +5,7 @@
 
 mod alloc;
 mod http;
+mod obs;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod state;
@@ -37,8 +38,17 @@ struct Cli {
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
+    /// Log format on stderr: text, or json (one object per line)
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -76,6 +86,26 @@ enum Cmd {
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
+        /// Do not log one line per request (target `sparkles::access`)
+        #[arg(long)]
+        no_access_log: bool,
+        /// Disable /$/metrics and stop recording request metrics
+        #[arg(long)]
+        no_metrics: bool,
+        /// Datasets with their own metric labels; the others share `$other`
+        #[arg(long, default_value_t = 100)]
+        metrics_max_datasets: usize,
+        /// Budget for the estimated memory of a query's intermediate results, in MiB
+        /// (0: unlimited)
+        #[arg(long, default_value_t = 8192)]
+        query_memory_mb: u64,
+        /// Budget for the serialized body of query and Graph Store GET responses, in MiB
+        /// (0: unlimited)
+        #[arg(long, default_value_t = 1024)]
+        max_result_mb: u64,
+        /// Maximum number of rows of any intermediate result
+        #[arg(long, default_value_t = 200_000_000)]
+        max_rows: usize,
     },
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
@@ -128,6 +158,9 @@ enum Cmd {
         time: bool,
         #[arg(long)]
         timeout: Option<f64>,
+        /// Budget for the estimated memory of intermediate results, in MiB (0: unlimited)
+        #[arg(long, default_value_t = 0)]
+        memory_mb: u64,
         /// Query string (if --query is not given)
         text: Option<String>,
     },
@@ -439,13 +472,19 @@ fn main() -> Result<()> {
         }
         _ => "warn",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    match cli.log_format {
+        LogFormat::Text => fmt.init(),
+        LogFormat::Json => fmt
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .init(),
+    }
     let opts = store_opts(&cli);
     match cli.cmd {
         Cmd::Serve {
@@ -460,11 +499,25 @@ fn main() -> Result<()> {
             idle_release_ms,
             text,
             schema_max_entries,
+            no_access_log,
+            no_metrics,
+            metrics_max_datasets,
+            query_memory_mb,
+            max_result_mb,
+            max_rows,
         } => {
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.read_only = read_only;
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
+            st.access_log = !no_access_log;
+            st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            let mib = |m: u64| (m > 0).then_some(m << 20);
+            st.limits = state::Limits {
+                query_memory_bytes: mib(query_memory_mb),
+                max_result_bytes: mib(max_result_mb),
+                max_rows,
+            };
             let st = Arc::new(st);
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -498,9 +551,14 @@ fn main() -> Result<()> {
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
                 }
+                // every dataset was opened before the listener was bound
+                st.set_phase(obs::Phase::Ready);
+                let st2 = st.clone();
                 axum::serve(listener, http::router(st))
-                    .with_graceful_shutdown(async {
-                        let _ = tokio::signal::ctrl_c().await;
+                    .with_graceful_shutdown(async move {
+                        shutdown_signal().await;
+                        st2.set_phase(obs::Phase::Draining);
+                        tracing::info!("shutting down: finishing requests in flight");
                     })
                     .await?;
                 anyhow::Ok(())
@@ -538,6 +596,7 @@ fn main() -> Result<()> {
             explain,
             time,
             timeout,
+            memory_mb,
             text,
         } => {
             let q = match (query, text) {
@@ -548,6 +607,7 @@ fn main() -> Result<()> {
             let store = open_or_load(loc, &data, opts)?;
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
+                max_memory_bytes: (memory_mb > 0).then_some(memory_mb << 20),
                 allow_service: true,
                 prefixes: store.prefixes().into_iter().collect(),
                 ..Default::default()
@@ -947,6 +1007,29 @@ fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Res
         )?;
     }
     Ok(())
+}
+
+/// SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// A database directory, or the given files loaded into an in-memory store.

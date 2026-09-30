@@ -1,13 +1,15 @@
 //! Result serialization (ARQ `ResultSetFormatter` / RIOT writers).
 
 use super::{QueryKind, QueryResult};
-use crate::error::{Error, Result};
+use crate::error::{Budget, BudgetKind, Error, Result};
 use oxrdf::{Term, Variable};
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde_json::{Value as J, json};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolutionsFormat {
@@ -29,6 +31,24 @@ impl SolutionsFormat {
             SolutionsFormat::Sparkles => "application/x-sparkles+json",
         }
     }
+    /// A lower bound of the serialized size of `rows` solutions of `vars` variables (any
+    /// of which may be unbound), for refusing a response over its size budget before
+    /// serializing it.
+    pub fn min_bytes(self, rows: usize, vars: usize) -> u64 {
+        let per_row = match self {
+            // separators and the line end
+            SolutionsFormat::Tsv => vars.max(1),
+            SolutionsFormat::Csv => vars + 1,
+            // `{}`
+            SolutionsFormat::Json => 2,
+            // `<result/>`
+            SolutionsFormat::Xml => 9,
+            // `[null,…]`
+            SolutionsFormat::Sparkles => 5 * vars + 1,
+        };
+        (rows as u64).saturating_mul(per_row as u64)
+    }
+
     /// Parse a media type or Fuseki `format=` short name.
     pub fn from_name(s: &str) -> Option<SolutionsFormat> {
         let base = s.split(';').next()?.trim().to_ascii_lowercase();
@@ -76,6 +96,112 @@ pub fn rdf_media_type(f: RdfFormat) -> &'static str {
 
 fn io(e: std::io::Error) -> Error {
     Error::Io(e)
+}
+
+/// `io::Write` adapter for the result-size budget: the first write that would take the
+/// output past `limit` bytes fails, and the cancellation flag is checked every 64 KiB.
+/// [`LimitedWriter::classify`] turns the resulting I/O error back into the reason.
+pub struct LimitedWriter<W> {
+    inner: W,
+    limit: Option<u64>,
+    written: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    next_check: u64,
+    /// size the refused write would have reached
+    exceeded: Option<u64>,
+    cancelled: bool,
+}
+
+const CANCEL_CHECK_BYTES: u64 = 64 << 10;
+
+impl<W: Write> LimitedWriter<W> {
+    pub fn new(inner: W, limit: Option<u64>, cancel: Option<Arc<AtomicBool>>) -> Self {
+        LimitedWriter {
+            inner,
+            limit,
+            written: 0,
+            cancel,
+            next_check: CANCEL_CHECK_BYTES,
+            exceeded: None,
+            cancelled: false,
+        }
+    }
+
+    /// Bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// An error of a serializer writing through this adapter: caused by the limit ->
+    /// [`Error::BudgetExceeded`] (result bytes); by cancellation -> [`Error::Cancelled`];
+    /// otherwise unchanged.
+    pub fn classify(&self, e: Error) -> Error {
+        if let Some(requested) = self.exceeded {
+            Error::BudgetExceeded(Budget {
+                kind: BudgetKind::ResultBytes,
+                limit: self.limit.unwrap_or(u64::MAX),
+                requested,
+            })
+        } else if self.cancelled {
+            Error::Cancelled
+        } else {
+            e
+        }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> LimitedWriter<W> {
+    /// Admit `len` more bytes: the size limit, and the cancellation flag every 64 KiB.
+    #[inline]
+    fn admit(&mut self, len: usize) -> std::io::Result<()> {
+        let end = self.written.saturating_add(len as u64);
+        if let Some(l) = self.limit
+            && end > l
+        {
+            self.exceeded = Some(end);
+            return Err(std::io::Error::other("result size budget exceeded"));
+        }
+        if end >= self.next_check {
+            self.next_check = end.saturating_add(CANCEL_CHECK_BYTES);
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                self.cancelled = true;
+                return Err(std::io::Error::other("query cancelled"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.admit(buf.len())?;
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    // serializers write many small pieces: hand them on whole, so a `Vec` appends them
+    // without the generic retry loop
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.admit(buf.len())?;
+        self.inner.write_all(buf)?;
+        self.written += buf.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Serialize SELECT / ASK results.
@@ -232,6 +358,7 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             "sentRows": n,
             "timing": r.timing,
             "plan": r.plan,
+            "memory": { "peakBytes": r.mem_peak_bytes },
         }),
     );
     J::Object(out)

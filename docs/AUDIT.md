@@ -25,7 +25,7 @@ Key Jena behaviours to preserve:
 * **RIOT**: Turtle, N-Triples, N-Quads, TriG, RDF/XML, JSON-LD 1.1 (+ RDF/JSON, Thrift, Protobuf, TriX — Jena-specific); streaming `StreamRDF` sinks; result formats JSON/XML/CSV/TSV.
 * **ARQ**: full SPARQL 1.1 Query + Update, property paths, aggregates, subqueries, VALUES, SERVICE, EXISTS, function library (XPath `fn:`, `math:`, `afn:`), property functions; optimizer transforms (filter placement, filter equality substitution, TopN, implicit joins, …).
 * **TDB2**: inline NodeIds (ints, decimals, doubles, dates, booleans) so FILTER/ORDER BY avoid the node table; MR+SW transactions with snapshot isolation; bulk loader pipeline; compaction into a new `Data-NNNN` generation; backups as `.nq.gz`.
-* **Fuseki**: `/{ds}/sparql|query|update|data|get|upload`, `/$/ping|server|datasets|stats|compact|backup|tasks`.
+* **Fuseki**: `/{ds}/sparql|query|update|data|get|upload`, `/$/ping|server|datasets|stats|compact|backup|tasks|metrics`.
 * **Reasoning**: RDFS (full/default/simple), OWL Micro/Mini/Full rule sets, `GenericRuleReasoner` with Jena rule syntax `[name: (?a p ?b) builtin(?x) -> (?a q ?b)]`.
 
 Conformance suites available in the Jena checkout (to be used by `sparkles` tests):
@@ -45,7 +45,7 @@ Conformance suites available in the Jena checkout (to be used by `sparkles` test
 | Joins | zipper merge join w/ UNDEF, galloping join for skewed sizes, MultiColumnJoin, OptionalJoin, Minus, TransitivePath w/ bound side | ✅ merge + galloping + hash join; transitive path with bound-side BFS |
 | GROUP BY | COUNT from metadata, sort-based grouping, special cases | ✅ COUNT fast paths + hash grouping |
 | Cache | concurrent LRU keyed by subtree + delta version; pinning | ✅ LRU keyed by canonical plan + snapshot version |
-| Limits | cancellation handle, memory-limited allocator, timeouts | ✅ cancellation/timeouts, row-budget memory guard |
+| Limits | cancellation handle, memory-limited allocator, timeouts | ✅ cancellation (also on client disconnect) / timeouts; per-query budgets for estimated intermediate-result memory, response bytes and rows (estimates, not an allocator limit) |
 | Server | streaming results, `qlever-json` with runtime-information tree, websockets for live plan | ✅ `x-sparkles+json` with executed plan tree (see API.md) |
 | Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | ⏭ future work |
 
