@@ -669,6 +669,37 @@ fn staged_and_kept_documents_are_recovered_after_a_crash() {
 }
 
 #[test]
+fn large_batches_are_committed_by_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    load(&s);
+    s.enable_text(TextConfig::default()).unwrap();
+    s.set_text_ticks(false);
+    let batch = |from: usize, n: usize| {
+        (from..from + n)
+            .map(|i| format!("ex:m{i} rdfs:label \"moose {i}\" ."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // a small batch stays staged
+    insert(&s, &batch(0, 1000));
+    let before = text_payload_seq(&root);
+    assert!(before < s.snapshot().commit);
+    // one that reaches the limit is committed without waiting for a search
+    for k in 1..20 {
+        insert(&s, &batch(k * 1000, 1000));
+    }
+    let head = s.snapshot().commit;
+    let seq = text_payload_seq(&root);
+    assert!(seq > before + 1 && seq < head, "{before} {seq} {head}");
+    assert_eq!(
+        rows(&s, "SELECT (COUNT(*) AS ?n) { ?s text:query \"moose\" }"),
+        ["20000"]
+    );
+}
+
+#[test]
 fn concurrent_searches_match_their_snapshots() {
     let s = std::sync::Arc::new(mem());
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -783,6 +814,31 @@ fn batch_insert_timing() {
                 times[times.len() / 2],
                 times[0]
             );
+            // the first search after a burst of writes (no tick meanwhile) commits it
+            s.set_text_ticks(false);
+            for rounds in [1, 5, 10, 20, 40] {
+                let mut times = Vec::new();
+                for _ in 0..5 {
+                    for _ in 0..rounds {
+                        sparkles::sparql::update::update(&s, &del, &o).unwrap();
+                        sparkles::sparql::update::update(&s, &ins, &o).unwrap();
+                    }
+                    let t = std::time::Instant::now();
+                    let n = rows(
+                        &s,
+                        "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s text:query (\"batch\" 10) } }",
+                    );
+                    assert_eq!(n, ["10"]);
+                    times.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!(
+                    "first search after {rounds} x (delete 1k, insert 1k): median {:.1} ms, max {:.1} ms",
+                    times[times.len() / 2],
+                    times[times.len() - 1]
+                );
+            }
+            s.set_text_ticks(true);
         }
     }
 }

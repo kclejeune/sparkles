@@ -435,8 +435,8 @@ mod imp {
         /// of removed quads are kept, and until the next Tantivy commit)
         applied: u64,
         committed: u64,
-        /// the writer holds operations no Tantivy commit has made visible yet
-        staged: bool,
+        /// operations (additions and deletions) no Tantivy commit has made visible yet
+        staged: usize,
         /// the batch of the views handed out since the last seal, if any
         open: Option<Arc<Slot>>,
         /// the last sealed batch: views of later commits share it while they change
@@ -680,6 +680,11 @@ mod imp {
     /// of the tick that seals batches.
     const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
 
+    /// Staged operations at which a write seals its batch itself. Commit time grows with
+    /// the batch (roughly 20 ms for 10k operations, 55 ms for 40k, measured on 1k-triple
+    /// updates), and the first search after a burst would pay it.
+    const STAGED_MAX: usize = 16_384;
+
     /// The single-threaded writer and the reader used between rebuilds.
     fn live_of(
         index: Index,
@@ -709,7 +714,7 @@ mod imp {
             dirty_since: None,
             applied: seq,
             committed: seq,
-            staged: false,
+            staged: 0,
             open: None,
             uncertain: Default::default(),
             removed: Default::default(),
@@ -1090,7 +1095,7 @@ mod imp {
             if let Some(slot) = live.open.take() {
                 let _ = slot.0.set(None);
             }
-            live.staged = false;
+            live.staged = 0;
             live.removed.clear();
             live.removed_since = None;
             *self.stale.lock() = Some(e.to_string());
@@ -1138,9 +1143,10 @@ mod imp {
                     if live.removed.remove(&key).is_some() || *indexed {
                         live.writer()?
                             .delete_term(Term::from_field_bytes(fields.key, &key));
+                        live.staged += 1;
                     }
                     live.writer()?.add_document(doc).map_err(text_err)?;
-                    live.staged = true;
+                    live.staged += 1;
                 } else {
                     live.removed.insert(key, hash);
                     // reopening catches up from the first commit that may have
@@ -1158,6 +1164,11 @@ mod imp {
             } else {
                 live.last.clone()
             };
+            // a large batch is sealed right away: the search that would seal it pays
+            // about as much as the commit costs
+            if live.staged + live.removed.len() >= STAGED_MAX {
+                self.seal_locked(live)?;
+            }
             Ok(self.view_in(live, snap.commit, slot))
         }
 
@@ -1172,7 +1183,7 @@ mod imp {
             prepared.commit().map_err(text_err)?;
             live.reader.reload().map_err(text_err)?;
             live.committed = seq;
-            live.staged = false;
+            live.staged = 0;
             if live.dir.is_some() && live.dirty_since.is_none() {
                 live.dirty_since = Some(Instant::now());
             }
@@ -1186,7 +1197,7 @@ mod imp {
             let Some(slot) = live.open.clone() else {
                 return Ok(());
             };
-            let committed = live.staged;
+            let committed = live.staged > 0;
             if committed {
                 self.commit_locked(live)?;
             }
@@ -1205,7 +1216,7 @@ mod imp {
             for key in removed.keys() {
                 live.writer()?
                     .delete_term(Term::from_field_bytes(field, key));
-                live.staged = true;
+                live.staged += 1;
             }
             live.removed_since = None;
             Ok(())
@@ -1215,7 +1226,7 @@ mod imp {
         /// then holds exactly the applied state.
         fn settle_locked(&self, live: &mut Live) -> Result<()> {
             self.seal_locked(live)?;
-            if live.staged {
+            if live.staged > 0 {
                 self.commit_locked(live)?;
                 live.uncertain.clear();
                 live.last = Slot::sealed(live.reader.searcher(), Default::default());

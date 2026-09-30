@@ -683,7 +683,8 @@ SELECT ?s ?score ?label WHERE {
 * **Consistency**: indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents; the index commit (a new segment) happens at the next text query that
-  needs it, or about once a second, so a burst of writes shares one. If an index is
+  needs it, about once a second, or as soon as about 16,000 changes are staged, so a
+  burst of writes shares one. If an index is
   behind (a failed update, a rebuild in progress), text queries return `503` until it is
   rebuilt. They never return stale results.
 * **Durability**: index commits are not fsynced; the write-ahead log is the durable
