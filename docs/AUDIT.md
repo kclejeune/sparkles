@@ -1,6 +1,7 @@
-# Audit: Apache Jena & QLever → Sparkles
+# Audit: Apache Jena, QLever and Oxigraph → Sparkles
 
-Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLever (b0c6d0cd, 2026‑09).
+Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLever (b0c6d0cd,
+2026‑09), Oxigraph (e0f286b0, 2026‑09‑23). Fluree was not audited (§2b).
 
 ## 1. Apache Jena — functional inventory
 
@@ -14,7 +15,7 @@ Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLe
 | jena-fuseki2 | ~36K | SPARQL server: query/update/GSP/upload/patch/shacl, `/$/` admin (datasets, stats, compact, backup, tasks, metrics) | `sparkles-server` |
 | jena-ontapi | 35K | OWL2 object API (profiles DL/EL/QL/RL, no DL reasoner) | out of scope (see §5) |
 | jena-shacl / jena-shex | 23K / 18K | SHACL Core + SPARQL; ShEx 2 | `sparkles-shacl`: SHACL Core + SHACL-SPARQL (W3C 98/98 + 20/20) |
-| jena-text / jena-geosparql | 7.5K / 23K | Lucene text index; GeoSPARQL (JTS/SIS) | out of scope for v1 |
+| jena-text / jena-geosparql | 7.5K / 23K | Lucene text index; GeoSPARQL (JTS/SIS) | `text:query` subset over string literals (Tantivy, BM25; not jena-text's Lucene format or assembler); GeoSPARQL out of scope for v1 |
 | jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | patch logs, client APIs, builders, CLI | CLI → `sparkles` binary; others n/a in Rust |
 | jena-tdb1, commonsrdf | — | deprecated | skipped |
 
@@ -47,7 +48,38 @@ Conformance suites available in the Jena checkout (to be used by `sparkles` test
 | Cache | concurrent LRU keyed by subtree + delta version; pinning | ✅ LRU keyed by canonical plan + snapshot version |
 | Limits | cancellation handle, memory-limited allocator, timeouts | ✅ cancellation (also on client disconnect) / timeouts; per-query budgets for estimated intermediate-result memory, response bytes and rows (estimates, not an allocator limit) |
 | Server | streaming results, `qlever-json` with runtime-information tree, websockets for live plan | ✅ `x-sparkles+json` with executed plan tree (see API.md) |
-| Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | ⏭ future work |
+| Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | text: BM25 full-text search through `text:query` (Tantivy), no text/entity co-occurrence index; patterns and spatial ⏭ future work |
+
+## 2a. Oxigraph — what Sparkles reuses
+
+[Oxigraph](https://github.com/oxigraph/oxigraph) (MIT / Apache-2.0) is both a database
+(RocksDB storage, lazy iterator-based SPARQL evaluation in `spareval`) and a set of RDF
+libraries. Sparkles uses the libraries and replaces the database:
+
+| Oxigraph crate | Role | In Sparkles |
+|---|---|---|
+| `oxrdf` 0.3, `oxiri`, `oxilangtag` | term model (IRIs, blank nodes, literals, RDF 1.2 triple terms), IRI and language-tag validation | ✅ the term model everywhere; ids and the vocabulary are Sparkles' own |
+| `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` 0.2 | parsers and serializers (Turtle, TriG, N-Triples, N-Quads, RDF/XML, JSON-LD) | ✅ all RDF I/O; the bulk loader drives `oxttl`'s parallel chunked parsing |
+| `sparesults` 0.3 | SPARQL result formats (JSON, XML, CSV, TSV) | ✅ result parsing/serialization (plus our own `x-sparkles+json`) |
+| `spargebra` 0.4.7 | SPARQL 1.1/1.2 parser and algebra | ✅ vendored with fixes for the W3C tests it failed and for left-associative arithmetic (`vendor/spargebra/PATCHED.md`) |
+| `oxsdatatypes` 0.2 | XSD value space (decimal, dateTime, durations) | ✅ literal values and arithmetic |
+| `sparopt`, `spareval` | algebra optimizer and evaluator | ✗ Sparkles has its own DP planner and columnar executor |
+| `oxigraph` (store) | RocksDB storage, 9 index orders, in-place updates | ✗ Sparkles uses QLever-style sorted blocks (§2) |
+| `spargeo` | GeoSPARQL functions | ✗ not used (GeoSPARQL is out of scope for v1) |
+
+Oxigraph is also one of the benchmark engines (`docs/BENCHMARKS.md`).
+
+## 2b. Fluree — not audited
+
+[Fluree DB](https://github.com/fluree/db) is licensed under BUSL-1.1. Sparkles neither
+depends on it nor borrows from it: its source, tests and design documents were not read.
+Features that other databases, Fluree among them, offer and Sparkles also provides
+(durable commit ids, point-in-time reads and named snapshots, full-text and vector
+search, dataset access control, an MCP server, backups to object storage) were
+specified from the W3C and IETF standards, the documentation of permissively licensed
+libraries, published papers and Sparkles' own code. Fluree appears only as a benchmark
+engine, downloaded at benchmark time, and in the README comparison, which is based on
+its public documentation.
 
 ## 3. Language decision: Rust
 
@@ -68,22 +100,30 @@ re-create the parser/algebra/datatype stack.
 ## 4. Sparkles architecture
 
 ```
-ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /$/ admin; CLI)
-                                   │
-                  sparkles-reasoner (RDFS / OWL-RL / Jena rules, semi-naive forward chaining)
+ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /$/ admin; auth, rate
+                                   │         limits, observability; CLI; MCP over stdio)
+                                   ├─ sparkles-reasoner (RDFS / OWL-RL / Jena rules, semi-naive forward chaining)
+                                   ├─ sparkles-shacl    (SHACL Core + SHACL-SPARQL, write-time validation)
+                                   └─ sparkles-backup   (repositories on a file system or S3, backups, restore, policies)
                                    │
 sparkles (library)
  ├─ id        64-bit tagged ids, inline literals
  ├─ vocab     sorted front-coded base vocab (mmap) + delta vocab + local vocab
  ├─ index     permutation files: 32k-row blocks, per-column compression, in-RAM block metadata
  ├─ builder   parallel bulk loader (partial vocabs → merge → remap → external sort)
- ├─ store     generations, WAL, MVCC snapshots (base ⊕ delta), compaction, backup
+ ├─ store     generations, WAL, MVCC snapshots (base ⊕ delta), commit catalog, history,
+ │            compaction, backup capture
  ├─ sparql    spargebra → planner (DP + interesting orders) → columnar operators → results
- └─ io        RDF & result-format parsing/serialization
+ ├─ text      full-text index (Tantivy)
+ ├─ vector    exact vector similarity
+ ├─ codec     gzip / zstd / brotli / LZ4
+ └─ io        RDF & result-format parsing/serialization (Oxigraph crates)
 ```
 
 ## 5. Explicit non-goals for v1
 
 JavaScript scripting functions, RDF Thrift/Protobuf, TriX, jena-ontapi's object mapping API,
-jena-text, GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth. These are
-documented extension points rather than hidden gaps.
+jena-text's Lucene index format and assembler configuration (Sparkles implements
+`text:query` itself), GeoSPARQL, ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth
+(Sparkles has its own authentication). These are documented extension points rather than
+hidden gaps.

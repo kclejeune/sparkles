@@ -7,7 +7,8 @@ A high-performance RDF / SPARQL / OWL database in Rust. It aims to be a
 It also ships a SvelteKit UI for database management, graph visualization and
 interactive querying.
 
-* `docs/AUDIT.md` covers the Jena and QLever audits and the language decision (Rust vs. Go).
+* `docs/AUDIT.md` covers the Jena and QLever audits, what Sparkles reuses from Oxigraph, why
+  Fluree was not audited, and the language decision (Rust vs. Go).
 * `docs/API.md` is the HTTP API contract (Fuseki-compatible, plus `/$/` extensions).
 
 ## Philosophy
@@ -38,6 +39,8 @@ interactive querying.
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core + SHACL-SPARQL validation over store snapshots | jena-shacl |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
+| `crates/sparkles-backup` | backup repositories (file system or S3): incremental, deduplicated backups, restore, lifecycle policies | Fuseki `/$/backup` (N-Quads dumps only) |
+| `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
 | `ui/` | SvelteKit management / query / graph-exploration UI *(in progress)* | jena-fuseki-ui |
 
 ## Status
@@ -757,9 +760,14 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 ## Testing
 
 ```sh
-cargo test --workspace
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests
+mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
+mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
+mise run ui:e2e        # Playwright end-to-end tests against a real server
 ```
 
-`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL 1.0 / 1.1 query and update suites that
-are vendored in the Apache Jena checkout (`../../apache/jena` next to this repository, or
-`SPARKLES_W3C_DIR`). Known failures are listed in `crates/sparkles/tests/w3c-known-failures.txt`.
+`crates/sparkles/tests/w3c.rs` runs the W3C SPARQL suites vendored in the Apache Jena
+checkout (`../../apache/jena` next to this repository, or `SPARKLES_W3C_DIR`); the SHACL
+suites come from the same checkout (or `SPARKLES_SHACL_TESTS`). Without the checkout the
+suites are skipped. All of them pass (482/482, 328/328, 157/157, 269/269; SHACL 98/98 and
+20/20); `crates/sparkles/tests/w3c-known-failures.txt` lists known failures and is empty.
