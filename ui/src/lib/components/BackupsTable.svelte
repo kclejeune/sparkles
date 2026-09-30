@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -79,10 +79,13 @@
     now = Date.now();
   }
 
+  // reload when asked, or when a repository comes, goes or changes reachability (not on
+  // every poll of the repository list)
+  const repoKey = $derived(repositories.map((r) => `${r.name}:${b.reachable(r)}`).join());
   $effect(() => {
     void refreshKey;
-    void repositories;
-    void load();
+    void repoKey;
+    untrack(() => void load());
   });
 
   onMount(() => {

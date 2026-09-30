@@ -51,10 +51,11 @@
     chosen = bk;
     step = 0;
     mode = 'new';
-    target = defaultRestoreName(
-      bk.dataset.name,
-      app.datasets.map((d) => d.name),
-    );
+    // disaster recovery: a backup of a dataset this server lacks restores under its name
+    const names = app.datasets.map((d) => d.name);
+    target = names.includes(bk.dataset.name)
+      ? defaultRestoreName(bk.dataset.name, names)
+      : bk.dataset.name;
     confirmText = '';
     identity = 'auto';
     check = 'quick';
