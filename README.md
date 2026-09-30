@@ -551,6 +551,24 @@ of the target data directory has it) and `--check quick|full|none` the integrity
 before the restored database is published. `restore --data` refuses while a server holds
 the data directory.
 
+A server (`sparkles serve --backup-config FILE`) also takes repositories registered through
+its API and UI (`POST /$/repositories`), under the operator's limits from that file. Their
+credentials only name a source defined there, never environment variables, files or the
+instance's default chain of the caller's choosing; their S3 endpoints go through the
+outbound policy below (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
+`--outbound-allow-private`); `fs` ones stay out of the data directory and the config
+files' directories, and under `[api] fs_roots` when it is set:
+
+```toml
+[credentials.minio]              # named by {"source": "named", "name": "minio"}
+source = "env"
+access_key_id_var = "MINIO_ACCESS_KEY"
+secret_access_key_var = "MINIO_SECRET_KEY"
+
+[api]
+fs_roots = ["/srv/backups"]
+```
+
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
 ### Outbound requests (SERVICE and LOAD)
