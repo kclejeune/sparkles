@@ -1,0 +1,13 @@
+#------------------------------------------------------------------
+# RDFS "simple" (Sparkles): the transitive closure of subClassOf and
+# subPropertyOf, their instance-level implications, and domain/range.
+# Equivalent to Jena's RDFS reasoner at level "simple" (no axioms, no
+# rdfs:Resource / rdf:Property typing).
+#------------------------------------------------------------------
+
+[rdfs2:  (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+[rdfs3:  (?p rdfs:range ?c), (?x ?p ?y) -> (?y rdf:type ?c)]
+[rdfs5:  (?a rdfs:subPropertyOf ?b), (?b rdfs:subPropertyOf ?c) -> (?a rdfs:subPropertyOf ?c)]
+[rdfs7:  (?p rdfs:subPropertyOf ?q), notEqual(?p, ?q), (?a ?p ?b) -> (?a ?q ?b)]
+[rdfs9:  (?x rdfs:subClassOf ?y), notEqual(?x, ?y), (?a rdf:type ?x) -> (?a rdf:type ?y)]
+[rdfs11: (?a rdfs:subClassOf ?b), (?b rdfs:subClassOf ?c) -> (?a rdfs:subClassOf ?c)]

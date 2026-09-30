@@ -1,0 +1,89 @@
+#------------------------------------------------------------------
+# Full RDFS entailment (Sparkles).
+#
+# A port of Jena's etc/rdfs.rules (RDFS "full" level) for forward
+# materialization. Rule names follow the W3C RDF 1.1 Semantics
+# numbering (§9.2.1); Jena's names are given in comments.
+# Default prefixes rdf:, rdfs:, owl:, xsd: are predefined.
+#------------------------------------------------------------------
+
+#------------------------------------------------------------------
+# RDF / RDFS axiomatic triples
+#------------------------------------------------------------------
+
+-> (rdf:type      rdfs:range rdfs:Class).
+-> (rdfs:Resource  rdf:type  rdfs:Class).
+-> (rdfs:Literal   rdf:type  rdfs:Class).
+-> (rdf:Statement  rdf:type  rdfs:Class).
+-> (rdf:nil        rdf:type  rdf:List).
+-> (rdf:subject    rdf:type  rdf:Property).
+-> (rdf:object     rdf:type  rdf:Property).
+-> (rdf:predicate  rdf:type  rdf:Property).
+-> (rdf:first      rdf:type  rdf:Property).
+-> (rdf:rest       rdf:type  rdf:Property).
+
+-> (rdfs:subPropertyOf rdfs:domain rdf:Property).
+-> (rdfs:subClassOf rdfs:domain rdfs:Class).
+-> (rdfs:domain rdfs:domain rdf:Property).
+-> (rdfs:range rdfs:domain rdf:Property).
+-> (rdf:subject rdfs:domain rdf:Statement).
+-> (rdf:predicate rdfs:domain rdf:Statement).
+-> (rdf:object rdfs:domain rdf:Statement).
+-> (rdf:first rdfs:domain rdf:List).
+-> (rdf:rest rdfs:domain rdf:List).
+
+-> (rdfs:subPropertyOf rdfs:range rdf:Property).
+-> (rdfs:subClassOf rdfs:range rdfs:Class).
+-> (rdfs:domain rdfs:range rdfs:Class).
+-> (rdfs:range rdfs:range rdfs:Class).
+-> (rdfs:comment rdfs:range rdfs:Literal).
+-> (rdfs:label rdfs:range rdfs:Literal).
+-> (rdf:rest rdfs:range rdf:List).
+
+-> (rdf:Alt rdfs:subClassOf rdfs:Container).
+-> (rdf:Bag rdfs:subClassOf rdfs:Container).
+-> (rdf:Seq rdfs:subClassOf rdfs:Container).
+-> (rdfs:ContainerMembershipProperty rdfs:subClassOf rdf:Property).
+
+-> (rdfs:isDefinedBy rdfs:subPropertyOf rdfs:seeAlso).
+
+-> (rdf:XMLLiteral rdf:type rdfs:Datatype).
+-> (rdf:langString rdf:type rdfs:Datatype).
+-> (rdf:HTML rdf:type rdfs:Datatype).
+-> (rdfs:Datatype rdfs:subClassOf rdfs:Class).
+
+-> (rdf:_1 rdf:type rdfs:ContainerMembershipProperty).
+-> (rdf:_2 rdf:type rdfs:ContainerMembershipProperty).
+-> (rdf:_3 rdf:type rdfs:ContainerMembershipProperty).
+
+#------------------------------------------------------------------
+# RDFS closure rules
+#------------------------------------------------------------------
+
+# rdf1 + rdfs4a/b (Jena rdf1and4)
+[rdf1:   (?x ?p ?y) -> (?p rdf:type rdf:Property)]
+[rdfs4:  (?x ?p ?y) -> (?x rdf:type rdfs:Resource), (?y rdf:type rdfs:Resource)]
+
+# domain / range (Jena rdfs2 / rdfs3)
+[rdfs2:  (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+[rdfs3:  (?p rdfs:range ?c), (?x ?p ?y) -> (?y rdf:type ?c)]
+
+# subPropertyOf: transitive, reflexive, inheritance (Jena rdfs5a / rdfs5b / rdfs6)
+[rdfs5:  (?a rdfs:subPropertyOf ?b), (?b rdfs:subPropertyOf ?c) -> (?a rdfs:subPropertyOf ?c)]
+[rdfs6:  (?a rdf:type rdf:Property) -> (?a rdfs:subPropertyOf ?a)]
+[rdfs7:  (?p rdfs:subPropertyOf ?q), notEqual(?p, ?q), (?a ?p ?b) -> (?a ?q ?b)]
+
+# classes (Jena rdfs7b / rdfs7 / rdfs9 / rdfs8)
+[rdfs8:  (?a rdf:type rdfs:Class) -> (?a rdfs:subClassOf rdfs:Resource)]
+[rdfs9:  (?x rdfs:subClassOf ?y), notEqual(?x, ?y), (?a rdf:type ?x) -> (?a rdf:type ?y)]
+[rdfs10: (?a rdf:type rdfs:Class) -> (?a rdfs:subClassOf ?a)]
+[rdfs11: (?a rdfs:subClassOf ?b), (?b rdfs:subClassOf ?c) -> (?a rdfs:subClassOf ?c)]
+
+# container membership properties (Jena rdfs10)
+[rdfs12: (?x rdf:type rdfs:ContainerMembershipProperty) -> (?x rdfs:subPropertyOf rdfs:member)]
+[rdfs12cmp: (?p rdf:type rdf:Property),
+            regex(?p, 'http://www[.]w3[.]org/1999/02/22-rdf-syntax-ns#_[1-9][0-9]*')
+            -> (?p rdf:type rdfs:ContainerMembershipProperty)]
+
+# datatypes
+[rdfs13: (?d rdf:type rdfs:Datatype) -> (?d rdfs:subClassOf rdfs:Literal)]

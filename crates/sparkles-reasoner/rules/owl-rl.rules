@@ -1,0 +1,202 @@
+#------------------------------------------------------------------
+# OWL 2 RL subset (Sparkles), for forward materialization.
+#
+# Comparable to Jena's OWL Mini / Micro rule sets (etc/owl-fb-mini.rules,
+# etc/owl-fb-micro.rules) with the backward and functor-based parts
+# rewritten as plain forward rules. Rule names follow the OWL 2 RL
+# profile tables (https://www.w3.org/TR/owl2-profiles/#OWL_2_RL); Jena
+# names are given in comments where they differ.
+#
+# Not covered: validation / inconsistency detection (rb:violation,
+# owl:Nothing, disjointness), cardinality > 1, hasKey, datatype
+# reasoning, reflexive owl:sameAs for every individual.
+#
+# Sparkles builtins used beyond Jena's: listMember(?list, ?x) enumerates
+# the members of an RDF list; listForAll(?list, ?s, ?p) holds when
+# (?s ?p m) exists for every member m.
+#------------------------------------------------------------------
+
+#------------------------------------------------------------------
+# Axioms (RDFS and OWL vocabulary)
+#------------------------------------------------------------------
+
+-> (rdf:type      rdfs:range rdfs:Class).
+-> (rdfs:Resource  rdf:type  rdfs:Class).
+-> (rdfs:Literal   rdf:type  rdfs:Class).
+-> (rdf:nil        rdf:type  rdf:List).
+-> (rdfs:subPropertyOf rdfs:domain rdf:Property).
+-> (rdfs:subClassOf rdfs:domain rdfs:Class).
+-> (rdfs:domain rdfs:domain rdf:Property).
+-> (rdfs:range rdfs:domain rdf:Property).
+-> (rdfs:subPropertyOf rdfs:range rdf:Property).
+-> (rdfs:subClassOf rdfs:range rdfs:Class).
+-> (rdfs:domain rdfs:range rdfs:Class).
+-> (rdfs:range rdfs:range rdfs:Class).
+-> (rdfs:isDefinedBy rdfs:subPropertyOf rdfs:seeAlso).
+-> (rdfs:Datatype rdfs:subClassOf rdfs:Class).
+
+-> (owl:FunctionalProperty rdfs:subClassOf rdf:Property).
+-> (owl:ObjectProperty rdfs:subClassOf rdf:Property).
+-> (owl:DatatypeProperty rdfs:subClassOf rdf:Property).
+-> (owl:AnnotationProperty rdfs:subClassOf rdf:Property).
+-> (owl:InverseFunctionalProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:TransitiveProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:SymmetricProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:AsymmetricProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:ReflexiveProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:IrreflexiveProperty rdfs:subClassOf owl:ObjectProperty).
+-> (owl:Class rdfs:subClassOf rdfs:Class).
+-> (owl:Restriction rdfs:subClassOf owl:Class).
+-> (owl:Thing rdf:type owl:Class).
+-> (owl:Nothing rdf:type owl:Class).
+-> (owl:Nothing rdfs:subClassOf owl:Thing).
+-> (owl:equivalentClass rdfs:domain owl:Class).
+-> (owl:equivalentClass rdfs:range  owl:Class).
+-> (owl:disjointWith rdfs:domain owl:Class).
+-> (owl:disjointWith rdfs:range  owl:Class).
+-> (owl:onProperty rdfs:domain owl:Restriction).
+-> (owl:onProperty rdfs:range  rdf:Property).
+-> (owl:intersectionOf rdfs:domain owl:Class).
+-> (owl:unionOf rdfs:domain owl:Class).
+-> (owl:oneOf rdfs:domain owl:Class).
+-> (owl:imports rdfs:domain owl:Ontology).
+-> (owl:imports rdfs:range owl:Ontology).
+-> (owl:versionInfo rdf:type owl:AnnotationProperty).
+-> (rdfs:label rdf:type owl:AnnotationProperty).
+-> (rdfs:comment rdf:type owl:AnnotationProperty).
+# (transitivity of sameAs / equivalentClass / equivalentProperty is handled by
+# dedicated rules that do not produce reflexive statements)
+-> (owl:sameAs rdf:type owl:SymmetricProperty).
+-> (owl:differentFrom rdf:type owl:SymmetricProperty).
+-> (owl:disjointWith rdf:type owl:SymmetricProperty).
+-> (owl:inverseOf rdf:type owl:SymmetricProperty).
+-> (owl:equivalentClass rdf:type owl:SymmetricProperty).
+-> (owl:equivalentProperty rdf:type owl:SymmetricProperty).
+
+#------------------------------------------------------------------
+# RDFS core (Jena mini: rdf4, rdfs2, rdfs3, rdfs5a, rdfs6, rdfs7, rdfs7b, rdfs9)
+#------------------------------------------------------------------
+
+[rdf1:     (?x ?p ?y) -> (?p rdf:type rdf:Property)]
+[prp-dom:  (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)]
+[prp-rng:  (?p rdfs:range ?c), (?x ?p ?y), notLiteral(?y) -> (?y rdf:type ?c)]
+[scm-spo:  (?a rdfs:subPropertyOf ?b), (?b rdfs:subPropertyOf ?c) -> (?a rdfs:subPropertyOf ?c)]
+[prp-spo1: (?p rdfs:subPropertyOf ?q), notEqual(?p, ?q), (?a ?p ?b) -> (?a ?q ?b)]
+[scm-sco:  (?a rdfs:subClassOf ?b), (?b rdfs:subClassOf ?c) -> (?a rdfs:subClassOf ?c)]
+[cax-sco:  (?x rdfs:subClassOf ?y), notEqual(?x, ?y), (?a rdf:type ?x) -> (?a rdf:type ?y)]
+[scm-cls:  (?c rdf:type rdfs:Class) -> (?c rdfs:subClassOf ?c), (?c rdfs:subClassOf rdfs:Resource)]
+[scm-owl-cls: (?c rdf:type owl:Class) -> (?c rdf:type rdfs:Class), (?c rdfs:subClassOf owl:Thing)]
+[scm-restriction: (?c rdf:type owl:Restriction) -> (?c rdf:type owl:Class)]
+[scm-int-cls: (?c owl:intersectionOf ?l) -> (?c rdf:type owl:Class)]
+
+# domain / range propagation (Jena rdfs2a / rdfs3a / rdfsder1 / rdfsder2)
+[scm-dom1: (?p rdfs:domain ?c1), (?c1 rdfs:subClassOf ?c2), notEqual(?c1, ?c2) -> (?p rdfs:domain ?c2)]
+[scm-dom2: (?p2 rdfs:domain ?c), (?p1 rdfs:subPropertyOf ?p2), notEqual(?p1, ?p2) -> (?p1 rdfs:domain ?c)]
+[scm-rng1: (?p rdfs:range ?c1), (?c1 rdfs:subClassOf ?c2), notEqual(?c1, ?c2) -> (?p rdfs:range ?c2)]
+[scm-rng2: (?p2 rdfs:range ?c), (?p1 rdfs:subPropertyOf ?p2), notEqual(?p1, ?p2) -> (?p1 rdfs:range ?c)]
+
+#------------------------------------------------------------------
+# Equivalence
+#------------------------------------------------------------------
+
+[scm-eqc1: (?a owl:equivalentClass ?b) -> (?a rdfs:subClassOf ?b), (?b rdfs:subClassOf ?a)]
+[scm-eqc2: (?a rdfs:subClassOf ?b), (?b rdfs:subClassOf ?a), notEqual(?a, ?b) -> (?a owl:equivalentClass ?b)]
+[scm-eqp1: (?a owl:equivalentProperty ?b) -> (?a rdfs:subPropertyOf ?b), (?b rdfs:subPropertyOf ?a)]
+[scm-eqp2: (?a rdfs:subPropertyOf ?b), (?b rdfs:subPropertyOf ?a), notEqual(?a, ?b) -> (?a owl:equivalentProperty ?b)]
+
+#------------------------------------------------------------------
+# Property characteristics
+#------------------------------------------------------------------
+
+[prp-inv0: (?p owl:inverseOf ?q) -> (?q owl:inverseOf ?p)]
+[prp-inv:  (?p owl:inverseOf ?q), (?x ?p ?y), notLiteral(?y) -> (?y ?q ?x)]
+[prp-inv-fp:  (?p owl:inverseOf ?q), (?p rdf:type owl:FunctionalProperty) -> (?q rdf:type owl:InverseFunctionalProperty)]
+[prp-inv-ifp: (?p owl:inverseOf ?q), (?p rdf:type owl:InverseFunctionalProperty) -> (?q rdf:type owl:FunctionalProperty)]
+[prp-inv-dom: (?p owl:inverseOf ?q), (?p rdfs:range ?c) -> (?q rdfs:domain ?c)]
+[prp-inv-rng: (?p owl:inverseOf ?q), (?p rdfs:domain ?c) -> (?q rdfs:range ?c)]
+
+[prp-symp: (?p rdf:type owl:SymmetricProperty), (?x ?p ?y), notLiteral(?y) -> (?y ?p ?x)]
+[prp-trp:  (?p rdf:type owl:TransitiveProperty), (?x ?p ?y), (?y ?p ?z) -> (?x ?p ?z)]
+
+[prp-fp:  (?p rdf:type owl:FunctionalProperty), (?x ?p ?y1), notLiteral(?y1),
+          (?x ?p ?y2), notLiteral(?y2), notEqual(?y1, ?y2) -> (?y1 owl:sameAs ?y2)]
+[prp-ifp: (?p rdf:type owl:InverseFunctionalProperty), (?x1 ?p ?y), (?x2 ?p ?y),
+          notEqual(?x1, ?x2) -> (?x1 owl:sameAs ?x2)]
+# Jena fpEarlyProp / ifpEarlyProp
+[prp-fp-sub:  (?p rdf:type owl:FunctionalProperty), (?q rdfs:subPropertyOf ?p), notEqual(?p, ?q) -> (?q rdf:type owl:FunctionalProperty)]
+[prp-ifp-sub: (?p rdf:type owl:InverseFunctionalProperty), (?q rdfs:subPropertyOf ?p), notEqual(?p, ?q) -> (?q rdf:type owl:InverseFunctionalProperty)]
+
+# property chains of length 2 and 3
+[prp-spo2-2: (?p owl:propertyChainAxiom ?l), (?l rdf:first ?p1), (?l rdf:rest ?l2),
+             (?l2 rdf:first ?p2), (?l2 rdf:rest rdf:nil),
+             (?u ?p1 ?v), (?v ?p2 ?w) -> (?u ?p ?w)]
+[prp-spo2-3: (?p owl:propertyChainAxiom ?l), (?l rdf:first ?p1), (?l rdf:rest ?l2),
+             (?l2 rdf:first ?p2), (?l2 rdf:rest ?l3), (?l3 rdf:first ?p3), (?l3 rdf:rest rdf:nil),
+             (?u ?p1 ?v), (?v ?p2 ?w), (?w ?p3 ?z) -> (?u ?p ?z)]
+
+#------------------------------------------------------------------
+# Equality (owl:sameAs). Reflexive sameAs is not materialized; replacement
+# skips owl:sameAs itself (its closure is computed by eq-sym / eq-trans).
+#------------------------------------------------------------------
+
+[eq-sym:   (?x owl:sameAs ?y), notEqual(?x, ?y) -> (?y owl:sameAs ?x)]
+[eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z), notEqual(?x, ?z) -> (?x owl:sameAs ?z)]
+[eq-rep-s: (?s owl:sameAs ?s2), notEqual(?s, ?s2), (?s ?p ?o), notEqual(?p, owl:sameAs) -> (?s2 ?p ?o)]
+[eq-rep-p: (?p owl:sameAs ?p2), notEqual(?p, ?p2), (?s ?p ?o) -> (?s ?p2 ?o)]
+[eq-rep-o: (?o owl:sameAs ?o2), notEqual(?o, ?o2), (?s ?p ?o), notEqual(?p, owl:sameAs) -> (?s ?p ?o2)]
+# Jena equality2 / equality3
+[eq-class: (?x owl:sameAs ?y), notEqual(?x, ?y), (?x rdf:type owl:Class) -> (?x owl:equivalentClass ?y)]
+[eq-prop:  (?x owl:sameAs ?y), notEqual(?x, ?y), (?x rdf:type owl:ObjectProperty) -> (?x owl:equivalentProperty ?y)]
+
+#------------------------------------------------------------------
+# Class expressions
+#------------------------------------------------------------------
+
+# owl:hasValue (Jena hasValueIF)
+[cls-hv1: (?x owl:hasValue ?y), (?x owl:onProperty ?p), (?u rdf:type ?x) -> (?u ?p ?y)]
+[cls-hv2: (?x owl:hasValue ?y), (?x owl:onProperty ?p), (?u ?p ?y) -> (?u rdf:type ?x)]
+
+# owl:someValuesFrom (Jena someRec2 / someRec2b)
+[cls-svf1: (?x owl:someValuesFrom ?y), (?x owl:onProperty ?p), (?u ?p ?v), (?v rdf:type ?y) -> (?u rdf:type ?x)]
+[cls-svf1-dt: (?x owl:someValuesFrom ?y), (?y rdf:type rdfs:Datatype), (?x owl:onProperty ?p), (?u ?p ?v),
+              isDType(?v, ?y) -> (?u rdf:type ?x)]
+[cls-svf2: (?x owl:someValuesFrom owl:Thing), (?x owl:onProperty ?p), (?u ?p ?v) -> (?u rdf:type ?x)]
+
+# owl:allValuesFrom (Jena all1b)
+[cls-avf: (?x owl:allValuesFrom ?y), (?x owl:onProperty ?p), (?u rdf:type ?x), (?u ?p ?v), notLiteral(?v)
+          -> (?v rdf:type ?y)]
+
+# owl:maxCardinality 1 / owl:maxQualifiedCardinality 1 (Jena max1)
+[cls-maxc2: (?x owl:maxCardinality ?n), equal(?n, 1), (?x owl:onProperty ?p), (?u rdf:type ?x),
+            (?u ?p ?y1), notLiteral(?y1), (?u ?p ?y2), notLiteral(?y2), notEqual(?y1, ?y2) -> (?y1 owl:sameAs ?y2)]
+[cls-maxqc3: (?x owl:maxQualifiedCardinality ?n), equal(?n, 1), (?x owl:onProperty ?p), (?x owl:onClass ?c),
+             (?u rdf:type ?x), (?u ?p ?y1), (?y1 rdf:type ?c), (?u ?p ?y2), (?y2 rdf:type ?c),
+             notEqual(?y1, ?y2) -> (?y1 owl:sameAs ?y2)]
+
+# owl:intersectionOf
+[cls-int1: (?c owl:intersectionOf ?l), listMember(?l, ?ci), (?y rdf:type ?ci),
+           listForAll(?l, ?y, rdf:type) -> (?y rdf:type ?c)]
+[cls-int2: (?c owl:intersectionOf ?l), listMember(?l, ?ci), (?y rdf:type ?c) -> (?y rdf:type ?ci)]
+
+# owl:unionOf (Jena unionOf1)
+[cls-uni: (?c owl:unionOf ?l), listMember(?l, ?ci), (?y rdf:type ?ci) -> (?y rdf:type ?c)]
+
+# owl:oneOf (Jena oneOf1)
+[cls-oo: (?c owl:oneOf ?l), listMember(?l, ?x) -> (?x rdf:type ?c)]
+
+#------------------------------------------------------------------
+# Schema vocabulary
+#------------------------------------------------------------------
+
+[scm-int: (?c owl:intersectionOf ?l), listMember(?l, ?ci) -> (?c rdfs:subClassOf ?ci)]
+[scm-uni: (?c owl:unionOf ?l), listMember(?l, ?ci) -> (?ci rdfs:subClassOf ?c)]
+[scm-hv:  (?c1 owl:hasValue ?i), (?c1 owl:onProperty ?p1), (?c2 owl:hasValue ?i), (?c2 owl:onProperty ?p2),
+          (?p1 rdfs:subPropertyOf ?p2), notEqual(?c1, ?c2) -> (?c1 rdfs:subClassOf ?c2)]
+[scm-svf1: (?c1 owl:someValuesFrom ?y1), (?c1 owl:onProperty ?p), (?c2 owl:someValuesFrom ?y2),
+           (?c2 owl:onProperty ?p), (?y1 rdfs:subClassOf ?y2), notEqual(?c1, ?c2) -> (?c1 rdfs:subClassOf ?c2)]
+[scm-svf2: (?c1 owl:someValuesFrom ?y), (?c1 owl:onProperty ?p1), (?c2 owl:someValuesFrom ?y),
+           (?c2 owl:onProperty ?p2), (?p1 rdfs:subPropertyOf ?p2), notEqual(?c1, ?c2) -> (?c1 rdfs:subClassOf ?c2)]
+[scm-avf1: (?c1 owl:allValuesFrom ?y1), (?c1 owl:onProperty ?p), (?c2 owl:allValuesFrom ?y2),
+           (?c2 owl:onProperty ?p), (?y1 rdfs:subClassOf ?y2), notEqual(?c1, ?c2) -> (?c1 rdfs:subClassOf ?c2)]
+[scm-avf2: (?c1 owl:allValuesFrom ?y), (?c1 owl:onProperty ?p1), (?c2 owl:allValuesFrom ?y),
+           (?c2 owl:onProperty ?p2), (?p1 rdfs:subPropertyOf ?p2), notEqual(?c1, ?c2) -> (?c2 rdfs:subClassOf ?c1)]

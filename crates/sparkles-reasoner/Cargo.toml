@@ -1,0 +1,20 @@
+[package]
+name = "sparkles-reasoner"
+description = "Forward-chaining RDFS / OWL 2 RL / Jena-rules materialization for Sparkles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles.workspace = true
+oxrdf.workspace = true
+oxsdatatypes.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
