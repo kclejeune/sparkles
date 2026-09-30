@@ -622,7 +622,8 @@ one API token), runs the Playwright tests in `ui/tests/e2e` in headless Chromium
 server. `SPARKLES_BIN=path/to/sparkles` tests another binary; extra arguments go to
 `playwright test` (`mise run ui:e2e -- -g Similar`). The flake's dev shell provides a Chromium
 matching the pinned `@playwright/test` (`nix develop -c mise run ui:e2e`); elsewhere the task
-downloads one with `playwright install chromium`. It is not part of `mise run ci`.
+downloads one with `playwright install chromium`. It is not part of `mise run ci`; on Linux the
+flake runs the same tests as the check `ui-e2e` (see Nix below).
 
 ### Nix
 
@@ -636,13 +637,16 @@ provides:
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
-  * `checks`, including a NixOS VM test of the module behind nginx;
+  * `checks`: the packages; on Linux also a NixOS VM test of the module behind nginx and
+    `ui-e2e`, the Playwright UI tests against the release binary in nixpkgs' headless
+    Chromium (in the build sandbox, on 127.0.0.1);
   * `nixosModules.default`.
 
 ```sh
 nix run github:kclejeune/sparkles -- serve --data ./data
 nix build .#sparkles-cli
-nix flake check          # packages + NixOS VM test (Linux, needs KVM)
+nix flake check          # packages + NixOS VM test (Linux, needs KVM) + UI end-to-end tests
+nix build .#checks.x86_64-linux.ui-e2e -L   # only the UI end-to-end tests
 ```
 
 On NixOS, `services.sparkles` runs the server as a hardened systemd service. Its state

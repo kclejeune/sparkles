@@ -66,6 +66,12 @@
             cargo = toolchain;
             rustc = toolchain;
           };
+          # Chromium for the Playwright UI tests (the dev shell and the `ui-e2e` check)
+          playwrightBrowsers = pkgs.playwright-driver.browsers.override {
+            withFirefox = false;
+            withWebkit = false;
+            withFfmpeg = false;
+          };
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
@@ -99,11 +105,7 @@
             # ui/package.json is pinned to this nixpkgs' playwright-driver version so that the
             # browser revisions match. Elsewhere `mise run ui:e2e` downloads its own.
             env = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-              PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers.override {
-                withFirefox = false;
-                withWebkit = false;
-                withFfmpeg = false;
-              };
+              PLAYWRIGHT_BROWSERS_PATH = playwrightBrowsers;
               PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
             };
             packages = [
@@ -126,6 +128,12 @@
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });
+            # the Playwright UI tests against the release binary, in nixpkgs' Chromium
+            ui-e2e = pkgs.callPackage ./nix/ui-e2e.nix {
+              inherit (self'.packages) sparkles;
+              ui = self'.packages.sparkles-ui;
+              browsers = playwrightBrowsers;
+            };
           };
 
           formatter = pkgs.nixfmt;

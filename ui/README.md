@@ -76,6 +76,15 @@ Explore, Similar, text search and the dataset history.
 dev shell provides (`PLAYWRIGHT_BROWSERS_PATH`); without Nix, `pnpm exec playwright install
 chromium` downloads one. `mise run ui:e2e` does all of this.
 
+On Linux the flake check `ui-e2e` (`nix/ui-e2e.nix`, part of `nix flake check`; alone:
+`nix build .#checks.x86_64-linux.ui-e2e -L`) runs the same tests hermetically in the build
+sandbox: `SPARKLES_BIN` is the flake's `sparkles` package, a release build that embeds the UI
+(so no `build/` is needed), the dependencies are the `sparkles-ui` package's pnpm store (the
+same hash, refreshed with it when the lockfile changes), and Chromium comes from nixpkgs'
+`playwright-driver` (with a fontconfig listing DejaVu, as the sandbox has no system fonts).
+With `CI` set, as there, a failed test is retried once and reported as
+flaky, and `test.only` fails the run.
+
 ## Serving from the Rust server
 
 - Serve `ui/build/` at `/ui/`; unknown paths under `/ui/` must fall back to
