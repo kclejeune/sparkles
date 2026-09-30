@@ -39,62 +39,9 @@ pub fn commit(dir: &Path, u: &str) {
     upd(&s, u);
 }
 
-/// A backup source for the closed database directory `dir` (what
-/// `Source::from_closed_dir` gives): the current generation's files, `commits.bin`, and
-/// the meta files, at the head commit of the catalog.
+/// A backup source for the closed database directory `dir`.
 pub fn closed_source(dir: &Path) -> Source {
-    let (dataset_id, commits) = sparkles::commit::read_catalog(&dir.join("commits.bin"))
-        .unwrap()
-        .expect("a commit catalog");
-    let commit = *commits.last().expect("a head commit");
-    let generation = std::fs::read_to_string(dir.join("CURRENT"))
-        .unwrap()
-        .trim()
-        .to_string();
-    let open = |rel: &str, kind: FileKind| {
-        let f = std::fs::File::open(dir.join(rel)).unwrap();
-        CapturedFile {
-            path: rel.to_string(),
-            kind,
-            len: f.metadata().unwrap().len(),
-            src: FileSource::File(f),
-        }
-    };
-    let mut names: Vec<String> = std::fs::read_dir(dir.join(&generation))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.ends_with(".tmp"))
-        .collect();
-    names.sort();
-    let mut files = Vec::new();
-    for n in names {
-        let kind = match n.as_str() {
-            "wal.log" | "delta.vocab" => FileKind::Append,
-            _ => FileKind::Immutable,
-        };
-        files.push(open(&format!("{generation}/{n}"), kind));
-    }
-    files.push(open("commits.bin", FileKind::Append));
-    for m in sparkles_backup::layout::ROOT_FILES {
-        if m != "commits.bin" && dir.join(m).exists() {
-            let bytes = std::fs::read(dir.join(m)).unwrap();
-            files.push(CapturedFile {
-                path: m.to_string(),
-                kind: FileKind::Meta,
-                len: bytes.len() as u64,
-                src: FileSource::Bytes(Arc::from(bytes)),
-            });
-        }
-    }
-    Source {
-        dataset_id,
-        commit,
-        generation,
-        index_format: sparkles::builder::FORMAT_VERSION,
-        files,
-        lock_hold: Duration::ZERO,
-        lease: LeaseGuard::none(),
-    }
+    Source::from_closed_dir(dir).unwrap()
 }
 
 pub fn memory_config(name: &str) -> RepoConfig {

@@ -653,7 +653,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs S1 (Source::from_closed_dir)"]
     async fn a_create_holds_one_shared_lock_and_honours_exclusive_ones() {
         use crate::{CreateOptions, Source};
         let dir = tempfile::tempdir().unwrap();

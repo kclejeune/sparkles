@@ -61,8 +61,9 @@ async fn first_backup() {
     assert_eq!(m.generation, "gen-0001");
     assert_eq!(m.repository_id, repo.id());
     assert_eq!(m.parent, None);
-    // every file's hash is that of its bytes on disk
-    for f in &m.files {
+    // every file's hash is that of its bytes on disk (prefixes.json is rendered from
+    // the store's prefixes, not read)
+    for f in m.files.iter().filter(|f| f.path != "prefixes.json") {
         let bytes = std::fs::read(db.join(&f.path)).unwrap();
         assert_eq!(f.size, bytes.len() as u64, "{}", f.path);
         assert_eq!(
@@ -132,7 +133,7 @@ async fn incremental_backup() {
         .collect();
     assert_eq!(names, ["b2", "b1"]);
     // the files hash to what is on disk now
-    for f in &m2.files {
+    for f in m2.files.iter().filter(|f| f.path != "prefixes.json") {
         let bytes = std::fs::read(db.join(&f.path)).unwrap();
         assert_eq!(
             f.sha256,

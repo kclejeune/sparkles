@@ -169,7 +169,6 @@ mod tests {
     /// A compaction while a backup uploads: the upload reads the leased generation, the
     /// backup restores to the captured commit, and the generation is collected after.
     #[test]
-    #[ignore = "needs the repository write and read paths"]
     fn a_backup_survives_a_compaction_during_its_upload() {
         use crate::{CreateOptions, OpenEnv, RepoConfig, Repository, RestoreOptions};
         let tmp = tempfile::tempdir().unwrap();

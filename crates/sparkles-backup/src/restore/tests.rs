@@ -653,7 +653,6 @@ fn swap_dir_rolls_back_when_the_second_rename_fails() {
 /// Backups of a live store, taken while another thread commits, restore to exactly
 /// their captured commits.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs S1 (Store::backup_capture)"]
 async fn backups_under_concurrent_writes_restore_to_their_commits() {
     use crate::{CreateOptions, Source};
     use sparkles::history::At;
