@@ -150,7 +150,7 @@ impl KeyFilter {
                 (Function::Contains | Function::StrStarts | Function::StrEnds, [a, n]) => {
                     let (needle, lang) = match n {
                         Expr::Lit(_, Value::Str(s)) => (s.clone(), None),
-                        Expr::Lit(_, Value::Lang(s, l)) => {
+                        Expr::Lit(_, Value::Lang(s, l) | Value::LangDir(s, l, _)) => {
                             (s.clone(), Some(l.clone()))
                         }
                         _ => return None,

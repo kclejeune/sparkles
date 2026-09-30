@@ -12,12 +12,12 @@ repository = "https://github.com/kclejeune/sparkles"
 sparkles = { path = "crates/sparkles" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
-oxrdf = { version = "0.3", features = ["rdfc-10"] }
-oxrdfio = "0.2"
-oxttl = "0.2"
+oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
+oxrdfio = { version = "0.2", features = ["rdf-12"] }
+oxttl = { version = "0.2", features = ["rdf-12"] }
 oxiri = "0.2"
-spargebra = "0.4"
-sparesults = "0.3"
+spargebra = { version = "0.4", features = ["sparql-12"] }
+sparesults = { version = "0.3", features = ["sparql-12"] }
 oxsdatatypes = "0.2"
 imbl = "7"
 arc-swap = "1"

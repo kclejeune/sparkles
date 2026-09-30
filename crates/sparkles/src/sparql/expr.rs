@@ -550,7 +550,8 @@ fn val_eq(x: Val, y: Val, ctx: &Ctx) -> EvalResult<bool> {
         }
         // IRIs / bnodes with different ids are different terms
         let (ka, kc) = (ctx.kind(a), ctx.kind(c));
-        if ka != TermKind::Literal || kc != TermKind::Literal {
+        let atomic = |k| matches!(k, TermKind::Iri | TermKind::BNode);
+        if atomic(ka) || atomic(kc) || ka != kc {
             return Ok(false);
         }
     }
@@ -729,7 +730,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             s(v.value(ctx)?.lexical()?)
         }
         F::Lang => match a0()?.into_owned() {
-            Value::Lang(_, l) => s(l),
+            Value::Lang(_, l) | Value::LangDir(_, l, _) => s(l),
             v if v.is_literal() => s(""),
             _ => return Err(TypeError),
         },
@@ -812,20 +813,31 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             Num::Double(d) => Value::Double(round_half_up_double(d.into()).into()),
         }),
         F::Concat => {
+            // the result keeps a language tag (and base direction) only if every
+            // argument has the same one
             let mut out = String::new();
-            let mut lang: Option<Option<Arc<str>>> = None;
+            type Tag = (Option<Arc<str>>, Option<oxrdf::BaseDirection>);
+            let mut tag: Option<Tag> = None;
             for i in 0..args.len() {
                 let v = arg(args, i, row, ctx)?;
                 let (st, l) = v.string_arg()?;
                 out.push_str(st);
-                let l: Option<Arc<str>> = l.map(Into::into);
-                lang = match lang {
-                    None => Some(l),
-                    Some(prev) if prev == l => Some(prev),
-                    Some(_) => Some(None),
+                let dir = match &*v {
+                    Value::LangDir(_, _, d) => Some(*d),
+                    _ => None,
+                };
+                let t: Tag = (l.map(Into::into), dir);
+                tag = match tag {
+                    None => Some(t),
+                    Some(prev) if prev == t => Some(prev),
+                    Some(_) => Some((None, None)),
                 };
             }
-            same_kind(lang.flatten().as_deref(), out)
+            match tag {
+                Some((Some(l), Some(d))) => Val::V(Value::LangDir(out.into(), l, d)),
+                Some((l, _)) => same_kind(l.as_deref(), out),
+                None => s(out),
+            }
         }
         F::SubStr => {
             let v = a0()?;
@@ -1030,6 +1042,80 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             b(compile_regex(p.as_str().ok_or(TypeError)?, &flags)?.is_match(st))
         }
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
+        // ---- SPARQL 1.2 -------------------------------------------------------------
+        F::Triple => {
+            let term = |i: usize| -> EvalResult<Term> {
+                let v = eval(&args[i], row, ctx)?;
+                match v.id() {
+                    Some(id) => ctx.term(id).ok_or(TypeError),
+                    None => Ok(v.value(ctx)?.to_term()),
+                }
+            };
+            let s = match term(0)? {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => return Err(TypeError),
+            };
+            let Term::NamedNode(p) = term(1)? else {
+                return Err(TypeError);
+            };
+            let o = term(2)?;
+            Val::V(Value::Triple(Arc::new(oxrdf::Triple::new(s, p, o))))
+        }
+        F::Subject | F::Predicate | F::Object => {
+            let v = eval(&args[0], row, ctx)?;
+            let t = match v.id() {
+                Some(id) => match ctx.term(id) {
+                    Some(Term::Triple(t)) => *t,
+                    _ => return Err(TypeError),
+                },
+                None => match v.value(ctx)? {
+                    Value::Triple(t) => (*t).clone(),
+                    _ => return Err(TypeError),
+                },
+            };
+            let c: Term = match f {
+                F::Subject => t.subject.into(),
+                F::Predicate => Term::NamedNode(t.predicate),
+                _ => t.object,
+            };
+            Val::Id(ctx.intern_term(&c))
+        }
+        F::IsTriple => {
+            let v = eval(&args[0], row, ctx)?;
+            b(match v.id() {
+                Some(id) => ctx.kind(id) == TermKind::Triple,
+                None => matches!(v.value(ctx)?, Value::Triple(_)),
+            })
+        }
+        F::LangDir => match &*a0()? {
+            Value::LangDir(_, _, d) => s(match d {
+                oxrdf::BaseDirection::Ltr => "ltr",
+                oxrdf::BaseDirection::Rtl => "rtl",
+            }),
+            v if v.is_literal() && !matches!(v, Value::Triple(_)) => s(""),
+            _ => return Err(TypeError),
+        },
+        F::HasLang => b(matches!(&*a0()?, Value::Lang(..) | Value::LangDir(..))),
+        F::HasLangDir => b(matches!(&*a0()?, Value::LangDir(..))),
+        F::StrLangDir => {
+            let (v, l, d) = (a0()?, a1()?, a2()?);
+            let st = v.as_str().ok_or(TypeError)?;
+            let l = l.as_str().ok_or(TypeError)?;
+            let dir = match d.as_str().ok_or(TypeError)? {
+                "ltr" => oxrdf::BaseDirection::Ltr,
+                "rtl" => oxrdf::BaseDirection::Rtl,
+                _ => return Err(TypeError),
+            };
+            if l.is_empty() {
+                return Err(TypeError);
+            }
+            Val::V(Value::LangDir(
+                st.into(),
+                l.to_ascii_lowercase().into(),
+                dir,
+            ))
+        }
         #[allow(unreachable_patterns)]
         _ => return Err(TypeError),
     })

@@ -8,3 +8,11 @@ syntax-sparql3/manifest#syn-bad-26
 # spargebra flattens `OPTIONAL { { P FILTER(e) } }` into a LeftJoin with expression `e`,
 # changing the filter's scope
 optional-filter/manifest#dawg-optional-filter-005-not-simplified
+
+# spargebra parser (SPARQL 1.2 suite):
+# rejects a valid query reusing a variable in SELECT expressions
+sparql12/grouping/manifest#select-variable-reuse
+# accepts triple terms in subject position / nested aggregates
+sparql12/syntax-triple-terms-negative/manifest#tripleterm-subject-03
+sparql12/syntax-triple-terms-negative/manifest#tripleterm-subject-06
+sparql12/syntax/manifest#nested-aggregate-functions

@@ -158,11 +158,29 @@ pub fn term_json(t: &Term) -> J {
             o.insert("value".into(), l.value().into());
             if let Some(lang) = l.language() {
                 o.insert("xml:lang".into(), lang.into());
+                if let Some(d) = l.direction() {
+                    o.insert(
+                        "its:dir".into(),
+                        match d {
+                            oxrdf::BaseDirection::Ltr => "ltr",
+                            oxrdf::BaseDirection::Rtl => "rtl",
+                        }
+                        .into(),
+                    );
+                }
             } else if l.datatype() != oxrdf::vocab::xsd::STRING {
                 o.insert("datatype".into(), l.datatype().as_str().into());
             }
             J::Object(o)
         }
+        Term::Triple(t) => json!({
+            "type": "triple",
+            "value": {
+                "subject": term_json(&t.subject.clone().into()),
+                "predicate": term_json(&Term::NamedNode(t.predicate.clone())),
+                "object": term_json(&t.object),
+            }
+        }),
     }
 }
 

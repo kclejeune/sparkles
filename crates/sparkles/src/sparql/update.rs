@@ -65,13 +65,6 @@ pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats
     Ok(stats)
 }
 
-fn graph_id(txn: &mut WriteTxn<'_>, g: &GraphName) -> Result<Id> {
-    Ok(match g {
-        GraphName::DefaultGraph => Id::DEFAULT_GRAPH,
-        GraphName::NamedNode(n) => txn.intern(&Term::NamedNode(n.clone()))?,
-    })
-}
-
 fn run_op(
     txn: &mut WriteTxn<'_>,
     op: &GraphUpdateOperation,
@@ -81,21 +74,19 @@ fn run_op(
 ) -> Result<()> {
     match op {
         GraphUpdateOperation::InsertData { data } => {
-            let mut bnodes: FxHashMap<String, Id> = FxHashMap::default();
+            let mut labels = std::collections::HashMap::new();
             for q in data {
-                let s = match &q.subject {
-                    oxrdf::NamedOrBlankNode::NamedNode(n) => {
-                        txn.intern(&Term::NamedNode(n.clone()))?
-                    }
-                    oxrdf::NamedOrBlankNode::BlankNode(b) => bnode(txn, &mut bnodes, b),
-                };
-                let p = txn.intern(&Term::NamedNode(q.predicate.clone()))?;
-                let o = match &q.object {
-                    Term::BlankNode(b) => bnode(txn, &mut bnodes, b),
-                    t => txn.intern(t)?,
-                };
-                let g = graph_id(txn, &q.graph_name)?;
-                if txn.insert([s, p, o, g])? {
+                let quad = oxrdf::Quad::new(
+                    q.subject.clone(),
+                    q.predicate.clone(),
+                    q.object.clone(),
+                    match &q.graph_name {
+                        GraphName::DefaultGraph => oxrdf::GraphName::DefaultGraph,
+                        GraphName::NamedNode(n) => oxrdf::GraphName::NamedNode(n.clone()),
+                    },
+                );
+                let ids = txn.encode_quad(&quad, &mut labels)?;
+                if txn.insert(ids)? {
                     stats.inserted += 1;
                 }
             }
@@ -108,8 +99,7 @@ fn run_op(
                 let o = match &q.object {
                     GroundTerm::NamedNode(n) => view.lookup_term(&Term::NamedNode(n.clone())),
                     GroundTerm::Literal(l) => view.lookup_term(&Term::Literal(l.clone())),
-                    #[allow(unreachable_patterns)]
-                    _ => None,
+                    t @ GroundTerm::Triple(_) => view.lookup_term(&super::plan::ground_term(t)),
                 };
                 let g = match &q.graph_name {
                     GraphName::DefaultGraph => Some(Id::DEFAULT_GRAPH),
@@ -177,8 +167,16 @@ fn run_op(
                             GroundTermPattern::Literal(l) => {
                                 ctx.snap.lookup_term(&Term::Literal(l.clone()))
                             }
-                            #[allow(unreachable_patterns)]
-                            _ => None,
+                            GroundTermPattern::Triple(tp) => {
+                                // a ground triple pattern is a template without blank nodes
+                                let pat = ground_pattern_to_term_pattern(tp);
+                                let term = super::instantiate(
+                                    &pat,
+                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut |_| Term::BlankNode(oxrdf::BlankNode::default()),
+                                )?;
+                                ctx.snap.lookup_term(&term)
+                            }
                         }
                     };
                     let s = gt(&q.subject);
@@ -202,8 +200,27 @@ fn run_op(
                                 Some(txn.intern(&Term::NamedNode(n.clone()))?)
                             }
                             TermPattern::Literal(l) => Some(txn.intern(&Term::Literal(l.clone()))?),
-                            #[allow(unreachable_patterns)]
-                            _ => None,
+                            t @ TermPattern::Triple(_) => {
+                                let mut bn = |b: &str| {
+                                    let id = match bnodes.get(b) {
+                                        Some(id) => *id,
+                                        None => {
+                                            let id = txn.new_bnode();
+                                            bnodes.insert(b.to_string(), id);
+                                            id
+                                        }
+                                    };
+                                    Term::BlankNode(crate::store::bnode_for(id))
+                                };
+                                match super::instantiate(
+                                    t,
+                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut bn,
+                                ) {
+                                    Some(term) => Some(txn.intern(&term)?),
+                                    None => None,
+                                }
+                            }
                         })
                     };
                     let s = tp(txn, &q.subject)?;
@@ -288,6 +305,20 @@ fn run_op(
     }
     let _ = store;
     Ok(())
+}
+
+fn ground_pattern_to_term_pattern(tp: &spargebra::term::GroundTriplePattern) -> TermPattern {
+    let conv = |t: &GroundTermPattern| match t {
+        GroundTermPattern::NamedNode(n) => TermPattern::NamedNode(n.clone()),
+        GroundTermPattern::Literal(l) => TermPattern::Literal(l.clone()),
+        GroundTermPattern::Variable(v) => TermPattern::Variable(v.clone()),
+        GroundTermPattern::Triple(t) => ground_pattern_to_term_pattern(t),
+    };
+    TermPattern::Triple(Box::new(spargebra::term::TriplePattern {
+        subject: conv(&tp.subject),
+        predicate: tp.predicate.clone(),
+        object: conv(&tp.object),
+    }))
 }
 
 fn named_pat(

@@ -236,27 +236,36 @@ impl Ctx {
             }
             Tag::BNode => TermKind::BNode,
             Tag::Vocab => {
-                if self.snap.generation.vocab.is_iri(id.payload()) {
+                let v = &self.snap.generation.vocab;
+                if v.is_iri(id.payload()) {
                     TermKind::Iri
+                } else if v.is_triple(id.payload()) {
+                    TermKind::Triple
                 } else {
                     TermKind::Literal
                 }
             }
-            Tag::Delta => match self.snap.key(id) {
-                Some(k) if id::is_key_iri(&k) => TermKind::Iri,
-                Some(_) => TermKind::Literal,
-                None => TermKind::None,
-            },
-            Tag::Local => match self.local.read().get(id.payload()) {
-                Some(k) if id::is_key_iri(k) => TermKind::Iri,
-                Some(_) => TermKind::Literal,
-                None => TermKind::None,
-            },
+            Tag::Delta => self.snap.key(id).map_or(TermKind::None, |k| key_kind(&k)),
+            Tag::Local => self
+                .local
+                .read()
+                .get(id.payload())
+                .map_or(TermKind::None, key_kind),
         }
     }
 
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
+    }
+}
+
+fn key_kind(k: &[u8]) -> TermKind {
+    if id::is_key_iri(k) {
+        TermKind::Iri
+    } else if id::is_key_triple(k) {
+        TermKind::Triple
+    } else {
+        TermKind::Literal
     }
 }
 
@@ -266,4 +275,6 @@ pub enum TermKind {
     Iri,
     BNode,
     Literal,
+    /// RDF 1.2 triple term
+    Triple,
 }

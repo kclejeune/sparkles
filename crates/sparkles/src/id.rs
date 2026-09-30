@@ -388,7 +388,34 @@ pub fn term_key(term: &Term) -> Vec<u8> {
     out
 }
 
+/// Blank node → id used inside triple-term keys when no store scope is available:
+/// labels minted by the store (`b<hex>`) map back to their id, other labels hash.
+pub fn default_bnode_id(b: &BlankNode) -> u64 {
+    if let Some(id) = b
+        .as_str()
+        .strip_prefix('b')
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+    {
+        return id & PAYLOAD_MASK;
+    }
+    let h = b.as_str().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, c| {
+        (h ^ c as u64).wrapping_mul(0x100_0000_01b3)
+    });
+    (h & (PAYLOAD_MASK >> 1)) | Id::LOCAL_BNODE_BIT
+}
+
 pub fn write_term_key(term: &Term, out: &mut Vec<u8>) {
+    write_term_key_with(term, out, &mut default_bnode_id)
+}
+
+/// Write the vocabulary key of a term. Triple terms (RDF 1.2) are encoded as
+/// `'(' (varint len, key){3}` with blank nodes inside them as `'_' u64-be id`, so the
+/// key of a triple term is canonical for the store's blank node identities.
+pub fn write_term_key_with(
+    term: &Term,
+    out: &mut Vec<u8>,
+    bnode: &mut dyn FnMut(&BlankNode) -> u64,
+) {
     match term {
         Term::NamedNode(n) => {
             out.push(b'<');
@@ -396,10 +423,20 @@ pub fn write_term_key(term: &Term, out: &mut Vec<u8>) {
         }
         Term::Literal(l) => write_literal_key(l, out),
         Term::BlankNode(b) => {
-            // Blank nodes are normally mapped to BNode ids; this path is only used for
-            // hashing/diagnostics.
-            out.extend_from_slice(b"_:");
-            out.extend_from_slice(b.as_str().as_bytes());
+            out.push(b'_');
+            out.extend_from_slice(&bnode(b).to_be_bytes());
+        }
+        Term::Triple(t) => {
+            out.push(b'(');
+            let mut part = Vec::new();
+            let subject: Term = t.subject.clone().into();
+            let predicate: Term = t.predicate.clone().into();
+            for c in [&subject, &predicate, &t.object] {
+                part.clear();
+                write_term_key_with(c, &mut part, bnode);
+                crate::vocab::write_varint(out, part.len() as u64);
+                out.extend_from_slice(&part);
+            }
         }
     }
 }
@@ -411,6 +448,12 @@ pub fn write_literal_key(l: &Literal, out: &mut Vec<u8>) {
     if let Some(lang) = l.language() {
         out.push(b'@');
         out.extend_from_slice(lang.as_bytes());
+        if let Some(dir) = l.direction() {
+            out.extend_from_slice(match dir {
+                oxrdf::BaseDirection::Ltr => b"--ltr",
+                oxrdf::BaseDirection::Rtl => b"--rtl",
+            });
+        }
     } else if l.datatype() != xsd::STRING {
         out.push(b'^');
         out.extend_from_slice(l.datatype().as_str().as_bytes());
@@ -424,6 +467,23 @@ pub fn iri_key(iri: &str) -> Vec<u8> {
     out
 }
 
+/// Language tag plus optional base direction from a key suffix (`en` / `en--ltr`).
+fn lang_literal(lex: String, tag: &str) -> Literal {
+    match tag.rsplit_once("--") {
+        Some((lang, "ltr")) => Literal::new_directional_language_tagged_literal_unchecked(
+            lex,
+            lang,
+            oxrdf::BaseDirection::Ltr,
+        ),
+        Some((lang, "rtl")) => Literal::new_directional_language_tagged_literal_unchecked(
+            lex,
+            lang,
+            oxrdf::BaseDirection::Rtl,
+        ),
+        _ => Literal::new_language_tagged_literal_unchecked(lex, tag),
+    }
+}
+
 /// Parse a vocabulary key back into a term.
 pub fn key_to_term(key: &[u8]) -> Term {
     match key.first() {
@@ -434,17 +494,38 @@ pub fn key_to_term(key: &[u8]) -> Term {
             let suffix = key.get(sep + 1..).unwrap_or(&[]);
             match suffix.first() {
                 None => Term::Literal(Literal::new_simple_literal(lex)),
-                Some(b'@') => Term::Literal(Literal::new_language_tagged_literal_unchecked(
-                    lex,
-                    utf8(&suffix[1..]),
-                )),
+                Some(b'@') => Term::Literal(lang_literal(lex, &utf8(&suffix[1..]))),
                 Some(_) => Term::Literal(Literal::new_typed_literal(
                     lex,
                     NamedNode::new_unchecked(utf8(&suffix[1..])),
                 )),
             }
         }
-        Some(b'_') => Term::BlankNode(BlankNode::new_unchecked(utf8(&key[2..]))),
+        Some(b'_') if key.len() == 9 => {
+            let id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+            Term::BlankNode(BlankNode::new_unchecked(format!("b{id:x}")))
+        }
+        Some(b'(') => {
+            let mut pos = 1;
+            let mut comps = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let len = crate::vocab::read_varint(key, &mut pos) as usize;
+                comps.push(key_to_term(&key[pos..pos + len]));
+                pos += len;
+            }
+            let o = comps.pop().unwrap();
+            let p = comps.pop().unwrap();
+            let s = comps.pop().unwrap();
+            let subject = match s {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => oxrdf::NamedOrBlankNode::BlankNode(BlankNode::new_unchecked("invalid")),
+            };
+            let Term::NamedNode(p) = p else {
+                return Term::NamedNode(NamedNode::new_unchecked("urn:x-sparkles:invalid"));
+            };
+            Term::Triple(Box::new(oxrdf::Triple::new(subject, p, o)))
+        }
         _ => Term::NamedNode(NamedNode::new_unchecked(utf8(key))),
     }
 }
@@ -456,6 +537,10 @@ fn utf8(b: &[u8]) -> String {
 
 /// Canonicalize a numeric/boolean literal term: used when *computing* values so that
 /// results produced by expressions get the canonical (inline-able) form.
+pub fn is_key_triple(key: &[u8]) -> bool {
+    key.first() == Some(&b'(')
+}
+
 pub fn is_key_iri(key: &[u8]) -> bool {
     key.first() == Some(&b'<')
 }
@@ -516,6 +601,30 @@ mod tests {
         let a = inline_literal("2020-01-01T00:00:00Z", xsd::DATE_TIME.as_str()).unwrap();
         let b = inline_literal("2020-01-02T00:00:00Z", xsd::DATE_TIME.as_str()).unwrap();
         assert!(a < b);
+    }
+
+    #[test]
+    fn rdf12_keys() {
+        let t = Term::Triple(Box::new(oxrdf::Triple::new(
+            BlankNode::new_unchecked("b2a"),
+            NamedNode::new_unchecked("http://ex.org/p"),
+            Term::Triple(Box::new(oxrdf::Triple::new(
+                NamedNode::new_unchecked("http://ex.org/s"),
+                NamedNode::new_unchecked("http://ex.org/q"),
+                Literal::new_directional_language_tagged_literal_unchecked(
+                    "hi",
+                    "en",
+                    oxrdf::BaseDirection::Rtl,
+                ),
+            ))),
+        )));
+        let k = term_key(&t);
+        assert!(is_key_triple(&k));
+        assert_eq!(key_to_term(&k), t);
+        // literals < triple terms < IRIs in key order
+        let lit = term_key(&Term::Literal(Literal::new_simple_literal("zzz")));
+        let iri = term_key(&Term::NamedNode(NamedNode::new_unchecked("a:b")));
+        assert!(lit < k && k < iri);
     }
 
     #[test]

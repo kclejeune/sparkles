@@ -167,6 +167,83 @@ fn initial_bindings() {
 }
 
 #[test]
+fn rdf12_triple_terms() {
+    let data = r#"
+        PREFIX : <http://ex.org/>
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        :alice :says <<( :bob :age 42 )>> .
+        _:r rdf:reifies <<( :bob :knows _:x )>> ; :source :census .
+        _:x :name "X" .
+        :t :label "hello"@en--rtl .
+    "#;
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = if persistent {
+            Store::open(dir.path(), StoreOptions::default()).unwrap()
+        } else {
+            Store::in_memory(StoreOptions::default())
+        };
+        s.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        // triple pattern with variables inside a triple term
+        let r = q(
+            &s,
+            "SELECT ?s ?o WHERE { ex:alice ex:says <<( ?s ex:age ?o )>> }",
+        );
+        assert_eq!(strs(&r), ["bob 42"]);
+        // constant triple term
+        assert!(q(&s, "ASK { ex:alice ex:says <<( ex:bob ex:age 42 )>> }").boolean);
+        // reification syntax, blank node inside the triple term joined with data
+        let r = q(
+            &s,
+            "SELECT ?src ?n WHERE { << ex:bob ex:knows ?x >> ex:source ?src . ?x ex:name ?n }",
+        );
+        assert_eq!(strs(&r), ["census X"]);
+        // functions
+        let r = q(
+            &s,
+            "SELECT ?p (isTRIPLE(?t) AS ?is) WHERE { ex:alice ex:says ?t BIND(PREDICATE(?t) AS ?p) }",
+        );
+        assert_eq!(strs(&r), ["age true"]);
+        let r = q(
+            &s,
+            "SELECT (LANGDIR(?l) AS ?d) (hasLANGDIR(?l) AS ?h) WHERE { ex:t ex:label ?l }",
+        );
+        assert_eq!(strs(&r), ["rtl true"]);
+        let r = q(&s, "SELECT ?t WHERE { BIND(TRIPLE(ex:a, ex:b, 1) AS ?t) }");
+        assert_eq!(r.table.len(), 1);
+        // updates with triple terms
+        update::update(
+            &s,
+            "PREFIX : <http://ex.org/> INSERT DATA { :carol :says <<( :bob :age 43 )>> }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let r = q(
+            &s,
+            "SELECT ?who WHERE { ?who ex:says <<( ex:bob ex:age ?a )>> FILTER(?a > 42) }",
+        );
+        assert_eq!(strs(&r), ["carol"]);
+        update::update(
+            &s,
+            "PREFIX : <http://ex.org/> DELETE DATA { :carol :says <<( :bob :age 43 )>> }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert!(!q(&s, "ASK { ?who ex:says <<( ex:bob ex:age 43 )>> }").boolean);
+        let r = q(
+            &s,
+            "CONSTRUCT { ?s ex:claimed <<( ?s ex:said ?t )>> } WHERE { ?s ex:says ?t }",
+        );
+        assert_eq!(r.triples.len(), 1);
+    }
+}
+
+#[test]
 fn bgp_join() {
     let s = store();
     let r = q(

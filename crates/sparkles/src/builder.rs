@@ -507,6 +507,15 @@ impl Encoder<'_> {
                 r
             }
             Term::NamedNode(n) => self.iri(n.as_str()),
+            Term::Triple(_) => {
+                let mut kb = std::mem::take(&mut self.keybuf);
+                kb.clear();
+                let (scope, next) = (self.scope.clone(), &self.b.next_bnode);
+                id::write_term_key_with(t, &mut kb, &mut |b| scope.get(b.as_str(), next));
+                let r = self.local(&kb);
+                self.keybuf = kb;
+                r
+            }
         }
     }
 

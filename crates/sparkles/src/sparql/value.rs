@@ -15,6 +15,10 @@ pub enum Value {
     /// simple literal or xsd:string
     Str(Arc<str>),
     Lang(Arc<str>, Arc<str>),
+    /// RDF 1.2 directional language-tagged string (`rdf:dirLangString`)
+    LangDir(Arc<str>, Arc<str>, oxrdf::BaseDirection),
+    /// RDF 1.2 triple term
+    Triple(Arc<oxrdf::Triple>),
     Bool(bool),
     Integer(Integer),
     Decimal(Decimal),
@@ -60,12 +64,16 @@ impl Value {
             Term::NamedNode(n) => Value::Iri(n.as_str().into()),
             Term::BlankNode(b) => Value::BNode(b.as_str().into()),
             Term::Literal(l) => Value::from_literal(l),
+            Term::Triple(t) => Value::Triple(Arc::new((**t).clone())),
         }
     }
 
     pub fn from_literal(l: &Literal) -> Value {
         match l.language() {
-            Some(lang) => Value::Lang(l.value().into(), lang.into()),
+            Some(lang) => match l.direction() {
+                Some(d) => Value::LangDir(l.value().into(), lang.into(), d),
+                None => Value::Lang(l.value().into(), lang.into()),
+            },
             None => Value::from_typed(l.value(), l.datatype().as_str()),
         }
     }
@@ -87,7 +95,18 @@ impl Value {
                 let suffix = key.get(sep + 1..).unwrap_or(&[]);
                 match suffix.first() {
                     None => Value::Str(lex.into()),
-                    Some(b'@') => Value::Lang(lex.into(), s(&suffix[1..]).into()),
+                    Some(b'@') => {
+                        let tag = s(&suffix[1..]);
+                        match tag.rsplit_once("--") {
+                            Some((l, "ltr")) => {
+                                Value::LangDir(lex.into(), l.into(), oxrdf::BaseDirection::Ltr)
+                            }
+                            Some((l, "rtl")) => {
+                                Value::LangDir(lex.into(), l.into(), oxrdf::BaseDirection::Rtl)
+                            }
+                            _ => Value::Lang(lex.into(), tag.into()),
+                        }
+                    }
                     Some(_) => Value::from_typed(&lex, &s(&suffix[1..])),
                 }
             }
@@ -136,6 +155,10 @@ impl Value {
             Value::Iri(i) => Term::NamedNode(NamedNode::new_unchecked(&**i)),
             Value::BNode(b) => Term::BlankNode(oxrdf::BlankNode::new_unchecked(&**b)),
             Value::Str(s) => Term::Literal(Literal::new_simple_literal(&**s)),
+            Value::LangDir(s, l, d) => Term::Literal(
+                Literal::new_directional_language_tagged_literal_unchecked(&**s, &**l, *d),
+            ),
+            Value::Triple(t) => Term::Triple(Box::new((**t).clone())),
             Value::Lang(s, l) => {
                 Term::Literal(Literal::new_language_tagged_literal_unchecked(&**s, &**l))
             }
@@ -155,7 +178,7 @@ impl Value {
     }
 
     pub fn is_literal(&self) -> bool {
-        !matches!(self, Value::Iri(_) | Value::BNode(_))
+        !matches!(self, Value::Iri(_) | Value::BNode(_) | Value::Triple(_))
     }
     pub fn is_numeric(&self) -> bool {
         matches!(
@@ -174,7 +197,7 @@ impl Value {
     pub fn string_arg(&self) -> EvalResult<(&str, Option<&str>)> {
         match self {
             Value::Str(s) => Ok((s, None)),
-            Value::Lang(s, l) => Ok((s, Some(l))),
+            Value::Lang(s, l) | Value::LangDir(s, l, _) => Ok((s, Some(l))),
             _ => Err(TypeError),
         }
     }
@@ -183,7 +206,8 @@ impl Value {
         Ok(match self {
             Value::Iri(i) => i.clone(),
             Value::BNode(_) => return Err(TypeError),
-            Value::Str(s) | Value::Lang(s, _) => s.clone(),
+            Value::Str(s) | Value::Lang(s, _) | Value::LangDir(s, _, _) => s.clone(),
+            Value::Triple(_) => return Err(TypeError),
             Value::Other { lex, .. } => lex.clone(),
             v => match v.to_term() {
                 Term::Literal(l) => l.value().into(),
@@ -197,6 +221,8 @@ impl Value {
             Value::Iri(_) | Value::BNode(_) => return Err(TypeError),
             Value::Str(_) => xsd::STRING.into(),
             Value::Lang(..) => rdf::LANG_STRING.into(),
+            Value::LangDir(..) => rdf::DIR_LANG_STRING.into(),
+            Value::Triple(_) => return Err(TypeError),
             Value::Other { dt, .. } => NamedNode::new_unchecked(&**dt),
             v => match v.to_term() {
                 Term::Literal(l) => l.datatype().into_owned(),
@@ -214,20 +240,8 @@ impl Value {
             Value::Decimal(d) => Ok(*d != Decimal::from(0)),
             Value::Float(f) => Ok(!(f32::from(*f) == 0.0 || f.is_nan())),
             Value::Double(d) => Ok(!(f64::from(*d) == 0.0 || d.is_nan())),
-            Value::Other { dt, .. } => {
-                // ill-typed boolean / numeric literals have EBV false
-                if &**dt == xsd::BOOLEAN.as_str()
-                    || &**dt == xsd::INTEGER.as_str()
-                    || &**dt == xsd::DECIMAL.as_str()
-                    || &**dt == xsd::DOUBLE.as_str()
-                    || &**dt == xsd::FLOAT.as_str()
-                    || INTEGER_DERIVED.contains(&&**dt)
-                {
-                    Ok(false)
-                } else {
-                    Err(TypeError)
-                }
-            }
+            // SPARQL 1.2 (§17.2.2): ill-typed boolean / numeric literals have no
+            // effective boolean value (SPARQL 1.1 said `false`)
             _ => Err(TypeError),
         }
     }
@@ -379,6 +393,9 @@ pub fn compare(a: &Value, b: &Value) -> EvalResult<Option<Ordering>> {
         _ if a.is_numeric() && b.is_numeric() => num_cmp(Num::of(a)?, Num::of(b)?),
         (Str(x), Str(y)) => Some(x.cmp(y)),
         (Lang(x, lx), Lang(y, ly)) if lx.eq_ignore_ascii_case(ly) => Some(x.cmp(y)),
+        (LangDir(x, lx, dx), LangDir(y, ly, dy)) if lx.eq_ignore_ascii_case(ly) && dx == dy => {
+            Some(x.cmp(y))
+        }
         (Bool(x), Bool(y)) => Some(x.cmp(y)),
         (DateTime(x), DateTime(y)) => x.partial_cmp(y),
         (Date(x), Date(y)) => x.partial_cmp(y),
@@ -413,6 +430,12 @@ pub fn equals(a: &Value, b: &Value) -> EvalResult<bool> {
         }
         (Str(x), Str(y)) => x == y,
         (Lang(x, lx), Lang(y, ly)) => x == y && lx.eq_ignore_ascii_case(ly),
+        (LangDir(x, lx, dx), LangDir(y, ly, dy)) => {
+            x == y && lx.eq_ignore_ascii_case(ly) && dx == dy
+        }
+        (Triple(x), Triple(y)) => triple_equals(x, y)?,
+        (Triple(_), _) | (_, Triple(_)) => false,
+        (LangDir(..), _) | (_, LangDir(..)) => false,
         (Bool(x), Bool(y)) => x == y,
         (Str(_), Lang(..)) | (Lang(..), Str(_)) => false,
         (Lang(..), _) | (_, Lang(..)) => false,
@@ -444,6 +467,17 @@ pub fn equals(a: &Value, b: &Value) -> EvalResult<bool> {
     })
 }
 
+/// RDFterm-equal for triple terms: component-wise, literals by value (errors propagate).
+fn triple_equals(x: &oxrdf::Triple, y: &oxrdf::Triple) -> EvalResult<bool> {
+    if x == y {
+        return Ok(true);
+    }
+    if x.subject != y.subject || x.predicate != y.predicate {
+        return Ok(false);
+    }
+    equals(&Value::from_term(&x.object), &Value::from_term(&y.object))
+}
+
 /// Total order for ORDER BY (SPARQL 15.1 + ARQ's fallback ordering):
 /// unbound < blank nodes < IRIs < literals; comparable literals by value, the rest by
 /// (kind, lexical form, datatype/lang).
@@ -458,6 +492,7 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         match v {
             Value::BNode(_) => 0,
             Value::Iri(_) => 1,
+            Value::Triple(_) => 3,
             _ => 2,
         }
     }
@@ -467,6 +502,24 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     }
     match (a, b) {
         (Value::BNode(x), Value::BNode(y)) | (Value::Iri(x), Value::Iri(y)) => return x.cmp(y),
+        (Value::Triple(x), Value::Triple(y)) => {
+            // component-wise (subject, predicate, object) in term order
+            let c = |t: &oxrdf::Triple| {
+                [
+                    Value::from_term(&t.subject.clone().into()),
+                    Value::from_term(&t.predicate.clone().into()),
+                    Value::from_term(&t.object),
+                ]
+            };
+            let (cx, cy) = (c(x), c(y));
+            for (p, q) in cx.iter().zip(cy.iter()) {
+                let o = order_cmp(Some(p), Some(q));
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            return Ordering::Equal;
+        }
         _ => {}
     }
     if let Ok(Some(o)) = compare(a, b)
@@ -542,7 +595,8 @@ mod tests {
     fn ebv() {
         assert!(!lit("0", xsd::INTEGER).ebv().unwrap());
         assert!(lit("abc", xsd::STRING).ebv().unwrap());
-        assert!(!lit("abc", xsd::INTEGER).ebv().unwrap());
+        // SPARQL 1.2: ill-typed numeric literals have no EBV
+        assert!(lit("abc", xsd::INTEGER).ebv().is_err());
         assert!(Value::Iri("http://x".into()).ebv().is_err());
     }
 

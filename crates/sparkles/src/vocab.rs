@@ -69,8 +69,10 @@ pub struct Vocab {
     data: Bytes,
     offsets: Bytes,
     len: u64,
-    /// id of the first IRI key: literal keys (`"…`) sort before IRI keys (`<…`)
+    /// id of the first IRI key: literal keys (`"…`) sort before triple-term keys (`(…`),
+    /// which sort before IRI keys (`<…`)
     first_iri: u64,
+    first_triple: u64,
 }
 
 impl Vocab {
@@ -80,6 +82,7 @@ impl Vocab {
             offsets: Bytes::Vec(Vec::new()),
             len: 0,
             first_iri: 0,
+            first_triple: 0,
         }
     }
 
@@ -97,8 +100,12 @@ impl Vocab {
             offsets,
             len,
             first_iri: 0,
+            first_triple: 0,
         };
         v.first_iri = match v.find(b"<") {
+            Ok(i) | Err(i) => i,
+        };
+        v.first_triple = match v.find(b"(") {
             Ok(i) | Err(i) => i,
         };
         Ok(v)
@@ -112,6 +119,11 @@ impl Vocab {
     #[inline]
     pub fn is_iri(&self, id: u64) -> bool {
         id >= self.first_iri
+    }
+    /// Is base id `id` an RDF 1.2 triple term?
+    #[inline]
+    pub fn is_triple(&self, id: u64) -> bool {
+        id >= self.first_triple && id < self.first_iri
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0

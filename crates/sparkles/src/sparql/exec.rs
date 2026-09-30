@@ -159,6 +159,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
+        Kind::Unpack { t, parts } => {
+            let input = child(0, &mut infos)?;
+            unpack(ctx, input, *t, parts, &n.vars)?
+        }
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
@@ -675,6 +679,59 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
         }
     }
     Ok(join_pairs(ctx, l, r, &lay, merge)?.len() as u64)
+}
+
+/// Decompose RDF 1.2 triple terms: rows whose `t` is not a triple term, or whose
+/// components do not match the constants / already bound variables, are dropped.
+fn unpack(
+    ctx: &Ctx,
+    input: Table,
+    t: VarId,
+    parts: &[PathEnd; 3],
+    vars: &[VarId],
+) -> Result<Table> {
+    let tc = input.col_of(t);
+    let mut out = Table::new(vars.to_vec());
+    let map: Vec<Option<usize>> = vars.iter().map(|v| input.col_of(*v)).collect();
+    let mut row = vec![Id::UNDEF; vars.len()];
+    for i in 0..input.len() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        let Some(tc) = tc else { break };
+        let Some(oxrdf::Term::Triple(tr)) = ctx.term(input.cols[tc][i]) else {
+            continue;
+        };
+        let comps = [
+            ctx.intern_term(&tr.subject.clone().into()),
+            ctx.intern_term(&oxrdf::Term::NamedNode(tr.predicate.clone())),
+            ctx.intern_term(&tr.object),
+        ];
+        for (j, m) in map.iter().enumerate() {
+            row[j] = m.map_or(Id::UNDEF, |c| input.cols[c][i]);
+        }
+        let mut ok = true;
+        for (p, c) in parts.iter().zip(comps) {
+            match p {
+                PathEnd::Const(k) => ok &= *k == c,
+                PathEnd::Var(v) => {
+                    let j = vars.iter().position(|x| x == v).unwrap();
+                    if row[j].is_undef() {
+                        row[j] = c;
+                    } else {
+                        ok &= row[j] == c;
+                    }
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        if ok {
+            out.push_row(&row);
+        }
+    }
+    Ok(out)
 }
 
 fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {

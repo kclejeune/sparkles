@@ -945,6 +945,41 @@ impl WriteTxn<'_> {
         self.intern_key(&id::term_key(t))
     }
 
+    /// Intern a term whose blank nodes (including those inside RDF 1.2 triple terms) are
+    /// scoped by `labels`: unseen labels get fresh blank node ids.
+    pub fn intern_scoped(
+        &mut self,
+        t: &Term,
+        labels: &mut std::collections::HashMap<String, Id>,
+    ) -> Result<Id> {
+        match t {
+            Term::BlankNode(b) => {
+                if let Some(&id) = labels.get(b.as_str()) {
+                    return Ok(id);
+                }
+                let id = self.new_bnode();
+                labels.insert(b.as_str().to_string(), id);
+                Ok(id)
+            }
+            Term::Triple(_) => {
+                let mut next = self.guard.next_bnode;
+                let mut key = Vec::new();
+                id::write_term_key_with(t, &mut key, &mut |b| {
+                    if let Some(id) = labels.get(b.as_str()) {
+                        return id.payload();
+                    }
+                    let id = Id::bnode(next);
+                    next += 1;
+                    labels.insert(b.as_str().to_string(), id);
+                    id.payload()
+                });
+                self.guard.next_bnode = next;
+                self.intern_key(&key)
+            }
+            t => self.intern(t),
+        }
+    }
+
     pub fn intern_key(&mut self, key: &[u8]) -> Result<Id> {
         if let Ok(i) = self.base.generation.vocab.find(key) {
             return Ok(Id::vocab(i));
@@ -964,27 +999,21 @@ impl WriteTxn<'_> {
         q: &Quad,
         labels: &mut std::collections::HashMap<String, Id>,
     ) -> Result<[Id; 4]> {
-        let mut bn = |this: &mut Self, b: &BlankNode| -> Id {
-            if let Some(&id) = labels.get(b.as_str()) {
-                return id;
-            }
-            let id = this.new_bnode();
-            labels.insert(b.as_str().to_string(), id);
-            id
-        };
         let s = match &q.subject {
             NamedOrBlankNode::NamedNode(n) => self.intern_key(&id::iri_key(n.as_str()))?,
-            NamedOrBlankNode::BlankNode(b) => bn(self, b),
+            NamedOrBlankNode::BlankNode(b) => {
+                self.intern_scoped(&Term::BlankNode(b.clone()), labels)?
+            }
         };
         let p = self.intern_key(&id::iri_key(q.predicate.as_str()))?;
         let o = match &q.object {
-            Term::BlankNode(b) => bn(self, b),
+            t @ (Term::BlankNode(_) | Term::Triple(_)) => self.intern_scoped(t, labels)?,
             t => self.intern(t)?,
         };
         let g = match &q.graph_name {
             GraphName::DefaultGraph => Id::DEFAULT_GRAPH,
             GraphName::NamedNode(n) => self.intern_key(&id::iri_key(n.as_str()))?,
-            GraphName::BlankNode(b) => bn(self, b),
+            GraphName::BlankNode(b) => self.intern_scoped(&Term::BlankNode(b.clone()), labels)?,
         };
         Ok([s, p, o, g])
     }

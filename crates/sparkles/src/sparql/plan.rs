@@ -171,6 +171,11 @@ pub enum Kind {
         spec: ScanSpec,
         var: VarId,
     },
+    /// decompose the triple term in `t` into `parts` (RDF 1.2)
+    Unpack {
+        t: VarId,
+        parts: [PathEnd; 3],
+    },
     /// transitive / optional path; child 0 = edges plan (unless simple);
     /// if `bound_from_left`, the last child is the input binding the start variable
     Path {
@@ -282,6 +287,7 @@ impl Node {
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
             Kind::CountJoin { .. } => "CountJoin",
+            Kind::Unpack { .. } => "TripleTerm",
             Kind::Path { .. } => "TransitivePath",
             Kind::Service { .. } => "Service",
         }
@@ -304,6 +310,7 @@ struct Triple {
 // a Node is much larger than a triple pattern, but items are short-lived and few
 #[allow(clippy::large_enum_variant)]
 enum Item {
+    Unpack(UnpackItem),
     Triple(Triple),
     Path(PathItem),
     Node(Node),
@@ -324,6 +331,16 @@ pub struct Planner<'a> {
     pub ctx: &'a Ctx,
     pub subst: FxHashMap<VarId, Id>,
     bnode_scope: u32,
+    /// RDF 1.2 triple-term patterns created while translating triple patterns
+    unpacks: std::cell::RefCell<Vec<UnpackItem>>,
+}
+
+/// `<<( s p o )>>` with variables: the triple term bound to `t` is decomposed into
+/// `parts` (constants must match, variables are bound).
+#[derive(Clone)]
+struct UnpackItem {
+    t: VarId,
+    parts: [PT; 3],
 }
 
 impl<'a> Planner<'a> {
@@ -332,6 +349,7 @@ impl<'a> Planner<'a> {
             ctx,
             subst: FxHashMap::default(),
             bnode_scope: 0,
+            unpacks: Default::default(),
         }
     }
 
@@ -379,8 +397,19 @@ impl<'a> Planner<'a> {
             }
             TermPattern::NamedNode(n) => PT::C(self.ctx.intern_term(&Term::NamedNode(n.clone()))),
             TermPattern::Literal(l) => PT::C(self.ctx.intern_term(&Term::Literal(l.clone()))),
-            #[allow(unreachable_patterns)]
-            _ => PT::C(Id::local(u64::MAX >> 5)),
+            TermPattern::Triple(tp) => match ground_triple(tp) {
+                Some(t) => PT::C(self.ctx.intern_term(&Term::Triple(Box::new(t)))),
+                None => {
+                    let t = self.ctx.fresh_var();
+                    let parts = [
+                        self.term_pattern(&tp.subject),
+                        self.named_pattern(&tp.predicate),
+                        self.term_pattern(&tp.object),
+                    ];
+                    self.unpacks.borrow_mut().push(UnpackItem { t, parts });
+                    PT::V(t)
+                }
+            },
         }
     }
 
@@ -486,8 +515,9 @@ impl<'a> Planner<'a> {
                             Some(GroundTerm::Literal(l)) => {
                                 self.ctx.intern_term(&Term::Literal(l.clone()))
                             }
-                            #[allow(unreachable_patterns)]
-                            Some(_) => Id::UNDEF,
+                            Some(t @ GroundTerm::Triple(_)) => {
+                                self.ctx.intern_term(&ground_term(t))
+                            }
                         })
                         .collect();
                     t.push_row(&ids);
@@ -652,6 +682,7 @@ impl<'a> Planner<'a> {
                 for tp in patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
                 }
+                items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Path {
                 subject,
@@ -661,6 +692,7 @@ impl<'a> Planner<'a> {
                 let s = self.term_pattern(subject);
                 let o = self.term_pattern(object);
                 self.collect_path(s, path, o, g, items);
+                items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Join { left, right } => {
                 self.collect(left, g, items)?;
@@ -776,6 +808,34 @@ impl<'a> Planner<'a> {
             ],
             graph: g.clone(),
         }
+    }
+
+    fn unpack(&self, input: Node, u: UnpackItem) -> Node {
+        let parts = u.parts.map(|p| match p {
+            PT::C(id) => PathEnd::Const(id),
+            PT::V(v) => PathEnd::Var(v),
+        });
+        let desc = format!(
+            "{} = <<( {} )>>",
+            self.pt_str(&PT::V(u.t)),
+            u.parts
+                .iter()
+                .map(|p| self.pt_str(p))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut n = Node::unary(Kind::Unpack { t: u.t, parts }, input, desc);
+        for p in u.parts {
+            if let PT::V(v) = p
+                && !n.vars.contains(&v)
+            {
+                n.vars.push(v);
+                n.certain.push(v);
+                n.dist.insert(v, n.est.max(1.0));
+            }
+        }
+        n.est *= 0.9;
+        n
     }
 
     /// `GRAPH ?g { P }` can bind ?g as a scan column when P is a plain join group that
@@ -1116,8 +1176,10 @@ impl<'a> Planner<'a> {
         let mut triples = Vec::new();
         let mut paths: Vec<PathItem> = Vec::new();
         let mut nodes = Vec::new();
+        let mut unpacks: Vec<UnpackItem> = Vec::new();
         for it in items {
             match it {
+                Item::Unpack(u) => unpacks.push(u),
                 Item::Triple(t) => triples.push(t),
                 Item::Path(p) => paths.push(p),
                 Item::Node(n) => nodes.push(n),
@@ -1133,6 +1195,9 @@ impl<'a> Planner<'a> {
                 && triples.iter().any(|t| t.t.contains(&PT::V(v)))
                 && !nodes.iter().any(|n| n.vars.contains(&v))
                 && !paths.iter().any(|p| p.s == PT::V(v) || p.o == PT::V(v))
+                && !unpacks
+                    .iter()
+                    .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
                 && !triples
                     .iter()
                     .any(|t| matches!(t.graph, ActiveGraph::Var(g) if g == v))
@@ -1184,6 +1249,19 @@ impl<'a> Planner<'a> {
                 .unwrap_or(0);
             let p = paths.remove(idx);
             result = self.attach_path(result, p)?;
+            let (now, later): (Vec<Expr>, Vec<Expr>) =
+                std::mem::take(&mut filters).into_iter().partition(|f| {
+                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
+                });
+            filters = later;
+            if !now.is_empty() {
+                result = filter(result, now, self.ctx);
+            }
+        }
+        // decompose triple terms once their variable is bound (outer before nested)
+        while let Some(i) = unpacks.iter().position(|u| result.vars.contains(&u.t)) {
+            let u = unpacks.remove(i);
+            result = self.unpack(result, u);
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {
                     !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
@@ -2392,6 +2470,39 @@ fn expr_vars(e: &Expression, out: &mut Vec<String>) {
         E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| expr_vars(x, out)),
         E::Exists(p) => collect_pattern_vars(p, out),
         _ => {}
+    }
+}
+
+/// A triple pattern without variables / blank nodes as an RDF 1.2 triple term.
+pub fn ground_triple(tp: &TriplePattern) -> Option<oxrdf::Triple> {
+    let term = |t: &TermPattern| -> Option<Term> {
+        Some(match t {
+            TermPattern::NamedNode(n) => Term::NamedNode(n.clone()),
+            TermPattern::Literal(l) => Term::Literal(l.clone()),
+            TermPattern::Triple(t) => Term::Triple(Box::new(ground_triple(t)?)),
+            _ => return None,
+        })
+    };
+    let s = match term(&tp.subject)? {
+        Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+        _ => return None,
+    };
+    let NamedNodePattern::NamedNode(p) = &tp.predicate else {
+        return None;
+    };
+    Some(oxrdf::Triple::new(s, p.clone(), term(&tp.object)?))
+}
+
+/// A ground term (VALUES) as an RDF term.
+pub fn ground_term(t: &GroundTerm) -> Term {
+    match t {
+        GroundTerm::NamedNode(n) => Term::NamedNode(n.clone()),
+        GroundTerm::Literal(l) => Term::Literal(l.clone()),
+        GroundTerm::Triple(t) => Term::Triple(Box::new(oxrdf::Triple::new(
+            t.subject.clone(),
+            t.predicate.clone(),
+            ground_term(&t.object),
+        ))),
     }
 }
 

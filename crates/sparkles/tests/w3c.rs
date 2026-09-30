@@ -122,13 +122,30 @@ fn collect_tests(manifest_url: &str, out: &mut Vec<(TestCase, std::rc::Rc<Manife
     let m = std::rc::Rc::new(Manifest {
         g: load_graph(manifest_url),
     });
-    let root: NamedOrBlankNode = nn(manifest_url).into();
-    for inc in m.objs(&root, &format!("{MF}include")) {
+    // the manifest node is usually the document itself, but may be any mf:Manifest
+    let mut roots: Vec<NamedOrBlankNode> =
+        m.g.subjects_for_predicate_object(rdf::TYPE, &nn(&format!("{MF}Manifest")))
+            .map(|s| s.into_owned())
+            .collect();
+    if roots.is_empty() {
+        roots.push(nn(manifest_url).into());
+    }
+    for root in &roots {
+        collect_manifest(&m, root, out);
+    }
+}
+
+fn collect_manifest(
+    m: &std::rc::Rc<Manifest>,
+    root: &NamedOrBlankNode,
+    out: &mut Vec<(TestCase, std::rc::Rc<Manifest>)>,
+) {
+    for inc in m.objs(root, &format!("{MF}include")) {
         for i in m.list(inc) {
             collect_tests(&iri(&i), out);
         }
     }
-    for entries in m.objs(&root, &format!("{MF}entries")) {
+    for entries in m.objs(root, &format!("{MF}entries")) {
         for e in m.list(entries) {
             let Some(s) = as_subject(&e) else { continue };
             let kind = m
@@ -184,7 +201,19 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
     ) -> Option<Vec<String>> {
         match (e, a) {
             (None, None) => Some(Vec::new()),
-            (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => {
+            (Some(x), Some(y)) => term_match(x, y, map, rev),
+            _ => None,
+        }
+    }
+    /// Term equality with blank-node mapping, recursing into RDF 1.2 triple terms.
+    fn term_match(
+        e: &Term,
+        a: &Term,
+        map: &mut BTreeMap<String, String>,
+        rev: &mut BTreeMap<String, String>,
+    ) -> Option<Vec<String>> {
+        match (e, a) {
+            (Term::BlankNode(x), Term::BlankNode(y)) => {
                 let (x, y) = (x.as_str().to_string(), y.as_str().to_string());
                 match (map.get(&x), rev.get(&y)) {
                     (Some(m), _) if *m == y => Some(Vec::new()),
@@ -196,7 +225,28 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
                     _ => None,
                 }
             }
-            (Some(x), Some(y)) if term_eq(x, y) => Some(Vec::new()),
+            (Term::Triple(x), Term::Triple(y)) => {
+                let mut added = Vec::new();
+                let parts = [
+                    (Term::from(x.subject.clone()), Term::from(y.subject.clone())),
+                    (
+                        Term::NamedNode(x.predicate.clone()),
+                        Term::NamedNode(y.predicate.clone()),
+                    ),
+                    (x.object.clone(), y.object.clone()),
+                ];
+                for (p, q) in &parts {
+                    match term_match(p, q, map, rev) {
+                        Some(n) => added.extend(n),
+                        None => {
+                            undo(&added, map, rev);
+                            return None;
+                        }
+                    }
+                }
+                Some(added)
+            }
+            (x, y) if term_eq(x, y) => Some(Vec::new()),
             _ => None,
         }
     }
@@ -281,6 +331,7 @@ fn solutions_match(expected: &[Row], actual: &[Row], ordered: bool) -> bool {
     )
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Expected {
     Boolean(bool),
     Solutions(Vec<String>, Vec<Row>),
@@ -646,6 +697,7 @@ fn run_suite(name: &str, manifests: &[&str]) {
             t.id.rsplit_once("/sparql/")
                 .map(|x| x.1)
                 .or_else(|| t.id.rsplit_once("/data-r2/").map(|x| x.1))
+                .or_else(|| t.id.rsplit_once("/sparql12#").map(|x| x.1))
                 .unwrap_or(&t.id)
                 .to_string();
         let r = match t.kind.as_str() {
@@ -659,8 +711,12 @@ fn run_suite(name: &str, manifests: &[&str]) {
             }
             "PositiveSyntaxTest" | "PositiveSyntaxTest11" => run_syntax_test(t, m, true, false),
             "NegativeSyntaxTest" | "NegativeSyntaxTest11" => run_syntax_test(t, m, false, false),
-            "PositiveUpdateSyntaxTest11" => run_syntax_test(t, m, true, true),
-            "NegativeUpdateSyntaxTest11" => run_syntax_test(t, m, false, true),
+            "PositiveUpdateSyntaxTest11" | "PositiveUpdateSyntaxTest" => {
+                run_syntax_test(t, m, true, true)
+            }
+            "NegativeUpdateSyntaxTest11" | "NegativeUpdateSyntaxTest" => {
+                run_syntax_test(t, m, false, true)
+            }
             _ => {
                 skip += 1;
                 continue;
@@ -724,6 +780,11 @@ fn sparql10() {
             "sparql10/manifest-syntax.ttl",
         ],
     );
+}
+
+#[test]
+fn sparql12() {
+    run_suite("SPARQL 1.2", &["sparql12/manifest.ttl"]);
 }
 
 #[allow(dead_code)]

@@ -414,6 +414,37 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     Ok((parsed.to_sse(), exec::describe(&ctx, &node)))
 }
 
+/// Instantiate a template term (CONSTRUCT / INSERT), recursing into RDF 1.2 triple
+/// terms. `var` resolves variables, `bnode` maps template blank node labels.
+pub fn instantiate(
+    tp: &TermPattern,
+    var: &mut dyn FnMut(&str) -> Option<Term>,
+    bnode: &mut dyn FnMut(&str) -> Term,
+) -> Option<Term> {
+    Some(match tp {
+        TermPattern::Variable(v) => var(v.as_str())?,
+        TermPattern::BlankNode(b) => bnode(b.as_str()),
+        TermPattern::NamedNode(n) => Term::NamedNode(n.clone()),
+        TermPattern::Literal(l) => Term::Literal(l.clone()),
+        TermPattern::Triple(t) => {
+            let s = match instantiate(&t.subject, var, bnode)? {
+                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+                _ => return None,
+            };
+            let p = match &t.predicate {
+                NamedNodePattern::NamedNode(n) => n.clone(),
+                NamedNodePattern::Variable(v) => match var(v.as_str())? {
+                    Term::NamedNode(n) => n,
+                    _ => return None,
+                },
+            };
+            let o = instantiate(&t.object, var, bnode)?;
+            Term::Triple(Box::new(Triple::new(s, p, o)))
+        }
+    })
+}
+
 fn construct(ctx: &Ctx, t: &Table, template: &[TriplePattern]) -> Vec<Triple> {
     let map = t.var_map(ctx.nvars());
     let mut seen = FxHashSet::default();
@@ -421,26 +452,22 @@ fn construct(ctx: &Ctx, t: &Table, template: &[TriplePattern]) -> Vec<Triple> {
     for i in 0..t.len() {
         let mut bnodes: FxHashMap<String, BlankNode> = FxHashMap::default();
         let inst = |tp: &TermPattern, bnodes: &mut FxHashMap<String, BlankNode>| -> Option<Term> {
-            Some(match tp {
-                TermPattern::Variable(v) => {
-                    let c = map.get(ctx.var(v.as_str()) as usize).copied().flatten()?;
+            instantiate(
+                tp,
+                &mut |v| {
+                    let c = map.get(ctx.var(v) as usize).copied().flatten()?;
                     let id = t.cols[c][i];
-                    if id.is_undef() {
-                        return None;
-                    }
-                    ctx.term(id)?
-                }
-                TermPattern::BlankNode(b) => Term::BlankNode(
-                    bnodes
-                        .entry(b.as_str().to_string())
-                        .or_insert_with(|| crate::store::bnode_for(ctx.fresh_bnode()))
-                        .clone(),
-                ),
-                TermPattern::NamedNode(n) => Term::NamedNode(n.clone()),
-                TermPattern::Literal(l) => Term::Literal(l.clone()),
-                #[allow(unreachable_patterns)]
-                _ => return None,
-            })
+                    if id.is_undef() { None } else { ctx.term(id) }
+                },
+                &mut |b| {
+                    Term::BlankNode(
+                        bnodes
+                            .entry(b.to_string())
+                            .or_insert_with(|| crate::store::bnode_for(ctx.fresh_bnode()))
+                            .clone(),
+                    )
+                },
+            )
         };
         for tp in template {
             let s = inst(&tp.subject, &mut bnodes);
