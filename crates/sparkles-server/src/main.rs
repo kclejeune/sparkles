@@ -457,10 +457,14 @@ enum Cmd {
         /// JSON file of rate limits (re-read on SIGHUP); --rate-limit flags apply on top
         #[arg(long, value_name = "FILE")]
         rate_limit_config: Option<PathBuf>,
-        /// Proxy (address or CIDR) whose Forwarded / X-Forwarded-For names the client
-        /// for rate limiting
+        /// Proxy (address, CIDR, or `unix` for the Unix socket) whose forwarding header
+        /// names the client for rate limiting and the auth layer's limits
         #[arg(long, value_name = "CIDR")]
         rate_limit_trusted_proxy: Vec<String>,
+        /// The header trusted proxies name the client in: x-forwarded-for (the default)
+        /// or forwarded; the other one is ignored
+        #[arg(long, value_name = "HEADER")]
+        rate_limit_trusted_proxy_header: Option<String>,
         /// Export traces and metrics over OTLP (also enabled by OTEL_EXPORTER_OTLP_ENDPOINT
         /// and the other OTEL_* variables)
         #[arg(long)]
@@ -1230,6 +1234,7 @@ fn run() -> Result<()> {
             rate_limit,
             rate_limit_config,
             rate_limit_trusted_proxy,
+            rate_limit_trusted_proxy_header,
             ..
         } => {
             // an open server on the network, or a bad auth configuration, stops the
@@ -1316,10 +1321,21 @@ fn run() -> Result<()> {
                 file: rate_limit_config,
                 flags: rate_limit,
                 trusted_proxies: rate_limit_trusted_proxy,
+                trusted_proxy_header: rate_limit_trusted_proxy_header,
                 // with auth, the pre-authentication limit is on by default
                 auth: st.auth.is_some(),
             };
-            if let Some(cfg) = limit_sources.load()? {
+            let limits = limit_sources.load()?;
+            for w in ratelimit::client_warnings(
+                limits.as_ref(),
+                st.auth.is_some(),
+                unix_socket.is_some(),
+                exposure::loopback(&host),
+            ) {
+                tracing::warn!("{w}");
+            }
+            let rate_limited = limits.as_ref().is_some_and(|c| !c.is_empty());
+            if let Some(cfg) = limits {
                 // signed-in callers are limited per principal, others per address
                 st.rate_limit = Some(Arc::new(
                     ratelimit::RateLimiter::new(&cfg)
@@ -1331,7 +1347,7 @@ fn run() -> Result<()> {
                 &host,
                 unix_socket.is_some(),
                 st.auth.is_some(),
-                st.rate_limit.is_some(),
+                rate_limited,
             ) {
                 tracing::warn!("{w}");
             }

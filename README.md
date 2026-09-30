@@ -464,7 +464,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--otel-plan-spans` | off | one span per executed plan operator |
 | `--rate-limit SPEC` | off (`preauth=30/min,burst=60` with `--auth-config`) | limit a request class per client, e.g. `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5`; `preauth=…` limits authentication failures per address before credentials are checked (repeatable; see `docs/API.md`, Rate limiting) |
 | `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP; `--rate-limit` applies on top |
-| `--rate-limit-trusted-proxy CIDR` | | proxy whose `Forwarded` / `X-Forwarded-For` names the client (repeatable); limits by address need a peer address clients cannot choose, so list only proxies that overwrite these headers |
+| `--rate-limit-trusted-proxy CIDR` | | proxy whose `X-Forwarded-For` names the client (repeatable; `unix`: the `--unix-socket`); limits by address need a peer address clients cannot choose, so list only proxies that overwrite or append to the header |
+| `--rate-limit-trusted-proxy-header H` | `x-forwarded-for` | the one header trusted proxies name the client in: `x-forwarded-for` or `forwarded` (RFC 7239); the other is ignored |
 | `--no-service` | | refuse `SERVICE` for everyone |
 | `--outbound-allow-private` | off | let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)) |
 | `--outbound-block-private` | | refuse those addresses: already the default of `serve` and `mcp`, an opt-in for the local `query` and `update` (which allow them by default) |
@@ -699,7 +700,13 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
 
 * `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
 * proxy timeouts to `queryTimeout + 30` seconds;
-* request/response buffering off, so large uploads and results stream through.
+* request/response buffering off, so large uploads and results stream through;
+* `X-Forwarded-For` to the client's address (`$remote_addr`, replacing whatever the
+  client sent), and `Forwarded` to nothing. The server always trusts nginx for it
+  (`--rate-limit-trusted-proxy` for 127.0.0.1 and ::1, or `unix` with `unixSocket`),
+  `rateLimits` or not, so failed logins and rate limits count each client rather than
+  nginx. Behind another proxy or CDN, set up nginx's realip module so that
+  `$remote_addr` is the client.
 
 With `auth.configFile` the service starts with `--auth-config` and `systemctl reload
 sparkles` re-reads it (SIGHUP). Keep the file out of the Nix store (agenix, sops-nix),

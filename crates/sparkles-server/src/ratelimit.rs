@@ -27,7 +27,8 @@
 //! per owner, failed device-code lookups, …) share the buckets, responses and metrics.
 //!
 //! Clients are keyed by [`ClientKeyer`]: the peer address by default (IPv6 by its /64),
-//! or the address a trusted proxy reports in `Forwarded` / `X-Forwarded-For`. The client
+//! or the client a trusted proxy (a network, or the Unix socket) reports in the one
+//! forwarding header the configuration names ([`ForwardHeader`]). The client
 //! state lives in a bounded cache ([`quick_cache`], sharded, frequency-aware eviction):
 //! a flood of new keys evicts other rarely seen keys, never clients with requests in
 //! flight, and memory stays at about `max_keys` × 100 bytes. An evicted client that
@@ -49,7 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -281,9 +282,12 @@ pub struct Config {
     /// per dataset and class; replaces the class limit on that dataset
     #[serde(default)]
     pub datasets: BTreeMap<String, BTreeMap<String, Limit>>,
-    /// proxies whose `Forwarded` / `X-Forwarded-For` name the client (CIDR or address)
+    /// proxies whose forwarding header names the client (CIDR, address, or `unix` for
+    /// the Unix socket)
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// the header they name it in: `x-forwarded-for` (default) or `forwarded`
+    pub trusted_proxy_header: Option<String>,
     /// clients tracked at most (default 100000)
     pub max_keys: Option<usize>,
     /// limits charged by code under a name ([`RateLimiter::acquire`]), not by route
@@ -366,8 +370,17 @@ impl Config {
         for m in self.datasets.values() {
             check(m, true)?;
         }
-        TrustedProxies::parse(&self.trusted_proxies).map_err(anyhow::Error::msg)?;
+        self.trusted().map_err(anyhow::Error::msg)?;
         Ok(())
+    }
+
+    /// The trusted proxies and the header they name the client in.
+    pub fn trusted(&self) -> Result<TrustedProxies, String> {
+        let header = match &self.trusted_proxy_header {
+            Some(h) => ForwardHeader::parse(h)?,
+            None => ForwardHeader::default(),
+        };
+        Ok(TrustedProxies::parse(&self.trusted_proxies)?.with_header(header))
     }
 
     /// Whether any limit is configured.
@@ -383,15 +396,55 @@ impl Config {
 
 // -------------------------------------------------------------- client keys ------
 
-/// Networks whose forwarding headers are believed.
+/// The forwarding header a trusted proxy names the client in. Only that one is read: a
+/// proxy overwrites or appends to the header it sets and passes any other through, so a
+/// second header would be the client's to choose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardHeader {
+    /// `X-Forwarded-For` (nginx, HAProxy, Caddy, Traefik, cloud load balancers)
+    #[default]
+    XForwardedFor,
+    /// `Forwarded` (RFC 7239), the `for=` of each element
+    Forwarded,
+}
+
+impl ForwardHeader {
+    pub fn parse(s: &str) -> Result<ForwardHeader, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "x-forwarded-for" => Ok(ForwardHeader::XForwardedFor),
+            "forwarded" => Ok(ForwardHeader::Forwarded),
+            _ => Err(format!(
+                "trusted proxy header '{s}': expected x-forwarded-for or forwarded"
+            )),
+        }
+    }
+}
+
+/// Peers whose forwarding header is believed: networks, and the Unix socket (`unix`).
 #[derive(Clone, Debug, Default)]
-pub struct TrustedProxies(Vec<(IpAddr, u8)>);
+pub struct TrustedProxies {
+    nets: Vec<(IpAddr, u8)>,
+    unix: bool,
+    header: ForwardHeader,
+}
+
+/// Where a connection came from, as far as client keys are concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerAddr {
+    Ip(IpAddr),
+    /// the Unix socket (`--unix-socket`)
+    Unix,
+}
 
 impl TrustedProxies {
-    /// Parse `10.0.0.0/8`, `::1`, `fd00::/8`, … .
+    /// Parse `10.0.0.0/8`, `::1`, `fd00::/8`, `unix`, … .
     pub fn parse(items: &[String]) -> Result<TrustedProxies, String> {
-        let mut v = Vec::new();
+        let mut t = TrustedProxies::default();
         for s in items {
+            if s.trim() == "unix" {
+                t.unix = true;
+                continue;
+            }
             let (addr, len) = match s.split_once('/') {
                 Some((a, l)) => (a, Some(l)),
                 None => (s.as_str(), None),
@@ -399,7 +452,7 @@ impl TrustedProxies {
             let ip: IpAddr = addr
                 .trim()
                 .parse()
-                .map_err(|_| format!("trusted proxy '{s}': not an IP address or CIDR"))?;
+                .map_err(|_| format!("trusted proxy '{s}': not an IP address, a CIDR or unix"))?;
             let max = if ip.is_ipv4() { 32 } else { 128 };
             let len = match len {
                 Some(l) => l
@@ -410,18 +463,25 @@ impl TrustedProxies {
                     .ok_or_else(|| format!("trusted proxy '{s}': bad prefix length"))?,
                 None => max,
             };
-            v.push((ip, len));
+            t.nets.push((ip, len));
         }
-        Ok(TrustedProxies(v))
+        Ok(t)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// The same proxies, naming the client in `header`.
+    pub fn with_header(mut self, header: ForwardHeader) -> TrustedProxies {
+        self.header = header;
+        self
+    }
+
+    /// Whether the Unix socket is trusted.
+    pub fn unix(&self) -> bool {
+        self.unix
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
-        self.0.iter().any(|&(net, len)| match (net, ip) {
+        self.nets.iter().any(|&(net, len)| match (net, ip) {
             (IpAddr::V4(n), IpAddr::V4(a)) => {
                 let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
                 u32::from(n) & mask == u32::from(a) & mask
@@ -434,24 +494,41 @@ impl TrustedProxies {
         })
     }
 
-    /// The client address of a request that arrived from `peer`: when `peer` is trusted,
-    /// the rightmost untrusted hop of `Forwarded` (RFC 7239), else of `X-Forwarded-For`.
-    pub fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-        if self.is_empty() || !self.contains(peer) {
-            return peer;
+    /// Whether `peer`'s forwarding header is believed.
+    pub fn trusts(&self, peer: PeerAddr) -> bool {
+        match peer {
+            PeerAddr::Ip(ip) => self.contains(ip),
+            PeerAddr::Unix => self.unix,
         }
-        let hops = forwarded_hops(headers);
-        let mut client = peer;
-        for hop in hops.iter().rev() {
+    }
+
+    /// The client of a request that arrived from `peer`. From a trusted peer it is the
+    /// rightmost untrusted hop of the configured header (every hop to its right was
+    /// written by a trusted proxy); a hop that is not an address (`unknown`, an RFC 7239
+    /// obfuscated `_id`) is keyed by its text, as that proxy reported it. When every hop
+    /// is trusted, the leftmost of them; with no hop at all, the peer, which on the Unix
+    /// socket (like an untrusted socket, or no peer) is one shared [`ClientKey::Unknown`].
+    pub fn client_key(&self, peer: Option<PeerAddr>, headers: &HeaderMap) -> ClientKey {
+        let mut client = match peer {
+            Some(PeerAddr::Ip(ip)) => ClientKey::ip(ip),
+            Some(PeerAddr::Unix) | None => ClientKey::Unknown,
+        };
+        match peer {
+            Some(p) if self.trusts(p) => {}
+            _ => return client,
+        }
+        for hop in forwarded_hops(headers, self.header).into_iter().rev() {
             match hop {
-                Some(ip) => {
-                    client = *ip;
-                    if !self.contains(*ip) {
+                Hop::Ip(ip) => {
+                    client = ClientKey::ip(ip);
+                    if !self.contains(ip) {
                         break;
                     }
                 }
-                // an unparsable or obfuscated hop: stop at the last known address
-                None => break,
+                Hop::Opaque(text) => {
+                    client = ClientKey::Opaque(text.into());
+                    break;
+                }
             }
         }
         client
@@ -466,45 +543,58 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The hops of `Forwarded` (`for=` of each element), else of `X-Forwarded-For`, left
-/// (origin) to right (nearest proxy); `None` for a hop that is not an address.
-fn forwarded_hops(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
-    let parse = |s: &str| -> Option<IpAddr> {
+/// One hop of a forwarding header.
+#[derive(Debug, PartialEq)]
+enum Hop {
+    Ip(IpAddr),
+    /// not an address: its text (at most 64 bytes)
+    Opaque(String),
+}
+
+/// The hops of `header` (for `Forwarded`, the `for=` of each element), left (origin)
+/// to right (nearest proxy).
+fn forwarded_hops(headers: &HeaderMap, header: ForwardHeader) -> Vec<Hop> {
+    let parse = |s: &str| -> Hop {
         let s = s.trim().trim_matches('"');
-        if let Ok(ip) = s.parse() {
-            return Some(ip);
+        let ip = s.parse().ok().or_else(|| match s.strip_prefix('[') {
+            // [v6]:port
+            Some(rest) => rest.split(']').next()?.parse().ok(),
+            // v4:port
+            None => s.parse::<SocketAddr>().ok().map(|a| a.ip()),
+        });
+        match ip {
+            Some(ip) => Hop::Ip(ip),
+            None => {
+                let mut end = s.len().min(64);
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Hop::Opaque(s[..end].to_string())
+            }
         }
-        // [v6]:port, v4:port
-        if let Some(rest) = s.strip_prefix('[') {
-            return rest.split(']').next()?.parse().ok();
-        }
-        s.parse::<SocketAddr>().ok().map(|a| a.ip())
     };
-    let fwd: Vec<&str> = headers
-        .get_all(header::FORWARDED)
+    let name = match header {
+        ForwardHeader::XForwardedFor => "x-forwarded-for",
+        ForwardHeader::Forwarded => "forwarded",
+    };
+    let elements = headers
+        .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .collect();
-    if !fwd.is_empty() {
-        return fwd
-            .iter()
-            .flat_map(|v| v.split(','))
+        .flat_map(|v| v.split(','));
+    match header {
+        ForwardHeader::XForwardedFor => elements.map(parse).collect(),
+        ForwardHeader::Forwarded => elements
             .map(|elem| {
-                elem.split(';').find_map(|pair| {
+                let f = elem.split(';').find_map(|pair| {
                     let (k, v) = pair.split_once('=')?;
                     k.trim().eq_ignore_ascii_case("for").then_some(v)
-                })
+                });
+                // an element without `for=` names no client
+                parse(f.unwrap_or("unknown"))
             })
-            .map(|v| v.and_then(parse))
-            .collect();
+            .collect(),
     }
-    headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(parse)
-        .collect()
 }
 
 /// Whom a request is counted against.
@@ -514,7 +604,10 @@ pub enum ClientKey {
     Ip(u128),
     /// an authenticated principal (or another key a named limit counts by)
     Principal(Arc<str>),
-    /// no address known (in-process requests): one shared key
+    /// a client a trusted proxy reported by a name rather than an address
+    Opaque(Arc<str>),
+    /// no address known (the Unix socket without a trusted proxy, in-process requests):
+    /// one shared key
     Unknown,
 }
 
@@ -544,22 +637,33 @@ pub struct PeerKeyer;
 
 impl ClientKeyer for PeerKeyer {
     fn key(&self, _: Class, req: &Request, trusted: &TrustedProxies) -> ClientKey {
-        match peer_ip(req) {
-            Some(peer) => ClientKey::ip(trusted.client_ip(peer, req.headers())),
-            None => ClientKey::Unknown,
-        }
+        trusted.client_key(peer_addr(req), req.headers())
     }
 }
 
+/// The client a request is counted against by address, in the request extensions:
+/// [`admit`] puts it there (with or without a limiter) for the auth layer's own limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientAddr(pub ClientKey);
+
 /// The address the connection came from, when the server recorded it.
 pub fn peer_ip(req: &Request) -> Option<IpAddr> {
+    match peer_addr(req)? {
+        PeerAddr::Ip(ip) => Some(ip),
+        PeerAddr::Unix => None,
+    }
+}
+
+/// Where the connection came from, when the server recorded it.
+pub fn peer_addr(req: &Request) -> Option<PeerAddr> {
     let ext = req.extensions();
-    ext.get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip())
-        .or_else(|| match ext.get::<ConnectInfo<crate::auth::Peer>>() {
-            Some(ConnectInfo(crate::auth::Peer::Tcp(a))) => Some(a.ip()),
-            _ => None,
-        })
+    if let Some(c) = ext.get::<ConnectInfo<SocketAddr>>() {
+        return Some(PeerAddr::Ip(c.0.ip()));
+    }
+    match ext.get::<ConnectInfo<crate::auth::Peer>>()? {
+        ConnectInfo(crate::auth::Peer::Tcp(a)) => Some(PeerAddr::Ip(a.ip())),
+        ConnectInfo(crate::auth::Peer::Unix) => Some(PeerAddr::Unix),
+    }
 }
 
 // ------------------------------------------------------------------- clock ------
@@ -931,7 +1035,7 @@ impl Inner {
             by_class,
             by_dataset,
             named,
-            trusted: TrustedProxies::parse(&cfg.trusted_proxies)?,
+            trusted: cfg.trusted()?,
             buckets,
         })
     }
@@ -958,6 +1062,9 @@ pub struct RateLimiter {
     evictions: Arc<AtomicU64>,
     clock: Clock,
     keyer: Arc<dyn ClientKeyer>,
+    /// requests with a forwarding header from a peer that is not a trusted proxy
+    untrusted_forwarded: AtomicU64,
+    forwarded_warned: AtomicBool,
 }
 
 /// The size of a limiter's client state (the `sparkles_rate_limit_*` metrics).
@@ -969,6 +1076,8 @@ pub struct Stats {
     pub evictions: u64,
     /// evicted clients whose debt is remembered
     pub penalties: u64,
+    /// requests with a forwarding header from an untrusted peer
+    pub untrusted_forwarded: u64,
 }
 
 impl RateLimiter {
@@ -983,6 +1092,8 @@ impl RateLimiter {
             evictions,
             clock,
             keyer: Arc::new(PeerKeyer),
+            untrusted_forwarded: AtomicU64::new(0),
+            forwarded_warned: AtomicBool::new(false),
         })
     }
 
@@ -1041,6 +1152,35 @@ impl RateLimiter {
             max_keys: b.max_keys as u64,
             evictions: b.evictions.load(Ordering::Relaxed),
             penalties: b.penalties.len() as u64,
+            untrusted_forwarded: self.untrusted_forwarded.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count a forwarding header from a peer that is not a trusted proxy, and warn about
+    /// the first: the server probably runs behind a proxy it does not trust, so every
+    /// client counts as the proxy.
+    fn note_untrusted_forwarding(&self, req: &Request, trusted: &TrustedProxies) {
+        let h = req.headers();
+        if !h.contains_key("x-forwarded-for") && !h.contains_key(header::FORWARDED) {
+            return;
+        }
+        let Some(peer) = peer_addr(req) else { return };
+        if trusted.trusts(peer) {
+            return;
+        }
+        self.untrusted_forwarded.fetch_add(1, Ordering::Relaxed);
+        if !self.forwarded_warned.swap(true, Ordering::Relaxed) {
+            let from = match peer {
+                PeerAddr::Ip(ip) => ip.to_string(),
+                PeerAddr::Unix => "the Unix socket".to_string(),
+            };
+            tracing::warn!(
+                "a request from {from} carries X-Forwarded-For or Forwarded, but {from} is not a \
+                 trusted proxy: the header is ignored. Behind a reverse proxy every client then \
+                 counts as the proxy and shares its budgets; list the proxy with \
+                 --rate-limit-trusted-proxy (warned once; sparkles_rate_limit_untrusted_forwarded_total \
+                 counts them)"
+            );
         }
     }
 
@@ -1123,7 +1263,7 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
     use std::fmt::Write;
     type Field = fn(&Stats) -> u64;
     let stats: Vec<(&str, Stats)> = limiters.iter().map(|(l, rl)| (*l, rl.stats())).collect();
-    let families: [(&str, &str, &str, Field); 4] = [
+    let families: [(&str, &str, &str, Field); 5] = [
         (
             "sparkles_rate_limit_keys",
             "gauge",
@@ -1148,6 +1288,12 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
             "Evicted clients whose unpaid debt is remembered.",
             |s| s.penalties,
         ),
+        (
+            "sparkles_rate_limit_untrusted_forwarded_total",
+            "counter",
+            "Requests with X-Forwarded-For or Forwarded from a peer that is not a trusted proxy (ignored).",
+            |s| s.untrusted_forwarded,
+        ),
     ];
     for (name, kind, help, f) in families {
         let _ = writeln!(o, "# HELP {name} {help}");
@@ -1159,19 +1305,22 @@ pub fn render_metrics(o: &mut String, limiters: &[(&str, &RateLimiter)]) {
 }
 
 /// Where a server's rate-limit configuration comes from: `--rate-limit-config`, then
-/// `--rate-limit` and `--rate-limit-trusted-proxy` on top.
+/// `--rate-limit`, `--rate-limit-trusted-proxy` and `--rate-limit-trusted-proxy-header`
+/// on top.
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
     pub file: Option<std::path::PathBuf>,
     pub flags: Vec<String>,
     pub trusted_proxies: Vec<String>,
+    pub trusted_proxy_header: Option<String>,
     /// authentication is on: `preauth` defaults to [`DEFAULT_PREAUTH`]
     pub auth: bool,
 }
 
 impl Sources {
     /// The merged configuration; `None` when nothing is configured and there is no
-    /// file (no limiter at all, so no overhead).
+    /// file (no limiter at all, so no overhead). Trusted proxies alone make a limiter
+    /// without limits: it still names the client the auth layer's own limits count.
     pub fn load(&self) -> anyhow::Result<Option<Config>> {
         let mut cfg = match &self.file {
             Some(f) => Config::read(f)?,
@@ -1182,16 +1331,57 @@ impl Sources {
         }
         cfg.trusted_proxies
             .extend(self.trusted_proxies.iter().cloned());
+        if let Some(h) = &self.trusted_proxy_header {
+            cfg.trusted_proxy_header = Some(h.clone());
+        }
         let preauth = Class::PreAuth.as_str();
         if self.auth && !cfg.classes.contains_key(preauth) {
             let l = Limit::parse(DEFAULT_PREAUTH).map_err(anyhow::Error::msg)?;
             cfg.classes.insert(preauth.to_string(), l);
         }
         cfg.validate()?;
-        Ok((self.file.is_some() || !cfg.is_empty()).then_some(cfg))
+        let any = self.file.is_some() || !cfg.is_empty() || !cfg.trusted_proxies.is_empty();
+        Ok(any.then_some(cfg))
     }
 }
 
+/// Startup warnings about telling clients apart. With authentication on, a server that
+/// listens where a reverse proxy usually connects from (the Unix socket, a loopback
+/// address) and trusts no proxy there counts every client as the proxy: one client's
+/// failed logins then spend everybody's budget.
+pub fn client_warnings(
+    cfg: Option<&Config>,
+    auth: bool,
+    unix_socket: bool,
+    loopback: bool,
+) -> Vec<String> {
+    if !auth {
+        return Vec::new();
+    }
+    let trusted = cfg.and_then(|c| c.trusted().ok()).unwrap_or_default();
+    let mut w = Vec::new();
+    if unix_socket && !trusted.unix() {
+        w.push(
+            "authentication is on and the Unix socket trusts no proxy: every client of the \
+             socket shares one budget of failed authentications and device logins, so one \
+             client's bad passwords refuse everybody's password logins for a while. If a \
+             reverse proxy connects through the socket, pass --rate-limit-trusted-proxy unix \
+             (the proxy must overwrite X-Forwarded-For)"
+                .to_string(),
+        );
+    }
+    if !unix_socket && loopback && trusted.nets.is_empty() {
+        w.push(
+            "authentication is on and the server listens on loopback with no trusted proxy: \
+             behind a reverse proxy every client counts as the proxy and shares one budget of \
+             failed authentications and device logins. Pass --rate-limit-trusted-proxy \
+             127.0.0.1 --rate-limit-trusted-proxy ::1 (the proxy must overwrite \
+             X-Forwarded-For)"
+                .to_string(),
+        );
+    }
+    w
+}
 /// Re-read the configuration on SIGHUP; a bad file keeps the running configuration.
 #[cfg(unix)]
 pub fn spawn_reload_on_sighup(rl: Arc<RateLimiter>, sources: Sources) {
@@ -1439,9 +1629,17 @@ pub async fn admit(
     next: Next,
 ) -> Response {
     let Some(rl) = rl else {
+        // no limiter, so no trusted proxy either: the peer
+        let client = PeerKeyer.key(Class::PreAuth, &req, &TrustedProxies::default());
+        req.extensions_mut().insert(ClientAddr(client));
         return next.run(req).await;
     };
     let inner = rl.inner.load_full();
+    rl.note_untrusted_forwarding(&req, &inner.trusted);
+    // without an address (the Unix socket without a trusted proxy, in-process requests)
+    // every such client shares one key: a shared budget still bounds password guessing
+    let client = PeerKeyer.key(Class::PreAuth, &req, &inner.trusted);
+    req.extensions_mut().insert(ClientAddr(client.clone()));
     let Some(pi) = inner.by_class[Class::PreAuth.index()] else {
         return next.run(req).await;
     };
@@ -1449,12 +1647,6 @@ pub async fn admit(
     let Some(g) = p.gcra else {
         return next.run(req).await;
     };
-    let client = PeerKeyer.key(Class::PreAuth, &req, &inner.trusted);
-    if client == ClientKey::Unknown {
-        // no address (the Unix socket, in-process requests): one shared budget would let
-        // any client lock out all the others
-        return next.run(req).await;
-    }
     let key = SlotKey {
         policy: p.id,
         client: client.clone(),

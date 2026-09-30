@@ -202,44 +202,119 @@ fn classifies_routes() {
 fn trusted_proxies_name_the_client() {
     let t = TrustedProxies::parse(&["10.0.0.0/8".into(), "::1".into()]).unwrap();
     let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+    let k = |s: &str| ClientKey::ip(ip(s));
+    let from = |t: &TrustedProxies, peer: &str, h: &HeaderMap| {
+        t.client_key(Some(PeerAddr::Ip(ip(peer))), h)
+    };
     let mut h = HeaderMap::new();
     h.insert("x-forwarded-for", "203.0.113.7, 10.1.2.3".parse().unwrap());
     // the rightmost untrusted hop
-    assert_eq!(t.client_ip(ip("10.0.0.1"), &h), ip("203.0.113.7"));
+    assert_eq!(from(&t, "10.0.0.1", &h), k("203.0.113.7"));
     // an untrusted peer's headers are ignored
-    assert_eq!(t.client_ip(ip("198.51.100.1"), &h), ip("198.51.100.1"));
+    assert_eq!(from(&t, "198.51.100.1", &h), k("198.51.100.1"));
     // a spoofed hop left of a real client does not win
     h.insert("x-forwarded-for", "1.1.1.1, 203.0.113.7".parse().unwrap());
-    assert_eq!(t.client_ip(ip("::1"), &h), ip("203.0.113.7"));
-    // Forwarded takes precedence, with quoted IPv6 and ports
+    assert_eq!(from(&t, "::1", &h), k("203.0.113.7"));
+    // only the configured header is read: the client's own Forwarded changes nothing
+    h.insert(header::FORWARDED, "for=198.51.100.9".parse().unwrap());
+    assert_eq!(from(&t, "10.9.9.9", &h), k("203.0.113.7"));
+    // with `forwarded` configured, X-Forwarded-For is the one ignored (quoted IPv6, ports)
+    let f = t.clone().with_header(ForwardHeader::Forwarded);
     h.insert(
         header::FORWARDED,
         "for=192.0.2.60;proto=http, for=\"[2001:db8::1]:4711\""
             .parse()
             .unwrap(),
     );
-    assert_eq!(t.client_ip(ip("10.9.9.9"), &h), ip("2001:db8::1"));
-    // an obfuscated hop stops the walk at the last known address
-    let mut h = HeaderMap::new();
+    assert_eq!(from(&f, "10.9.9.9", &h), k("2001:db8::1"));
+    // a hop that is not an address is a client of its own (never the proxy before it)
     h.insert(
         header::FORWARDED,
         "for=_hidden, for=10.2.2.2".parse().unwrap(),
     );
-    assert_eq!(t.client_ip(ip("10.0.0.1"), &h), ip("10.2.2.2"));
+    assert_eq!(
+        from(&f, "10.0.0.1", &h),
+        ClientKey::Opaque("_hidden".into())
+    );
+    h.insert(header::FORWARDED, "proto=https".parse().unwrap());
+    assert_eq!(
+        from(&f, "10.0.0.1", &h),
+        ClientKey::Opaque("unknown".into())
+    );
+    let mut x = HeaderMap::new();
+    x.insert("x-forwarded-for", "garbage, 10.2.2.2".parse().unwrap());
+    assert_eq!(
+        from(&t, "10.0.0.1", &x),
+        ClientKey::Opaque("garbage".into())
+    );
+    let long = "x".repeat(300);
+    x.insert("x-forwarded-for", long.parse().unwrap());
+    assert_eq!(
+        from(&t, "10.0.0.1", &x),
+        ClientKey::Opaque("x".repeat(64).into())
+    );
+    // every hop trusted: the leftmost; no hop: the peer
+    x.insert("x-forwarded-for", "10.3.3.3, 10.2.2.2".parse().unwrap());
+    assert_eq!(from(&t, "10.0.0.1", &x), k("10.3.3.3"));
+    assert_eq!(from(&t, "10.0.0.1", &HeaderMap::new()), k("10.0.0.1"));
+    // the Unix socket: one shared key unless trusted, then the forwarded client
+    let u = TrustedProxies::parse(&["unix".into()]).unwrap();
+    x.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+    assert!(u.unix() && !t.unix());
+    assert_eq!(t.client_key(Some(PeerAddr::Unix), &x), ClientKey::Unknown);
+    assert_eq!(u.client_key(Some(PeerAddr::Unix), &x), k("203.0.113.7"));
+    assert_eq!(
+        u.client_key(Some(PeerAddr::Unix), &HeaderMap::new()),
+        ClientKey::Unknown
+    );
+    assert_eq!(u.client_key(None, &x), ClientKey::Unknown);
+    // trusting the socket trusts no TCP peer
+    assert_eq!(from(&u, "127.0.0.1", &x), k("127.0.0.1"));
+    assert!(TrustedProxies::parse(&["socket".into()]).is_err());
+    assert!(ForwardHeader::parse("X-Real-IP").is_err());
+    assert_eq!(
+        ForwardHeader::parse("X-Forwarded-For").unwrap(),
+        ForwardHeader::XForwardedFor
+    );
+    let j: Config = serde_json::from_str(r#"{"trustedProxyHeader":"x-real-ip"}"#).unwrap();
+    assert!(j.validate().is_err());
+    let j: Config = serde_json::from_str(
+        r#"{"trustedProxies":["unix","10.0.0.0/8"],"trustedProxyHeader":"forwarded"}"#,
+    )
+    .unwrap();
+    let t = j.trusted().unwrap();
+    assert!(t.unix() && t.contains(ip("10.1.1.1")));
     // IPv6 clients share a key per /64; mapped IPv4 is IPv4
-    assert_eq!(
-        ClientKey::ip(ip("2001:db8::1")),
-        ClientKey::ip(ip("2001:db8::ffff"))
+    assert_eq!(k("2001:db8::1"), k("2001:db8::ffff"));
+    assert_ne!(k("2001:db8::1"), k("2001:db8:0:1::1"));
+    assert_eq!(k("::ffff:192.0.2.1"), k("192.0.2.1"));
+    assert!(
+        TrustedProxies::parse(&["10.0.0.0/8".into()])
+            .unwrap()
+            .contains(ip("::ffff:10.1.1.1"))
     );
-    assert_ne!(
-        ClientKey::ip(ip("2001:db8::1")),
-        ClientKey::ip(ip("2001:db8:0:1::1"))
+}
+
+#[test]
+fn listeners_behind_an_untrusted_proxy_are_warned_about() {
+    let cfg = |trusted: &[&str]| Config {
+        trusted_proxies: trusted.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    // without auth: nothing to say
+    assert!(client_warnings(None, false, true, true).is_empty());
+    let w = client_warnings(None, true, true, false);
+    assert_eq!(w.len(), 1);
+    assert!(w[0].contains("--rate-limit-trusted-proxy unix"), "{w:?}");
+    assert!(client_warnings(Some(&cfg(&["unix"])), true, true, false).is_empty());
+    let w = client_warnings(Some(&cfg(&["unix"])), true, false, true);
+    assert!(
+        w[0].contains("--rate-limit-trusted-proxy 127.0.0.1"),
+        "{w:?}"
     );
-    assert_eq!(
-        ClientKey::ip(ip("::ffff:192.0.2.1")),
-        ClientKey::ip(ip("192.0.2.1"))
-    );
-    assert!(t.contains(ip("::ffff:10.1.1.1")));
+    assert!(client_warnings(Some(&cfg(&["127.0.0.1"])), true, false, true).is_empty());
+    // a network listener is not assumed to be behind a proxy
+    assert!(client_warnings(None, true, false, false).is_empty());
 }
 
 #[tokio::test]
@@ -357,10 +432,40 @@ async fn trusted_proxies_key_by_forwarded_client() {
     // the first client again, through another proxy
     let r = s.call("GET", Q, "10.0.0.6", &via("203.0.113.1")).await;
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
-    // an untrusted peer cannot choose its key
+    // a client-sent Forwarded does not override the proxy's X-Forwarded-For
+    let spoof = [
+        ("x-forwarded-for", "203.0.113.1"),
+        ("forwarded", "for=198.51.100.77"),
+    ];
+    let r = s.call("GET", Q, "10.0.0.5", &spoof).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    // an untrusted peer cannot choose its key; its headers are counted (and warned about)
+    assert_eq!(s.rl.stats().untrusted_forwarded, 0);
     let r = s.call("GET", Q, "198.51.100.1", &via("203.0.113.9")).await;
     assert_eq!(r.status(), StatusCode::OK);
     let r = s.call("GET", Q, "198.51.100.1", &via("203.0.113.10")).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(s.rl.stats().untrusted_forwarded, 2);
+    assert!(s.rl.forwarded_warned.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn the_forwarded_header_is_read_only_when_configured() {
+    let mut cfg = Config::default();
+    cfg.apply_flag("query=1/min").unwrap();
+    cfg.trusted_proxies = vec!["10.0.0.0/8".into()];
+    cfg.trusted_proxy_header = Some("forwarded".into());
+    let s = server_cfg(cfg);
+    let r = s
+        .call("GET", Q, "10.0.0.5", &[("forwarded", "for=203.0.113.1")])
+        .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    // X-Forwarded-For is now the header clients may set
+    let h = [
+        ("forwarded", "for=203.0.113.1"),
+        ("x-forwarded-for", "198.51.100.1"),
+    ];
+    let r = s.call("GET", Q, "10.0.0.5", &h).await;
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -534,13 +639,27 @@ fn sources_merge_file_and_flags() {
         file: Some(f),
         flags: vec!["query=50/s".into()],
         trusted_proxies: vec!["10.0.0.0/8".into()],
+        trusted_proxy_header: Some("forwarded".into()),
         auth: false,
     };
     let c = s.load().unwrap().unwrap();
     assert_eq!(c.classes["query"].rate.unwrap().count, 50);
     assert_eq!(c.classes["update"].rate.unwrap().count, 1);
     assert_eq!(c.trusted_proxies, ["10.0.0.0/8"]);
+    assert_eq!(c.trusted_proxy_header.as_deref(), Some("forwarded"));
     assert!(Sources::default().load().unwrap().is_none());
+    // trusted proxies alone: a limiter without limits, to name clients
+    let proxies = Sources {
+        trusted_proxies: vec!["unix".into()],
+        ..Default::default()
+    };
+    let c = proxies.load().unwrap().unwrap();
+    assert!(c.is_empty() && c.trusted().unwrap().unix());
+    let bad = Sources {
+        trusted_proxy_header: Some("x-real-ip".into()),
+        ..Default::default()
+    };
+    assert!(bad.load().is_err());
     let bad = Sources {
         flags: vec!["query=fast".into()],
         ..Default::default()

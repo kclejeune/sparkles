@@ -1,5 +1,6 @@
 # NixOS VM test: the service starts, serves a declared dataset through nginx, keeps
-# data across restarts, and serves the embedded UI.
+# data across restarts, serves the embedded UI, and tells clients behind nginx apart
+# for the failed-login budget.
 { self }:
 {
   name = "sparkles";
@@ -18,6 +19,22 @@
           enable = true;
           virtualHost = "sparkles.test";
         };
+        # anonymous callers keep full access; alice signs in with a password
+        auth.configFile = "/etc/sparkles/auth.toml";
+      };
+      environment.etc."sparkles/auth.toml" = {
+        mode = "0440";
+        user = "sparkles";
+        text = ''
+          version = 1
+
+          [anonymous]
+          datasets = { "*" = "admin" }
+
+          [[users]]
+          name = "alice"
+          password = "$argon2id$v=19$m=19456,t=2,p=1$Rx7LbFknfawV8XRp8CMm0Q$dEIdCOdMNBRhz+OBLTVscRhb7x5z8rlt9+wV1jOZBls"
+        '';
       };
       networking.hosts."127.0.0.1" = [ "sparkles.test" ];
     };
@@ -60,6 +77,22 @@
         + "'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'"
     )
     assert last_value(out) == "0", out
+
+    # behind nginx each client has a budget of failed logins of its own (nginx names it in
+    # X-Forwarded-For, the server trusts nginx), and a client's Forwarded header does not
+    # choose the budget: the default preauth budget allows 60 failures at once
+    ask = f"'{base}/demo/sparql?query=ASK%7B%7D'"
+
+    def status(args):
+        return machine.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' {args}").strip()
+
+    for i in range(60):
+        code = status(f"--interface 127.0.0.2 -u alice:wrong{i} -H 'Forwarded: for=198.51.100.{i}' {ask}")
+        assert code == "401", (i, code)
+    code = status(f"--interface 127.0.0.2 -u alice:wrong -H 'Forwarded: for=198.51.100.99' {ask}")
+    assert code == "429", code
+    code = status(f"--interface 127.0.0.3 -u alice:alice-pw -H 'Forwarded: for=127.0.0.2' {ask}")
+    assert code == "200", code
 
     # the CLI is installed; the served database is locked against a second process
     machine.succeed("sparkles --version")

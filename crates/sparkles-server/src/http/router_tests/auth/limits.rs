@@ -8,6 +8,11 @@ use crate::ratelimit::{RateLimiter, Sources};
 /// The fixture server with the rate limits `serve --auth-config … --rate-limit FLAG…`
 /// sets up (the pre-authentication limit on by default, callers keyed by owner).
 fn limited(f: Fixture, flags: &[&str]) -> AuthServer {
+    limited_behind(f, flags, &[])
+}
+
+/// [`limited`] with `--rate-limit-trusted-proxy PROXY…`.
+fn limited_behind(f: Fixture, flags: &[&str], proxies: &[&str]) -> AuthServer {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("auth.toml");
     std::fs::write(&config, config_text(&f)).unwrap();
@@ -16,6 +21,7 @@ fn limited(f: Fixture, flags: &[&str]) -> AuthServer {
     st.auth = Some(Arc::new(Auth::open(&config, dir.path()).unwrap().0));
     let sources = Sources {
         flags: flags.iter().map(|s| s.to_string()).collect(),
+        trusted_proxies: proxies.iter().map(|s| s.to_string()).collect(),
         auth: true,
         ..Default::default()
     };
@@ -356,4 +362,81 @@ async fn device_logins_are_limited_per_address() {
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(r.json()["reason"], "device");
     assert_eq!(start("203.0.113.8").await.status, StatusCode::OK);
+}
+
+/// A failed Basic login to `/wiki` from `peer` with `headers`.
+async fn guess_from(s: &AuthServer, peer: Peer, headers: &[(&str, &str)], pw: &str) -> R {
+    let wrong = basic("bob", pw);
+    let mut h = headers.to_vec();
+    h.push(("authorization", &wrong));
+    call_from(&s.app, peer, "GET", &format!("/wiki{ASK}"), &h, "").await
+}
+
+#[tokio::test]
+async fn a_client_cannot_pick_its_budget_with_forwarded() {
+    let s = limited_behind(Fixture::default(), &["preauth=30/min"], &["127.0.0.1"]);
+    let proxy = || from("127.0.0.1");
+    // one real client behind the proxy, a new Forwarded value with every guess
+    for i in 0..30 {
+        let fwd = format!("for=198.51.100.{i}");
+        let h = [
+            ("x-forwarded-for", "203.0.113.50"),
+            ("forwarded", fwd.as_str()),
+        ];
+        let r = guess_from(&s, proxy(), &h, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let h = [
+        ("x-forwarded-for", "203.0.113.50"),
+        ("forwarded", "for=198.51.100.200"),
+    ];
+    let r = guess_from(&s, proxy(), &h, "wrong-30").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // another client behind the same proxy still signs in
+    let wiki = format!("/wiki{ASK}");
+    let bob = b("bob");
+    let h = [
+        ("x-forwarded-for", "203.0.113.51"),
+        ("authorization", bob.as_str()),
+    ];
+    let r = call_from(&s.app, proxy(), "GET", &wiki, &h, "").await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unix_socket_clients_are_told_apart_by_a_trusted_proxy() {
+    let s = limited_behind(Fixture::default(), &["preauth=3/min"], &["unix"]);
+    let one = [("x-forwarded-for", "203.0.113.1")];
+    for i in 0..3 {
+        let r = guess_from(&s, Peer::Unix, &one, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let r = guess_from(&s, Peer::Unix, &one, "wrong-3").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    // another address behind the proxy is not affected
+    let two = [("x-forwarded-for", "203.0.113.2")];
+    let r = guess_from(&s, Peer::Unix, &two, "wrong").await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_untrusted_unix_socket_shares_one_budget() {
+    let s = limited(Fixture::default(), &["preauth=3/min"]);
+    let one = [("x-forwarded-for", "203.0.113.1")];
+    for i in 0..3 {
+        let r = guess_from(&s, Peer::Unix, &one, &format!("wrong-{i}")).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    // guessing is bounded on the socket too: its clients share one budget
+    let two = [("x-forwarded-for", "203.0.113.2")];
+    let r = guess_from(&s, Peer::Unix, &two, "wrong").await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        metric(
+            &s.app,
+            "sparkles_rate_limit_untrusted_forwarded_total{limiter=\"requests\"}"
+        )
+        .await,
+        4
+    );
 }

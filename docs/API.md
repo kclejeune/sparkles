@@ -257,22 +257,32 @@ they drop below it. A bad file keeps the running configuration.
   },
   "datasets": { "public": { "query": { "rate": "5/s" } } },
   "trustedProxies": ["127.0.0.1", "::1"],
+  "trustedProxyHeader": "x-forwarded-for",
   "maxKeys": 100000
 }
 ```
 
 **Clients.** A client is its peer address (an IPv6 client by its /64). Behind a reverse
-proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`): for
-requests from a trusted address the client is the rightmost untrusted hop of `Forwarded`
-(RFC 7239), else of `X-Forwarded-For`. Headers from untrusted peers are ignored. With
-authentication, a signed-in caller is counted as its owner instead (see
+proxy, list the proxy under `trustedProxies` (or `--rate-limit-trusted-proxy CIDR`;
+`unix` trusts the `--unix-socket`): for requests from a trusted peer the client is the
+rightmost untrusted hop of `X-Forwarded-For`, the header nginx, HAProxy, Caddy, Traefik
+and cloud load balancers set. Only that header is read, so a client's own `Forwarded`
+changes nothing. For a proxy that sets `Forwarded` (RFC 7239) instead, set
+`"trustedProxyHeader": "forwarded"` (or `--rate-limit-trusted-proxy-header forwarded`);
+`X-Forwarded-For` is then the ignored one. A hop that is not an address (`unknown`, an
+obfuscated `_id`) is a client of its own, named by that text; when every hop is trusted,
+the client is the leftmost of them. On the Unix socket without a trusted `unix`, clients
+have no address and share one key. Forwarding headers from untrusted peers are ignored,
+counted in `sparkles_rate_limit_untrusted_forwarded_total`, and the first is logged as a
+warning. With authentication, a signed-in caller is counted as its owner instead (see
 [Authentication](#authentication-and-access-control)), except in `preauth` and `auth`.
 
 Limits by address are only as good as the address: they need a peer address that clients
-cannot choose. List only proxies that overwrite (or append to) the forwarding headers
-they receive, never a network that clients can send from; and behind a proxy that is not
-listed, every client has the proxy's address and shares one budget (with `preauth`, one
-client's failed logins then refuse everybody's requests for a while).
+cannot choose. List only proxies that overwrite (nginx: `proxy_set_header X-Forwarded-For
+$remote_addr;`) or append to the header they receive, never a network that clients can
+send from. Behind a proxy that is not listed, every client has the proxy's address and
+shares one budget, so `serve` warns at startup when authentication is on and the listener
+(the Unix socket, or a loopback address) trusts no proxy.
 
 At most `maxKeys` clients (default 100,000, about 100 bytes each) are tracked; a flood of
 new addresses evicts other rarely seen clients, never one with requests in flight. An
@@ -322,8 +332,9 @@ refills, whatever it sends and before any password is hashed. A password check (
 Basic, a UI password login) takes the cost of a failure before it starts and gives it
 back when the password is right, so concurrent guesses from one address cannot all start
 hashing. Responses to failures carry the stage's `RateLimit-Policy` and `RateLimit`.
-Requests without a peer address (over `--unix-socket`) are not counted: they would all
-share one budget.
+Requests without a client address (over `--unix-socket` with no trusted `unix` proxy)
+share one budget, so guessing stays bounded there too; trust the proxy on the socket so
+that its clients are told apart.
 
 With `--auth-config` it is on by default at `30/min,burst=60` (60 failures at once, then
 one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` or
