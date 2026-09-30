@@ -170,6 +170,63 @@ pub fn not_built() -> Error {
     Error::Unsupported("built without full-text search (cargo feature \"text\")".into())
 }
 
+/// What [`probe`] found in a dataset's full-text index (read only, for `sparkles check`).
+#[derive(Debug, Default)]
+pub(crate) struct TextProbe {
+    /// `text.json` exists
+    pub configured: bool,
+    /// `text.json` does not parse
+    pub config_error: Option<String>,
+    /// this build has no full-text support: only the configuration was read
+    pub unsupported: bool,
+    /// `<root>/text/` exists
+    pub index_dir: bool,
+    /// `text.dirty` exists: the index may hold unsynced writes
+    pub dirty: bool,
+    /// the index could not be opened (or has another schema)
+    pub open_error: Option<String>,
+    pub payload: Option<ProbePayload>,
+    pub payload_error: Option<String>,
+    pub segments: usize,
+    pub docs: u64,
+    /// segment files looked at
+    pub files: usize,
+    /// (file relative to `text/`, problem)
+    pub damaged: Vec<(String, String)>,
+}
+
+/// The commit payload of the index's `meta.json`.
+#[derive(Debug)]
+pub(crate) struct ProbePayload {
+    pub format_ok: bool,
+    pub seq: u64,
+    pub config_matches: bool,
+}
+
+#[cfg(feature = "text")]
+pub(crate) use imp::probe;
+
+/// Without full-text support only the configuration can be checked.
+#[cfg(not(feature = "text"))]
+pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
+    let mut p = TextProbe::default();
+    match std::fs::read(root.join("text.json")) {
+        Ok(b) => {
+            p.configured = true;
+            p.unsupported = true;
+            if let Err(e) = serde_json::from_slice::<TextConfig>(&b) {
+                p.config_error = Some(e.to_string());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            p.configured = true;
+            p.config_error = Some(e.to_string());
+        }
+    }
+    p
+}
+
 #[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
@@ -385,6 +442,101 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    /// Inspect `<root>/text` without writing anything: the configuration, the commit
+    /// payload, and that every file of the committed segments exists (and, with
+    /// `checksums`, matches its checksum). A server may commit and merge meanwhile, so
+    /// damage is re-checked against a fresh `meta.json` before it is reported.
+    pub(crate) fn probe(root: &Path, checksums: bool) -> super::TextProbe {
+        use tantivy::directory::Directory;
+        let mut p = super::TextProbe::default();
+        let config = match read_config(root) {
+            Ok(Some(c)) => c,
+            Ok(None) => return p,
+            Err(e) => {
+                p.configured = true;
+                p.config_error = Some(e.to_string());
+                return p;
+            }
+        };
+        p.configured = true;
+        p.dirty = marker(root).exists();
+        let dir = root.join("text");
+        p.index_dir = dir.is_dir();
+        if !p.index_dir {
+            return p;
+        }
+        for attempt in 0..3 {
+            // opening reads `meta.json` and the managed file list; nothing is written
+            let index = match Index::open_in_dir(&dir) {
+                Ok(i) => i,
+                Err(e) => {
+                    p.open_error = Some(e.to_string());
+                    return p;
+                }
+            };
+            if index.schema() != schema().0 {
+                p.open_error = Some("unexpected index schema".into());
+                return p;
+            }
+            let meta = match index.load_metas() {
+                Ok(m) => m,
+                Err(e) => {
+                    p.open_error = Some(e.to_string());
+                    return p;
+                }
+            };
+            p.payload = None;
+            p.payload_error = None;
+            match meta.payload.as_deref().map(serde_json::from_str::<Payload>) {
+                Some(Ok(pl)) => {
+                    p.payload = Some(super::ProbePayload {
+                        format_ok: pl.format == FORMAT,
+                        seq: pl.seq,
+                        config_matches: pl.config == config_hash(&config),
+                    })
+                }
+                Some(Err(e)) => p.payload_error = Some(e.to_string()),
+                None => p.payload_error = Some("no commit payload".into()),
+            }
+            p.segments = meta.segments.len();
+            p.docs = meta.segments.iter().map(|s| s.num_docs() as u64).sum();
+            p.files = 0;
+            p.damaged.clear();
+            let d = index.directory();
+            for m in &meta.segments {
+                for f in m.list_files() {
+                    // `list_files` names a deletes file even for segments that have none
+                    if m.delete_opstamp().is_none() && f.extension().is_some_and(|e| e == "del") {
+                        continue;
+                    }
+                    p.files += 1;
+                    let problem = match Directory::exists(d, &f) {
+                        Ok(false) => Some("missing".to_string()),
+                        Ok(true) if checksums => match d.validate_checksum(&f) {
+                            Ok(true) => None,
+                            Ok(false) => Some("checksum mismatch".to_string()),
+                            Err(e) => Some(e.to_string()),
+                        },
+                        Ok(true) => None,
+                        Err(e) => Some(e.to_string()),
+                    };
+                    if let Some(problem) = problem {
+                        p.damaged.push((f.display().to_string(), problem));
+                    }
+                }
+            }
+            if p.damaged.is_empty() || attempt == 2 {
+                break;
+            }
+            // damage is reported only against the latest committed state
+            match index.load_metas() {
+                Ok(m) if m.opstamp != meta.opstamp => continue,
+                _ => break,
+            }
+        }
+        p
     }
 
     /// How long the index may hold unsynced commits before a checkpoint.
