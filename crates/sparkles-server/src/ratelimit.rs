@@ -9,10 +9,11 @@
 //! `u64` per client), and caps on the requests in flight, server-wide and per client.
 //!
 //! Enforcement has two stages. [`admit`] runs before authentication and applies the
-//! `preauth` limit: a budget of authentication failures per client address, so that
-//! password guessing and the hashing it costs are bounded before any credential is
-//! checked (the auth layer reserves the cost of a failure through [`Admission`] before
-//! it verifies a password). [`limit`] runs after authentication and applies the class
+//! `preauth` limit: a budget of failed credential checks per client address (and IPv6
+//! /48), so that password guessing and the hashing it costs are bounded (the auth layer
+//! reserves the cost of a failure through [`Admission`] before it verifies a password,
+//! and an address that spent its budget has its password checks and unknown tokens
+//! refused, nothing else). [`limit`] runs after authentication and applies the class
 //! limits, keyed by [`ClientKeyer`] (the signed-in owner with auth).
 //!
 //! * Over the rate: `429 Too Many Requests` with `Retry-After`.
@@ -975,6 +976,8 @@ struct Inner {
     by_class: [Option<u32>; Class::COUNT],
     by_dataset: BTreeMap<String, [Option<u32>; Class::COUNT]>,
     named: HashMap<&'static str, u32>,
+    /// the `preauth` limit of an IPv6 /48 ([`AGGREGATE_FACTOR`])
+    preauth_aggregate: Option<u32>,
     trusted: TrustedProxies,
     buckets: Arc<Buckets>,
 }
@@ -1003,6 +1006,10 @@ impl Inner {
             let class = Class::parse(c).ok_or_else(|| format!("unknown class '{c}'"))?;
             by_class[class.index()] = add(class, class.as_str().to_string(), l);
         }
+        let preauth_aggregate = match cfg.classes.get(Class::PreAuth.as_str()) {
+            Some(l) => add(Class::PreAuth, "preauth/48".into(), &aggregate_limit(l)),
+            None => None,
+        };
         let mut by_dataset = BTreeMap::new();
         for (ds, m) in &cfg.datasets {
             // a dataset override for one class leaves the others at the class limit
@@ -1035,6 +1042,7 @@ impl Inner {
             by_class,
             by_dataset,
             named,
+            preauth_aggregate,
             trusted: cfg.trusted()?,
             buckets,
         })
@@ -1539,20 +1547,52 @@ fn reject(
 
 // ------------------------------------------------------ before authentication ------
 
-/// Marks a response as an authentication failure for the `preauth` limit when its
-/// status does not say so (an invalid session cookie is ignored, not refused).
+/// Marks a response as a failed credential check, the only thing the `preauth` limit
+/// charges: a wrong password, an unknown, expired or malformed token, an invalid session
+/// cookie, an unknown device code, a CSRF refusal on an auth route. The auth layer and
+/// its handlers set it; refusals of authorization (a `403`, a hidden dataset's `404`),
+/// handler errors and a busy password check are not failures of the address.
 #[derive(Clone, Copy, Debug)]
 pub struct AuthFailed;
 
-/// Whether authentication or authorization failed: a 401 or 403, or the auth layer's
-/// report of bad credentials or a refusal (a hidden dataset's 404, a busy password check).
-fn auth_failed(r: &Response) -> bool {
-    matches!(r.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        || r.extensions().get::<AuthFailed>().is_some()
-        || r.extensions()
-            .get::<crate::auth::AuthReport>()
-            // `limited`: refused by this very limit, not a failure of its own
-            .is_some_and(|a| a.denied.is_some() || a.error.is_some_and(|e| e != "limited"))
+/// An IPv6 /48 (a site) has this many times the `preauth` budget of one of its /64s,
+/// on top of theirs: a network that holds many /64s cannot multiply its budget.
+pub const AGGREGATE_FACTOR: u32 = 8;
+
+/// The `preauth` limit of a /48: the /64 limit times [`AGGREGATE_FACTOR`].
+fn aggregate_limit(l: &Limit) -> Limit {
+    Limit {
+        rate: l.rate.map(|r| Rate {
+            count: r.count.saturating_mul(AGGREGATE_FACTOR),
+            period: r.period,
+        }),
+        burst: l
+            .burst
+            .or(l.rate.map(|r| r.count))
+            .map(|b| b.saturating_mul(AGGREGATE_FACTOR)),
+        ..l.clone()
+    }
+}
+
+impl ClientKey {
+    /// The network a client belongs to: the /48 of an IPv6 address; an IPv4 address and
+    /// any other key are their own.
+    pub fn network(&self) -> ClientKey {
+        self.ipv6_network().unwrap_or_else(|| self.clone())
+    }
+
+    /// The /48 of an IPv6 address.
+    fn ipv6_network(&self) -> Option<ClientKey> {
+        match self {
+            ClientKey::Ip(a) if !is_mapped_v4(*a) => Some(ClientKey::Ip(a & !((1u128 << 80) - 1))),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an [`ClientKey::Ip`] value is an IPv4 address (mapped into IPv6).
+fn is_mapped_v4(a: u128) -> bool {
+    a >> 32 == 0xffff
 }
 
 /// A request's standing under the `preauth` limit (in the request extensions): the auth
@@ -1563,66 +1603,149 @@ pub struct Admission(Arc<AdmissionState>);
 
 struct AdmissionState {
     inner: Arc<Inner>,
-    policy: u32,
-    client: ClientKey,
+    /// the client's policy and key, then its /48's (IPv6 only)
+    slots: Vec<(u32, ClientKey)>,
     clock: Clock,
     reserved: AtomicU32,
 }
 
 impl Admission {
-    /// The client address the request is counted against.
-    pub fn client(&self) -> &ClientKey {
-        &self.0.client
+    fn new(inner: Arc<Inner>, client: ClientKey, clock: Clock) -> Option<Admission> {
+        let p = inner.by_class[Class::PreAuth.index()]?;
+        let mut slots = vec![(p, client.clone())];
+        if let (Some(a), Some(net)) = (inner.preauth_aggregate, client.ipv6_network()) {
+            slots.push((a, net));
+        }
+        Some(Admission(Arc::new(AdmissionState {
+            inner,
+            slots,
+            clock,
+            reserved: AtomicU32::new(0),
+        })))
+    }
+
+    /// The policies and client states the request is counted under (with a rate).
+    fn each(&self) -> impl Iterator<Item = (&Policy, (u64, u32), SlotKey)> {
+        let a = &self.0;
+        a.slots.iter().filter_map(|(i, client)| {
+            let p = &a.inner.policies[*i as usize];
+            let key = SlotKey {
+                policy: p.id,
+                client: client.clone(),
+            };
+            Some((p, p.gcra?, key))
+        })
+    }
+
+    fn cost(&self) -> u32 {
+        self.0.inner.policies[self.0.slots[0].0 as usize].failure_cost
     }
 
     /// Charge a failure now, before an expensive credential check; it is given back when
-    /// the request does not fail. `false`: the address has no failures left (answer
-    /// [`Admission::refusal`]).
+    /// the request does not fail. `false`: the address (or its network) has no failures
+    /// left (answer [`Admission::refusal`]).
     pub fn reserve(&self) -> bool {
         let a = &self.0;
-        let p = &a.inner.policies[a.policy as usize];
-        let Some(g) = p.gcra else { return true };
         if a.reserved.load(Ordering::Relaxed) > 0 {
             return true;
         }
-        let slot = a.inner.buckets.slot(SlotKey {
-            policy: p.id,
-            client: a.client.clone(),
-        });
-        let ok = slot.acquire(a.clock.now(), g, p.failure_cost).is_ok();
-        if ok {
-            a.reserved.store(p.failure_cost, Ordering::Relaxed);
+        let (now, cost) = (a.clock.now(), self.cost());
+        let mut taken: Vec<(Arc<Slot>, u64)> = Vec::new();
+        for (_, g, key) in self.each() {
+            let slot = a.inner.buckets.slot(key);
+            if slot.acquire(now, g, cost).is_err() {
+                for (s, t) in taken {
+                    s.refund(t, cost);
+                }
+                return false;
+            }
+            taken.push((slot, g.0));
         }
-        ok
+        a.reserved.store(cost, Ordering::Relaxed);
+        true
     }
 
-    /// The `429` of a request whose reservation failed.
+    /// Whether the address (or its network) has no failures left for a request that
+    /// has not reserved one: its password checks and unknown tokens are refused.
+    pub fn exhausted(&self) -> bool {
+        if self.0.reserved.load(Ordering::Relaxed) > 0 {
+            return false;
+        }
+        let (now, cost) = (self.0.clock.now(), self.cost());
+        self.each().any(|(_, g, key)| {
+            self.0
+                .inner
+                .buckets
+                .get(&key)
+                .is_some_and(|s| s.check(now, g, cost).is_err())
+        })
+    }
+
+    /// The `429` of a request whose reservation failed, or of an exhausted address.
     pub fn refusal(&self) -> Response {
+        let (now, cost) = (self.0.clock.now(), self.cost());
+        let mut worst: Option<(&Policy, u64)> = None;
+        for (p, g, key) in self.each() {
+            let wait = self
+                .0
+                .inner
+                .buckets
+                .get(&key)
+                .and_then(|s| s.check(now, g, cost).err())
+                .unwrap_or(0);
+            if worst.is_none_or(|(_, w)| wait > w) {
+                worst = Some((p, wait));
+            }
+        }
         let a = &self.0;
-        let p = &a.inner.policies[a.policy as usize];
-        let key = SlotKey {
-            policy: p.id,
-            client: a.client.clone(),
-        };
-        let wait = match (p.gcra, a.inner.buckets.get(&key)) {
-            (Some(g), Some(s)) => s.check(a.clock.now(), g, p.failure_cost).err(),
-            _ => None,
-        };
+        let (p, wait) = worst.unwrap_or((&a.inner.policies[a.slots[0].0 as usize], 0));
         reject(
             p,
             StatusCode::TOO_MANY_REQUESTS,
-            wait.map_or(1, secs_ceil),
+            secs_ceil(wait.max(1)),
             "failures",
             0,
         )
     }
+
+    /// After the response: charge a failure (what the reservation did not already
+    /// cover) and report the standing, or give the reservation back.
+    fn settle(&self, resp: &mut Response) {
+        let a = &self.0;
+        let reserved = a.reserved.load(Ordering::Relaxed);
+        let failed = resp.extensions().get::<AuthFailed>().is_some();
+        if !failed && reserved == 0 {
+            return;
+        }
+        let now = a.clock.now();
+        let rest = self.cost().saturating_sub(reserved);
+        for (i, (p, g, key)) in self.each().enumerate() {
+            let slot = a.inner.buckets.slot(key);
+            if !failed {
+                if reserved > 0 {
+                    slot.refund(g.0, reserved);
+                }
+                continue;
+            }
+            if rest > 0 {
+                slot.charge(now, g.0, rest);
+            }
+            if i == 0 {
+                let s = slot.standing(now, g);
+                rate_headers(resp.headers_mut(), p, s.remaining, s.reset_secs);
+            }
+        }
+    }
 }
 
 /// The first stage (`from_fn_with_state`, outside the auth layer and inside
-/// `obs::observe` and CORS): refuses an address that spent its `preauth` budget of
-/// authentication failures before any credential is checked, and charges each failure
-/// (`failure-cost`, default 1) to the address. An address without failures costs a cache
-/// lookup; nothing is stored for it. Without a limiter it does nothing.
+/// `obs::observe` and CORS). It names the client ([`ClientAddr`], for the auth layer's
+/// own limits too) and, with a `preauth` limit, puts the request's [`Admission`] into
+/// it: a budget of failed credential checks per address (and IPv6 /48). Only failures
+/// are charged (`failure-cost`, default 1), and only what would verify a password or
+/// look up an unknown token is refused once the budget is spent (the auth layer asks
+/// the admission); valid tokens and sessions, anonymous requests, health checks and the
+/// UI pass. An address without failures costs a cache lookup; nothing is stored for it.
 pub async fn admit(
     State(rl): State<Option<Arc<RateLimiter>>>,
     mut req: Request,
@@ -1640,50 +1763,12 @@ pub async fn admit(
     // every such client shares one key: a shared budget still bounds password guessing
     let client = PeerKeyer.key(Class::PreAuth, &req, &inner.trusted);
     req.extensions_mut().insert(ClientAddr(client.clone()));
-    let Some(pi) = inner.by_class[Class::PreAuth.index()] else {
+    let Some(adm) = Admission::new(inner, client, rl.clock.clone()) else {
         return next.run(req).await;
     };
-    let p = &inner.policies[pi as usize];
-    let Some(g) = p.gcra else {
-        return next.run(req).await;
-    };
-    let key = SlotKey {
-        policy: p.id,
-        client: client.clone(),
-    };
-    if let Some(s) = inner.buckets.get(&key)
-        && let Err(wait) = s.check(rl.clock.now(), g, 1)
-    {
-        return reject(
-            p,
-            StatusCode::TOO_MANY_REQUESTS,
-            secs_ceil(wait),
-            "failures",
-            0,
-        );
-    }
-    let adm = Admission(Arc::new(AdmissionState {
-        inner: inner.clone(),
-        policy: pi,
-        client,
-        clock: rl.clock.clone(),
-        reserved: AtomicU32::new(0),
-    }));
     req.extensions_mut().insert(adm.clone());
     let mut resp = next.run(req).await;
-    let reserved = adm.0.reserved.load(Ordering::Relaxed);
-    if auth_failed(&resp) {
-        let slot = inner.buckets.slot(key);
-        let now = rl.clock.now();
-        let rest = p.failure_cost.saturating_sub(reserved);
-        if rest > 0 {
-            slot.charge(now, g.0, rest);
-        }
-        let s = slot.standing(now, g);
-        rate_headers(resp.headers_mut(), p, s.remaining, s.reset_secs);
-    } else if reserved > 0 {
-        inner.buckets.slot(key).refund(g.0, reserved);
-    }
+    adm.settle(&mut resp);
     resp
 }
 

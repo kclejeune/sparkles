@@ -734,12 +734,15 @@ fn limiter(flags: &[&str]) -> (Arc<RateLimiter>, Arc<AtomicU64>) {
 }
 
 /// The pre-authentication stage around a stub of the auth layer: `x-reserve` reserves a
-/// failure first (as a password check does), `x-fail` answers 401.
+/// failure first (as a password check does), `x-fail` answers a failed credential check
+/// (401), `x-deny` a refusal of authorization (403).
 fn preauth_app(rl: Arc<RateLimiter>) -> Router {
     async fn stub(req: Request, next: Next) -> Response {
-        let (reserve, fail) = (
-            req.headers().contains_key("x-reserve"),
-            req.headers().contains_key("x-fail"),
+        let h = req.headers();
+        let (reserve, fail, deny) = (
+            h.contains_key("x-reserve"),
+            h.contains_key("x-fail"),
+            h.contains_key("x-deny"),
         );
         if reserve
             && let Some(a) = req.extensions().get::<Admission>()
@@ -748,7 +751,12 @@ fn preauth_app(rl: Arc<RateLimiter>) -> Router {
             return a.refusal();
         }
         if fail {
-            return StatusCode::UNAUTHORIZED.into_response();
+            let mut r = StatusCode::UNAUTHORIZED.into_response();
+            r.extensions_mut().insert(AuthFailed);
+            return r;
+        }
+        if deny {
+            return StatusCode::FORBIDDEN.into_response();
         }
         next.run(req).await
     }
@@ -764,7 +772,7 @@ async fn send(app: &Router, peer: &str, headers: &[&str]) -> Response {
         b = b.header(*h, "1");
     }
     let mut req = b.body(Body::empty()).unwrap();
-    let addr: SocketAddr = format!("{peer}:1").parse().unwrap();
+    let addr = SocketAddr::new(peer.parse().unwrap(), 1);
     req.extensions_mut().insert(ConnectInfo(addr));
     app.clone().oneshot(req).await.unwrap()
 }
@@ -809,14 +817,17 @@ fn preauth_is_a_server_wide_failure_budget() {
 }
 
 #[tokio::test]
-async fn preauth_refuses_addresses_that_failed_too_often() {
+async fn preauth_charges_failed_checks_and_refuses_only_password_checks() {
     let (rl, clock) = limiter(&["preauth=3/min"]);
     let app = preauth_app(rl.clone());
-    // successes cost nothing, and leave no state behind
+    // successes cost nothing and leave no state behind; neither do refusals of
+    // authorization (or any other response that is not a failed credential check)
     for _ in 0..5 {
         let r = send(&app, "192.0.2.1", &[]).await;
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.headers().get("ratelimit").is_none());
+        let r = send(&app, "192.0.2.1", &["x-deny"]).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
     assert_eq!(rl.tracked(), 0);
     for (remaining, reset) in [(2, 20), (1, 40), (0, 60)] {
@@ -828,8 +839,8 @@ async fn preauth_refuses_addresses_that_failed_too_often() {
             format!("\"preauth\";r={remaining};t={reset}")
         );
     }
-    // spent: every request of the address is refused, before authentication
-    let r = send(&app, "192.0.2.1", &[]).await;
+    // spent: a password check is refused before anything is hashed
+    let r = send(&app, "192.0.2.1", &["x-reserve"]).await;
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(hdr(&r, "retry-after"), "20");
     let j = body_json(r).await;
@@ -841,19 +852,60 @@ async fn preauth_refuses_addresses_that_failed_too_often() {
             .unwrap()
             .contains("too many failed authentications")
     );
+    // requests that check no password still pass
+    assert_eq!(send(&app, "192.0.2.1", &[]).await.status(), StatusCode::OK);
     // other addresses are not affected
-    assert_eq!(send(&app, "192.0.2.2", &[]).await.status(), StatusCode::OK);
+    let r = send(&app, "192.0.2.2", &["x-reserve"]).await;
+    assert_eq!(r.status(), StatusCode::OK);
     // a refused request costs nothing more; one failure refills in 20 s
     clock.fetch_add(20_000_000_000, Ordering::Relaxed);
-    assert_eq!(send(&app, "192.0.2.1", &[]).await.status(), StatusCode::OK);
+    let r = send(&app, "192.0.2.1", &["x-reserve"]).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = send(&app, "192.0.2.1", &["x-reserve", "x-fail"]).await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = send(&app, "192.0.2.1", &["x-reserve"]).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn ipv6_networks_share_a_larger_budget() {
+    let (rl, _) = limiter(&["preauth=3/min"]);
+    let app = preauth_app(rl);
+    // a hundred /64s of one /48: its budget (eight times a /64's) runs out first
+    let mut statuses = Vec::new();
+    for i in 0..100 {
+        let peer = format!("2001:db8:0:{i:x}::1");
+        let r = send(&app, &peer, &["x-reserve", "x-fail"]).await;
+        statuses.push(r.status());
+    }
+    let count = |c: StatusCode| statuses.iter().filter(|s| **s == c).count();
+    assert_eq!(count(StatusCode::UNAUTHORIZED), 24);
+    assert_eq!(count(StatusCode::TOO_MANY_REQUESTS), 76);
+    let r = send(&app, "2001:db8:0:ff::2", &["x-reserve"]).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(hdr(&r, "ratelimit-policy"), "\"preauth/48\";q=24;w=60");
+    // another /48 is not affected
+    let r = send(&app, "2001:db8:1::1", &["x-reserve"]).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    // IPv4 addresses have no network budget
+    for i in 1..=10 {
+        let peer = format!("198.51.100.{i}");
+        for _ in 0..3 {
+            let r = send(&app, &peer, &["x-reserve", "x-fail"]).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{peer}");
+        }
+    }
+    let ip = |s: &str| ClientKey::ip(s.parse().unwrap());
     assert_eq!(
-        send(&app, "192.0.2.1", &["x-fail"]).await.status(),
-        StatusCode::UNAUTHORIZED
+        ip("2001:db8:0:1::1").network(),
+        ip("2001:db8:0:ffff::1").network()
     );
-    assert_eq!(
-        send(&app, "192.0.2.1", &[]).await.status(),
-        StatusCode::TOO_MANY_REQUESTS
+    assert_ne!(
+        ip("2001:db8:0:1::1").network(),
+        ip("2001:db8:1::1").network()
     );
+    assert_eq!(ip("192.0.2.1").network(), ip("192.0.2.1"));
+    assert_ne!(ip("192.0.2.1").network(), ip("192.0.2.2").network());
 }
 
 #[tokio::test]
@@ -870,15 +922,9 @@ async fn reservations_are_refunded_unless_the_request_fails() {
     assert_eq!(hdr(&r, "ratelimit"), "\"preauth\";r=1;t=30");
     // concurrent checks cannot all start: a reservation holds the failure it may cost
     let inner = rl.inner.load_full();
-    let policy = inner.by_class[Class::PreAuth.index()].unwrap();
     let admission = || {
-        Admission(Arc::new(AdmissionState {
-            inner: inner.clone(),
-            policy,
-            client: ClientKey::ip("192.0.2.1".parse().unwrap()),
-            clock: rl.clock.clone(),
-            reserved: AtomicU32::new(0),
-        }))
+        let client = ClientKey::ip("192.0.2.1".parse().unwrap());
+        Admission::new(inner.clone(), client, rl.clock.clone()).unwrap()
     };
     let (a, b) = (admission(), admission());
     assert!(a.reserve());

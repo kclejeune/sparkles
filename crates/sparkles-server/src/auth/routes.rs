@@ -520,16 +520,37 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<crate::ratelimit::Admission>()
         .cloned();
+    let client = req
+        .extensions()
+        .get::<crate::ratelimit::ClientAddr>()
+        .map(|c| c.0.network());
     let authed = match auth
-        .authenticate(req.headers(), peer.as_ref(), admission.as_ref())
+        .authenticate(
+            req.headers(),
+            peer.as_ref(),
+            admission.as_ref(),
+            client.as_ref(),
+        )
         .await
     {
         Ok(a) => a,
-        Err(e) => {
+        Err(mut e) => {
+            // credentials that were checked and failed (not a busy check, this limit's
+            // refusal, or a proxy identity that is not admitted)
+            let failed = matches!(
+                e.failure,
+                Failure::Malformed | Failure::Invalid | Failure::Expired
+            );
+            // an address without failures left has its unknown tokens refused like its
+            // password checks
+            let exhausted = failed && admission.as_ref().is_some_and(|a| a.exhausted());
+            if exhausted {
+                e.failure = Failure::Limited;
+            }
             auth.count_failure(e);
             span.record("principal", "-");
             span.record("auth", e.scheme);
-            let r = match e.failure {
+            let mut r = match e.failure {
                 // the address spent its failures: the pre-authentication limit's 429
                 Failure::Limited => match &admission {
                     Some(a) => a.refusal(),
@@ -570,6 +591,9 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     basic,
                 ),
             };
+            if failed && !exhausted {
+                r.extensions_mut().insert(crate::ratelimit::AuthFailed);
+            }
             return with_report(
                 r,
                 AuthReport {
@@ -590,6 +614,15 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         if let Some(c) = &clear {
             r.headers_mut().append(header::SET_COOKIE, c.clone());
             // an invalid session cookie is a failed authentication, though not refused
+            r.extensions_mut().insert(crate::ratelimit::AuthFailed);
+        }
+        r
+    };
+    // a refused origin or CSRF token on an auth route (a login, a token, a device
+    // approval) is a failed authentication too
+    let auth_route = route.starts_with("/$/auth/");
+    let csrf_failed = |mut r: Response| {
+        if auth_route {
             r.extensions_mut().insert(crate::ratelimit::AuthFailed);
         }
         r
@@ -618,7 +651,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         )
     {
         let r = json_error(StatusCode::FORBIDDEN, "cross-origin request refused");
-        return finish(deny(Denied::CrossOrigin, r, &p));
+        return finish(csrf_failed(deny(Denied::CrossOrigin, r, &p)));
     }
     if !safe(&method) && p.is_ambient() && !cli_grant_route(&route) {
         let sent = req
@@ -629,7 +662,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         let want = p.info.csrf.as_deref().unwrap_or("");
         if want.is_empty() || !super::crypto::ct_eq(sent, want.as_bytes()) {
             let r = json_error(StatusCode::FORBIDDEN, "CSRF token missing or invalid");
-            return finish(deny(Denied::Csrf, r, &p));
+            return finish(csrf_failed(deny(Denied::Csrf, r, &p)));
         }
     }
 

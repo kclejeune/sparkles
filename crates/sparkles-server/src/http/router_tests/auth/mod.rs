@@ -1571,20 +1571,30 @@ async fn login_cost_is_bounded() {
     }
     assert_eq!(verifications() - before, 1);
 
+    // a failure costs every request a verification of its own; one client has at most
+    // its share of the verification queue, so the guesses go in waves of that size (more
+    // at once would be refused as busy, which `one_network_cannot_fill_the_verification_queue`
+    // covers)
     let before = verifications();
-    let mut handles = Vec::new();
-    for _ in 0..50 {
-        let app = s.app.clone();
-        handles.push(tokio::spawn(async move {
-            get_as(&app, &format!("/wiki{ASK}"), Some(&basic("nobody", "x")))
-                .await
-                .status
-        }));
+    let wave = auth.verifications_per_client();
+    for _ in 0..50usize.div_ceil(wave) {
+        let mut handles = Vec::new();
+        for _ in 0..wave {
+            let app = s.app.clone();
+            handles.push(tokio::spawn(async move {
+                get_as(&app, &format!("/wiki{ASK}"), Some(&basic("nobody", "x")))
+                    .await
+                    .status
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), StatusCode::UNAUTHORIZED);
+        }
     }
-    for h in handles {
-        assert_eq!(h.await.unwrap(), StatusCode::UNAUTHORIZED);
-    }
-    assert_eq!(verifications() - before, 50);
+    assert_eq!(
+        verifications() - before,
+        (50usize.div_ceil(wave) * wave) as u64
+    );
 }
 
 // ---------------------------------------------------------------------------

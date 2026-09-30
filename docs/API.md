@@ -219,7 +219,7 @@ Off by default, except for failed authentications when authentication is on (see
 | `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
-| `preauth` | every request, before authentication: authentication failures per client address (no per-dataset form) |
+| `preauth` | every request, before authentication: failed credential checks per client address and IPv6 /48 (no per-dataset form) |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
 
@@ -230,7 +230,8 @@ Off by default, except for failed authentications when authentication is on (see
 * `concurrency=N`: requests of the class in flight server-wide;
 * `client-concurrency=N`: requests in flight per client;
 * `failure-cost=N`: what a `401` or `403` response costs, in requests (default 1), so that
-  failed logins exhaust the budget faster.
+  failed logins exhaust the budget faster (for `preauth`: what a failed credential check
+  costs).
 
 `CLASS@DATASET=…` replaces the class limit for requests to that dataset (with its own
 counters); `CLASS@DATASET=off` exempts the dataset. Examples:
@@ -322,16 +323,27 @@ in `sparkles_requests_total{outcome="rate_limited"}` and
 #### Before authentication (`preauth`)
 
 A first stage runs before any credential is checked, so that password guessing and the
-hashing it costs are bounded per client address. Every address has a budget of
-authentication failures: a `401` or `403`, a refusal of the auth layer (a hidden
-dataset's `404`, a cross-origin or CSRF refusal), an invalid session cookie, or a busy
-password check. Each costs `failure-cost` (default 1); successful requests cost nothing,
-and an address without failures leaves no state behind. An address that has spent its
-budget is refused with `429` (`"limitClass": "preauth"`, `"reason": "failures"`) until it
-refills, whatever it sends and before any password is hashed. A password check (HTTP
-Basic, a UI password login) takes the cost of a failure before it starts and gives it
-back when the password is right, so concurrent guesses from one address cannot all start
-hashing. Responses to failures carry the stage's `RateLimit-Policy` and `RateLimit`.
+hashing it costs are bounded per client address. Every address has a budget of failed
+credential checks: a wrong password (HTTP Basic or a UI login), an unknown, expired or
+malformed token, an invalid session cookie, an unknown device user code or loopback
+code, a failed OIDC callback, and a cross-origin or CSRF refusal on an `/$/auth/` route.
+Nothing else is charged: not a `403` of authorization (a read-only server, `SERVICE` or
+`LOAD` refused by policy, a missing permission), not a hidden dataset's `404`, not the
+`401` of an anonymous request, and not a busy password check. Each failure costs
+`failure-cost` (default 1); an address without failures leaves no state behind. An IPv6
+client also spends the budget of its /48, eight times as large (`"preauth/48"` in the
+headers), so a network that holds many /64s does not get a budget per /64.
+
+An address (or /48) that has spent its budget is refused with `429` (`"limitClass":
+"preauth"`, `"reason": "failures"`) until it refills, but only for what would hash a
+password (HTTP Basic and UI password logins whose credentials are not in the
+verified-credential cache) or turns out to present an unknown token. Valid tokens,
+sessions and proxy identities, anonymous requests, `/$/ping`, `/$/ready` and the UI keep
+working, so one client's guesses from a shared address do not take the others, or a load
+balancer's health checks, down with it. A password check takes the cost of a failure
+before it starts and gives it back when the password is right, so concurrent guesses
+from one address cannot all start hashing. Responses to failures carry the stage's
+`RateLimit-Policy` and `RateLimit`.
 Requests without a client address (over `--unix-socket` with no trusted `unix` proxy)
 share one budget, so guessing stays bounded there too; trust the proxy on the socket so
 that its clients are told apart.
@@ -1487,12 +1499,16 @@ per client address.
 
 The auth layer has limits of its own, which answer `429` with `"limitClass": "auth"`:
 tokens minted per owner (`tokens_policy.mint_rate`, default `60/h`; `reason` `mint`),
-device logins started per address (20, then two a minute, with `preauth` on; `device`) and
+device logins started per client network (an IPv4 address or an IPv6 /48; 20, then two a
+minute, whether `preauth` is on or not; `device`) and
 unknown user codes per session (20, then two a minute; `device-code`). An owner has at
 most `tokens_policy.max_active_per_owner` unexpired tokens (default 100); minting another
 answers `409` until one is revoked or expires. At most max(1, cores / 2) argon2 password
 verifications run at once and four per permit wait (up to five seconds); a check beyond
-that is refused at once with `503` and `Retry-After: 1`.
+that is refused at once with `503` and `Retry-After: 1`. One client network (an IPv4
+address, an IPv6 /48, or the clients of an untrusted Unix socket together) has at most
+max(2, cores / 2) of them running and waiting, and its further checks are refused the
+same way, so that a single network cannot fill the queue for everyone.
 
 **Metrics.** `sparkles_auth_failures_total{scheme,reason}`,
 `sparkles_auth_denied_total{kind}` (`unauthenticated`, `forbidden`, `hidden`,

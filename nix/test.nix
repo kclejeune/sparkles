@@ -93,6 +93,10 @@
     assert code == "429", code
     code = status(f"--interface 127.0.0.3 -u alice:alice-pw -H 'Forwarded: for=127.0.0.2' {ask}")
     assert code == "200", code
+    # the spent client is refused password checks only: health checks and anonymous
+    # requests still pass
+    assert status(f"--interface 127.0.0.2 {base}/\\$/ping") == "200"
+    assert status(f"--interface 127.0.0.2 {ask}") == "200"
 
     # the CLI is installed; the served database is locked against a second process
     machine.succeed("sparkles --version")
