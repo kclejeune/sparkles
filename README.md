@@ -34,7 +34,7 @@ interactive querying.
 
 | Path | Role | Jena analogue |
 |---|---|---|
-| `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db |
+| `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db, jena-querybuilder, jena-rdfconnection (in-process) |
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core + SHACL-SPARQL validation over store snapshots | jena-shacl |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
@@ -79,7 +79,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`) | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`), operating on the database directory directly | ✅ |
+| Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
 | SHACL Core + SHACL-SPARQL validation (`sparkles-shacl`): W3C suite **98/98** Core, **20/20** SPARQL; parallel, index-backed | ✅ |
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
@@ -88,10 +89,11 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 
 ## Performance
 
-See `docs/BENCHMARKS.md`. On 1.05M triples, Sparkles bulk-loads in 0.9 s (QLever 1.4 s,
-Jena TDB2 4.4 s) and is the fastest of the three on 7 of 11 queries over HTTP. It is
-within 1–2× of QLever on the rest. It is 1.2–15× faster than Fuseki on every query
-except `contains`, where the two are within noise.
+See `docs/BENCHMARKS.md`. On 1.05M triples (hyperfine over HTTP, result caches off),
+Sparkles bulk-loads in 0.8 s (QLever 1.5 s, Jena TDB2 4.3 s). It is the fastest of the
+three on 9 of 11 queries, within 1.6× of QLever on the other two, and 1.3–11× faster
+than Fuseki throughout. At 10.5M triples the load takes 6.1 s (QLever 9.1 s, TDB2
+42.6 s).
 
 ## Notable optimizations adopted from QLever
 
@@ -166,6 +168,64 @@ except `contains`, where the two are within noise.
 | Reasoning is materialized (forward chaining into the `urn:x-sparkles:inferred` graph, queried as default ∪ inferred) instead of Jena's on-the-fly `InfGraph` | Query speed stays that of the plain index. The trade-off is re-running `/$/reason` after updates. Backward (LP) rules are not supported. |
 | `AS ?v` targets that are already in scope are rejected (SPARQL §18.2.1) | `spargebra` does not check this, so Sparkles validates it itself, matching Jena and QLever. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text, GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
+
+## Using the library (no server)
+
+`crates/sparkles` is a plain Rust library. The CLI (everything except `serve`) and the
+server are built on it, so anything they do can be done in-process. A database
+directory is locked while open (`sparkles.lock`, like TDB2's `tdb.lock`).
+
+```rust
+use sparkles::{Dataset, io::RdfFormat};
+use sparkles::querybuilder::{SelectBuilder, UpdateBuilder, expr, lit, var};
+
+let ds = Dataset::open("mydb")?;                 // or Dataset::memory()
+ds.load_file("data.ttl.gz")?;                    // parallel bulk path for large inputs
+
+// SPARQL text
+for row in &ds.select("SELECT ?s ?name WHERE { ?s foaf:name ?name } LIMIT 10")? {
+    println!("{} {}", row.get("s").unwrap(), row.get("name").unwrap());
+}
+
+// fluent builder (jena-querybuilder): typed terms, escaped literals, prepared queries
+let adults = SelectBuilder::new()
+    .select("?name")
+    .where_("?p", "foaf:name", "?name")
+    .where_("?p", "foaf:age", "?age")
+    .filter(expr::gt(var("age"), 17))
+    .order_by("?name")
+    .limit(100)
+    .execute(&ds)?;
+UpdateBuilder::new()
+    .insert_data("<http://ex/carol>", "foaf:name", lit(user_input))
+    .execute(&ds)?;
+
+// term-level graph access (Jena Graph / DatasetGraph)
+let g = ds.default_graph();                       // named_graph(iri), union_graph()
+let knows = g.find(Some(&alice), Some(&foaf_knows), None)?;
+ds.transaction(|tx| {                              // committed on Ok, rolled back on Err
+    tx.remove_triple(&knows[0])?;
+    tx.insert_triple(&new_triple)?;
+    Ok(())
+})?;
+ds.dump(std::io::stdout(), RdfFormat::TriG)?;
+```
+
+| Jena | Sparkles |
+|---|---|
+| `TDB2Factory.connectDataset(dir)` / `DatasetFactory.createTxnMem()` | `Dataset::open(dir)` / `Dataset::memory()` |
+| `RDFDataMgr.read` / `RDFParser` | `Dataset::load_file`, `load_str`, `load_*_into(graph)`; `sparkles::io` |
+| `QueryExecution` / `RDFConnection.query` | `Dataset::query`, `select`, `ask`, `construct` (`QueryOptions` for timeouts, datasets, initial bindings) |
+| `UpdateExecution` / `RDFConnection.update` | `Dataset::update` |
+| `Graph.find/add/delete/size`, `DatasetGraph.find` | `GraphView::find/insert/remove/len`, `Dataset::find` |
+| `Txn.executeWrite` | `Dataset::transaction` |
+| `jena-querybuilder` `SelectBuilder` & co. | `sparkles::querybuilder` |
+| `QueryExec.substitution` / `setVar` | `QueryOptions::initial_bindings` / builder `set_var` |
+| reasoners (`InfModel`) | `sparkles_reasoner::materialize` (crate `sparkles-reasoner`) |
+| `ShaclValidator` | `sparkles_shacl::validate` (crate `sparkles-shacl`) |
+
+Lower-level access (ids, snapshots, raw index scans, the bulk `Builder`) is available
+through `Dataset::store()` and the `store` / `index` / `builder` modules.
 
 ## Building & running
 
