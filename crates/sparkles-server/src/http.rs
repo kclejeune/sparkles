@@ -82,17 +82,32 @@ impl From<Error> for ApiError {
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let mut body = json!({ "error": msg });
-        if let Error::SparqlSyntax(_) = e {
-            // peg errors look like "error at 3:14: expected ..."
-            let re = regex::Regex::new(r"at (\d+):(\d+)").unwrap();
-            if let Some(c) = re.captures(&msg) {
-                body["line"] = c[1].parse::<u64>().unwrap_or(0).into();
-                body["column"] = c[2].parse::<u64>().unwrap_or(0).into();
-            }
-        }
+        let body = if let Error::SparqlSyntax(_) = e { syntax_error_body(&msg) } else { json!({ "error": msg }) };
         ApiError(status, body)
     }
+}
+
+/// `{error, detail?, line?, column?}` for a SPARQL parse error. Parser messages look like
+/// "SPARQL syntax error: error at 3:14: expected one of …" and the list of expected
+/// tokens can run to several hundred characters, so `error` gets a short summary and
+/// the full text goes to `detail`.
+fn syntax_error_body(msg: &str) -> J {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)error at (\d+):(\d+):\s*(.*)").unwrap());
+    const MAX: usize = 160;
+    let Some(c) = RE.captures(msg) else {
+        return json!({ "error": msg });
+    };
+    let (line, column) = (c[1].parse::<u64>().unwrap_or(0), c[2].parse::<u64>().unwrap_or(0));
+    let rest = c[3].trim();
+    let mut summary = format!("SPARQL syntax error at line {line}, column {column}: {rest}");
+    let mut body = json!({ "line": line, "column": column });
+    if summary.chars().count() > MAX {
+        summary = summary.chars().take(MAX).collect::<String>().trim_end().to_string() + "…";
+        body["detail"] = msg.into();
+    }
+    body["error"] = summary.into();
+    body
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -293,28 +308,30 @@ async fn query_endpoint(State(st): St, Path(name): Path<String>, method: Method,
     let prefixes = ds.store.prefixes();
     blocking(move || {
         let t = std::time::Instant::now();
-        let mut r = sparkles::sparql::query(ds.store.snapshot(), &query, &opts)?;
+        let r = sparkles::sparql::query(ds.store.snapshot(), &query, &opts)?;
         let mut buf = Vec::new();
+        let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
         let ct: String = match r.kind {
-            QueryKind::Select | QueryKind::Ask => {
-                if sfmt == SolutionsFormat::Sparkles {
-                    // account for serialization time inside the document
-                    let ts = std::time::Instant::now();
-                    results::write_solutions(&r, sfmt, &mut Vec::new(), send)?;
-                    r.timing.serialize_ms = ts.elapsed().as_secs_f64() * 1000.0;
-                    r.timing.total_ms += r.timing.serialize_ms;
+            _ if sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers)) => {
+                // Build the document once, then patch the serialization time into it.
+                let ts = std::time::Instant::now();
+                let mut doc = results::sparkles_json(&r, send);
+                let ser_ms = ts.elapsed().as_secs_f64() * 1000.0;
+                if let Some(timing) = doc.pointer_mut("/meta/timing").and_then(J::as_object_mut) {
+                    let total = timing.get("totalMs").and_then(J::as_f64).unwrap_or(0.0);
+                    timing.insert("serializeMs".into(), ser_ms.into());
+                    timing.insert("totalMs".into(), (total + ser_ms).into());
                 }
+                serde_json::to_writer(&mut buf, &doc).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                SolutionsFormat::Sparkles.media_type().into()
+            }
+            QueryKind::Select | QueryKind::Ask => {
                 results::write_solutions(&r, sfmt, &mut buf, send)?;
                 sfmt.media_type().into()
             }
             _ => {
-                if sfmt == SolutionsFormat::Sparkles && params_wants_sparkles(&headers) {
-                    results::write_solutions(&r, SolutionsFormat::Sparkles, &mut buf, send)?;
-                    SolutionsFormat::Sparkles.media_type().into()
-                } else {
-                    results::write_graph(&r, rfmt, &prefixes, &mut buf)?;
-                    results::rdf_media_type(rfmt).into()
-                }
+                results::write_graph(&r, rfmt, &prefixes, &mut buf)?;
+                results::rdf_media_type(rfmt).into()
             }
         };
         tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
@@ -654,6 +671,12 @@ async fn create_dataset(State(st): St, uri: Uri, headers: HeaderMap, body: Bytes
         "persistent" | "tdb" | "tdb2" => DbType::Persistent,
         other => return Err(err(StatusCode::BAD_REQUEST, format!("unknown dbType '{other}'"))),
     };
+    if !crate::state::valid_name(&name) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid dataset name '{name}': use letters, digits, '_', '-' or '.' (max 64 characters)"),
+        ));
+    }
     if st.get(&name).is_some() {
         return Err(err(StatusCode::CONFLICT, format!("dataset /{name} already exists")));
     }
@@ -840,6 +863,9 @@ async fn reason(State(st): St, Path(name): Path<String>, headers: HeaderMap, bod
 
 #[cfg(feature = "reasoning")]
 async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
     let ds = dataset(&st, &name)?;
     let st2 = st.clone();
     blocking(move || {
@@ -877,7 +903,25 @@ async fn get_task(State(st): St, Path(id): Path<String>) -> ApiResult<Json<J>> {
 
 #[cfg(test)]
 mod tests {
-    use super::negotiate;
+    use super::{negotiate, syntax_error_body};
+
+    #[test]
+    fn syntax_errors() {
+        let b = syntax_error_body("SPARQL syntax error: error at 3:2: expected OPTIONAL");
+        assert_eq!(b["line"], 3);
+        assert_eq!(b["column"], 2);
+        assert_eq!(b["error"], "SPARQL syntax error at line 3, column 2: expected OPTIONAL");
+        assert!(b.get("detail").is_none());
+
+        let long = format!("SPARQL syntax error: error at 1:41: expected one of {}", "\"x\", ".repeat(100));
+        let b = syntax_error_body(&long);
+        assert_eq!(b["line"], 1);
+        assert!(b["error"].as_str().unwrap().ends_with('…'));
+        assert!(b["error"].as_str().unwrap().chars().count() <= 161);
+        assert_eq!(b["detail"], long.as_str());
+
+        assert_eq!(syntax_error_body("something else")["error"], "something else");
+    }
 
     #[test]
     fn content_negotiation() {
