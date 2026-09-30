@@ -1,0 +1,163 @@
+# Development tools and tasks. `mise tasks` lists everything; `mise run <task>`.
+# Rust itself is pinned by rust-toolchain.toml (rustup), not here.
+
+[tools]
+node = "24"
+pnpm = "10.34.5"
+hyperfine = "1.20"
+
+# ------------------------------------------------------------------------------ UI ----
+
+[tasks."ui:install"]
+description = "Install UI dependencies"
+dir = "ui"
+run = "pnpm install --frozen-lockfile"
+sources = ["package.json", "pnpm-lock.yaml"]
+outputs = ["node_modules/.modules.yaml"]
+
+[tasks."ui:build"]
+description = "Build the SvelteKit UI (embedded into the server binary)"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm build"
+sources = ["src/**/*", "static/**/*", "svelte.config.js", "vite.config.ts", "package.json"]
+outputs = ["build/index.html"]
+
+[tasks."ui:dev"]
+description = "UI dev server (proxies the API to $SPARKLES_API, default http://localhost:3030)"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm dev"
+
+[tasks."ui:mock"]
+description = "Mock API server for UI development without the Rust backend"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm mock"
+
+[tasks."ui:check"]
+description = "Type-check the UI (svelte-check)"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm check"
+
+[tasks."ui:fmt"]
+description = "Format the UI (Prettier)"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm format"
+
+[tasks."ui:fmt:check"]
+description = "Check UI formatting"
+depends = ["ui:install"]
+dir = "ui"
+run = "pnpm format:check"
+
+# ----------------------------------------------------------------- format / lint / test ----
+
+[tasks.fmt]
+description = "Format Rust and UI code"
+depends = ["ui:fmt"]
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting (CI)"
+depends = ["ui:fmt:check"]
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Clippy (warnings are errors) + svelte-check"
+depends = ["ui:check"]
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.check]
+description = "Fast compile check of all crates and targets + UI type check"
+depends = ["ui:check"]
+run = "cargo check --workspace --all-targets"
+
+[tasks.test]
+description = "All Rust tests (unit, W3C SPARQL + SHACL suites when the Jena checkout is present, doctests)"
+run = "cargo test --workspace"
+
+[tasks."test:w3c"]
+description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
+run = "cargo test -p sparkles --test w3c -- --nocapture --test-threads=1"
+
+[tasks."test:shacl"]
+description = "W3C SHACL Core + SHACL-SPARQL conformance"
+run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
+
+[tasks.ci]
+description = "Everything CI should run: formatting, lints, tests"
+depends = ["fmt:check", "lint", "test"]
+
+# -------------------------------------------------------------------------- build / run ----
+
+[tasks.build]
+description = "Release build of the server/CLI with the embedded UI"
+depends = ["ui:build"]
+run = "cargo build --release -p sparkles-server"
+
+[tasks.serve]
+description = "Run the server (UI at http://localhost:3030/ui/); extra args go to `sparkles serve`"
+depends = ["build"]
+run = "./target/release/sparkles serve --data ./data"
+
+[tasks.doc]
+description = "API docs for the library crates"
+run = "cargo doc --workspace --no-deps --exclude sparkles-server"
+
+[tasks.gen-data]
+description = "Generate a synthetic N-Triples dataset (~10.5 triples per person)"
+usage = '''
+arg "[people]" default="100000" help="number of people to generate"
+arg "[out]" default="target/bench-data/data.nt" help="output file"
+'''
+run = '''
+mkdir -p "$(dirname "$usage_out")"
+python3 scripts/gen-data.py "$usage_people" > "$usage_out"
+wc -l "$usage_out"
+'''
+
+[tasks.clean]
+description = "Remove build outputs"
+run = ["cargo clean", "rm -rf ui/build ui/.svelte-kit"]
+
+# ---------------------------------------------------------------------------- benchmarks ----
+
+[tasks.bench]
+description = "Sparkles vs Jena/Fuseki vs QLever (hyperfine over HTTP; Jena/QLever from nixpkgs if not on PATH)"
+depends = ["build"]
+usage = '''
+arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench" help="data, indexes and results/ (summary.md)"
+flag "--runs <n>" default="10" help="measured runs per query"
+flag "--warmup <n>" default="2" help="warm-up runs per query"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--skip-queries" help="reuse per-query results; re-run updates / throughput / memory"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" \
+SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
+scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:reasoner"]
+description = "RDFS / OWL RL materialization benchmark on generated data"
+usage = '''
+arg "[triples]" default="100000"
+arg "[profile]" default="rdfs" help="rdfs | rdfs-simple | owl-rl"
+'''
+run = 'cargo run --release -p sparkles-reasoner --example bench -- "$usage_triples" "$usage_profile"'
+
+[tasks."bench:shacl"]
+description = "SHACL validation benchmark on generated data"
+usage = '''
+arg "[people]" default="10000"
+'''
+run = '''
+mkdir -p target/bench-data
+f="target/bench-data/shacl-$usage_people.nt"
+[ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
+cargo run --release -p sparkles-shacl --example bench -- "$f" - 5
+'''
