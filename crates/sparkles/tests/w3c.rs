@@ -51,7 +51,7 @@ fn path_to_url(p: &Path) -> String {
 
 fn load_graph(url: &str) -> Graph {
     let path = url_to_path(url);
-    let (fmt, _) = sparkles::io::format_for_path(&path).unwrap_or((RdfFormat::Turtle, false));
+    let (fmt, _) = sparkles::io::format_for_path(&path).unwrap_or((RdfFormat::Turtle, None));
     let parser = oxrdfio::RdfParser::from_format(fmt)
         .with_base_iri(url)
         .unwrap();

@@ -52,14 +52,14 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Bulk write path: large update/inference batches are merged into a rebuilt generation (atomic `CURRENT` switch) | ✅ |
 | Sorted, front-coded, mmapped base vocabulary; append-only delta vocabulary | ✅ |
 | 7 permutations (SPO SOP PSO POS OSP OPS GSPO), 32k-row compressed blocks | ✅ |
-| Parallel bulk loader (Turtle / N-Triples / N-Quads / TriG / RDF/XML / JSON-LD, `.gz`) | ✅ |
+| Parallel bulk loader (Turtle / N-Triples / N-Quads / TriG / RDF/XML / JSON-LD; gzip, zstd, brotli or LZ4 compressed) | ✅ |
 | External sort for inputs larger than the memory budget | ✅ |
 | Planner statistics (per predicate counts, distinct S/O, classes, graphs) | ✅ |
 | MVCC snapshots, single writer (MR+SW), WAL with crash-safe replay | ✅ |
 | Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
-| Backups (gzipped N-Quads) | ✅ |
+| Backups and dumps (N-Quads; gzip by default, or zstd, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
 | Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
@@ -304,7 +304,7 @@ See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the head-to-head numbers.
 | Graph stored as a 4th key column in every permutation, plus a GSPO permutation | This matches QLever's graph column. GSPO gives TDB2-style graph-scoped access (dumps, `GRAPH ?g {}` enumeration). |
 | Deltas held as persistent ordered sets (`imbl`) and WAL-logged | Gives O(1) snapshot publication for MVCC. QLever locates delta triples per block instead; we may adopt that later. |
 | Blank nodes are stored ids and serialize as `_:b<hex>` | Labels round-trip through the protocol, like Jena's `<_:…>` handling. |
-| LZ4 instead of zstd for blocks; front coding instead of FSST for the vocabulary | Pure-Rust dependencies and very fast decoding. zstd/FSST remain a possible upgrade for compression ratio. |
+| LZ4 instead of zstd for index blocks; front coding instead of FSST for the vocabulary | Very fast decoding on the query path. zstd is used where ratio matters more than decode speed (backups, dumps, HTTP, the full-text document store); zstd blocks and FSST remain possible upgrades. |
 | Canonical decimal output follows XSD 1.1 (`"4"^^xsd:decimal`), whereas Jena writes `"4.0"` | Comes from `oxsdatatypes`; the values are equal, so value-based result comparison is unaffected. |
 | SPARQL parsing and algebra via `spargebra` instead of a port of ARQ's JavaCC grammar | The algebra matches SPARQL 1.1 §18. ARQ syntax extensions (LET, `apf:` property functions, custom aggregates) are not supported. |
 | Filter placement and equality substitution happen in the planner rather than as ARQ-style algebra transforms | Same effect as `TransformFilterPlacement` / `TransformFilterEquality`, with one less pass over the algebra. |
@@ -433,7 +433,8 @@ sparkles query   --data file.ttl --query q.rq # query files in memory (arq --dat
 sparkles update  --loc db 'INSERT DATA {...}'
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
-sparkles backup  --loc db --out backups/
+sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
+sparkles backup  --loc db --out backups/      # gzip; --compress zstd --level 9 --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)

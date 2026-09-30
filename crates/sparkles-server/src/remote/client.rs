@@ -382,8 +382,11 @@ pub fn load(
     }
     let r = Remote::open(server, insecure)?;
     for f in files {
-        let (format, gz) = sparkles::io::format_for_path(f)
+        let (format, _) = sparkles::io::format_for_path(f)
             .with_context(|| format!("{}: unknown RDF format", f.display()))?;
+        let mut src = sparkles::io::Source::from_path(f, None)?;
+        src.compression = None;
+        let codec = src.codec()?;
         let quads = matches!(
             format,
             oxrdfio::RdfFormat::NQuads | oxrdfio::RdfFormat::TriG
@@ -402,14 +405,26 @@ pub fn load(
             if target.is_empty() { "" } else { "?" }
         );
         let file = std::fs::File::open(f).with_context(|| format!("opening {}", f.display()))?;
-        let body = if gz {
-            reqwest::blocking::Body::new(flate2::read::MultiGzDecoder::new(file))
-        } else {
-            reqwest::blocking::Body::new(file)
+        // gzip, zstd and brotli travel compressed (`Content-Encoding`); LZ4 has no HTTP
+        // encoding and is decompressed here
+        let (body, encoding) = match codec.content_encoding() {
+            Some(e) => (reqwest::blocking::Body::new(file), Some(e)),
+            None if codec == sparkles::codec::Codec::None => {
+                (reqwest::blocking::Body::new(file), None)
+            }
+            None => {
+                let mut tmp = tempfile::tempfile()?;
+                std::io::copy(&mut codec.reader(file, None)?, &mut tmp)?;
+                std::io::Seek::rewind(&mut tmp)?;
+                (reqwest::blocking::Body::new(tmp), None)
+            }
         };
+        let mut req = r.req(Method::POST, &path);
+        if let Some(e) = encoding {
+            req = req.header("content-encoding", e);
+        }
         let resp = r.check(
-            r.req(Method::POST, &path)
-                .header("content-type", format.media_type())
+            req.header("content-type", format.media_type())
                 .header("accept", "application/json")
                 .body(body)
                 .send(),

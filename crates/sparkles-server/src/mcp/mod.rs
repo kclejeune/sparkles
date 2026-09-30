@@ -313,6 +313,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         max_result_bytes: None,
         max_rows: args.max_rows,
         update_timeout: None,
+        ..Default::default()
     };
     let st = Arc::new(st);
     if args.data.is_empty() {

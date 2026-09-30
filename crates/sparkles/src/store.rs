@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
+use crate::codec::{Codec, Level};
 use crate::commit::{
     self, Catalog, CommitInfo, CommitKind, CommitPage, CommitRange, ForkedFrom, Receipt,
 };
@@ -2374,12 +2375,30 @@ impl Store {
 
     /// Gzipped N-Quads backup into `dir` (Fuseki `/$/backup`). Returns the file path.
     pub fn backup(&self, dir: &Path, name: &str) -> Result<PathBuf> {
+        self.backup_with(dir, name, Codec::Gzip, None, 1)
+    }
+
+    /// N-Quads backup into `dir` as `{name}_{timestamp}.nq{codec extension}`, written to a
+    /// temporary name first so a failed backup leaves no partial file. Returns the path.
+    pub fn backup_with(
+        &self,
+        dir: &Path,
+        name: &str,
+        codec: Codec,
+        level: Option<Level>,
+        threads: usize,
+    ) -> Result<PathBuf> {
         std::fs::create_dir_all(dir)?;
         let ts = crate::builder::now_rfc3339().replace(':', "-");
-        let path = dir.join(format!("{name}_{ts}.nq.gz"));
-        let f = BufWriter::new(File::create(&path)?);
-        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        self.dump_nquads(gz)?;
+        let path = dir.join(format!("{name}_{ts}.nq{}", codec.extension()));
+        let tmp = tempfile::Builder::new()
+            .prefix(".backup-")
+            .tempfile_in(dir)?;
+        let mut w = codec.writer(BufWriter::new(tmp.as_file()), level, threads)?;
+        self.dump_nquads(&mut w)?;
+        w.finish()?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| Error::Io(e.error))?;
         Ok(path)
     }
 
@@ -2963,14 +2982,14 @@ fn guard_required_by(root: &Path) -> bool {
 }
 
 /// A rough quad count of RDF sources from their size (~80 bytes per quad in text
-/// formats, gzip counted as 8×).
+/// formats; compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion)).
 fn estimated_quads(sources: &[Source]) -> u64 {
     let mut bytes = 0u64;
     for s in sources {
         bytes += match &s.data {
             crate::io::SourceData::Bytes(b) => b.len() as u64,
             crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-        } * if s.gzip { 8 } else { 1 };
+        } * s.codec().map_or(1, |c| c.expansion());
     }
     bytes / 80
 }

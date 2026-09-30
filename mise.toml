@@ -20,7 +20,7 @@ description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install"]
 dir = "ui"
 run = "pnpm build"
-sources = ["src/**/*", "static/**/*", "svelte.config.js", "vite.config.ts", "package.json"]
+sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json"]
 outputs = ["build/index.html"]
 
 [tasks."ui:dev"]

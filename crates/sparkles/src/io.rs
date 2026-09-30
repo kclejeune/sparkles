@@ -1,5 +1,6 @@
 //! RDF input: format detection and (parallel) parsing of sources (RIOT equivalent).
 
+use crate::codec::Codec;
 use crate::error::{Error, Result};
 use memmap2::Mmap;
 use oxrdf::{GraphName, NamedNode, Quad};
@@ -23,7 +24,11 @@ pub enum SourceData {
 pub struct Source {
     pub data: SourceData,
     pub format: RdfFormat,
-    pub gzip: bool,
+    /// The compression of the data: `None` detects it (magic bytes, then the file
+    /// extension); a codec is checked against the magic bytes.
+    pub compression: Option<Codec>,
+    /// Fail past this many decompressed bytes (compressed data only).
+    pub max_decompressed: Option<u64>,
     /// Load triples into this graph (default graph if `None`). Named graphs from quad
     /// formats are kept.
     pub graph: Option<NamedNode>,
@@ -34,14 +39,15 @@ pub struct Source {
 
 impl Source {
     pub fn from_path(path: &Path, graph: Option<NamedNode>) -> Result<Source> {
-        let (format, gzip) = format_for_path(path).ok_or_else(|| {
+        let (format, _) = format_for_path(path).ok_or_else(|| {
             Error::invalid(format!("cannot determine RDF format of {}", path.display()))
         })?;
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         Ok(Source {
             data: SourceData::File(path.to_path_buf()),
             format,
-            gzip,
+            compression: None,
+            max_decompressed: None,
             graph,
             base: Some(format!("file://{}", abs.display())),
             name: path.display().to_string(),
@@ -52,21 +58,58 @@ impl Source {
         Source {
             data: SourceData::Bytes(bytes),
             format,
-            gzip: false,
+            compression: None,
+            max_decompressed: None,
             graph,
             base: None,
             name: "<request body>".into(),
         }
     }
+
+    /// The data's compression: the explicit choice (checked against the magic bytes),
+    /// else the magic bytes, else the file extension. Logs a warning when the file
+    /// name and the data disagree.
+    pub fn codec(&self) -> Result<Codec> {
+        let mut prefix = [0u8; 4];
+        let (n, path) = match &self.data {
+            SourceData::Bytes(b) => {
+                let n = b.len().min(4);
+                prefix[..n].copy_from_slice(&b[..n]);
+                (n, None)
+            }
+            SourceData::File(p) => {
+                let mut f = File::open(p)?;
+                let mut n = 0;
+                while n < 4 {
+                    match f.read(&mut prefix[n..])? {
+                        0 => break,
+                        k => n += k,
+                    }
+                }
+                (n, Some(p.as_path()))
+            }
+        };
+        let (codec, warning) = Codec::detect(self.compression, &prefix[..n], path)?;
+        if let Some(w) = warning {
+            tracing::warn!("{w}");
+        }
+        if !codec.supported() {
+            return Err(Error::Unsupported(format!(
+                "{}: built without {}",
+                self.name,
+                codec.name()
+            )));
+        }
+        Ok(codec)
+    }
 }
 
-/// Guess format (and gzip) from a file name like `data.ttl.gz`.
-pub fn format_for_path(path: &Path) -> Option<(RdfFormat, bool)> {
+/// Guess the format (and compression) from a file name like `data.ttl.gz` or
+/// `data.nq.zst`.
+pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
+    let codec = Codec::from_extension(path);
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-    let (name, gz) = match name.strip_suffix(".gz") {
-        Some(n) => (n.to_string(), true),
-        None => (name, false),
-    };
+    let name = Codec::strip_extension(&name);
     let ext = name.rsplit('.').next()?;
     let f = match ext {
         "ttl" | "turtle" => RdfFormat::Turtle,
@@ -80,7 +123,7 @@ pub fn format_for_path(path: &Path) -> Option<(RdfFormat, bool)> {
         "n3" => RdfFormat::N3,
         _ => RdfFormat::from_extension(ext)?,
     };
-    Some((f, gz))
+    Some((f, codec))
 }
 
 /// Parse a media type (ignoring parameters) into an RDF format.
@@ -113,20 +156,22 @@ impl AsRef<[u8]> for Loaded {
 }
 
 fn load_bytes(src: &Source) -> Result<Loaded> {
+    let codec = src.codec()?;
+    let inflate = |r: &mut dyn Read| -> Result<Loaded> {
+        let mut out = Vec::new();
+        codec
+            .reader(r, src.max_decompressed)?
+            .read_to_end(&mut out)
+            .map_err(crate::codec::io_error)?;
+        Ok(Loaded::Vec(out))
+    };
     match &src.data {
-        SourceData::Bytes(b) if !src.gzip => Ok(Loaded::Vec(b.clone())),
-        SourceData::Bytes(b) => {
-            let mut out = Vec::new();
-            flate2::read::MultiGzDecoder::new(&b[..]).read_to_end(&mut out)?;
-            Ok(Loaded::Vec(out))
-        }
+        SourceData::Bytes(b) if codec == Codec::None => Ok(Loaded::Vec(b.clone())),
+        SourceData::Bytes(b) => inflate(&mut &b[..]),
         SourceData::File(p) => {
-            let f = File::open(p)?;
-            if src.gzip {
-                let mut out = Vec::new();
-                flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f))
-                    .read_to_end(&mut out)?;
-                Ok(Loaded::Vec(out))
+            let mut f = File::open(p)?;
+            if codec != Codec::None {
+                inflate(&mut f)
             } else if f.metadata()?.len() == 0 {
                 Ok(Loaded::Vec(Vec::new()))
             } else {

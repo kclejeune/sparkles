@@ -89,6 +89,30 @@ pub struct TextConfig {
     /// hits one `text:query` without a limit may return
     #[serde(default = "default_max_hits")]
     pub max_hits: usize,
+    /// compression of the stored documents: `zstd` (the default when built with zstd),
+    /// `lz4` or `none`; changing it rebuilds the index
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docstore_compression: Option<DocstoreCompression>,
+}
+
+/// Compression of the full-text index's document store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocstoreCompression {
+    Zstd,
+    Lz4,
+    None,
+}
+
+impl DocstoreCompression {
+    /// The effective choice: the configured one, else zstd when this build has it.
+    pub fn effective(c: Option<DocstoreCompression>) -> DocstoreCompression {
+        c.unwrap_or(if cfg!(feature = "zstd") {
+            DocstoreCompression::Zstd
+        } else {
+            DocstoreCompression::Lz4
+        })
+    }
 }
 
 fn default_max_text_bytes() -> usize {
@@ -105,6 +129,7 @@ impl Default for TextConfig {
             graphs: GraphScope::default(),
             max_text_bytes: default_max_text_bytes(),
             max_hits: default_max_hits(),
+            docstore_compression: None,
         }
     }
 }
@@ -391,16 +416,39 @@ mod imp {
     }
 
     /// A new, empty index (in `dir`, replacing anything there, or in memory).
-    fn new_index(dir: Option<&Path>) -> Result<(Index, Fields)> {
+    fn new_index(dir: Option<&Path>, config: &TextConfig) -> Result<(Index, Fields)> {
         let (schema, fields) = schema();
+        let docstore_compression = match DocstoreCompression::effective(config.docstore_compression)
+        {
+            #[cfg(feature = "zstd")]
+            DocstoreCompression::Zstd => {
+                tantivy::store::Compressor::Zstd(tantivy::store::ZstdCompressor {
+                    compression_level: Some(3),
+                })
+            }
+            #[cfg(not(feature = "zstd"))]
+            DocstoreCompression::Zstd => {
+                return Err(Error::Unsupported(
+                    "full-text index: docstoreCompression zstd needs a build with zstd".into(),
+                ));
+            }
+            DocstoreCompression::Lz4 => tantivy::store::Compressor::Lz4,
+            DocstoreCompression::None => tantivy::store::Compressor::None,
+        };
+        let builder = Index::builder()
+            .schema(schema)
+            .settings(tantivy::IndexSettings {
+                docstore_compression,
+                ..Default::default()
+            });
         let index = match dir {
-            None => Index::create_in_ram(schema),
+            None => builder.create_in_ram().map_err(text_err)?,
             Some(d) => {
                 if d.exists() {
                     std::fs::remove_dir_all(d)?;
                 }
                 std::fs::create_dir_all(d)?;
-                Index::create_in_dir(d, schema).map_err(text_err)?
+                builder.create_in_dir(d).map_err(text_err)?
             }
         };
         register_tokenizer(&index);
@@ -755,7 +803,7 @@ mod imp {
                 tracing::info!("full-text index is missing, damaged or behind the WAL; rebuilding");
             }
             // an empty placeholder until the rebuild below swaps the real one in
-            let (index, fields) = new_index(None)?;
+            let (index, fields) = new_index(None, &config)?;
             let t = ti(live_of(index, fields, &config, None, 0)?, 0);
             let view = t.rebuild(snap)?;
             Ok((t, view))
@@ -898,7 +946,7 @@ mod imp {
         pub fn rebuild(&self, snap: &Snapshot) -> Result<Arc<TextView>> {
             let t0 = std::time::Instant::now();
             let new_dir = self.root.as_ref().map(|r| r.join("text.new"));
-            let (index, fields) = new_index(new_dir.as_deref())?;
+            let (index, fields) = new_index(new_dir.as_deref(), &self.config)?;
             let threads = std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(8);

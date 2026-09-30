@@ -7,6 +7,7 @@ mod alloc;
 mod auth;
 mod check_cmd;
 mod clone;
+mod compress;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -287,6 +288,46 @@ enum LogFormat {
     Json,
 }
 
+/// Compression of a dump or backup.
+#[derive(clap::Args, Clone, Debug)]
+struct CompressArgs {
+    /// none, gzip, zstd, brotli or lz4 (default: from the file extension, or the
+    /// command's default)
+    #[arg(long)]
+    compress: Option<String>,
+    /// Level of the codec: gzip 0-9, zstd 1-22, brotli 0-11
+    #[arg(long)]
+    level: Option<i32>,
+    /// zstd worker threads (default: up to 8)
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+impl CompressArgs {
+    fn codec(&self, default: sparkles::codec::Codec) -> Result<sparkles::codec::Codec> {
+        let c = match &self.compress {
+            Some(c) => sparkles::codec::Codec::parse(c)?,
+            None => default,
+        };
+        if !c.supported() {
+            bail!("built without {c}");
+        }
+        Ok(c)
+    }
+    fn level(&self) -> Option<sparkles::codec::Level> {
+        self.level.map(sparkles::codec::Level)
+    }
+    fn threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(8)
+        })
+    }
+}
+
+// parsed once; `serve` has most of the flags
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the SPARQL server with the web UI
@@ -359,6 +400,20 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Compress responses for clients that accept it: auto or off
+        #[arg(long, default_value = "auto", value_name = "MODE")]
+        http_compression: String,
+        /// Response compression level: fastest, default (zstd 3, brotli 4, gzip 6), best
+        /// or a number for the chosen algorithm
+        #[arg(long, default_value = "default", value_name = "LEVEL")]
+        http_compression_level: String,
+        /// Response encodings offered, comma-separated
+        #[arg(long, default_value = "zstd,br,gzip,deflate", value_name = "LIST")]
+        http_compression_algorithms: String,
+        /// Largest decompressed size of a compressed request body or uploaded file, in MiB
+        /// (0: unlimited)
+        #[arg(long, default_value_t = 65536)]
+        max_decompressed_mb: u64,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -432,6 +487,10 @@ enum Cmd {
         #[arg(long)]
         graph: Option<String>,
         files: Vec<PathBuf>,
+        /// Compression of the files: auto (magic bytes, then the extension), none, gzip,
+        /// zstd, brotli or lz4
+        #[arg(long, default_value = "auto")]
+        compression: String,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -499,13 +558,18 @@ enum Cmd {
         #[arg(long)]
         insecure_http: bool,
     },
-    /// Write the database as N-Quads (or TriG) to stdout
+    /// Write the database as N-Quads, to stdout or a file
     Dump {
         #[arg(long)]
         loc: PathBuf,
         /// a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
         #[arg(long)]
         at: Option<String>,
+        /// Write to this file instead of stdout (its extension picks the compression)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        compress: CompressArgs,
     },
     /// Write-time SHACL validation of a database: status, set, or turn off
     #[cfg(feature = "shacl")]
@@ -553,12 +617,14 @@ enum Cmd {
         #[arg(long)]
         loc: PathBuf,
     },
-    /// Write a gzipped N-Quads backup
+    /// Write a compressed N-Quads backup (gzip unless --compress says otherwise)
     Backup {
         #[arg(long)]
         loc: PathBuf,
         #[arg(long, default_value = "./backups")]
         out: PathBuf,
+        #[command(flatten)]
+        compress: CompressArgs,
     },
     /// Copy a database into a new, independent one (same data and blank nodes, new
     /// dataset id)
@@ -1019,6 +1085,10 @@ fn run() -> Result<()> {
             allow_unvalidated_writes,
             auto_reason,
             auto_reason_max_delay,
+            http_compression,
+            http_compression_level,
+            http_compression_algorithms,
+            max_decompressed_mb,
             auth_config,
             unix_socket,
             rate_limit,
@@ -1035,6 +1105,11 @@ fn run() -> Result<()> {
             st.allow_service = !no_service;
             st.schema_max_entries = schema_max_entries;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
+            st.http_compression = compress::HttpCompression::parse(
+                &http_compression,
+                &http_compression_level,
+                &http_compression_algorithms,
+            )?;
             sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
@@ -1045,6 +1120,7 @@ fn run() -> Result<()> {
                 max_rows,
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
+                max_decompressed_bytes: mib(max_decompressed_mb),
             };
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
@@ -1180,6 +1256,7 @@ fn run() -> Result<()> {
             loc,
             graph,
             files,
+            compression,
             server,
             dataset,
             insecure_http,
@@ -1202,10 +1279,20 @@ fn run() -> Result<()> {
             }
             let store = open_for_write(&loc, opts, no_validate)?;
             let g = graph.map(oxrdf::NamedNode::new).transpose()?;
+            let explicit = match compression.as_str() {
+                "auto" => None,
+                c => Some(sparkles::codec::Codec::parse(c)?),
+            };
             let sources = files
                 .iter()
-                .map(|f| Source::from_path(f, g.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|f| -> Result<Source> {
+                    let mut s = Source::from_path(f, g.clone())?;
+                    s.compression = explicit;
+                    // fail before loading anything
+                    s.codec()?;
+                    Ok(s)
+                })
+                .collect::<Result<Vec<_>>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
             let r = store.load_as(&sources, sparkles::commit::CommitKind::Load)?;
@@ -1377,20 +1464,42 @@ fn run() -> Result<()> {
             at,
             format,
         } => print_log(&loc, limit, before, after, at.as_deref(), &format),
-        Cmd::Dump { loc, at } => {
+        Cmd::Dump {
+            loc,
+            at,
+            out,
+            compress,
+        } => {
             let store = Store::open(&loc, opts)?;
-            let out = std::io::BufWriter::new(std::io::stdout().lock());
+            let codec = compress.codec(
+                out.as_deref()
+                    .and_then(sparkles::codec::Codec::from_extension)
+                    .unwrap_or_default(),
+            )?;
+            let sink: Box<dyn std::io::Write> = match &out {
+                Some(p) => Box::new(
+                    std::fs::File::create(p)
+                        .with_context(|| format!("creating {}", p.display()))?,
+                ),
+                None => Box::new(std::io::stdout().lock()),
+            };
+            let mut w = codec.writer(
+                std::io::BufWriter::new(sink),
+                compress.level(),
+                compress.threads(),
+            )?;
             match at {
                 Some(a) => {
                     let a: sparkles::history::At = a.parse()?;
                     let r = store.resolve(&a)?;
                     eprintln!("at commit {} ({})", r.commit.seq, r.commit.timestamp());
-                    store.dump_nquads_at(&a, out)?;
+                    store.dump_nquads_at(&a, &mut w)?;
                 }
                 None => {
-                    store.dump_nquads(out)?;
+                    store.dump_nquads(&mut w)?;
                 }
             }
+            w.finish()?;
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
@@ -1509,14 +1618,22 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Backup { loc, out } => {
+        Cmd::Backup { loc, out, compress } => {
             let store = Store::open(&loc, opts)?;
             let name = loc
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "db".into());
-            let p = store.backup(&out, &name)?;
-            eprintln!("backup written to {}", p.display());
+            let codec = compress.codec(sparkles::codec::Codec::Gzip)?;
+            let t = Instant::now();
+            let p = store.backup_with(&out, &name, codec, compress.level(), compress.threads())?;
+            let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+            eprintln!(
+                "backup written to {} ({}, {:.1}s)",
+                p.display(),
+                sparkles::error::human_bytes(size),
+                t.elapsed().as_secs_f64()
+            );
             Ok(())
         }
         Cmd::Clone {
@@ -2090,16 +2207,17 @@ fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> R
 #[cfg(feature = "shacl")]
 fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
     use std::io::Read;
-    let (format, gz) =
-        sparkles::io::format_for_path(path).unwrap_or((oxrdfio::RdfFormat::Turtle, false));
+    let (format, _) =
+        sparkles::io::format_for_path(path).unwrap_or((oxrdfio::RdfFormat::Turtle, None));
+    let codec = Source::from_path(path, None)
+        .and_then(|s| s.codec())
+        .unwrap_or_default();
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let text = if gz {
-        let mut s = String::new();
-        flate2::read::MultiGzDecoder::new(&raw[..]).read_to_string(&mut s)?;
-        s
-    } else {
-        String::from_utf8(raw).with_context(|| format!("{} is not UTF-8", path.display()))?
-    };
+    let mut text = String::new();
+    codec
+        .reader(&raw[..], None)?
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {} ({codec})", path.display()))?;
     let base = std::path::absolute(path)
         .ok()
         .map(|p| format!("file://{}", p.display()));

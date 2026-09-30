@@ -117,7 +117,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .layer(axum::middleware::from_fn(error_request_id))
         .layer(DefaultBodyLimit::max(8 << 30))
-        .layer(tower_http::compression::CompressionLayer::new());
+        .layer(state.http_compression.layer())
+        // compressed request bodies: marked (outermost), decompressed, then capped
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits.max_decompressed_bytes,
+            crate::compress::limit_decompressed,
+        ))
+        .layer(tower_http::decompression::RequestDecompressionLayer::new())
+        .layer(axum::middleware::from_fn(crate::compress::mark_encoded));
     // inside `observe` (limited requests are logged and counted) and CORS (browsers
     // can read the 429); inside the auth layer, which puts the principal in the request
     let app = match &state.rate_limit {
@@ -257,6 +264,9 @@ impl From<Error> for ApiError {
             Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
             Error::Timeout => StatusCode::REQUEST_TIMEOUT,
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Service(_) => StatusCode::BAD_GATEWAY,
@@ -1226,14 +1236,20 @@ impl Spooled {
         self,
         format: RdfFormat,
         graph: Option<oxrdf::NamedNode>,
+        max_decompressed: Option<u64>,
     ) -> (Source, Option<tempfile::NamedTempFile>) {
         match self {
-            Spooled::Memory(b) => (Source::from_bytes(b, format, graph), None),
+            Spooled::Memory(b) => {
+                let mut s = Source::from_bytes(b, format, graph);
+                s.max_decompressed = max_decompressed;
+                (s, None)
+            }
             Spooled::File(f) => (
                 Source {
                     data: sparkles::io::SourceData::File(f.path().to_path_buf()),
                     format,
-                    gzip: false,
+                    compression: None,
+                    max_decompressed,
                     graph,
                     base: None,
                     name: "<request body>".into(),
@@ -1241,6 +1257,18 @@ impl Spooled {
                 Some(f),
             ),
         }
+    }
+}
+
+/// A request body that could not be read: 413 past the decompressed-size cap, else 400.
+fn body_error(e: axum::Error) -> ApiError {
+    if crate::compress::is_length_limit(&e) {
+        err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed request body exceeds --max-decompressed-mb",
+        )
+    } else {
+        err(StatusCode::BAD_REQUEST, e.to_string())
     }
 }
 
@@ -1259,7 +1287,7 @@ async fn spool_after(body: axum::body::Body, limit: usize) -> ApiResult<Spooled>
     let mut buf = Vec::new();
     let mut file: Option<tempfile::NamedTempFile> = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let chunk = chunk.map_err(body_error)?;
         match &mut file {
             Some(f) => f.write_all(&chunk).map_err(io)?,
             None => {
@@ -1445,7 +1473,8 @@ async fn gsp(
                     ),
                     _ => None,
                 };
-                let (src, _spooled) = body.into_source(format, graph.clone());
+                let (src, _spooled) =
+                    body.into_source(format, graph.clone(), st.limits.max_decompressed_bytes);
                 use sparkles::commit::CommitKind;
                 let (count, receipt) = if replace {
                     // parse first, then clear and insert atomically
@@ -1632,7 +1661,12 @@ async fn upload(
         };
         let sources = files
             .iter()
-            .map(|p| Source::from_path(p, g.clone()))
+            .map(|p| {
+                Source::from_path(p, g.clone()).map(|mut s| {
+                    s.max_decompressed = st.limits.max_decompressed_bytes;
+                    s
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let receipt = ds
             .store
@@ -2118,13 +2152,39 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
-async fn backup(State(st): St, Path(name): Path<String>) -> ApiResult {
+/// `POST /$/backup/{ds}[?compression=gzip|zstd|brotli|lz4|none&level=N]`: an N-Quads
+/// backup in `backups/`, gzip by default (as Fuseki).
+async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
+    use sparkles::codec::{Codec, Level};
     let ds = dataset(&st, &name)?;
+    let params = Params::from_query(&uri);
+    let codec = match params.get("compression") {
+        Some(c) => Codec::parse(c)?,
+        None => Codec::Gzip,
+    };
+    let level = match params.get("level") {
+        Some(l) => Some(Level(l.parse().map_err(|_| {
+            err(StatusCode::BAD_REQUEST, "level must be an integer")
+        })?)),
+        None => None,
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
     let dir = st.data_dir.join("backups");
     let task = st.start_task("backup", &name, move |h| {
         h.progress(0.1, "writing N-Quads");
-        let p = ds.store.backup(&dir, &ds.name)?;
-        Ok(format!("backup written to {}", p.display()))
+        let t = std::time::Instant::now();
+        let p = ds
+            .store
+            .backup_with(&dir, &ds.name, codec, level, threads)?;
+        let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+        Ok(format!(
+            "backup written to {} ({}, {codec}, {:.1} s)",
+            p.display(),
+            sparkles::error::human_bytes(size),
+            t.elapsed().as_secs_f64()
+        ))
     });
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
@@ -2434,6 +2494,8 @@ async fn shacl() -> ApiResult {
 }
 
 #[cfg(test)]
+mod compress_tests;
+#[cfg(test)]
 mod history_tests;
 #[cfg(test)]
 mod obs_tests;
@@ -2459,7 +2521,7 @@ mod spool_tests {
         };
         assert_eq!(std::fs::read(f.path()).unwrap(), data);
         let path = f.path().to_path_buf();
-        let (src, guard) = Spooled::File(f).into_source(RdfFormat::NTriples, None);
+        let (src, guard) = Spooled::File(f).into_source(RdfFormat::NTriples, None, None);
         assert!(matches!(src.data, sparkles::io::SourceData::File(ref p) if *p == path));
         drop(guard);
         assert!(!path.exists(), "the temporary file goes with its guard");

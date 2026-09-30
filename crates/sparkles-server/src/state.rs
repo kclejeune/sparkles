@@ -140,6 +140,8 @@ pub struct AppState {
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
     pub allow_unvalidated_writes: bool,
+    /// response compression
+    pub http_compression: crate::compress::HttpCompression,
     pub allow_service: bool,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
@@ -253,6 +255,8 @@ pub struct Limits {
     pub max_rows: usize,
     /// SPARQL updates without a `timeout` parameter (`None`: no limit, the default)
     pub update_timeout: Option<std::time::Duration>,
+    /// decompressed size of a compressed request body or uploaded file
+    pub max_decompressed_bytes: Option<u64>,
 }
 
 impl Default for Limits {
@@ -262,6 +266,7 @@ impl Default for Limits {
             max_result_bytes: Some(1 << 30),
             max_rows: 200_000_000,
             update_timeout: None,
+            max_decompressed_bytes: Some(64 << 30),
         }
     }
 }
@@ -306,6 +311,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Starting as u8),
             auth: None,
             allow_unvalidated_writes: false,
+            http_compression: Default::default(),
             auto_reason: None,
             reserved: Mutex::new(BTreeMap::new()),
             manage: Mutex::new(()),
@@ -362,6 +368,7 @@ impl AppState {
             rate_limit: None,
             auth: None,
             allow_unvalidated_writes: false,
+            http_compression: Default::default(),
         }
     }
 

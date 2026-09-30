@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "build": "vite build",
+    "build": "vite build && node scripts/precompress.mjs",
     "preview": "vite preview",
     "mock": "node mock/server.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",

@@ -65,13 +65,16 @@ pub enum BudgetKind {
     Memory,
     /// bytes of the serialized response
     ResultBytes,
+    /// bytes of a decompressed input (a compressed request body or upload)
+    DecompressedBytes,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 3] = [
+    pub const ALL: [BudgetKind; 4] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
+        BudgetKind::DecompressedBytes,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -79,6 +82,7 @@ impl BudgetKind {
             BudgetKind::Rows => "rows",
             BudgetKind::Memory => "memory",
             BudgetKind::ResultBytes => "result-bytes",
+            BudgetKind::DecompressedBytes => "decompressed-bytes",
         }
     }
 }
@@ -108,6 +112,11 @@ impl std::fmt::Display for Budget {
             BudgetKind::ResultBytes => write!(
                 f,
                 "response exceeds the result size budget of {}",
+                human_bytes(self.limit)
+            ),
+            BudgetKind::DecompressedBytes => write!(
+                f,
+                "decompressed input exceeds the limit of {}",
                 human_bytes(self.limit)
             ),
         }

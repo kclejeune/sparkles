@@ -42,11 +42,13 @@ rand = "0.10"
 percent-encoding = "2"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }
-tower-http = { version = "0.7", features = ["cors", "compression-full", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "compression-full", "decompression-full", "trace"] }
 clap = { version = "4", features = ["derive"] }
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "form"] }
 flate2 = "1"
+zstd = { version = "0.14", features = ["zstdmt"] }
+brotli = "8"
 chrono = "0.4"
 
 [profile.release]

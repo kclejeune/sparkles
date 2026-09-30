@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod check;
+pub mod codec;
 pub mod commit;
 pub mod dataset;
 pub mod error;

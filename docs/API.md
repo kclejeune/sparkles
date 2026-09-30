@@ -294,7 +294,7 @@ in `sparkles_requests_total{outcome="rate_limited"}` and
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`. |
-| POST   | `/$/backup/{ds}`             | Write gzipped N-Quads dump to `<data>/backups/`. Returns `Task`. |
+| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it). Returns `Task`; its message gives the size and time. |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
@@ -706,6 +706,7 @@ type TextConfig = {
   graphs?: { include?: "all" | string[]; exclude?: string[] };  // graph IRIs; urn:x-arq:DefaultGraph
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
   maxHits?: number;                                     // default 1000000 hits without a limit (then 507)
+  docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
@@ -1002,13 +1003,46 @@ type PlanNode = {
 
 `GET|POST /{ds}/explain?query=…` → `{ "algebra": string /* SSE */, "plan": PlanNode }` (plan not executed; `actualRows`=-1).
 
+## Compression
+
+**Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
+`gzip` or `deflate`, streamed bodies included. Bodies under 256 bytes and images are sent
+as they are. The UI's larger assets are built with brotli and gzip copies, which are
+served as they are (with `Vary: Accept-Encoding`) rather than compressed per request.
+
+| `sparkles serve` flag | Default | |
+|---|---|---|
+| `--http-compression auto\|off` | `auto` | |
+| `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6; a number applies to whichever algorithm is chosen |
+| `--http-compression-algorithms` | `zstd,br,gzip,deflate` | the encodings offered |
+| `--max-decompressed-mb` | `65536` | cap on a compressed request body or upload after decompression (0: none) |
+
+**Request bodies** (updates, queries, Graph Store PUT/POST, uploads) may be sent with
+`Content-Encoding: gzip`, `br`, `zstd` or `deflate`. Another encoding gets `415` with an
+`Accept-Encoding` header naming the supported ones. RDF bodies and uploaded files are also
+recognised as compressed by their first bytes (gzip, zstd, LZ4 frames) and, for uploads,
+by file name (`.gz`, `.zst`, `.br`, `.lz4`). A body that decompresses past
+`--max-decompressed-mb` fails with `413` and commits nothing.
+
+**Files.** `sparkles load` reads the same codecs (`--compression auto|none|gzip|zstd|brotli|lz4`;
+`auto` goes by magic bytes, then the extension; brotli has no magic bytes, so it needs
+`.br` or `--compression brotli`). When a file's name and its data disagree, the data
+wins and a warning is logged; an explicit `--compression` that disagrees is an error.
+`sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N`
+and `--threads N` (zstd). Backups stay gzip by default.
+
+**Full-text documents** are stored with zstd (level 3). `"docstoreCompression": "lz4"`
+or `"none"` in the text configuration picks another; changing it rebuilds the index.
+Indexes built before zstd was available keep LZ4 until they are rebuilt.
+
 ## Errors
 
 Non-2xx responses carry `{ "error": string, "detail"?: string, "line"?: number, "column"?: number, "requestId": string }`
 (`requestId` is the response's `X-Request-Id`, for finding the request in the logs)
 with `400` for parse errors, `401`/`403` for authentication and permissions, `404` unknown
-dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `429` over a rate
-limit, `503` for a cancelled query, over a concurrency limit (see
+dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a
+compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
+`Content-Encoding`, `429` over a rate limit, `503` for a cancelled query, over a concurrency limit (see
 [Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
 until restart; reads continue), `500` otherwise.
 
