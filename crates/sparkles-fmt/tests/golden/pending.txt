@@ -9,3 +9,9 @@ sparql/s3 needs the VALUES, BIND, MINUS, NOT EXISTS and operator-chain printers
 sparql/s4 needs the CONSTRUCT, triples and blank-node printers
 sparql/s5 needs the update printers
 sparql/s6 needs the RDF 1.2 term, VALUES and pragma printers
+sparql/path-forms needs the prologue and query printers around the patterns
+sparql/pattern-comments needs the prologue and query printers around the patterns
+sparql/pattern-elements needs the prologue and query printers around the patterns
+sparql/triples-brackets needs the prologue and query printers around the patterns
+sparql/triples-layout needs the prologue and query printers around the patterns
+sparql/triples-rdf12 needs the prologue and query printers around the patterns

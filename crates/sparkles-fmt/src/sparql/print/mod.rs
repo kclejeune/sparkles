@@ -635,7 +635,7 @@ mod tests {
         let (out, moved) = group(src, STMTS);
         assert_eq!(
             out,
-            "{\n  # lead\n  ?s   ?p ?o . # trailing\n\n  # detached\n\n  # leading\n  ?a ?b ?c .\n\n  # dangling\n}\n\n# end\n"
+            "{\n  # lead\n  ?s ?p ?o . # trailing\n\n  # detached\n\n  # leading\n  ?a ?b ?c .\n\n  # dangling\n}\n\n# end\n"
         );
         assert_eq!(moved, 0);
         // blank lines just inside the brackets go
@@ -648,13 +648,13 @@ mod tests {
     #[test]
     fn verbatim_nodes_print_their_comments_once() {
         // a displaced comment inside a node printed as written stays where it was
-        let (out, moved) = group("{ FILTER # c\n (?x) }", "(Q (G _ (F _ (B _ _ _)) _))");
+        let (out, moved) = group("{ FILTER # c\n (?x) }", "(Q (G _ (F (X _ _ _ _)) _))");
         assert_eq!(out, "{\n  FILTER # c\n (?x)\n}\n");
         assert_eq!(moved, 0);
         // a trailing comment of the last branch of a union printed as written
-        let shape = "(Q (G _ (U (R (G _ (S _ (E _ (O _))) _)) _ (R (G _ (S _ (E _ (O _))) _))) _))";
+        let shape = "(Q (G _ (U (R (G _ (S _ (E _ (O _))) _)) _ (R (X _ _ _ _ _))) _))";
         let (out, _) = group("{ {?a ?b ?c} UNION {?d ?e ?f} # t\n}", shape);
-        assert_eq!(out, "{\n  {?a ?b ?c} UNION {?d ?e ?f} # t\n}\n");
+        assert_eq!(out, "{\n  {\n    ?a ?b ?c .\n  } UNION {?d ?e ?f} # t\n}\n");
     }
 
     #[test]
