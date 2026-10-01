@@ -861,6 +861,16 @@ mod tests {
     }
 
     #[test]
+    fn the_benchmark_map() {
+        let m = parse(include_str!("../examples/bench.smap"), &vec![], None).unwrap();
+        assert_eq!(m.0.len(), 8);
+        assert!(m.0.iter().all(|a| matches!(
+            &a.shape,
+            ShapeLabel::Iri(i) if i.starts_with("http://example.org/")
+        )));
+    }
+
+    #[test]
     fn directives_and_prefixes() {
         // without directives the schema's prefixes apply; directives add to them
         let m = parse("ex:a@ex:S", &schema_prefixes(), None).unwrap();
