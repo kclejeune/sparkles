@@ -236,6 +236,9 @@ pub(crate) struct GeoBase {
     pub generation_name: String,
     /// base rows in PSO order (the tree's items)
     pub rows: Vec<Row>,
+    /// base rows whose literal was skipped but may still match (see
+    /// [`Slot::rechecked`]): candidates of every search
+    pub skipped: Vec<Row>,
     pub tree: Option<RTree<f32>>,
     pub column: Column,
     /// base rows per predicate slot
@@ -250,6 +253,7 @@ impl GeoBase {
             generation: snap.generation.uid,
             generation_name: snap.generation.name.clone(),
             rows: Vec::new(),
+            skipped: Vec::new(),
             tree: None,
             column: Column::empty(),
             slot_rows: vec![0; cfg.predicates.len()],
@@ -263,7 +267,8 @@ impl GeoBase {
     }
 
     fn tree_bytes(&self) -> u64 {
-        (self.rows.len() * std::mem::size_of::<Row>()) as u64 + tree_bytes(&self.tree)
+        ((self.rows.len() + self.skipped.len()) * std::mem::size_of::<Row>()) as u64
+            + tree_bytes(&self.tree)
     }
 }
 
@@ -362,12 +367,18 @@ pub(crate) fn build_base(
         Ok(())
     })?;
     let mut boxes: Vec<[f32; 4]> = Vec::with_capacity(rows.len());
+    let mut skipped = Vec::new();
     rows.retain(|r| match column.base_entry(r.o) {
         Some(e) => {
             boxes.push(e.bbox());
             true
         }
-        None => false,
+        None => {
+            if column.get(r.o).is_some_and(|s| s.rechecked()) {
+                skipped.push(*r);
+            }
+            false
+        }
     });
     for r in &rows {
         if let Some(&(_, slot)) = preds.iter().find(|(p, _)| *p == r.p) {
@@ -380,6 +391,7 @@ pub(crate) fn build_base(
     base.tree = pack(boxes.into_iter());
     base.rows = rows;
     base.rows.shrink_to_fit();
+    base.skipped = skipped;
     base.column = column;
     let need = base.bytes();
     if need > ctl.budget {
@@ -394,6 +406,9 @@ pub(crate) fn build_base(
 pub(crate) struct Overlay {
     pub rows: Vec<TailRow>,
     pub tree: Option<RTree<f32>>,
+    /// inserted rows whose literal was skipped but may still match
+    /// ([`Slot::rechecked`])
+    pub skipped: Vec<Row>,
 }
 
 impl Overlay {
@@ -401,11 +416,21 @@ impl Overlay {
         Overlay {
             rows: Vec::new(),
             tree: None,
+            skipped: Vec::new(),
         }
     }
 
-    /// The overlay of `rows` (sorted, one per quad).
-    pub fn build(mut rows: Vec<TailRow>) -> Overlay {
+    /// The overlay of `rows` and the skipped rows `skipped` (each sorted, one per quad).
+    pub fn build(rows: Vec<TailRow>, mut skipped: Vec<Row>) -> Overlay {
+        skipped.sort_unstable();
+        skipped.dedup();
+        Overlay {
+            skipped,
+            ..Overlay::tree(rows)
+        }
+    }
+
+    fn tree(mut rows: Vec<TailRow>) -> Overlay {
         rows.sort_unstable_by_key(|r| r.row);
         rows.dedup_by_key(|r| r.row);
         let tree = pack(
@@ -414,11 +439,17 @@ impl Overlay {
                 .collect::<Vec<_>>()
                 .into_iter(),
         );
-        Overlay { rows, tree }
+        Overlay {
+            rows,
+            tree,
+            skipped: Vec::new(),
+        }
     }
 
     pub fn bytes(&self) -> u64 {
-        (self.rows.len() * std::mem::size_of::<TailRow>()) as u64 + tree_bytes(&self.tree)
+        (self.rows.len() * std::mem::size_of::<TailRow>()
+            + self.skipped.len() * std::mem::size_of::<Row>()) as u64
+            + tree_bytes(&self.tree)
     }
 }
 
@@ -433,6 +464,7 @@ pub(crate) fn overlay_of(
     lookup.resolve(snap, cfg);
     let ins = &snap.delta.ins[Perm::Pso.index()];
     let mut rows = Vec::new();
+    let mut skipped = Vec::new();
     if ins.is_empty() {
         return Overlay::empty();
     }
@@ -443,20 +475,20 @@ pub(crate) fn overlay_of(
             if !lookup.graph(Id(k[3]), snap, cfg) {
                 continue;
             }
-            if let Slot::Geom(entry) = base.column.get_or_classify(Id(k[2]), snap, cfg) {
-                rows.push(TailRow {
-                    row: Row {
-                        s: k[1],
-                        p: k[0],
-                        o: k[2],
-                        g: k[3],
-                    },
-                    entry,
-                });
+            let row = Row {
+                s: k[1],
+                p: k[0],
+                o: k[2],
+                g: k[3],
+            };
+            match base.column.get_or_classify(Id(k[2]), snap, cfg) {
+                Slot::Geom(entry) => rows.push(TailRow { row, entry }),
+                s if s.rechecked() => skipped.push(row),
+                _ => {}
             }
         }
     }
-    Overlay::build(rows)
+    Overlay::build(rows, skipped)
 }
 
 /// The tail length past which the overlay tree is rebuilt.
@@ -492,6 +524,8 @@ pub struct GeoView {
     pub(crate) base: Option<Arc<GeoBase>>,
     pub(crate) overlay: Arc<Overlay>,
     pub(crate) tail: imbl::Vector<TailRow>,
+    /// skipped rows inserted since the overlay was built (as the tail)
+    pub(crate) skipped: imbl::Vector<Row>,
 }
 
 impl GeoView {
@@ -513,6 +547,7 @@ impl GeoView {
             base: None,
             overlay: Arc::new(Overlay::empty()),
             tail: imbl::Vector::new(),
+            skipped: imbl::Vector::new(),
         }
     }
 
@@ -535,6 +570,7 @@ impl GeoView {
             base: Some(base),
             overlay: Arc::new(overlay),
             tail: imbl::Vector::new(),
+            skipped: imbl::Vector::new(),
         }
     }
 
@@ -545,6 +581,7 @@ impl GeoView {
             base: None,
             overlay: Arc::new(Overlay::empty()),
             tail: imbl::Vector::new(),
+            skipped: imbl::Vector::new(),
             ..self.clone()
         }
     }
@@ -624,7 +661,9 @@ impl GeoView {
 
     /// Memory of the rows this view adds to its base (overlay and tail).
     pub(crate) fn overlay_bytes(&self) -> u64 {
-        self.overlay.bytes() + (self.tail.len() * std::mem::size_of::<TailRow>()) as u64
+        self.overlay.bytes()
+            + (self.tail.len() * std::mem::size_of::<TailRow>()
+                + self.skipped.len() * std::mem::size_of::<Row>()) as u64
     }
 
     /// Memory of the index as this view sees it.

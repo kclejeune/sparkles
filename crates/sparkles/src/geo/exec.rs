@@ -28,7 +28,6 @@ use crate::sparql::ctx::Ctx;
 use crate::sparql::geopf::{ScanShape, SpatialPfSpec, SpatialScanSpec, SpatialTest};
 use crate::sparql::plan::PathEnd;
 use crate::sparql::table::{Table, VarId};
-use crate::sparql::value::Value;
 use crate::store::Chunk;
 use oxrdf::Term;
 use rayon::prelude::*;
@@ -200,12 +199,15 @@ enum Src {
 struct Check<'a> {
     /// its envelope meets one of these
     windows: &'a [[f64; 4]],
+    /// meeting the windows is the test itself (the cardinal functions); otherwise the
+    /// windows only rule out geometries that cannot pass the tests, and a geometry
+    /// without an envelope in longitude and latitude goes to the tests
+    envelope_test: bool,
     /// all of these hold
     tests: &'a [SpatialTest],
     /// rank by the distance from this geometry
     rank: Option<&'a GeomRef>,
     model: DistanceModel,
-    cfg: &'a GeoConfig,
 }
 
 /// [`Check`] for one worker: the constants prepared once (a prepared geometry is not
@@ -238,9 +240,11 @@ impl<'a> Tester<'a> {
 
     /// `None`: `w` fails; else its ranking distance (0 without ranking).
     fn check(&mut self, w: &Geom) -> Option<f64> {
-        let b = w.bbox84()?;
-        if !windows_meet(b, self.check.windows) {
-            return None;
+        match w.bbox84() {
+            Some(b) if !windows_meet(b, self.check.windows) => return None,
+            Some(_) => {}
+            None if w.empty || self.check.envelope_test => return None,
+            None => {}
         }
         let model = self.check.model;
         let mut near: Option<(&GeomRef, f64)> = None;
@@ -326,19 +330,14 @@ fn holds(
 }
 
 /// The geometry of a candidate literal: the index's column, or the literal parsed as
-/// functions parse it (through the query's memo) when the index would hold it.
-fn load(ctx: &Ctx, id: Id, src: &Src, cfg: &GeoConfig) -> Option<GeomRef> {
+/// functions parse it (through the query's memo; a literal too long for the index is
+/// read all the same, as the index's searches hand it out too).
+fn load(ctx: &Ctx, id: Id, src: &Src) -> Option<GeomRef> {
     use super::memo::{MemoKey, max_vertices, parse_value};
     match src {
         Src::Entry(e) => e.geom(&ctx.snap).ok(),
         Src::Literal => {
             let v = ctx.value(id)?;
-            let Value::Other { lex, .. } = &v else {
-                return None;
-            };
-            if lex.len() > cfg.max_geometry_bytes {
-                return None;
-            }
             let max = max_vertices(ctx);
             ctx.geo
                 .get_or_parse(MemoKey::Id(id), || parse_value(&v, max))
@@ -361,7 +360,7 @@ fn refine(
             if i % CHECK_EVERY == CHECK_EVERY - 1 {
                 ctx.check()?;
             }
-            out.push(load(ctx, *id, src, check.cfg).and_then(|g| t.check(&g)));
+            out.push(load(ctx, *id, src).and_then(|g| t.check(&g)));
         }
         Ok(out)
     };
@@ -462,13 +461,15 @@ fn scan_keys(
     })
 }
 
-fn counters(st: &SearchStats, state: IndexState) -> Counters {
+/// `state`: the index's state, or how the operator found its rows without it.
+fn counters(st: &SearchStats, state: String) -> Counters {
     let mut c = Counters::new();
     c.insert("candidates".into(), st.candidates.into());
     c.insert("refined".into(), st.refined.into());
     c.insert("matched".into(), st.matched.into());
     c.insert("treeNodesVisited".into(), st.nodes.into());
-    c.insert("index".into(), state.to_string().into());
+    c.insert("rechecked".into(), st.rechecked.into());
+    c.insert("index".into(), state.into());
     c.insert("fallback".into(), st.fallback.into());
     c
 }
@@ -511,10 +512,10 @@ pub fn spatial_scan(
     )?;
     let check = Check {
         windows: &spec.windows,
+        envelope_test: false,
         tests: &spec.tests,
         rank: None,
         model: cfg.distance,
-        cfg: &cfg,
     };
     let (mut rows, _) = cands.refine(ctx, &check, &mut st)?;
     rows.sort_unstable();
@@ -567,7 +568,7 @@ pub fn spatial_scan(
         st.matched = t.len() as u64;
     }
     t.sorted = shape.sorted();
-    Ok((t, counters(&st, state)))
+    Ok((t, counters(&st, state.to_string())))
 }
 
 // -------------------------------------------------------------------- SpatialPf --
@@ -603,10 +604,10 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
     };
     let check = Check {
         windows: &windows,
+        envelope_test: tests.is_empty(),
         tests: &tests,
         rank: rank.as_ref(),
         model: cfg.distance,
-        cfg: &cfg,
     };
     let mut st = SearchStats::default();
     // feature (and graph, under GRAPH ?g) → its ranking distance
@@ -702,7 +703,12 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
         t.push_row(&row);
     }
     t.sorted = vars.to_vec();
-    Ok((t, counters(&st, state)))
+    // a given feature's links are read whatever the index's state
+    let how = match spec.subject {
+        PathEnd::Const(_) => "feature-links".to_string(),
+        PathEnd::Var(_) => state.to_string(),
+    };
+    Ok((t, counters(&st, how)))
 }
 
 /// Map the matching geometry `s` (in graph `g`, at ranking distance `d`) to its
