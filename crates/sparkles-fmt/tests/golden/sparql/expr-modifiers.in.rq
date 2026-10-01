@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+select ?type (count(distinct ?item) as ?n) (group_concat(distinct ?label;separator=', ') as ?labels) (max(?n2)+1 as ?next) (<http://example.org/score>(?type, -1, +2.5) as ?score) where {}
+group by ?type (lcase(str(?type)) as ?lt) ex:key(?type)
+having (count(distinct ?item) > 5 && avg(?n2)*2 >= 10 && (sum(?n2) < 1000 || sample(?label) in ("a", "b", "c")) && !bound(?lt))
+  (sum(?n2) not in ())
+order by desc(?n) asc(strlen(?labels)) ex:rank(?type) ?type

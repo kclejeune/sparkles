@@ -1,0 +1,17 @@
+PREFIX ex: <http://example.org/>
+
+SELECT
+  ?type
+  (COUNT(DISTINCT ?item) AS ?n)
+  (GROUP_CONCAT(DISTINCT ?label; SEPARATOR = ", ") AS ?labels)
+  (MAX(?n2) + 1 AS ?next)
+  (ex:score(?type, -1, +2.5) AS ?score)
+WHERE {}
+GROUP BY ?type (LCASE(STR(?type)) AS ?lt) ex:key(?type)
+HAVING(
+  COUNT(DISTINCT ?item) > 5
+    && AVG(?n2) * 2 >= 10
+    && (SUM(?n2) < 1000 || SAMPLE(?label) IN ("a", "b", "c"))
+    && !BOUND(?lt)
+) (SUM(?n2) NOT IN ())
+ORDER BY DESC(?n) ASC(STRLEN(?labels)) ex:rank(?type) ?type

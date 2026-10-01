@@ -14,7 +14,7 @@ use crate::doc::DocId;
 use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId};
-use crate::{OperatorPosition, QuoteStyle, trivia};
+use crate::{OperatorPosition, trivia};
 
 /// `OrChain`: one group, broken one operand per line.
 pub fn or_chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
@@ -309,43 +309,28 @@ fn element(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
     }
 }
 
-/// A token of an expression: keywords and built-in names in the grammar's spelling,
-/// `NIL` as `()`, strings in double quotes unless `quote-style = "preserve"`; anything
-/// else as written.
+/// A token of an expression: `NIL` as `()`, anything else as [`Ctx::term`] prints it
+/// (keywords in the grammar's spelling, IRIs compacted, strings requoted).
 pub fn term_token(cx: &mut Ctx<'_, '_>, t: TokenId) -> DocId {
-    let kind = cx.tree.token_kind(t);
-    match kind {
-        TokenKind::Kw(_) => cx.kw(t),
+    match cx.tree.token_kind(t) {
         TokenKind::Nil => cx.tok_as(t, "()"),
-        k if k.is_string() && cx.opts.quote_style == QuoteStyle::Double => {
-            match crate::normalize::requote(cx.tree.token_text(t), k) {
-                Some(s) => cx.tok_as(t, s),
-                None => cx.tok(t),
-            }
-        }
-        _ => cx.tok(t),
+        _ => cx.term(t),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Options;
-    use crate::doc::DocArena;
     use crate::sparql::parse::expr;
     use crate::trivia::Comments;
+    use crate::{Options, QuoteStyle};
 
     /// `FILTER` and the constraint `src`, printed one level deep (as in a `WHERE`
     /// group) with `opts`.
     fn filter_with(src: &str, opts: &Options) -> String {
         let tree = expr::parse_with(src, expr::constraint);
         let comments = Comments::attach(&tree, &super::super::RULES);
-        let mut cx = Ctx {
-            tree: &tree,
-            arena: DocArena::new(&tree.tokens),
-            opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&tree, &comments, opts);
         let c = tree.child_nodes(tree.root()).next().unwrap();
         let doc = node(&mut cx, c);
         let nl = cx.arena.hard_line();

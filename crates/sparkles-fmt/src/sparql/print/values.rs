@@ -110,7 +110,6 @@ fn term(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
 mod tests {
     use super::*;
     use crate::Options;
-    use crate::doc::DocArena;
     use crate::lex::{LexMode, lex};
     use crate::sparql::Unit;
     use crate::sparql::parse::parse;
@@ -126,12 +125,7 @@ mod tests {
             line_width: width,
             ..Options::default()
         };
-        let mut cx = Ctx {
-            tree: &tree,
-            arena: DocArena::new(&tree.tokens),
-            opts: &opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&tree, &comments, &opts);
         let n = (0..tree.len() as u32)
             .map(NodeId)
             .find(|&n| {
