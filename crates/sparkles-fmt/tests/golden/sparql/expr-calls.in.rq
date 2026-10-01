@@ -1,0 +1,11 @@
+PREFIX ex: <http://example.org/>
+select ?type (count(distinct ?item) as ?n) (group_concat(distinct ?label;separator=", ") as ?labels) (sample(?item) as ?example) (count(*) AS ?all) (max(?n2)+1 as ?next) where {
+  ?item a ?type ; ex:label ?label ; ex:n ?n2 .
+  filter(?type in(ex:A,ex:B) && ?label not in ( ))
+  filter regex(str(?label),'^a' , "i")
+  filter ex:check(?item, -1, +2.5)
+  filter not exists { ?item ex:hidden true }
+  filter(<<( ?item ex:p "x"@en )>> != triple(?item, ex:p, ?label) && !istriple(?label))
+  filter(!bound(?label) || sameterm(?item, ?type) || haslang(?label))
+}
+group by ?type having (count(distinct ?item) > 5 && avg(?n2)*2 >= 10) order by desc(?n) asc(strlen(?labels))

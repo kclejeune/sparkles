@@ -1,0 +1,7 @@
+PREFIX schema: <https://schema.org/>
+SELECT ?s WHERE {
+?s schema:price ?price ; schema:priceCurrency ?currency .
+FILTER (?price > "10"^^<http://www.w3.org/2001/XMLSchema#decimal> && ?price < 1000 && contains(lcase(str(?s)), "sale") && ?currency != "GBP")
+FILTER (?currency = "EUR" || (?currency = "USD" && ?price < 500 && ?price > 100 && bound(?s) && !isBlank(?s)) || ?currency = "CHF")
+FILTER(lang(?s)="en"||lang(?s)="")
+}
