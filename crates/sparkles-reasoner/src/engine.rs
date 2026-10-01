@@ -650,8 +650,6 @@ pub(crate) struct Limits {
 
 pub(crate) struct Outcome {
     pub iterations: usize,
-    /// graph rows `[base_len, end)` are derived
-    pub base_len: u32,
 }
 
 const CHUNK: usize = 2048;
@@ -856,6 +854,5 @@ pub(crate) fn run(
     }
     Ok(Outcome {
         iterations: iteration,
-        base_len,
     })
 }
