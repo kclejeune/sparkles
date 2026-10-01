@@ -884,9 +884,25 @@ mod tests {
             align_values: true,
             ..Options::default()
         };
+        // both act on SPARQL now
         let f = format("ASK {}", Language::Sparql, &opts).unwrap();
-        let codes: Vec<_> = f.warnings.iter().map(|w| w.code).collect();
-        assert_eq!(codes, ["option-not-implemented", "option-not-implemented"]);
+        assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+        // a key that does not act yet warns where it would
+        let codes: Vec<_> = option_warnings(
+            &Options {
+                sort: true,
+                ..Options::default()
+            },
+            Language::Turtle,
+        )
+        .iter()
+        .map(|w| w.code)
+        .collect();
+        let expected: &[&str] = match turtle::sort::IMPLEMENTED {
+            true => &[],
+            false => &["option-not-implemented"],
+        };
+        assert_eq!(codes, expected);
     }
 
     #[test]

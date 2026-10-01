@@ -1,0 +1,25 @@
+PREFIX ex: <http://example.org/>
+PREFIX schema: <https://schema.org/>
+
+SELECT $s ?price ?discounted
+WHERE {
+  VALUES (?s ?currency) {
+    (<https://example.org/p1> "EUR")
+    (ex:p2 UNDEF)
+  }
+  ?s schema:price ?price ;
+    schema:priceCurrency ?currency .
+  BIND(?price * 0.9 AS ?discounted)
+  FILTER NOT EXISTS {
+    ?s schema:availability schema:Discontinued .
+  }
+  MINUS {
+    ?s schema:category "internal" .
+  }
+  FILTER(
+    ?price > "10"^^<http://www.w3.org/2001/XMLSchema#decimal>
+      && ?price < 1000
+      && CONTAINS(LCASE(STR(?s)), "sale")
+      && ?currency != "GBP"
+  )
+}
