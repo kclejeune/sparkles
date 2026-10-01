@@ -96,9 +96,68 @@ pub fn in_crs<'a>(g: &'a Geom, to: &CrsRef) -> Result<Cow<'a, Geom>, OpError> {
     }
 }
 
-fn crs_iri(c: &CrsRef) -> &str {
+/// A constructed geometry in the CRS of `like`.
+pub(crate) fn made(like: &Geom, g: georust::Geometry<f64>) -> Geom {
+    Geom::from_geometry(like.crs.clone(), g)
+}
+
+/// Whether the literal's first axis is northing (latitude): internal coordinates are
+/// swapped from the literal's.
+pub(crate) fn lat_first(crs: &CrsRef) -> bool {
+    let _ = crs;
+    false
+}
+
+/// The IRI of a CRS (the canonical one of a built-in CRS).
+pub fn crs_iri(c: &CrsRef) -> &str {
     match c {
         CrsRef::Known(_) => super::crs::CRS84_IRI,
         CrsRef::Unknown(iri) => iri,
+    }
+}
+
+/// The built-in CRS an IRI names; anything else is a type error.
+pub fn known_crs(iri: &str) -> Result<CrsRef, OpError> {
+    super::crs::lookup(iri)
+        .map(CrsRef::Known)
+        .ok_or_else(|| type_error(format!("transform: <{iri}> is not a supported CRS")))
+}
+
+/// `g` in the CRS `to`.
+pub fn transform(g: &Geom, to: &CrsRef) -> Result<Geom, OpError> {
+    let mut out = in_crs(g, to)?.into_owned();
+    out.crs = to.clone();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use georust::{Geometry, LineString};
+
+    #[test]
+    fn operation_size_limit() {
+        let line = |n: usize| {
+            let g = Geometry::LineString(LineString::from(
+                (0..n).map(|i| (i as f64, 0.0)).collect::<Vec<_>>(),
+            ));
+            Geom::from_geometry(CrsRef::Known(CRS84), g)
+        };
+        let (a, b) = (line(600), line(500));
+        assert!(check_vertices(1100, &[&a, &b]).is_ok());
+        assert_eq!(
+            check_vertices(1000, &[&a, &b]),
+            Err(OpError::TooLarge(1100))
+        );
+        assert_eq!(
+            OpError::TooLarge(1100).to_string(),
+            "geometry operation too large (1100 vertices)"
+        );
+    }
+
+    #[test]
+    fn panics_become_type_errors() {
+        let r: Result<(), OpError> = guarded("test", || panic!("degenerate"));
+        assert!(matches!(r, Err(OpError::Type(_))));
     }
 }
