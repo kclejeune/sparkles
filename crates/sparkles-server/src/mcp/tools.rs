@@ -844,7 +844,12 @@ impl Tools<'_> {
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
         let mut lines = String::new();
         plan_lines(&plan, 0, &mut lines);
-        let mut warnings = Vec::new();
+        // the planner's own notes first (spatial filters not pushed down, …)
+        let mut warnings: Vec<Value> = plan
+            .warnings
+            .iter()
+            .map(|w| json!({"code": w.code, "message": w.message}))
+            .collect();
         // unknown constant terms
         let mut consts = Vec::new();
         constant_terms(pattern(&parsed), &mut consts);
