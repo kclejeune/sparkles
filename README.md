@@ -865,10 +865,11 @@ mise run build        # UI + release binary
 mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
+mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
 mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
-mise run ci           # fmt:check + lint + test + ui:test + licenses:check
+mise run ci           # fmt:check + lint + lint:features + test + ui:test + licenses:check
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
@@ -1074,6 +1075,7 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
+mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
@@ -1088,3 +1090,11 @@ suites are skipped. All of them pass (482/482, 328/328, 157/157, 269/269; SHACL 
 The shexTest suite comes from the same checkout too (`jena-shex`, or `SPARKLES_SHEX_TESTS`
 for an upstream shexTest checkout); `crates/sparkles-shex/tests/known-failures.txt` lists
 what fails, with reasons.
+
+`mise run lint:features` (`scripts/lint-features.sh`) runs clippy with warnings as errors
+over the builds `mise run lint` does not see: the server with no optional feature, with
+each default feature on its own, and with `mcp,shacl` and `mcp,shex`; `sparkles` and
+`sparkles-fmt` with their features off; the `sparkles-backup` library without a backend.
+Code used only under some feature is gated on it, so this catches dead code and missing
+gates. Every combination shares the workspace target directory: the first run builds the
+dependencies once per feature set, after that a change costs a minute or two.
