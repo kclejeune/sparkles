@@ -2389,7 +2389,17 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
         .collect::<Vec<_>>()
         .join(" && ");
     let sel = FILTER_SELECTIVITY.powi(exprs.len() as i32);
+    // a conjunct evaluated once per distinct value sorts its input column, unless the
+    // input is sorted on it already (an index scan can be read in that order instead).
+    // Costed whether or not the expression cache is on, so that switching it off does
+    // not change the plan.
+    let unsorted = exprs.iter().any(|e| {
+        super::exprcache::eligible(&[e])
+            .is_ok_and(|v| v.is_some_and(|v| n.vars.contains(&v) && n.sorted.first() != Some(&v)))
+    });
+    let sort_cost = if unsorted { n.est * 0.5 } else { 0.0 };
     let mut f = Node::unary(Kind::Filter(exprs), n, desc);
+    f.cost += sort_cost;
     f.est = (f.est * sel).max(if f.est > 0.0 { 1.0 } else { 0.0 });
     for d in f.dist.values_mut() {
         *d = d.min(f.est.max(1.0));

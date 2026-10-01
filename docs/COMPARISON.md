@@ -231,7 +231,9 @@ ran.
   by row. EXPLAIN notes `[expr cache: …]` with the distinct count, or why the operator
   ran row by row, and reports `exprCacheHits` / `exprCacheMisses` / `exprCacheSkipped`.
   A constant regular expression is compiled once per thread and reused with its match
-  cache.
+  cache. The planner counts the sort of an unsorted input column in the filter's cost,
+  so a single pattern under such a FILTER is read from the permutation sorted on the
+  filtered variable.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric
   constants reads only the id ranges that can match. Inline integers, and inline
   decimals of one scale, sort by value within their id segment. So each segment's

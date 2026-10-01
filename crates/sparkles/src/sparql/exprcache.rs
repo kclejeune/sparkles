@@ -28,13 +28,16 @@ use super::table::{Table, VarId};
 use crate::error::Result;
 use crate::id::{Id, Tag};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::Function;
 
 /// Smallest input that is worth the distinct pass.
 pub const MIN_ROWS: usize = 1024;
 /// Rows sampled to estimate how many distinct values a column holds.
 const SAMPLE: usize = 4096;
+/// Most distinct values (estimated) that are collected by hashing instead of sorting a
+/// copy of the column.
+const HASH_DISTINCT: usize = 1 << 14;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
@@ -289,26 +292,48 @@ fn distinct(
         report.push(ctx, exprs, n, Err(why));
         Ok(None)
     };
-    if !always && !runs {
-        let est = estimate_distinct(col);
-        if est > n / 2 {
-            return reject(report, format!("about {est} distinct of {n} rows"));
-        }
+    let est = if runs { 0 } else { estimate_distinct(col) };
+    if !always && est > n / 2 {
+        return reject(report, format!("about {est} distinct of {n} rows"));
     }
     // the slots, and a sorted copy of the column while it is deduplicated
     let Ok(_held) = ctx.charge((n * 12) as u64) else {
         return reject(report, "memory budget".into());
     };
-    let mut uniq = col.clone();
-    if !runs {
-        uniq.par_sort_unstable();
-    }
-    uniq.dedup();
+    // few distinct values: collected by hashing, and each row looks up its slot
+    let hashed = !runs && est <= HASH_DISTINCT;
+    let mut uniq = if hashed {
+        let set = col
+            .par_chunks(1 << 16)
+            .map(|c| c.iter().copied().collect::<FxHashSet<Id>>())
+            .reduce(FxHashSet::default, |mut a, b| {
+                a.extend(b);
+                a
+            });
+        let mut u: Vec<Id> = set.into_iter().collect();
+        u.sort_unstable();
+        u
+    } else {
+        let mut u = col.clone();
+        if !runs {
+            u.par_sort_unstable();
+        }
+        u.dedup();
+        u
+    };
+    uniq.shrink_to_fit();
     if !always && uniq.len() > n / 4 * 3 {
         return reject(report, format!("{} distinct of {n} rows", uniq.len()));
     }
     ctx.check()?;
-    let slot: Vec<u32> = if runs {
+    let slot: Vec<u32> = if hashed {
+        let at: FxHashMap<Id, u32> = uniq
+            .iter()
+            .enumerate()
+            .map(|(j, id)| (*id, j as u32))
+            .collect();
+        col.par_iter().map(|id| at[id]).collect()
+    } else if runs {
         // `uniq` lists the runs in column order
         let mut j = 0u32;
         col.iter()
