@@ -2,6 +2,9 @@
 //! `geo-index`, read through that layout directly so that a tree held in memory and a
 //! tree read from a file are searched by the same code.
 
+use super::persist::Mapped;
+use std::sync::Arc;
+
 use geo_index::indices::Indices;
 use geo_index::rtree::sort::HilbertSort;
 use geo_index::rtree::{RTreeBuilder, RTreeIndex, RTreeMetadata};
@@ -15,9 +18,14 @@ pub(crate) struct PackedTree {
     meta: RTreeMetadata<f32>,
 }
 
-/// Where a tree's bytes are (persisted trees will add a mapped file region).
+/// Where a tree's bytes are: built in memory, or a region of a mapped index file.
 enum TreeData {
     Owned(Vec<u8>),
+    Mapped {
+        file: Arc<Mapped>,
+        at: usize,
+        len: usize,
+    },
 }
 
 impl PackedTree {
@@ -39,11 +47,34 @@ impl PackedTree {
         })
     }
 
+    /// The tree of `items` items in the `len` bytes at `at` of `file`'s data (`None`:
+    /// not such a tree, or not aligned for reading in place).
+    pub(crate) fn mapped(file: Arc<Mapped>, at: usize, len: usize, items: u64) -> Option<Self> {
+        let b = file.data().get(at..at.checked_add(len)?)?;
+        if !(b.as_ptr() as usize).is_multiple_of(8) {
+            return None;
+        }
+        let meta = RTreeMetadata::<f32>::from_slice(b).ok()?;
+        if meta.node_size() != NODE_SIZE || u64::from(meta.num_items()) != items || items == 0 {
+            return None;
+        }
+        Some(PackedTree {
+            data: TreeData::Mapped { file, at, len },
+            meta,
+        })
+    }
+
     /// The tree's bytes (the flatbush layout).
     pub fn data(&self) -> &[u8] {
         match &self.data {
             TreeData::Owned(v) => v,
+            TreeData::Mapped { file, at, len } => &file.data()[*at..*at + *len],
         }
+    }
+
+    /// Whether the tree is read from a mapped file.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.data, TreeData::Mapped { .. })
     }
 
     /// The tree's nodes.

@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT *
+WHERE {
+  # sparkles-fmt: ignore
+  ?s   rdf:type   <http://example.org/Thing> .
+  ?s ?p 1 .
+}

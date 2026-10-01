@@ -1543,8 +1543,27 @@ envelope has no place in longitude and latitude. Malformed literals, literals ov
 `maxVertices`, empty geometries and literals in an unknown CRS are never candidates: no
 relation or distance with a constant can hold for them (they are type errors or empty).
 A `spatial:` call with a constant subject reads that feature's links directly, index or
-not. The index lives in memory: it is built when the database is opened (queries run
-without it meanwhile), and again for each new generation (bulk loads, compaction).
+not. The index's base belongs to a generation: it is built when the index is enabled, and
+again for each new generation (bulk loads, compaction), where the literals the previous
+generation's index parsed are taken over and only new ones are parsed. A persistent
+database writes the base to `gen-NNNN/geo/` (`rtree.spkg`, `column.spkg`; checksummed,
+written to a temporary file and renamed) and reads it from there in place, decoding a
+geometry the first time a query needs it: opening the database, or enabling the same
+predicates, graphs and limits again, parses no literal. Files that are missing, damaged,
+written by another version or made for another configuration or generation are removed
+and the base is built again (queries run without the index meanwhile). `serve
+--read-only` writes no index files (it builds in memory when the files do not fit).
+The files are derived data: backups and clones leave them out, and they go with their
+generation or a `DELETE /$/geo/{ds}`.
+
+**W3C Basic Geo.** With `"wgs84": true`, a subject with `wgs84_pos:lat` and
+`wgs84_pos:long` (`http://www.w3.org/2003/01/geo/wgs84_pos#`) in the same graph is also
+a point of the index (several of either: every combination, as in Jena). Values are
+numbers of any XSD numeric type, or strings holding one, within ±90° and ±180°; other
+pairs are no points. A point lives while both of its quads do. The `spatial:` functions
+find such a subject as a feature (no feature link needed), and the map view reports it;
+`geof:` FILTERs do not see the pairs (there is no geometry literal), so they are not
+pushed down for them either.
 
 Each spatial operator in an executed plan reports `counters`: `candidates` (rows the index
 or the scan handed out), `rechecked` (those among them the index could not place),
@@ -1557,8 +1576,9 @@ rows came from a scan instead of the index).
 |--------|------|-------------|
 | GET | `/$/geo/{ds}` | `GeoStatus` (below), or `{ "enabled": false }` |
 | PUT | `/$/geo/{ds}` | Enable or reconfigure; the body is a `GeoConfig` (empty: defaults). `202` with the build `Task` (`kind: "geo-index"`); `400 invalid geo configuration: …`; `409 spatial index build already running` |
-| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` |
-| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` and the index files |
+| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base from RDF, its files too (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| GET | `/{ds}/geo?bbox=minLon,minLat,maxLon,maxLat[&graph=IRI][&predicate=IRI][&limit=N][&tolerance=DEG]` | The indexed geometries meeting a CRS84 box (dataset read access), as `application/geo+json` (below). Without a ready index (off, building, failed) the same answer by a scan of the configuration's (or the default) predicates. `400` for a bad `bbox` (not four numbers, min after max, latitude out of ±90), `limit` outside 1–50,000 or a negative `tolerance`; `404` unknown dataset |
 
 ```ts
 type GeoConfig = {
@@ -1568,7 +1588,7 @@ type GeoConfig = {
   distance?: "geodesic" | "haversine";   // default "geodesic"
   maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
   maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
-  wgs84?: boolean;              // not supported yet (true: 400)
+  wgs84?: boolean;              // W3C Basic Geo lat/long pairs as points (default false)
   queryRewrite?: boolean;       // not supported yet (true: 400)
   formatVersion?: 1;
 };
@@ -1578,22 +1598,45 @@ type GeoStatus = {
   progress?: number; message?: string;
   generation: string;           // the generation the base was built for
   commit: number;               // the commit the status describes
-  rows: { base: number; overlay: number; tail: number };
+  rows: { base: number; overlay: number; tail: number; wgs84?: number };  // wgs84: W3C Basic Geo points among them
   literals: number;             // distinct parsed geometries
   skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
   crs: { [iri: string]: number };   // literals per CRS, unknown ones included
-  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number;
+            mappedBytes?: number };   // index files read in place (not counted against the budget)
   config: GeoConfig; formatVersion: 1;
   lastBuild?: { at: string; ms: number; rows: number };
+  files?: { bytes: number; opened: boolean };   // the base's index files; opened: read, not built
+};
+type GeoFeatureCollection = {   // GET /{ds}/geo
+  type: "FeatureCollection";
+  features: {
+    type: "Feature";
+    id: string;                 // the row's subject (an IRI, or _:label)
+    geometry: object;           // GeoJSON, CRS84, simplified with Douglas-Peucker
+    properties: {
+      subject: string;
+      feature?: string;         // a feature linked to the subject (one Feature per link; the subject itself for a W3C Basic Geo point)
+      graph: string | null;     // null: the default graph
+      predicate: string;        // the serialization predicate, or wgs84_pos:lat_long
+    };
+  }[];
+  truncated: boolean;           // more than `limit` features met the box
 };
 ```
+
+`GET /{ds}/geo` tests each geometry exactly against the box (in CRS84), transforms it to
+CRS84 and simplifies it with `tolerance` degrees (default: the box's width / 1024; a ring
+keeps at least four positions). `graph` narrows to one graph (`urn:x-arq:DefaultGraph` for
+the default graph), `predicate` to one serialization predicate (or
+`http://www.w3.org/2003/01/geo/wgs84_pos#lat_long` for the W3C Basic Geo points).
 
 `over-budget`: the index would need more than `serve --geo-mb` (4096 MiB); queries run
 without it. `failed`: a build or a commit's update of the index failed (the write itself
 never fails because of the index); queries run without it until a rebuild or a
 compaction. The configuration lives in the database directory (`geo.json`; `sparkles
 check` validates it, clones copy it, backups include it). CLI:
-`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
+`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--wgs84] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
 and `sparkles serve --geo NAME[=geo.json]`.
 
 ### Hulls, aggregates, Jena filter functions, UTM and conversion
@@ -1931,10 +1974,16 @@ overlap. Built with the `shex` cargo feature (on by default; `501` without it).
 JSON envelope carries both:
 
 * **Schema as the body.** `Content-Type: text/shex` (ShExC), `application/shex+json`, or
-  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object. Any
-  other content type is sniffed: ShExJ when the body starts with `{`, ShExC otherwise. The
-  shape map is `map=<compact shape map>`, or `node=<term>` with `shape=<label>`
-  (`START` when `shape` is absent). `base=<iri>` resolves relative IRIs of the schema.
+  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object;
+  ShExR (the schema as RDF in the ShEx vocabulary `http://www.w3.org/ns/shex#`) as
+  `text/turtle`, `application/n-triples`, `application/trig`, `application/n-quads` or
+  `application/rdf+xml` (the triples of every graph are read as one graph, and a Turtle or
+  TriG body's prefixes are the schema's). Any other content type (`text/plain`, a form
+  type) is sniffed: ShExJ when the body starts with `{`, ShExC otherwise.
+  `schema-format=shexc|shexj|shexr` names the syntax where the media type does not (ShExR
+  is then read in the RDF syntax of the media type, else as Turtle). The shape map is
+  `map=<compact shape map>`, or `node=<term>` with `shape=<label>` (`START` when `shape`
+  is absent). `base=<iri>` resolves relative IRIs of the schema.
 * **JSON envelope** (`Content-Type: application/json`, a body that is not a ShExJ schema):
 
   ```json
@@ -1946,7 +1995,8 @@ JSON envelope carries both:
     "base": "http://ex.org/schema" }
   ```
 
-  `schemaFormat` is `shexc` or `shexj` (default: sniffed); `map` is a compact shape map
+  `schemaFormat` is `shexc`, `shexj` or `shexr` (Turtle; default: sniffed as ShExC or
+  ShExJ); `map` is a compact shape map
   (a string) or a JSON shape map (an array); `externs` defines the schema's `EXTERNAL`
   shapes; `imports` gives the bodies of `IMPORT`ed IRIs. Only `schema` is required, and
   the shape map comes from the envelope or the query string, not both. Unknown keys are
@@ -1959,7 +2009,21 @@ literal or a blank node as Sparkles prints it in query results (`_:b1f`); `{FOCU
 `{FOCUS p _}`, `{s p FOCUS}` and `{_ p FOCUS}` select the nodes of the data graph with
 those arcs. The JSON syntax is an array of `{"node": …, "shape": …}` (the draft's
 `nodeSelector` and `shapeLabel` are accepted too). A node that is not in the data graph
-is validated with no arcs. `SPARQL """…"""` selectors are not supported yet (`400`).
+is validated with no arcs.
+
+`SPARQL """SELECT …"""` (any of the four string quotes) selects the bindings of `?focus`,
+or of the first projected variable, in the order of the solutions (unbound ones are
+skipped; values the store does not hold are validated with no arcs). It is an extension
+from other ShEx tools, not part of the ShapeMap draft. The query is checked when the map
+is parsed (`400` with `line` and `column` at the selector unless it is a SELECT query that
+projects a variable and has no `SERVICE`) and runs on the data graph: its default graph is
+the data graph (`graph`, with the inferences when `reasoning` includes them), and `FROM`,
+`FROM NAMED` and `GRAPH` see nothing else. It has no prefixes or base IRI but its own
+(neither the map's nor the schema's), the row and memory budgets of a query
+(`--max-rows`, `--query-memory-mb`; `507` past them), and the validation's
+`timeout`, which covers the selectors and the validation together. The selected nodes
+count, with the other associations, against the report's size, and are deduplicated with
+them per (node, shape).
 
 **Imports** (`IMPORT <iri>`) resolve from the envelope's `imports`, then `file:` IRIs under
 `--load-dir` (none without it), then http(s) IRIs through the `--outbound-*` policy of
@@ -2017,7 +2081,9 @@ Jena's report, `OK` or one `<n> @ <S> :: Focus = <n>, Status = nonconformant, Re
 line per association.
 
 **Errors.** `400` with `line` and `column` for a syntax error in the schema, the shape map,
-the externs or an inline import (also ShEx 2.2 syntax); `400` for a schema that cannot be
+the externs or an inline import (also ShEx 2.2 syntax); `400` without them for a ShExR
+schema whose graph is not a schema (no `sx:Schema` node, a missing `sx:predicate`, a value
+of the wrong kind: the message names the node); `400` for a schema that cannot be
 used (an undefined reference, a negated reference cycle, an invalid `&include`, an import
 that does not resolve or is not allowed, an `EXTERNAL` shape without a definition), a shape
 label the schema does not define, `START` without a start shape, and invalid parameters;
@@ -2028,14 +2094,20 @@ budget, or `"outbound-bytes"` when the imports exceed the request's outbound bud
 [Budgets](#budgets)).
 
 The CLI equivalent is `sparkles shex validate (--loc DB | --data FILE…) --schema FILE
-(--map FILE | --shape-map 'MAP' | --node TERM [--shape LABEL]) [--graph default|union|IRI]
+[--schema-format shexc|shexj|shexr] (--map FILE | --shape-map 'MAP' | --node TERM [--shape
+LABEL]) [--graph default|union|IRI]
 [--no-inferences] [--externs FILE] [--format text|json|shapemap|smap] [--only-nonconformant]
 [--timeout S] [--semact-trace] [--stats]`, with Jena's flag names as aliases (`val`, `v`;
 `--shapes`/`-s`, `--datafile`/`-d`, `--shapesMap`/`-m`, `--target`/`-n`). Imports resolve
 against the schema file's directory. It prints Jena's text report by default and exits
 with 0 when every association conforms, 1 when one does not (or on a timeout or budget
-error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--out
-shexc|shexj|text] [--base IRI]` prints schemas as ShExC, ShExJ or a structural dump.
+error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--in
+shexc|shexj|shexr] [--out shexc|shexj|shexr|text] [--base IRI]` prints schemas as ShExC,
+ShExJ, ShExR (Turtle) or a structural dump. Schema files are read by extension: ShExJ for
+`.json` and `.shexj`; ShExR for `.ttl`, `.nt`, `.nq`, `.trig`, `.rdf`, `.owl` and `.n3`
+(in that RDF syntax); ShExC or ShExJ (sniffed) otherwise; `--in`/`--schema-format` name
+the syntax of stdin (`-`) or of a file whose name does not say. SPARQL selectors on the
+command line have no row or memory budgets.
 
 ## Formatting
 

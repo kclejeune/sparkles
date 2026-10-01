@@ -3,4 +3,3 @@
 # skips them (and never blesses them); `-- --ignored` checks them and reports the ones
 # that pass, which then leave this list. One `<language>/<name>` per line (all its
 # variants) or `<language>/<name>.<variant>` (that variant), whitespace, and the reason.
-nquads/l1 the N-Quads example, default and sorted (before the line formats)

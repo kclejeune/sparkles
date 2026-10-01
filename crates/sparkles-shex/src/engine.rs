@@ -36,7 +36,20 @@ pub fn validate(
         &opts.extra_graphs,
         &opts.exclude_graphs,
     )?;
-    let (entries, mut warnings) = shapemap::expand(map, &data, schema)?;
+    // the timeout covers the expansion (SPARQL selectors) and the typing together
+    let deadline = opts.timeout.map(|t| started + t);
+    let (entries, mut warnings) = shapemap::expand(map, &data, schema, opts, deadline)?;
+    let rest;
+    let opts = match opts.timeout {
+        Some(t) => {
+            rest = ValidateOptions {
+                timeout: Some(t.saturating_sub(started.elapsed())),
+                ..opts.clone()
+            };
+            &rest
+        }
+        None => opts,
+    };
     if let Some(limit) = opts.max_results
         && !opts.only_nonconformant
         && entries.len() > limit

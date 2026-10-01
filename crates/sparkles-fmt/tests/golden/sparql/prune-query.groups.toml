@@ -1,0 +1,2 @@
+prune-prefixes = true
+prefix-groups = [["rdf", "rdfs", "xsd", "owl"]]

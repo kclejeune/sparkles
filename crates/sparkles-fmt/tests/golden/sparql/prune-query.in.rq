@@ -1,0 +1,23 @@
+# people and their labels
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX ex: <http://example.org/>
+PREFIX unused: <http://example.org/unused/>
+
+# vocabularies kept for later
+PREFIX schema: <https://schema.org/>
+PREFIX dc: <http://purl.org/dc/terms/>  # Dublin Core
+BASE <http://example.org/base/>
+PREFIX dcat: <http://www.w3.org/ns/dcat#>
+
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?s ?label WHERE {
+  ?s rdf:type foaf:Person ;
+    rdfs:label ?label ;
+    ex:age "42"^^xsd:integer .
+  ?s <http://www.w3.org/2004/02/skos/core#prefLabel> <relative> .
+}

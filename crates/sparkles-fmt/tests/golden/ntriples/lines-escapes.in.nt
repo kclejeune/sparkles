@@ -1,0 +1,6 @@
+<http://example.org/\u0073> <http://example.org/p> "caf\u00e9 \U0001F600 tab\u0009 nl\u000a q\" bs\\ bell\u0007 del\u007F" .
+<http://example.org/s> <http://example.org/p> "x"^^<http://www.w3.org/2001/XMLSchema#string> .
+<http://example.org/s> <http://example.org/p> "Hallo"@DE-at .
+<http://example.org/s> <http://example.org/p> "x"@EN--rtl .
+<http://example.org/s> <http://example.org/p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/s> <http://example.org/p> "\b\f\r\t\n\"\\" .

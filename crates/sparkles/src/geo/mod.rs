@@ -55,6 +55,8 @@ pub mod spatialf;
 #[cfg(feature = "geo")]
 pub(crate) mod tree;
 #[cfg(feature = "geo")]
+pub mod wgs84;
+#[cfg(feature = "geo")]
 pub mod write;
 
 #[cfg(all(test, feature = "geo"))]
@@ -153,8 +155,11 @@ pub struct GeoProbe {
     /// this build has no GeoSPARQL support: only the configuration was read
     pub unsupported: bool,
     pub config: Option<GeoConfig>,
-    /// problems of the index's own files, as (file, problem); none are persisted yet
+    /// problems of the index's own files, as (file, problem)
     pub damaged: Vec<(String, String)>,
+    /// the index files that are good, and their bytes
+    pub files: Vec<String>,
+    pub file_bytes: u64,
 }
 
 /// Inspect the spatial index of the database at `root` without opening it.

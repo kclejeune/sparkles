@@ -1,15 +1,16 @@
 //! `VALUES`: one variable inline when it fits (`VALUES ?x { a b c }`), else one value
-//! per line; several variables one row per line, each row `(v₁ v₂)`, the columns not
-//! aligned (`align-values` is not implemented yet and only warns).
+//! per line; several variables one row per line, each row `(v₁ v₂)`, the columns
+//! aligned only with `align-values`.
 
 use super::Ctx;
 use super::expr::term_token;
 use crate::doc::DocId;
 use crate::lex::TokenKind;
-use crate::tree::{Element, NodeId};
+use crate::tree::{Element, NodeId, TokenId};
+use unicode_width::UnicodeWidthStr;
 
-/// Whether `align-values` is implemented (until it is, it warns `option-not-implemented`).
-pub const ALIGN_IMPLEMENTED: bool = false;
+/// Whether `align-values` is implemented.
+pub const ALIGN_IMPLEMENTED: bool = true;
 
 /// `ValuesClause`: the `VALUES` block after a query, as [`inline_values`].
 pub fn values_clause(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
@@ -71,7 +72,11 @@ fn data_block(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
         let docs: Vec<DocId> = items.iter().map(|&c| cx.node(c)).collect();
         cx.delimited(n, open, &docs, close, true)
     } else {
-        let docs: Vec<(NodeId, DocId)> = items.iter().map(|&c| (c, cx.node(c))).collect();
+        let aligned = match cx.opts.align_values {
+            true => aligned_rows(cx, &items),
+            false => None,
+        };
+        let docs = aligned.unwrap_or_else(|| items.iter().map(|&c| (c, cx.node(c))).collect());
         cx.block(n, open, &docs, close)
     };
     head.push(block);
@@ -92,6 +97,103 @@ pub fn values_row(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
         (Some(&e), _) if children.len() == 1 => term(cx, e),
         _ => cx.verbatim(n),
     }
+}
+
+/// The rows of a multi-variable block with their cells padded into columns
+/// (`align-values`): every cell but the last of its row is followed by spaces up to the
+/// width of its column's widest cell, then one space. `None` leaves the block as
+/// [`values_row`] prints it: a row under an ignore pragma, a comment inside a row, a
+/// cell holding a line break (a long string), or fewer than two columns.
+///
+/// Whether the aligned rows fit the line width is known only where they are printed,
+/// so every row follows one group printed at the start of the first row: it holds as
+/// many spaces as the widest aligned row is wider than the first (the printer drops
+/// spaces at the start of a line, but measures them), so it fits exactly when the widest
+/// aligned row does. Flat, the rows print aligned; broken, as without the key.
+fn aligned_rows(cx: &mut Ctx<'_, '_>, rows: &[NodeId]) -> Option<Vec<(NodeId, DocId)>> {
+    let mut parsed: Vec<(NodeId, TokenId, Vec<NodeId>, TokenId)> = Vec::new();
+    for &r in rows {
+        if cx.comments.ignored(r) {
+            return None;
+        }
+        let children = cx.children(r);
+        let (Some(&Element::Token(open)), Some(&Element::Token(close))) =
+            (children.first(), children.last())
+        else {
+            return None;
+        };
+        if cx.tree.token_kind(open) != TokenKind::LParen || children.len() < 2 {
+            return None;
+        }
+        let cells = cx.child_nodes(r);
+        let comment_inside =
+            (open.0 + 1..close.0).any(|i| cx.tree.tokens[i as usize].kind == TokenKind::Comment);
+        if comment_inside || cells.iter().any(|&c| cx.has_comments(c)) {
+            return None;
+        }
+        parsed.push((r, open, cells, close));
+    }
+    if parsed.iter().map(|p| p.2.len()).max()? < 2 {
+        return None;
+    }
+    // each cell's document and printed width
+    let mut cells: Vec<Vec<(DocId, usize)>> = Vec::new();
+    for (_, _, row, _) in &parsed {
+        let mut docs = Vec::new();
+        for &c in row {
+            let d = cx.node(c);
+            let src = cx.tree.src;
+            let printed =
+                crate::doc::print(&cx.arena, d, src, u16::MAX, cx.opts.indent_width, None);
+            let text = printed.ok()?.text;
+            if text.contains(['\n', '\r']) {
+                return None;
+            }
+            docs.push((d, text.width()));
+        }
+        cells.push(docs);
+    }
+    // a column's width: its widest cell that is not the last of its row
+    let mut widths: Vec<usize> = Vec::new();
+    for row in &cells {
+        for (j, &(_, w)) in row.iter().enumerate().take(row.len().saturating_sub(1)) {
+            match widths.get_mut(j) {
+                Some(c) => *c = (*c).max(w),
+                None => widths.push(w),
+            }
+        }
+    }
+    let row_width = |row: &[(DocId, usize)]| -> usize {
+        let Some((&(_, last), init)) = row.split_last() else {
+            return 2;
+        };
+        2 + last + widths[..init.len()].iter().map(|w| w + 1).sum::<usize>()
+    };
+    let widest = cells.iter().map(|r| row_width(r)).max()?;
+    let measure = cx.text(&" ".repeat(widest - row_width(&cells[0])));
+    let (measure, fits) = cx.group_with_id(measure);
+    let mut out = Vec::new();
+    for (k, ((r, open, _, close), row)) in parsed.into_iter().zip(&cells).enumerate() {
+        let open = cx.tok(open);
+        let close = cx.tok(close);
+        let mut aligned = vec![open];
+        for (j, &(d, w)) in row.iter().enumerate() {
+            aligned.push(d);
+            if j + 1 < row.len() {
+                aligned.push(cx.text(&" ".repeat(widths[j] - w + 1)));
+            }
+        }
+        aligned.push(close);
+        let aligned = cx.concat(aligned);
+        let docs: Vec<DocId> = row.iter().map(|c| c.0).collect();
+        let plain = cx.delimited(r, open, &docs, close, false);
+        let mut doc = cx.if_break(plain, aligned, Some(fits));
+        if k == 0 {
+            doc = cx.concat([measure, doc]);
+        }
+        out.push((r, crate::trivia::wrap(&mut cx.arena, cx.comments, r, doc)));
+    }
+    Some(out)
 }
 
 /// `DataValue`: an IRI, a literal, `UNDEF` or a triple term.
@@ -209,6 +311,105 @@ mod tests {
         assert_eq!(
             values("SELECT * { VALUES (?a ?b) { (1 # one\n 2) (3 4) # three\n } }"),
             "VALUES (?a ?b) {\n  (\n    1 # one\n    2\n  )\n  (3 4) # three\n}"
+        );
+    }
+
+    /// `src` formatted with `align-values` at `width`, through every check.
+    fn aligned(src: &str, width: u16) -> String {
+        let opts = Options {
+            align_values: true,
+            line_width: width,
+            ..Options::default()
+        };
+        let out = crate::format(src, crate::Language::Sparql, &opts).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let again = crate::format(&out.text, crate::Language::Sparql, &opts).unwrap();
+        assert_eq!(again.text, out.text, "not a fixpoint");
+        out.text
+    }
+
+    #[test]
+    fn align_values_pads_every_cell_but_the_last() {
+        assert_eq!(
+            aligned(
+                "PREFIX ex: <http://e/>\nSELECT * { VALUES (?s ?currency ?n) { (<https://example.org/p1> \"EUR\" 1) (ex:p2 UNDEF 22) (ex:p3 'GBP' 3) } }",
+                100
+            ),
+            "PREFIX ex: <http://e/>
+
+SELECT *
+WHERE {
+  VALUES (?s ?currency ?n) {
+    (<https://example.org/p1> \"EUR\" 1)
+    (ex:p2                    UNDEF 22)
+    (ex:p3                    \"GBP\" 3)
+  }
+}
+"
+        );
+        // wide characters count by display width; trailing comments follow the `)`
+        assert_eq!(
+            aligned(
+                "SELECT * {} VALUES (?a ?b) { (\"日本\" 1) # wide\n (\"ab\" 2) (\"abcdef\" 3) }",
+                100
+            ),
+            "SELECT *
+WHERE {}
+VALUES (?a ?b) {
+  (\"日本\"   1) # wide
+  (\"ab\"     2)
+  (\"abcdef\" 3)
+}
+"
+        );
+    }
+
+    #[test]
+    fn align_values_leaves_some_blocks_as_written() {
+        // too wide once aligned (each row alone fits)
+        let src = "SELECT * { VALUES (?a ?b) { (<http://example.org/a-rather-long-name> 1) (2 <http://example.org/another-long-name>) } }";
+        assert_eq!(
+            aligned(src, 60),
+            crate::format(
+                src,
+                crate::Language::Sparql,
+                &Options {
+                    line_width: 60,
+                    ..Options::default()
+                }
+            )
+            .unwrap()
+            .text
+        );
+        assert_eq!(
+            aligned(src, 100),
+            "SELECT *
+WHERE {
+  VALUES (?a ?b) {
+    (<http://example.org/a-rather-long-name> 1)
+    (2                                       <http://example.org/another-long-name>)
+  }
+}
+"
+        );
+        // the widest aligned row is 80 columns at indent 4: it fits 84 exactly
+        assert!(aligned(src, 84).contains("(2                                       <"));
+        assert!(aligned(src, 83).contains("(2 <"));
+        // a comment inside a row, an ignored row, a long string with a line break
+        for src in [
+            "SELECT * { VALUES (?a ?b) { (1 # one\n 2) (333 4) } }",
+            "SELECT * { VALUES (?a ?b) {\n # sparkles-fmt: ignore\n (1   2)\n (333 4) } }",
+            "SELECT * { VALUES (?a ?b) { (\"\"\"x\ny\"\"\" 2) (333 4) } }",
+        ] {
+            let plain = crate::format(src, crate::Language::Sparql, &Options::default())
+                .unwrap()
+                .text;
+            assert_eq!(aligned(src, 100), plain, "{src}");
+        }
+        // one column: nothing to pad
+        assert_eq!(
+            aligned("SELECT * { VALUES (?a) { (1) (333) } }", 100),
+            "SELECT *\nWHERE {\n  VALUES (?a) {\n    (1)\n    (333)\n  }\n}\n"
         );
     }
 }

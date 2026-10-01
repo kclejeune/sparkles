@@ -7,6 +7,8 @@
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { receiptSummary } from '$lib/commits';
+  import { formatEditor } from '$lib/fmt-edit';
+  import { formatFailure } from '$lib/fmt-view';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
   import { load, save } from '$lib/storage';
@@ -19,6 +21,7 @@
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
   import TaskList from '$components/TaskList.svelte';
   import TermView from '$components/TermView.svelte';
+  import TurtleEditor from '$components/TurtleEditor.svelte';
 
   const name = $derived(page.params.name ?? '');
   const info = $derived(app.datasets.find((d) => d.name === name));
@@ -260,6 +263,30 @@ ex:PersonShape a sh:NodeShape ;
     } finally {
       validating = false;
       shaclCtl = null;
+    }
+  }
+
+  let shapesEditor = $state<TurtleEditor>();
+  let formattingShapes = $state(false);
+
+  /** Format the shapes graph through the server (the Format button and Shift+Alt+F). */
+  async function formatShapes() {
+    const ed = shapesEditor;
+    if (!ed || formattingShapes || !ed.snapshot().text.trim()) return;
+    formattingShapes = true;
+    try {
+      await formatEditor(ed, (req) => api.format({ ...req, language: 'turtle' }));
+      ed.showError(undefined);
+    } catch (e) {
+      const failure = formatFailure(e, 'these shapes');
+      if (!failure) {
+        toasts.error('Formatting failed', e);
+        return;
+      }
+      if (failure.line != null) ed.showError(failure.line, failure.column);
+      toasts.push('error', failure.title, failure.detail);
+    } finally {
+      formattingShapes = false;
     }
   }
 
@@ -592,13 +619,25 @@ ex:PersonShape a sh:NodeShape ;
             {/if}
           </div>
           <div class="panel-body shacl">
-            <textarea
-              class="textarea mono"
-              rows="12"
-              bind:value={shapes}
-              spellcheck="false"
-              aria-label="Shapes graph (Turtle)"></textarea>
+            <TurtleEditor
+              bind:this={shapesEditor}
+              value={shapes}
+              onchange={(v) => (shapes = v)}
+              onformat={() => void formatShapes()}
+              label="Shapes graph (Turtle)"
+            />
             <div class="row shacl-opts">
+              <button
+                class="btn"
+                onclick={() => formatShapes()}
+                disabled={formattingShapes || !shapes.trim()}
+                title="Format (Shift+Alt+F)"
+              >
+                {#if formattingShapes}<span class="spinner"></span>{:else}<Icon
+                    name="wand"
+                    size={13}
+                  />{/if} Format
+              </button>
               <label class="inline">
                 <span class="faint">Data graph</span>
                 <select class="select" bind:value={shaclGraph} aria-label="Data graph">
@@ -1152,12 +1191,6 @@ ex:PersonShape a sh:NodeShape ;
   .shacl {
     display: grid;
     gap: 10px;
-  }
-  .shacl textarea {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    line-height: 1.5;
-    resize: vertical;
   }
   .shacl-opts {
     flex-wrap: wrap;
