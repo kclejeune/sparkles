@@ -1,0 +1,37 @@
+PREFIX ex: <http://example.org/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# The schema of `scripts/bench-shacl-write.sh --lang shex` in `reject` mode: bench.shex
+# (with the shape map bench.smap) loosened until scripts/gen-data.py data conforms to
+# it, so every timed write passes: ages up to 80, all ten cities, years up to 2026, and
+# advisors that are any person. The same work as bench.shex otherwise: the recursive
+# knows component, documents citing documents, and a CLOSED shape, which also keeps
+# every write to the default graph validated (with no CLOSED shape, a write of a
+# predicate no triple constraint mentions would be skipped).
+
+ex:Person {
+  a [ex:Employee ex:Researcher ex:Manager ex:Student] ;
+  foaf:name xsd:string ;
+  foaf:age xsd:integer MININCLUSIVE 18 MAXINCLUSIVE 80 ? ;
+  ex:salary xsd:decimal MINEXCLUSIVE 0 ? ;
+  foaf:knows IRI @ex:Person * ;            # recursive: one SCC over the knows graph
+  ex:colleagueOf IRI * ;
+  ex:authorOf @ex:Document ? ;
+  ex:worksFor @ex:Org ? ;
+  ex:advisor @ex:Person ?
+}
+
+ex:Document {
+  a [ex:Article ex:Book] ;
+  ex:title [@en] /^On the theory/ ;
+  ex:year xsd:integer MAXINCLUSIVE 2026 ;
+  ex:cites @ex:Document *                  # recursive
+}
+
+ex:Org CLOSED {
+  a [ex:University ex:Company] ;
+  foaf:name . ;
+  ex:city ["Kyoto" "Paris" "Berlin" "Boston" "Zurich" "Toronto" "Freiburg" "London" "Austin" "Oslo"] ;
+  ex:founded xsd:date
+}
