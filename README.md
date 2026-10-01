@@ -580,7 +580,8 @@ API and UI (`POST /$/repositories`), under the operator's limits from that file.
 credentials only name a source defined there, never environment variables, files or the
 instance's default chain of the caller's choosing; their S3 endpoints go through the
 outbound policy below (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
-`--outbound-allow-private`); `fs` ones stay out of the data directory and the config
+`--outbound-allow-private`), never through a proxy of the environment (`HTTPS_PROXY`;
+the config file's repositories and the CLI's use it); `fs` ones stay out of the data directory and the config
 files' directories, and under `[api] fs_roots` when it is set:
 
 ```toml

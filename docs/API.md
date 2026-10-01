@@ -1248,7 +1248,10 @@ access wherever they like:
   outbound policy (the `--outbound-*` flags of `SERVICE` and `LOAD`: public addresses
   only by default), and connections go only to the addresses checked. A MinIO on
   localhost needs `--outbound-allow 127.0.0.1` or `--outbound-allow-private`. A refused
-  endpoint is `400 invalid-config` (`field: "endpoint"`).
+  endpoint is `400 invalid-config` (`field: "endpoint"`). These connections never go
+  through a proxy of the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`), which
+  would reach the endpoint past the address checks; repositories of the config file, and
+  the CLI's, use the environment's proxies as usual.
 * `fs` repositories must lie under one of `[api] fs_roots` when it is set.
 * `gcs` and `azure` repositories use the server's own credentials and can only come from
   the config file; `memory` is for tests.
