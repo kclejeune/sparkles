@@ -16,7 +16,7 @@ use sparkles_fmt::sparql::print::{Ctx, RULES, node};
 use sparkles_fmt::syntax::NodeKind;
 use sparkles_fmt::tree::{NodeId, Tree};
 use sparkles_fmt::trivia::Comments;
-use sparkles_fmt::{OperatorPosition, Options, QuoteStyle};
+use sparkles_fmt::{FormatError, Language, OperatorPosition, Options, QuoteStyle, format};
 
 /// The node kinds the expression printer owns.
 fn is_expr(k: NodeKind) -> bool {
@@ -157,4 +157,82 @@ fn printed_expressions_keep_the_algebra_and_are_stable() {
 /// The lines without blank ones (the line breaks the splice adds).
 fn strip(s: &str) -> Vec<&str> {
     s.lines().filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// The byte offsets after which the sweep puts a comment: the end of every token inside
+/// an outermost expression, and of the token just before it.
+fn expression_spots(text: &str) -> Vec<usize> {
+    let tokens = lex(text, LexMode::Sparql);
+    let Ok(reference) = sparql_reference(text, &tokens) else {
+        return Vec::new();
+    };
+    let Ok(tree) = parse(text, tokens, reference.unit) else {
+        return Vec::new();
+    };
+    let mut spots = Vec::new();
+    for n in roots(&tree) {
+        let r = tree.range(n);
+        let first = tree.first_token(n).expect("a token");
+        if let Some(p) = tree.prev_significant(first) {
+            spots.push(tree.token(p).end());
+        }
+        spots.extend(
+            tree.tokens
+                .iter()
+                .filter(|t| !t.kind.is_trivia() && t.start as usize >= r.start && t.end() <= r.end)
+                .map(|t| t.end()),
+        );
+    }
+    spots.sort_unstable();
+    spots.dedup();
+    spots
+}
+
+/// One comment after each token in and before every expression of every positive W3C
+/// file, one at a time, under both operator positions: the output keeps the comment once
+/// and is a fixpoint. Slow; run with `--ignored` (in release mode).
+#[test]
+#[ignore]
+fn a_comment_anywhere_in_an_expression_is_kept_and_stable() {
+    const MARK: &str = "# sparkles-sweep";
+    let texts = corpus::positive_texts();
+    let failures: Vec<String> = corpus::par_map(texts, |(name, text)| {
+        let mut out = Vec::new();
+        for at in expression_spots(text) {
+            let injected = format!("{} {MARK}\n{}", &text[..at], &text[at..]);
+            for position in [OperatorPosition::Leading, OperatorPosition::Trailing] {
+                let opts = Options {
+                    operator_position: position,
+                    ..Options::default()
+                };
+                let once = match format(&injected, Language::Sparql, &opts) {
+                    Ok(f) => f.text,
+                    Err(FormatError::Syntax { .. }) => continue,
+                    Err(e) => {
+                        out.push(format!("{name} @{at} {position:?}: {e}\n{injected}"));
+                        continue;
+                    }
+                };
+                if once.matches(MARK).count() != 1 {
+                    out.push(format!("{name} @{at} {position:?}: comment lost\n{once}"));
+                    continue;
+                }
+                match format(&once, Language::Sparql, &opts) {
+                    Ok(f) if f.text == once => {}
+                    Ok(f) => out.push(format!(
+                        "{name} @{at} {position:?}: not a fixpoint\n--- input ---\n{injected}\
+                         --- once ---\n{once}--- twice ---\n{}",
+                        f.text
+                    )),
+                    Err(e) => out.push(format!("{name} @{at} {position:?}: again: {e}\n{once}")),
+                }
+            }
+        }
+        out
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!("{} failures", failures.len());
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
