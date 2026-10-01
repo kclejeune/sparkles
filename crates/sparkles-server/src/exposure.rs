@@ -17,6 +17,7 @@ pub fn loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+#[cfg(any(feature = "auth", test))]
 /// Whether `host` is a loopback listener: a loopback address or a Unix socket (`unix`).
 pub fn local_listener(host: &str) -> bool {
     host == "unix" || loopback(host)

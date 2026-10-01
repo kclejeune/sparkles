@@ -87,6 +87,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | `GET /{ds}/geo?bbox=…`: the indexed geometries in a box as simplified CRS84 GeoJSON, for map views | ✅ |
 | Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | ✅ |
 | GeoSPARQL `boundingCircle`, `concaveHull`, `isSimple`; the six `geof:agg…` aggregates (GROUP BY, DISTINCT); Jena's 15 `spatialF:` filter functions; the 120 UTM zones (EPSG:326NN/327NN, Krüger's series); `POST /$/geo/convert` (literals as CRS84 GeoJSON for maps); Oxigraph's GeoSPARQL tests (37/44, the rest listed with reasons) and Jena-derived tests; see [docs/API.md](docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) | ✅ |
+| Spatial joins (a GeoSPARQL relation, `relate` or distance bound between the geometries of two parts of a group: an index nested loop or trees packed per query, instead of a cross product) and nearest-neighbour `ORDER BY geof:metricDistance(?w, C) LIMIT k` from the index (`SpatialJoin`, `SpatialKnn` in EXPLAIN, `geo-not-joined`/`geo-not-knn` warnings); see [docs/API.md](docs/API.md#spatial-joins-and-nearest-neighbours) | ✅ |
+| GeoSPARQL query rewrite of the 24 topological properties (asserted ∪ derived through default geometries and serializations, opt-in per dataset with `queryRewrite`, `serve --no-geo-rewrite` for the server), Jena's `spatial:equals`, RDFS entailment of the GeoSPARQL and Simple Features vocabulary (`infer --vocab geosparql`) and materialized default geometries (`infer --geo-default-geometry`); see [docs/API.md](docs/API.md#query-rewrite-spatialequals-and-rdfs-entailment) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
@@ -108,7 +110,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | ShEx 2.1 validation (`sparkles-shex`; `shex` cargo feature, on by default): ShExC, ShExJ and ShExR (RDF in any syntax Sparkles reads: `text/turtle`, N-Triples, RDF/XML, TriG, N-Quads; `.ttl`, `.nt`, … files) schemas with imports (inline, `--load-dir` files, http(s) through the outbound policy), `EXTERNAL` shapes, annotations and the Test semantic-action extension; compact and JSON shape maps with `{FOCUS p o}` selectors and `SPARQL """SELECT …"""` selectors (run on the data graph with the query's row and memory budgets, no SERVICE); recursion and negation by stratified greatest-fixed-point typing without deep stacks; parallel, index-backed; shexTest: 100% of the syntax, negative-syntax, negative-structure and representation tests, 100% of the ShExR tests (each `.ttl` schema read as ShExJ, each `.shex` written as the `.ttl` graph), **99.9%** of the validation tests from ShExC, ShExJ and ShExR (the 42 that test blank-node labels are skipped, and one more is listed: the store does not keep them). `POST /{ds}/shex` (a Sparkles extension) with JSON, ShapeMap JSON, compact and text reports, and `sparkles shex validate\|parse` (Jena's flag names as aliases; `parse --out shexr` writes Turtle); see [docs/API.md](docs/API.md#shex-validation). Not yet: ShEx 2.2, a UI | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
-| MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits, full-text and vector similarity search; `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
+| MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits, full-text and vector similarity search, SHACL and ShEx validation (counts and the first results, compactly); `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
 | SPARQL formatter (`sparkles-fmt`, `sparkles fmt`, `POST /$/format`; `fmt` cargo feature, on by default): comment-preserving, self-checking (the output must parse to the same algebra, keep every comment and format to itself); the pipeline, the style options, the endpoint (JSON and raw bodies, the editor's cursor carried across in UTF-16 units, refusals as `422`; see [docs/API.md](docs/API.md#formatting)) and the command line (directory walks with ignore files, config discovery, `--check`, `--write`, `--diff`, Prettier's exit codes) are in place, the formatting rules are not yet (documents come back as written, syntax errors with their position) | 🚧 |
 | Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries and writes stop when their client disconnects | ✅ |
@@ -169,7 +171,7 @@ feature gaps are:
 | Area | Jena / Fuseki has | Sparkles |
 |---|---|---|
 | Full-text search | jena-text (Lucene), `text:query` | `text:query` subset over string literals (Tantivy, BM25), updated in the commit path; no highlighting, per-language stemming or entity-style multi-field documents yet |
-| Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions with a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | the GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs, Jena's `spatial:` property functions, and a spatial index per dataset that FILTERs and property functions use; no `spatialF:` functions, query rewrite, geometry-type entailment, GML/KML literals or EPSG database yet (see `docs/AUDIT.md` §5) |
+| Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions with a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | the GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs, Jena's `spatial:` property functions, and a spatial index per dataset that FILTERs and property functions use; query rewrite of the topological properties (off by default) and RDFS entailment of the geometry hierarchy (`--vocab geosparql`); no `spatialF:` functions, geometry-type entailment, GML/KML literals or EPSG database yet (see `docs/AUDIT.md` §5) |
 | Shape languages | ShEx (jena-shex) | SHACL and ShEx 2.1 (ShExC, ShExJ, ShExR, SPARQL selectors); no ShEx 2.2 |
 | Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
@@ -190,7 +192,7 @@ feature gaps are:
 | Streaming execution | lazy, block-wise evaluation of scans, joins, filters and GROUP BY; results streamed to the client | every operator materializes its full result (bounded by row and memory budgets); responses over 1 MiB are streamed to the client as they are serialized |
 | Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals); non-canonical numerals are still tested row by row |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts use index runs instead) |
-| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); GeoSPARQL functions and a spatial index, no spatial joins yet |
+| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); GeoSPARQL functions, a spatial index, spatial joins on GeoSPARQL FILTERs and nearest-neighbour ORDER BY |
 | Vocabulary compression | FSST string compression, IRI-as-id encoding for numeric IRIs | front coding, no IRI encoding |
 | Named / pinned results, materialized views | `pin-result-with-name`, materialized views | result cache only (no pinning) |
 | Live query monitoring | websocket runtime-information updates | executed plan returned after completion only |
@@ -409,6 +411,7 @@ result cache, and the web UI.
 | GeoSPARQL literals are read with their CRS's own axis order (EPSG:4326 is latitude first); the legacy `…/def/crs/EPSG/4326` (without `/0/`) is CRS84, as in Jena | GeoSPARQL Req 16. `minX`…`maxY` report the literal's own axes, as in Jena. |
 | GeoSPARQL literals in a CRS this build does not know are valid geometries: same-CRS planar relations, accessors and constructions work, metric functions and mixes with other CRSs are type errors, and the index leaves them out (counted in its status) | Jena logs a warning and treats the coordinates as CRS84 degrees, which gives wrong answers silently. |
 | GeoSPARQL relations follow DE-9IM: an empty geometry is disjoint from everything (`sfDisjoint` true, every other relation false), equal points are `sfEquals`, `sfCrosses` of two curves is `0********`, RCC8 relations hold between regions only | Jena returns false for every relation on an empty geometry and compares `sfEquals` with the tables' `TFFFTFFFT` pattern, under which two equal points are not equal. |
+| GeoSPARQL query rewrite is off by default (`geo.json` `"queryRewrite": true` per dataset) | Jena rewrites by default. Each rewritten pattern costs a spatial search or join, and enabling a spatial index should not change what an existing query over asserted triples means. |
 | `geof:getSRID` returns an `xsd:anyURI`; `geof:dimension` of an empty geometry is its type's dimension (`-1` for an empty collection) | The GeoSPARQL 1.1 signature (Jena returns `xsd:string`); never a type error. |
 | `geof:concaveHull(g, targetPercent)` sets concaveman's concavity to `targetPercent / 25` (50 = the default 2.0, 100 = the convex hull); `geof:aggConcaveHull` uses the default; `spatialF:angle` follows Jena's documented meaning (clockwise from the y axis) in every quadrant | GeoSPARQL leaves the hull parameter to the implementation, and a SPARQL aggregate takes one expression. Jena's `angle` is a quarter turn off south-east and north-west of the first point. |
 | The spatial index is opt-in per dataset (`geo.json`); the `geof:` functions work without it, and every answer from the index is refined with the exact test, so answers are the same with or without it | Jena's index is built for the whole dataset at start-up and its `spatial:withinBox`/`intersectBox` return envelope hits for an unbound subject. |
@@ -598,6 +601,7 @@ sparkles check   --loc db                     # verify the files, read-only (--q
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
+sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
@@ -731,7 +735,8 @@ database to an `fs` repository.
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 `scripts/gen-geo.py N` generates a GeoSPARQL one (points around cities, lines, polygons,
 an administrative hierarchy) with its queries, and `scripts/bench-geo.sh N` times them
-with and without the spatial index after checking that both give the same answers.
+with and without the spatial index (and the nearest-neighbour query with the spatial
+rewrites off) after checking that every run gives the same answers.
 `scripts/geosparql-benchmark.sh` runs the GeoSPARQL Compliance Benchmark (GPL-2.0, so it
 is fetched into `target/` at a pinned commit only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`,
 and never added to the repository).
@@ -865,10 +870,11 @@ mise run build        # UI + release binary
 mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
+mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
 mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
-mise run ci           # fmt:check + lint + test + ui:test + licenses:check
+mise run ci           # fmt:check + lint + lint:features + test + ui:test + licenses:check
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
@@ -1050,9 +1056,11 @@ Code; `claude mcp add sparkles -- sparkles mcp --loc /data/books` does the same)
 
 The tools are read-only: `list_datasets`, `describe_schema`, `sparql_query`,
 `explain_query`, `describe_resource`, `list_commits`, `search_text` (BM25 over a
-full-text index; `--text` indexes `--data` files) and `similar_entities` (exact search
-over stored `spk:vector` embeddings; it never computes them). Schemas are in
-[`docs/API.md`](docs/API.md#mcp-server). Results are sized for a model's context:
+full-text index; `--text` indexes `--data` files), `similar_entities` (exact search
+over stored `spk:vector` embeddings; it never computes them), and `validate_shacl` and
+`validate_shex` (a shapes graph, or a ShEx schema with a shape map, checked against a
+snapshot: counts and the first 20 results with node, shape and reason; no imports).
+Schemas are in [`docs/API.md`](docs/API.md#mcp-server). Results are sized for a model's context:
 query rows come back as a compact table with the dataset's prefixes (100 rows / 64 KiB by
 default), every truncation is announced with the exact total and how to continue, and
 data values are escaped so they cannot pass for table structure or status lines. Every
@@ -1072,6 +1080,7 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
+mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
@@ -1086,3 +1095,11 @@ suites are skipped. All of them pass (482/482, 328/328, 157/157, 269/269; SHACL 
 The shexTest suite comes from the same checkout too (`jena-shex`, or `SPARKLES_SHEX_TESTS`
 for an upstream shexTest checkout); `crates/sparkles-shex/tests/known-failures.txt` lists
 what fails, with reasons.
+
+`mise run lint:features` (`scripts/lint-features.sh`) runs clippy with warnings as errors
+over the builds `mise run lint` does not see: the server with no optional feature, with
+each default feature on its own, and with `mcp,shacl` and `mcp,shex`; `sparkles` and
+`sparkles-fmt` with their features off; the `sparkles-backup` library without a backend.
+Code used only under some feature is gated on it, so this catches dead code and missing
+gates. Every combination shares the workspace target directory: the first run builds the
+dependencies once per feature set, after that a change costs a minute or two.

@@ -125,7 +125,26 @@ pub fn status_value(info: &ReasoningInfo, store: &Store, auto: J) -> J {
     if let Some(r) = f.reason {
         j["staleReason"] = r.into();
     }
+    if !info.vocabularies.is_empty() {
+        j["vocabularies"] = info.vocabularies.clone().into();
+    }
+    if info.geo_default_geometry {
+        j["geoDefaultGeometry"] = true.into();
+    }
     j
+}
+
+/// The profile with its extras: `rdfs + geosparql + default geometries`.
+fn profile_text(info: &ReasoningInfo) -> String {
+    let mut s = info.profile.clone();
+    for v in &info.vocabularies {
+        s.push_str(" + ");
+        s.push_str(v);
+    }
+    if info.geo_default_geometry {
+        s.push_str(" + default geometries");
+    }
+    s
 }
 
 /// One line for the CLI: `owl-rl, 1234 inferred at commit 40 (STALE: 3 commits since)`.
@@ -145,7 +164,8 @@ pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
     };
     format!(
         "{}, {} inferred {at} ({state})",
-        info.profile, info.inferred
+        profile_text(info),
+        info.inferred
     )
 }
 

@@ -387,7 +387,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` (zstd level 3; gzip, `.nq.gz`, in a build without zstd). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it, so `compression=gzip` gives Fuseki's `.nq.gz`; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
+| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }` (a form takes `vocabulary` repeated and `geoDefaultGeometry`; see [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment)), or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile, rules and extras (`409` when nothing is recorded). `400` for an unknown profile or vocabulary. Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
@@ -1589,7 +1589,7 @@ type GeoConfig = {
   maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
   maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
   wgs84?: boolean;              // W3C Basic Geo lat/long pairs as points (default false)
-  queryRewrite?: boolean;       // not supported yet (true: 400)
+  queryRewrite?: boolean;       // default false: match the topological geo: properties against geometries too
   formatVersion?: 1;
 };
 type GeoStatus = {
@@ -1706,6 +1706,127 @@ and the 7 others are listed with the reason in
 `testsuite/geosparql/oxigraph/expected-failures.txt` (EPSG:4326 is supported, with its
 latitude-first axes; unclosed polygon rings are malformed literals).
 
+### Spatial joins and nearest neighbours
+
+**Spatial joins.** A FILTER conjunct that tests two geometry variables bound by different
+parts of a group (parts that share no variable) joins those parts on the test instead of
+forming their cross product (`SpatialJoin` in EXPLAIN):
+
+```sparql
+SELECT ?state (COUNT(?p) AS ?n) WHERE {
+  ?state a ex:State ; geo:hasDefaultGeometry/geo:asWKT ?sw .
+  ?p a ex:Place ; geo:hasDefaultGeometry/geo:asWKT ?pw .
+  FILTER(geof:sfContains(?sw, ?pw))
+} GROUP BY ?state
+```
+
+The tests are the relations (but the disjoint ones), `relate` with a pattern that needs an
+intersection, and `distance`/`metricDistance` below a constant (`<`, `<=`, or the bound
+first with `>`, `>=`). A part that is a single pattern `?x <indexed predicate> ?w` is
+searched in the spatial index when it is ready: per geometry of the other part when that
+part is small next to it (`[index nested loop on <…>]`), otherwise its rows near the
+other part are read once. Any other part is planned as usual, and its distinct geometries
+are packed into an R-tree for the query (`[tree join]`, also without an index). Each
+candidate pair is tested with the function itself, so the answer (duplicates included) is
+the cross product's with the filter: geometries in an unknown CRS are tested against those
+of the same CRS, and a relation with a literal the index does not hold reads the pattern
+instead of searching the index. A disjointness test, a lower bound on a distance, a
+pattern that holds without an intersection or a non-constant bound keep the cross product
+and add a `geo-not-joined` warning naming the reason. Candidate pairs count against the
+query's row limit: past it the query fails with `507`.
+
+**Nearest neighbours.** `ORDER BY ASC(geof:metricDistance(?w, C))` or
+`geof:distance(?w, C, unit)` with a length unit (or a variable bound to one of them), with
+a `LIMIT`, over a group where `?w` is the object of one pattern of an indexed predicate
+and the other patterns connect to that pattern, reads the pattern nearest first
+(`SpatialKnn` under the top-k): the group runs over batches of the nearest rows until the
+`k`-th distance found is below the bound of every row not read yet. Rows whose distance is
+an error (not a geometry, malformed, empty, a CRS without a transform) come first in
+SPARQL's order, so without a `FILTER(BOUND(?d))` or a bound on the distance in the group,
+the pattern's rows are also read once to find them:
+
+```sparql
+SELECT ?g ?d WHERE {
+  ?g geo:asWKT ?w
+  BIND(geof:metricDistance(?w, "POINT(9 1)"^^geo:wktLiteral) AS ?d)
+  FILTER(BOUND(?d))
+} ORDER BY ?d LIMIT 10
+```
+
+The answer is the generic sort's, up to the choice among rows tied at the `k`-th
+distance. A descending order, an angle unit, a constant that is empty or not in longitude
+and latitude, an index that is not ready, and a group whose other patterns do not connect
+to `?w`'s pattern keep the generic sort and add a `geo-not-knn` warning.
+
+Both operators report the counters of the other spatial operators, and `pairs` (geometry
+pairs that passed) and `indexProbes` for a join, `batches` (runs of the group) and
+`errorRows` for nearest neighbours. They are the `spatial_join` and `spatial_knn`
+optimizations (`QueryOptions::optimizations`, `SPARKLES_DISABLE_OPTIMIZATIONS`), on by
+default.
+
+### Query rewrite, `spatial:equals` and RDFS entailment
+
+**Query rewrite** (GeoSPARQL's Query Rewrite Extension) is off by default and switched on
+per dataset with `"queryRewrite": true` in the spatial index configuration (`PUT
+/$/geo/{ds}`); `sparkles serve --no-geo-rewrite` switches it off for the whole server
+whatever the datasets say (`GET /$/geo/{ds}` shows the effective value). With it, a
+triple pattern whose predicate is one of the 24 topological properties (`geo:sfWithin`,
+`geo:ehMeet`, `geo:rcc8po`, …) matches the asserted triples and the derived ones, as one
+set:
+
+```sparql
+SELECT ?x WHERE { ?x geo:sfContains ex:g1 }   # features and geometries containing ex:g1
+```
+
+* `so1 geo:R so2` is derived when some geometry literal of `so1` and some of `so2`
+  satisfy `geof:R`, computed as the function computes it. A feature's literals are those
+  of its `geo:hasDefaultGeometry` (not `geo:hasGeometry`), a geometry's are its
+  serializations (the index's `predicates`), and a geometry literal written in the query
+  is itself. So a feature relates to its own geometry, a point contains itself, and
+  `?x geo:sfWithin ex:region` returns features and geometries alike (add `?x a
+  geo:Feature` to keep the features).
+* Variables bind features and geometries, never literals. The literals are those the
+  spatial index covers: the configured predicates, in graphs of its scope. Literals it
+  leaves out still count where the function says so: an empty geometry is
+  `sfDisjoint` from everything, and two literals in the same unknown CRS can be equal.
+* Under `GRAPH ?g` both ends' serializations and the feature links are in the graph `?g`
+  binds; in a merged default graph (`reasoning=true`, `default-graph-uri`) any of its
+  graphs. A predicate variable (`ex:a ?p ex:b`) matches asserted triples only.
+* One constant end searches the index around each of its literals (or reads every
+  literal while the index is not ready, with the same answers); two variable ends pair
+  every literal with those whose envelope meets it; the disjoint relations
+  (`sfDisjoint`, `ehDisjoint`, `rcc8dc`) test every pair, within the query's row limit
+  (`507` beyond it).
+* EXPLAIN shows `SpatialRelate ?x geo:sfContains <…g1> [asserted ∪ derived]` with the
+  spatial counters, `asserted` (asserted triples) and `pairs` (literal pairs that hold).
+
+**`spatial:equals`** (Jena) is always available, with or without query rewrite or an
+index: `?f spatial:equals ex:A` derives `sfEquals` between features, geometries and
+geometry literals in the same way, and never matches asserted triples.
+
+**RDFS entailment** of the GeoSPARQL vocabulary: `sparkles infer --loc DB --profile rdfs
+--vocab geosparql` (or `POST /$/reason/{ds}` with `"vocabularies": ["geosparql"]`) adds
+the GeoSPARQL 1.1 and Simple Features class and property axioms to the profile's rules:
+`sf:Polygon ⊑ sf:Surface ⊑ sf:Geometry ⊑ geo:Geometry`, `geo:asWKT ⊑
+geo:hasSerialization`, `geo:hasDefaultGeometry ⊑ geo:hasGeometry`, the domains and ranges
+of the feature, geometry and topological properties. The axioms are written for Sparkles
+from the standard (no OGC file is shipped). They and what the rules derive from them land
+in `urn:x-sparkles:inferred`, never in the data's graphs; queries see them with
+`reasoning=true` as other inferences:
+
+```sparql
+SELECT ?g WHERE { ?g a geo:Geometry }          # ex:gA, given ex:gA a sf:Polygon
+```
+
+**Default geometries.** Query rewrite follows `geo:hasDefaultGeometry` only. `sparkles
+infer --geo-default-geometry` (`"geoDefaultGeometry": true`) materializes `F
+geo:hasDefaultGeometry G` for every feature `F` with exactly one `geo:hasGeometry` (`G`)
+and no `geo:hasDefaultGeometry`, as Jena's `applyDefaultGeometry`. It runs with the
+profile (`rdfs` unless given), whose rules see these triples, and writes them to the
+inferred graph, so a re-run recomputes them and clearing the inferences removes them.
+The reasoning status records both (`vocabularies`, `geoDefaultGeometry`) and re-runs,
+manual or automatic, repeat them.
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
@@ -1727,6 +1848,8 @@ type ReasoningStatus = {
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
   auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
+  vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
+  geoDefaultGeometry?: true;   // default geometries were materialized
 };
 ```
 
@@ -2806,10 +2929,22 @@ open-world when SERVICE is allowed). Common arguments:
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`, `text` being the matched literal (escaped, ≤ 300 characters) and `types` at most 3. Only in builds with the `text` feature; a dataset without an index (`textSearch: false`) gives `text-disabled` |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: exact `spk:vectorSearch` over the stored `spk:vector` literals (it never computes embeddings). `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector |
+| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation), most severe results first (then by shape and focus node). `severity` is `Violation`, `Warning`, `Info` (SHACL 1.2 `Debug` and `Trace` count as info); a complex `path` is a SPARQL property path. Only in builds with the `shacl` feature |
+| `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), results in shape-map order. `shape` is `START` for a START association; `failures` are the report's `appinfo.failures` with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused (`bad-argument`: put the imported shapes into the schema) and EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE and with no prefixes but their own (a failing selector query is `invalid-schema`). Only in builds with the `shex` feature |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
 has the complete JSON Schemas.
+
+**Validation tools.** `validate_shacl` and `validate_shex` read one snapshot (they take
+`atCommit` and `reasoning` like the other tools), write nothing and fetch nothing: no
+imports, no SERVICE (SHACL-SPARQL refuses it as over HTTP). `total` and `counts` cover
+every result; `results` holds the first `maxResults`, cut earlier when the results
+would pass `--mcp-max-bytes`, and `truncated` says whether any were left out. A call
+runs under its timeout, in the validation thread pool of `/{ds}/shacl`, with the
+memory budget bounding the report (512 bytes a result: a SHACL report or ShEx result
+map larger than that is `budget-memory`) and the ShEx typing (64 bytes a pair:
+`budget-validation-work`).
 
 **Terms** in results use Turtle/SPARQL syntax, so they can be pasted into queries:
 `ex:alice` (a dataset prefix whose namespace fits), `<http://…>`, `_:b1f`, `"text"`,
@@ -2859,14 +2994,15 @@ A failed call is a result with `isError: true`, one text block `"<message>\nHint
 |---|---|---|
 | `bad-argument` | 400 | an argument outside its schema (unknown field, out of range, bad IRI) |
 | `unknown-dataset` | 404 | no such dataset, or `dataset` omitted on a server with several (the hint lists them) |
-| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes) |
+| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes); a shapes graph, ShEx schema or shape map that does not parse |
+| `invalid-shapes`, `invalid-schema` | 400 | shapes the SHACL validator cannot use; a ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape) or a shape-map label it does not define |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query` |
 | `timeout` | 408 | the call's timeout passed |
-| `budget-memory`, `budget-rows` | 507 | a query budget was exceeded |
+| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | a query or validation budget was exceeded |
 | `service-disabled` | 403 | a query uses SERVICE and it is not allowed |
 | `unknown-commit` | 404 / 410 | `atCommit` in the future / no longer held |
 | `stale-cursor` | 409 / 400 | a schema cursor whose snapshot is gone / a malformed cursor |
-| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors |
+| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors; `unknown-graph` also for the `graph` of a validation tool |
 | `text-disabled` | 400 | `search_text` on a dataset without a full-text index |
 | `no-vectors` | 400 | `similar_entities`: no vectors under the predicate, a dimension mismatch, or an entity without a vector |
 | `text-unavailable`, `write-failed`, `unsupported` | 503, 503, 501 | as over HTTP |

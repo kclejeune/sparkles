@@ -647,6 +647,7 @@ impl ClientKeyer for PeerKeyer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientAddr(pub ClientKey);
 
+#[cfg(feature = "otel")]
 /// The address the connection came from, when the server recorded it.
 pub fn peer_ip(req: &Request) -> Option<IpAddr> {
     match peer_addr(req)? {
@@ -789,6 +790,7 @@ impl Slot {
         }
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// Whether `cost` more requests would be admitted now; `Err(wait)` when not (nothing
     /// is charged either way).
     fn check(&self, now: u64, (t, burst): (u64, u32), cost: u32) -> Result<(), u64> {
@@ -912,6 +914,7 @@ impl Buckets {
         })
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// A client's state when it has any (tracked, or a debt left at eviction); nothing is
     /// stored for a client that has none.
     fn get(&self, key: &SlotKey) -> Option<Arc<Slot>> {
@@ -975,6 +978,7 @@ struct Inner {
     policies: Vec<Policy>,
     by_class: [Option<u32>; Class::COUNT],
     by_dataset: BTreeMap<String, [Option<u32>; Class::COUNT]>,
+    #[cfg(any(feature = "auth", test))]
     named: HashMap<&'static str, u32>,
     /// the `preauth` limit of an IPv6 /48 ([`AGGREGATE_FACTOR`])
     preauth_aggregate: Option<u32>,
@@ -1020,17 +1024,22 @@ impl Inner {
             }
             by_dataset.insert(ds.clone(), per);
         }
-        let mut named = HashMap::new();
-        for (name, (l, _)) in &cfg.named {
-            if let Some(i) = add(Class::Auth, name.to_string(), l) {
-                named.insert(*name, i);
+        // named limits are charged by the auth layer only
+        #[cfg(any(feature = "auth", test))]
+        let named = {
+            let mut named = HashMap::new();
+            for (name, (l, _)) in &cfg.named {
+                if let Some(i) = add(Class::Auth, name.to_string(), l) {
+                    named.insert(*name, i);
+                }
             }
-        }
-        for (name, (_, what)) in &cfg.named {
-            if let Some(&i) = named.get(name) {
-                policies[i as usize].what = Some(*what);
+            for (name, (_, what)) in &cfg.named {
+                if let Some(&i) = named.get(name) {
+                    policies[i as usize].what = Some(*what);
+                }
             }
-        }
+            named
+        };
         let max_keys = cfg.max_keys.unwrap_or(DEFAULT_MAX_KEYS).max(16);
         let buckets = match prev {
             Some(p) if p.buckets.max_keys == max_keys => p.buckets.clone(),
@@ -1041,6 +1050,7 @@ impl Inner {
             policies,
             by_class,
             by_dataset,
+            #[cfg(any(feature = "auth", test))]
             named,
             preauth_aggregate,
             trusted: cfg.trusted()?,
@@ -1054,6 +1064,7 @@ impl Inner {
             .map_or(self.by_class[class.index()], |p| p[class.index()])
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// A named limit with a rate.
     fn named(&self, name: &str) -> Option<(&Policy, (u64, u32))> {
         let p = &self.policies[*self.named.get(name)? as usize];
@@ -1192,6 +1203,7 @@ impl RateLimiter {
         }
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// Charge `cost` to `client` under the named limit `name` (nothing to do when it is
     /// not configured); over the limit, nothing is charged and the `429` to answer is
     /// returned.
@@ -1222,6 +1234,7 @@ impl RateLimiter {
         }
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// Whether the named limit admits one more for `client`, without charging it.
     #[allow(clippy::result_large_err)]
     pub fn check(&self, name: &'static str, client: &ClientKey) -> Result<(), Response> {
@@ -1249,6 +1262,7 @@ impl RateLimiter {
         }
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// Charge `cost` to `client` under the named limit without a check (a failure found
     /// after the fact; [`RateLimiter::check`] refuses the next request).
     pub fn charge(&self, name: &'static str, client: ClientKey, cost: u32) {
@@ -1592,6 +1606,7 @@ fn aggregate_limit(l: &Limit) -> Limit {
 }
 
 impl ClientKey {
+    #[cfg(any(feature = "auth", test))]
     /// The network a client belongs to: the /48 of an IPv6 address; an IPv4 address and
     /// any other key are their own.
     pub fn network(&self) -> ClientKey {
@@ -1658,6 +1673,7 @@ impl Admission {
         self.0.inner.policies[self.0.slots[0].0 as usize].failure_cost
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// Charge a failure now, before an expensive credential check; it is given back when
     /// the request does not fail. `false`: the address (or its network) has no failures
     /// left (answer [`Admission::refusal`]).
@@ -1682,6 +1698,7 @@ impl Admission {
         true
     }
 
+    #[cfg(feature = "auth")]
     /// Whether the address (or its network) has no failures left for a request that
     /// has not reserved one: its password checks and unknown tokens are refused.
     pub fn exhausted(&self) -> bool {
@@ -1698,6 +1715,7 @@ impl Admission {
         })
     }
 
+    #[cfg(any(feature = "auth", test))]
     /// The `429` of a request whose reservation failed, or of an exhausted address.
     pub fn refusal(&self) -> Response {
         let (now, cost) = (self.0.clock.now(), self.cost());

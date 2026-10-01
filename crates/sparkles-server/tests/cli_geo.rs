@@ -105,9 +105,9 @@ fn geo_index_lifecycle() {
     expect(&["clone", "--loc", &db, "--to", copy.to_str().unwrap()], 0);
     assert!(copy.join("geo.json").exists());
     // a broken geo.json is an error of check
-    std::fs::write(Path::new(&db).join("geo.json"), br#"{"queryRewrite":true}"#).unwrap();
+    std::fs::write(Path::new(&db).join("geo.json"), br#"{"maxVertices":0}"#).unwrap();
     let o = expect(&["check", "--loc", &db, "--format", "json"], 1);
-    assert!(String::from_utf8_lossy(&o.stdout).contains("queryRewrite"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("maxVertices"));
     std::fs::write(Path::new(&db).join("geo.json"), b"{}").unwrap();
     // disable
     expect(&["geo-index", "--loc", &db, "--disable"], 0);

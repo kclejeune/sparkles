@@ -2,8 +2,6 @@
 //! axioms join the TBox (`infer --vocab geosparql`), and GeoSPARQL's default geometry
 //! (`infer --geo-default-geometry`: `geo:hasDefaultGeometry` for features with exactly
 //! one `geo:hasGeometry`, as Jena's `applyDefaultGeometry`).
-//!
-//! Not supported yet: [`Extras::validate`] refuses anything but the defaults.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,11 +14,26 @@ pub enum Vocabulary {
     GeoSparql,
 }
 
+/// The GeoSPARQL axioms (`vocab/geosparql.rules`): written from the standard's class and
+/// property definitions, as rules without premises.
+pub const GEOSPARQL_RULES: &str = include_str!("../vocab/geosparql.rules");
+
 impl Vocabulary {
     pub fn name(self) -> &'static str {
         match self {
             Vocabulary::GeoSparql => "geosparql",
         }
+    }
+
+    /// The vocabulary's axioms as rule text.
+    pub fn text(self) -> &'static str {
+        match self {
+            Vocabulary::GeoSparql => GEOSPARQL_RULES,
+        }
+    }
+
+    pub fn rules(self) -> Result<Vec<crate::Rule>, crate::RuleParseError> {
+        crate::parse_rules(self.text())
     }
 }
 
@@ -83,12 +96,9 @@ impl Extras {
             .collect()
     }
 
-    /// Whether this build can materialize these extras.
+    /// Whether this build can materialize these extras (every extra can).
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.is_empty() {
-            return Ok(());
-        }
-        anyhow::bail!("vocabularies and the GeoSPARQL default geometry are not supported yet")
+        Ok(())
     }
 }
 
@@ -104,5 +114,13 @@ mod tests {
         assert!(Extras::parse(&["dublin-core"], false).is_err());
         assert!(Extras::default().is_empty());
         assert!(Extras::default().validate().is_ok());
+        assert!(e.validate().is_ok());
+    }
+
+    #[test]
+    fn the_geosparql_axioms_parse() {
+        let rules = Vocabulary::GeoSparql.rules().unwrap();
+        assert!(rules.len() > 100, "{}", rules.len());
+        assert!(rules.iter().all(|r| r.body.is_empty()));
     }
 }

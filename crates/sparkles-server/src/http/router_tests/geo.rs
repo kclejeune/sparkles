@@ -89,10 +89,7 @@ async fn enable_status_rebuild_disable() {
     for (body, needle) in [
         ("{", "invalid geo configuration"),
         (r#"{"distance":"flat"}"#, "invalid geo configuration"),
-        (
-            r#"{"queryRewrite":true}"#,
-            "queryRewrite: not supported yet",
-        ),
+        (r#"{"maxVertices":0}"#, "maxVertices: must be positive"),
         (r#"{"predicates":["not an iri"]}"#, "predicates:"),
     ] {
         let r = send(&s.app, put("/$/geo/ds", body)).await;

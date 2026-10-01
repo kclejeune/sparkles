@@ -334,6 +334,7 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 }
 
 impl Dataset {
+    #[cfg(feature = "reasoning")]
     /// Update the reasoning status in memory and in the database directory.
     pub fn set_reasoning(&self, info: Option<ReasoningInfo>) -> Result<()> {
         if let Some(root) = self.store.root() {
@@ -578,6 +579,7 @@ impl AppState {
         }))
     }
 
+    #[cfg(any(feature = "reasoning", feature = "backup"))]
     /// Persist the registry of managed datasets.
     pub fn save_registry(&self) -> Result<()> {
         let _guard = self.manage.lock();
@@ -1080,6 +1082,7 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    #[cfg(feature = "backup")]
     /// The reserved dataset name.
     pub fn name(&self) -> &str {
         &self.name

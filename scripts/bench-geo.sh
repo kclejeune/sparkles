@@ -6,16 +6,21 @@
 #
 # Steps: generate N point features (plus lines, polygons and the administrative
 # hierarchy) and the queries over them; load; time the index build (`sparkles geo-index`);
-# serve the database with the index and time Q1-Q4, Q8 and Q9; serve it again without the
-# index (disabled) and time the same queries (Q10 is Q1 there). Before timing, both
-# servers' answers to every query are fingerprinted with scripts/bench-answers.py
-# (geometries compared by coordinates): the index must not change any answer. Results
-# go to WORKDIR/results/geo-*.json and WORKDIR/results/geo-summary.md.
+# serve the database with the index and time Q1-Q9; serve it again without the index
+# (disabled) and time the same queries (Q10 is Q1 there; the spatial joins Q5 and Q6 pack
+# their own trees there); then serve it with the index but the spatial join and
+# nearest-neighbour rewrites switched off (SPARKLES_DISABLE_OPTIMIZATIONS) and time the
+# PLAIN_QUERIES. Before timing, every server's answers to every query are fingerprinted
+# with scripts/bench-answers.py (geometries compared by coordinates): neither the index
+# nor the rewrites may change an answer. Results go to WORKDIR/results/geo-*.json and
+# WORKDIR/results/geo-summary.md.
 #
 # Env: WARMUP (default 2), RUNS (default 10), ADMIN (administrative levels, default 3),
 # SKIP_LOAD=1 to reuse the database, QUERIES="geo-q1-within …" to run a subset,
-# PORT (default 3941), SPARKLES (default target/release/sparkles), SPARKLES_ARGS
-# (extra `serve` flags), MAX_TIME (seconds per request, default 300).
+# PLAIN_QUERIES (default "geo-q7-knn"; the plain plans of Q5 and Q6 are cross products of
+# 1M x 1,600 and 64k x 64k geometries, hours at N = 1M), PORT (default 3941), SPARKLES
+# (default target/release/sparkles), SPARKLES_ARGS (extra `serve` flags), MAX_TIME
+# (seconds per request, default 300).
 set -euo pipefail
 
 N=${1:-100000}
@@ -23,6 +28,7 @@ WORK=${2:-/tmp/sparkles-geo-bench}
 WARMUP=${WARMUP:-2}
 RUNS=${RUNS:-10}
 ADMIN=${ADMIN:-3}
+PLAIN_QUERIES=${PLAIN_QUERIES:-geo-q7-knn}
 PORT=${PORT:-3941}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
@@ -121,6 +127,15 @@ serve sparkles-scan
 run sparkles-scan
 stop
 "$SPARKLES" geo-index --loc "$DB" > /dev/null 2>&1
+# with the index, the spatial join and nearest-neighbour rewrites off
+if [ -n "$PLAIN_QUERIES" ]; then
+  QUERIES_ALL=${QUERIES:-}
+  QUERIES=$PLAIN_QUERIES
+  SPARKLES_DISABLE_OPTIMIZATIONS=spatial_join,spatial_knn serve sparkles-plain --geo bench
+  run sparkles-plain
+  stop
+  QUERIES=$QUERIES_ALL
+fi
 
 python3 - "$WORK/results" "${NAMES[@]}" << 'EOF'
 import json, os, sys
@@ -132,15 +147,17 @@ def ms(r):
     if any(e != 0 for e in r.get("exit_codes", [])):
         return "error"
     return f"{r['mean'] * 1000:.1f} ± {(r['stddev'] or 0) * 1000:.1f}"
-out = ["| query | rows | with the index (ms) | without (ms) | speedup | same answer |",
-       "|---|---:|---:|---:|---:|:-:|"]
+out = ["| query | rows | with the index (ms) | without (ms) | speedup | rewrites off (ms) | same answer |",
+       "|---|---:|---:|---:|---:|---:|:-:|"]
 for n in names:
     rs, an = load(f"{d}/{n}.json"), answers.get(n, {})
-    a, b = rs.get("sparkles"), rs.get("sparkles-scan")
-    x, y = an.get("sparkles", {}), an.get("sparkles-scan", {})
+    a, b, c = rs.get("sparkles"), rs.get("sparkles-scan"), rs.get("sparkles-plain")
+    x, y, z = an.get("sparkles", {}), an.get("sparkles-scan", {}), an.get("sparkles-plain")
     same = "yes" if x and x.get("value") == y.get("value") and x.get("rows") != "error" else "**no**"
+    if z is not None and z.get("value") != x.get("value"):
+        same = "**no**"
     speed = f"{b['mean'] / a['mean']:.1f}×" if a and b and ms(a) != "error" and ms(b) != "error" else "—"
-    out.append(f"| {n} | {x.get('rows', '—')} | {ms(a) if a else '—'} | {ms(b) if b else '—'} | {speed} | {same} |")
+    out.append(f"| {n} | {x.get('rows', '—')} | {ms(a) if a else '—'} | {ms(b) if b else '—'} | {speed} | {ms(c) if c else '—'} | {same} |")
 for f, label in (("geo-load", "load"), ("geo-build", "index build")):
     r = load(f"{d}/{f}.json")
     for v in r.values():
