@@ -1,12 +1,13 @@
-// Writes brotli (.br) and gzip (.gz) siblings of the built text assets, which the
-// server embeds and serves by Accept-Encoding instead of compressing per request.
+// Writes brotli (.br) and gzip (.gz) siblings of the built text assets and of the
+// formatter's WebAssembly module (when the build has it), which the server embeds and
+// serves by Accept-Encoding instead of compressing per request.
 // A sibling is kept only when it is at least 10% smaller than the asset.
 import { readdir, readFile, writeFile, stat, unlink } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { brotliCompressSync, gzipSync, constants } from 'node:zlib';
 
 const root = new URL('../build/', import.meta.url).pathname;
-const TEXT = new Set(['.js', '.css', '.html', '.svg', '.json', '.map', '.txt']);
+const COMPRESSIBLE = new Set(['.js', '.css', '.html', '.svg', '.json', '.map', '.txt', '.wasm']);
 const MIN = 1024;
 
 async function* files(dir) {
@@ -25,7 +26,7 @@ for await (const p of files(root)) {
     await unlink(p); // stale sibling of an earlier build
     continue;
   }
-  if (!TEXT.has(extname(p)) || (await stat(p)).size < MIN) continue;
+  if (!COMPRESSIBLE.has(extname(p)) || (await stat(p)).size < MIN) continue;
   const data = await readFile(p);
   const variants = [
     [

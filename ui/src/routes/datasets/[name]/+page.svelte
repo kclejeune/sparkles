@@ -8,6 +8,7 @@
   import { auth } from '$lib/auth.svelte';
   import { receiptSummary } from '$lib/commits';
   import { formatEditor } from '$lib/fmt-edit';
+  import { formatAny } from '$lib/fmt-wasm';
   import { formatFailure } from '$lib/fmt-view';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
@@ -269,13 +270,13 @@ ex:PersonShape a sh:NodeShape ;
   let shapesEditor = $state<TurtleEditor>();
   let formattingShapes = $state(false);
 
-  /** Format the shapes graph through the server (the Format button and Shift+Alt+F). */
+  /** Format the shapes graph, in the browser or on the server (Format and Shift+Alt+F). */
   async function formatShapes() {
     const ed = shapesEditor;
     if (!ed || formattingShapes || !ed.snapshot().text.trim()) return;
     formattingShapes = true;
     try {
-      await formatEditor(ed, (req) => api.format({ ...req, language: 'turtle' }));
+      await formatEditor(ed, (req) => formatAny({ ...req, language: 'turtle' }));
       ed.showError(undefined);
     } catch (e) {
       const failure = formatFailure(e, 'these shapes');

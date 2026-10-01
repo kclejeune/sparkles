@@ -11,6 +11,7 @@
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
+  import { formatAny } from '$lib/fmt-wasm';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
   import GraphView from '$components/GraphView.svelte';
@@ -143,7 +144,8 @@
   }
 
   /**
-   * Format the editor's query through the server (the Format button and Shift+Alt+F).
+   * Format the editor's query, in the browser or through the server (the Format button and
+   * Shift+Alt+F).
    * `quiet` (format on run) reports nothing: the run reports a syntax error itself.
    */
   async function formatQuery(quiet = false) {
@@ -151,7 +153,7 @@
     if (!ed || formatting || !ed.snapshot().text.trim()) return;
     formatting = true;
     try {
-      await formatEditor(ed, (req) => api.format(req));
+      await formatEditor(ed, (req) => formatAny(req));
       ed.showError(undefined);
     } catch (e) {
       if (quiet) return;

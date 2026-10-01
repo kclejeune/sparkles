@@ -71,6 +71,25 @@ pnpm build     # writes build/ (index.html + /ui/_app/… assets)
 pnpm preview   # serves build/ at http://localhost:4173/ui/ with the same proxy
 ```
 
+## Formatting in the browser
+
+Format (the query editor and the shapes editor) runs the formatter in the browser when the
+build has its WebAssembly module, and asks `POST /$/format` otherwise. The module is
+optional: `mise run ui:wasm` (from the repository root) builds `crates/sparkles-fmt-wasm`
+into `src/lib/wasm/` (git-ignored) with `scripts/build-fmt-wasm.sh`, which needs the
+`wasm32-unknown-unknown` target (`rust-toolchain.toml` lists it) and the wasm-bindgen CLI of
+the version in `Cargo.lock` (the task installs it). Once it is there, `mise run ui:build`
+rebuilds it whenever the formatter changes; delete the directory to build without it. The
+Nix `sparkles-ui` package always builds it in (`nix/fmt-wasm.nix`).
+
+`lib/fmt-wasm.ts` loads the module the first time something is formatted (a hashed asset
+under `/ui/_app/immutable/`, served compressed: about 250 KB with brotli). It takes the
+endpoint's JSON and answers with it, errors included, so the pages handle both the same way;
+a module that does not load or fails while running hands the request to the endpoint. The
+pages' Content Security Policy has `'wasm-unsafe-eval'` for it. `VITE_FMT_WASM=off` leaves
+the module out of a build or `vite dev` (the mock tests below set it, so the mock's stand-in
+formatter answers).
+
 ## End-to-end tests
 
 `tests/e2e` holds Playwright smoke tests of the UI against a real `sparkles serve`:
@@ -121,6 +140,7 @@ src/
   app.css                  design tokens (light/dark), base controls
   lib/api.ts               typed client for docs/API.md
   lib/app.svelte.ts        global state: datasets, current dataset, prefixes, theme, ping, toasts
+  lib/fmt-wasm.ts          formatting in the browser (the WebAssembly formatter) or through /$/format
   lib/rdf.ts               prefix shortening, term formatting, query-kind/update detection, PREFIX insertion
   lib/sparql-lang.ts       CodeMirror SPARQL tokenizer, highlighting, completion, error-line decoration
   lib/explore.ts           SPARQL used by Explore; the schema browser's model

@@ -1,6 +1,6 @@
 // Applying the formatter's result to an editor: the smallest change that turns the text
 // into the formatted text (so undo, scrolling and marks elsewhere are disturbed as little
-// as possible), the cursor the server mapped, and a guard that drops a result when the
+// as possible), the cursor the formatter mapped, and a guard that drops a result when the
 // text changed while the request was out.
 
 import type { FormatRequest, FormatResult } from './api';
@@ -43,8 +43,8 @@ export function minimalChange(before: string, after: string): Change | null {
 }
 
 /**
- * Where the cursor goes in `text`: the server's mapped offset, clamped to the text and
- * moved off the middle of a surrogate pair; `null` when the server mapped none.
+ * Where the cursor goes in `text`: the formatter's mapped offset, clamped to the text and
+ * moved off the middle of a surrogate pair; `null` when the formatter mapped none.
  */
 export function placeCursor(text: string, cursor: number | null | undefined): number | null {
   if (cursor == null || !Number.isFinite(cursor)) return null;
@@ -71,9 +71,10 @@ export type FormatOutcome =
   | 'stale';
 
 /**
- * Format the target's text: snapshot it, ask the server, and apply the result only when
- * the text is still what was sent. Errors (an `ApiError` for a syntax error, a refusal)
- * propagate to the caller.
+ * Format the target's text: snapshot it, ask the formatter (`request`, in the browser or on
+ * the server: `formatAny` of `fmt-wasm.ts`), and apply the result only when the text is
+ * still what was sent. Errors (an `ApiError` for a syntax error, a refusal) propagate to
+ * the caller.
  */
 export async function formatEditor(
   target: FormatTarget,

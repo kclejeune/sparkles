@@ -252,7 +252,9 @@ async fn security_headers() {
     let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
     assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
     assert!(csp.contains("script-src 'self'"), "{csp}");
-    assert!(!csp.contains("unsafe-eval"), "{csp}");
+    // WebAssembly compilation (the formatter in the browser), never JavaScript's eval
+    assert!(csp.contains("'wasm-unsafe-eval'"), "{csp}");
+    assert!(!csp.contains("'unsafe-eval'"), "{csp}");
     assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
     assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     assert_eq!(h[header::REFERRER_POLICY], "same-origin");
