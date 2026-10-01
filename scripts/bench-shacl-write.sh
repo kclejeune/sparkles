@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
-# Write-time SHACL validation cost: the latency of a 1-triple INSERT DATA with validation
-# off, `warn` and `reject`, over a generated dataset, with 0 and DELTA pending delta quads.
+# Write-time validation cost: the latency of a 1-triple INSERT DATA with validation off,
+# `warn` and `reject`, over a generated dataset, with 0 and DELTA pending delta quads.
 #
-#   scripts/bench-shacl-write.sh [N_PEOPLE] [WORKDIR]
+#   scripts/bench-shacl-write.sh [--lang shacl|shex] [N_PEOPLE] [WORKDIR]
 #
-# The shapes are the SHACL benchmark's (crates/sparkles-shacl/examples/bench.rs), which the
-# generated data does not conform to: `warn` commits and reports the results; `reject` uses
-# the same shapes at severity sh:Warning, so the same validation runs and every write
-# passes. The timed triple goes into the default graph (the data graph), so every timed
+# SHACL (the default): the shapes are the SHACL benchmark's
+# (crates/sparkles-shacl/examples/bench.rs), which the generated data does not conform to:
+# `warn` commits and reports the results; `reject` uses the same shapes at severity
+# sh:Warning, so the same validation runs and every write passes.
+# ShEx (--lang shex): `warn` uses the ShEx benchmark's schema and map
+# (crates/sparkles-shex/examples/bench.shex, bench.smap), which the data does not conform
+# to; `reject` uses bench-write.shex, the same schema loosened until the data conforms,
+# with the same map. Both have a CLOSED shape, so no write to the data graph is skipped.
+# The timed triple goes into the default graph (the data graph), so every timed
 # write is validated; an untimed --prepare deletes it first, so every run inserts. The
 # standalone full validation time is what `sparkles validation` reports when it turns
 # validation on. The delta quads are foaf:name triples of untyped subjects: no new
 # results, but every foaf:name scan merges them.
-# Results go to WORKDIR/results/shacl-write.{json,md}.
+# Results go to WORKDIR/results/{shacl,shex}-write.{json,md}.
 # Env: WARMUP (default 3), RUNS (default 20), DELTA (default 10000), SPARKLES (binary,
-# default target/release/sparkles), PORT (default 3937).
+# default target/release/sparkles), PORT (default 3937), LANG_SEL (shacl or shex, as
+# --lang).
 set -euo pipefail
 
+LANG_SEL=${LANG_SEL:-shacl}
+if [ "${1:-}" = --lang ]; then
+  LANG_SEL=${2:-}
+  shift 2
+fi
+case "$LANG_SEL" in
+  shacl | shex) ;;
+  *)
+    echo "--lang is shacl or shex" >&2
+    exit 2
+    ;;
+esac
 N=${1:-10000}
-WORK=${2:-/tmp/sparkles-bench-shacl-write}
+WORK=${2:-/tmp/sparkles-bench-$LANG_SEL-write}
 WARMUP=${WARMUP:-3}
 RUNS=${RUNS:-20}
 DELTA=${DELTA:-10000}
@@ -118,6 +136,18 @@ EOF
 # the same shapes at severity sh:Warning: below the `reject` threshold (violation)
 sed -e 's/a sh:NodeShape ;/a sh:NodeShape ; sh:severity sh:Warning ;/' \
   -e 's/\[ sh:path/[ sh:severity sh:Warning ; sh:path/' shapes-warn.ttl > shapes-reject.ttl
+# ShEx: the benchmark's schema for `warn`, the one the data conforms to for `reject`
+SHEX=$ROOT/crates/sparkles-shex/examples
+SHEX_MAP=$(grep -v '^#' "$SHEX/bench.smap")
+validation_on() { # validation_on <db> <mode>
+  if [ "$LANG_SEL" = shex ]; then
+    local schema=$SHEX/bench.shex
+    [ "$2" = reject ] && schema=$SHEX/bench-write.shex
+    "$SPARKLES" validation --loc "$1" --mode "$2" --schema "$schema" --shape-map "$SHEX_MAP"
+  else
+    "$SPARKLES" validation --loc "$1" --mode "$2" --shapes "shapes-$2.ttl"
+  fi
+}
 
 T='<http://example.org/bench/s> <http://example.org/bench/p> "v"'
 printf 'INSERT DATA { %s }' "$T" > insert.ru
@@ -143,7 +173,7 @@ for delta in 0 "$DELTA"; do
     if [ "$mode" = off ]; then
       "$SPARKLES" validation --loc "$db" --off > /dev/null
     else
-      out=$("$SPARKLES" validation --loc "$db" --mode "$mode" --shapes "shapes-$mode.ttl")
+      out=$(validation_on "$db" "$mode")
       echo "$mode: $out"
       FULL_MS["$delta-$mode"]=$(echo "$out" | sed -n 's/.* in \([0-9]*\) ms$/\1/p')
     fi
@@ -162,22 +192,23 @@ for delta in 0 "$DELTA"; do
     }
     hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic \
       --prepare "$(upd delete.ru)" --command-name "$mode/delta=$delta" "$(upd insert.ru)" \
-      --export-json results/shacl-write.new.json
-    merge results/shacl-write.new.json results/shacl-write.json
+      --export-json "results/$LANG_SEL-write.new.json"
+    merge "results/$LANG_SEL-write.new.json" "results/$LANG_SEL-write.json"
     stop_server
   done
 done
 
 args=()
 for k in "${!FULL_MS[@]}"; do args+=("$k=${FULL_MS[$k]}"); done
-python3 - results/shacl-write.json results/shacl-write.md "$N" "$(wc -l < "$DATA")" "${args[@]}" << 'EOF'
+python3 - "results/$LANG_SEL-write.json" "results/$LANG_SEL-write.md" "$N" "$(wc -l < "$DATA")" "$LANG_SEL" "${args[@]}" << 'EOF'
 import json, sys
-src, dest, people, triples = sys.argv[1:5]
-full = dict(kv.split("=", 1) for kv in sys.argv[5:])
+src, dest, people, triples, lang = sys.argv[1:6]
+full = dict(kv.split("=", 1) for kv in sys.argv[6:])
 res = {r["command"]: r for r in json.load(open(src))["results"]}
 deltas = sorted({c.split("delta=")[1] for c in res}, key=int)
 ms = lambda r: f'{r["mean"] * 1e3:.2f} ± {r["stddev"] * 1e3:.2f}' if r.get("stddev") is not None else f'{r["mean"] * 1e3:.2f}'
-out = [f"1-triple INSERT DATA latency (ms, mean ± sd) over {triples} triples ({people} people)", "",
+title = {"shacl": "SHACL", "shex": "ShEx"}[lang]
+out = [f"{title}: 1-triple INSERT DATA latency (ms, mean ± sd) over {triples} triples ({people} people)", "",
        "| pending delta | off | warn | reject | full validation (warn / reject) | reject ≤ full + 10 ms |",
        "|---:|---:|---:|---:|---:|:---:|"]
 for d in deltas:

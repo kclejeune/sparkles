@@ -1808,60 +1808,106 @@ CLI: `sparkles infer --loc DB --status` prints the status; `sparkles infer --loc
 
 ## Write-time validation
 
-A dataset can validate **every write** against SHACL shapes before it commits. The
-configuration lives in the database directory (`validation.json`):
+A dataset can validate **every write** against SHACL shapes or a ShEx schema before it
+commits; it uses one language at a time. The configuration lives in the database
+directory (`validation.json`, format 2; SHACL configurations of older Sparkles versions,
+format 1 without `language`, are still read):
 
 ```json
-{ "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
+{ "format": 2, "language": "shacl", "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
   "dataGraph": "default", "includeInferences": false,
   "threshold": "violation", "timeoutSeconds": 10, "reportLimit": 100 }
 ```
 
 | Field | Values | Default | Meaning |
 |---|---|---|---|
+| `language` | `shacl`, `shex` | `shacl` | The shape language (always written; a `PUT` without it is SHACL) |
 | `mode` | `reject`, `warn`, `off` | — | `reject`: a write that leaves results at or above the threshold is not committed (`422`); `warn`: it commits, and the receipt and header report the findings |
-| `shapes` | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, read from the state being validated (so changes to them are validated, and must parse), or shapes given inline and copied to `validation-shapes.ttl` |
+| `shapes` (SHACL) | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, read from the state being validated (so changes to them are validated, and must parse), or shapes given inline and copied to `validation-shapes.ttl` |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph; the shapes graphs are never part of it, and the inferred graph only with `includeInferences` |
-| `threshold` | `violation`, `warning`, `info` | `violation` | Results at or above it block |
+| `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block |
 | `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | Budget per write (exceeding it fails the write with `408`); results carried in a report |
+
+**ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
+
+```json
+{ "format": 2, "language": "shex", "mode": "reject",
+  "schema": { "file": "validation-schema.shex", "format": "shexc", "sha256": "…" },
+  "shapeMap": "{FOCUS a ex:Person}@ex:Person, {FOCUS a ex:Org}@ex:Org",
+  "dataGraph": "default", "includeInferences": false, "timeoutSeconds": 10, "reportLimit": 100 }
+```
+
+| Field | Values | Meaning |
+|---|---|---|
+| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text (ShExC, ShExJ, or ShExR in Turtle; sniffed without `format`: `{` is ShExJ) and the base its relative IRIs resolve against. It is copied into the database: verbatim to `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ) when it has no imports; otherwise the imports are resolved now and the merged schema is written as ShExJ to `validation-schema.json`, with the schema's prefixes kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and has the SHA-256 of the text given. A later write never fetches anything. A `PUT` may give the stored `schema` back (with its `file`, without `inline`) to change the other fields |
+| `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map, expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es |
+| `threshold` | — | Not accepted: every nonconformant association blocks |
+
+Imports resolve as for `POST /{ds}/shex`: `file:` IRIs and relative IRIs inside
+`--load-dir`, http(s) through the outbound policy. A `PUT` takes no inline import bodies or
+externs, so an EXTERNAL shape is a `400`; labels the schema does not define, START without
+a start shape, and SPARQL node selectors (which every validated write would run) are `400`
+too.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ language, config, status }` (`language`: `shacl`; `status`: mode, shape count, the baseline of the last commit, counters, warnings) or `{ config: null }` |
-| PUT | `/$/validation/{ds}` | Set the configuration. The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the report. `400` for a bad configuration or shapes that do not parse |
-| DELETE | `/$/validation/{ds}` | Turn validation off (`204`) |
+| GET | `/$/validation/{ds}` | `{ language, config, status }` (`status`: mode, shape count, the baseline of the last commit, counters, warnings; ShEx adds `associations`, the size of the last expanded map) or `{ config: null }` |
+| PUT | `/$/validation/{ds}` | Set the configuration (either language; it replaces the other language's files). The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or shapes or a schema that cannot be used; `501` for a language this binary was built without |
+| DELETE | `/$/validation/{ds}` | Turn validation off (`204`); every validation file is removed |
 
 **Writes** (update, Graph Store PUT/POST/DELETE, upload, and through the CLI `load`,
 `update`, `infer`, and bulk loads) are validated once per request, on the final state,
-before any byte is written; a write that touches neither the data graph nor the shapes
-graphs is skipped. Responses carry
-`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`,
-and receipts (`receipt=true`) include a `validation` object (with `"language": "shacl"`). A rejection is
+before any byte is written. A write that touches neither the data graph nor the shapes
+graphs is skipped. ShEx also skips a write when every quad it changes has a predicate
+that no triple constraint and no `{FOCUS p …}` selector mentions, unless a shape is
+`CLOSED` (a neighbourhood holds only the arcs of the predicates its shape mentions).
+Responses carry
+`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`
+(ShEx adds `lang=shex` after `strategy`),
+and receipts (`receipt=true`) include a `validation` object with its `language`. A rejection is
 `422 Unprocessable Content`:
 
 ```json
 { "error": "SHACL validation failed: 2 blocking results (threshold violation); nothing was committed",
-  "validation": { "status": "rejected", "blocking": 2, "total": 3, "limit": 100, "truncated": false,
-                  "results": [ … ], "head": 41, "kind": "update" } }
+  "validation": { "language": "shacl", "status": "rejected", "blocking": 2, "total": 3, "limit": 100,
+                  "truncated": false, "results": [ … ], "head": 41, "kind": "update" } }
 ```
 
-or a Turtle `sh:ValidationReport` when the request's `Accept` names `text/turtle`. No
-commit number is used. `?validationLimit=N` bounds the results of one request.
+or a Turtle `sh:ValidationReport` when the request's `Accept` names `text/turtle`. A ShEx
+rejection counts associations: `total` is the size of the expanded map, `blocking` (and
+`bySeverity.violation`) the nonconformant ones, `threshold` is `violation`, and `results`
+are the first `limit` nonconformant [ShEx result objects](#shex-validation) in map order.
+There is no Turtle report, so it is JSON whatever the `Accept`:
+
+```json
+{ "error": "ShEx validation failed: 1 nonconformant association; nothing was committed",
+  "validation": { "language": "shex", "status": "rejected", "strategy": "full", "blocking": 1, "total": 4,
+                  "results": [ { "node": { "type": "uri", "value": "http://ex.org/dave" },
+                                 "shape": { "type": "uri", "value": "http://ex.org/Person" },
+                                 "status": "nonconformant", "reason": "…", "appinfo": { "failures": [ … ] } } ],
+                  … } }
+```
+
+No commit number is used. `?validationLimit=N` bounds the results of one request.
 `?validate=false` (or `Sparkles-Validate: off`) skips validation only on a server started
 with `--allow-unvalidated-writes` (`403` otherwise); the CLI has `--no-validate`. A dataset
-whose `validation.json` cannot be loaded refuses writes (`501`) rather than accepting
-them unvalidated.
+whose `validation.json` cannot be loaded (a ShEx configuration opened by a binary built
+without `shex` included) refuses writes (`501`) rather than accepting them unvalidated.
 
-CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`,
-`--status`, `--off`. A write rejected in the CLI exits with status 3; `load`, `update` and
+CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`
+for SHACL, `sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …]`
+for ShEx (`--schema` and `--shape-map` imply `--lang shex`; imports resolve against the
+schema's directory), `--status [--format json]`, `--off`. A write rejected in the CLI
+exits with status 3 (ShEx lists `  <node> @ <shape>: <reason>`); `load`, `update` and
 `infer` end their summary line with the validation status, and `sparkles stats` shows the
-configuration (`validation      reject · 1 shape graph · 20 shapes`). A reasoning task
+configuration (`validation      reject · 1 shape graph · 20 shapes`, or
+`reject · ShEx · 3 shapes · last full 12 ms`). A reasoning task
 whose inferences are rejected fails with
 `inferences rejected by SHACL validation: N blocking results (first: <shape> at <node>)`.
-Rejections are logged at INFO under `sparkles::validation` (dataset, kind, counts, first
-shape and focus node); see [Metrics](#metrics) for the counters. Cost: each validated
-write runs a full validation of the data graph (about 160 ms at 1M triples); writes that do
-not touch the data graph are free.
+Rejections are logged at INFO under `sparkles::validation` (dataset, language, kind, counts,
+first shape and focus node); see [Metrics](#metrics) for the counters (`language` label).
+Cost: each validated write runs a full validation of the data graph (SHACL about 160 ms at
+1M triples); skipped writes are free.
 
 ## SHACL validation
 

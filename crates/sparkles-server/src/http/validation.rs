@@ -115,13 +115,10 @@ mod handlers {
         )
     }
 
-    /// Set a SHACL configuration (`format` 1 unless the body says otherwise).
+    /// Set a SHACL configuration (format 1 or 2; written as format 2).
     #[cfg(feature = "shacl")]
-    fn set_shacl(ds: &Dataset, mut j: J) -> ApiResult<Outcome> {
+    fn set_shacl(ds: &Dataset, j: J) -> ApiResult<Outcome> {
         use sparkles_shacl::guard::{self, SetOutcome, ValidationConfig};
-        if let Some(o) = j.as_object_mut() {
-            o.entry("format").or_insert(json!(1));
-        }
         let cfg: ValidationConfig = serde_json::from_value(j).map_err(invalid)?;
         Ok(
             match guard::set_config(&ds.store, Some(cfg)).map_err(config_error)? {
@@ -133,7 +130,9 @@ mod handlers {
     }
 
     /// Set a ShEx configuration (format 2). The schema's imports resolve as for
-    /// `/{ds}/shex`: `file:` IRIs under `--load-dir`, http(s) through the outbound policy.
+    /// `/{ds}/shex`: `file:` IRIs under `--load-dir` (and relative IRIs against it),
+    /// http(s) through the outbound policy; there are no inline import bodies or
+    /// externs, so an EXTERNAL shape is an error.
     #[cfg(feature = "shex")]
     fn set_shex(st: &AppState, ds: &Dataset, mut j: J) -> ApiResult<Outcome> {
         use sparkles_shex::guard::{self, SetOutcome, ShexValidationConfig};
@@ -143,6 +142,10 @@ mod handlers {
         let cfg: ShexValidationConfig = serde_json::from_value(j).map_err(invalid)?;
         let budget = sparkles::outbound::RequestBudget::new(&st.outbound);
         let resolver = sparkles_shex::FileResolver {
+            dirs: match &st.file_loads {
+                sparkles::sparql::FileLoads::Under(d) => vec![d.clone()],
+                _ => Vec::new(),
+            },
             files: st.file_loads.clone(),
             outbound: Some((st.outbound.clone(), budget)),
             ..Default::default()
@@ -259,3 +262,7 @@ pub(super) async fn get_validation() -> ApiResult {
 pub(super) use get_validation as put_validation;
 #[cfg(not(any(feature = "shacl", feature = "shex")))]
 pub(super) use get_validation as delete_validation;
+
+#[cfg(all(test, feature = "shex"))]
+#[path = "validation_shex_tests.rs"]
+mod shex_tests;

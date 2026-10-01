@@ -1,0 +1,18 @@
+PREFIX ex: <http://example.org/>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+PREFIX : <http://example.org/default#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+BASE <http://example.org/base/>
+PREFIX rel: <relative/>
+
+:a
+  rdfs:seeAlso <other>, rel:x ;
+.
+
+# a later block stays as written
+PREFIX z: <http://z.example/>
+PREFIX a: <http://a.example/>
+
+z:s a:p :o .

@@ -634,6 +634,8 @@ mod tests {
         }
         s.set_prefix("ex", "http://example.org/").unwrap();
         std::fs::write(root.join("validation-shapes.ttl"), b"# shapes\n").unwrap();
+        std::fs::write(root.join("validation-schema.shex"), b"# schema\n").unwrap();
+        std::fs::write(root.join("validation-schema.json"), b"{}").unwrap();
         std::fs::write(root.join("origin.json"), b"{}").unwrap();
         let c = s.backup_capture("b1").unwrap();
         assert_eq!(c.commit.seq, 3);
@@ -662,7 +664,9 @@ mod tests {
                 "dataset.json",
                 "prefixes.json",
                 "origin.json",
-                "validation-shapes.ttl"
+                "validation-shapes.ttl",
+                "validation-schema.shex",
+                "validation-schema.json"
             ]
         );
         for f in &c.files {
@@ -696,6 +700,11 @@ mod tests {
         restore_and_compare(&s, &c, &out);
         assert_eq!(dump_at(&s, 3).len(), 3);
         assert!(out.join("validation-shapes.ttl").exists());
+        assert_eq!(
+            std::fs::read(out.join("validation-schema.shex")).unwrap(),
+            b"# schema\n"
+        );
+        assert!(out.join("validation-schema.json").exists());
         let r = Store::open(&out, StoreOptions::default()).unwrap();
         assert_eq!(r.prefixes(), p);
     }

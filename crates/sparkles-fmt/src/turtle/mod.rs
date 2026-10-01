@@ -20,8 +20,8 @@ use crate::tree::Tree;
 use crate::trivia::{CommentRules, Comments};
 use crate::{FormatError, Language, Options, Warning};
 
-/// Whether Turtle and TriG format (the printing rules are not written yet).
-pub const IMPLEMENTED: bool = false;
+/// Whether Turtle and TriG format.
+pub const IMPLEMENTED: bool = true;
 
 /// Turtle (`trig: false`) or TriG in the formatting pipeline.
 pub struct Turtle {

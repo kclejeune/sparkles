@@ -1,0 +1,20 @@
+
+
+
+@prefix ex: <http://example.org/> .
+ex:a ex:p 1 .
+ex:b ex:p 2 .
+
+
+
+ex:c ex:p 3 .
+ex:d ex:p 4 ; ex:q 5 .
+ex:e ex:p 6 .
+ex:f
+
+  ex:p 7 ;
+
+
+  ex:q 8 .
+
+

@@ -1,0 +1,21 @@
+# A file header
+# over two lines
+
+@prefix ex: <http://example.org/> .   # the example namespace
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+# --- section ---
+
+ex:a rdfs:label "a" ; # the label
+     rdfs:comment "a thing" ;
+     # ex:old "commented out" ;
+     .
+ex:b ex:p ex:c , # first
+          ex:d   # second
+          ; ex:q [ # inside
+            ex:r 1 ] .
+
+ex:c ex:p ( ex:x # in a list
+  ex:y ) .
+ex:d ex:p ex:o .   # after a flat statement
+# at the end
