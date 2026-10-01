@@ -59,6 +59,12 @@ pub struct PlanInfo {
     pub time_ms: f64,
     pub cached: bool,
     pub children: Vec<PlanInfo>,
+    /// operator counters (spatial operators: candidates, refined, matched, …)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counters: Option<serde_json::Map<String, serde_json::Value>>,
+    /// notes about the plan (root only)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<super::ctx::PlanWarning>,
 }
 
 fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
@@ -81,6 +87,8 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
         time_ms: 0.0,
         cached: false,
         children: n.children.iter().map(|c| describe(ctx, c)).collect(),
+        counters: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -102,6 +110,7 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 | Kind::GroupCountScan { .. }
                 | Kind::CountJoinRuns { .. }
         );
+    // (spatial operators are cached: an index search is not cheap to repeat)
     let key = if cacheable {
         super::cache::key(n, ctx)
     } else {
@@ -145,6 +154,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     };
     // runtime detail for EXPLAIN (which variant of the operator ran)
     let mut note: Option<String> = None;
+    let mut counters = None;
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
@@ -342,6 +352,16 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
         Kind::VectorSearch(spec) => vector_search(ctx, spec, &n.vars)?,
+        Kind::SpatialScan(spec) => {
+            let (t, c) = spatial_scan(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
+        Kind::SpatialPf(spec) => {
+            let (t, c) = spatial_pf(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::Service {
             endpoint,
             query,
@@ -389,6 +409,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         time_ms: start.elapsed().as_secs_f64() * 1000.0,
         cached: false,
         children: infos,
+        counters,
+        warnings: Vec::new(),
     };
     Ok((table, info))
 }
@@ -2643,6 +2665,26 @@ fn path(
 // ----------------------------------------------------------------- vectors ------
 
 /// Exact top-k vector search (`spk:vectorSearch`).
+#[cfg(feature = "geo")]
+use crate::geo::exec::{spatial_pf, spatial_scan};
+
+#[cfg(not(feature = "geo"))]
+type Counters = serde_json::Map<String, serde_json::Value>;
+
+#[cfg(not(feature = "geo"))]
+fn spatial_scan(
+    _: &Ctx,
+    _: &super::geopf::SpatialScanSpec,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_pf(_: &Ctx, _: &super::geopf::SpatialPfSpec, _: &[VarId]) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
 fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> Result<Table> {
     use super::plan::VectorQuery;
     use crate::vector;

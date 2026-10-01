@@ -288,7 +288,7 @@ pub enum Val {
 }
 
 impl Val {
-    fn value(self, ctx: &Ctx) -> EvalResult<Value> {
+    pub(crate) fn value(self, ctx: &Ctx) -> EvalResult<Value> {
         match self {
             Val::Id(id) => ctx.value(id).ok_or(TypeError),
             Val::V(v) | Val::Dec(_, v) => Ok(v),
@@ -589,7 +589,12 @@ fn same_kind(lang: Option<&str>, v: String) -> Val {
 /// Evaluate a function argument to a value, borrowing constants and pre-decoded columns
 /// instead of cloning them (cloning a shared `Arc` from every thread contends on its
 /// reference count).
-fn arg<'r>(args: &'r [Expr], i: usize, row: &'r Row<'_>, ctx: &Ctx) -> EvalResult<Cow<'r, Value>> {
+pub(crate) fn arg<'r>(
+    args: &'r [Expr],
+    i: usize,
+    row: &'r Row<'_>,
+    ctx: &Ctx,
+) -> EvalResult<Cow<'r, Value>> {
     let e = args.get(i).ok_or(TypeError)?;
     match e {
         Expr::Lit(_, v) => Ok(Cow::Borrowed(v)),
@@ -1286,15 +1291,23 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
     })
 }
 
-/// Is `iri` a supported extension function (fn:, math:, afn:)?
+/// Is `iri` a supported extension function (fn:, math:, afn:, and with the `geo`
+/// feature geof:, spatialF:)?
 pub fn is_extension(iri: &str) -> bool {
     iri.starts_with(FN)
         || iri.starts_with(MATH)
         || iri.starts_with(AFN)
         || iri.starts_with(crate::vector::NS)
+        || (cfg!(feature = "geo")
+            && (iri.starts_with(crate::geo::vocab::GEOF)
+                || iri.starts_with(crate::geo::vocab::SPATIALF)))
 }
 
 fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
+    #[cfg(feature = "geo")]
+    if let Some(r) = crate::geo::functions::call(iri, args, row, ctx) {
+        return r;
+    }
     let a = |i: usize| arg(args, i, row, ctx);
     let dbl = |i: usize| -> EvalResult<f64> { Ok(Num::of(&*a(i)?)?.to_double().into()) };
     let d = |x: f64| Ok(Val::V(Value::Double(x.into())));

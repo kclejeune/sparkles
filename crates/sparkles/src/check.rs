@@ -144,7 +144,7 @@ impl Issue {
 #[serde(rename_all = "camelCase")]
 pub struct Check {
     /// `layout`, `generation`, `vocabulary`, `delta-vocabulary`, `perm.spo` … `perm.gspo`,
-    /// `permutations`, `wal`, `catalog`, `text`, `reasoning`
+    /// `permutations`, `wal`, `catalog`, `text`, `geo`, `reasoning`
     pub name: String,
     pub status: Status,
     /// what was checked, in one line
@@ -382,6 +382,11 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         c.text(text);
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "text") {
             t.millis += text_ms;
+        }
+        let t_geo = Instant::now();
+        c.geo(crate::geo::probe(root, c.full));
+        if let Some(t) = c.checks.iter_mut().find(|x| x.name == "geo") {
+            t.millis += t_geo.elapsed().as_secs_f64() * 1000.0;
         }
     }
     c.reasoning();
@@ -1524,6 +1529,33 @@ impl Checker<'_> {
             _ => "no records".to_string(),
         };
         self.checks.push(run.done(summary));
+    }
+
+    // ------------------------------------------------------------- spatial index ------
+
+    fn geo(&mut self, p: crate::geo::GeoProbe) {
+        if !p.configured {
+            return;
+        }
+        let mut run = Run::new("geo");
+        if let Some(e) = p.config_error {
+            run.add(Issue::error(format!("{e}: the spatial index does not open")).file("geo.json"));
+            self.checks.push(run.done("invalid configuration"));
+            return;
+        }
+        if p.unsupported {
+            self.checks.push(
+                run.done("configured, but this build has no GeoSPARQL support: index not checked"),
+            );
+            return;
+        }
+        for (f, problem) in &p.damaged {
+            run.add(Issue::warning(format!("{problem}: rebuilt on open")).file(f.clone()));
+        }
+        let preds = p.config.as_ref().map_or(0, |c| c.predicates.len());
+        self.checks.push(run.done(format!(
+            "configured for {preds} predicates; built in memory when opened"
+        )));
     }
 
     // --------------------------------------------------------------- full-text ------

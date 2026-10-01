@@ -41,6 +41,12 @@ brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
 tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "lz4-compression"], optional = true }
 tempfile = "3"
+# GeoSPARQL (feature `geo`)
+georust = { workspace = true, optional = true }
+wkt = { workspace = true, optional = true }
+geojson = { workspace = true, optional = true }
+geo-index = { workspace = true, optional = true }
+geographiclib-rs = { workspace = true, optional = true }
 
 # statvfs: the free disk space a store keeps
 [target.'cfg(unix)'.dependencies]
@@ -55,6 +61,14 @@ tempfile.workspace = true
 [features]
 # Full-text search over string literals (Tantivy), `text:query` in SPARQL
 text = ["dep:tantivy"]
+# GeoSPARQL: `geof:` functions, `spatial:` property functions and a spatial index
+geo = [
+    "dep:georust",
+    "dep:wkt",
+    "dep:geojson",
+    "dep:geo-index",
+    "dep:geographiclib-rs",
+]
 # zstd inputs, dumps and backups (libzstd, a C build), and zstd for the text doc store
 zstd = ["dep:zstd", "tantivy?/zstd-compression"]
 # brotli inputs, dumps and backups (pure Rust)
