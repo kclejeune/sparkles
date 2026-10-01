@@ -51,7 +51,7 @@ generates one (`{boot:08x}-{seq:012x}`, unique per process and increasing). The 
 `sparkles serve` logs one INFO line per completed request under the target
 `sparkles::access` (`--no-access-log` turns it off; `/ui/*`, `/$/ping`, `/$/ready` and
 `/$/metrics` are logged at DEBUG). Fields: `dataset` (or `$none`), `operation` (`query`,
-`update`, `gsp`, `upload`, `shacl`, `explain`, `admin`, `other`), `status`, `outcome`
+`update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin`, `other`), `status`, `outcome`
 (`ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`, `rate_limited`, `denied`,
 `rejected`: a write refused by write-time validation),
 with auth the `principal` (`user:bob`, `token:tok_…`, `oidc:…`, `proxy:…`, `anonymous`; never
@@ -186,7 +186,7 @@ and for writes `sparkles.commit.seq`. 5xx responses set the span status to error
   are the recorded ones; children are laid out one after another from their parent's
   start, so their offsets are approximate.
 * `commit` (`seq`, `kind`, `inserted`, `deleted`) for every commit, `sparql.service` (a
-  client span) for each SERVICE call, and `shacl.validate`.
+  client span) for each SERVICE call, `shacl.validate`, and `shex.compile` and `shex.validate`.
 * Refusals by a rate limit add a `rate_limited` event and `sparkles.rate_limit.class`.
 
 Background tasks (compaction, backups, clones, reasoning, full-text rebuilds) are root
@@ -222,7 +222,7 @@ Off by default, except for failed authentications when authentication is on (see
 | Class | Requests |
 |-------|----------|
 | `auth` | every path under `/$/auth/` (login, token minting, device flow, OIDC callback), matched or not |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format` |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format` (dataset management, compaction, backups, reasoning, caches, full-text) |
 | `preauth` | every request, before authentication: failed credential checks per client address and IPv6 /48 (no per-dataset form) |
@@ -393,7 +393,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 type DatasetInfo = {
   name: string;            // "ds"
   type: "persistent" | "mem";
-  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string /* absent when built without the `shacl` feature */ };
+  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string; shex?: string /* each absent when built without its feature */ };
   quads: number;           // approximate total (base + delta)
   reasoning: null | {
     profile: string; inferred: number; at: string;
@@ -606,6 +606,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol. `?default` or `?graph=<iri>`; no param on GET = whole dataset as N-Quads/TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | POST       | `/{ds}/upload`        | Multipart file upload; format chosen from filename extension / content-type. Optional `graph` field. |
 | POST       | `/{ds}/shacl`         | SHACL validation (Fuseki `/{ds}/shacl`); see [SHACL validation](#shacl-validation). |
+| POST       | `/{ds}/shex`          | ShEx validation (a Sparkles extension; Fuseki has none); see [ShEx validation](#shex-validation). |
 
 Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
@@ -1639,6 +1640,122 @@ The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph defa
 files in memory); like Jena's `shacl validate` it exits with status 1 when the data does not
 conform.
 
+## ShEx validation
+
+`POST /{ds}/shex` validates nodes of a data graph against a ShEx 2.1 schema (Shape
+Expressions). Fuseki has no ShEx operation; the parameters follow `/{ds}/shacl` where they
+overlap. Built with the `shex` cargo feature (on by default; `501` without it).
+
+**Request.** Either the schema is the body and the shape map is in the query string, or a
+JSON envelope carries both:
+
+* **Schema as the body.** `Content-Type: text/shex` (ShExC), `application/shex+json`, or
+  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object. Any
+  other content type is sniffed: ShExJ when the body starts with `{`, ShExC otherwise. The
+  shape map is `map=<compact shape map>`, or `node=<term>` with `shape=<label>`
+  (`START` when `shape` is absent). `base=<iri>` resolves relative IRIs of the schema.
+* **JSON envelope** (`Content-Type: application/json`, a body that is not a ShExJ schema):
+
+  ```json
+  { "schema": "PREFIX ex: <http://ex.org/> ex:S { ex:name . }",
+    "schemaFormat": "shexc",
+    "map": "{FOCUS a ex:Person}@ex:S",
+    "externs": "ex:Ext { … }",
+    "imports": { "http://ex.org/common": "<ShExC or ShExJ text>" },
+    "base": "http://ex.org/schema" }
+  ```
+
+  `schemaFormat` is `shexc` or `shexj` (default: sniffed); `map` is a compact shape map
+  (a string) or a JSON shape map (an array); `externs` defines the schema's `EXTERNAL`
+  shapes; `imports` gives the bodies of `IMPORT`ed IRIs. Only `schema` is required, and
+  the shape map comes from the envelope or the query string, not both. Unknown keys are
+  an error.
+
+**Shape maps.** The compact syntax of the ShapeMap draft, plus Jena's `BASE`/`PREFIX`
+directives, commas between associations, a trailing `.` and `a` for `rdf:type`. Without
+directives, prefixed names use the schema's prefixes. A node is an IRI, a prefixed name, a
+literal or a blank node as Sparkles prints it in query results (`_:b1f`); `{FOCUS p o}`,
+`{FOCUS p _}`, `{s p FOCUS}` and `{_ p FOCUS}` select the nodes of the data graph with
+those arcs. The JSON syntax is an array of `{"node": …, "shape": …}` (the draft's
+`nodeSelector` and `shapeLabel` are accepted too). A node that is not in the data graph
+is validated with no arcs. `SPARQL """…"""` selectors are not supported yet (`400`).
+
+**Imports** (`IMPORT <iri>`) resolve from the envelope's `imports`, then `file:` IRIs under
+`--load-dir` (none without it), then http(s) IRIs through the `--outbound-*` policy of
+SPARQL `LOAD`; an IRI that does not resolve as given is tried with `.shex`, then `.json`
+appended. One validation reads at most 64 schemas and 16 MiB of imports, and its http(s)
+imports share the `outbound-bytes` budget of one request.
+
+**Semantic actions.** The Test extension (`http://shex.io/extensions/Test/`, `fail` and
+`print`) runs; actions of other extensions are skipped, with a warning in the report.
+`semact-trace=true` adds the Test extension's `print` output to each result's `appinfo`.
+
+| param | values | default |
+|---|---|---|
+| `graph` | `default`, `union` or a graph IRI (`urn:x-arq:DefaultGraph`, `urn:x-arq:UnionGraph` too); `404` if the graph does not exist | `default` |
+| `reasoning` | `true` / `false`: merge `urn:x-sparkles:inferred` into the data graph | `true` when the dataset has inferences |
+| `results` | `all` / `nonconformant` (the counts still cover all) | `all` |
+| `format` | `json`, `shapemap`, `smap` or `text` (otherwise `Accept`: `application/json`, `text/plain`) | `json` |
+| `timeout` | seconds, as for queries; `408` past it | the server's |
+| `semact-trace` | `true` / `false` | `false` |
+| `stats` | `true`: add the typing's counters to the JSON report | `false` |
+| `base` | the base IRI of the schema | none |
+
+**Response.** `200` whether or not the nodes conform, with `Sparkles-Commit` (and the
+inference headers of `/{ds}/shacl` when inferences were included):
+
+```ts
+type ShexReport = {
+  conforms: boolean;                        // every association conformant
+  counts: { conformant: number; nonconformant: number };
+  results: {                                // in shape-map order
+    node: Term;
+    shape: Term | { type: "start" };
+    status: "conformant" | "nonconformant";
+    reason?: string;                        // the first failure, in one line
+    appinfo?: { failures: ShexFailure[]; prints?: string[] };   // up to 8 failures
+  }[];
+  warnings: string[];
+  millis: number;
+  stats?: { pairs: number; evaluations: number; waves: number[] };   // stats=true
+};
+type ShexFailure =
+  | { kind: "nodeKind" | "datatype" | "facet" | "valueSet"; value: Term; constraint: string }
+  | { kind: "cardinality"; predicate: string; inverse: boolean; min: number; max: number | null; count: number }
+  | { kind: "closed" | "extra"; predicate: string; value: Term }
+  | { kind: "noMatch"; detail: string }
+  | { kind: "reference"; shape: string; value: Term }
+  | { kind: "not" | "external"; shape: string }
+  | { kind: "semAct"; extension: string; message: string };
+```
+
+`format=shapemap` is the ShapeMap draft's JSON result map (`[{node, shape, status,
+reason?, appinfo?}]`, compact-syntax strings); `format=smap` the compact result map, one
+`<node>@<shape>` (conformant) or `<node>@!<shape>` (nonconformant) per line; `format=text`
+Jena's report, `OK` or one `<n> @ <S> :: Focus = <n>, Status = nonconformant, Reason = …`
+line per association.
+
+**Errors.** `400` with `line` and `column` for a syntax error in the schema, the shape map,
+the externs or an inline import (also ShEx 2.2 syntax); `400` for a schema that cannot be
+used (an undefined reference, a negated reference cycle, an invalid `&include`, an import
+that does not resolve or is not allowed, an `EXTERNAL` shape without a definition), a shape
+label the schema does not define, `START` without a start shape, and invalid parameters;
+`404` for a missing graph; `408` on timeout; `413` for a body over
+`--max-query-body-mb`; `507` with `budget: "result-bytes"` for a report over
+`--max-result-mb` (as for `/{ds}/shacl`), `"validation-work"` past the partition or pair
+budget, or `"outbound-bytes"` when the imports exceed the request's outbound budget (see
+[Budgets](#budgets)).
+
+The CLI equivalent is `sparkles shex validate (--loc DB | --data FILE…) --schema FILE
+(--map FILE | --shape-map 'MAP' | --node TERM [--shape LABEL]) [--graph default|union|IRI]
+[--no-inferences] [--externs FILE] [--format text|json|shapemap|smap] [--only-nonconformant]
+[--timeout S] [--semact-trace] [--stats]`, with Jena's flag names as aliases (`val`, `v`;
+`--shapes`/`-s`, `--datafile`/`-d`, `--shapesMap`/`-m`, `--target`/`-n`). Imports resolve
+against the schema file's directory. It prints Jena's text report by default and exits
+with 0 when every association conforms, 1 when one does not (or on a timeout or budget
+error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--out
+shexc|shexj|text] [--base IRI]` prints schemas as ShExC, ShExJ or a structural dump.
+
 ## Formatting
 
 `POST /$/format` formats a SPARQL query or update (Turtle, TriG, N-Triples, N-Quads and
@@ -1788,7 +1905,7 @@ served as they are (with `Vary: Accept-Encoding`) rather than compressed per req
 | `--http-compression-level fastest\|default\|best\|N` | `default` | zstd 3, brotli 4, gzip 6; a number applies to whichever algorithm is chosen |
 | `--http-compression-algorithms` | `zstd,br,gzip,deflate` | the encodings offered |
 | `--max-decompressed-mb` | `65536` | cap on a compressed request body or upload after decompression (0: none) |
-| `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain` or `/{ds}/shacl` request (0: none) |
+| `--max-query-body-mb` | `16` | largest body of a SPARQL query, `/{ds}/explain`, `/{ds}/shacl` or `/{ds}/shex` request (0: none) |
 | `--max-update-body-mb` | `256` | largest body of a SPARQL update (0: none) |
 | `--max-admin-body-mb` | `16` | largest body of an admin request (`/$/…`) or `/{ds}/prefixes` change (0: none) |
 | `--max-upload-mb` | `4096` | largest Graph Store write or upload body, after HTTP decompression (0: none) |
@@ -1804,7 +1921,7 @@ by file name (`.gz`, `.zst`, `.br`, `.lz4`). A body that decompresses past
 
 **Body ceilings.** A body that is read whole has the ceiling of its request class:
 `--max-query-body-mb` for queries (also `/{ds}/explain` and the shapes graph of
-`/{ds}/shacl`), `--max-update-body-mb` for updates, `--max-admin-body-mb` for `/$/…`
+`/{ds}/shacl` and the schema of `/{ds}/shex`), `--max-update-body-mb` for updates, `--max-admin-body-mb` for `/$/…`
 requests and prefix changes, and a fixed 64 KiB for `/$/auth/*`. It counts decompressed
 bytes and is checked while the body is read (a declared `Content-Length` over it is
 refused before anything is read), so no more than the ceiling is held; past it the request
@@ -1875,7 +1992,12 @@ the request with `507 Insufficient Storage` and
   the bytes all the SERVICE calls and `LOAD <http…>` of one query or update receive (a
   compressed `LOAD` counts once decompressed). An update that exceeds it commits nothing;
   `SILENT` does not hide it. Their summed time has a total as well
-  (`--outbound-request-timeout`, default 4 × `--outbound-timeout`, 240 s).
+  (`--outbound-request-timeout`, default 4 × `--outbound-timeout`, 240 s). The http(s)
+  imports of one `/{ds}/shex` validation share the same budget.
+* `validation-work`: the work of one ShEx validation, the partitions tried to match one
+  node's neighbourhood to a shape (100,000) and the (node, shape) pairs of its typing
+  (10,000,000, or `--query-memory-mb` at 64 bytes per pair if that is fewer). A
+  validation past either fails; it never becomes a nonconformant result.
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
@@ -2005,7 +2127,7 @@ the permission is `403` before any connection or file is opened, even under `SIL
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin` (a restore also on its target name) |
 | `/$/repositories` | GET | any caller; the full list for `server-admin`, names and types for callers with `admin` on some dataset, else empty |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
-| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/data` (GET, HEAD) | | `read` |
+| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | by operation: `update=` or `application/sparql-update` → `write`; queries and GET → `read`; other writes → `write` |
 | `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |

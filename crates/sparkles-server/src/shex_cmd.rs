@@ -72,6 +72,10 @@ pub struct ValidateArgs {
     /// Include the Test extension's `print` output
     #[arg(long)]
     pub semact_trace: bool,
+    /// Add the typing's counters (pairs, evaluations, refinement waves) to the JSON
+    /// report, or print them to stderr with the other formats
+    #[arg(long)]
+    pub stats: bool,
 }
 
 #[derive(Args, Debug)]
@@ -88,10 +92,254 @@ pub struct ParseArgs {
     pub base: Option<String>,
 }
 
+/// Output formats of a ShEx result map (`format` of `/{ds}/shex` and `--format`).
+#[cfg(feature = "shex")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShexFormat {
+    /// the Sparkles JSON report
+    Json,
+    /// the ShapeMap JSON result map
+    ShapeMap,
+    /// the compact result map (`<n>@<S>`, `<n>@!<S>`)
+    Smap,
+    /// Jena's text report
+    Text,
+}
+
+#[cfg(feature = "shex")]
+impl ShexFormat {
+    /// From a format name (`json`, `shapemap`, `smap`, `text`) or a media type.
+    pub fn from_name(s: &str) -> Option<ShexFormat> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "json" | "application/json" => Some(ShexFormat::Json),
+            "shapemap" => Some(ShexFormat::ShapeMap),
+            "smap" => Some(ShexFormat::Smap),
+            "text" | "txt" | "text/plain" => Some(ShexFormat::Text),
+            _ => None,
+        }
+    }
+
+    /// Accept-header offers, in preference order.
+    pub const OFFERS: [&'static str; 2] = ["application/json", "text/plain"];
+
+    pub fn media_type(self) -> &'static str {
+        match self {
+            ShexFormat::Json | ShexFormat::ShapeMap => "application/json",
+            ShexFormat::Smap | ShexFormat::Text => "text/plain; charset=utf-8",
+        }
+    }
+}
+
+/// A result map in `format` (JSON compact, without a final newline), with the typing's
+/// counters in the JSON report when `stats` is set.
+#[cfg(feature = "shex")]
+pub(crate) fn write_report(
+    r: &sparkles_shex::ResultMap,
+    format: ShexFormat,
+    stats: bool,
+) -> String {
+    match format {
+        ShexFormat::Json => {
+            let mut v = r.to_json();
+            if stats && let Some(o) = v.as_object_mut() {
+                let s = &r.stats;
+                o.insert(
+                    "stats".into(),
+                    serde_json::json!({"pairs": s.pairs, "evaluations": s.evaluations, "waves": s.waves}),
+                );
+            }
+            v.to_string()
+        }
+        ShexFormat::ShapeMap => r.to_shapemap_json().to_string(),
+        ShexFormat::Smap => r.to_smap(),
+        ShexFormat::Text => r.to_text(),
+    }
+}
+
 #[cfg(feature = "shex")]
 pub fn run(args: ShexArgs, opts: StoreOptions) -> Result<()> {
-    let _ = (args, opts);
-    anyhow::bail!("sparkles shex is not implemented yet")
+    match args.cmd {
+        ShexCmd::Validate(v) => enabled::validate(v, opts),
+        ShexCmd::Parse(p) => enabled::parse(p),
+    }
+}
+
+#[cfg(feature = "shex")]
+mod enabled {
+    use super::{ParseArgs, ShexFormat, ValidateArgs, write_report};
+    use crate::validation_common::{self as common, GraphParam};
+    use anyhow::{Context, Result};
+    use sparkles::store::StoreOptions;
+    use sparkles_shex::resolve::file_url;
+    use sparkles_shex::{
+        FileResolver, ParseError, Schema, SchemaError, SchemaFormat, ShapeMap, ValidateOptions,
+    };
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Usage, parse and schema errors: exit status 2.
+    fn usage(msg: impl std::fmt::Display) -> ! {
+        eprintln!("error: {msg}");
+        std::process::exit(2)
+    }
+
+    fn syntax(what: &str, e: &ParseError) -> ! {
+        usage(format_args!(
+            "{what}: syntax error at line {}, column {}: {}",
+            e.line, e.column, e.message
+        ))
+    }
+
+    /// The syntax of a schema file: ShExJ for `.json` and `.shexj`, else sniffed.
+    fn hint(path: &Path) -> Option<SchemaFormat> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json" | "shexj") => Some(SchemaFormat::ShExJ),
+            _ => None,
+        }
+    }
+
+    fn read_text(path: &Path) -> String {
+        let r = if path == Path::new("-") {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).map(|_| s)
+        } else {
+            std::fs::read_to_string(path)
+        };
+        r.unwrap_or_else(|e| usage(format_args!("{}: {e}", path.display())))
+    }
+
+    /// A schema file, its relative IRIs against its own location (or `base`).
+    fn read_schema(path: &Path, base: Option<&str>) -> Schema {
+        let text = read_text(path);
+        let url = (path != Path::new("-")).then(|| file_url(path));
+        sparkles_shex::parse_schema(&text, base.or(url.as_deref()), hint(path))
+            .unwrap_or_else(|e| syntax(&path.display().to_string(), &e))
+    }
+
+    pub(super) fn validate(a: ValidateArgs, opts: StoreOptions) -> Result<()> {
+        let schema = read_schema(&a.schema, None);
+        let externs = a.externs.as_deref().map(|x| read_schema(x, None));
+        // imports: relative IRIs against the schema's directory, any readable file, and
+        // http(s) with the local commands' outbound defaults
+        let policy = sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        };
+        let budget = sparkles::outbound::RequestBudget::new(&policy);
+        let dir = std::path::absolute(&a.schema)
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let resolver = FileResolver {
+            dirs: dir.into_iter().collect(),
+            outbound: Some((policy, budget)),
+            externs,
+            ..Default::default()
+        };
+        let schema = sparkles_shex::compile(&schema, &resolver)
+            .unwrap_or_else(|e| usage(format_args!("{}: {}", a.schema.display(), e.message)));
+
+        let map = if let Some(m) = &a.map {
+            let text = read_text(m);
+            let what = m.display().to_string();
+            if m.extension().is_some_and(|e| e == "json") {
+                ShapeMap::from_json(&text).unwrap_or_else(|e| syntax(&what, &e))
+            } else {
+                let base = file_url(m);
+                ShapeMap::parse(&text, schema.prefixes(), Some(&base))
+                    .unwrap_or_else(|e| syntax(&what, &e))
+            }
+        } else {
+            let text = match (&a.shape_map, &a.node) {
+                (Some(m), _) => m.clone(),
+                (None, Some(n)) => {
+                    let shape = match &a.shape {
+                        Some(s) => s.clone(),
+                        None if schema.has_start() => "START".to_string(),
+                        None => usage("the schema has no start shape; give --shape"),
+                    };
+                    format!("{n}@{shape}")
+                }
+                // clap requires one of them
+                (None, None) => usage("give --map, --shape-map or --node"),
+            };
+            ShapeMap::parse(&text, schema.prefixes(), schema.base())
+                .unwrap_or_else(|e| syntax("shape map", &e))
+        };
+
+        let format = ShexFormat::from_name(&a.format)
+            .with_context(|| format!("unknown report format '{}'", a.format))?;
+        let graph = GraphParam::parse(&a.graph).unwrap_or_else(|e| usage(format_args!("{e:#}")));
+        let store = crate::open_or_load(a.loc, &a.data, opts)?;
+        let snap = store.snapshot();
+        if let GraphParam::Named(iri) = &graph
+            && !common::graph_exists(&snap, iri)
+        {
+            usage(format_args!("no such graph: <{iri}>"));
+        }
+        let inferred = common::graph_exists(&snap, crate::http::INFERRED_GRAPH)
+            .then_some(crate::http::INFERRED_GRAPH);
+        let inputs = common::inputs(&snap, &graph, inferred, !a.no_inferences)?;
+        let vopts = ValidateOptions {
+            data_graph: inputs.data_graph,
+            extra_graphs: inputs.extra_graphs,
+            exclude_graphs: inputs.exclude_graphs,
+            timeout: a.timeout.map(Duration::from_secs_f64),
+            only_nonconformant: a.only_nonconformant,
+            semact_trace: a.semact_trace,
+            ..Default::default()
+        };
+        let results = match sparkles_shex::validate(&snap, &schema, &map, &vopts) {
+            Ok(r) => r,
+            // an undefined label, or START without a start shape
+            Err(e) if e.downcast_ref::<SchemaError>().is_some() => usage(e),
+            Err(e) => return Err(e),
+        };
+        let mut out = std::io::stdout().lock();
+        out.write_all(write_report(&results, format, a.stats).as_bytes())?;
+        if matches!(format, ShexFormat::Json | ShexFormat::ShapeMap) {
+            writeln!(out)?;
+        }
+        out.flush()?;
+        if a.stats && format != ShexFormat::Json {
+            let s = &results.stats;
+            eprintln!(
+                "{} pairs, {} evaluations, waves per stratum {:?}",
+                s.pairs, s.evaluations, s.waves
+            );
+        }
+        if !results.conforms {
+            std::process::exit(1);
+        }
+        Ok(())
+    }
+
+    pub(super) fn parse(a: ParseArgs) -> Result<()> {
+        let mut out = std::io::stdout().lock();
+        let several = a.files.len() > 1;
+        for f in &a.files {
+            let schema = read_schema(f, a.base.as_deref());
+            if several {
+                writeln!(out, "# {}", f.display())?;
+            }
+            match a.out.as_str() {
+                "shexj" => {
+                    serde_json::to_writer_pretty(&mut out, &schema.to_shexj())?;
+                    writeln!(out)?;
+                }
+                "text" => writeln!(out, "{schema:#?}")?,
+                _ => {
+                    let c = schema.to_shexc();
+                    out.write_all(c.as_bytes())?;
+                    if !c.ends_with('\n') {
+                        writeln!(out)?;
+                    }
+                }
+            }
+        }
+        out.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "shex"))]
