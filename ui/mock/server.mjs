@@ -341,6 +341,62 @@ function readyInfo() {
   };
 }
 
+/**
+ * The mock's stand-in for the formatter: runs of spaces and tabs become one space
+ * (outside strings, IRIs and comments), lines lose their trailing whitespace, and the
+ * text ends with one newline. The cursor (UTF-16 offset) maps through the same edits. A
+ * bracket that does not match is a syntax error at the line and column where it is.
+ */
+function mockFormat(text, cursor) {
+  const pairs = { ')': '(', '}': '{', ']': '[' };
+  const stack = [];
+  let out = '';
+  // out offset for each input offset, to map the cursor
+  const map = new Array(text.length + 1);
+  let quote = null; // '"', "'", '<' or '#' while inside a string, an IRI or a comment
+  let line = 1;
+  let col = 1;
+  for (let i = 0; i < text.length; i++) {
+    map[i] = out.length;
+    const c = text[i];
+    if (quote) {
+      out += c;
+      if ((quote === '#' && c === '\n') || (quote !== '#' && c === quote && text[i - 1] !== '\\'))
+        quote = null;
+    } else if (c === ' ' || c === '\t') {
+      const next = text[i + 1];
+      // keep one space, none before a line break or another space
+      if (next !== ' ' && next !== '\t' && next !== '\n' && next !== undefined) out += ' ';
+    } else {
+      if (c === '"' || c === "'" || c === '#') quote = c;
+      else if (c === '<' && /^<[^\s<>"{}|^`\\]*>/.test(text.slice(i))) quote = '>';
+      else if (c === '(' || c === '{' || c === '[') stack.push({ c, line, col });
+      else if (pairs[c]) {
+        const open = stack.pop();
+        if (!open || open.c !== pairs[c])
+          return { error: { message: `unexpected '${c}'`, line, column: col } };
+      }
+      out += c;
+    }
+    if (c === '\n') {
+      line++;
+      col = 1;
+    } else col++;
+  }
+  map[text.length] = out.length;
+  if (stack.length) {
+    const open = stack[stack.length - 1];
+    return { error: { message: `'${open.c}' is not closed`, line: open.line, column: open.col } };
+  }
+  const trimmed = out.replace(/\s+$/, '');
+  const text2 = trimmed + '\n';
+  const c =
+    typeof cursor === 'number'
+      ? Math.min(map[Math.min(cursor, text.length)], trimmed.length)
+      : null;
+  return { text: text2, cursor: c };
+}
+
 function fail(res, status, error, extra = {}) {
   send(res, status, { error, ...extra });
 }
@@ -1672,7 +1728,8 @@ const server = http.createServer(async (req, res) => {
       switch (what) {
         case 'ping':
           return send(res, 200, new Date().toISOString(), 'text/plain');
-        // the formatter: echoes the text and cursor, unchanged
+        // the formatter, a stand-in: normalizes whitespace (see mockFormat) and reports
+        // unbalanced brackets as a syntax error
         case 'format': {
           if (req.method !== 'POST') return fail(res, 405, 'method not allowed');
           let body;
@@ -1683,11 +1740,20 @@ const server = http.createServer(async (req, res) => {
           }
           if (typeof body?.text !== 'string')
             return fail(res, 400, 'expected `text`', { code: 'bad-request' });
+          const out = mockFormat(body.text, body.cursorOffset);
+          if (out.error) {
+            return fail(res, 400, out.error.message, {
+              code: 'syntax',
+              line: out.error.line,
+              column: out.error.column,
+              language: 'sparql',
+            });
+          }
           return send(res, 200, {
-            text: body.text,
-            changed: false,
+            text: out.text,
+            changed: out.text !== body.text,
             language: body.language ?? 'sparql',
-            cursorOffset: body.cursorOffset ?? null,
+            cursorOffset: out.cursor,
             warnings: [],
           });
         }

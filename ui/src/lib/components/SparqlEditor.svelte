@@ -5,6 +5,7 @@
     history,
     historyKeymap,
     indentWithTab,
+    isolateHistory,
     toggleComment,
   } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
@@ -20,6 +21,7 @@
     placeholder as cmPlaceholder,
   } from '@codemirror/view';
   import { onDestroy, onMount } from 'svelte';
+  import { minimalChange } from '$lib/fmt-edit';
   import { highlightError, sparql, type CompletionData } from '$lib/sparql-lang';
 
   let {
@@ -36,7 +38,7 @@
     value: string;
     onchange: (value: string) => void;
     onrun: () => void;
-    /** Format the document (Shift+Alt+F); not bound yet. */
+    /** Format the document (Shift+Alt+F). */
     onformat?: () => void;
     completion: CompletionData;
     placeholder?: string;
@@ -133,6 +135,12 @@
       Prec.highest(
         keymap.of([
           { key: 'Mod-Enter', run: () => (onrun(), true), preventDefault: true },
+          // VS Code's binding (Mod-Shift-f is left alone: Firefox and some IMEs use it)
+          {
+            key: 'Shift-Alt-f',
+            run: () => (onformat ? (onformat(), true) : false),
+            preventDefault: true,
+          },
           { key: 'Mod-/', run: toggleComment },
         ]),
       ),
@@ -207,15 +215,20 @@
   }
 
   /**
-   * Replace the document with its formatted text as one undoable change, the cursor at
-   * `cursorOffset`.
-   *
-   * TODO: replace only the changed middle (common prefix and suffix trimmed); a no-op until
-   * the Format button lands.
+   * Replace the document with its formatted text: only the changed middle (common prefix
+   * and suffix trimmed), in one transaction that undo reverts on its own, the cursor at
+   * `cursorOffset` (or mapped through the change without one). The scroll position stays.
    */
   export function replaceFormatted(text: string, cursorOffset: number | null) {
-    void text;
-    void cursorOffset;
+    if (!view) return;
+    const change = minimalChange(view.state.doc.toString(), text);
+    if (!change) return;
+    view.dispatch({
+      changes: change,
+      selection: cursorOffset == null ? undefined : { anchor: cursorOffset },
+      userEvent: 'input.format',
+      annotations: isolateHistory.of('full'),
+    });
   }
 
   export function forget(id: string) {
