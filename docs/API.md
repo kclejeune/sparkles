@@ -1543,8 +1543,27 @@ envelope has no place in longitude and latitude. Malformed literals, literals ov
 `maxVertices`, empty geometries and literals in an unknown CRS are never candidates: no
 relation or distance with a constant can hold for them (they are type errors or empty).
 A `spatial:` call with a constant subject reads that feature's links directly, index or
-not. The index lives in memory: it is built when the database is opened (queries run
-without it meanwhile), and again for each new generation (bulk loads, compaction).
+not. The index's base belongs to a generation: it is built when the index is enabled, and
+again for each new generation (bulk loads, compaction), where the literals the previous
+generation's index parsed are taken over and only new ones are parsed. A persistent
+database writes the base to `gen-NNNN/geo/` (`rtree.spkg`, `column.spkg`; checksummed,
+written to a temporary file and renamed) and reads it from there in place, decoding a
+geometry the first time a query needs it: opening the database, or enabling the same
+predicates, graphs and limits again, parses no literal. Files that are missing, damaged,
+written by another version or made for another configuration or generation are removed
+and the base is built again (queries run without the index meanwhile). `serve
+--read-only` writes no index files (it builds in memory when the files do not fit).
+The files are derived data: backups and clones leave them out, and they go with their
+generation or a `DELETE /$/geo/{ds}`.
+
+**W3C Basic Geo.** With `"wgs84": true`, a subject with `wgs84_pos:lat` and
+`wgs84_pos:long` (`http://www.w3.org/2003/01/geo/wgs84_pos#`) in the same graph is also
+a point of the index (several of either: every combination, as in Jena). Values are
+numbers of any XSD numeric type, or strings holding one, within ±90° and ±180°; other
+pairs are no points. A point lives while both of its quads do. The `spatial:` functions
+find such a subject as a feature (no feature link needed), and the map view reports it;
+`geof:` FILTERs do not see the pairs (there is no geometry literal), so they are not
+pushed down for them either.
 
 Each spatial operator in an executed plan reports `counters`: `candidates` (rows the index
 or the scan handed out), `rechecked` (those among them the index could not place),
@@ -1557,8 +1576,9 @@ rows came from a scan instead of the index).
 |--------|------|-------------|
 | GET | `/$/geo/{ds}` | `GeoStatus` (below), or `{ "enabled": false }` |
 | PUT | `/$/geo/{ds}` | Enable or reconfigure; the body is a `GeoConfig` (empty: defaults). `202` with the build `Task` (`kind: "geo-index"`); `400 invalid geo configuration: …`; `409 spatial index build already running` |
-| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` |
-| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` and the index files |
+| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base from RDF, its files too (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| GET | `/{ds}/geo?bbox=minLon,minLat,maxLon,maxLat[&graph=IRI][&predicate=IRI][&limit=N][&tolerance=DEG]` | The indexed geometries meeting a CRS84 box (dataset read access), as `application/geo+json` (below). Without a ready index (off, building, failed) the same answer by a scan of the configuration's (or the default) predicates. `400` for a bad `bbox` (not four numbers, min after max, latitude out of ±90), `limit` outside 1–50,000 or a negative `tolerance`; `404` unknown dataset |
 
 ```ts
 type GeoConfig = {
@@ -1568,7 +1588,7 @@ type GeoConfig = {
   distance?: "geodesic" | "haversine";   // default "geodesic"
   maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
   maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
-  wgs84?: boolean;              // not supported yet (true: 400)
+  wgs84?: boolean;              // W3C Basic Geo lat/long pairs as points (default false)
   queryRewrite?: boolean;       // not supported yet (true: 400)
   formatVersion?: 1;
 };
@@ -1578,22 +1598,45 @@ type GeoStatus = {
   progress?: number; message?: string;
   generation: string;           // the generation the base was built for
   commit: number;               // the commit the status describes
-  rows: { base: number; overlay: number; tail: number };
+  rows: { base: number; overlay: number; tail: number; wgs84?: number };  // wgs84: W3C Basic Geo points among them
   literals: number;             // distinct parsed geometries
   skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
   crs: { [iri: string]: number };   // literals per CRS, unknown ones included
-  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number;
+            mappedBytes?: number };   // index files read in place (not counted against the budget)
   config: GeoConfig; formatVersion: 1;
   lastBuild?: { at: string; ms: number; rows: number };
+  files?: { bytes: number; opened: boolean };   // the base's index files; opened: read, not built
+};
+type GeoFeatureCollection = {   // GET /{ds}/geo
+  type: "FeatureCollection";
+  features: {
+    type: "Feature";
+    id: string;                 // the row's subject (an IRI, or _:label)
+    geometry: object;           // GeoJSON, CRS84, simplified with Douglas-Peucker
+    properties: {
+      subject: string;
+      feature?: string;         // a feature linked to the subject (one Feature per link; the subject itself for a W3C Basic Geo point)
+      graph: string | null;     // null: the default graph
+      predicate: string;        // the serialization predicate, or wgs84_pos:lat_long
+    };
+  }[];
+  truncated: boolean;           // more than `limit` features met the box
 };
 ```
+
+`GET /{ds}/geo` tests each geometry exactly against the box (in CRS84), transforms it to
+CRS84 and simplifies it with `tolerance` degrees (default: the box's width / 1024; a ring
+keeps at least four positions). `graph` narrows to one graph (`urn:x-arq:DefaultGraph` for
+the default graph), `predicate` to one serialization predicate (or
+`http://www.w3.org/2003/01/geo/wgs84_pos#lat_long` for the W3C Basic Geo points).
 
 `over-budget`: the index would need more than `serve --geo-mb` (4096 MiB); queries run
 without it. `failed`: a build or a commit's update of the index failed (the write itself
 never fails because of the index); queries run without it until a rebuild or a
 compaction. The configuration lives in the database directory (`geo.json`; `sparkles
 check` validates it, clones copy it, backups include it). CLI:
-`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
+`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--wgs84] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
 and `sparkles serve --geo NAME[=geo.json]`.
 
 ### Hulls, aggregates, Jena filter functions, UTM and conversion
@@ -1823,60 +1866,106 @@ CLI: `sparkles infer --loc DB --status` prints the status; `sparkles infer --loc
 
 ## Write-time validation
 
-A dataset can validate **every write** against SHACL shapes before it commits. The
-configuration lives in the database directory (`validation.json`):
+A dataset can validate **every write** against SHACL shapes or a ShEx schema before it
+commits; it uses one language at a time. The configuration lives in the database
+directory (`validation.json`, format 2; SHACL configurations of older Sparkles versions,
+format 1 without `language`, are still read):
 
 ```json
-{ "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
+{ "format": 2, "language": "shacl", "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
   "dataGraph": "default", "includeInferences": false,
   "threshold": "violation", "timeoutSeconds": 10, "reportLimit": 100 }
 ```
 
 | Field | Values | Default | Meaning |
 |---|---|---|---|
+| `language` | `shacl`, `shex` | `shacl` | The shape language (always written; a `PUT` without it is SHACL) |
 | `mode` | `reject`, `warn`, `off` | — | `reject`: a write that leaves results at or above the threshold is not committed (`422`); `warn`: it commits, and the receipt and header report the findings |
-| `shapes` | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, read from the state being validated (so changes to them are validated, and must parse), or shapes given inline and copied to `validation-shapes.ttl` |
+| `shapes` (SHACL) | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, read from the state being validated (so changes to them are validated, and must parse), or shapes given inline and copied to `validation-shapes.ttl` |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph; the shapes graphs are never part of it, and the inferred graph only with `includeInferences` |
-| `threshold` | `violation`, `warning`, `info` | `violation` | Results at or above it block |
+| `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block |
 | `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | Budget per write (exceeding it fails the write with `408`); results carried in a report |
+
+**ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
+
+```json
+{ "format": 2, "language": "shex", "mode": "reject",
+  "schema": { "file": "validation-schema.shex", "format": "shexc", "sha256": "…" },
+  "shapeMap": "{FOCUS a ex:Person}@ex:Person, {FOCUS a ex:Org}@ex:Org",
+  "dataGraph": "default", "includeInferences": false, "timeoutSeconds": 10, "reportLimit": 100 }
+```
+
+| Field | Values | Meaning |
+|---|---|---|
+| `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text (ShExC, ShExJ, or ShExR in Turtle; sniffed without `format`: `{` is ShExJ) and the base its relative IRIs resolve against. It is copied into the database: verbatim to `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ) when it has no imports; otherwise the imports are resolved now and the merged schema is written as ShExJ to `validation-schema.json`, with the schema's prefixes kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and has the SHA-256 of the text given. A later write never fetches anything. A `PUT` may give the stored `schema` back (with its `file`, without `inline`) to change the other fields |
+| `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map, expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es |
+| `threshold` | — | Not accepted: every nonconformant association blocks |
+
+Imports resolve as for `POST /{ds}/shex`: `file:` IRIs and relative IRIs inside
+`--load-dir`, http(s) through the outbound policy. A `PUT` takes no inline import bodies or
+externs, so an EXTERNAL shape is a `400`; labels the schema does not define, START without
+a start shape, and SPARQL node selectors (which every validated write would run) are `400`
+too.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ language, config, status }` (`language`: `shacl`; `status`: mode, shape count, the baseline of the last commit, counters, warnings) or `{ config: null }` |
-| PUT | `/$/validation/{ds}` | Set the configuration. The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the report. `400` for a bad configuration or shapes that do not parse |
-| DELETE | `/$/validation/{ds}` | Turn validation off (`204`) |
+| GET | `/$/validation/{ds}` | `{ language, config, status }` (`status`: mode, shape count, the baseline of the last commit, counters, warnings; ShEx adds `associations`, the size of the last expanded map) or `{ config: null }` |
+| PUT | `/$/validation/{ds}` | Set the configuration (either language; it replaces the other language's files). The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or shapes or a schema that cannot be used; `501` for a language this binary was built without |
+| DELETE | `/$/validation/{ds}` | Turn validation off (`204`); every validation file is removed |
 
 **Writes** (update, Graph Store PUT/POST/DELETE, upload, and through the CLI `load`,
 `update`, `infer`, and bulk loads) are validated once per request, on the final state,
-before any byte is written; a write that touches neither the data graph nor the shapes
-graphs is skipped. Responses carry
-`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`,
-and receipts (`receipt=true`) include a `validation` object (with `"language": "shacl"`). A rejection is
+before any byte is written. A write that touches neither the data graph nor the shapes
+graphs is skipped. ShEx also skips a write when every quad it changes has a predicate
+that no triple constraint and no `{FOCUS p …}` selector mentions, unless a shape is
+`CLOSED` (a neighbourhood holds only the arcs of the predicates its shape mentions).
+Responses carry
+`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`
+(ShEx adds `lang=shex` after `strategy`),
+and receipts (`receipt=true`) include a `validation` object with its `language`. A rejection is
 `422 Unprocessable Content`:
 
 ```json
 { "error": "SHACL validation failed: 2 blocking results (threshold violation); nothing was committed",
-  "validation": { "status": "rejected", "blocking": 2, "total": 3, "limit": 100, "truncated": false,
-                  "results": [ … ], "head": 41, "kind": "update" } }
+  "validation": { "language": "shacl", "status": "rejected", "blocking": 2, "total": 3, "limit": 100,
+                  "truncated": false, "results": [ … ], "head": 41, "kind": "update" } }
 ```
 
-or a Turtle `sh:ValidationReport` when the request's `Accept` names `text/turtle`. No
-commit number is used. `?validationLimit=N` bounds the results of one request.
+or a Turtle `sh:ValidationReport` when the request's `Accept` names `text/turtle`. A ShEx
+rejection counts associations: `total` is the size of the expanded map, `blocking` (and
+`bySeverity.violation`) the nonconformant ones, `threshold` is `violation`, and `results`
+are the first `limit` nonconformant [ShEx result objects](#shex-validation) in map order.
+There is no Turtle report, so it is JSON whatever the `Accept`:
+
+```json
+{ "error": "ShEx validation failed: 1 nonconformant association; nothing was committed",
+  "validation": { "language": "shex", "status": "rejected", "strategy": "full", "blocking": 1, "total": 4,
+                  "results": [ { "node": { "type": "uri", "value": "http://ex.org/dave" },
+                                 "shape": { "type": "uri", "value": "http://ex.org/Person" },
+                                 "status": "nonconformant", "reason": "…", "appinfo": { "failures": [ … ] } } ],
+                  … } }
+```
+
+No commit number is used. `?validationLimit=N` bounds the results of one request.
 `?validate=false` (or `Sparkles-Validate: off`) skips validation only on a server started
 with `--allow-unvalidated-writes` (`403` otherwise); the CLI has `--no-validate`. A dataset
-whose `validation.json` cannot be loaded refuses writes (`501`) rather than accepting
-them unvalidated.
+whose `validation.json` cannot be loaded (a ShEx configuration opened by a binary built
+without `shex` included) refuses writes (`501`) rather than accepting them unvalidated.
 
-CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`,
-`--status`, `--off`. A write rejected in the CLI exits with status 3; `load`, `update` and
+CLI: `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`
+for SHACL, `sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …]`
+for ShEx (`--schema` and `--shape-map` imply `--lang shex`; imports resolve against the
+schema's directory), `--status [--format json]`, `--off`. A write rejected in the CLI
+exits with status 3 (ShEx lists `  <node> @ <shape>: <reason>`); `load`, `update` and
 `infer` end their summary line with the validation status, and `sparkles stats` shows the
-configuration (`validation      reject · 1 shape graph · 20 shapes`). A reasoning task
+configuration (`validation      reject · 1 shape graph · 20 shapes`, or
+`reject · ShEx · 3 shapes · last full 12 ms`). A reasoning task
 whose inferences are rejected fails with
 `inferences rejected by SHACL validation: N blocking results (first: <shape> at <node>)`.
-Rejections are logged at INFO under `sparkles::validation` (dataset, kind, counts, first
-shape and focus node); see [Metrics](#metrics) for the counters. Cost: each validated
-write runs a full validation of the data graph (about 160 ms at 1M triples); writes that do
-not touch the data graph are free.
+Rejections are logged at INFO under `sparkles::validation` (dataset, language, kind, counts,
+first shape and focus node); see [Metrics](#metrics) for the counters (`language` label).
+Cost: each validated write runs a full validation of the data graph (SHACL about 160 ms at
+1M triples); skipped writes are free.
 
 ## SHACL validation
 
@@ -1943,10 +2032,16 @@ overlap. Built with the `shex` cargo feature (on by default; `501` without it).
 JSON envelope carries both:
 
 * **Schema as the body.** `Content-Type: text/shex` (ShExC), `application/shex+json`, or
-  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object. Any
-  other content type is sniffed: ShExJ when the body starts with `{`, ShExC otherwise. The
-  shape map is `map=<compact shape map>`, or `node=<term>` with `shape=<label>`
-  (`START` when `shape` is absent). `base=<iri>` resolves relative IRIs of the schema.
+  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object;
+  ShExR (the schema as RDF in the ShEx vocabulary `http://www.w3.org/ns/shex#`) as
+  `text/turtle`, `application/n-triples`, `application/trig`, `application/n-quads` or
+  `application/rdf+xml` (the triples of every graph are read as one graph, and a Turtle or
+  TriG body's prefixes are the schema's). Any other content type (`text/plain`, a form
+  type) is sniffed: ShExJ when the body starts with `{`, ShExC otherwise.
+  `schema-format=shexc|shexj|shexr` names the syntax where the media type does not (ShExR
+  is then read in the RDF syntax of the media type, else as Turtle). The shape map is
+  `map=<compact shape map>`, or `node=<term>` with `shape=<label>` (`START` when `shape`
+  is absent). `base=<iri>` resolves relative IRIs of the schema.
 * **JSON envelope** (`Content-Type: application/json`, a body that is not a ShExJ schema):
 
   ```json
@@ -1958,7 +2053,8 @@ JSON envelope carries both:
     "base": "http://ex.org/schema" }
   ```
 
-  `schemaFormat` is `shexc` or `shexj` (default: sniffed); `map` is a compact shape map
+  `schemaFormat` is `shexc`, `shexj` or `shexr` (Turtle; default: sniffed as ShExC or
+  ShExJ); `map` is a compact shape map
   (a string) or a JSON shape map (an array); `externs` defines the schema's `EXTERNAL`
   shapes; `imports` gives the bodies of `IMPORT`ed IRIs. Only `schema` is required, and
   the shape map comes from the envelope or the query string, not both. Unknown keys are
@@ -1971,7 +2067,21 @@ literal or a blank node as Sparkles prints it in query results (`_:b1f`); `{FOCU
 `{FOCUS p _}`, `{s p FOCUS}` and `{_ p FOCUS}` select the nodes of the data graph with
 those arcs. The JSON syntax is an array of `{"node": …, "shape": …}` (the draft's
 `nodeSelector` and `shapeLabel` are accepted too). A node that is not in the data graph
-is validated with no arcs. `SPARQL """…"""` selectors are not supported yet (`400`).
+is validated with no arcs.
+
+`SPARQL """SELECT …"""` (any of the four string quotes) selects the bindings of `?focus`,
+or of the first projected variable, in the order of the solutions (unbound ones are
+skipped; values the store does not hold are validated with no arcs). It is an extension
+from other ShEx tools, not part of the ShapeMap draft. The query is checked when the map
+is parsed (`400` with `line` and `column` at the selector unless it is a SELECT query that
+projects a variable and has no `SERVICE`) and runs on the data graph: its default graph is
+the data graph (`graph`, with the inferences when `reasoning` includes them), and `FROM`,
+`FROM NAMED` and `GRAPH` see nothing else. It has no prefixes or base IRI but its own
+(neither the map's nor the schema's), the row and memory budgets of a query
+(`--max-rows`, `--query-memory-mb`; `507` past them), and the validation's
+`timeout`, which covers the selectors and the validation together. The selected nodes
+count, with the other associations, against the report's size, and are deduplicated with
+them per (node, shape).
 
 **Imports** (`IMPORT <iri>`) resolve from the envelope's `imports`, then `file:` IRIs under
 `--load-dir` (none without it), then http(s) IRIs through the `--outbound-*` policy of
@@ -2029,7 +2139,9 @@ Jena's report, `OK` or one `<n> @ <S> :: Focus = <n>, Status = nonconformant, Re
 line per association.
 
 **Errors.** `400` with `line` and `column` for a syntax error in the schema, the shape map,
-the externs or an inline import (also ShEx 2.2 syntax); `400` for a schema that cannot be
+the externs or an inline import (also ShEx 2.2 syntax); `400` without them for a ShExR
+schema whose graph is not a schema (no `sx:Schema` node, a missing `sx:predicate`, a value
+of the wrong kind: the message names the node); `400` for a schema that cannot be
 used (an undefined reference, a negated reference cycle, an invalid `&include`, an import
 that does not resolve or is not allowed, an `EXTERNAL` shape without a definition), a shape
 label the schema does not define, `START` without a start shape, and invalid parameters;
@@ -2040,14 +2152,20 @@ budget, or `"outbound-bytes"` when the imports exceed the request's outbound bud
 [Budgets](#budgets)).
 
 The CLI equivalent is `sparkles shex validate (--loc DB | --data FILE…) --schema FILE
-(--map FILE | --shape-map 'MAP' | --node TERM [--shape LABEL]) [--graph default|union|IRI]
+[--schema-format shexc|shexj|shexr] (--map FILE | --shape-map 'MAP' | --node TERM [--shape
+LABEL]) [--graph default|union|IRI]
 [--no-inferences] [--externs FILE] [--format text|json|shapemap|smap] [--only-nonconformant]
 [--timeout S] [--semact-trace] [--stats]`, with Jena's flag names as aliases (`val`, `v`;
 `--shapes`/`-s`, `--datafile`/`-d`, `--shapesMap`/`-m`, `--target`/`-n`). Imports resolve
 against the schema file's directory. It prints Jena's text report by default and exits
 with 0 when every association conforms, 1 when one does not (or on a timeout or budget
-error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--out
-shexc|shexj|text] [--base IRI]` prints schemas as ShExC, ShExJ or a structural dump.
+error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--in
+shexc|shexj|shexr] [--out shexc|shexj|shexr|text] [--base IRI]` prints schemas as ShExC,
+ShExJ, ShExR (Turtle) or a structural dump. Schema files are read by extension: ShExJ for
+`.json` and `.shexj`; ShExR for `.ttl`, `.nt`, `.nq`, `.trig`, `.rdf`, `.owl` and `.n3`
+(in that RDF syntax); ShExC or ShExJ (sniffed) otherwise; `--in`/`--schema-format` name
+the syntax of stdin (`-`) or of a file whose name does not say. SPARQL selectors on the
+command line have no row or memory budgets.
 
 ## Formatting
 
@@ -2746,10 +2864,22 @@ open-world when SERVICE is allowed). Common arguments:
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`, `text` being the matched literal (escaped, ≤ 300 characters) and `types` at most 3. Only in builds with the `text` feature; a dataset without an index (`textSearch: false`) gives `text-disabled` |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: exact `spk:vectorSearch` over the stored `spk:vector` literals (it never computes embeddings). `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector |
+| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation), most severe results first (then by shape and focus node). `severity` is `Violation`, `Warning`, `Info` (SHACL 1.2 `Debug` and `Trace` count as info); a complex `path` is a SPARQL property path. Only in builds with the `shacl` feature |
+| `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), results in shape-map order. `shape` is `START` for a START association; `failures` are the report's `appinfo.failures` with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused (`bad-argument`: put the imported shapes into the schema) and EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE and with no prefixes but their own (a failing selector query is `invalid-schema`). Only in builds with the `shex` feature |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
 has the complete JSON Schemas.
+
+**Validation tools.** `validate_shacl` and `validate_shex` read one snapshot (they take
+`atCommit` and `reasoning` like the other tools), write nothing and fetch nothing: no
+imports, no SERVICE (SHACL-SPARQL refuses it as over HTTP). `total` and `counts` cover
+every result; `results` holds the first `maxResults`, cut earlier when the results
+would pass `--mcp-max-bytes`, and `truncated` says whether any were left out. A call
+runs under its timeout, in the validation thread pool of `/{ds}/shacl`, with the
+memory budget bounding the report (512 bytes a result: a SHACL report or ShEx result
+map larger than that is `budget-memory`) and the ShEx typing (64 bytes a pair:
+`budget-validation-work`).
 
 **Terms** in results use Turtle/SPARQL syntax, so they can be pasted into queries:
 `ex:alice` (a dataset prefix whose namespace fits), `<http://…>`, `_:b1f`, `"text"`,
@@ -2799,14 +2929,15 @@ A failed call is a result with `isError: true`, one text block `"<message>\nHint
 |---|---|---|
 | `bad-argument` | 400 | an argument outside its schema (unknown field, out of range, bad IRI) |
 | `unknown-dataset` | 404 | no such dataset, or `dataset` omitted on a server with several (the hint lists them) |
-| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes) |
+| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes); a shapes graph, ShEx schema or shape map that does not parse |
+| `invalid-shapes`, `invalid-schema` | 400 | shapes the SHACL validator cannot use; a ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape) or a shape-map label it does not define |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query` |
 | `timeout` | 408 | the call's timeout passed |
-| `budget-memory`, `budget-rows` | 507 | a query budget was exceeded |
+| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | a query or validation budget was exceeded |
 | `service-disabled` | 403 | a query uses SERVICE and it is not allowed |
 | `unknown-commit` | 404 / 410 | `atCommit` in the future / no longer held |
 | `stale-cursor` | 409 / 400 | a schema cursor whose snapshot is gone / a malformed cursor |
-| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors |
+| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors; `unknown-graph` also for the `graph` of a validation tool |
 | `text-disabled` | 400 | `search_text` on a dataset without a full-text index |
 | `no-vectors` | 400 | `similar_entities`: no vectors under the predicate, a dimension mismatch, or an entity without a vector |
 | `text-unavailable`, `write-failed`, `unsupported` | 503, 503, 501 | as over HTTP |

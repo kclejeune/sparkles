@@ -94,7 +94,8 @@ fn main() -> anyhow::Result<()> {
     let map = ShapeMap::parse(&map_text, schema.prefixes(), schema.base())?;
     let t = Instant::now();
     let data_graph = DataGraph::new(snap.clone(), None, &[], &[])?;
-    let (fixed, _) = sparkles_shex::shapemap::expand(&map, &data_graph, &schema)?;
+    let (fixed, _) =
+        sparkles_shex::shapemap::expand(&map, &data_graph, &schema, &Default::default(), None)?;
     println!(
         "shape map: {} associations expanded in {:.1} ms",
         fixed.len(),

@@ -10,7 +10,8 @@
 //! links (`POS` lookups of `[link, geometry]`; under `GRAPH ?g` the link must be in the
 //! geometry's graph), keeps one solution per feature, and with a `limit` keeps the
 //! features nearest to the query (box and cardinal functions: to the centre of the
-//! query's envelope), ties by subject id.
+//! query's envelope), ties by subject id. A W3C Basic Geo point (`"wgs84": true`) is a
+//! geometry of its subject itself.
 
 use super::GeomRef;
 use super::column::ColumnEntry;
@@ -581,7 +582,10 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
     let ids = |iris: &[String]| -> Vec<Id> {
         iris.iter().filter_map(|i| ctx.snap.lookup_iri(i)).collect()
     };
-    let (preds, links) = (ids(&cfg.predicates), ids(&cfg.feature_links));
+    let (mut preds, links) = (ids(&cfg.predicates), ids(&cfg.feature_links));
+    // W3C Basic Geo points, whose subject is the feature
+    let lat = search::wgs84_lat(&ctx.snap);
+    preds.extend(lat);
     let windows = pf_windows(spec.func, &spec.query, spec.radius_m);
     let tests = pf_tests(spec);
     let nearby = matches!(
@@ -640,6 +644,30 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
                         Ok(())
                     })?;
                 }
+                // and its W3C Basic Geo points
+                if let (Some(lat), Some((_, long))) = (lat, super::wgs84::predicates(&ctx.snap)) {
+                    let mut scope = Scope::new(&cfg);
+                    let mut n = 0;
+                    scan_keys(ctx, Perm::Spo, &[f.0, lat.0], |k| {
+                        let (lat_o, g) = (k[2], k[3]);
+                        if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
+                            return Ok(());
+                        }
+                        let Some(y) = super::wgs84::number(&ctx.snap, Id(lat_o)) else {
+                            return Ok(());
+                        };
+                        for long_o in super::wgs84::objects(&ctx.snap, f.0, long.0, g)? {
+                            let e = super::wgs84::number(&ctx.snap, Id(long_o))
+                                .and_then(|x| super::wgs84::point(y, x));
+                            if let Some(e) = e {
+                                n += 1;
+                                let o = Id(super::wgs84::pair_id(n));
+                                cands.push(ctx, *f, o, Id(g), || Src::Entry(e))?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
             } else {
                 // the index's window search (a scan of the predicates when it cannot serve)
                 search::window_with(
@@ -662,6 +690,10 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
             let mut geoms: FxHashMap<(Id, Id), f64> = FxHashMap::default();
             for r in rows {
                 let d = pass[&r[1]];
+                if super::wgs84::is_pair(r[1].0) {
+                    own_feature(spec, r[0], r[2], d, &mut feats);
+                    continue;
+                }
                 let e = geoms.entry((r[0], r[2])).or_insert(d);
                 *e = e.min(d);
             }
@@ -749,6 +781,24 @@ fn features(
     Ok(())
 }
 
+/// A W3C Basic Geo point of `s` (in graph `g`, at ranking distance `d`) matched: `s`
+/// is the feature.
+fn own_feature(spec: &SpatialPfSpec, s: Id, g: Id, d: f64, feats: &mut FxHashMap<(Id, Id), f64>) {
+    if matches!(spec.subject, PathEnd::Const(c) if c != s) {
+        return;
+    }
+    let key = (
+        s,
+        if spec.graph_var.is_some() {
+            g
+        } else {
+            Id::UNDEF
+        },
+    );
+    let e = feats.entry(key).or_insert(d);
+    *e = e.min(d);
+}
+
 /// `nearby` with a limit: a nearest-first search that stops once `k` features are
 /// nearer than anything left (or the radius is reached).
 #[allow(clippy::too_many_arguments)]
@@ -794,7 +844,11 @@ fn knn(
                 };
                 if let Some(d) = d {
                     matched += 1;
-                    features(ctx, spec, links, h.s, h.g, d, feats)?;
+                    if super::wgs84::is_pair(h.o.0) {
+                        own_feature(spec, h.s, h.g, d, feats);
+                    } else {
+                        features(ctx, spec, links, h.s, h.g, d, feats)?;
+                    }
                 }
             }
             // no later row is nearer than `bound`

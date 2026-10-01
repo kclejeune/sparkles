@@ -1,7 +1,7 @@
 //! `sparkles lsp`: a language server over stdin and stdout (`lsp-server`, `lsp-types`)
 //! for the languages `sparkles fmt` formats. It offers `textDocument/formatting` and
 //! `textDocument/rangeFormatting` (the whole document, returned as the smallest edit), and
-//! publishes syntax errors as diagnostics. Each document is formatted with the options of
+//! publishes syntax errors and the formatter's warnings as diagnostics. Each document is formatted with the options of
 //! the `.sparklesfmt.toml` nearest to its file, as `sparkles fmt` would; there are no
 //! editor-side settings.
 //!
@@ -22,8 +22,8 @@ use lsp_types::notification::{
 use lsp_types::request::{Formatting, RangeFormatting, Request as _};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams, Position,
-    PublishDiagnosticsParams, Range, TextEdit, Uri,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
+    NumberOrString, Position, PublishDiagnosticsParams, Range, TextEdit, Uri,
 };
 use serde_json::{Value, json};
 use sparkles_fmt::{Detection, FormatError, Formatted, Language, Options};
@@ -311,14 +311,30 @@ impl Doc {
         &self.result.as_ref().expect("just set").1
     }
 
-    /// A syntax error, or the formatter refusing the document, or a broken config file.
+    /// The formatter's warnings for a formatted document; otherwise a syntax error, the
+    /// formatter refusing the document, or a broken config file.
     fn diagnostics(&mut self, uri: &Uri, enc: Encoding) -> Vec<Diagnostic> {
-        let refusal = match self.format(uri) {
-            Ok(_) => return Vec::new(),
-            Err(r) => r.clone(),
-        };
+        self.format(uri);
         let text = &self.text;
-        let (severity, start) = match &refusal {
+        let refusal = match &self.result.as_ref().expect("formatted").1 {
+            Ok(f) => {
+                return f
+                    .warnings
+                    .iter()
+                    .map(|w| {
+                        // no position: the start of the document
+                        let start = match w.line {
+                            0 => 0,
+                            line => sparkles_fmt::offset_of(text, line, w.column),
+                        };
+                        let severity = warning_severity(w.code);
+                        diagnostic(text, start, enc, severity, Some(w.code), w.message.clone())
+                    })
+                    .collect();
+            }
+            Err(r) => r,
+        };
+        let (severity, start) = match refusal {
             Refusal::Format(_, FormatError::Syntax { offset, .. }) => {
                 (DiagnosticSeverity::ERROR, *offset)
             }
@@ -332,23 +348,58 @@ impl Doc {
             // nothing to point at in the document
             Refusal::Format(..) | Refusal::Language(_) => return Vec::new(),
         };
-        let mut start = start.min(text.len());
-        while !text.is_char_boundary(start) {
-            start -= 1;
-        }
-        // the character there, unless it is a line break or the end
-        let end = text[start..]
-            .chars()
-            .next()
-            .filter(|c| !matches!(c, '\n' | '\r'))
-            .map_or(start, |c| start + c.len_utf8());
-        vec![Diagnostic {
-            range: range(text, start, end, enc),
-            severity: Some(severity),
-            source: Some("sparkles".to_string()),
-            message: refusal.message(),
-            ..Diagnostic::default()
-        }]
+        let code = match refusal {
+            Refusal::Format(_, e) => Some(e.code()),
+            Refusal::Config(_) => Some("config"),
+            _ => None,
+        };
+        vec![diagnostic(
+            text,
+            start,
+            enc,
+            severity,
+            code,
+            refusal.message(),
+        )]
+    }
+}
+
+/// How much a formatter warning matters: a moved comment means the output may surprise
+/// the reader, so it is a warning; the others (`undeclared-prefix`,
+/// `option-not-implemented`) are information. (`comments-dropped` and `unstable-labels`
+/// come only from `canonicalize`, which the server never sets.)
+fn warning_severity(code: &str) -> DiagnosticSeverity {
+    match code {
+        "comment-moved" => DiagnosticSeverity::WARNING,
+        _ => DiagnosticSeverity::INFORMATION,
+    }
+}
+
+/// A diagnostic on the character at byte `start` (empty at a line break or the end).
+fn diagnostic(
+    text: &str,
+    start: usize,
+    enc: Encoding,
+    severity: DiagnosticSeverity,
+    code: Option<&str>,
+    message: String,
+) -> Diagnostic {
+    let mut start = start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let end = text[start..]
+        .chars()
+        .next()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .map_or(start, |c| start + c.len_utf8());
+    Diagnostic {
+        range: range(text, start, end, enc),
+        severity: Some(severity),
+        code: code.map(|c| NumberOrString::String(c.to_string())),
+        source: Some("sparkles fmt".to_string()),
+        message,
+        ..Diagnostic::default()
     }
 }
 

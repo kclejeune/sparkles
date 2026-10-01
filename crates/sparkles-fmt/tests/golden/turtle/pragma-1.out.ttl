@@ -1,0 +1,13 @@
+PREFIX ex: <http://example.org/>
+
+# sparkles-fmt: ignore
+ex:table ex:row ( 1   2   3 ) ,
+                ( 10  20  30 ) .
+
+ex:s
+  ex:a 1 ;
+  # sparkles-fmt: ignore
+  ex:grid ( 1 0
+            0 1 ) ;
+  ex:b 2 ;
+.

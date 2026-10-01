@@ -1,7 +1,11 @@
-//! `sparkles fmt`: format SPARQL queries and updates (Turtle, TriG, N-Triples, N-Quads
+//! `sparkles fmt`: format SPARQL queries and updates, N-Triples and N-Quads (Turtle, TriG
 //! and JSON-LD later). Prettier's modes and exit codes: print to stdout by default,
 //! `--check` / `--list-different` exit 1 when something would change, `--write`
 //! rewrites in place, and any error exits 2.
+//!
+//! N-Triples and N-Quads stream: a file (or stdin) of any size is formatted in one pass
+//! in bounded memory, printed as it goes, checked into `io::sink()`, or written to a
+//! temporary file next to it; `--diff` formats them in memory like the other languages.
 
 pub(crate) mod config;
 pub(crate) mod report;
@@ -215,10 +219,6 @@ impl FmtArgs {
 
     /// What the line formats' streaming needs: the sort budget, the canonicalization
     /// limit and the threads, spilling to the system's temporary directory.
-    #[allow(
-        dead_code,
-        reason = "the streaming of N-Triples and N-Quads calls it once they format"
-    )]
     pub fn lines_config(&self) -> LinesConfig {
         LinesConfig {
             sort_memory: self.sort_memory,
@@ -379,10 +379,18 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
     };
     let mut jobs = Vec::new();
     if args.paths.is_empty() {
-        let mut text = String::new();
-        std::io::stdin()
-            .read_to_string(&mut text)
-            .context("reading stdin")?;
+        // N-Triples and N-Quads named by --language or --stdin-filepath stream; anything
+        // else is read whole
+        let text = match line_format(args.language, args.stdin_filepath.as_deref(), mode) {
+            Some(_) => None,
+            None => {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .context("reading stdin")?;
+                Some(text)
+            }
+        };
         let abs = args
             .stdin_filepath
             .as_deref()
@@ -399,7 +407,7 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
                 .map_or_else(|| "<stdin>".to_string(), |p| p.display().to_string()),
             file: None,
             lang_path: args.stdin_filepath.clone(),
-            text: Some(text),
+            text,
             ignored: abs.is_some_and(|a| ignores.ignored(&a, false)),
             options: options_in(&dir),
         });
@@ -422,20 +430,31 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
         }
     }
 
-    let outcomes: Vec<Outcome> = if jobs.len() > 1 {
+    // documents streamed to stdout are formatted in order, while the output is written
+    let to_stdout = |j: &Job| mode == Mode::Print && streamed(j, args, mode).is_some();
+    let run = |j: &Job| (!to_stdout(j)).then(|| process(j, args, mode));
+    let outcomes: Vec<Option<Outcome>> = if jobs.len() > 1 {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads.unwrap_or(0))
             .build()
             .context("starting the formatting threads")?;
-        pool.install(|| jobs.par_iter().map(|j| process(j, args, mode)).collect())
+        pool.install(|| jobs.par_iter().map(run).collect())
     } else {
-        jobs.iter().map(|j| process(j, args, mode)).collect()
+        jobs.iter().map(run).collect()
     };
 
     let mut changed = 0;
     let mut once = HashSet::new();
     let mut out = std::io::stdout().lock();
-    for (job, o) in jobs.iter().zip(&outcomes) {
+    for (job, o) in jobs.iter().zip(outcomes) {
+        let o = match (o, streamed(job, args, mode)) {
+            (Some(o), _) => o,
+            (None, Some(lang)) => {
+                let _ = out.flush();
+                stream(job, args, mode, lang, Some(&mut out))
+            }
+            (None, None) => Outcome::error(None),
+        };
         for w in &o.warnings {
             // the same for every file: said once
             if w.code == "option-not-implemented" {
@@ -491,9 +510,16 @@ fn process(job: &Job, args: &FmtArgs, mode: Mode) -> Outcome {
     {
         return fail(&FormatError::unsupported_language(l).to_string());
     }
-    // documents formatted in memory have a size limit; the line formats stream
+    if let Some(lang) = streamed(job, args, mode) {
+        return stream(job, args, mode, lang, None);
+    }
+    // documents formatted in memory have a size limit; the line formats stream, except
+    // for --diff
+    let in_memory = |lang: Option<Language>| {
+        !lang.is_some_and(Language::is_line_format) || matches!(mode, Mode::Check { diff: true })
+    };
     let over_limit = |len: u64, lang: Option<Language>| {
-        (len > args.max_bytes && !lang.is_some_and(Language::is_line_format))
+        (len > args.max_bytes && in_memory(lang))
             .then(|| fail(&too_large_message(len, args.max_bytes, lang)))
     };
     if let (None, Some(path)) = (&job.text, &job.file)
@@ -565,6 +591,200 @@ fn process(job: &Job, args: &FmtArgs, mode: Mode) -> Outcome {
         _ => {}
     }
     o
+}
+
+/// N-Triples or N-Quads, by `--language` or the path's extension, outside `--diff`:
+/// formatted as a stream.
+fn line_format(flag: Option<Language>, path: Option<&Path>, mode: Mode) -> Option<Language> {
+    if matches!(mode, Mode::Check { diff: true }) {
+        return None;
+    }
+    language_by_name(flag, path)
+        .ok()
+        .flatten()
+        .filter(|l| l.is_line_format() && l.is_implemented())
+}
+
+/// The line format `job` streams in, if it does (a file, or stdin left unread).
+fn streamed(job: &Job, args: &FmtArgs, mode: Mode) -> Option<Language> {
+    match (&job.text, &job.options) {
+        (None, Some(_)) => line_format(args.language, job.lang_path.as_deref(), mode),
+        _ => None,
+    }
+}
+
+/// Keeps the first I/O error of a reader or a writer, which the formatter only reports
+/// as a failed run.
+struct Noted<T> {
+    inner: T,
+    error: Option<std::io::Error>,
+}
+
+impl<T> Noted<T> {
+    fn new(inner: T) -> Noted<T> {
+        Noted { inner, error: None }
+    }
+
+    fn note<V>(&mut self, r: std::io::Result<V>) -> std::io::Result<V> {
+        if let Err(e) = &r
+            && self.error.is_none()
+        {
+            self.error = Some(std::io::Error::new(e.kind(), e.to_string()));
+        }
+        r
+    }
+}
+
+impl<T: Read> Read for Noted<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = self.inner.read(buf);
+        self.note(r)
+    }
+}
+
+impl<T: std::io::BufRead> std::io::BufRead for Noted<T> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if let Err(e) = self.inner.fill_buf() {
+            return self.note(Err(e));
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.inner.consume(n)
+    }
+}
+
+impl<T: Write> Write for Noted<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let r = self.inner.write(buf);
+        self.note(r)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let r = self.inner.flush();
+        self.note(r)
+    }
+}
+
+/// Stream one N-Triples or N-Quads document (a file, or stdin) and do with it what `mode`
+/// says: print it to `stdout` (given for [`Mode::Print`]), check it into a sink, or write
+/// it to a temporary file next to the original, renamed over it only if it changed.
+fn stream(
+    job: &Job,
+    args: &FmtArgs,
+    mode: Mode,
+    lang: Language,
+    stdout: Option<&mut dyn Write>,
+) -> Outcome {
+    let name = job.name.as_str();
+    let fail = |message: &str| Outcome::error(Some(format!("{name}: error: {message}")));
+    let Some(opts) = job.options.as_deref() else {
+        return Outcome::error(None);
+    };
+    let input: Box<dyn std::io::BufRead> = match &job.file {
+        Some(path) => match std::fs::File::open(path) {
+            Ok(f) => Box::new(std::io::BufReader::with_capacity(256 << 10, f)),
+            Err(e) => return fail(&report::io(&e)),
+        },
+        None => Box::new(std::io::stdin().lock()),
+    };
+    let mut input = Noted::new(input);
+    let mut tmp = None;
+    let output: Box<dyn Write + '_> = match (mode, stdout) {
+        (Mode::Print, Some(out)) if job.ignored => {
+            // passed through as it is
+            return match std::io::copy(&mut input, out) {
+                Ok(_) => Outcome::default(),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Outcome::default(),
+                Err(e) => fail(&report::io(&e)),
+            };
+        }
+        (_, _) if job.ignored => return Outcome::default(),
+        (Mode::Print, Some(out)) => Box::new(out),
+        (Mode::Write, _) => match job.file.as_deref().map(temp_beside) {
+            Some(Ok((t, file))) => {
+                tmp = Some(t);
+                Box::new(file)
+            }
+            Some(Err(e)) => {
+                return fail(&format!("writing the formatted file: {}", report::io(&e)));
+            }
+            None => return Outcome::error(None),
+        },
+        _ => Box::new(std::io::sink()),
+    };
+    let mut output = Noted::new(output);
+    let result =
+        sparkles_fmt::format_lines(&mut input, &mut output, lang, opts, &args.lines_config());
+    let (read_error, write_error) = (input.error.take(), output.error.take());
+    drop(output);
+    let stats = match (result, read_error, write_error) {
+        (Ok(s), ..) => s,
+        // a closed pipe (`| head`) ends the output, not the run's verdict
+        (Err(_), _, Some(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            return Outcome::default();
+        }
+        (Err(_), Some(e), _) => return fail(&report::io(&e)),
+        (Err(_), None, Some(e)) => {
+            return fail(&match mode {
+                Mode::Write => format!("writing the formatted file: {}", report::io(&e)),
+                _ => format!("writing stdout: {}", report::io(&e)),
+            });
+        }
+        (Err(e), None, None) => return Outcome::error(Some(report::error_line(name, lang, &e))),
+    };
+    let mut o = Outcome {
+        status: match stats.changed {
+            true => Status::Changed,
+            false => Status::Unchanged,
+        },
+        warnings: stats.warnings,
+        ..Outcome::default()
+    };
+    match mode {
+        Mode::Check { .. } if stats.changed => o.stderr.push(format!("[warn] {name}")),
+        Mode::List if stats.changed => o.stdout = format!("{name}\n"),
+        Mode::Write if stats.changed => {
+            if let (Some(t), Some(path)) = (tmp, &job.file)
+                && let Err(e) = replace_with(t, path)
+            {
+                return fail(&format!("writing the formatted file: {}", report::io(&e)));
+            }
+        }
+        // an unchanged file keeps its modification time: the temporary file goes
+        _ => {}
+    }
+    o
+}
+
+/// A temporary file next to `path` (through symbolic links), to write the formatted text
+/// to, and a buffered writer into it.
+fn temp_beside(
+    path: &Path,
+) -> std::io::Result<(tempfile::NamedTempFile, std::io::BufWriter<std::fs::File>)> {
+    let target = std::fs::canonicalize(path)?;
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let tmp = tempfile::Builder::new()
+        .prefix(".sparklesfmt-")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    let file = tmp.as_file().try_clone()?;
+    Ok((tmp, std::io::BufWriter::with_capacity(256 << 10, file)))
+}
+
+/// Rename a written temporary file over `path` (through symbolic links), with its
+/// permissions, synced first.
+fn replace_with(tmp: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path)?;
+    let dir = target.parent().unwrap_or(Path::new("."));
+    tmp.as_file()
+        .set_permissions(std::fs::metadata(&target)?.permissions())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map_err(|e| e.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// The message for a document over `--max-bytes`.
@@ -814,10 +1034,7 @@ mod tests {
             sniffed("<?xml version=\"1.0\"?>"),
             Err(sparkles_fmt::RDF_XML_MESSAGE.to_string())
         );
-        assert_eq!(
-            sniffed("<a> <b> <c> ."),
-            Err("turtle formatting is not available yet".to_string())
-        );
+        assert_eq!(sniffed("<a> <b> <c> ."), Ok(Language::Turtle));
         assert!(sniffed("# only a comment").is_err());
     }
 }

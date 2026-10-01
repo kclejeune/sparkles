@@ -16,10 +16,15 @@
 //!   compile;
 //! * **representation** (`schemas/manifest.jsonld`, or `manifest.ttl`): ShExC → ShExJ
 //!   equals the `.json` file after normalization, and ShExJ → ShExC → ShExJ is stable;
-//! * **validation** (`validation/manifest.ttl`): each test runs twice, with the schema
-//!   from ShExC (`validation/…`) and from ShExJ (`validation-shexj/…`), on one in-memory
-//!   store. The data is inserted term by term so that blank node labels in the manifest
-//!   (`sht:focus _:x`) name the data's blank nodes.
+//! * **shexr** (the representation tests' `.ttl` files): ShExR → ShExJ equals the
+//!   `.json` file after the same normalization;
+//! * **shexr-write**: ShExC → ShExR is the graph of the `.ttl` file (isomorphic, by
+//!   RDFC-1.0 canonicalization);
+//! * **validation** (`validation/manifest.ttl`): each test runs three times, with the
+//!   schema from ShExC (`validation/…`), from ShExJ (`validation-shexj/…`) and from ShExR
+//!   (`validation-shexr/…`), on one in-memory store. The data is inserted term by term so
+//!   that blank node labels in the manifest (`sht:focus _:x`) name the data's blank
+//!   nodes.
 //!
 //! Test ids are `group/name`. Failures listed in `tests/known-failures.txt` do not fail
 //! the run, and listed tests that pass are reported. Tests with `mf:status mf:Proposed`
@@ -29,9 +34,11 @@
 //! does not keep blank node labels. Parts of the crate that still report "not
 //! implemented" are counted as skipped, not failed.
 
+use oxrdf::dataset::{CanonicalizationAlgorithm, CanonicalizationHashAlgorithm};
 use oxrdf::{BlankNode, Graph, Literal, NamedNode, Term, TermRef};
 use serde_json::Value;
 use sparkles::id::Id;
+use sparkles::io::RdfFormat;
 use sparkles::store::{Store, StoreOptions};
 use sparkles_shex::{
     Association, FileResolver, NodeSelector, ResultMap, Schema, SemAct, ShapeExpr, ShapeLabel,
@@ -610,13 +617,14 @@ fn shexj_of(s: &Schema) -> Result<Value, Outcome> {
     }
 }
 
-/// A representation test: the `.shex` and `.json` files of one schema.
+/// A representation test: the `.shex`, `.json` and `.ttl` files of one schema.
 struct RepTest {
     name: String,
     proposed: bool,
     excluded: bool,
     shex: PathBuf,
     json: PathBuf,
+    ttl: Option<PathBuf>,
 }
 
 fn rep_tests(dir: &Path) -> Vec<RepTest> {
@@ -648,6 +656,7 @@ fn rep_tests(dir: &Path) -> Vec<RepTest> {
                     .any(|t| EXCLUDED_TRAITS.contains(&local_name(t).trim_start_matches("sht:"))),
                 shex: sdir.join(shex),
                 json: sdir.join(json),
+                ttl: e["ttl"].as_str().map(|t| sdir.join(t)),
             });
         }
         return out;
@@ -664,6 +673,7 @@ fn rep_tests(dir: &Path) -> Vec<RepTest> {
         Some((e, name, shex, json))
     }) {
         out.push(RepTest {
+            ttl: iri(&g, &e, &format!("{SX}ttl")).map(|t| url_to_path(&t)),
             name,
             proposed: is_proposed(&g, &e),
             excluded: is_excluded(&g, &e),
@@ -750,6 +760,218 @@ fn representation_tests() {
             g.record(&t.name, t.proposed, o);
         }
     });
+}
+
+// ---------------------------------------------------------------------- ShExR ----
+
+fn canonical(mut g: Graph) -> Graph {
+    g.canonicalize(CanonicalizationAlgorithm::Rdfc10 {
+        hash_algorithm: CanonicalizationHashAlgorithm::Sha256,
+    });
+    g
+}
+
+/// The graph with its `sx:shapes` lists sorted: the order of the declarations has no
+/// meaning, and a few `.ttl` files list them in another order than the `.shex` file.
+fn sorted_shapes(g: &Graph) -> Graph {
+    let shapes = nn(&format!("{}shapes", sparkles_shex::shexr::SX));
+    let (first, rest) = (nn(&format!("{RDF}first")), nn(&format!("{RDF}rest")));
+    let nil = Term::NamedNode(nn(&format!("{RDF}nil")));
+    let mut out = g.clone();
+    let heads: Vec<(oxrdf::NamedOrBlankNode, Term)> = g
+        .triples_for_predicate(&shapes)
+        .map(|t| (t.subject.into_owned(), t.object.into_owned()))
+        .collect();
+    for (schema, head) in heads {
+        let mut items = Vec::new();
+        let mut cur = head.clone();
+        while cur != nil {
+            let (Some(f), Some(r)) = (
+                obj(g, &cur, &format!("{RDF}first")),
+                obj(g, &cur, &format!("{RDF}rest")),
+            ) else {
+                // not a list: leave it
+                items.clear();
+                break;
+            };
+            let cell = subject_ref(&cur).unwrap().into_owned();
+            out.remove(&oxrdf::Triple::new(cell.clone(), first.clone(), f.clone()));
+            out.remove(&oxrdf::Triple::new(cell, rest.clone(), r.clone()));
+            items.push(f);
+            cur = r;
+        }
+        if items.is_empty() {
+            continue;
+        }
+        out.remove(&oxrdf::Triple::new(schema.clone(), shapes.clone(), head));
+        items.sort_by_key(|t| t.to_string());
+        let cells: Vec<BlankNode> = items.iter().map(|_| BlankNode::default()).collect();
+        for (i, item) in items.into_iter().enumerate() {
+            let next: Term = cells.get(i + 1).map_or(nil.clone(), |c| c.clone().into());
+            out.insert(&oxrdf::Triple::new(cells[i].clone(), first.clone(), item));
+            out.insert(&oxrdf::Triple::new(cells[i].clone(), rest.clone(), next));
+        }
+        out.insert(&oxrdf::Triple::new(
+            schema,
+            shapes.clone(),
+            cells[0].clone(),
+        ));
+    }
+    out
+}
+
+/// ShExJ as ShExR can compare it: normalized, the declarations sorted by label, and
+/// every labelled triple expression replaced by its label and listed apart (ShExR does
+/// not say which use of a labelled triple expression defines it).
+fn normalize_shexr(v: &Value) -> Value {
+    fn hoist(v: &Value, defs: &mut serde_json::Map<String, Value>) -> Value {
+        match v {
+            Value::Array(a) => Value::Array(a.iter().map(|x| hoist(x, defs)).collect()),
+            Value::Object(o) => {
+                let mut m = serde_json::Map::new();
+                for (k, x) in o {
+                    let mut x = hoist(x, defs);
+                    // the values of sx:extra have no order
+                    if let ("extra", Value::Array(a)) = (k.as_str(), &mut x) {
+                        a.sort_by_key(Value::to_string);
+                    }
+                    m.insert(k.clone(), x);
+                }
+                let te = matches!(
+                    o.get("type").and_then(Value::as_str),
+                    Some("EachOf" | "OneOf" | "TripleConstraint")
+                );
+                if te && let Some(Value::String(id)) = o.get("id") {
+                    defs.insert(id.clone(), Value::Object(m));
+                    return Value::String(id.clone());
+                }
+                Value::Object(m)
+            }
+            v => v.clone(),
+        }
+    }
+    let mut v = normalize(v);
+    if let Some(Value::Array(shapes)) = v.get_mut("shapes") {
+        shapes.sort_by_key(|d| d.get("id").map(Value::to_string).unwrap_or_default());
+    }
+    let mut defs = serde_json::Map::new();
+    let mut v = hoist(&v, &mut defs);
+    if !defs.is_empty() {
+        v["tripleExprLabels"] = Value::Object(defs);
+    }
+    v
+}
+
+/// ShExR → ShExJ is the `.json` file.
+fn shexr_read(t: &RepTest, ttl: &Path) -> Outcome {
+    let (text, json) = match (read(ttl), read(&t.json)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return Outcome::Fail(e),
+    };
+    let mut expected: Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(e) => return Outcome::Fail(format!("{}: {e}", t.json.display())),
+    };
+    resolve_imports(&mut expected, &path_to_url(&t.json));
+    let schema = match Schema::from_shexr(&text, RdfFormat::Turtle, Some(&path_to_url(ttl))) {
+        Ok(s) => s,
+        Err(e) => return failed(format!("ShExR: {e}")),
+    };
+    let got = match shexj_of(&schema) {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    let (got, expected) = (normalize_shexr(&got), normalize_shexr(&expected));
+    if got != expected {
+        return Outcome::Fail(format!(
+            "ShExR → ShExJ differs (normalized)\n--- expected\n{}\n--- actual\n{}",
+            serde_json::to_string_pretty(&expected).unwrap(),
+            serde_json::to_string_pretty(&got).unwrap()
+        ));
+    }
+    Outcome::Pass
+}
+
+/// ShExC → ShExR is the graph of the `.ttl` file.
+fn shexr_write(t: &RepTest, ttl: &Path) -> Outcome {
+    let text = match read(&t.shex) {
+        Ok(t) => t,
+        Err(e) => return Outcome::Fail(e),
+    };
+    let schema = match Schema::parse_shexc(&text, Some(&path_to_url(&t.shex))) {
+        Ok(s) => s,
+        Err(e) => return failed(format!("ShExC: {e}")),
+    };
+    let expected = match load_turtle(&path_to_url(ttl)) {
+        Ok(g) => canonical(sorted_shapes(&g)),
+        Err(e) => return Outcome::Fail(e),
+    };
+    let got = canonical(sorted_shapes(&schema.to_shexr()));
+    if got == expected {
+        return Outcome::Pass;
+    }
+    let only = |a: &Graph, b: &Graph| {
+        a.iter()
+            .filter(|x| !b.contains(*x))
+            .take(10)
+            .map(|x| format!("  {x}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Outcome::Fail(format!(
+        "ShExC → ShExR is not the .ttl graph\n--- only in the .ttl\n{}\n--- only written\n{}\n--- written\n{}",
+        only(&expected, &got),
+        only(&got, &expected),
+        schema.to_shexr_turtle()
+    ))
+}
+
+#[test]
+fn shexr_tests() {
+    let Some(dir) = suite_or_skip("shexr") else {
+        return;
+    };
+    let h = std::thread::Builder::new()
+        .name("group_shexr".into())
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let mut r = Group::new("shexr");
+            let mut w = Group::new("shexr-write");
+            for t in rep_tests(&dir) {
+                for (g, write) in [(&mut r, false), (&mut w, true)] {
+                    if !g.selects(&t.name) {
+                        continue;
+                    }
+                    if t.excluded {
+                        g.exclude();
+                        continue;
+                    }
+                    let Some(ttl) = &t.ttl else {
+                        g.skip("no .ttl file");
+                        continue;
+                    };
+                    let o = guarded(|| {
+                        if write {
+                            shexr_write(&t, ttl)
+                        } else {
+                            shexr_read(&t, ttl)
+                        }
+                    });
+                    g.record(&t.name, t.proposed, o);
+                }
+            }
+            (r, w)
+        })
+        .unwrap();
+    let (r, w) = match h.join() {
+        Ok(x) => x,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.finish()));
+    w.finish();
+    if let Err(p) = res {
+        std::panic::resume_unwind(p);
+    }
 }
 
 // ----------------------------------------------------------------- validation ----
@@ -961,22 +1183,27 @@ fn supply_sem_acts(schema: &mut Schema, ext: &[SemAct]) {
 enum Syntax {
     ShExC,
     ShExJ,
+    ShExR,
 }
 
 /// The file of a schema-like resource in the syntax, if there is one: `x.shex` →
-/// `x.json`, `x.shextern` → `x.jsontern`.
+/// `x.json` or `x.ttl`, `x.shextern` → `x.jsontern` or `x.ttltern`.
 fn in_syntax(url: &str, syntax: Syntax) -> Option<PathBuf> {
     let p = url_to_path(url);
     if syntax == Syntax::ShExC {
         return Some(p);
     }
-    let ext = match p.extension()?.to_str()? {
-        "shex" => "json",
-        "shextern" => "jsontern",
+    let ext = match (p.extension()?.to_str()?, syntax) {
+        ("shex", Syntax::ShExJ) => "json",
+        ("shextern", Syntax::ShExJ) => "jsontern",
+        ("shex", _) => "ttl",
+        ("shextern", _) => "ttltern",
         _ => return Some(p),
     };
     let j = p.with_extension(ext);
-    j.exists().then_some(j)
+    // next to a schema of the validation tests, `x.ttl` is the data
+    let shexr = || read(&j).is_ok_and(|t| t.contains(sparkles_shex::shexr::SX));
+    (j.exists() && (syntax != Syntax::ShExR || shexr())).then_some(j)
 }
 
 fn read_schema(url: &str, syntax: Syntax) -> Result<Option<Schema>, Outcome> {
@@ -988,6 +1215,7 @@ fn read_schema(url: &str, syntax: Syntax) -> Result<Option<Schema>, Outcome> {
         Syntax::ShExC => Schema::parse_shexc(&text, Some(&path_to_url(&p))),
         // relative IRIs resolve against the schema file, as in ShExC
         Syntax::ShExJ => sparkles_shex::shexj::from_shexj_with_base(&text, Some(&path_to_url(&p))),
+        Syntax::ShExR => Schema::from_shexr(&text, RdfFormat::Turtle, Some(&path_to_url(&p))),
     };
     parsed
         .map(Some)
@@ -1036,7 +1264,7 @@ fn expected_triples(json: &str) -> Result<BTreeSet<(String, String, bool)>, Stri
 fn validation(t: &ValTest, syntax: Syntax, store: &Store, focus: Option<&Term>) -> Outcome {
     let run = || -> Result<Outcome, Outcome> {
         let Some(mut schema) = read_schema(&t.schema, syntax)? else {
-            return Ok(Outcome::Fail("no ShExJ form of the schema".into()));
+            return Ok(Outcome::Fail("no ShExJ or ShExR form of the schema".into()));
         };
         if let Some(sa) = &t.sem_acts {
             let text = read(&url_to_path(sa)).map_err(Outcome::Fail)?;
@@ -1130,53 +1358,61 @@ fn validation_tests() {
         .name("group_validation".into())
         .stack_size(64 << 20)
         .spawn(move || {
-            let mut c = Group::new("validation");
-            let mut j = Group::new("validation-shexj");
+            let mut groups = [
+                (Group::new("validation"), Syntax::ShExC),
+                (Group::new("validation-shexj"), Syntax::ShExJ),
+                (Group::new("validation-shexr"), Syntax::ShExR),
+            ];
             for t in val_tests(&dir) {
-                let (sc, sj) = (c.selects(&t.name), j.selects(&t.name));
-                if !sc && !sj {
+                let selected: Vec<bool> = groups.iter().map(|(g, _)| g.selects(&t.name)).collect();
+                if !selected.contains(&true) {
                     continue;
                 }
                 if t.excluded {
-                    c.exclude();
-                    j.exclude();
+                    groups.iter_mut().for_each(|(g, _)| g.exclude());
                     continue;
                 }
                 if let Some(why) = t.skip {
-                    c.skip(why);
-                    j.skip(why);
+                    groups.iter_mut().for_each(|(g, _)| g.skip(why));
                     continue;
                 }
                 let (store, focus) = match load_data(&t.data, t.focus.as_ref()) {
                     Ok(x) => x,
                     Err(e) => {
                         let e = format!("data: {e}");
-                        c.record(&t.name, t.proposed, Outcome::Fail(e.clone()));
-                        j.record(&t.name, t.proposed, Outcome::Fail(e));
+                        for (g, _) in &mut groups {
+                            g.record(&t.name, t.proposed, Outcome::Fail(e.clone()));
+                        }
                         continue;
                     }
                 };
-                for (g, syntax, selected) in
-                    [(&mut c, Syntax::ShExC, sc), (&mut j, Syntax::ShExJ, sj)]
-                {
+                for ((g, syntax), selected) in groups.iter_mut().zip(selected) {
                     if !selected {
                         continue;
                     }
-                    let o = validation(&t, syntax, &store, focus.as_ref());
+                    if *syntax == Syntax::ShExR && in_syntax(&t.schema, Syntax::ShExR).is_none() {
+                        g.skip("no ShExR form of the schema");
+                        continue;
+                    }
+                    let o = validation(&t, *syntax, &store, focus.as_ref());
                     g.record(&t.name, t.proposed, o);
                 }
             }
-            (c, j)
+            groups.map(|(g, _)| g)
         })
         .unwrap();
-    let (c, j) = match h.join() {
+    let groups = match h.join() {
         Ok(x) => x,
         Err(p) => std::panic::resume_unwind(p),
     };
-    // report both before failing on either
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.finish()));
-    j.finish();
-    if let Err(p) = r {
+    // report every group before failing on any
+    let mut first_panic = None;
+    for g in groups {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.finish())) {
+            first_panic.get_or_insert(p);
+        }
+    }
+    if let Some(p) = first_panic {
         std::panic::resume_unwind(p);
     }
 }

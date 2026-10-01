@@ -1,0 +1,34 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# a hand-maintained table
+SELECT ?item ?label ?price
+WHERE {
+  VALUES (?item ?label ?price) {
+    (ex:apple "Apple" 1.25) # on sale
+    # imported fruit
+    (
+      ex:dragon-fruit
+      "Dragon fruit"
+      4.50
+    )
+    (ex:kiwi "Kiwi" UNDEF)
+    (ex:日本 "日本" 3)
+  }
+  OPTIONAL {
+    VALUES (?item ?origin) {
+      (ex:apple        ex:ch)
+      (ex:kiwi         ex:nz)
+      (ex:dragon-fruit UNDEF)
+    }
+    ?item ex:origin ?origin .
+  }
+  ?item ex:label ?label .
+}
+VALUES (?a ?b) {
+  (
+    1 # one
+    2
+  )
+  (333 4)
+}

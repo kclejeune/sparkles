@@ -165,6 +165,44 @@ fn inject(text: &str, spots: &[usize]) -> (String, usize) {
     (out, at.len())
 }
 
+/// `text` with marker comments as [`inject`] puts them, each on a line of its own with
+/// a blank line before it (`1`), after it (`2`), both (`3`) or neither (`0`), so they
+/// lead, trail, or stand apart as blocks.
+fn inject_blocks(text: &str, spots: &[(usize, u8)]) -> (String, usize) {
+    let mut ends: Vec<usize> = vec![0];
+    ends.extend(
+        lex(text, LexMode::Sparql)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia() && t.kind != TokenKind::Eof)
+            .map(|t| t.end()),
+    );
+    let mut at: Vec<(usize, u8)> = spots
+        .iter()
+        .map(|&(s, blanks)| (ends[s % ends.len()], blanks))
+        .collect();
+    at.sort_unstable();
+    at.dedup_by_key(|a| a.0);
+    let mut out = String::with_capacity(text.len() + 32 * at.len());
+    let mut prev = 0;
+    for (n, &(pos, blanks)) in at.iter().enumerate() {
+        out.push_str(&text[prev..pos]);
+        if pos > 0 {
+            out.push('\n');
+        }
+        if blanks & 1 != 0 {
+            out.push('\n');
+        }
+        out.push_str(&marker(n));
+        out.push('\n');
+        if blanks & 2 != 0 {
+            out.push('\n');
+        }
+        prev = pos;
+    }
+    out.push_str(&text[prev..]);
+    (out, at.len())
+}
+
 /// `text` re-spaced: whitespace within lines changes width, single line breaks become
 /// spaces or line breaks with any indentation, blank lines stay blank lines. Whitespace
 /// next to a comment or in the header is kept, since it decides what the comment
@@ -269,6 +307,33 @@ proptest! {
             .map(|f| f.text);
         let direct = format(text, Language::Sparql, &b).map(|f| f.text);
         prop_assert_eq!(via_a, direct, "{}", name);
+    }
+
+    #[test]
+    fn pruning_keeps_comments_and_converges(
+        i in any::<Index>(),
+        unused in 0usize..4,
+        spots in prop::collection::vec((any::<usize>(), 0u8..4), 1..6),
+        seed in option_seed(),
+    ) {
+        let (name, text) = pick(&i);
+        // declarations nothing uses, and comments with or without blank lines around
+        let extra: String = (0..unused)
+            .map(|k| format!("PREFIX zz{k}: <http://example.org/unused/{k}#>\n"))
+            .collect();
+        let (injected, n) = inject_blocks(&format!("{extra}{text}"), &spots);
+        let mut opts = options_from(&seed, &injected);
+        opts.prune_prefixes = false;
+        // what the formatter cannot format without the key is not this test's
+        prop_assume!(fixpoint(&injected, &opts).is_ok());
+        opts.prune_prefixes = true;
+        let out = match fixpoint(&injected, &opts) {
+            Ok(out) => out,
+            Err(e) => return Err(TestCaseError::fail(format!("{name} under {opts:?}: {e}\n{injected}"))),
+        };
+        for c in 0..n {
+            prop_assert_eq!(out.matches(&marker(c)).count(), 1, "{}: {} lost\n{}", name, marker(c), out);
+        }
     }
 
     #[test]

@@ -36,9 +36,14 @@ pub struct ValidateArgs {
     /// Data files to validate (loaded into memory)
     #[arg(long, short = 'd', visible_alias = "datafile", num_args = 1.., value_name = "FILE")]
     pub data: Vec<PathBuf>,
-    /// Schema file: ShExC, or ShExJ (`.json`, `.shexj`, or a text starting with `{`)
+    /// Schema file: ShExC, ShExJ (`.json`, `.shexj`, or a text starting with `{`), or
+    /// ShExR (`.ttl`, `.nt`, `.rdf`, `.trig`, `.nq`)
     #[arg(long, short = 's', visible_alias = "shapes", value_name = "FILE")]
     pub schema: PathBuf,
+    /// The schema's syntax, when its file name does not say (ShExR: in the RDF syntax of
+    /// the file's extension, else Turtle)
+    #[arg(long, value_parser = ["shexc", "shexj", "shexr"], value_name = "FORMAT")]
+    pub schema_format: Option<String>,
     /// Shape map file: a `.json` file is a JSON shape map, anything else compact syntax
     #[arg(long, short = 'm', visible_alias = "shapesMap", value_name = "FILE")]
     pub map: Option<PathBuf>,
@@ -84,9 +89,14 @@ pub struct ParseArgs {
     /// `# FILE` header
     #[arg(required = true, value_name = "FILE")]
     pub files: Vec<PathBuf>,
-    /// Output: shexc (pretty-printed), shexj, text (a structural dump)
-    #[arg(long, default_value = "shexc", value_parser = ["shexc", "shexj", "text"])]
+    /// Output: shexc (pretty-printed), shexj, shexr (Turtle), text (a structural dump)
+    #[arg(long, default_value = "shexc", value_parser = ["shexc", "shexj", "shexr", "text"])]
     pub out: String,
+    /// Input syntax, when the file name does not say (stdin): shexc, shexj, or shexr
+    /// (in the RDF syntax of the file's extension, else Turtle); default: by extension,
+    /// else sniffed (ShExJ for a text starting with `{`, else ShExC)
+    #[arg(long = "in", value_parser = ["shexc", "shexj", "shexr"], value_name = "FORMAT")]
+    pub input: Option<String>,
     /// Base IRI for relative IRIs (default: the file's location)
     #[arg(long, value_name = "IRI")]
     pub base: Option<String>,
@@ -185,17 +195,37 @@ mod enabled {
     }
 
     fn syntax(what: &str, e: &ParseError) -> ! {
+        if e.line == 0 {
+            // a ShExR error is not at a place in the text
+            usage(format_args!("{what}: {}", e.message))
+        }
         usage(format_args!(
             "{what}: syntax error at line {}, column {}: {}",
             e.line, e.column, e.message
         ))
     }
 
-    /// The syntax of a schema file: ShExJ for `.json` and `.shexj`, else sniffed.
-    fn hint(path: &Path) -> Option<SchemaFormat> {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("json" | "shexj") => Some(SchemaFormat::ShExJ),
+    /// The syntax of a schema file: `given` (`shexc`, `shexj`, `shexr`), else ShExJ for
+    /// `.json` and `.shexj`, ShExR for the RDF extensions (`.ttl`, `.nt`, `.nq`,
+    /// `.trig`, `.rdf`, `.owl`, `.n3`), else sniffed. ShExR is read in the RDF syntax of
+    /// the file's extension, else as Turtle.
+    fn hint(path: &Path, given: Option<&str>) -> Option<SchemaFormat> {
+        use sparkles::io::RdfFormat;
+        let ext = path.extension().and_then(|e| e.to_str());
+        let rdf = match ext.map(str::to_ascii_lowercase).as_deref() {
+            Some("ttl" | "turtle") => Some(RdfFormat::Turtle),
+            Some("nt" | "ntriples") => Some(RdfFormat::NTriples),
+            Some("nq" | "nquads") => Some(RdfFormat::NQuads),
+            Some("trig") => Some(RdfFormat::TriG),
+            Some("rdf" | "owl" | "rdfxml") => Some(RdfFormat::RdfXml),
+            Some("n3") => Some(RdfFormat::N3),
             _ => None,
+        };
+        match given.and_then(SchemaFormat::from_name) {
+            Some(SchemaFormat::ShExR(turtle)) => Some(SchemaFormat::ShExR(rdf.unwrap_or(turtle))),
+            Some(f) => Some(f),
+            None if matches!(ext, Some("json" | "shexj")) => Some(SchemaFormat::ShExJ),
+            None => rdf.map(SchemaFormat::ShExR),
         }
     }
 
@@ -209,17 +239,18 @@ mod enabled {
         r.unwrap_or_else(|e| usage(format_args!("{}: {e}", path.display())))
     }
 
-    /// A schema file, its relative IRIs against its own location (or `base`).
-    fn read_schema(path: &Path, base: Option<&str>) -> Schema {
+    /// A schema file, its relative IRIs against its own location (or `base`), in the
+    /// syntax `given` or [`hint`]'s.
+    fn read_schema(path: &Path, base: Option<&str>, given: Option<&str>) -> Schema {
         let text = read_text(path);
         let url = (path != Path::new("-")).then(|| file_url(path));
-        sparkles_shex::parse_schema(&text, base.or(url.as_deref()), hint(path))
+        sparkles_shex::parse_schema(&text, base.or(url.as_deref()), hint(path, given))
             .unwrap_or_else(|e| syntax(&path.display().to_string(), &e))
     }
 
     pub(super) fn validate(a: ValidateArgs, opts: StoreOptions) -> Result<()> {
-        let schema = read_schema(&a.schema, None);
-        let externs = a.externs.as_deref().map(|x| read_schema(x, None));
+        let schema = read_schema(&a.schema, None, a.schema_format.as_deref());
+        let externs = a.externs.as_deref().map(|x| read_schema(x, None, None));
         // imports: relative IRIs against the schema's directory, any readable file, and
         // http(s) with the local commands' outbound defaults
         let policy = sparkles::outbound::OutboundPolicy {
@@ -318,7 +349,7 @@ mod enabled {
         let mut out = std::io::stdout().lock();
         let several = a.files.len() > 1;
         for f in &a.files {
-            let schema = read_schema(f, a.base.as_deref());
+            let schema = read_schema(f, a.base.as_deref(), a.input.as_deref());
             if several {
                 writeln!(out, "# {}", f.display())?;
             }
@@ -327,6 +358,7 @@ mod enabled {
                     serde_json::to_writer_pretty(&mut out, &schema.to_shexj())?;
                     writeln!(out)?;
                 }
+                "shexr" => out.write_all(schema.to_shexr_turtle().as_bytes())?,
                 "text" => writeln!(out, "{schema:#?}")?,
                 _ => {
                     let c = schema.to_shexc();
@@ -422,6 +454,14 @@ mod tests {
             assert_eq!(p.files.len(), 2);
             assert_eq!(p.out, "shexj");
         }
+        let ShexCmd::Parse(p) = parse(&["parse", "-", "--in", "shexr", "--out", "shexr"]).unwrap()
+        else {
+            panic!("not parse");
+        };
+        assert_eq!(
+            (p.input.as_deref(), p.out.as_str()),
+            (Some("shexr"), "shexr")
+        );
     }
 
     #[test]
@@ -458,5 +498,20 @@ mod tests {
         );
         assert!(parse(&["parse"]).is_err());
         assert!(parse(&["parse", "a.shex", "--out", "json"]).is_err());
+        assert!(parse(&["parse", "a.shex", "--in", "turtle"]).is_err());
+        assert!(
+            parse(&[
+                "validate",
+                "-s",
+                "s",
+                "-d",
+                "a",
+                "-n",
+                "x",
+                "--schema-format",
+                "ttl"
+            ])
+            .is_err()
+        );
     }
 }

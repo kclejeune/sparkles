@@ -1,0 +1,12 @@
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:s ex:int "42"^^xsd:integer , "-7"^^<http://www.w3.org/2001/XMLSchema#integer> , "007"^^xsd:integer ;
+  ex:dec "3.14"^^xsd:decimal , "1"^^xsd:decimal , "1."^^xsd:decimal ;
+  ex:dbl "1e10"^^xsd:double , "INF"^^xsd:double ;
+  ex:bool "true"^^xsd:boolean , "1"^^xsd:boolean , false ;
+  ex:str 'single' , 'it\'s' , 'say "hi"' , "x"^^xsd:string , '''long
+single''' , """long
+double""" ;
+  ex:lang "chat"@FR , "colour"@en-GB , "שלום"@he--rtl ;
+  ex:esc "tab\there" , "\u00e9" .

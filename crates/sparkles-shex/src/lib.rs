@@ -1,11 +1,12 @@
 //! ShEx 2.1 (Shape Expressions) validation for Sparkles (Apache Jena `jena-shex`
 //! equivalent).
 //!
-//! * **Schemas** in ShExC (`text/shex`) and ShExJ (`application/shex+json`), with
-//!   imports, EXTERNAL shapes, annotations and semantic actions (the Test extension
-//!   runs; other extensions are reported and skipped).
+//! * **Schemas** in ShExC (`text/shex`), ShExJ (`application/shex+json`) and ShExR (RDF
+//!   in the ShEx vocabulary), with imports, EXTERNAL shapes, annotations and semantic
+//!   actions (the Test extension runs; other extensions are reported and skipped).
 //! * **Shape maps** in the compact syntax (with Jena's `BASE`/`PREFIX`, commas and `a`)
-//!   and the JSON form; `{FOCUS p o}` selectors expand over the data graph.
+//!   and the JSON form; `{FOCUS p o}` and `SPARQL """SELECT …"""` selectors expand over
+//!   the data graph.
 //! * **Validation** computes the typing of the (node, shape) pairs the shape map reaches,
 //!   as the greatest fixed point per stratum of the schema: recursion and negation
 //!   without a call stack as deep as the data.

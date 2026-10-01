@@ -686,6 +686,9 @@ pub struct StoreOptions {
     /// Honour `queryRewrite` of a dataset's `geo.json`; `false` never rewrites
     /// topological properties (`serve --no-geo-rewrite`).
     pub geo_query_rewrite: bool,
+    /// Persistent stores write the spatial index's files (`gen-NNNN/geo/`) after each
+    /// build; `false` builds in memory only and writes nothing (read-only servers).
+    pub geo_files: bool,
 }
 
 /// Default of [`StoreOptions::max_prefixes`].
@@ -715,6 +718,7 @@ impl Default for StoreOptions {
             geo_budget_bytes: 4 << 30,
             geo_op_vertices: 2_000_000,
             geo_query_rewrite: true,
+            geo_files: true,
         }
     }
 }

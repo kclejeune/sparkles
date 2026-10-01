@@ -1361,6 +1361,8 @@ fn run() -> Result<()> {
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
             opts.geo_query_rewrite = !no_geo_rewrite;
+            // a read-only server writes no index files (it still reads good ones)
+            opts.geo_files = !read_only;
             if map_style_url.is_some() {
                 bail!("--map-style-url: not supported yet");
             }
