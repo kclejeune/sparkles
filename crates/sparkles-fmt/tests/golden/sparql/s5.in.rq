@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+# bump versions
+with <http://example.org/g> delete { ?d ex:version ?v } insert { ?d ex:version ?v2 ; ex:modified ?now }
+where { ?d ex:version ?v . bind(?v+1 as ?v2) bind(now() as ?now) } ;
+insert data { graph <http://example.org/log> { ex:run1 ex:note """bumped
+all""" } } ;

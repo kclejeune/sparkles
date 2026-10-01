@@ -3,7 +3,9 @@
 //! width 40), and `<name>.<variant>.out.<ext>` with the options of
 //! `<name>.<variant>.toml` (config file keys).
 //!
-//! `SPARKLES_FMT_BLESS=1` writes the outputs instead of comparing them.
+//! `SPARKLES_FMT_BLESS=1` writes the outputs instead of comparing them. Names listed in
+//! `tests/golden/pending.txt` (outputs written by hand ahead of the printers) are left
+//! out of the default run and never blessed; `-- --ignored` checks them.
 
 use sparkles_fmt::options::{self, Value};
 use sparkles_fmt::{Language, Options, format};
@@ -100,12 +102,39 @@ fn variants(dir: &Path, name: &str, ext: &str) -> Vec<String> {
     v
 }
 
-#[test]
-fn golden_files() {
+/// `tests/golden/pending.txt`: golden names (`<language>/<name>`, every variant) whose
+/// outputs were written by hand ahead of the printers, with the reason. The default run
+/// skips them; `cargo test -p sparkles-fmt --test golden -- --ignored` checks them.
+fn pending() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/pending.txt");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (name, reason) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+            assert!(
+                !reason.trim().is_empty(),
+                "golden/pending.txt: {name}: no reason"
+            );
+            name.to_string()
+        })
+        .collect()
+}
+
+/// Check the golden files `select` picks (by `<language>/<name>`): `(checks, failures,
+/// names that passed every check)`. `bless` writes the outputs instead of comparing.
+fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let mut failures = Vec::new();
+    let mut passed = Vec::new();
     let mut checked = 0;
-    let mut langs: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().collect();
+    let mut langs: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
     langs.sort_by_key(|e| e.file_name());
     for lang_dir in langs {
         let dir = lang_dir.path();
@@ -113,6 +142,10 @@ fn golden_files() {
         let lang = Language::from_name(&lang_name)
             .unwrap_or_else(|| panic!("tests/golden/{lang_name}: not a language"));
         for (input, name, ext) in inputs(&dir) {
+            if !select(&format!("{lang_name}/{name}")) {
+                continue;
+            }
+            let before = failures.len();
             let text = std::fs::read_to_string(&input).unwrap();
             for variant in variants(&dir, &name, &ext) {
                 checked += 1;
@@ -138,7 +171,7 @@ fn golden_files() {
                         continue;
                     }
                 };
-                if bless() {
+                if bless {
                     std::fs::write(&out_path, &out).unwrap();
                 } else {
                     let expected = std::fs::read_to_string(&out_path).unwrap_or_default();
@@ -160,15 +193,84 @@ fn golden_files() {
                     Err(e) => failures.push(format!("{label}: formatting the output: {e}")),
                 }
             }
+            if failures.len() == before {
+                passed.push(format!("{lang_name}/{name}"));
+            }
         }
     }
-    assert!(checked > 0, "no golden files under {}", root.display());
+    (checked, failures, passed)
+}
+
+#[test]
+fn golden_files() {
+    let pending = pending();
+    let (checked, failures, _) = run_golden(&|name| !pending.iter().any(|p| p == name), bless());
+    assert!(checked > 0, "no golden files");
     assert!(
         failures.is_empty(),
         "{} of {checked} golden checks failed (SPARKLES_FMT_BLESS=1 rewrites the outputs):\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+/// The pending golden files, never blessed: their outputs are the specification.
+#[test]
+#[ignore = "golden outputs written ahead of the printers (tests/golden/pending.txt)"]
+fn pending_golden_files() {
+    let pending = pending();
+    let (checked, failures, passed) = run_golden(&|name| pending.iter().any(|p| p == name), false);
+    eprintln!(
+        "pending golden files: {} names, {checked} checks, {} failures",
+        pending.len(),
+        failures.len()
+    );
+    if !passed.is_empty() {
+        eprintln!(
+            "passing now (remove from tests/golden/pending.txt): {}",
+            passed.join(", ")
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} pending golden checks failed:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// Every expected SPARQL output, pending ones included, parses to the algebra of its
+/// input and keeps its comments: the hand-written outputs pass the formatter's own
+/// safety checks before any printer produces them.
+#[test]
+fn sparql_outputs_mean_what_their_inputs_mean() {
+    use sparkles_fmt::check::{comments, sparql_equivalent, sparql_reference};
+    use sparkles_fmt::lex::{LexMode, lex};
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/sparql");
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for (input, name, ext) in inputs(&dir) {
+        let text = std::fs::read_to_string(&input).unwrap();
+        let r = sparql_reference(&text, &lex(&text, LexMode::Sparql))
+            .unwrap_or_else(|e| panic!("sparql/{name}: the input: {e}"));
+        for variant in variants(&dir, &name, &ext) {
+            let out_path = match variant.as_str() {
+                "" => dir.join(format!("{name}.out.{ext}")),
+                v => dir.join(format!("{name}.{v}.out.{ext}")),
+            };
+            let Ok(out) = std::fs::read_to_string(&out_path) else {
+                continue;
+            };
+            checked += 1;
+            if let Err(e) = sparql_equivalent(&r, &out)
+                .and_then(|()| comments::same(&text, &out, LexMode::Sparql))
+            {
+                failures.push(format!("{}: {e}", out_path.display()));
+            }
+        }
+    }
+    assert!(checked > 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
