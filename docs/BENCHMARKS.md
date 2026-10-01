@@ -409,6 +409,20 @@ these sizes). Under load (`oha`, 16 connections, two alternating rounds each):
 
 No measurable overhead.
 
+### Spatial index: commit cost
+
+Commit latency with the spatial index enabled against the same store without it, on a quiet
+machine (2026-10-01, release build at `02e3a78`, `commit_latency` in
+`crates/sparkles/src/store/geo.rs`; medians of 200 one-triple commits and 20 commits of
+1,000 `geo:asWKT` points each, three runs):
+
+| | Index off | Index on |
+|---|---:|---:|
+| 1-triple non-geometry commit | 0.012–0.016 ms | 0.015–0.017 ms |
+| 1,000-point commit | 3.19–3.50 ms | 3.11–3.16 ms |
+
+The index adds no measurable time to a commit: the differences are within run-to-run noise.
+
 ### GeoSPARQL Compliance Benchmark
 
 The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021: 206 queries over
