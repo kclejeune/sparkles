@@ -14,7 +14,7 @@ Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLe
 | jena-db + jena-tdb2 | 25K + 19K | DBOE: CoW MVCC B+trees, journal, node table (MD5 → NodeId), inline NodeIds, 3 triple + 6 quad indexes, loaders, compaction | `sparkles::store` (QLever-style instead of B+trees) |
 | jena-fuseki2 | ~36K | SPARQL server: query/update/GSP/upload/patch/shacl, `/$/` admin (datasets, stats, compact, backup, tasks, metrics) | `sparkles-server` |
 | jena-ontapi | 35K | OWL2 object API (profiles DL/EL/QL/RL, no DL reasoner) | out of scope (see §5) |
-| jena-shacl / jena-shex | 23K / 18K | SHACL Core + SPARQL; ShEx 2 | `sparkles-shacl`: SHACL Core + SHACL-SPARQL (W3C 98/98 + 20/20) |
+| jena-shacl / jena-shex | 23K / 18K | SHACL Core + SPARQL; ShEx 2 | `sparkles-shacl`: SHACL Core + SHACL-SPARQL (W3C 98/98 + 20/20); `sparkles-shex`: ShEx 2.1 (ShExC, ShExJ, shape maps; shexTest validation 99.9%) |
 | jena-text | 7.5K | Lucene text index | `text:query` subset over string literals (Tantivy, BM25; not jena-text's Lucene format or assembler) |
 | jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS: `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML/KML/WKT/GeoJSON literals, EPSG CRSs | `sparkles::geo` (`geo` cargo feature) on the `geo`, `wkt`, `geojson`, `geo-index` and `geographiclib-rs` crates: the `geof:` functions over WKT and GeoJSON in built-in CRSs, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions; Jena's behaviour where GeoSPARQL leaves room, with the divergences listed in the README. Not yet: `spatialF:`, query rewrite, GML/KML, other CRSs (§5) |
 | jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | patch logs, client APIs, builders, CLI | CLI → `sparkles` binary; others n/a in Rust |
@@ -126,7 +126,7 @@ sparkles (library)
 
 JavaScript scripting functions, RDF Thrift/Protobuf, TriX, jena-ontapi's object mapping API,
 jena-text's Lucene index format and assembler configuration (Sparkles implements
-`text:query` itself), ShEx, RDF Patch, backward-chaining (LP) rules, Shiro auth
+`text:query` itself), RDF Patch, backward-chaining (LP) rules, Shiro auth
 (Sparkles has its own authentication). These are documented extension points rather than
 hidden gaps.
 

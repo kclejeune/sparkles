@@ -147,18 +147,20 @@ fn extensions_are_tried() {
         ("b", &format!("{P}:B {{ }}")),
         ("b.shex", &format!("{P}:Wrong {{ }}")),
         ("c.shex", &format!("{P}:C {{ }}")),
-        ("j.json", "{ \"type\": \"Schema\" }"),
-    ]);
-    // the exact name first, then .shex, then .json (ShExJ, sniffed)
-    let s = close(&d.schema("a.shex"), &FileResolver::default());
-    match s {
-        Ok(s) => assert_eq!(
-            labels(&s),
-            ["http://ex.org/A", "http://ex.org/B", "http://ex.org/C"]
+        (
+            "j.json",
+            r#"{"type": "Schema", "shapes": [{"id": "J", "type": "Shape"}]}"#,
         ),
-        // until the ShExJ reader is in place, j.json is found and fails to read
-        Err(e) => assert!(e.message.contains("/j.json>"), "{e}"),
-    }
+    ]);
+    // the exact name first, then .shex, then .json (ShExJ, sniffed; its relative IRIs
+    // resolve against its own location)
+    let s = close(&d.schema("a.shex"), &FileResolver::default()).unwrap();
+    let l = labels(&s);
+    assert_eq!(
+        l[..3],
+        ["http://ex.org/A", "http://ex.org/B", "http://ex.org/C"]
+    );
+    assert_eq!(l[3], file_url(&d.path("J")));
     let mut no_json = d.schema("a.shex");
     no_json.imports.pop();
     let s = close(&no_json, &FileResolver::default()).unwrap();

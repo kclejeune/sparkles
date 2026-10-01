@@ -38,6 +38,7 @@ interactive querying.
 | `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db, jena-querybuilder, jena-rdfconnection (in-process) |
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core + SHACL-SPARQL validation over store snapshots | jena-shacl |
+| `crates/sparkles-shex` | ShEx 2.1 validation (ShExC, ShExJ, shape maps) over store snapshots | jena-shex |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
 | `crates/sparkles-backup` | backup repositories (file system or S3): incremental, deduplicated backups, restore, lifecycle policies | Fuseki `/$/backup` (N-Quads dumps only) |
 | `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
@@ -90,7 +91,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `repo`, `stats`, `infer`, `shacl`, `schema`, `clone`, `check`), operating on the database directory directly | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `repo`, `stats`, `infer`, `shacl`, `shex`, `schema`, `clone`, `check`), operating on the database directory directly | ✅ |
 | Backup repositories (`sparkles-backup`; `backup` cargo feature, on by default): online backups of persistent datasets to a file system or S3 (AWS, MinIO, R2, Ceph RGW) that hold the writer lock only for a few system calls; incremental and deduplicated (content-addressed 32 MiB pieces, only the appended bytes of the WAL and catalog), manifest written last; restore to a new dataset or in place (requests get `503` + `Retry-After` during the swap, never `404`) with dataset-id rules (`auto` / `new` / `keep`) and an integrity check before publishing; verification (`exists`, `data`, `restore`); lifecycle policies (cron or `every` schedules in an IANA time zone, catch-up, retention, optional GC); two-phase GC with a grace period; lease locks judged by the storage server's clock, so several servers and the CLI share a repository; repositories from a config file or registered through the API within operator limits (named credential sources, the outbound policy, `fs` roots); `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`, `sparkles backup create\|list\|show\|restore\|verify\|delete\|policy`, a Backups page in the UI, `sparkles_backup_*` metrics and audit events; see [docs/API.md](docs/API.md#backup-repositories). Not yet: in-memory datasets, encryption, server-wide backups, running policies offline | ✅ |
 | Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`): same quads and blank-node ids, new dataset id with `forkedFrom`, inferences copied or dropped | ✅ |
 | Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
@@ -100,6 +101,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SHACL Core + SHACL-SPARQL validation (`sparkles-shacl`): W3C suite **98/98** Core, **20/20** SPARQL; parallel, index-backed | ✅ |
 | Write-time SHACL validation: every commit's post-state is validated before anything is written (`reject` refuses with `422`, `warn` commits and reports), shapes from dataset graphs or a file, relevance skip, fail-closed without a guard (`/$/validation/{ds}`, `sparkles validation`, `--no-validate`); `sparkles_validation_*` metrics, `validation` / `validation_ms` access-log fields, the status in CLI summaries and `sparkles stats`; full validation per write (incremental validation is planned) | ✅ |
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
+| ShEx 2.1 validation (`sparkles-shex`; `shex` cargo feature, on by default): ShExC and ShExJ schemas with imports (inline, `--load-dir` files, http(s) through the outbound policy), `EXTERNAL` shapes, annotations and the Test semantic-action extension; compact and JSON shape maps with `{FOCUS p o}` selectors; recursion and negation by stratified greatest-fixed-point typing without deep stacks; parallel, index-backed; shexTest: 100% of the syntax, negative-syntax and negative-structure tests, **99.9%** of the validation tests from ShExC and from ShExJ (the 42 that test blank-node labels are skipped: the store does not keep them). `POST /{ds}/shex` (a Sparkles extension) with JSON, ShapeMap JSON, compact and text reports, and `sparkles shex validate\|parse` (Jena's flag names as aliases); see [docs/API.md](docs/API.md#shex-validation). Not yet: ShExR schemas, ShEx 2.2, SPARQL selectors, write-time ShEx validation, a UI | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
 | MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits, full-text and vector similarity search; `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
@@ -164,7 +166,7 @@ feature gaps are:
 |---|---|---|
 | Full-text search | jena-text (Lucene), `text:query` | `text:query` subset over string literals (Tantivy, BM25), updated in the commit path; no highlighting, per-language stemming or entity-style multi-field documents yet |
 | Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions with a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | the GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs, and a spatial index per dataset; `spatial:` property functions are being added; no `spatialF:` functions, query rewrite, geometry-type entailment, GML/KML literals or EPSG database yet (see `docs/AUDIT.md` §5) |
-| Shape languages | ShEx (jena-shex) | ✗ SHACL only |
+| Shape languages | ShEx (jena-shex) | SHACL and ShEx 2.1 (ShExC, ShExJ); no ShExR (RDF) schemas, ShEx 2.2 or ShEx write-time validation |
 | Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
 | SPARQL extensions | property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, full `afn:`/`fn:` library | ✗ none of the extensions; common `fn:`/`afn:`/`math:` functions only |
@@ -373,7 +375,7 @@ result cache, and the web UI.
 | GeoSPARQL relations follow DE-9IM: an empty geometry is disjoint from everything (`sfDisjoint` true, every other relation false), equal points are `sfEquals`, `sfCrosses` of two curves is `0********`, RCC8 relations hold between regions only | Jena returns false for every relation on an empty geometry and compares `sfEquals` with the tables' `TFFFTFFFT` pattern, under which two equal points are not equal. |
 | `geof:getSRID` returns an `xsd:anyURI`; `geof:dimension` of an empty geometry is its type's dimension (`-1` for an empty collection) | The GeoSPARQL 1.1 signature (Jena returns `xsd:string`); never a type error. |
 | The spatial index is opt-in per dataset (`geo.json`); the `geof:` functions work without it, and every answer from the index is refined with the exact test, so answers are the same with or without it | Jena's index is built for the whole dataset at start-up and its `spatial:withinBox`/`intersectBox` return envelope hits for an unbound subject. |
-| Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
+| Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Using the library (no server)
 
@@ -429,6 +431,7 @@ ds.dump(std::io::stdout(), RdfFormat::TriG)?;
 | `QueryExec.substitution` / `setVar` | `QueryOptions::initial_bindings` / builder `set_var` |
 | reasoners (`InfModel`) | `sparkles_reasoner::materialize` (crate `sparkles-reasoner`) |
 | `ShaclValidator` | `sparkles_shacl::validate` (crate `sparkles-shacl`) |
+| `ShexValidator` | `sparkles_shex::validate` (crate `sparkles-shex`) |
 
 Lower-level access (ids, snapshots, raw index scans, the bulk `Builder`) is available
 through `Dataset::store()` and the `store` / `index` / `builder` modules.
@@ -1014,6 +1017,7 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
+mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 ```
 
@@ -1022,3 +1026,6 @@ checkout (`../../apache/jena` next to this repository, or `SPARKLES_W3C_DIR`); t
 suites come from the same checkout (or `SPARKLES_SHACL_TESTS`). Without the checkout the
 suites are skipped. All of them pass (482/482, 328/328, 157/157, 269/269; SHACL 98/98 and
 20/20); `crates/sparkles/tests/w3c-known-failures.txt` lists known failures and is empty.
+The shexTest suite comes from the same checkout too (`jena-shex`, or `SPARKLES_SHEX_TESTS`
+for an upstream shexTest checkout); `crates/sparkles-shex/tests/known-failures.txt` lists
+what fails, with reasons.
