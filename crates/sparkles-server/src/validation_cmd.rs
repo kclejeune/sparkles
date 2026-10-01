@@ -17,7 +17,7 @@ pub struct ValidationArgs {
     /// reject or warn
     #[arg(long, value_parser = ["reject", "warn"])]
     pub mode: Option<String>,
-    /// the shape language: shacl (the default) or shex
+    /// the shape language: shacl, or shex (the default with --schema or --shape-map)
     #[arg(long, value_parser = ["shacl", "shex"])]
     pub lang: Option<String>,
     /// shapes graph of the dataset (repeatable; SHACL)
@@ -57,16 +57,20 @@ pub struct ValidationArgs {
     pub format: String,
 }
 
-/// The language a `--mode` asks for, and the flags of the other language it may not use.
+/// The language a `--mode` asks for (`--lang`, or ShEx when `--schema` or `--shape-map`
+/// is given), and the flags of the other language it may not use.
 fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
+    let shex_flags = a.schema.is_some() || a.shape_map.is_some();
     let lang = match a.lang.as_deref() {
         Some("shex") => GuardLanguage::Shex,
-        _ => GuardLanguage::Shacl,
+        Some(_) => GuardLanguage::Shacl,
+        None if shex_flags => GuardLanguage::Shex,
+        None => GuardLanguage::Shacl,
     };
     match lang {
         GuardLanguage::Shacl => {
-            if a.schema.is_some() || a.shape_map.is_some() {
-                bail!("--schema and --shape-map are for --lang shex (SHACL takes --shapes)");
+            if shex_flags {
+                bail!("--schema and --shape-map are for ShEx (SHACL takes --shapes)");
             }
         }
         GuardLanguage::Shex => {
@@ -108,10 +112,15 @@ pub fn run(a: ValidationArgs, opts: StoreOptions) -> Result<()> {
         GuardLanguage::Shacl => set_shacl(&store, &a, mode)?,
         GuardLanguage::Shex => set_shex(&store, &a, mode)?,
     };
+    // ShEx counts associations, every nonconformant one blocking
+    let (total, blocking) = match summary.as_ref().unwrap_or_else(|s| s) {
+        s if s.language == GuardLanguage::Shex => ("associations", "nonconformant"),
+        _ => ("results", "blocking"),
+    };
     match summary {
         Ok(s) => {
             println!(
-                "validation on: {} results ({} blocking) in {} ms",
+                "validation on: {} {total} ({} {blocking}) in {} ms",
                 s.total, s.blocking, s.millis
             );
             Ok(())
@@ -119,7 +128,7 @@ pub fn run(a: ValidationArgs, opts: StoreOptions) -> Result<()> {
         Err(s) => {
             println!("{}", serde_json::to_string_pretty(&s)?);
             eprintln!(
-                "the data does not conform ({} blocking results); fix it or use --mode warn first",
+                "the data does not conform ({} {blocking} {total}); fix it or use --mode warn first",
                 s.blocking
             );
             std::process::exit(1);
@@ -153,6 +162,9 @@ fn status(store: &Store, format: &str) -> Result<()> {
         "shapes     {} shapes",
         j["status"]["shapeCount"].as_u64().unwrap_or(0)
     );
+    if let Some(n) = j["status"]["associations"].as_u64() {
+        println!("map        {n} associations");
+    }
     for w in j["status"]["warnings"].as_array().into_iter().flatten() {
         println!("warning    {}", w.as_str().unwrap_or_default());
     }
@@ -199,8 +211,8 @@ fn set_shacl(
         None => bail!("give --shapes FILE or --shapes-graph IRI"),
     };
     let cfg = ValidationConfig {
-        format: 1,
-        language: None,
+        format: 2,
+        language: Some(GuardLanguage::Shacl),
         mode,
         shapes,
         data_graph: data_graph(&a.data_graph),
@@ -321,8 +333,29 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(language(&a).unwrap(), GuardLanguage::Shex);
-        // the other language's flags are refused
+        // --schema and --shape-map imply ShEx
         let a = parse(&["--loc", "db", "--mode", "reject", "--schema", "s.shex"]).unwrap();
+        assert_eq!(language(&a).unwrap(), GuardLanguage::Shex);
+        let a = parse(&[
+            "--loc",
+            "db",
+            "--mode",
+            "reject",
+            "--shape-map",
+            "<urn:a>@START",
+        ])
+        .unwrap();
+        assert_eq!(language(&a).unwrap(), GuardLanguage::Shex);
+        // the other language's flags are refused
+        let a = parse(&[
+            "--loc", "db", "--lang", "shacl", "--mode", "reject", "--schema", "s.shex",
+        ])
+        .unwrap();
+        assert!(language(&a).is_err());
+        let a = parse(&[
+            "--loc", "db", "--mode", "reject", "--schema", "s.shex", "--shapes", "s.ttl",
+        ])
+        .unwrap();
         assert!(language(&a).is_err());
         let a = parse(&[
             "--loc",
