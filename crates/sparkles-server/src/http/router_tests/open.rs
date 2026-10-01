@@ -309,7 +309,8 @@ async fn map_style_url_origin_in_the_page_policy() {
             csp.contains("img-src 'self' data: blob: https://tiles.example.com;"),
             "{csp}"
         );
-        assert!(!csp.contains("unsafe-eval"), "{csp}");
+        // WebAssembly for the formatter, but never JavaScript's eval
+        assert!(!csp.contains("'unsafe-eval'"), "{csp}");
     }
     // the maps' worker runs under its own script's policy: it fetches from the UI and the
     // style's origin

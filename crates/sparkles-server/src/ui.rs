@@ -282,7 +282,10 @@ mod tests {
             "{csp}"
         );
         // scripts and workers stay the UI's own
-        assert!(csp.contains("script-src 'self';"), "{csp}");
+        assert!(
+            csp.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "{csp}"
+        );
         assert!(csp.contains("worker-src 'self' blob:;"), "{csp}");
         let worker = worker_csp(Some(&o));
         assert!(
