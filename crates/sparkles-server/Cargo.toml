@@ -81,6 +81,9 @@ tower = { version = "0.5", features = ["util"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "testing"] }
 # signs the ID tokens of the mock OIDC provider in tests (already in the tree via rustls)
 aws-lc-rs = "1"
+# the formatter's test-only fault switch (`SPARKLES_FMT_FAULT`), so the tests can show that
+# `sparkles fmt` and `POST /$/format` refuse output that fails the safety checks
+sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 
 [features]
 default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth", "mcp", "backup", "fmt"]
