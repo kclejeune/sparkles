@@ -1,8 +1,8 @@
 //! `sparkles lsp` as a child process, driven over stdin/stdout with framed JSON-RPC the
 //! way an editor drives it: the handshake, diagnostics on open and change, formatting
-//! and range formatting as one minimal edit, positions in UTF-16 or UTF-8 across
-//! characters outside the BMP and `\r\n` line breaks, config discovery, and the exit
-//! status of `shutdown`/`exit`.
+//! and range formatting as one minimal edit, the formatter's warnings as diagnostics,
+//! positions in UTF-16 or UTF-8 across characters outside the BMP and `\r\n` line
+//! breaks, config discovery, and the exit status of `shutdown`/`exit`.
 
 #![cfg(feature = "fmt")]
 
@@ -288,7 +288,8 @@ fn session_with_utf16_positions_crlf_and_a_config_file() {
     let diags = p["diagnostics"].as_array().unwrap();
     assert_eq!(diags.len(), 1, "{p}");
     assert_eq!(diags[0]["severity"], 1);
-    assert_eq!(diags[0]["source"], "sparkles");
+    assert_eq!(diags[0]["source"], "sparkles fmt");
+    assert_eq!(diags[0]["code"], "syntax");
     assert!(
         diags[0]["message"]
             .as_str()
@@ -513,6 +514,141 @@ fn every_language_the_library_formats() {
     assert_eq!(c.shutdown(), Some(0));
 }
 
+/// The formatter's warnings, as (code, severity, start) of each diagnostic.
+fn warnings(p: &Value) -> Vec<(String, u64, Value)> {
+    p["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            assert_eq!(d["source"], "sparkles fmt", "{d}");
+            (
+                d["code"].as_str().unwrap().to_string(),
+                d["severity"].as_u64().unwrap(),
+                d["range"]["start"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn formatter_warnings_are_diagnostics() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = Client::start(d.path(), &[]);
+    c.initialize(&["utf-16"]);
+    // an undeclared prefix (information) and a comment the formatter moves (warning),
+    // both after characters outside the BMP
+    let uri_q = uri(&d.path().join("q.rq"));
+    let q = "PREFIX ex: <http://example.org/>\nSELECT * { ?s ex:p \"𝄞\" . ?s dc:x \"😀\"^^ # moved\n ex:t }\n";
+    c.open(&uri_q, "sparql", q);
+    let p = c.diagnostics(&uri_q);
+    let (dc, comment) = (q.find("dc:x").unwrap(), q.find("# moved").unwrap());
+    assert_eq!(
+        warnings(&p),
+        [
+            (
+                "undeclared-prefix".into(),
+                3,
+                json!({"line": 1, "character": 29})
+            ),
+            (
+                "comment-moved".into(),
+                2,
+                json!({"line": 1, "character": 41})
+            ),
+        ],
+        "{p}"
+    );
+    assert_eq!(
+        p["diagnostics"][0]["range"]["start"],
+        position_of(q, dc, true)
+    );
+    assert_eq!(
+        p["diagnostics"][1]["range"]["start"],
+        position_of(q, comment, true)
+    );
+    assert!(
+        p["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the prefix dc: is not declared"),
+        "{p}"
+    );
+    // formatting still works, with the warnings
+    let r = c.format(&uri_q);
+    assert_eq!(r["result"].as_array().unwrap().len(), 1, "{r}");
+    // fixed: declared, and the comment where it stays
+    let fixed = "PREFIX dc: <http://purl.org/dc/terms/>\nPREFIX ex: <http://example.org/>\nSELECT * { ?s ex:p \"𝄞\" . ?s dc:x \"😀\"^^ex:t } # stays\n";
+    c.change(&uri_q, 2, fixed);
+    assert_eq!(
+        c.diagnostics(&uri_q),
+        json!({"uri": uri_q, "version": 2, "diagnostics": []})
+    );
+    // back again, then closed: cleared
+    c.change(&uri_q, 3, q);
+    assert_eq!(warnings(&c.diagnostics(&uri_q)).len(), 2);
+    c.notify(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri_q}}),
+    );
+    assert_eq!(c.diagnostics(&uri_q)["diagnostics"], json!([]));
+
+    // Turtle: a moved comment after an emoji
+    let uri_t = uri(&d.path().join("g.ttl"));
+    let t = "PREFIX ex: <http://example.org/>\nex:a ex:b \"😀\"^^ # moved\n ex:t .\n";
+    c.open(&uri_t, "turtle", t);
+    let p = c.diagnostics(&uri_t);
+    assert_eq!(
+        warnings(&p),
+        [(
+            "comment-moved".into(),
+            2,
+            json!({"line": 1, "character": 17})
+        )],
+        "{p}"
+    );
+    assert_eq!(
+        p["diagnostics"][0]["range"]["start"],
+        position_of(t, t.find('#').unwrap(), true)
+    );
+    c.change(
+        &uri_t,
+        2,
+        "PREFIX ex: <http://example.org/>\nex:a ex:b \"😀\"^^ex:t . # stays\n",
+    );
+    assert_eq!(c.diagnostics(&uri_t)["diagnostics"], json!([]));
+
+    // a warning without a position (a key this build does not act on yet) goes at 0:0
+    let sub = d.path().join("conventional");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(
+        sub.join(".sparklesfmt.toml"),
+        "turtle-layout = \"conventional\"\n",
+    )
+    .unwrap();
+    let uri_c = uri(&sub.join("c.ttl"));
+    c.open(
+        &uri_c,
+        "turtle",
+        "PREFIX ex: <http://example.org/>\nex:a ex:b ex:c .\n",
+    );
+    let p = c.diagnostics(&uri_c);
+    if sparkles_fmt::turtle::print::CONVENTIONAL_IMPLEMENTED {
+        assert_eq!(p["diagnostics"], json!([]), "{p}");
+    } else {
+        assert_eq!(
+            warnings(&p),
+            [(
+                "option-not-implemented".into(),
+                3,
+                json!({"line": 0, "character": 0})
+            )],
+            "{p}"
+        );
+    }
+    assert_eq!(c.shutdown(), Some(0));
+}
+
 #[test]
 fn a_refused_output_is_a_warning_and_an_error() {
     let d = tempfile::tempdir().unwrap();
@@ -523,6 +659,7 @@ fn a_refused_output_is_a_warning_and_an_error() {
     let p = c.diagnostics(&uri);
     let diag = &p["diagnostics"][0];
     assert_eq!(diag["severity"], 2, "{p}");
+    assert_eq!(diag["code"], "unsafe-format", "{p}");
     assert_eq!(
         diag["message"],
         "formatter refused its own output (algebra differs); input left unchanged; please report"
