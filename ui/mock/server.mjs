@@ -18,7 +18,7 @@ const PORT = Number(process.env.PORT ?? 3030);
 const LATENCY = Number(process.env.MOCK_LATENCY ?? 0);
 const VERSION = '0.1.0-mock';
 const startedAt = new Date();
-const INFERRED = ox.namedNode('urn:sparkles:inferred');
+const INFERRED = ox.namedNode('urn:x-sparkles:inferred');
 
 /** @type {Map<string, any>} */
 const datasets = new Map();
@@ -1310,14 +1310,14 @@ function startTask(kind, ds, work, durationMs = 2500) {
 
 const RDFS_RULES = [
   // rdfs9 — subclass membership (transitive via property path)
-  `INSERT { GRAPH <urn:sparkles:inferred> { ?x a ?super } } WHERE { ?x a ?c . ?c <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super . FILTER NOT EXISTS { ?x a ?super } }`,
+  `INSERT { GRAPH <urn:x-sparkles:inferred> { ?x a ?super } } WHERE { ?x a ?c . ?c <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super . FILTER NOT EXISTS { ?x a ?super } }`,
   // rdfs2 / rdfs3 — domain and range
-  `INSERT { GRAPH <urn:sparkles:inferred> { ?x a ?c } } WHERE { ?p <http://www.w3.org/2000/01/rdf-schema#domain> ?c . ?x ?p ?y . FILTER NOT EXISTS { ?x a ?c } }`,
-  `INSERT { GRAPH <urn:sparkles:inferred> { ?y a ?c } } WHERE { ?p <http://www.w3.org/2000/01/rdf-schema#range> ?c . ?x ?p ?y . FILTER(isIRI(?y)) FILTER NOT EXISTS { ?y a ?c } }`,
+  `INSERT { GRAPH <urn:x-sparkles:inferred> { ?x a ?c } } WHERE { ?p <http://www.w3.org/2000/01/rdf-schema#domain> ?c . ?x ?p ?y . FILTER NOT EXISTS { ?x a ?c } }`,
+  `INSERT { GRAPH <urn:x-sparkles:inferred> { ?y a ?c } } WHERE { ?p <http://www.w3.org/2000/01/rdf-schema#range> ?c . ?x ?p ?y . FILTER(isIRI(?y)) FILTER NOT EXISTS { ?y a ?c } }`,
 ];
 const OWL_RULES = [
-  `INSERT { GRAPH <urn:sparkles:inferred> { ?y ?p ?x } } WHERE { ?p a <http://www.w3.org/2002/07/owl#SymmetricProperty> . ?x ?p ?y . FILTER NOT EXISTS { ?y ?p ?x } }`,
-  `INSERT { GRAPH <urn:sparkles:inferred> { ?y ?q ?x } } WHERE { ?p <http://www.w3.org/2002/07/owl#inverseOf> ?q . ?x ?p ?y . FILTER NOT EXISTS { ?y ?q ?x } }`,
+  `INSERT { GRAPH <urn:x-sparkles:inferred> { ?y ?p ?x } } WHERE { ?p a <http://www.w3.org/2002/07/owl#SymmetricProperty> . ?x ?p ?y . FILTER NOT EXISTS { ?y ?p ?x } }`,
+  `INSERT { GRAPH <urn:x-sparkles:inferred> { ?y ?q ?x } } WHERE { ?p <http://www.w3.org/2002/07/owl#inverseOf> ?q . ?x ?p ?y . FILTER NOT EXISTS { ?y ?q ?x } }`,
 ];
 
 function inferredCount(ds) {
@@ -1943,7 +1943,7 @@ const server = http.createServer(async (req, res) => {
             );
           if (req.method === 'DELETE') {
             const before = quadSet(ds);
-            ds.store.update('DROP SILENT GRAPH <urn:sparkles:inferred>');
+            ds.store.update('DROP SILENT GRAPH <urn:x-sparkles:inferred>');
             ds.reasoning = null;
             commitWrite(ds, 'reason-clear', before);
             return send(res, 200, { ok: true });
