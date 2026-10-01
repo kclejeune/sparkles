@@ -331,7 +331,6 @@ pub fn term_token(cx: &mut Ctx<'_, '_>, t: TokenId) -> DocId {
 mod tests {
     use super::*;
     use crate::Options;
-    use crate::doc::DocArena;
     use crate::sparql::parse::expr;
     use crate::trivia::Comments;
 
@@ -340,12 +339,7 @@ mod tests {
     fn filter_with(src: &str, opts: &Options) -> String {
         let tree = expr::parse_with(src, expr::constraint);
         let comments = Comments::attach(&tree, &super::super::RULES);
-        let mut cx = Ctx {
-            tree: &tree,
-            arena: DocArena::new(&tree.tokens),
-            opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&tree, &comments, opts);
         let c = tree.child_nodes(tree.root()).next().unwrap();
         let doc = node(&mut cx, c);
         let nl = cx.arena.hard_line();
