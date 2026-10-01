@@ -10,8 +10,9 @@
 //!   so formatting under one value and then the other equals formatting under the second
 //!   directly.
 //!
-//! Turtle is not switched on in `format()` yet, so the documents go through the pipeline
-//! directly (`check::run`). `PROPTEST_CASES` sets the number of cases (default 64).
+//! The documents go through the pipeline with the language set (`check::run` with
+//! [`Turtle`]), as `format()` does for `.ttl` and `.trig` files. `PROPTEST_CASES` sets
+//! the number of cases (default 64).
 
 mod corpus;
 

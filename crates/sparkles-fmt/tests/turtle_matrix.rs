@@ -10,8 +10,8 @@
 //!   file under the whole matrix (slow). The suites under the defaults and with every key
 //!   flipped are `w3c_turtle.rs`.
 //!
-//! Turtle is not switched on in `format()` yet, so the documents go through the pipeline
-//! directly (`check::run`).
+//! The documents go through the pipeline with the language set (`check::run` with
+//! [`Turtle`]), as `format()` does for `.ttl` and `.trig` files.
 
 mod corpus;
 

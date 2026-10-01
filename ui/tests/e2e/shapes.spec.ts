@@ -1,5 +1,5 @@
 // The SHACL panel of the dataset page: the shapes graph is a code editor whose text
-// Validate sends, and which has a Format button.
+// Validate sends, and which formats as Turtle through the server.
 
 import { expect, test } from './fixtures';
 import { DATASET, EX } from './data';
@@ -42,4 +42,39 @@ test('the shapes editor feeds Validate and offers Format', async ({ page }) => {
   await panel.getByRole('button', { name: 'Validate', exact: true }).click();
   await expect(panel.locator('.panel-head .badge')).toHaveText(/Does not conform/);
   await expect(panel.getByText(/^4 results/)).toBeVisible();
+});
+
+/** The editor's text, line by line (an empty line holds only a `<br>`). */
+const textOf = async (page: Page) =>
+  (await shapes(page).locator('.cm-line').allInnerTexts())
+    .map((l) => l.replace(/\n$/, ''))
+    .join('\n');
+
+test('Format formats the shapes as Turtle, one undo restores them, a syntax error is shown', async ({
+  page,
+}) => {
+  await page.goto(`/ui/datasets/${DATASET}`);
+  const original = SHAPES('ex:age');
+  await setText(page, original);
+  await page.keyboard.press('Shift+Alt+F');
+  await expect.poll(() => textOf(page)).toBe(`PREFIX ex: <${EX}>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+
+ex:PersonShape
+  a sh:NodeShape ;
+  sh:targetClass ex:Person ;
+  sh:property [
+    sh:path ex:age ;
+    sh:minCount 1 ;
+  ] ;
+.
+`);
+  await page.keyboard.press('ControlOrMeta+z');
+  await expect.poll(() => textOf(page)).toBe(original);
+
+  await setText(page, `@prefix ex: <${EX}> .\nex:s ex:p ex:o ;\n  ex:q ] .\n`);
+  await page.keyboard.press('Shift+Alt+F');
+  await expect(page.getByText(/^Can't format: syntax error at line \d/)).toBeVisible();
+  await expect(page.locator('.cm-error-line')).toHaveCount(1);
 });
