@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/>
+# inside the declaration: moved before it
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT ?name
+WHERE {
+  ?p foaf:name ?name .
+}

@@ -723,7 +723,8 @@ mod tests {
 
     #[test]
     fn identity_pipeline() {
-        let q = "PREFIX ex: <http://e/>\n# c\nselect * { ?s ex:p [ ex:q 1 ] ; dc:x ?o }\n";
+        // already formatted
+        let q = "PREFIX ex: <http://e/>\n\n# c\nSELECT *\nWHERE {\n  ?s ex:p [ ex:q 1 ] ;\n    dc:x ?o .\n}\n";
         let opts = Options {
             cursor: Some(5),
             ..Options::default()
@@ -735,7 +736,7 @@ mod tests {
         assert_eq!(f.language, Language::Sparql);
         assert_eq!(f.warnings.len(), 1);
         assert_eq!(f.warnings[0].code, "undeclared-prefix");
-        assert_eq!((f.warnings[0].line, f.warnings[0].column), (3, 33));
+        assert_eq!((f.warnings[0].line, f.warnings[0].column), (7, 5));
 
         let u = "INSERT DATA { <a> <b> <c> } ;\nCLEAR ALL";
         assert_eq!(
@@ -779,8 +780,8 @@ mod tests {
 
     #[test]
     fn a_bom_is_dropped() {
-        let f = format("\u{feff}ASK {}", Language::Sparql, &Options::default()).unwrap();
-        assert_eq!(f.text, "ASK {}");
+        let f = format("\u{feff}ASK {}\n", Language::Sparql, &Options::default()).unwrap();
+        assert_eq!(f.text, "ASK {}\n");
         assert!(f.changed);
     }
 
