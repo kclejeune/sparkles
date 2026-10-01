@@ -26,6 +26,8 @@ pub struct ExistsSpec {
     /// table no longer holds them as columns, but they are part of the outer solution
     pub bound: Vec<(VarId, Id)>,
     pub memo: Mutex<FxHashMap<Vec<Id>, bool>>,
+    /// the key set answering the EXISTS for every outer row (see [`super::exists`])
+    pub decor: super::exists::Decor,
 }
 
 impl ExistsSpec {
@@ -41,6 +43,7 @@ impl ExistsSpec {
             vars,
             bound,
             memo: Mutex::new(FxHashMap::default()),
+            decor: Default::default(),
         }
     }
 
@@ -556,7 +559,8 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             if let Some(&r) = spec.memo.lock().get(&key) {
                 return Ok(b(r));
             }
-            let r = super::plan::eval_exists(ctx, spec, &key).map_err(|_| TypeError)?;
+            let r = super::exists::per_row(|| super::plan::eval_exists(ctx, spec, &key))
+                .map_err(|_| TypeError)?;
             let mut m = spec.memo.lock();
             if m.len() < 100_000 {
                 m.insert(key, r);

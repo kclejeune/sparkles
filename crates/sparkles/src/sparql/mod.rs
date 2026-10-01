@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod ctx;
 pub mod exec;
+mod exists;
 pub mod expr;
 pub mod geopf;
 mod keyfilter;
@@ -677,6 +678,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod exists_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]

@@ -291,6 +291,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::Filter(exprs) => {
             let mut t = child(0, &mut infos)?;
             apply_filter(ctx, &mut t, exprs)?;
+            (note, counters) = super::exists::explain(ctx, exprs);
             t
         }
         Kind::Extend(v, e) => {
@@ -666,7 +667,11 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
                 let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
                 let out = apply_unary(ctx, n, input)?;
                 if out.len() >= want || complete {
-                    return finish(out, vec![cinfo], complete);
+                    let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
+                    if let Kind::Filter(exprs) = &n.kind {
+                        super::exists::annotate(ctx, &mut info, exprs);
+                    }
+                    return Ok((t, info, complete));
                 }
                 budget = budget.saturating_mul(8);
             }
@@ -1607,6 +1612,12 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
 }
 
 fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<()> {
+    // EXISTS conjuncts answered from a key set first
+    let rest = super::exists::apply(ctx, t, exprs)?;
+    let exprs = rest.as_deref().unwrap_or(exprs);
+    if exprs.is_empty() {
+        return Ok(());
+    }
     let t0 = Instant::now();
     let keep = match distinct_filter_mask(ctx, t, exprs)? {
         Some(keep) => {

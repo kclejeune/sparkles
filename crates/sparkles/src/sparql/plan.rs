@@ -3409,7 +3409,7 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
     walk(gp, out);
 }
 
-fn expr_vars(e: &Expression, out: &mut Vec<String>) {
+pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out.push(v.as_str().to_string()),
