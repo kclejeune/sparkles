@@ -193,6 +193,8 @@ pub struct RequestReport {
     /// write-time validation status and time (from the `Sparkles-Validation` header)
     pub validation: Option<&'static str>,
     pub validation_ms: Option<u64>,
+    /// query: the work of its spatial operators (candidates, exact tests, matches)
+    pub geo_work: Option<[u64; 3]>,
 }
 
 impl RequestReport {
@@ -577,6 +579,8 @@ pub struct DsMetrics {
     result_rows: AtomicU64,
     budget: [AtomicU64; BudgetKind::ALL.len()],
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
+    /// candidates, exact tests and matches of spatial operators
+    geo_work: [AtomicU64; 3],
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -651,6 +655,11 @@ impl Metrics {
         {
             ds.result_rows.fetch_add(n, Ordering::Relaxed);
         }
+        if let Some(g) = r.geo_work {
+            for (c, n) in ds.geo_work.iter().zip(g) {
+                c.fetch_add(n, Ordering::Relaxed);
+            }
+        }
         if outcome == Outcome::Budget
             && let Some(k) = r.budget
         {
@@ -673,7 +682,6 @@ impl Metrics {
     }
 
     /// The `dataset` label of a request to `dataset` (see [`Metrics::series`]).
-    #[cfg_attr(not(any(feature = "otel", feature = "backup")), allow(dead_code))]
     pub fn dataset_label(&self, dataset: Option<&str>) -> String {
         self.series(dataset).0
     }
@@ -691,6 +699,14 @@ impl Metrics {
 
     pub fn active(&self, op: Op) -> i64 {
         self.active[op.index()].load(Ordering::Relaxed)
+    }
+
+    /// The spatial operators' work per dataset label: candidates, exact tests, matches.
+    pub fn geo_work(&self) -> Vec<(String, [u64; 3])> {
+        self.snapshot()
+            .into_iter()
+            .map(|(k, m)| (k, m.geo_work.each_ref().map(|c| c.load(Ordering::Relaxed))))
+            .collect()
     }
 
     fn snapshot(&self) -> Vec<(String, Arc<DsMetrics>)> {

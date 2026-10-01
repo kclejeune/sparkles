@@ -20,6 +20,8 @@ mod clone;
 mod cost;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "geo")]
+mod geo;
 mod loads;
 mod open;
 #[cfg(feature = "reasoning")]
