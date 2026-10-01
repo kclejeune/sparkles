@@ -520,6 +520,81 @@ fn class_counts_from_statistics_only_when_exact() {
 }
 
 #[test]
+fn distinct_counts_from_statistics_only_when_exact() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..3000 {
+        // repeated objects, objects shared between predicates, literals, a self-loop
+        ttl.push_str(&format!(
+            "ex:s{} ex:knows ex:s{} .\n",
+            i % 700,
+            (i * 7) % 900
+        ));
+        ttl.push_str(&format!("ex:s{i} ex:name \"n{}\" .\n", i % 1100));
+        if i % 9 == 0 {
+            ttl.push_str(&format!("ex:s{i} ex:likes ex:s{i} .\n"));
+        }
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    s.compact().unwrap();
+    let queries = [
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }",
+        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:knows ?o }",
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:name ?o }",
+        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o }",
+        "SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }",
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ?p ?o }",
+    ];
+    let mut before = Vec::new();
+    for q in queries {
+        before.push(same_answer(&s, q, "CountDistinctFromMetadata"));
+    }
+    // a predicate that is not in the data, and repeated variables, are counted from runs
+    for q in [
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:none ?o }",
+        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:likes ?s }",
+        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:knows ex:s7 }",
+    ] {
+        let r = run(&s, q, Optimizations::ALL);
+        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
+        same_rows(&s, q);
+    }
+    // a delta makes the statistics stale: the runs are counted instead
+    update(
+        &s,
+        "INSERT DATA { ex:new ex:knows ex:other . ex:new ex:name \"n1\" } ; DELETE DATA { ex:s0 ex:knows ex:s0 }",
+    );
+    let mut after = Vec::new();
+    for q in queries {
+        let r = run(&s, q, Optimizations::ALL);
+        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
+        assert!(has_op(&r.plan, "CountDistinctFromIndex"), "{q}");
+        after.push(same_rows(&s, q));
+    }
+    assert_ne!(before, after);
+    // after compaction they are exact again
+    s.compact().unwrap();
+    for (q, a) in queries.iter().zip(&after) {
+        assert_eq!(&same_answer(&s, q, "CountDistinctFromMetadata"), a);
+    }
+    // named graphs: the statistics count terms of every graph
+    update(
+        &s,
+        "INSERT DATA { GRAPH ex:g { ex:s1 ex:knows ex:elsewhere . ex:t ex:name \"other\" } }",
+    );
+    s.compact().unwrap();
+    for q in queries {
+        let r = run(&s, q, Optimizations::ALL);
+        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
+        same_rows(&s, q);
+    }
+    same_rows(
+        &s,
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s ex:knows ?o } }",
+    );
+}
+
+#[test]
 fn optimizations_can_be_disabled_by_name() {
     let o = Optimizations::ALL
         .disable("range_pushdown, metadata_counts")

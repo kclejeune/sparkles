@@ -213,6 +213,9 @@ ran.
 * **`COUNT(DISTINCT ?v)` from index runs.** Over a single triple pattern, the scan is
   re-targeted to a permutation sorted on `?v` and the distinct values are counted as
   runs of equal ids (`CountDistinctFromIndex`). No rows are materialized or hashed.
+  When the pattern is `?s ?p ?o` or has only its predicate bound, the count is read
+  from the index statistics instead, under the same conditions as the class counts
+  below (`CountDistinctFromMetadata`, part of `metadata_counts`).
 * **Filters on vocabulary keys.** `CONTAINS` / `STRSTARTS` / `STRENDS` / `REGEX` over
   `?v` or `STR(?v)`, and `LANGMATCHES(LANG(?v), …)`, are tested directly on the stored
   key bytes (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in

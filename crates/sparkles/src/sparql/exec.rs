@@ -246,8 +246,15 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 }
             }
         }
-        Kind::CountDistinctScan { spec, var } => {
-            let c = count_distinct_scan(ctx, spec)?;
+        Kind::CountDistinctScan {
+            spec,
+            var,
+            metadata,
+        } => {
+            let c = match metadata {
+                Some(c) => *c,
+                None => count_distinct_scan(ctx, spec)?,
+            };
             let mut t = Table::new(vec![*var]);
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t

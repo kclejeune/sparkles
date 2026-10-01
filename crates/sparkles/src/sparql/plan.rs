@@ -300,6 +300,8 @@ pub enum Kind {
     CountDistinctScan {
         spec: ScanSpec,
         var: VarId,
+        /// the count read from the index statistics (exact for this snapshot)
+        metadata: Option<u64>,
     },
     /// decompose the triple term in `t` into `parts` (RDF 1.2)
     Unpack {
@@ -435,6 +437,9 @@ impl Node {
             Kind::Slice { .. } => "Limit",
             Kind::Group { .. } => "GroupBy",
             Kind::CountScan { .. } => "CountFromIndex",
+            Kind::CountDistinctScan {
+                metadata: Some(_), ..
+            } => "CountDistinctFromMetadata",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
             Kind::GroupCountScan { metadata: true, .. } => "GroupCountFromMetadata",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
@@ -2926,13 +2931,33 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         && let Some(spec) = reorder_scan(spec, *k)
     {
         let var = aggs[0].0;
+        let metadata = ctx
+            .opt
+            .metadata_counts
+            .then(|| distinct_count_exact(&spec, ctx))
+            .flatten();
         let desc = format!(
-            "{} distinct ?{}",
+            "{} distinct ?{}{}",
             retarget_desc(&child.desc, &spec),
-            ctx.var_name(*k)
+            ctx.var_name(*k),
+            if metadata.is_some() {
+                " [from statistics]"
+            } else {
+                ""
+            }
         );
-        let mut n = Node::leaf(Kind::CountDistinctScan { spec, var }, vec![var], 1.0, desc);
-        n.cost = child.est;
+        let cost = if metadata.is_some() { 1.0 } else { child.est };
+        let mut n = Node::leaf(
+            Kind::CountDistinctScan {
+                spec,
+                var,
+                metadata,
+            },
+            vec![var],
+            1.0,
+            desc,
+        );
+        n.cost = cost;
         return n;
     }
     // COUNT(*) over a join of two scans on one variable: per-key run lengths
@@ -3137,6 +3162,32 @@ fn class_counts_exact(spec: &ScanSpec, key: VarId, ctx: &Ctx) -> bool {
         && snap
             .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
             .is_some_and(|t| spec.prefix == [t.0])
+}
+
+/// The number of distinct values of a scan's first free column, when the index
+/// statistics hold it exactly: a scan of the whole index or of one predicate without
+/// repeated variables, a snapshot without a delta, and every quad in the default graph,
+/// which the scan reads (the statistics count over all graphs). The statistics hold the
+/// distinct subjects, predicates and objects of the index, and the distinct subjects
+/// and objects of each predicate.
+fn distinct_count_exact(spec: &ScanSpec, ctx: &Ctx) -> Option<u64> {
+    let snap = &ctx.snap;
+    let stats = &snap.generation.stats;
+    let exact = spec.eqs.is_empty()
+        && snap.delta.is_empty()
+        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
+        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0);
+    if !exact || spec.cols.first()?.0 != spec.prefix.len() {
+        return None;
+    }
+    match (spec.perm, spec.prefix.as_slice()) {
+        (Perm::Spo | Perm::Sop, []) => Some(stats.distinct_subjects),
+        (Perm::Pso | Perm::Pos, []) => Some(stats.distinct_predicates),
+        (Perm::Osp | Perm::Ops, []) => Some(stats.distinct_objects),
+        (Perm::Pso, [p]) => stats.predicate(*p).map(|ps| ps.distinct_subjects),
+        (Perm::Pos, [p]) => stats.predicate(*p).map(|ps| ps.distinct_objects),
+        _ => None,
+    }
 }
 
 /// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.
