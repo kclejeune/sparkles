@@ -35,7 +35,7 @@ pub enum ActiveGraph {
     Var(VarId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GraphFilter {
     /// no restriction (graph is an output column or the prefix)
     All,
@@ -326,6 +326,9 @@ pub enum Kind {
     SpatialScan(Box<super::geopf::SpatialScanSpec>),
     /// a `spatial:` property function
     SpatialPf(Box<super::geopf::SpatialPfSpec>),
+    /// triple patterns read only for the keys of the input (child 0); see
+    /// [`super::indexjoin`]
+    IndexJoin(Box<super::indexjoin::IndexJoinSpec>),
 }
 
 #[derive(Clone)]
@@ -385,7 +388,7 @@ impl Node {
         matches!(self.kind, Kind::Empty)
     }
 
-    fn d(&self, v: VarId) -> f64 {
+    pub(super) fn d(&self, v: VarId) -> f64 {
         self.dist
             .get(&v)
             .copied()
@@ -437,6 +440,8 @@ impl Node {
             Kind::VectorSearch(_) => "VectorSearch",
             Kind::SpatialScan(_) => "SpatialScan",
             Kind::SpatialPf(_) => "SpatialPf",
+            Kind::IndexJoin(j) if j.probes.len() > 1 => "StarJoin",
+            Kind::IndexJoin(_) => "IndexJoin",
         }
     }
 }
@@ -1777,7 +1782,7 @@ impl<'a> Planner<'a> {
         for p in it {
             acc = self.place_filters(join(acc, p, self.ctx), filters);
         }
-        Ok(acc)
+        Ok(super::indexjoin::fuse_stars(acc, self.ctx))
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
@@ -2120,7 +2125,7 @@ impl<'a> Planner<'a> {
 // node constructors (with estimates)
 // ------------------------------------------------------------------------------
 
-fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
+pub(super) fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
         let x = match (a.vars.contains(v), b.vars.contains(v)) {
@@ -2133,7 +2138,7 @@ fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
     d
 }
 
-fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
+pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
     if keys.is_empty() {
         return a.est * b.est;
     }
@@ -2250,6 +2255,7 @@ fn join_candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
             .join(" ")
     );
     out.push(h);
+    out.extend(super::indexjoin::candidates(a, b, ctx));
     out
 }
 

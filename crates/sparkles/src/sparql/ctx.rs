@@ -59,10 +59,16 @@ pub struct Optimizations {
     pub selective_columns: bool,
     /// spatial FILTERs on an indexed predicate's object search the spatial index
     pub spatial_pushdown: bool,
+    /// a join with a selective input reads a triple pattern only for the input's distinct
+    /// keys, by clustered seeks over a permutation sorted on the key
+    pub batched_join: bool,
+    /// index joins on one subject over constant predicates are read together, walking
+    /// each subject's run once when that touches fewer blocks
+    pub star_fusion: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 9] = [
+    pub const NAMES: [&str; 11] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -72,6 +78,8 @@ impl Optimizations {
         "ordered_topk",
         "selective_columns",
         "spatial_pushdown",
+        "batched_join",
+        "star_fusion",
     ];
 
     /// Everything on.
@@ -85,6 +93,8 @@ impl Optimizations {
         ordered_topk: true,
         selective_columns: true,
         spatial_pushdown: true,
+        batched_join: true,
+        star_fusion: true,
     };
 
     /// Everything off: the generic operators only.
@@ -98,6 +108,8 @@ impl Optimizations {
         ordered_topk: false,
         selective_columns: false,
         spatial_pushdown: false,
+        batched_join: false,
+        star_fusion: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -111,6 +123,8 @@ impl Optimizations {
             "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
+            "batched_join" => &mut self.batched_join,
+            "star_fusion" => &mut self.star_fusion,
             _ => return None,
         })
     }

@@ -5,6 +5,7 @@ pub mod ctx;
 pub mod exec;
 pub mod expr;
 pub mod geopf;
+pub mod indexjoin;
 mod keyfilter;
 pub mod plan;
 pub mod results;
@@ -677,6 +678,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod indexjoin_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]
