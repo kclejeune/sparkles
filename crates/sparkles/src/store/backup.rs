@@ -250,8 +250,9 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 4] = [
+const OPTIONAL_META: [&str; 5] = [
     "text.json",
+    "geo.json",
     "origin.json",
     "validation.json",
     "validation-shapes.ttl",

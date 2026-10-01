@@ -64,11 +64,29 @@ pub fn take_calls(
     Vec<(Vec<TermPattern>, Vec<TermPattern>)>,
     Vec<TriplePattern>,
 )> {
-    let is_call = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == iri);
-    if !patterns.iter().any(is_call) {
+    let (calls, rest) = take_calls_where(patterns, |p| p == iri, |_| name.to_string())?;
+    Ok((calls.into_iter().map(|(_, s, o)| (s, o)).collect(), rest))
+}
+
+/// [`take_calls`] for every property function whose IRI satisfies `is_call`; each call
+/// comes with its predicate. Errors are prefixed with `name(iri)`.
+#[allow(clippy::type_complexity)]
+pub fn take_calls_where(
+    patterns: &[TriplePattern],
+    is_call: impl Fn(&str) -> bool,
+    name: impl Fn(&str) -> String,
+) -> Result<(
+    Vec<(NamedNode, Vec<TermPattern>, Vec<TermPattern>)>,
+    Vec<TriplePattern>,
+)> {
+    let call_iri = |t: &TriplePattern| match &t.predicate {
+        NamedNodePattern::NamedNode(p) if is_call(p.as_str()) => Some(p.clone()),
+        _ => None,
+    };
+    if !patterns.iter().any(|t| call_iri(t).is_some()) {
         return Ok((Vec::new(), patterns.to_vec()));
     }
-    let bad = |m: &str| Error::invalid(format!("{name}: {m}"));
+    let bad = |iri: &str| Error::invalid(format!("{}: malformed argument list", name(iri)));
     // list cells: blank node → (first, rest) triple indexes
     let mut first: FxHashMap<&BlankNode, Vec<usize>> = FxHashMap::default();
     let mut rest: FxHashMap<&BlankNode, Vec<usize>> = FxHashMap::default();
@@ -85,41 +103,44 @@ pub fn take_calls(
     }
     let mut used = vec![false; patterns.len()];
     // the elements of the list headed by `t`, if `t` heads one
-    let list = |t: &TermPattern, used: &mut Vec<bool>| -> Result<Option<Vec<TermPattern>>> {
-        let TermPattern::BlankNode(b) = t else {
-            return Ok(None);
-        };
-        let mut b = b;
-        if !first.contains_key(b) {
-            return Ok(None);
-        }
-        let mut items = Vec::new();
-        loop {
-            let (Some([f]), Some([r])) = (
-                first.get(b).map(Vec::as_slice),
-                rest.get(b).map(Vec::as_slice),
-            ) else {
-                return Err(bad("malformed argument list"));
+    let list =
+        |t: &TermPattern, used: &mut Vec<bool>, iri: &str| -> Result<Option<Vec<TermPattern>>> {
+            let TermPattern::BlankNode(b) = t else {
+                return Ok(None);
             };
-            used[*f] = true;
-            used[*r] = true;
-            items.push(patterns[*f].object.clone());
-            match &patterns[*r].object {
-                TermPattern::NamedNode(n) if *n == rdf::NIL => return Ok(Some(items)),
-                TermPattern::BlankNode(next) if items.len() < 64 => b = next,
-                _ => return Err(bad("malformed argument list")),
+            let mut b = b;
+            if !first.contains_key(b) {
+                return Ok(None);
             }
-        }
-    };
+            let mut items = Vec::new();
+            loop {
+                let (Some([f]), Some([r])) = (
+                    first.get(b).map(Vec::as_slice),
+                    rest.get(b).map(Vec::as_slice),
+                ) else {
+                    return Err(bad(iri));
+                };
+                used[*f] = true;
+                used[*r] = true;
+                items.push(patterns[*f].object.clone());
+                match &patterns[*r].object {
+                    TermPattern::NamedNode(n) if *n == rdf::NIL => return Ok(Some(items)),
+                    TermPattern::BlankNode(next) if items.len() < 64 => b = next,
+                    _ => return Err(bad(iri)),
+                }
+            }
+        };
     let mut calls = Vec::new();
     for (i, t) in patterns.iter().enumerate() {
-        if !is_call(t) {
+        let Some(iri) = call_iri(t) else {
             continue;
-        }
+        };
         used[i] = true;
-        let subjects = list(&t.subject, &mut used)?.unwrap_or_else(|| vec![t.subject.clone()]);
-        let args = list(&t.object, &mut used)?.unwrap_or_else(|| vec![t.object.clone()]);
-        calls.push((subjects, args));
+        let subjects =
+            list(&t.subject, &mut used, iri.as_str())?.unwrap_or_else(|| vec![t.subject.clone()]);
+        let args =
+            list(&t.object, &mut used, iri.as_str())?.unwrap_or_else(|| vec![t.object.clone()]);
+        calls.push((iri, subjects, args));
     }
     let rest = patterns
         .iter()

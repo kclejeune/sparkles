@@ -33,6 +33,8 @@ export type DatasetInfo = {
   modified?: string;
   /** Full-text index summary (null: disabled; absent: server without the field). */
   text?: { state: TextState; docs: number } | null;
+  /** Spatial index summary: state and indexed rows (null: disabled; absent: server without the field). */
+  geo?: { state: GeoState; rows: number } | null;
   /** The caller's level on the dataset; absent without auth (then everything goes). */
   access?: Level;
 };
@@ -175,6 +177,8 @@ export type DatasetStats = {
   resultCache?: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number };
   /** Reasoning status; absent on servers that predate it. */
   reasoning?: ReasoningStatus | null;
+  /** Spatial index status (null: disabled); absent on servers that predate it. */
+  geo?: GeoStatus | null;
 };
 
 export type TaskKind =
@@ -184,6 +188,7 @@ export type TaskKind =
   | 'load'
   | 'clone'
   | 'text-rebuild'
+  | 'geo-index'
   | 'backup-create'
   | 'backup-restore'
   | 'backup-verify'
@@ -226,7 +231,14 @@ export type PlanNode = {
   timeMs: number;
   cached: boolean;
   children: PlanNode[];
+  /** Operator counters (spatial operators: candidates, refined, matched, treeNodesVisited, index, fallback). */
+  counters?: Record<string, number | string | boolean>;
+  /** Notes about the plan (root only). */
+  warnings?: PlanWarning[];
 };
+
+/** `geo-not-pushed`, `geo-index-building`, `geo-not-built`, … */
+export type PlanWarning = { code: string; message: string };
 
 export type Timing = {
   parseMs: number;
@@ -1189,6 +1201,48 @@ export function commits(
     cache: 'no-store',
   });
 }
+
+// --- spatial index (GeoSPARQL) -----------------------------------------------------
+
+export type GeoState = 'ready' | 'building' | 'failed' | 'over-budget';
+
+export type GeoConfig = {
+  /** Serialization predicates; default geo:asWKT, geo:asGeoJSON, geo:hasSerialization. */
+  predicates?: string[];
+  /** Default geo:hasDefaultGeometry, geo:hasGeometry. */
+  featureLinks?: string[];
+  graphs?: { include?: 'all' | string[]; exclude?: string[] };
+  /** Not supported yet. */
+  wgs84?: boolean;
+  /** Not supported yet. */
+  queryRewrite?: boolean;
+  /** Default "geodesic". */
+  distance?: 'geodesic' | 'haversine';
+  maxGeometryBytes?: number;
+  maxVertices?: number;
+  formatVersion?: number;
+};
+
+export type GeoStatus = {
+  enabled: true;
+  state: GeoState;
+  progress?: number;
+  message?: string;
+  /** The generation the base was built for. */
+  generation: string;
+  /** The commit of the snapshot the status describes. */
+  commit: number;
+  rows: { base: number; overlay: number; tail: number };
+  /** Distinct parsed geometries. */
+  literals: number;
+  skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
+  /** Literals per CRS IRI. */
+  crs: Record<string, number>;
+  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  config: GeoConfig;
+  formatVersion: number;
+  lastBuild?: { at: string; ms: number; rows: number };
+};
 
 // --- full-text search --------------------------------------------------------------
 
