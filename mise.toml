@@ -28,7 +28,8 @@ depends = ["ui:install"]
 dir = "ui"
 run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json"]
-outputs = ["build/index.html"]
+# not index.html: the server build writes a placeholder one when the UI is missing
+outputs = ["build/_app/version.json"]
 
 [tasks."ui:dev"]
 description = "UI dev server (proxies the API to $SPARKLES_API, default http://localhost:3030)"
