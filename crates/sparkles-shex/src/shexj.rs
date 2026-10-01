@@ -5,7 +5,6 @@
 use crate::ParseError;
 use crate::ast::*;
 use crate::check::check_facets;
-use crate::error::NOT_IMPLEMENTED;
 use oxiri::Iri;
 use serde_json::{Map, Value};
 
@@ -26,8 +25,8 @@ pub fn from_shexj(json: &str) -> Result<Schema, ParseError> {
     from_shexj_with_base(json, None)
 }
 
-/// Parse ShExJ, resolving relative IRIs against `base` (all but imports, which the
-/// resolver finds relative to the importing schema).
+/// Parse ShExJ, resolving relative IRIs against `base`, imports included (as the
+/// ShExC parser does, so an imported schema's own imports are relative to it).
 pub fn from_shexj_with_base(json: &str, base: Option<&str>) -> Result<Schema, ParseError> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| ParseError::new(format!("invalid JSON: {e}"), e.line(), e.column()))?;
@@ -80,6 +79,7 @@ impl Rebase<'_> {
     }
 
     fn schema(&mut self, s: &mut Schema) {
+        s.imports.iter_mut().for_each(|i| self.iri(i));
         for a in &mut s.start_acts {
             self.iri(&mut a.name);
         }
@@ -182,10 +182,297 @@ impl Rebase<'_> {
     }
 }
 
-/// Write ShExJ.
+// ------------------------------------------------------------------- writing ------
+
+/// Write ShExJ: the ShEx 2.1 form (`shapes` with `id`s), with a 2.next `ShapeDecl`
+/// wrapper only for a declaration that is a bare reference (a string cannot carry an
+/// `id`). Lists that are empty and `Option`s that are `None` are left out.
 pub fn to_shexj(schema: &Schema) -> Value {
-    let _ = schema;
-    unimplemented!("ShExJ writer: {NOT_IMPLEMENTED}")
+    let mut o = Map::new();
+    o.insert("@context".into(), CONTEXT.into());
+    o.insert("type".into(), "Schema".into());
+    if !schema.imports.is_empty() {
+        o.insert("imports".into(), schema.imports.clone().into());
+    }
+    put_list(&mut o, "startActs", &schema.start_acts, w_sem_act);
+    if let Some(s) = &schema.start {
+        o.insert("start".into(), w_shape_expr(s));
+    }
+    put_list(&mut o, "shapes", &schema.shapes, w_shape_decl);
+    Value::Object(o)
+}
+
+fn put_list<T>(o: &mut Map<String, Value>, key: &str, v: &[T], f: impl Fn(&T) -> Value) {
+    if !v.is_empty() {
+        o.insert(key.into(), Value::Array(v.iter().map(f).collect()));
+    }
+}
+
+fn typed(t: &str) -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert("type".into(), t.into());
+    o
+}
+
+fn w_shape_decl(d: &ShapeDecl) -> Value {
+    let id = Value::from(d.label.to_shexj());
+    match w_shape_expr(&d.expr) {
+        Value::Object(mut o) => {
+            o.insert("id".into(), id);
+            Value::Object(o)
+        }
+        reference => {
+            let mut o = typed("ShapeDecl");
+            o.insert("id".into(), id);
+            o.insert("shapeExpr".into(), reference);
+            Value::Object(o)
+        }
+    }
+}
+
+fn w_shape_expr(e: &ShapeExpr) -> Value {
+    let o = match e {
+        ShapeExpr::Ref(l) => return l.to_shexj().into(),
+        ShapeExpr::Or(v) | ShapeExpr::And(v) => {
+            let mut o = typed(if matches!(e, ShapeExpr::Or(_)) {
+                "ShapeOr"
+            } else {
+                "ShapeAnd"
+            });
+            o.insert(
+                "shapeExprs".into(),
+                Value::Array(v.iter().map(w_shape_expr).collect()),
+            );
+            o
+        }
+        ShapeExpr::Not(x) => {
+            let mut o = typed("ShapeNot");
+            o.insert("shapeExpr".into(), w_shape_expr(x));
+            o
+        }
+        ShapeExpr::External => typed("ShapeExternal"),
+        ShapeExpr::Nc(nc) => w_node_constraint(nc),
+        ShapeExpr::Shape(s) => {
+            let mut o = typed("Shape");
+            if let Some(c) = s.closed {
+                o.insert("closed".into(), c.into());
+            }
+            if !s.extra.is_empty() {
+                o.insert("extra".into(), s.extra.clone().into());
+            }
+            if let Some(t) = &s.expression {
+                o.insert("expression".into(), w_triple_expr(t));
+            }
+            put_list(&mut o, "semActs", &s.sem_acts, w_sem_act);
+            put_list(&mut o, "annotations", &s.annotations, w_annotation);
+            o
+        }
+    };
+    Value::Object(o)
+}
+
+/// A numeric facet bound as a JSON number (a string if it is not a finite number).
+fn w_numeric(n: &NumericLiteral) -> Value {
+    let (NumericLiteral::Integer(s) | NumericLiteral::Decimal(s) | NumericLiteral::Double(s)) = n;
+    let t = s.strip_prefix('+').unwrap_or(s);
+    if matches!(n, NumericLiteral::Integer(_)) {
+        if let Ok(i) = t.parse::<i64>() {
+            return i.into();
+        }
+        if let Ok(u) = t.parse::<u64>() {
+            return u.into();
+        }
+    }
+    match t.parse::<f64>() {
+        Ok(f) if f.is_finite() => f.into(),
+        _ => s.clone().into(),
+    }
+}
+
+fn w_node_constraint(nc: &NodeConstraint) -> Map<String, Value> {
+    let mut o = typed("NodeConstraint");
+    if let Some(k) = nc.node_kind {
+        o.insert("nodeKind".into(), k.as_str().into());
+    }
+    let strings = [
+        ("datatype", &nc.datatype),
+        ("pattern", &nc.pattern),
+        ("flags", &nc.flags),
+    ];
+    let ints = [
+        ("length", nc.length),
+        ("minlength", nc.min_length),
+        ("maxlength", nc.max_length),
+        ("totaldigits", nc.total_digits),
+        ("fractiondigits", nc.fraction_digits),
+    ];
+    let nums = [
+        ("mininclusive", &nc.min_inclusive),
+        ("minexclusive", &nc.min_exclusive),
+        ("maxinclusive", &nc.max_inclusive),
+        ("maxexclusive", &nc.max_exclusive),
+    ];
+    for (k, v) in strings {
+        if let Some(v) = v {
+            o.insert(k.into(), v.clone().into());
+        }
+    }
+    for (k, v) in ints {
+        if let Some(v) = v {
+            o.insert(k.into(), v.into());
+        }
+    }
+    for (k, v) in nums {
+        if let Some(v) = v {
+            o.insert(k.into(), w_numeric(v));
+        }
+    }
+    if let Some(values) = &nc.values {
+        o.insert(
+            "values".into(),
+            Value::Array(values.iter().map(w_value).collect()),
+        );
+    }
+    o
+}
+
+fn w_literal(l: &ObjectLiteral) -> Value {
+    let mut o = Map::new();
+    o.insert("value".into(), l.value.clone().into());
+    if let Some(lang) = &l.language {
+        o.insert("language".into(), lang.clone().into());
+    }
+    if let Some(dt) = &l.datatype {
+        o.insert("type".into(), dt.clone().into());
+    }
+    Value::Object(o)
+}
+
+fn w_object(v: &ObjectValue) -> Value {
+    match v {
+        ObjectValue::Iri(i) => i.clone().into(),
+        ObjectValue::Literal(l) => w_literal(l),
+    }
+}
+
+fn w_stem(t: &str, stem: &str) -> Value {
+    let mut o = typed(t);
+    o.insert("stem".into(), stem.into());
+    Value::Object(o)
+}
+
+fn w_range(t: &str, stem_type: &str, stem: &Stem, exclusions: &[Exclusion]) -> Value {
+    let mut o = typed(t);
+    o.insert(
+        "stem".into(),
+        match stem {
+            Stem::Value(s) => s.clone().into(),
+            Stem::Wildcard => Value::Object(typed("Wildcard")),
+        },
+    );
+    o.insert(
+        "exclusions".into(),
+        Value::Array(
+            exclusions
+                .iter()
+                .map(|x| match x {
+                    Exclusion::Value(v) => v.clone().into(),
+                    Exclusion::Stem(s) => w_stem(stem_type, s),
+                })
+                .collect(),
+        ),
+    );
+    Value::Object(o)
+}
+
+fn w_value(v: &ValueSetValue) -> Value {
+    match v {
+        ValueSetValue::Object(o) => w_object(o),
+        ValueSetValue::IriStem(s) => w_stem("IriStem", s),
+        ValueSetValue::LiteralStem(s) => w_stem("LiteralStem", s),
+        ValueSetValue::LanguageStem(s) => w_stem("LanguageStem", s),
+        ValueSetValue::Language(l) => {
+            let mut o = typed("Language");
+            o.insert("languageTag".into(), l.clone().into());
+            Value::Object(o)
+        }
+        ValueSetValue::IriStemRange { stem, exclusions } => {
+            w_range("IriStemRange", "IriStem", stem, exclusions)
+        }
+        ValueSetValue::LiteralStemRange { stem, exclusions } => {
+            w_range("LiteralStemRange", "LiteralStem", stem, exclusions)
+        }
+        ValueSetValue::LanguageStemRange { stem, exclusions } => {
+            w_range("LanguageStemRange", "LanguageStem", stem, exclusions)
+        }
+    }
+}
+
+fn put_card(o: &mut Map<String, Value>, min: Option<u32>, max: Option<i64>) {
+    if let Some(m) = min {
+        o.insert("min".into(), m.into());
+    }
+    if let Some(m) = max {
+        o.insert("max".into(), m.into());
+    }
+}
+
+fn w_triple_expr(t: &TripleExpr) -> Value {
+    let o = match t {
+        TripleExpr::Include(l) => return l.to_shexj().into(),
+        TripleExpr::EachOf(g) | TripleExpr::OneOf(g) => {
+            let mut o = typed(if matches!(t, TripleExpr::EachOf(_)) {
+                "EachOf"
+            } else {
+                "OneOf"
+            });
+            if let Some(id) = &g.id {
+                o.insert("id".into(), id.to_shexj().into());
+            }
+            o.insert(
+                "expressions".into(),
+                Value::Array(g.exprs.iter().map(w_triple_expr).collect()),
+            );
+            put_card(&mut o, g.min, g.max);
+            put_list(&mut o, "semActs", &g.sem_acts, w_sem_act);
+            put_list(&mut o, "annotations", &g.annotations, w_annotation);
+            o
+        }
+        TripleExpr::Tc(tc) => {
+            let mut o = typed("TripleConstraint");
+            if let Some(id) = &tc.id {
+                o.insert("id".into(), id.to_shexj().into());
+            }
+            if let Some(i) = tc.inverse {
+                o.insert("inverse".into(), i.into());
+            }
+            o.insert("predicate".into(), tc.predicate.clone().into());
+            if let Some(v) = &tc.value_expr {
+                o.insert("valueExpr".into(), w_shape_expr(v));
+            }
+            put_card(&mut o, tc.min, tc.max);
+            put_list(&mut o, "semActs", &tc.sem_acts, w_sem_act);
+            put_list(&mut o, "annotations", &tc.annotations, w_annotation);
+            o
+        }
+    };
+    Value::Object(o)
+}
+
+fn w_sem_act(a: &SemAct) -> Value {
+    let mut o = typed("SemAct");
+    o.insert("name".into(), a.name.clone().into());
+    if let Some(c) = &a.code {
+        o.insert("code".into(), c.clone().into());
+    }
+    Value::Object(o)
+}
+
+fn w_annotation(a: &Annotation) -> Value {
+    let mut o = typed("Annotation");
+    o.insert("predicate".into(), a.predicate.clone().into());
+    o.insert("object".into(), w_object(&a.object));
+    Value::Object(o)
 }
 
 // ------------------------------------------------------------------- reading ------
@@ -827,11 +1114,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.shapes, s2.shapes);
-        assert_eq!(s.imports, ["common"]);
+        assert_eq!(s.imports, s2.imports);
         assert_eq!(s.base.as_deref(), Some("http://ex.org/dir/s.json"));
         // without a base they are kept as written
         let s = from_shexj(json).unwrap();
         assert_eq!(s.shapes[0].label, Label::Iri("S1".into()));
         assert!(from_shexj_with_base(json, Some("not a base")).is_err());
+    }
+
+    /// ShExJ → AST → ShExJ gives back the document, key for key.
+    #[test]
+    fn writes_what_it_reads() {
+        let doc: Value = serde_json::from_str(
+            r#"{
+          "@context": "http://www.w3.org/ns/shex.jsonld",
+          "type": "Schema",
+          "imports": ["http://ex.org/common"],
+          "startActs": [{"type": "SemAct", "name": "http://ex.org/x"}],
+          "start": {"type": "ShapeNot", "shapeExpr": "http://ex.org/S"},
+          "shapes": [
+            {"id": "http://ex.org/S", "type": "Shape", "closed": false,
+             "extra": ["http://ex.org/b"],
+             "expression": {"type": "OneOf", "id": "_:g", "min": 0, "max": -1, "expressions": [
+               {"type": "TripleConstraint", "id": "_:e", "predicate": "http://ex.org/a",
+                "inverse": true, "min": 2, "max": 5,
+                "valueExpr": {"type": "NodeConstraint",
+                  "datatype": "http://www.w3.org/2001/XMLSchema#decimal", "length": 3,
+                  "minlength": 1, "maxlength": 9, "pattern": "^a/b$", "flags": "i",
+                  "mininclusive": 4.5, "minexclusive": -2, "maxinclusive": 1e300,
+                  "maxexclusive": 10, "totaldigits": 5, "fractiondigits": 2},
+                "semActs": [{"type": "SemAct", "name": "http://ex.org/y", "code": " p(o) "}],
+                "annotations": [{"type": "Annotation", "predicate": "http://ex.org/n",
+                  "object": "http://ex.org/o"}]},
+               "_:f",
+               {"type": "EachOf", "expressions": [
+                 {"type": "TripleConstraint", "predicate": "http://ex.org/c"},
+                 {"type": "TripleConstraint", "predicate": "http://ex.org/d",
+                  "valueExpr": {"type": "Shape"}}]}
+             ]},
+             "semActs": [{"type": "SemAct", "name": "http://ex.org/z"}],
+             "annotations": [{"type": "Annotation", "predicate": "http://ex.org/note",
+               "object": {"value": "hi", "language": "en"}}]},
+            {"id": "_:t", "type": "ShapeOr", "shapeExprs": ["http://ex.org/S",
+              {"type": "ShapeAnd", "shapeExprs": [
+                {"type": "NodeConstraint", "values": []},
+                {"type": "NodeConstraint", "values": [
+                  "http://ex.org/v",
+                  {"value": "1", "type": "http://www.w3.org/2001/XMLSchema#integer"},
+                  {"value": "x"},
+                  {"type": "IriStem", "stem": "http://ex.org/s"},
+                  {"type": "IriStemRange", "stem": {"type": "Wildcard"},
+                   "exclusions": ["http://ex.org/x", {"type": "IriStem", "stem": "http://ex.org/y"}]},
+                  {"type": "LiteralStem", "stem": "ab"},
+                  {"type": "LiteralStemRange", "stem": "a",
+                   "exclusions": ["ab", {"type": "LiteralStem", "stem": "ac"}]},
+                  {"type": "Language", "languageTag": "en"},
+                  {"type": "LanguageStem", "stem": ""},
+                  {"type": "LanguageStemRange", "stem": "en",
+                   "exclusions": ["en-us", {"type": "LanguageStem", "stem": "en-gb"}]}
+                ]}]}]},
+            {"type": "ShapeDecl", "id": "http://ex.org/Alias", "shapeExpr": "http://ex.org/S"},
+            {"id": "http://ex.org/E", "type": "ShapeExternal"}
+          ]
+        }"#,
+        )
+        .unwrap();
+        let s = from_shexj(&doc.to_string()).unwrap();
+        assert_eq!(to_shexj(&s), doc);
+        // and the ShExC of it reads back to the same schema
+        let c = crate::shexc::writer::write(&s);
+        let again = crate::shexc::parser::parse(&c, None).unwrap_or_else(|e| panic!("{e}\n{c}"));
+        let mut expected = doc.clone();
+        // what ShExC cannot say: `closed: false`
+        expected["shapes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("closed");
+        assert_eq!(to_shexj(&again), expected, "\n{c}");
     }
 }

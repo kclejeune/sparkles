@@ -124,8 +124,8 @@ impl Schema {
         shexj::from_shexj(json)
     }
 
-    /// Parse ShExJ, resolving relative IRIs against `base` (imports excepted: the
-    /// [`Resolver`] resolves those).
+    /// Parse ShExJ, resolving relative IRIs against `base` (imports included, as in
+    /// ShExC). Without a base, relative imports are left to the [`Resolver`].
     pub fn from_shexj_with_base(json: &str, base: Option<&str>) -> Result<Schema, ParseError> {
         shexj::from_shexj_with_base(json, base)
     }

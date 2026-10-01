@@ -514,9 +514,11 @@ fn negative_structure() {
 // ------------------------------------------------------------- representation ----
 
 /// ShExJ in a canonical form: numbers compared as doubles, defaulted keys (`min` and
-/// `max` of 1, `closed`, `inverse` and `abstract` false) dropped, and 2.next `ShapeDecl`
+/// `max` of 1, `closed`, `inverse` and `abstract` false) dropped, 2.next `ShapeDecl`
 /// wrappers that are not abstract unwrapped into the ShEx 2.1 form (`id` on the shape
-/// expression). Key order never matters to `Value` equality.
+/// expression), language tags in lower case (they are case-insensitive), and `\/` in
+/// patterns as `/` (the same regular expression). Key order never matters to `Value`
+/// equality.
 fn normalize(v: &Value) -> Value {
     match v {
         Value::Number(n) => n.as_f64().map(Value::from).unwrap_or_else(|| v.clone()),
@@ -543,13 +545,53 @@ fn normalize(v: &Value) -> Value {
                     }
                     _ => false,
                 };
-                if !defaulted {
-                    m.insert(k.clone(), normalize(x));
+                if defaulted {
+                    continue;
                 }
+                let language = matches!(k.as_str(), "language" | "languageTag")
+                    || (k == "stem"
+                        && o.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.starts_with("LanguageStem")));
+                let x = match x {
+                    Value::String(t) if language => Value::String(t.to_lowercase()),
+                    Value::String(t) if k == "pattern" => Value::String(t.replace("\\/", "/")),
+                    Value::Array(a)
+                        if k == "exclusions"
+                            && o.get("type").and_then(Value::as_str)
+                                == Some("LanguageStemRange") =>
+                    {
+                        Value::Array(
+                            a.iter()
+                                .map(|e| match e {
+                                    Value::String(t) => Value::String(t.to_lowercase()),
+                                    e => e.clone(),
+                                })
+                                .collect(),
+                        )
+                    }
+                    x => x.clone(),
+                };
+                m.insert(k.clone(), normalize(&x));
             }
             Value::Object(m)
         }
         _ => v.clone(),
+    }
+}
+
+/// Resolve the relative `imports` of a ShExJ schema against `base`, as reading it with
+/// a base does.
+fn resolve_imports(v: &mut Value, base: &str) {
+    let base = oxiri::Iri::parse(base.to_string()).expect("a base IRI");
+    if let Some(Value::Array(imports)) = v.get_mut("imports") {
+        for i in imports {
+            if let Value::String(s) = i
+                && let Ok(r) = base.resolve(s)
+            {
+                *s = r.into_inner();
+            }
+        }
     }
 }
 
@@ -637,11 +679,12 @@ fn representation(t: &RepTest) -> Outcome {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => return Outcome::Fail(e),
     };
-    let expected: Value = match serde_json::from_str(&json) {
+    let mut expected: Value = match serde_json::from_str(&json) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(format!("{}: {e}", t.json.display())),
     };
     let base = path_to_url(&t.shex);
+    resolve_imports(&mut expected, &path_to_url(&t.json));
     // ShExC → ShExJ is the .json file
     let from_c = match Schema::parse_shexc(&text, Some(&base)) {
         Ok(s) => s,
@@ -659,7 +702,7 @@ fn representation(t: &RepTest) -> Outcome {
         ));
     }
     // ShExJ → ShExC → ShExJ is stable
-    let from_j = match Schema::from_shexj(&json) {
+    let from_j = match Schema::from_shexj_with_base(&json, Some(&path_to_url(&t.json))) {
         Ok(s) => s,
         Err(e) => return failed(format!("ShExJ: {e}")),
     };
@@ -1155,6 +1198,30 @@ fn normalization() {
     assert_eq!(
         normalize(&serde_json::json!({"mininclusive": 5})),
         normalize(&serde_json::json!({"mininclusive": 5.0}))
+    );
+    assert_eq!(
+        normalize(&serde_json::json!({"value": "x", "language": "en-UK"})),
+        normalize(&serde_json::json!({"value": "x", "language": "en-uk"}))
+    );
+    assert_eq!(
+        normalize(
+            &serde_json::json!({"type": "LanguageStemRange", "stem": "EN",
+            "exclusions": ["en-GB", {"type": "LanguageStem", "stem": "en-US"}]})
+        ),
+        normalize(
+            &serde_json::json!({"type": "LanguageStemRange", "stem": "en",
+            "exclusions": ["en-gb", {"type": "LanguageStem", "stem": "en-us"}]})
+        )
+    );
+    assert_eq!(
+        normalize(&serde_json::json!({"pattern": "^https?:\\/\\/"})),
+        normalize(&serde_json::json!({"pattern": "^https?://"}))
+    );
+    let mut j = serde_json::json!({"imports": ["1dot", "http://ex.org/x"]});
+    resolve_imports(&mut j, "file:///suite/schemas/a.json");
+    assert_eq!(
+        j,
+        serde_json::json!({"imports": ["file:///suite/schemas/1dot", "http://ex.org/x"]})
     );
 }
 

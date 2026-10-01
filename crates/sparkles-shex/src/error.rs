@@ -45,7 +45,3 @@ impl SchemaError {
 pub struct TooManyResults {
     pub limit: usize,
 }
-
-/// The message of a part that is not written yet; callers (the conformance harness)
-/// skip what fails with it.
-pub(crate) const NOT_IMPLEMENTED: &str = "not implemented";
