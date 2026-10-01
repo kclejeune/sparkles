@@ -2,11 +2,7 @@
 # before the printers that produce them exist. `cargo test -p sparkles-fmt --test golden`
 # skips them (and never blesses them); `-- --ignored` checks them and reports the ones
 # that pass, which then leave this list. One `<language>/<name>` per line (all its
-# variants), whitespace, and the reason.
-turtle/t1 the Turtle example with prefixes, rdf:type, shorthands and comments, its directive-style/prefix-groups, conventional-layout and preserve variants (before the Turtle printer)
-turtle/t2 the Turtle example with object lists, collections, nested blank nodes and long strings (before the Turtle printer)
-turtle/t4 sections as sort barriers, sorted and as written (before the Turtle printer)
-turtle/t5 the SHACL shapes graph example (before the Turtle printer)
-turtle/a6 literal shorthands only when the lexical form is the token, tags as written (before the Turtle printer)
-trig/t3 the TriG example with annotations, reified triples and triple terms (before the TriG printer)
+# variants) or `<language>/<name>.<variant>` (that variant), whitespace, and the reason.
+turtle/t1.conventional the T1 example under turtle-layout = "conventional" (before the conventional layout)
+turtle/t4.sort sections as sort barriers, sorted (before Turtle sorting)
 nquads/l1 the N-Quads example, default and sorted (before the line formats)

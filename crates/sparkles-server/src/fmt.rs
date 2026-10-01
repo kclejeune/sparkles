@@ -814,10 +814,7 @@ mod tests {
             sniffed("<?xml version=\"1.0\"?>"),
             Err(sparkles_fmt::RDF_XML_MESSAGE.to_string())
         );
-        assert_eq!(
-            sniffed("<a> <b> <c> ."),
-            Err("turtle formatting is not available yet".to_string())
-        );
+        assert_eq!(sniffed("<a> <b> <c> ."), Ok(Language::Turtle));
         assert!(sniffed("# only a comment").is_err());
     }
 }
