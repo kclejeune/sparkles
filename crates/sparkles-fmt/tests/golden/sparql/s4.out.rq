@@ -1,0 +1,18 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+CONSTRUCT {
+  ?p a ex:Contact ;
+    ex:name ?n ;
+    ex:address [
+      ex:city ?city ;
+      ex:country ?country
+    ] .
+}
+WHERE {
+  ?p ex:fullName ?n .
+  OPTIONAL {
+    ?p ex:city ?city ;
+      ex:country ?country .
+  }
+}
