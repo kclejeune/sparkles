@@ -47,7 +47,8 @@ pub struct GeoConfig {
     /// index W3C Basic Geo `lat`/`long` pairs as points
     #[serde(default)]
     pub wgs84: bool,
-    /// match the topological `geo:` properties against geometries (not supported yet)
+    /// match the topological `geo:` properties against geometries as well as asserted
+    /// triples (GeoSPARQL's query rewrite; off by default)
     #[serde(default)]
     pub query_rewrite: bool,
     /// distance model of geographic coordinates
@@ -108,9 +109,6 @@ impl GeoConfig {
                 "formatVersion: {} is not supported (this build reads {FORMAT_VERSION})",
                 self.format_version
             ));
-        }
-        if self.query_rewrite {
-            return bad("queryRewrite: not supported yet".into());
         }
         if self.predicates.is_empty() {
             return bad("predicates: at least one predicate is needed".into());
@@ -351,11 +349,12 @@ mod tests {
         let err = |c: GeoConfig| c.validate().unwrap_err().to_string();
         let d = GeoConfig::default;
         assert!(
-            err(GeoConfig {
+            GeoConfig {
                 query_rewrite: true,
                 ..d()
-            })
-            .contains("queryRewrite: not supported yet")
+            }
+            .validate()
+            .is_ok()
         );
         assert!(GeoConfig { wgs84: true, ..d() }.validate().is_ok());
         assert!(

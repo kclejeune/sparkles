@@ -197,14 +197,27 @@ fn load_default_graph(snap: &Snapshot) -> anyhow::Result<graph::Graph> {
 fn derive(
     snap: Arc<Snapshot>,
     profile: &Profile,
+    extras: &Extras,
     opts: &ReasonOptions,
 ) -> anyhow::Result<Derivation> {
-    let rules = profile
+    let mut rules = profile
         .rules()
         .with_context(|| format!("parsing rules for profile '{}'", profile.name()))?;
+    for v in &extras.vocabularies {
+        rules.extend(
+            v.rules()
+                .with_context(|| format!("parsing the {v} vocabulary"))?,
+        );
+    }
     progress(opts, 0.0, "loading default graph");
     let mut g = load_default_graph(&snap)?;
+    // rows from here on are derived
+    let base_len = g.len();
     let terms = Terms::new(snap);
+    if extras.geo_default_geometry {
+        let defaults = default_geometries(&g, &terms);
+        g.add_batch(defaults);
+    }
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &terms, &mut warnings);
     let limits = engine::Limits {
@@ -216,13 +229,49 @@ fn derive(
     progress(opts, 0.1, "reasoning");
     let out = engine::run(&mut g, &compiled, &terms, &limits)?;
     Ok(Derivation {
-        base_len: out.base_len,
+        base_len,
         graph: g,
         terms,
         rules: compiled.len(),
         iterations: out.iterations,
         warnings,
     })
+}
+
+/// `F geo:hasDefaultGeometry G` for every `F` of the default graph with exactly one
+/// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
+/// `applyDefaultGeometry`).
+fn default_geometries(g: &graph::Graph, terms: &Terms) -> Vec<[u64; 3]> {
+    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    let iri = |l: &str| {
+        terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
+            "{GEO}{l}"
+        ))))
+    };
+    let (has, default) = (iri("hasGeometry"), iri("hasDefaultGeometry"));
+    // feature → its only geometry (`None` once it has a second)
+    let mut one: FxHashMap<u64, Option<u64>> = FxHashMap::default();
+    let mut with_default: FxHashSet<u64> = FxHashSet::default();
+    for t in &g.triples {
+        if t[1] == has {
+            one.entry(t[0])
+                .and_modify(|x| {
+                    if *x != Some(t[2]) {
+                        *x = None;
+                    }
+                })
+                .or_insert(Some(t[2]));
+        } else if t[1] == default {
+            with_default.insert(t[0]);
+        }
+    }
+    let mut out: Vec<[u64; 3]> = one
+        .into_iter()
+        .filter(|(f, _)| !with_default.contains(f))
+        .filter_map(|(f, geom)| Some([f, default, geom?]))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 impl Derivation {
@@ -239,6 +288,11 @@ impl Derivation {
 }
 
 /// [`materialize`] with the vocabularies and switches of `extras` added to the profile.
+///
+/// A vocabulary's axioms join the rules (their triples, and what the rules derive from
+/// them, land in [`INFERRED_GRAPH`] like the RDFS axiomatic triples); the GeoSPARQL
+/// default geometries are derived before the rules run, so the rules see them, and are
+/// written with the other derived triples (a re-run or [`clear`] keeps them consistent).
 pub fn materialize_with(
     store: &Store,
     profile: &Profile,
@@ -246,24 +300,10 @@ pub fn materialize_with(
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
-    materialize(store, profile, opts)
-}
-
-/// Clear [`INFERRED_GRAPH`], run the rules over the default graph, and write every
-/// derived triple that is not already in the default graph into [`INFERRED_GRAPH`] in
-/// one write transaction.
-///
-/// The store's writer lock is held for the whole run, so the entailments are exactly
-/// those of the committed default graph at the start.
-pub fn materialize(
-    store: &Store,
-    profile: &Profile,
-    opts: &ReasonOptions,
-) -> anyhow::Result<ReasonReport> {
     let t0 = Instant::now();
     let mut txn = store.write_as(sparkles::commit::CommitKind::Reason);
     let snap = txn.base().clone();
-    let d = derive(snap.clone(), profile, opts)?;
+    let d = derive(snap.clone(), profile, extras, opts)?;
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
 
@@ -366,6 +406,20 @@ pub fn materialize(
     Ok(report)
 }
 
+/// Clear [`INFERRED_GRAPH`], run the rules over the default graph, and write every
+/// derived triple that is not already in the default graph into [`INFERRED_GRAPH`] in
+/// one write transaction.
+///
+/// The store's writer lock is held for the whole run, so the entailments are exactly
+/// those of the committed default graph at the start.
+pub fn materialize(
+    store: &Store,
+    profile: &Profile,
+    opts: &ReasonOptions,
+) -> anyhow::Result<ReasonReport> {
+    materialize_with(store, profile, &Extras::default(), opts)
+}
+
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
     let mut txn = store.write_as(sparkles::commit::CommitKind::ReasonClear);
@@ -393,7 +447,7 @@ pub fn infer(
     opts: &ReasonOptions,
 ) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
-    let d = derive(snap, profile, opts)?;
+    let d = derive(snap, profile, &Extras::default(), opts)?;
     let mut out = Vec::new();
     for t in d.derived() {
         if !d.valid(t) {

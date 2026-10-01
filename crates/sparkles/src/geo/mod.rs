@@ -242,9 +242,9 @@ mod tests {
         let p = probe(dir.path(), false);
         assert!(p.configured && p.config_error.is_none());
         assert_eq!(p.unsupported, !cfg!(feature = "geo"));
-        std::fs::write(dir.path().join(CONFIG_FILE), br#"{"queryRewrite":true}"#).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), br#"{"maxVertices":0}"#).unwrap();
         let p = probe(dir.path(), false);
-        assert!(p.config_error.unwrap().contains("queryRewrite"));
+        assert!(p.config_error.unwrap().contains("maxVertices"));
         std::fs::write(dir.path().join(CONFIG_FILE), b"{").unwrap();
         assert!(probe(dir.path(), false).config_error.is_some());
     }

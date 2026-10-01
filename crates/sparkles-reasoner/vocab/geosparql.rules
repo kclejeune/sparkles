@@ -1,0 +1,161 @@
+#------------------------------------------------------------------
+# GeoSPARQL 1.1 and Simple Features vocabulary axioms (Sparkles).
+#
+# Written for Sparkles from the class and property definitions of the
+# OGC GeoSPARQL 1.1 standard (the geo: ontology and the sf: geometry
+# types); no OGC file is copied. Added to a profile's rules by
+# `infer --vocab geosparql`, so the profile's subclass, subproperty,
+# domain and range rules close the data over them (with rdfs:
+# sf:Polygon ⊑ sf:Surface ⊑ sf:Geometry ⊑ geo:Geometry, and so on).
+#
+# Ranges that are literal datatypes (geo:asWKT → geo:wktLiteral, the
+# size properties → xsd:double, …) are left out: they would only type
+# literals, which RDF cannot state.
+#------------------------------------------------------------------
+
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+@prefix sf:  <http://www.opengis.net/ont/sf#> .
+
+#------------------------------------------------------------------
+# Classes
+#------------------------------------------------------------------
+
+-> (geo:SpatialObject rdf:type rdfs:Class).
+-> (geo:Feature rdfs:subClassOf geo:SpatialObject).
+-> (geo:Geometry rdfs:subClassOf geo:SpatialObject).
+-> (geo:SpatialObjectCollection rdfs:subClassOf rdfs:Container).
+-> (geo:FeatureCollection rdfs:subClassOf geo:SpatialObjectCollection).
+-> (geo:GeometryCollection rdfs:subClassOf geo:SpatialObjectCollection).
+
+# Simple Features geometry types
+-> (sf:Geometry rdfs:subClassOf geo:Geometry).
+-> (sf:Point rdfs:subClassOf sf:Geometry).
+-> (sf:Curve rdfs:subClassOf sf:Geometry).
+-> (sf:Surface rdfs:subClassOf sf:Geometry).
+-> (sf:GeometryCollection rdfs:subClassOf sf:Geometry).
+-> (sf:LineString rdfs:subClassOf sf:Curve).
+-> (sf:Line rdfs:subClassOf sf:LineString).
+-> (sf:LinearRing rdfs:subClassOf sf:LineString).
+-> (sf:Polygon rdfs:subClassOf sf:Surface).
+-> (sf:Triangle rdfs:subClassOf sf:Polygon).
+-> (sf:PolyhedralSurface rdfs:subClassOf sf:Surface).
+-> (sf:TIN rdfs:subClassOf sf:PolyhedralSurface).
+-> (sf:MultiPoint rdfs:subClassOf sf:GeometryCollection).
+-> (sf:MultiCurve rdfs:subClassOf sf:GeometryCollection).
+-> (sf:MultiLineString rdfs:subClassOf sf:MultiCurve).
+-> (sf:MultiSurface rdfs:subClassOf sf:GeometryCollection).
+-> (sf:MultiPolygon rdfs:subClassOf sf:MultiSurface).
+
+# geometry literal datatypes
+-> (geo:wktLiteral rdf:type rdfs:Datatype).
+-> (geo:gmlLiteral rdf:type rdfs:Datatype).
+-> (geo:geoJSONLiteral rdf:type rdfs:Datatype).
+-> (geo:kmlLiteral rdf:type rdfs:Datatype).
+-> (geo:dggsLiteral rdf:type rdfs:Datatype).
+
+#------------------------------------------------------------------
+# Features and their geometries
+#------------------------------------------------------------------
+
+-> (geo:hasGeometry rdfs:domain geo:Feature).
+-> (geo:hasGeometry rdfs:range geo:Geometry).
+-> (geo:hasDefaultGeometry rdfs:subPropertyOf geo:hasGeometry).
+-> (geo:hasDefaultGeometry rdfs:domain geo:Feature).
+-> (geo:hasDefaultGeometry rdfs:range geo:Geometry).
+-> (geo:hasCentroid rdfs:subPropertyOf geo:hasGeometry).
+-> (geo:hasCentroid rdfs:range geo:Geometry).
+-> (geo:hasBoundingBox rdfs:subPropertyOf geo:hasGeometry).
+-> (geo:hasBoundingBox rdfs:range geo:Geometry).
+
+#------------------------------------------------------------------
+# Geometries and their serializations and properties
+#------------------------------------------------------------------
+
+-> (geo:hasSerialization rdfs:domain geo:Geometry).
+-> (geo:asWKT rdfs:subPropertyOf geo:hasSerialization).
+-> (geo:asGML rdfs:subPropertyOf geo:hasSerialization).
+-> (geo:asGeoJSON rdfs:subPropertyOf geo:hasSerialization).
+-> (geo:asKML rdfs:subPropertyOf geo:hasSerialization).
+-> (geo:asDGGS rdfs:subPropertyOf geo:hasSerialization).
+-> (geo:asWKT rdfs:domain geo:Geometry).
+-> (geo:asGML rdfs:domain geo:Geometry).
+-> (geo:asGeoJSON rdfs:domain geo:Geometry).
+-> (geo:asKML rdfs:domain geo:Geometry).
+-> (geo:asDGGS rdfs:domain geo:Geometry).
+
+-> (geo:dimension rdfs:domain geo:Geometry).
+-> (geo:coordinateDimension rdfs:domain geo:Geometry).
+-> (geo:spatialDimension rdfs:domain geo:Geometry).
+-> (geo:isEmpty rdfs:domain geo:Geometry).
+-> (geo:isSimple rdfs:domain geo:Geometry).
+-> (geo:hasSpatialResolution rdfs:domain geo:Geometry).
+-> (geo:hasMetricSpatialResolution rdfs:domain geo:Geometry).
+-> (geo:hasSpatialAccuracy rdfs:domain geo:Geometry).
+-> (geo:hasMetricSpatialAccuracy rdfs:domain geo:Geometry).
+
+# sizes of spatial objects
+-> (geo:hasSize rdfs:domain geo:SpatialObject).
+-> (geo:hasLength rdfs:subPropertyOf geo:hasSize).
+-> (geo:hasPerimeterLength rdfs:subPropertyOf geo:hasSize).
+-> (geo:hasArea rdfs:subPropertyOf geo:hasSize).
+-> (geo:hasVolume rdfs:subPropertyOf geo:hasSize).
+-> (geo:hasMetricSize rdfs:domain geo:SpatialObject).
+-> (geo:hasMetricLength rdfs:subPropertyOf geo:hasMetricSize).
+-> (geo:hasMetricPerimeterLength rdfs:subPropertyOf geo:hasMetricSize).
+-> (geo:hasMetricArea rdfs:subPropertyOf geo:hasMetricSize).
+-> (geo:hasMetricVolume rdfs:subPropertyOf geo:hasMetricSize).
+
+#------------------------------------------------------------------
+# The topological relations between spatial objects
+#------------------------------------------------------------------
+
+-> (geo:sfEquals rdfs:domain geo:SpatialObject).
+-> (geo:sfEquals rdfs:range geo:SpatialObject).
+-> (geo:sfDisjoint rdfs:domain geo:SpatialObject).
+-> (geo:sfDisjoint rdfs:range geo:SpatialObject).
+-> (geo:sfIntersects rdfs:domain geo:SpatialObject).
+-> (geo:sfIntersects rdfs:range geo:SpatialObject).
+-> (geo:sfTouches rdfs:domain geo:SpatialObject).
+-> (geo:sfTouches rdfs:range geo:SpatialObject).
+-> (geo:sfWithin rdfs:domain geo:SpatialObject).
+-> (geo:sfWithin rdfs:range geo:SpatialObject).
+-> (geo:sfContains rdfs:domain geo:SpatialObject).
+-> (geo:sfContains rdfs:range geo:SpatialObject).
+-> (geo:sfOverlaps rdfs:domain geo:SpatialObject).
+-> (geo:sfOverlaps rdfs:range geo:SpatialObject).
+-> (geo:sfCrosses rdfs:domain geo:SpatialObject).
+-> (geo:sfCrosses rdfs:range geo:SpatialObject).
+
+-> (geo:ehEquals rdfs:domain geo:SpatialObject).
+-> (geo:ehEquals rdfs:range geo:SpatialObject).
+-> (geo:ehDisjoint rdfs:domain geo:SpatialObject).
+-> (geo:ehDisjoint rdfs:range geo:SpatialObject).
+-> (geo:ehMeet rdfs:domain geo:SpatialObject).
+-> (geo:ehMeet rdfs:range geo:SpatialObject).
+-> (geo:ehOverlap rdfs:domain geo:SpatialObject).
+-> (geo:ehOverlap rdfs:range geo:SpatialObject).
+-> (geo:ehCovers rdfs:domain geo:SpatialObject).
+-> (geo:ehCovers rdfs:range geo:SpatialObject).
+-> (geo:ehCoveredBy rdfs:domain geo:SpatialObject).
+-> (geo:ehCoveredBy rdfs:range geo:SpatialObject).
+-> (geo:ehInside rdfs:domain geo:SpatialObject).
+-> (geo:ehInside rdfs:range geo:SpatialObject).
+-> (geo:ehContains rdfs:domain geo:SpatialObject).
+-> (geo:ehContains rdfs:range geo:SpatialObject).
+
+-> (geo:rcc8eq rdfs:domain geo:SpatialObject).
+-> (geo:rcc8eq rdfs:range geo:SpatialObject).
+-> (geo:rcc8dc rdfs:domain geo:SpatialObject).
+-> (geo:rcc8dc rdfs:range geo:SpatialObject).
+-> (geo:rcc8ec rdfs:domain geo:SpatialObject).
+-> (geo:rcc8ec rdfs:range geo:SpatialObject).
+-> (geo:rcc8po rdfs:domain geo:SpatialObject).
+-> (geo:rcc8po rdfs:range geo:SpatialObject).
+-> (geo:rcc8tppi rdfs:domain geo:SpatialObject).
+-> (geo:rcc8tppi rdfs:range geo:SpatialObject).
+-> (geo:rcc8tpp rdfs:domain geo:SpatialObject).
+-> (geo:rcc8tpp rdfs:range geo:SpatialObject).
+-> (geo:rcc8ntpp rdfs:domain geo:SpatialObject).
+-> (geo:rcc8ntpp rdfs:range geo:SpatialObject).
+-> (geo:rcc8ntppi rdfs:domain geo:SpatialObject).
+-> (geo:rcc8ntppi rdfs:range geo:SpatialObject).
