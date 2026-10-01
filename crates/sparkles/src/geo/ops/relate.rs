@@ -20,16 +20,17 @@ use crate::geo::geom::Geom;
 use crate::geo::{GeomRef, Relation};
 use georust::dimensions::Dimensions;
 use georust::relate::IntersectionMatrix;
-use georust::{BoundingRect, Geometry, HasDimensions, Intersects, PreparedGeometry, Relate};
+use georust::{BoundingRect, Geometry, HasDimensions, Intersects, PreparedGeometry, Rect, Relate};
 
 /// Whether `r(a, b)` holds (`b` is transformed into `a`'s CRS).
 pub fn relation(a: &Geom, b: &Geom, r: Relation) -> Result<bool, OpError> {
     let b = in_crs(b, &a.crs)?;
-    if let Some(v) = decided(a, &b, r) {
+    let (fa, fb) = (Facts::of(a), Facts::of(&b));
+    if let Some(v) = decided(&fa, &fb, r) {
         return Ok(v);
     }
     let im = guarded(r.local(), || a.g.relate(&b.g))?;
-    Ok(holds(&im, r, dim(&a.g), dim(&b.g)))
+    Ok(holds(&im, r, fa.dim, fb.dim))
 }
 
 /// Whether the DE-9IM matrix of `(a, b)` matches `pattern` (9 characters of `TF*012`,
@@ -57,6 +58,7 @@ pub struct Prepared {
     /// `None` for an empty geometry, or when preparing failed (tests then use the
     /// plain geometry)
     prep: Option<PreparedGeometry<'static, Geometry<f64>>>,
+    facts: Facts,
 }
 
 impl Prepared {
@@ -66,7 +68,8 @@ impl Prepared {
         } else {
             guarded("prepare", || PreparedGeometry::from(g.g.clone())).ok()
         };
-        Prepared { g, prep }
+        let facts = Facts::of(&g);
+        Prepared { g, prep, facts }
     }
 
     pub fn geom(&self) -> &GeomRef {
@@ -83,11 +86,12 @@ impl Prepared {
     /// `r(self, b)`.
     pub fn relation(&self, b: &Geom, r: Relation) -> Result<bool, OpError> {
         let b = in_crs(b, &self.g.crs)?;
-        if let Some(v) = decided(&self.g, &b, r) {
+        let fb = Facts::of(&b);
+        if let Some(v) = decided(&self.facts, &fb, r) {
             return Ok(v);
         }
         let im = self.matrix(&b, r.local())?;
-        Ok(holds(&im, r, dim(&self.g.g), dim(&b.g)))
+        Ok(holds(&im, r, self.facts.dim, fb.dim))
     }
 
     /// The DE-9IM matrix of `(self, b)` against `pattern`.
@@ -136,18 +140,38 @@ fn areal(g: &Geometry<f64>) -> bool {
     }
 }
 
+/// What the relations need to know of a geometry besides its matrix.
+#[derive(Clone, Copy, Debug)]
+struct Facts {
+    empty: bool,
+    areal: bool,
+    dim: i8,
+    rect: Option<Rect<f64>>,
+}
+
+impl Facts {
+    fn of(g: &Geom) -> Facts {
+        Facts {
+            empty: g.empty,
+            areal: areal(&g.g),
+            dim: dim(&g.g),
+            rect: g.g.bounding_rect(),
+        }
+    }
+}
+
 /// The answer when it does not need the matrix: empty geometries, RCC8 relations of
 /// non-regions, dimension pairs a relation excludes, disjoint envelopes.
-fn decided(a: &Geom, b: &Geom, r: Relation) -> Option<bool> {
+fn decided(a: &Facts, b: &Facts, r: Relation) -> Option<bool> {
     use Relation::*;
     let disjoint = matches!(r, SfDisjoint | EhDisjoint | Rcc8Dc);
     if a.empty || b.empty {
         return Some(matches!(r, SfDisjoint | EhDisjoint));
     }
-    if r.areal_only() && !(areal(&a.g) && areal(&b.g)) {
+    if r.areal_only() && !(a.areal && b.areal) {
         return Some(false);
     }
-    let (da, db) = (dim(&a.g), dim(&b.g));
+    let (da, db) = (a.dim, b.dim);
     let excluded = match r {
         SfTouches | EhMeet => da == 0 && db == 0,
         SfOverlaps => da != db || da == -1,
@@ -157,7 +181,7 @@ fn decided(a: &Geom, b: &Geom, r: Relation) -> Option<bool> {
     if excluded {
         return Some(false);
     }
-    match (a.g.bounding_rect(), b.g.bounding_rect()) {
+    match (a.rect, b.rect) {
         (Some(ra), Some(rb)) if !ra.intersects(&rb) => Some(disjoint),
         _ => None,
     }
