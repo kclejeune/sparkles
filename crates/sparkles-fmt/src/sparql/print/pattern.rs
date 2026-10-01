@@ -38,16 +38,19 @@ pub fn minus(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 }
 
 /// `Union`: the branches one space apart (`} UNION {`); a lone group as itself. A
-/// branch with a leading comment starts its own line, the comment above its `UNION`.
+/// branch with a leading comment starts its own line, the comment above its `UNION`,
+/// and so does a branch after one with a trailing comment.
 pub fn union(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let mut parts = Vec::new();
+    let mut after_comment = false;
     for (i, e) in cx.children(n).into_iter().enumerate() {
         if i > 0 {
             parts.push(match e {
-                Element::Node(b) if cx.has_leading(b) => cx.hard_line(),
+                Element::Node(b) if after_comment || cx.has_leading(b) => cx.hard_line(),
                 _ => cx.space(),
             });
         }
+        after_comment = matches!(e, Element::Node(b) if !cx.comments.trailing(b).is_empty());
         parts.push(term::element(cx, e));
     }
     cx.concat(parts)
@@ -136,7 +139,6 @@ fn starts_with_paren(cx: &Ctx<'_, '_>, e: Element) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::{Ctx, RULES};
-    use crate::doc::DocArena;
     use crate::lex::{LexMode, lex};
     use crate::sparql::Unit;
     use crate::syntax::NodeKind;
@@ -155,12 +157,7 @@ pub(crate) mod tests {
             .find(|&n| tree.kind(n) == kind)
             .expect("a node of that kind");
         let comments = Comments::attach(&tree, &RULES);
-        let mut cx = Ctx {
-            tree: &tree,
-            arena: DocArena::new(&tree.tokens),
-            opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&tree, &comments, opts);
         let d = cx.node(n);
         let p = crate::doc::print(&cx.arena, d, src, opts.line_width, opts.indent_width, None);
         p.unwrap().text
@@ -219,6 +216,8 @@ pub(crate) mod tests {
             group("# a\n?s ?p ?o . # b\n\n\n# c\n{ ?a ?b ?c } # d\n# e\nUNION { } # f\n"),
             "{\n  # a\n  ?s ?p ?o . # b\n\n  # c\n  {\n    ?a ?b ?c .\n  } # d\n  # e\n  UNION {} # f\n}"
         );
+        // a branch after a trailing comment starts its own line
+        assert_eq!(group("{} # d\nUNION {}"), "{\n  {} # d\n  UNION {}\n}");
     }
 
     #[test]

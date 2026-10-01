@@ -64,7 +64,7 @@ pub fn triples_stmt(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 /// follows in the same list.
 pub fn property_list_entry(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let verb = match cx.children(n).first() {
-        Some(&Element::Token(t)) => term::verb(cx, t),
+        Some(&Element::Token(t)) => cx.verb(t),
         Some(&Element::Node(v)) if cx.tree.kind(v) != NodeKind::Object => cx.node(v),
         _ => cx.nil(),
     };
