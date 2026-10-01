@@ -142,15 +142,20 @@ impl Lookup {
     /// The lookup for `snap`'s generation, with the configured predicates that `snap`
     /// knows resolved.
     pub fn new(snap: &Snapshot, cfg: &GeoConfig) -> Lookup {
-        let mut preds = FxHashMap::default();
+        let l = Lookup::empty(cfg);
+        l.resolve(snap, cfg);
+        l
+    }
+
+    /// Learn the ids `snap` has for the configured predicates (a predicate first used
+    /// after the lookup was made has a delta id it does not know yet).
+    pub fn resolve(&self, snap: &Snapshot, cfg: &GeoConfig) {
+        let mut preds = self.preds.write();
         for (i, iri) in cfg.predicates.iter().enumerate() {
             if let Some(id) = snap.lookup_iri(iri) {
                 preds.insert(id.0, Some(i as u16));
             }
         }
-        let l = Lookup::empty(cfg);
-        *l.preds.write() = preds;
-        l
     }
 
     /// A lookup that knows no ids yet.
@@ -425,6 +430,7 @@ pub(crate) fn overlay_of(
     base: &GeoBase,
     lookup: &Lookup,
 ) -> Overlay {
+    lookup.resolve(snap, cfg);
     let ins = &snap.delta.ins[Perm::Pso.index()];
     let mut rows = Vec::new();
     if ins.is_empty() {
@@ -650,6 +656,7 @@ pub struct GeoIndex {
     /// test hook: background builds wait before they publish
     pub(crate) paused: AtomicBool,
     /// test hook: the next commit-path update fails
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fail_next: AtomicBool,
 }
 
@@ -664,6 +671,7 @@ impl GeoIndex {
             done: Condvar::new(),
             retired: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            #[cfg(any(test, feature = "failpoints"))]
             fail_next: AtomicBool::new(false),
         }
     }

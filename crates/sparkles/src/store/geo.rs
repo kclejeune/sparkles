@@ -353,6 +353,7 @@ impl Store {
         let current = Arc::downgrade(&self.current);
         let writer = Arc::downgrade(&self.writer);
         let uid = snap.generation.uid;
+        let failed = idx.clone();
         let spawned = std::thread::Builder::new()
             .name("geo-build".into())
             .spawn(move || {
@@ -397,6 +398,7 @@ impl Store {
             });
         if let Err(e) = spawned {
             tracing::error!("cannot start the spatial index build: {e}");
+            failed.finish(epoch, Some(format!("build failed: {e}")), None);
         }
     }
 }
@@ -603,7 +605,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     fn preds(snap: &Snapshot) -> Vec<Id> {
-        ["asWKT", "asGeoJSON"]
+        ["asWKT", "asGeoJSON", "hasSerialization"]
             .iter()
             .filter_map(|p| snap.lookup_iri(&format!("{GEO}{p}")))
             .collect()
@@ -710,6 +712,16 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         let near = |s| window(s, NEAR, GraphFilter::All).0;
         assert_eq!(near(ds.snapshot()), names(&["gA", "g1", "g5"]));
         assert_eq!(near(reader.clone()), names(&["gA", "g1"]));
+        // a configured predicate the base does not have
+        update(
+            &ds,
+            "INSERT",
+            r#"ex:g7 geo:hasSerialization "POINT(30 30)"^^geo:wktLiteral"#,
+        );
+        assert_eq!(
+            window(ds.snapshot(), [29.0, 29.0, 31.0, 31.0], GraphFilter::All).0,
+            names(&["g3", "g7"])
+        );
         update(
             &ds,
             "DELETE",
@@ -720,8 +732,8 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert!(!st.fallback);
         assert_eq!(near(reader), names(&["gA", "g1"]));
         let s = ds.store().geo_status().unwrap();
-        assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 0, 1));
-        assert_eq!(s.literals, 8);
+        assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 0, 2));
+        assert_eq!(s.literals, 9);
         // deleting and inserting a quad again leaves one row
         for op in ["DELETE", "INSERT", "DELETE", "INSERT"] {
             update(&ds, op, r#"ex:g5 geo:asWKT "POINT(1 1)"^^geo:wktLiteral"#);
@@ -733,7 +745,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         let s = ds.store().geo_status().unwrap();
         assert_eq!(
             (s.state.as_str(), s.rows.base, s.rows.overlay, s.rows.tail),
-            ("ready", 7, 0, 0)
+            ("ready", 8, 0, 0)
         );
         assert_eq!(ds.snapshot().geo.as_ref().unwrap().epoch, epoch);
         assert_eq!(near(ds.snapshot()), names(&["gA", "g5"]));
@@ -804,21 +816,23 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert!(matches!(state(&ds), IndexState::Building(_)));
         let (rows, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
         assert!(st.fallback);
-        // commits go on meanwhile
+        // commits go on meanwhile, with a predicate the build did not know
         update(
             &ds,
             "INSERT",
-            r#"ex:g5 geo:asWKT "POINT(1 1)"^^geo:wktLiteral"#,
+            r#"ex:g5 geo:asWKT "POINT(1 1)"^^geo:wktLiteral .
+            ex:g7 geo:hasSerialization "POINT(1.5 1.5)"^^geo:wktLiteral"#,
         );
         assert!(matches!(state(&ds), IndexState::Building(_)));
         ds.store().pause_geo_build(false);
         let s = ds.store().wait_geo().unwrap();
         assert_eq!(s.state, "ready");
-        assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 1, 0));
+        assert_eq!((s.rows.base, s.rows.overlay, s.rows.tail), (7, 2, 0));
         let (after, st, _) = window(ds.snapshot(), WORLD, GraphFilter::All);
         assert!(!st.fallback);
         let mut expected = rows;
         expected.insert("g5".into());
+        expected.insert("g7".into());
         assert_eq!(after, expected);
     }
 
