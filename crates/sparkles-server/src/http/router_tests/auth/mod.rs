@@ -1568,6 +1568,7 @@ fn route_coverage() {
     // the routers: `http::router` up to its layers, and the auth routes
     let routers = [
         include_str!("../../../http.rs"),
+        include_str!("../../../http/format.rs"),
         include_str!("../../../auth/api.rs"),
         include_str!("../../../auth/handlers.rs"),
         include_str!("../../../backup/http.rs"),
@@ -1577,7 +1578,12 @@ fn route_coverage() {
     for src in routers {
         let start = src.find("Router::new()").unwrap();
         let rest = &src[start..];
-        let end = rest.find(".layer(").or_else(|| rest.find("\n}")).unwrap();
+        // the end of the statement that builds it (a route's own `.layer(` is inside)
+        let end = [rest.find(";\n"), rest.find("\n}")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap();
         body.push_str(&rest[..end]);
     }
     let method_re = regex::Regex::new(r"\b(get|post|put|delete|head|any)\(").unwrap();

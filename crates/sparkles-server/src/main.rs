@@ -11,6 +11,8 @@ mod check_cmd;
 mod clone;
 mod compress;
 mod exposure;
+#[cfg(feature = "fmt")]
+mod fmt;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -538,6 +540,19 @@ enum Cmd {
         /// socket
         #[arg(long, value_name = "NAME")]
         public_host: Vec<String>,
+        /// Who may use POST /$/format: on (every caller the server admits), authenticated
+        /// (not the anonymous principal) or off
+        #[cfg(feature = "fmt")]
+        #[arg(long, value_enum, default_value_t = state::FormatEndpoint::On, value_name = "MODE")]
+        format_endpoint: state::FormatEndpoint,
+        /// Largest request body of POST /$/format, in MiB (0: unlimited)
+        #[cfg(feature = "fmt")]
+        #[arg(long, default_value_t = 16)]
+        format_max_mb: u64,
+        /// Seconds a POST /$/format request may take, waiting for a slot included
+        #[cfg(feature = "fmt")]
+        #[arg(long, default_value_t = 10.0, value_name = "SECS")]
+        format_timeout: f64,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -549,6 +564,9 @@ enum Cmd {
     /// on stdin/stdout): read-only tools for schema discovery and bounded queries
     #[cfg(feature = "mcp")]
     Mcp(mcp::McpArgs),
+    /// Format SPARQL queries and updates: print, check (--check, -l) or rewrite (--write)
+    #[cfg(feature = "fmt")]
+    Fmt(fmt::FmtArgs),
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
         #[arg(long)]
@@ -1274,6 +1292,12 @@ fn run() -> Result<()> {
             rate_limit_config,
             rate_limit_trusted_proxy,
             rate_limit_trusted_proxy_header,
+            #[cfg(feature = "fmt")]
+            format_endpoint,
+            #[cfg(feature = "fmt")]
+            format_max_mb,
+            #[cfg(feature = "fmt")]
+            format_timeout,
             ..
         } => {
             // an open server on the network, or a bad auth configuration, stops the
@@ -1348,6 +1372,18 @@ fn run() -> Result<()> {
                 max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(max_timeout)),
             };
+            #[cfg(feature = "fmt")]
+            {
+                if !(format_timeout.is_finite() && format_timeout > 0.0) {
+                    bail!("--format-timeout expects a positive number of seconds");
+                }
+                st.format = state::FormatConf {
+                    endpoint: format_endpoint,
+                    max_bytes: mib(format_max_mb),
+                    timeout: Duration::from_secs_f64(format_timeout),
+                    ..Default::default()
+                };
+            }
             if let Some(max) = st.limits.max_timeout
                 && (st.default_timeout > max || st.limits.update_timeout.is_some_and(|u| u > max))
             {
@@ -1510,6 +1546,8 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "mcp")]
         Cmd::Mcp(args) => mcp::run(args, opts),
+        #[cfg(feature = "fmt")]
+        Cmd::Fmt(args) => fmt::run(args),
         Cmd::Load {
             loc,
             graph,

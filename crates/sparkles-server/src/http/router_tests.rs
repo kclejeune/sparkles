@@ -18,6 +18,8 @@ mod auth;
 mod backup;
 mod clone;
 mod cost;
+#[cfg(feature = "fmt")]
+mod format;
 mod loads;
 mod open;
 #[cfg(feature = "reasoning")]

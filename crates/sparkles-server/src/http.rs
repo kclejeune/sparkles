@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+#[cfg(feature = "fmt")]
+mod format;
 mod history;
 mod schema;
 mod stream;
@@ -32,24 +34,27 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 type St = State<Arc<AppState>>;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let cors = crate::auth::cors_layer(
-        &state,
-        vec![
-            header::HeaderName::from_static(SPARKLES_COMMIT),
-            header::HeaderName::from_static(SPARKLES_DATASET_ID),
-            crate::obs::X_REQUEST_ID.clone(),
-            header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
-            header::HeaderName::from_static(history::SPARKLES_AT),
-            header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
-            header::HeaderName::from_static(history::SPARKLES_HEAD),
-            header::HeaderName::from_static("memento-datetime"),
-            header::LINK,
-            header::RETRY_AFTER,
-            header::HeaderName::from_static("ratelimit"),
-            header::HeaderName::from_static("ratelimit-policy"),
-            header::HeaderName::from_static("traceresponse"),
-        ],
-    );
+    #[cfg_attr(not(feature = "fmt"), allow(unused_mut))]
+    let mut exposed = vec![
+        header::HeaderName::from_static(SPARKLES_COMMIT),
+        header::HeaderName::from_static(SPARKLES_DATASET_ID),
+        crate::obs::X_REQUEST_ID.clone(),
+        header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
+        header::HeaderName::from_static(history::SPARKLES_AT),
+        header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
+        header::HeaderName::from_static(history::SPARKLES_HEAD),
+        header::HeaderName::from_static("memento-datetime"),
+        header::LINK,
+        header::RETRY_AFTER,
+        header::HeaderName::from_static("ratelimit"),
+        header::HeaderName::from_static("ratelimit-policy"),
+        header::HeaderName::from_static("traceresponse"),
+    ];
+    #[cfg(feature = "fmt")]
+    exposed.push(header::HeaderName::from_static(
+        format::SPARKLES_FORMAT_CHANGED,
+    ));
+    let cors = crate::auth::cors_layer(&state, exposed);
     let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui/") }))
         .route("/ui", get(|| async { Redirect::temporary("/ui/") }))
@@ -126,6 +131,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
+    // the formatter, with its own body limit
+    #[cfg(feature = "fmt")]
+    let app = app.merge(format::routes(&state));
     let app = app
         // a dataset being replaced in place answers 503 (inside the auth layer, so a
         // hidden dataset stays a 404)

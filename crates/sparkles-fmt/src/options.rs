@@ -163,6 +163,24 @@ pub fn get(o: &Options, kebab_key: &str) -> Option<Value> {
     })
 }
 
+/// One prefix group from a comma-separated list of labels (`--prefix-group rdf,rdfs`,
+/// `prefixGroup=rdf,rdfs`), where `""` is the empty label. The labels are checked by
+/// [`set`].
+pub fn group_from_list(list: &str) -> Result<Vec<String>, OptionError> {
+    list.split(',')
+        .map(|label| match label.trim() {
+            "\"\"" => Ok(String::new()),
+            "" => Err(OptionError {
+                key: "prefix-groups".to_string(),
+                message: format!(
+                    "\"{list}\" has an empty label (the empty prefix is written \"\")"
+                ),
+            }),
+            l => Ok(l.to_string()),
+        })
+        .collect()
+}
+
 /// Check the ranges and the prefix groups of options built without [`set`].
 pub fn validate(o: &Options) -> Result<(), OptionError> {
     let err = |key: &str, message: String| OptionError {
@@ -359,6 +377,17 @@ mod tests {
             set_err("lineWidth", Value::Int(80)),
             "lineWidth: unknown option"
         );
+    }
+
+    #[test]
+    fn groups_from_lists() {
+        assert_eq!(
+            group_from_list("rdf, rdfs,xsd").unwrap(),
+            ["rdf", "rdfs", "xsd"]
+        );
+        assert_eq!(group_from_list("\"\",ex").unwrap(), ["", "ex"]);
+        assert!(group_from_list("rdf,,xsd").is_err());
+        assert!(group_from_list("").is_err());
     }
 
     #[test]
