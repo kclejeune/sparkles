@@ -8,3 +8,58 @@
 # Not listed: Jena skips syntax/_all and syntax/1refbnode_with_spanning_PN_CHARS_BASE1
 # as "ill-formed surrogate pairs", but both files are valid UTF-8 whose characters
 # outside the BMP (U+10000, U+EFFFD, ...) trip Java's UTF-16 strings, not the grammar.
+
+# String facets (LENGTH, MINLENGTH, MAXLENGTH, PATTERN) on blank nodes test the label
+# written in the data file. The store names blank nodes itself (_:b0, ...) and keeps no
+# labels, so these cannot pass (Jena excludes them for the same reason).
+validation/1bnodeLength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1bnodeMaxlength_fail-bnode-long  facet on a blank node label the store does not keep
+validation/1bnodeMinlength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1bnodeMinlength_pass-bnode-long  facet on a blank node label the store does not keep
+validation/1bnodePattern_fail-bnode-long  facet on a blank node label the store does not keep
+validation/1bnodePattern_pass-bnode-match  facet on a blank node label the store does not keep
+validation/1focusBNODELength_dot_pass  facet on a blank node label the store does not keep
+validation/1focusLength-dot_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1focusMaxLength-dot_fail-bnode-long  facet on a blank node label the store does not keep
+validation/1focusMinLength-dot_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1focusMinLength-dot_pass-bnode-long  facet on a blank node label the store does not keep
+validation/1focusPatternB-dot_pass-bnode-long  facet on a blank node label the store does not keep
+validation/1focusPatternB-dot_pass-bnode-match  facet on a blank node label the store does not keep
+validation/1nonliteralLength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1nonliteralMaxlength_fail-bnode-long  facet on a blank node label the store does not keep
+validation/1nonliteralMinlength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation/1nonliteralMinlength_pass-bnode-long  facet on a blank node label the store does not keep
+validation/1nonliteralPattern_pass-bnode-long  facet on a blank node label the store does not keep
+validation/1nonliteralPattern_pass-bnode-match  facet on a blank node label the store does not keep
+validation-shexj/1bnodeLength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1bnodeMaxlength_fail-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1bnodeMinlength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1bnodeMinlength_pass-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1bnodePattern_fail-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1bnodePattern_pass-bnode-match  facet on a blank node label the store does not keep
+validation-shexj/1focusBNODELength_dot_pass  facet on a blank node label the store does not keep
+validation-shexj/1focusLength-dot_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1focusMaxLength-dot_fail-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1focusMinLength-dot_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1focusMinLength-dot_pass-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1focusPatternB-dot_pass-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1focusPatternB-dot_pass-bnode-match  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralLength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralMaxlength_fail-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralMinlength_pass-bnode-equal  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralMinlength_pass-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralPattern_pass-bnode-long  facet on a blank node label the store does not keep
+validation-shexj/1nonliteralPattern_pass-bnode-match  facet on a blank node label the store does not keep
+
+# The Test extension: actions of extension IRIs below Test/ (Test/#a) do not run, and
+# fail("msg") does not print its message.
+validation/1dotNoCode3_pass  actions of http://shex.io/extensions/Test/#a, #b, #c do not run
+validation/startCode1fail_abort  fail("startAct") in a start action prints nothing
+validation/startCode1startReffail_abort  fail("startAct") in a start action prints nothing
+validation-shexj/1dotNoCode3_pass  actions of http://shex.io/extensions/Test/#a, #b, #c do not run
+validation-shexj/startCode1fail_abort  fail("startAct") in a start action prints nothing
+validation-shexj/startCode1startReffail_abort  fail("startAct") in a start action prints nothing
+
+# ShExJ has no base IRI: the relative IRIs of 1dot-relative.json ("S1", "p1") stay relative.
+validation-shexj/1dot-relative_pass-short-shape  relative IRIs in ShExJ
+validation-shexj/1dot-relative_pass-relative-shape  relative IRIs in ShExJ
