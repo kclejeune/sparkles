@@ -4,6 +4,7 @@
 use super::*;
 use crate::state::FormatEndpoint;
 use serde_json::json;
+use sparkles_fmt::Language;
 
 fn fmt_server(conf: impl FnOnce(&mut AppState)) -> (tempfile::TempDir, Router) {
     let dir = tempfile::tempdir().unwrap();
@@ -165,14 +166,31 @@ async fn bad_requests() {
 #[tokio::test]
 async fn unsupported_languages() {
     let (_d, app) = fmt_server(|_| {});
-    let r = post_json(
-        &app,
-        "/$/format",
-        json!({ "text": "<a> <b> <c> .", "language": "turtle" }),
-    )
-    .await;
-    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(r.json()["error"], "turtle formatting is not available yet");
+    // the languages this build does not format yet, by name and by media type
+    for (l, media_type) in [
+        (Language::Turtle, "text/turtle"),
+        (Language::TriG, "application/trig"),
+        (Language::NTriples, "application/n-triples"),
+        (Language::NQuads, "application/n-quads"),
+        (Language::JsonLd, "application/ld+json"),
+    ] {
+        if l.is_implemented() {
+            continue;
+        }
+        let r = post_json(
+            &app,
+            "/$/format",
+            json!({ "text": "<a> <b> <c> .", "language": l.name() }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            r.json()["error"],
+            format!("{} formatting is not available yet", l.name())
+        );
+        let r = post_as(&app, "/$/format", media_type, "<a> <b> <c> .").await;
+        assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
     let r = post_json(
         &app,
         "/$/format",
@@ -184,8 +202,6 @@ async fn unsupported_languages() {
     let r = post_as(&app, "/$/format", "application/rdf+xml", "<rdf:RDF/>").await;
     assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(r.json()["error"], sparkles_fmt::RDF_XML_MESSAGE);
-    let r = post_as(&app, "/$/format", "text/turtle", "<a> <b> <c> .").await;
-    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     let r = post_as(&app, "/$/format", "image/png", "x").await;
     assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }

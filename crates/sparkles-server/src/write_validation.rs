@@ -138,23 +138,71 @@ mod tests {
         assert!(!store.guard_required());
     }
 
-    #[cfg(feature = "shex")]
-    #[test]
-    fn shex_configuration_fails_closed_until_implemented() {
+    /// A database with a ShEx configuration (and its schema copy).
+    fn shex_database() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Default::default()).unwrap();
-        drop(store);
+        drop(Store::open(dir.path(), Default::default()).unwrap());
         std::fs::write(
             dir.path().join(sparkles::guard::config::CONFIG_FILE),
-            r#"{"format":2,"language":"shex","mode":"reject","schema":{"file":"validation-schema.shex"},"shapeMap":"<http://ex.org/a>@START"}"#,
+            r#"{"format":2,"language":"shex","mode":"reject","schema":{"file":"validation-schema.shex","format":"shexc"},"shapeMap":"{FOCUS a <http://ex.org/P>}@<http://ex.org/S>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join(sparkles::guard::config::SHEX_SCHEMA_SHEXC_FILE),
+            "<http://ex.org/S> { <http://ex.org/name> . }",
         )
         .unwrap();
         let store = Store::open(dir.path(), Default::default()).unwrap();
         assert!(store.guard_required());
-        match install(&store) {
-            // the guard is not implemented yet: the store keeps refusing writes
-            Err(e) => assert!(format!("{e:#}").contains("ShEx"), "{e:#}"),
-            Ok(v) => assert!(v.is_some_and(|v| v.language() == GuardLanguage::Shex)),
-        }
+        (dir, store)
+    }
+
+    fn insert(store: &Store) -> sparkles::Result<sparkles::sparql::update::UpdateStats> {
+        sparkles::sparql::update::update(
+            store,
+            "INSERT DATA { <http://ex.org/a> a <http://ex.org/P> }",
+            &Default::default(),
+        )
+    }
+
+    #[cfg(feature = "shex")]
+    #[test]
+    fn shex_configurations_install_the_shex_guard() {
+        let (dir, store) = shex_database();
+        let v = install(&store).unwrap().unwrap();
+        assert_eq!(v.language(), GuardLanguage::Shex);
+        assert_eq!(v.json()["language"], "shex");
+        assert_eq!(v.json()["status"]["shapeCount"], 1);
+        assert_eq!(v.stats_line(), "reject · ShEx · 1 shapes");
+        assert!(matches!(insert(&store), Err(sparkles::Error::Rejected(_))));
+        // without its schema copy the guard cannot be installed: writes stay refused
+        drop(store);
+        std::fs::remove_file(
+            dir.path()
+                .join(sparkles::guard::config::SHEX_SCHEMA_SHEXC_FILE),
+        )
+        .unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        assert!(install(&store).is_err());
+        assert!(matches!(
+            insert(&store),
+            Err(sparkles::Error::GuardMissing(_))
+        ));
+    }
+
+    #[cfg(not(feature = "shex"))]
+    #[test]
+    fn shex_configurations_fail_closed_without_the_feature() {
+        let (_dir, store) = shex_database();
+        let e = install(&store).err().unwrap();
+        assert!(
+            format!("{e:#}").contains("built without the `shex` feature"),
+            "{e:#}"
+        );
+        assert!(matches!(
+            insert(&store),
+            Err(sparkles::Error::GuardMissing(_))
+        ));
     }
 }

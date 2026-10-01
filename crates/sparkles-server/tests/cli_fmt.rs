@@ -81,6 +81,19 @@ fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// Whether this build formats the language of `path`'s extension.
+fn implemented(path: &str) -> bool {
+    matches!(sparkles_fmt::detect_path(Path::new(path)),
+        Some(sparkles_fmt::Detection::Lang(l)) if l.is_implemented())
+}
+
+/// A language this build does not format yet, if any.
+fn not_implemented() -> Option<sparkles_fmt::Language> {
+    sparkles_fmt::Language::ALL
+        .into_iter()
+        .find(|l| !l.is_implemented())
+}
+
 #[test]
 fn prints_writes_and_leaves_formatted_files_alone() {
     let d = tempdir();
@@ -267,9 +280,9 @@ fn walks_and_explicit_paths() {
     ] {
         write(dir, f, &unformatted);
     }
-    // never formatted in walks: unimplemented languages, RDF/XML, compressed and other
-    // files (each would be an error if given explicitly)
-    for f in [
+    // never formatted in walks: languages not formatted yet, RDF/XML, compressed and
+    // other files (each would be an error if given explicitly)
+    let skipped = [
         "w/d.ttl",
         "w/d.trig",
         "w/d.nt",
@@ -280,7 +293,8 @@ fn walks_and_explicit_paths() {
         "w/d.json",
         "w/d.n3",
         "w/notes.txt",
-    ] {
+    ];
+    for f in skipped.into_iter().filter(|f| !implemented(f)) {
         write(dir, f, "garbage\n");
     }
     let o = expect(dir, &["-l", "w"], None, 1);
@@ -320,15 +334,23 @@ fn walks_and_explicit_paths() {
         ),
         ("missing.rq", "missing.rq: error: No such file or directory"),
     ] {
+        if message.ends_with("is not available yet") && implemented(file) {
+            continue;
+        }
         let o = expect(dir, &[file], None, 2);
         assert_eq!(stderr(&o), format!("{message}\n"));
         assert_eq!(stdout(&o), "");
     }
-    let o = expect(dir, &["--language", "turtle", "w/a.rq"], None, 2);
-    assert_eq!(
-        stderr(&o),
-        "w/a.rq: error: turtle formatting is not available yet\n"
-    );
+    if let Some(l) = not_implemented() {
+        let o = expect(dir, &["--language", l.name(), "w/a.rq"], None, 2);
+        assert_eq!(
+            stderr(&o),
+            format!(
+                "w/a.rq: error: {} formatting is not available yet\n",
+                l.name()
+            )
+        );
+    }
     // an unknown extension: the content decides
     write(dir, "query.txt", QUERY);
     let o = expect(dir, &["query.txt"], None, 0);
@@ -404,11 +426,9 @@ fn stdin_and_stdin_filepath() {
         "{}",
         stderr(&o)
     );
-    let o = expect(dir, &[], Some("<a> <b> <c> .\n"), 2);
-    assert_eq!(
-        stderr(&o),
-        "<stdin>: error: turtle formatting is not available yet\n"
-    );
+    // Turtle, by its content
+    let o = expect(dir, &[], Some("<a>   <b> <c> .\n"), 0);
+    assert_eq!(stdout(&o), "<a> <b> <c> .\n");
     let o = expect(dir, &[], Some("<?xml version=\"1.0\"?>\n<rdf:RDF/>\n"), 2);
     assert_eq!(
         stderr(&o),
@@ -429,9 +449,10 @@ fn stdin_and_stdin_filepath() {
     );
     assert!(stderr(&o).contains("\nq/x.rq:3:14: error: "));
     let o = expect(dir, &["--stdin-filepath", "data.ttl"], Some(QUERY), 2);
-    assert_eq!(
-        stderr(&o),
-        "data.ttl: error: turtle formatting is not available yet\n"
+    assert!(
+        stderr(&o).starts_with("data.ttl:2:1: error: Turtle syntax error: "),
+        "{}",
+        stderr(&o)
     );
     let o = expect(dir, &["--stdin-filepath", "x.owl"], Some(QUERY), 2);
     assert!(stderr(&o).contains("RDF/XML formatting is not supported"));

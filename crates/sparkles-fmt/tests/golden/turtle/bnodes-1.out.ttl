@@ -1,0 +1,36 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+ex:alice
+  ex:knows [ ex:name "Bob" ], [
+    a ex:Person ;
+    ex:name "Carol" ;
+    ex:knows [
+      ex:name "Dave" ;
+      ex:age 40 ;
+    ] ;
+  ] ;
+.
+
+[
+  ex:name "anonymous" ;
+  ex:knows ex:alice ;
+] .
+
+[ ex:name "subject" ] ex:p ex:o .
+
+_:x
+  ex:p [], [ ex:q _:y ] ;
+.
+
+ex:list
+  ex:items (
+    [ ex:n 1 ]
+    [
+      ex:n 2 ;
+      ex:m 3 ;
+    ]
+    ( 4 5 )
+    ()
+  ) ;
+.

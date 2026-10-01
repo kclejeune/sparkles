@@ -6,6 +6,7 @@
 //!   under the default options and with every style key that acts on Turtle flipped;
 //! - every negative syntax and negative evaluation test is a positioned syntax error;
 //! - every SHACL shapes or data graph formats the same way;
+//! - a comment after any token of those inputs keeps formatting safe (comment sweeps);
 //! - nothing panics.
 //!
 //! Exceptions are listed with a reason in `tests/fmt-known-failures.txt` (the path under
@@ -20,6 +21,7 @@ mod corpus;
 
 use corpus::rdf::{self, RdfCase};
 use sparkles_fmt::check;
+use sparkles_fmt::lex::{LexMode, TokenKind, lex};
 use sparkles_fmt::turtle::Turtle;
 use sparkles_fmt::{Check, DirectiveStyle, FormatError, Language, Options, QuoteStyle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -223,4 +225,84 @@ fn language_tags_are_copied() {
         out.text,
         "<http://e/s>\n  <http://e/p> \"x\"@EN-gb, \"y\"@en--rtl ;\n.\n"
     );
+}
+
+/// A comment after one significant token: the input with it either formats (a fixpoint,
+/// every check passed) or is a syntax error. The number of inputs that formatted, or the
+/// first failure.
+fn sweep(name: &str, text: &str, trig: bool, step: usize) -> Result<usize, String> {
+    let tokens = lex(text, LexMode::Turtle);
+    let ends: Vec<usize> = tokens
+        .iter()
+        .filter(|t| !t.kind.is_trivia() && t.kind != TokenKind::Eof)
+        .map(|t| t.end())
+        .collect();
+    let mut formatted = 0;
+    for &end in ends.iter().step_by(step) {
+        for comment in [" # c\n", "\n# c\n"] {
+            let mut s = text.to_string();
+            s.insert_str(end, comment);
+            match catch_unwind(AssertUnwindSafe(|| {
+                format_twice(&s, trig, &Options::default())
+            })) {
+                Ok(Ok(_)) => formatted += 1,
+                Ok(Err(FormatError::Syntax { .. })) => {}
+                Ok(Err(e)) => return Err(format!("{name}: {comment:?} at byte {end}: {e}")),
+                Err(_) => return Err(format!("{name}: {comment:?} at byte {end}: panicked")),
+            }
+        }
+    }
+    Ok(formatted)
+}
+
+/// Comment sweeps: a trailing comment, and a comment on a line of its own, after every
+/// significant token of the golden inputs and the W3C inputs (every few tokens of the
+/// SHACL files): no comment is lost or moves twice.
+#[test]
+fn comment_sweeps() {
+    let mut inputs: Vec<(String, String, bool, usize)> = Vec::new();
+    let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    for (dir, trig) in [("turtle", false), ("trig", true)] {
+        for e in std::fs::read_dir(golden.join(dir)).unwrap().flatten() {
+            let p = e.path();
+            if p.to_string_lossy().contains(".in.") {
+                inputs.push((p.display().to_string(), read(&p).unwrap(), trig, 1));
+            }
+        }
+    }
+    let known = corpus::fmt_known_failures();
+    if let Some(dir) = rdf::suite_dir() {
+        for lang in [Language::Turtle, Language::TriG] {
+            for c in rdf::cases(&dir, lang) {
+                if !c.kind.is_positive() || known.contains_key(&c.rel) {
+                    continue;
+                }
+                if let Ok(text) = read(&c.path) {
+                    inputs.push((c.rel, text, lang == Language::TriG, 1));
+                }
+            }
+        }
+    }
+    if let Some(dir) = rdf::shacl_dir() {
+        for (rel, path) in rdf::shacl_files(&dir) {
+            if let Ok(text) = read(&path) {
+                inputs.push((format!("shacl:{rel}"), text, false, 13));
+            }
+        }
+    }
+    let results = corpus::par_map(&inputs, |(name, text, trig, step)| {
+        sweep(name, text, *trig, *step)
+    });
+    let formatted: usize = results.iter().flatten().sum();
+    let failures: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+    eprintln!(
+        "comment sweeps: {} inputs, {formatted} documents with a comment formatted, {} failures",
+        inputs.len(),
+        failures.len()
+    );
+    assert!(
+        formatted > 1000,
+        "the sweeps formatted only {formatted} documents"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

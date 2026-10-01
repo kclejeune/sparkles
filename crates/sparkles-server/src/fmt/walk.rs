@@ -267,12 +267,11 @@ mod tests {
         let (inputs, errors) = collect(&[PathBuf::from("q")], root, &ignores);
         assert!(errors.is_empty(), "{errors:?}");
         let names: Vec<_> = inputs.iter().map(|i| i.path.clone()).collect();
-        assert_eq!(
-            names,
-            ["q/.hidden/e.rq", "q/a.rq", "q/b.ru"]
-                .map(PathBuf::from)
-                .to_vec()
-        );
+        let mut walked: Vec<&str> = vec!["q/.hidden/e.rq", "q/a.rq", "q/b.ru"];
+        if Language::Turtle.is_implemented() {
+            walked.push("q/data.ttl");
+        }
+        assert_eq!(names, walked.iter().map(PathBuf::from).collect::<Vec<_>>());
         // explicit files: any extension, unless the ignore file matches; .gitignore does
         // not apply
         let (inputs, errors) = collect(
@@ -300,7 +299,7 @@ mod tests {
         assert!(errors[0].starts_with("missing.rq: error: "), "{errors:?}");
         // a directory whose files were all named before is not empty
         let (inputs, errors) = collect(&["q/a.rq", "q"].map(PathBuf::from), root, &ignores);
-        assert_eq!((inputs.len(), errors.len()), (3, 0));
+        assert_eq!((inputs.len(), errors.len()), (walked.len(), 0));
         // a directory with nothing to format is an error
         let (_, errors) = collect(&[PathBuf::from("q/gen")], root, &Arc::default());
         assert!(errors.is_empty());

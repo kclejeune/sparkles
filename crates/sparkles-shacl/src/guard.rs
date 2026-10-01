@@ -15,7 +15,9 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
 pub use sparkles::guard::config::{Baseline, CONFIG_FILE, Counters, DataGraphSel};
-use sparkles::guard::config::{INFERRED_GRAPH as INFERRED, sha256_hex, write_atomic};
+use sparkles::guard::config::{
+    DecisionCounts, INFERRED_GRAPH as INFERRED, sha256_hex, write_atomic,
+};
 use sparkles::guard::{
     Candidate, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity, SeverityCounts,
     Strategy, ValidationSummary, WriteOptions,
@@ -31,8 +33,8 @@ use std::time::{Duration, Instant};
 /// A shapes file copied into the database directory.
 pub const SHAPES_FILE: &str = sparkles::guard::config::SHACL_SHAPES_FILE;
 
-/// Write-time SHACL validation of one dataset (`validation.json`, format 1; or format 2
-/// with `"language": "shacl"`).
+/// Write-time SHACL validation of one dataset (`validation.json`, format 2 with
+/// `"language": "shacl"`; format 1 files, without `language`, are read too).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValidationConfig {
@@ -210,7 +212,7 @@ pub struct ShaclGuard {
     shapes: RwLock<Arc<Shapes>>,
     pending: Mutex<Option<Pending>>,
     baseline: Mutex<Option<Baseline>>,
-    counters: [AtomicU64; 5],
+    counters: DecisionCounts,
     last_full: AtomicU64,
 }
 
@@ -221,7 +223,7 @@ impl ShaclGuard {
             shapes: RwLock::new(shapes),
             pending: Mutex::new(None),
             baseline: Mutex::new(None),
-            counters: Default::default(),
+            counters: DecisionCounts::default(),
             last_full: AtomicU64::new(u64::MAX),
         }
     }
@@ -231,18 +233,10 @@ impl ShaclGuard {
     }
 
     fn count(&self, s: GuardStatus) {
-        let i = match s {
-            GuardStatus::Passed => 0,
-            GuardStatus::Warned => 1,
-            GuardStatus::Rejected => 2,
-            GuardStatus::Skipped => 3,
-            GuardStatus::Bypassed => 4,
-        };
-        self.counters[i].fetch_add(1, Ordering::Relaxed);
+        self.counters.count(s);
     }
 
     pub fn status(&self) -> ValidationStatus {
-        let c = |i: usize| self.counters[i].load(Ordering::Relaxed);
         let shape_count = self.shapes.read().len();
         let last = self.last_full.load(Ordering::Relaxed);
         let mut warnings = Vec::new();
@@ -259,13 +253,7 @@ impl ShaclGuard {
             shape_count,
             baseline: self.baseline.lock().clone(),
             last_full_millis: (last != u64::MAX).then_some(last),
-            counters: Counters {
-                passed: c(0),
-                warned: c(1),
-                rejected: c(2),
-                skipped: c(3),
-                bypassed: c(4),
-            },
+            counters: self.counters.get(),
             warnings,
         }
     }
@@ -591,6 +579,9 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         return Ok(SetOutcome::NotConforming(summary));
     }
     cfg.updated = Some(sparkles::guard::config::now_rfc3339());
+    // written as format 2, whatever was given
+    cfg.format = 2;
+    cfg.language = Some(GuardLanguage::Shacl);
     if let Some(r) = &root {
         // a ShEx configuration this one replaces leaves nothing behind
         sparkles::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;

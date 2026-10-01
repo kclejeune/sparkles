@@ -1,0 +1,32 @@
+@prefix ex: <http://example.org/> .
+
+# the default graph
+{
+  ex:a ex:p ex:b .
+  ex:c ex:p ex:d .
+}
+
+ex:g1 {
+  ex:a
+    ex:p ex:b ;
+    ex:q ex:c ;
+  .
+}
+
+ex:g2 {
+  # inside
+  ex:x ex:y ex:z .
+  # last
+}
+
+_:g3 {}
+ex:top ex:p ex:o .
+
+[] {
+  ex:s
+    ex:p [
+      ex:q 1 ;
+      ex:r 2 ;
+    ] ;
+  .
+}
