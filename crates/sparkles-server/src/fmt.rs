@@ -4,7 +4,7 @@
 //! rewrites in place, and any error exits 2.
 
 mod config;
-mod report;
+pub(crate) mod report;
 mod walk;
 
 use anyhow::{Context, Result, bail};
