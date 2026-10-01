@@ -45,13 +45,14 @@ run = "pnpm mock"
 
 [tasks."ui:check"]
 description = "Type-check the UI (svelte-check)"
-depends = ["ui:install"]
+# after ui:build: both regenerate ui/.svelte-kit, and running them at once races
+depends = ["ui:install", "ui:build"]
 dir = "ui"
 run = "pnpm check"
 
 [tasks."ui:test"]
 description = "UI unit tests (Vitest)"
-depends = ["ui:install"]
+depends = ["ui:install", "ui:build"]
 dir = "ui"
 run = "pnpm test"
 
