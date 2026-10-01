@@ -408,3 +408,52 @@ these sizes). Under load (`oha`, 16 connections, two alternating rounds each):
 | star join, 1,000 requests | 103 / 103 req/s, p50 155 / 156 ms | 104 / 100 req/s, p50 154 / 159 ms |
 
 No measurable overhead.
+
+### GeoSPARQL Compliance Benchmark
+
+The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021: 206 queries over
+the 30 requirements of GeoSPARQL 1.0, a 338-triple dataset) run with
+`scripts/geosparql-benchmark.sh` on 2026-10-01: the benchmark at commit `879e0746`, a
+release build of `sparkles-server` with its default features at commit `70e4c45`, with
+the spatial index enabled. An answer counts as correct when it matches one of the
+expected result files: solutions as multisets, numbers within a relative 1e-6, geometry
+literals by their coordinates (rounded to 6 decimals; ring starts and directions, line
+directions, vertices on straight runs and member order ignored). Requirement R17 has no
+query.
+
+| Requirement | Correct | Queries |
+|---|---:|---:|
+| R1 core: SPARQL protocol | 1 | 1 |
+| R2 core: spatial object class | 1 | 1 |
+| R3 core: feature class | 1 | 1 |
+| R4 topology vocabulary: Simple Features relations | 8 | 8 |
+| R5 topology vocabulary: Egenhofer relations | 8 | 8 |
+| R6 topology vocabulary: RCC8 relations | 8 | 8 |
+| R7 geometry class | 1 | 1 |
+| R8 feature properties | 2 | 2 |
+| R9 geometry properties | 6 | 6 |
+| R10 WKT literal | 1 | 1 |
+| R11 WKT literal default CRS | 1 | 1 |
+| R12 WKT axis order | 1 | 1 |
+| R13 empty WKT literal | 0 | 2 |
+| R14 `asWKT` | 1 | 1 |
+| R15 GML literal | 1 | 1 |
+| R16 empty GML literal | 0 | 2 |
+| R18 `asGML` | 1 | 1 |
+| R19 query functions | 6 | 28 |
+| R20 `getSRID` | 1 | 2 |
+| R21 `relate` | 1 | 4 |
+| R22 Simple Features functions | 8 | 32 |
+| R23 Egenhofer functions | 8 | 32 |
+| R24 RCC8 functions | 8 | 32 |
+| R25 RDFS entailment: basic graph patterns | 0 | 3 |
+| R26 RDFS entailment: WKT geometry types | 0 | 2 |
+| R27 RDFS entailment: GML geometry types | 0 | 1 |
+| R28 query rewrite: Simple Features | 0 | 8 |
+| R29 query rewrite: Egenhofer | 0 | 8 |
+| R30 query rewrite: RCC8 | 0 | 8 |
+| **Total** | **74** | **206** |
+
+The mean of the per-requirement scores is 57.6% over the 29 requirements with queries.
+Of the 77 queries that use only WKT literals and no RDFS entailment or query rewrite, 72
+are answered as expected.

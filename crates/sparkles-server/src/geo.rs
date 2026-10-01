@@ -183,15 +183,22 @@ pub fn status_json(ds: &Dataset) -> J {
         .map_or(J::Null, |s| serde_json::to_value(s).unwrap())
 }
 
+/// The explain counters of spatial operators that the metrics sum up.
+pub const WORK: [&str; 4] = ["candidates", "refined", "matched", "rechecked"];
+
+/// Sums of the [`WORK`] counters.
+pub type Work = [u64; WORK.len()];
+
 /// The work of a query's spatial operators, from their explain counters: candidates,
-/// exact tests and matches (`None` when the plan has no spatial operator).
-pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<[u64; 3]> {
-    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<[u64; 3]>) {
+/// exact tests, matches and candidates the index could not place (`None` when the plan
+/// has no spatial operator).
+pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<Work> {
+    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<Work>) {
         if let Some(c) = &p.counters
             && c.contains_key("candidates")
         {
-            let s = sum.get_or_insert([0; 3]);
-            for (x, k) in s.iter_mut().zip(["candidates", "refined", "matched"]) {
+            let s = sum.get_or_insert([0; WORK.len()]);
+            for (x, k) in s.iter_mut().zip(WORK) {
                 *x += c.get(k).and_then(J::as_u64).unwrap_or(0);
             }
         }
@@ -204,10 +211,72 @@ pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<[u64; 3]> {
     sum
 }
 
+/// The spatial index series of one dataset label (datasets past `--metrics-max-datasets`
+/// share `$other`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GeoSeries {
+    /// whether a dataset of the label has the index enabled
+    pub enabled: bool,
+    /// rows in the base, the overlay and the tail
+    pub rows: [u64; 3],
+    /// the longest last build of the label's datasets
+    pub build_seconds: Option<f64>,
+    /// the spatial operators' candidates, exact tests and matches
+    pub work: Work,
+}
+
+/// The spatial index series by dataset label: datasets with the index, and labels whose
+/// queries ran spatial operators.
+pub fn series(st: &AppState) -> std::collections::BTreeMap<String, GeoSeries> {
+    let mut out: std::collections::BTreeMap<String, GeoSeries> = Default::default();
+    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    for ds in datasets {
+        let Some(s) = ds.store.geo_status() else {
+            continue;
+        };
+        let e = out
+            .entry(st.metrics.dataset_label(Some(&ds.name)))
+            .or_default();
+        e.enabled = true;
+        for (x, n) in e
+            .rows
+            .iter_mut()
+            .zip([s.rows.base, s.rows.overlay, s.rows.tail])
+        {
+            *x += n;
+        }
+        if let Some(b) = &s.last_build {
+            let secs = b.ms / 1000.0;
+            e.build_seconds = Some(e.build_seconds.map_or(secs, |x| x.max(secs)));
+        }
+    }
+    for (label, w) in st.metrics.geo_work() {
+        if w.iter().any(|&n| n > 0) || out.contains_key(&label) {
+            out.entry(label).or_default().work = w;
+        }
+    }
+    out
+}
+
+/// The `geo` member of a dataset in the JSON metrics snapshot, or null.
+pub fn series_json(s: Option<&GeoSeries>) -> J {
+    match s {
+        None => J::Null,
+        Some(s) => json!({
+            "enabled": s.enabled,
+            "rows": { "base": s.rows[0], "overlay": s.rows[1], "tail": s.rows[2] },
+            "buildSeconds": s.build_seconds,
+            "candidates": s.work[0],
+            "refined": s.work[1],
+            "matches": s.work[2],
+            "rechecked": s.work[3],
+        }),
+    }
+}
+
 /// Prometheus series of the spatial indexes: rows per part, the last build's duration,
 /// and the work of spatial operators (`sparkles_geo_*`).
 pub fn metrics(st: &AppState, out: &mut String) {
-    use std::collections::BTreeMap;
     use std::fmt::Write;
     let family = |o: &mut String, name: &str, kind: &str, help: &str| {
         let _ = writeln!(o, "# HELP {name} {help}");
@@ -218,31 +287,8 @@ pub fn metrics(st: &AppState, out: &mut String) {
             .replace('"', "\\\"")
             .replace('\n', "\\n")
     };
-    // datasets past --metrics-max-datasets share the `$other` label
-    let mut rows: BTreeMap<String, [u64; 3]> = BTreeMap::new();
-    let mut build: BTreeMap<String, f64> = BTreeMap::new();
-    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
-    for ds in datasets {
-        let Some(s) = ds.store.geo_status() else {
-            continue;
-        };
-        let l = st.metrics.dataset_label(Some(&ds.name));
-        let r = rows.entry(l.clone()).or_default();
-        for (x, n) in r.iter_mut().zip([s.rows.base, s.rows.overlay, s.rows.tail]) {
-            *x += n;
-        }
-        if let Some(b) = &s.last_build {
-            let e = build.entry(l).or_default();
-            *e = e.max(b.ms / 1000.0);
-        }
-    }
-    let work: Vec<(String, [u64; 3])> = st
-        .metrics
-        .geo_work()
-        .into_iter()
-        .filter(|(l, w)| rows.contains_key(l) || w.iter().any(|&n| n > 0))
-        .collect();
-    if rows.is_empty() && work.is_empty() {
+    let all = series(st);
+    if all.is_empty() {
         return;
     }
     family(
@@ -251,8 +297,8 @@ pub fn metrics(st: &AppState, out: &mut String) {
         "gauge",
         "Rows of the spatial index by part (base, overlay, tail).",
     );
-    for (ds, r) in &rows {
-        for (part, n) in ["base", "overlay", "tail"].iter().zip(r) {
+    for (ds, s) in all.iter().filter(|(_, s)| s.enabled) {
+        for (part, n) in ["base", "overlay", "tail"].iter().zip(s.rows) {
             let _ = writeln!(
                 out,
                 "sparkles_geo_rows{{dataset=\"{}\",part=\"{part}\"}} {n}",
@@ -266,12 +312,14 @@ pub fn metrics(st: &AppState, out: &mut String) {
         "gauge",
         "Duration of the last build of the spatial index's base, in seconds.",
     );
-    for (ds, s) in &build {
-        let _ = writeln!(
-            out,
-            "sparkles_geo_build_seconds{{dataset=\"{}\"}} {s:.3}",
-            label(ds)
-        );
+    for (ds, s) in &all {
+        if let Some(b) = s.build_seconds {
+            let _ = writeln!(
+                out,
+                "sparkles_geo_build_seconds{{dataset=\"{}\"}} {b:.3}",
+                label(ds)
+            );
+        }
     }
     for (i, (name, help)) in [
         (
@@ -286,13 +334,17 @@ pub fn metrics(st: &AppState, out: &mut String) {
             "sparkles_geo_matches_total",
             "Rows that passed the exact test of spatial operators.",
         ),
+        (
+            "sparkles_geo_rechecked_total",
+            "Candidates of spatial operators whose literal the index skipped (too long to index, or with no place in longitude and latitude), tested whatever the search window.",
+        ),
     ]
     .into_iter()
     .enumerate()
     {
         family(out, name, "counter", help);
-        for (ds, w) in &work {
-            let _ = writeln!(out, "{name}{{dataset=\"{}\"}} {}", label(ds), w[i]);
+        for (ds, s) in &all {
+            let _ = writeln!(out, "{name}{{dataset=\"{}\"}} {}", label(ds), s.work[i]);
         }
     }
 }

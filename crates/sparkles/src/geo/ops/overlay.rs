@@ -53,7 +53,10 @@ pub fn overlay(a: &Geom, b: &Geom, op: Overlay) -> Result<Geom, OpError> {
         Overlay::Union | Overlay::SymDifference => da.max(db),
     };
     Ok(match out.assemble() {
-        Some(g) => made(a, g),
+        Some(mut g) => {
+            snap_to_inputs(&mut g, &a.g, &b.g);
+            made(a, g)
+        }
         None => Geom::empty(
             a.crs.clone(),
             match empty_dim {
@@ -63,6 +66,27 @@ pub fn overlay(a: &Geom, b: &Geom, op: Overlay) -> Result<Geom, OpError> {
             },
         ),
     })
+}
+
+/// Put output vertices that are input vertices up to rounding back on them exactly:
+/// `geo`'s boolean operations compute on a fixed-point grid, so `-83.6` can come back as
+/// `-83.60000000018627`. Vertices within a billionth (relative) of an input vertex take
+/// its coordinates; new vertices (crossings) are left as computed.
+fn snap_to_inputs(out: &mut Geometry<f64>, a: &Geometry<f64>, b: &Geometry<f64>) {
+    use georust::{CoordsIter, MapCoordsInPlace};
+    let mut inputs: Vec<Coord<f64>> = a.coords_iter().chain(b.coords_iter()).collect();
+    inputs.sort_by(|p, q| p.x.total_cmp(&q.x));
+    let tol = |v: f64| 1e-9 * v.abs().max(1.0);
+    out.map_coords_in_place(|c| {
+        let t = tol(c.x).max(tol(c.y));
+        let from = inputs.partition_point(|p| p.x < c.x - t);
+        inputs[from..]
+            .iter()
+            .take_while(|p| p.x <= c.x + t)
+            .find(|p| (p.y - c.y).abs() <= t)
+            .copied()
+            .unwrap_or(c)
+    });
 }
 
 /// A geometry as its points, curves (as segments) and areas.
@@ -371,6 +395,20 @@ mod tests {
             "POLYGON EMPTY",
         );
         check(GA, GA, Difference, "POLYGON EMPTY");
+    }
+
+    #[test]
+    fn input_vertices_come_back_exactly() {
+        let a = "POLYGON((-83.6 34.1, -83.2 34.1, -83.2 34.5, -83.6 34.5, -83.6 34.1))";
+        let b = "POLYGON((-83.6 34.1, -83.4 34.1, -83.4 34.3, -83.6 34.3, -83.6 34.1))";
+        for op in [Union, Intersection, Difference] {
+            let r = overlay(&g(a), &g(b), op).unwrap();
+            for c in georust::CoordsIter::coords_iter(&r.g) {
+                for v in [c.x, c.y] {
+                    assert_eq!((v * 10.0).round() / 10.0, v, "{op:?}: {:?}", r.g);
+                }
+            }
+        }
     }
 
     #[test]
