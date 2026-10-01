@@ -1,12 +1,14 @@
 //! Turtle and TriG printing: directives in the `directive-style` family, subject blocks in
-//! the diff-friendly expanded form, object lists, blank node property lists, collections,
-//! RDF 1.2 terms and TriG graph blocks.
+//! the diff-friendly expanded form (or SPARQL's compact form with `turtle-layout =
+//! "conventional"`), object lists, blank node property lists, collections, RDF 1.2 terms
+//! and TriG graph blocks.
 //!
 //! - The document: the file header, the directives, the statements and graph blocks one
-//!   after another, the comments at the end and one final newline. One blank line
+//!   after another (with `sort`, ordered between directive blocks and detached comment
+//!   blocks, [`sort`]), the comments at the end and one final newline. One blank line
 //!   follows a directive block when a statement follows it, and one separates two
 //!   statements (or graph blocks) when either prints on more than one line; other blank
-//!   lines are kept as written, collapsed to one.
+//!   lines are kept as written, collapsed to one (not inside a sorted run).
 //! - Directives: `PREFIX`/`BASE`/`VERSION`, or `@prefix`/`@base`/`@version` with their
 //!   final ` .`, one per line. The leading directive block puts `VERSION` first and
 //!   sorts, deduplicates and groups its `PREFIX` runs as a SPARQL prologue does (N5,
@@ -21,6 +23,7 @@
 
 pub mod triples;
 
+use super::sort::{self, Placed};
 use crate::doc::{self, Doc, DocId, Printed};
 use crate::lex::TokenKind;
 use crate::normalize::{self, PrefixDecl};
@@ -32,15 +35,17 @@ use crate::{DirectiveStyle, FormatError, Options};
 use std::ops::{Deref, DerefMut};
 use unicode_width::UnicodeWidthStr;
 
-/// Whether `turtle-layout = "conventional"` is implemented (until it is, it warns
-/// `option-not-implemented` and prints the default layout).
-pub const CONVENTIONAL_IMPLEMENTED: bool = false;
+/// Whether `turtle-layout = "conventional"` is implemented.
+pub const CONVENTIONAL_IMPLEMENTED: bool = true;
 
 /// The Turtle printer's context: the SPARQL printer's [`Ctx`] (its helpers for terms,
 /// normalizations, blocks and comments), with nodes dispatched by [`node`].
 pub struct Tx<'a, 's> {
     pub cx: Ctx<'a, 's>,
     pub trig: bool,
+    /// With `sort`: a second printer over the same tree without comments, which builds
+    /// the printed forms sorting compares ([`sort::printed`]).
+    pub keys: Option<Box<Tx<'a, 's>>>,
 }
 
 impl<'a, 's> Deref for Tx<'a, 's> {
@@ -67,6 +72,7 @@ impl<'a, 's> Tx<'a, 's> {
         Tx {
             cx: Ctx::new(tree, comments, opts),
             trig,
+            keys: None,
         }
     }
 
@@ -141,7 +147,11 @@ pub fn print(
     opts: &Options,
     trig: bool,
 ) -> Result<Printed, FormatError> {
+    let plain = Comments::default();
     let mut tx = Tx::new(tree, comments, opts, trig);
+    if opts.sort {
+        tx.keys = Some(Box::new(Tx::new(tree, &plain, opts, trig)));
+    }
     let root = node(&mut tx, tree.root());
     doc::print(
         &tx.arena,
@@ -207,8 +217,17 @@ enum Part {
     Statement(NodeId),
 }
 
+/// A top-level part in printing order.
+enum Item {
+    /// consecutive directives; whether they are the leading block
+    Directives(Vec<NodeId>, bool),
+    /// a statement or a graph block
+    Statement(Placed),
+}
+
 /// `TurtleDoc`, `TrigDoc`: the file header, the directive blocks, statements and graph
-/// blocks, the comments at the end, one final newline.
+/// blocks (sorted between the directive blocks with `sort`), the comments at the end,
+/// one final newline.
 fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
     let mut parts_of: Vec<Part> = Vec::new();
     for c in tx.child_nodes(n) {
@@ -222,23 +241,50 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
             (false, _) => parts_of.push(Part::Statement(c)),
         }
     }
+    let mut items = Vec::new();
+    let mut i = 0;
+    while i < parts_of.len() {
+        if let Part::Directives(ds) = &parts_of[i] {
+            items.push(Item::Directives(ds.clone(), i == 0));
+            i += 1;
+            continue;
+        }
+        let mut statements = Vec::new();
+        while let Some(&Part::Statement(s)) = parts_of.get(i) {
+            statements.push(s);
+            i += 1;
+        }
+        items.extend(
+            statement_order(tx, &statements)
+                .into_iter()
+                .map(Item::Statement),
+        );
+    }
     let mut parts = Vec::new();
     parts.extend(tx.header());
     // (a directive block, prints on several lines)
     let mut prev: Option<(bool, bool)> = None;
-    for (i, part) in parts_of.iter().enumerate() {
-        let (doc, first, directives, multi) = match part {
-            Part::Directives(ds) => (directive_block(tx, ds, i == 0), ds[0], true, false),
-            Part::Statement(s) => {
-                let (doc, multi) = match tx.tree.kind(*s) {
-                    NodeKind::GraphBlock => graph_block(tx, *s),
-                    _ => triples::statement(tx, *s, 0),
+    for item in &items {
+        let (doc, blank_before, directives, multi) = match item {
+            Item::Directives(ds, leading) => {
+                let blank = tx.comments.blank_before(ds[0]);
+                (directive_block(tx, ds, *leading), blank, true, false)
+            }
+            Item::Statement(p) => {
+                let opening = run_opening(tx, p);
+                let (doc, multi) = match tx.tree.kind(p.node) {
+                    NodeKind::GraphBlock => graph_block(tx, p.node),
+                    _ => triples::statement(tx, p.node, 0),
                 };
-                (doc, *s, false, multi)
+                let doc = match opening {
+                    Some(o) => tx.concat([o, doc]),
+                    None => doc,
+                };
+                (doc, p.blank, false, multi)
             }
         };
         if let Some((prev_directives, prev_multi)) = prev {
-            let blank = tx.comments.blank_before(first)
+            let blank = blank_before
                 || (prev_directives && !directives)
                 || (!prev_directives && !directives && (prev_multi || multi));
             parts.push(match blank {
@@ -252,6 +298,70 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
     parts.extend(tx.dangling(n, prev.is_some()));
     parts.push(tx.hard_line());
     tx.concat(parts)
+}
+
+/// Statements and graph blocks in printing order: as written, or with `sort` by printed
+/// subject, TriG's default graph blocks after the triples outside any block, then the
+/// named graph blocks by printed name, within the runs between detached comment blocks.
+fn statement_order(tx: &mut Tx<'_, '_>, statements: &[NodeId]) -> Vec<Placed> {
+    let keys = match tx.opts.sort {
+        false => None,
+        true => Some(
+            statements
+                .iter()
+                .map(|&s| statement_key(tx, s))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    sort::order(
+        tx.comments,
+        statements,
+        keys.as_deref(),
+        tx.opts.sort,
+        false,
+    )
+}
+
+/// What a statement or graph block sorts by: the default graph first, then its printed
+/// subject or name (its source text under the ignore pragma).
+fn statement_key(tx: &mut Tx<'_, '_>, s: NodeId) -> (u8, String) {
+    let ignored = tx.comments.ignored(s);
+    if tx.tree.kind(s) == NodeKind::GraphBlock {
+        let label = tx.children(s).into_iter().find(|e| {
+            matches!(*e, Element::Token(t) if !matches!(
+                tx.tree.token_kind(t),
+                TokenKind::Kw(_) | TokenKind::LBrace | TokenKind::RBrace
+            ))
+        });
+        return match (label, ignored) {
+            (None, _) => (1, sort::printed(tx, Element::Node(s))),
+            (Some(_), true) => (2, sort::printed(tx, Element::Node(s))),
+            (Some(l), false) => (2, sort::printed(tx, l)),
+        };
+    }
+    match (tx.children(s).first().copied(), ignored) {
+        (Some(subject), false) => (0, sort::printed(tx, subject)),
+        _ => (0, sort::printed(tx, Element::Node(s))),
+    }
+}
+
+/// The detached comment blocks that open a run, when the node written first in the run
+/// moved further down: each block on its lines, a blank line after it.
+pub fn run_opening(tx: &mut Tx<'_, '_>, p: &Placed) -> Option<DocId> {
+    let head = p.run_head.filter(|&h| h != p.node)?;
+    let mut parts = Vec::new();
+    for block in tx.comments.detached_before(head).to_vec() {
+        for &c in &block {
+            tx.comments.mark_printed(c);
+        }
+        let cx = &mut tx.cx;
+        parts.push(trivia::comment_lines(&mut cx.arena, cx.comments, &block));
+        parts.push(tx.empty_line());
+    }
+    match parts.is_empty() {
+        true => None,
+        false => Some(tx.concat(parts)),
+    }
 }
 
 /// Consecutive directives, one per line. The leading block (`sorted`) puts `VERSION`
@@ -479,16 +589,21 @@ fn graph_block(tx: &mut Tx<'_, '_>, n: NodeId) -> (DocId, bool) {
     (tx.wrap(n, doc), multi)
 }
 
-/// Statements one per line at `indent` columns, with a blank line between two of them
-/// where the source had one or where either prints on several lines; `None` when there
-/// are none.
+/// Statements one per line at `indent` columns (sorted with `sort`), with a blank line
+/// between two of them where the source had one or where either prints on several
+/// lines; `None` when there are none.
 fn statement_list(tx: &mut Tx<'_, '_>, statements: &[NodeId], indent: usize) -> Option<DocId> {
     let mut parts = Vec::new();
     let mut prev_multi = None;
-    for &s in statements {
-        let (doc, multi) = triples::statement(tx, s, indent);
+    for p in statement_order(tx, statements) {
+        let opening = run_opening(tx, &p);
+        let (doc, multi) = triples::statement(tx, p.node, indent);
+        let doc = match opening {
+            Some(o) => tx.concat([o, doc]),
+            None => doc,
+        };
         if let Some(prev_multi) = prev_multi {
-            let blank = prev_multi || multi || tx.comments.blank_before(s);
+            let blank = prev_multi || multi || p.blank;
             parts.push(match blank {
                 true => tx.empty_line(),
                 false => tx.hard_line(),
