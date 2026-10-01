@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+ex:g1 { ex:a ex:b ex:c . ex:d ex:e ex:f }
+graph ex:g2 { ex:a ex:b ex:c . }
+GRAPH _:g3 { }
+[] { ex:a ex:b [ ex:c ex:d ] }
+{ ex:a ex:b ex:c }
+ex:a ex:b ex:c .
+[ ex:p ex:o ] .

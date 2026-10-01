@@ -9,4 +9,3 @@ turtle/t4 sections as sort barriers, sorted and as written (before the Turtle pr
 turtle/t5 the SHACL shapes graph example (before the Turtle printer)
 turtle/a6 literal shorthands only when the lexical form is the token, tags as written (before the Turtle printer)
 trig/t3 the TriG example with annotations, reified triples and triple terms (before the TriG printer)
-jsonld/j1 the JSON-LD example: key order and layout (before the JSON-LD printer)

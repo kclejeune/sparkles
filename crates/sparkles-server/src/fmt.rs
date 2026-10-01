@@ -7,7 +7,7 @@
 //! in bounded memory, printed as it goes, checked into `io::sink()`, or written to a
 //! temporary file next to it; `--diff` formats them in memory like the other languages.
 
-mod config;
+pub(crate) mod config;
 pub(crate) mod report;
 mod walk;
 

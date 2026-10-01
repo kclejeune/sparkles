@@ -162,10 +162,12 @@ impl Shape<'_, '_> {
     /// the outermost node ending with the separator, as it does after it, since the
     /// separator is printed before the comment (the last operand of a nested chain
     /// would otherwise take it inside that chain, and the next time, printed after the
-    /// outer operator, it would trail the outer operand).
+    /// outer operator, it would trail the outer operand). After a separator the
+    /// comment stays with the item that separator ends, even when another separator
+    /// follows (`ex:o ; # c` before a Turtle statement's `.`).
     fn trailing_owner(&self, p: TokenId, n: TokenId) -> Option<NodeId> {
         let separator = |t: TokenId| self.rules.is_separator(self.tree.token_kind(t));
-        let with_separator = match separator(n) {
+        let with_separator = match separator(n) && !separator(p) {
             true => self
                 .ending_at(n)
                 .filter(|&x| self.first(x).is_some_and(|f| f <= p)),
@@ -779,6 +781,12 @@ mod tests {
         assert_eq!(texts(&t, c.trailing(nth(4))), ["# c"]);
         assert!(c.trailing(nth(3)).is_empty());
         assert_eq!(texts(&t, c.leading(nth(5))), ["# d"]);
+        // after a separator, the item it ends takes it even before another separator
+        let src = "{ ?s ?p ?a ; # c\n . }";
+        let t = tree(src, "(Q (G _ (S _ (E _ (O _) _) _) _))");
+        let c = Comments::attach(&t, &RULES);
+        assert_eq!(texts(&t, c.trailing(nth(3))), ["# c"]);
+        assert!(c.trailing(nth(2)).is_empty());
         // after the next item it trails again
         let src = "{ ?s ?p ?a # c\n ; ?q ?b ; # d\n ?r ?e }";
         let t = tree(

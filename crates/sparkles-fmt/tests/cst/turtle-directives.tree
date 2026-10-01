@@ -1,0 +1,35 @@
+TurtleDoc
+  PrefixDecl
+    LangDir "@prefix"
+    PnameNs "ex:"
+    IriRef "<http://example.org/>"
+    Dot "."
+  PrefixDecl
+    Kw(Prefix) "prefix"
+    PnameNs "rdfs:"
+    IriRef "<http://www.w3.org/2000/01/rdf-schema#>"
+  BaseDecl
+    LangDir "@base"
+    IriRef "<http://example.org/base/>"
+    Dot "."
+  BaseDecl
+    Kw(Base) "BASE"
+    IriRef "<http://example.org/other/>"
+  VersionDecl
+    Kw(Version) "VERSION"
+    String2 "\"1.2\""
+  VersionDecl
+    LangDir "@version"
+    String1 "'1.2'"
+    Dot "."
+  PrefixDecl
+    Kw(Prefix) "PREFIX"
+    PnameNs ":"
+    IriRef "<http://example.org/empty#>"
+  TriplesStmt
+    PnameLn ":a"
+    PropertyListEntry
+      PnameLn "ex:p"
+      Object
+        IriRef "<relative>"
+    Dot "."

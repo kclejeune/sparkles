@@ -224,10 +224,7 @@ impl Geom {
         if id.is_geographic() {
             return Some(b);
         }
-        // the built-in projections map each axis monotonically
-        let (x0, y0) = crs::to_lonlat(id, b[0], b[1])?;
-        let (x1, y1) = crs::to_lonlat(id, b[2], b[3])?;
-        Some([x0, y0, x1, y1])
+        crs::box_to_lonlat(id, b)
     }
 
     /// This geometry in the built-in CRS `to` (`None`: no common built-in CRS, or a
