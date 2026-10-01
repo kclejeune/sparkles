@@ -629,13 +629,34 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// A compiled pattern, shared by the calls of one thread: reusing the instance keeps its
+/// match cache (a clone of a `Regex` starts an empty one).
+type SharedRegex = std::rc::Rc<regex::Regex>;
+
 thread_local! {
-    static REGEX_CACHE: std::cell::RefCell<FxHashMap<(String, String), Option<regex::Regex>>> =
+    static REGEX_CACHE: std::cell::RefCell<FxHashMap<(String, String), Option<SharedRegex>>> =
         std::cell::RefCell::new(FxHashMap::default());
+    /// the last pattern looked up: a constant pattern is found without hashing or
+    /// allocating on every row
+    static LAST_REGEX: std::cell::RefCell<Option<(String, String, SharedRegex)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    REGEX_CACHE.with(|c| {
+    shared_regex(pattern, flags).map(|r| (*r).clone())
+}
+
+/// The compiled pattern, from this thread's cache.
+fn shared_regex(pattern: &str, flags: &str) -> EvalResult<SharedRegex> {
+    if let Some(r) = LAST_REGEX.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(p, f, _)| p == pattern && f == flags)
+            .map(|(_, _, r)| r.clone())
+    }) {
+        return Ok(r);
+    }
+    let r = REGEX_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() > 1000 {
             c.clear();
@@ -663,10 +684,13 @@ pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
                     .size_limit(1 << 22)
                     .build()
                     .ok()
+                    .map(std::rc::Rc::new)
             })
             .clone()
             .ok_or(TypeError)
-    })
+    })?;
+    LAST_REGEX.with(|l| *l.borrow_mut() = Some((pattern.into(), flags.into(), r.clone())));
+    Ok(r)
 }
 
 /// XPath replacement string → Rust regex replacement.
@@ -884,15 +908,16 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let (st, l) = v.string_arg()?;
             let p = a1()?;
             let r = a2()?;
-            let flags = if args.len() > 3 {
-                arg(args, 3, row, ctx)?
-                    .as_str()
-                    .ok_or(TypeError)?
-                    .to_string()
+            let f = if args.len() > 3 {
+                Some(arg(args, 3, row, ctx)?)
             } else {
-                String::new()
+                None
             };
-            let re = compile_regex(p.as_str().ok_or(TypeError)?, &flags)?;
+            let flags = f
+                .as_deref()
+                .map_or(Some(""), Value::as_str)
+                .ok_or(TypeError)?;
+            let re = shared_regex(p.as_str().ok_or(TypeError)?, flags)?;
             if re.is_match("") {
                 return Err(TypeError);
             }
@@ -1041,12 +1066,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let v = a0()?;
             let (st, _) = v.string_arg()?;
             let p = a1()?;
-            let flags = if args.len() > 2 {
-                a2()?.as_str().ok_or(TypeError)?.to_string()
-            } else {
-                String::new()
-            };
-            b(compile_regex(p.as_str().ok_or(TypeError)?, &flags)?.is_match(st))
+            let f = if args.len() > 2 { Some(a2()?) } else { None };
+            let flags = f
+                .as_deref()
+                .map_or(Some(""), Value::as_str)
+                .ok_or(TypeError)?;
+            b(shared_regex(p.as_str().ok_or(TypeError)?, flags)?.is_match(st))
         }
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
         // ---- SPARQL 1.2 -------------------------------------------------------------
