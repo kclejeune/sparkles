@@ -1639,6 +1639,73 @@ check` validates it, clones copy it, backups include it). CLI:
 `sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--wgs84] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
 and `sparkles serve --geo NAME[=geo.json]`.
 
+### Hulls, aggregates, Jena filter functions, UTM and conversion
+
+**More `geof:` functions** (planar in the CRS of `g`, like `convexHull`):
+
+| Function | Result |
+|---|---|
+| `boundingCircle(g)` | the smallest circle holding every vertex of `g` (Welzl), as a polygon of 128 sides drawn around the circle, so every input point is inside it; a single point for one distinct point |
+| `concaveHull(g)`, `concaveHull(g, targetPercent)` | `geo`'s concave hull (concaveman) of the vertices. `targetPercent` in (0, 100] sets the concavity linearly, `targetPercent / 25` (50 is the default concavity 2.0, smaller values follow the input more closely), and 100 is the convex hull; outside the range: a type error. Degenerate inputs give their convex hull (a point, a segment) |
+| `isSimple(g)` | `xsd:boolean`, OGC simplicity: points always; multipoints without repeated points; curves that do not meet themselves except consecutive segments at their shared vertex and a closed curve at its closing vertex; multicurves whose members meet only at ends of both; polygons with simple rings; collections with simple members |
+
+**Aggregates.** `geof:aggBoundingBox`, `geof:aggBoundingCircle`, `geof:aggCentroid` (the
+centroid of the union), `geof:aggConvexHull`, `geof:aggConcaveHull` (the default
+concavity: an aggregate takes one expression) and `geof:aggUnion` group like `SUM`,
+`DISTINCT` included:
+
+```sparql
+SELECT ?region (geof:aggUnion(DISTINCT ?w) AS ?shape)
+WHERE { ?f ex:region ?region ; geo:hasDefaultGeometry/geo:asWKT ?w }
+GROUP BY ?region
+```
+
+The result has the datatype and CRS of the group's first value; the others are
+transformed into that CRS. A value that is an error or not a geometry, a CRS without a
+transform, more input vertices than `--geo-op-vertices`, or an empty group make the
+aggregate unbound. The aggregate IRIs are not functions (`BIND(geof:aggUnion(?w) AS ?u)`
+is a syntax error). Without the `geo` feature they still group, with an unbound value.
+
+**Jena filter functions** (`spatialF:` `<http://jena.apache.org/function/spatial#>`,
+Jena's argument forms: a unit, datatype or CRS may be an IRI, an `xsd:anyURI` literal or
+a plain string):
+
+| Function | Result |
+|---|---|
+| `convertLatLon(lat, lon)` | EPSG:4326 `POINT(lat lon)` (numbers or numeric strings; latitude within ±90, longitude within ±180) |
+| `convertLatLonBox(latMin, lonMin, latMax, lonMax)` | EPSG:4326 `POLYGON` |
+| `equals(g1, g2)` | `geof:sfEquals` |
+| `nearby(g1, g2, radius, unit)`, `withinCircle` | `xsd:boolean`: distance `<` radius |
+| `distance(g1, g2, unit)` | `geof:distance` |
+| `greatCircle(lat1, lon1, lat2, lon2, unit)` | `xsd:double` in a length unit, under the dataset's distance model (geodesic by default; `haversine` gives Jena's numbers) |
+| `greatCircleGeom(g1, g2, unit)` | the same between the closest points (projected geometries are measured on WGS 84) |
+| `angle(x1, y1, x2, y2)`, `angleDeg` | direction clockwise from the y axis in [0, 2π) radians / degrees (degrees rounded to 6 decimals, as Jena). Jena's implementation is a quarter turn off south-east and north-west of the first point; Sparkles follows the documented meaning |
+| `azimuth(lat1, lon1, lat2, lon2)`, `azimuthDeg` | initial great-circle bearing clockwise from north, in [0, 2π) radians / degrees |
+| `transform(g, datatype, crs)`, `transformDatatype(g, datatype)`, `transformSRS(g, crs)` | `g` in another datatype (`geo:wktLiteral`, `geo:geoJSONLiteral`) and/or CRS |
+
+**UTM.** The 120 UTM zones on WGS 84 (`http://www.opengis.net/def/crs/EPSG/0/32601` to
+`…/32660` north, `…/32701` to `…/32760` south; easting, northing in metres) are built-in
+CRSs: transverse Mercator with Krüger's series to the sixth order (Karney 2011), well
+under a millimetre within a zone. Points more than 60° of longitude from the zone's
+central meridian have no coordinates (`transform` is a type error). Literals in a UTM CRS
+are indexed; distances between them are Euclidean in metres.
+
+**Conversion for maps.**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/$/geo/convert` | Any caller (like `/$/format`). Body `{"literals": [{"value": "POINT(2 3)", "datatype": "http://www.opengis.net/ont/geosparql#wktLiteral"}, …]}`, at most 10,000. `200 {"results": [{"geometry": {…}} \| {"error": "…"}]}` in request order: each literal as an RFC 7946 geometry in CRS84 (longitude, latitude; EPSG:4326 swapped, projected CRSs transformed; an empty geometry is an empty `GeometryCollection`), or why it has none (`malformed literal at offset N: …`, `unknown CRS <…>: no transform to CRS84`, `not a geometry literal datatype: <…>`). `400` for a body of another shape or too many literals; `501` without the `geo` feature |
+
+The route takes the place of `GET /$/geo/{ds}` for a dataset named `convert`: its index
+status is not available over HTTP (`405`); its other `/$/geo/convert/…` routes and
+`sparkles geo-index --loc DB --status` still work.
+
+**Conformance.** Oxigraph's GeoSPARQL test suite runs with the W3C harness
+(`cargo test -p sparkles --features geo --test w3c geosparql`): 37 of its 44 cases pass,
+and the 7 others are listed with the reason in
+`testsuite/geosparql/oxigraph/expected-failures.txt` (EPSG:4326 is supported, with its
+latitude-first axes; unclosed polygon rings are malformed literals).
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
@@ -2098,7 +2165,9 @@ type PlanNode = {
   children: PlanNode[];
   counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
                              // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
-                             // "feature-links", …), fallback (see GeoSPARQL)
+                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
+                             // once per distinct value: exprCacheHits (rows that reused a result),
+                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
   warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```

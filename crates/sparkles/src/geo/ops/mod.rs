@@ -1,12 +1,15 @@
-//! The geometric operations behind the `geof:` functions, over parsed geometries.
+//! The geometric operations behind the `geof:` and `spatialF:` functions and the
+//! GeoSPARQL aggregates, over parsed geometries.
 
 pub mod accessors;
 pub mod aeqd;
 pub mod construct;
 pub mod distance;
+pub mod hull;
 pub mod measure;
 pub mod overlay;
 pub mod relate;
+pub mod simple;
 
 use super::crs::CrsRef;
 use super::geom::Geom;

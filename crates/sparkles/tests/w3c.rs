@@ -6,6 +6,9 @@
 //! is used; the tests are skipped when neither exists. `SPARKLES_W3C_VERBOSE=1` prints
 //! every failure; `SPARKLES_W3C_FILTER=substr` restricts to matching test IRIs.
 //! Failures listed in `tests/w3c-known-failures.txt` do not fail the run.
+//!
+//! With the feature `geo` the same harness runs Oxigraph's GeoSPARQL tests, vendored in
+//! `testsuite/geosparql/oxigraph` (so never skipped).
 
 use oxrdf::dataset::CanonicalizationAlgorithm;
 use oxrdf::vocab::rdf;
@@ -667,23 +670,31 @@ fn run_syntax_test(t: &TestCase, m: &Manifest, positive: bool, update: bool) -> 
     }
 }
 
+/// Run the W3C suite's `manifests` (relative to `SPARKLES_W3C_DIR`); skipped when the
+/// suite is not checked out.
 fn run_suite(name: &str, manifests: &[&str]) {
     let Some(dir) = suite_dir() else {
         eprintln!("W3C test suite not found; skipping {name}");
         return;
     };
+    let known = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt");
+    run_suite_in(name, &dir, manifests, &known);
+}
+
+/// Run the manifests under `dir`; the tests named in `known_failures` (one short name
+/// per line, `#` comments, a reason after the name) may fail.
+fn run_suite_in(name: &str, dir: &Path, manifests: &[&str], known_failures: &Path) {
     let mut tests = Vec::new();
     for m in manifests {
         collect_tests(&path_to_url(&dir.join(m)), &mut tests);
     }
-    let known: BTreeSet<String> = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c-known-failures.txt"),
-    )
-    .unwrap_or_default()
-    .lines()
-    .map(|l| l.trim().to_string())
-    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-    .collect();
+    let known: BTreeSet<String> = std::fs::read_to_string(known_failures)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|l| !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
     let filter = std::env::var("SPARKLES_W3C_FILTER").ok();
     let verbose = std::env::var("SPARKLES_W3C_VERBOSE").is_ok();
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
@@ -694,8 +705,10 @@ fn run_suite(name: &str, manifests: &[&str]) {
             continue;
         }
         let short =
-            t.id.rsplit_once("/sparql/")
+            t.id.split_once("/oxigraph/tests/")
+                .and_then(|x| x.1.rsplit_once('#'))
                 .map(|x| x.1)
+                .or_else(|| t.id.rsplit_once("/sparql/").map(|x| x.1))
                 .or_else(|| t.id.rsplit_once("/data-r2/").map(|x| x.1))
                 .or_else(|| t.id.rsplit_once("/sparql12#").map(|x| x.1))
                 .unwrap_or(&t.id)
@@ -785,6 +798,21 @@ fn sparql10() {
 #[test]
 fn sparql12() {
     run_suite("SPARQL 1.2", &["sparql12/manifest.ttl"]);
+}
+
+/// Oxigraph's GeoSPARQL function tests, vendored in `testsuite/geosparql/oxigraph` with
+/// their license; the cases where Sparkles deliberately answers otherwise are listed,
+/// with the reason, in its `expected-failures.txt`.
+#[cfg(feature = "geo")]
+#[test]
+fn geosparql_oxigraph() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testsuite/geosparql/oxigraph");
+    run_suite_in(
+        "GeoSPARQL (Oxigraph)",
+        &dir,
+        &["manifest.ttl"],
+        &dir.join("expected-failures.txt"),
+    );
 }
 
 #[allow(dead_code)]

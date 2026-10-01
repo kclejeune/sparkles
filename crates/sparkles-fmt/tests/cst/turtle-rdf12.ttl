@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+VERSION "1.2"
+
+ex:a ex:b ex:c ~ ex:r1 {| ex:since 2020 |} ~ _:r2 ~ {| ex:p ex:o |} .
+<< ex:a ex:b ex:c >> ex:statedBy ex:d .
+<< ex:a ex:b ex:c ~ ex:r >> .
+<< [] ex:b << ex:c ex:d ex:e >> >> ex:p <<( ex:a ex:b <<( ex:c ex:d "e"@en--ltr )>> )>> .

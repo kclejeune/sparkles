@@ -240,7 +240,7 @@ export type PlanNode = {
   timeMs: number;
   cached: boolean;
   children: PlanNode[];
-  /** Operator counters (spatial operators: candidates, refined, matched, treeNodesVisited, index, fallback). */
+  /** Operator counters (spatial operators: candidates, refined, matched, treeNodesVisited, index, fallback; expressions per distinct value: exprCacheHits, exprCacheMisses, exprCacheSkipped). */
   counters?: Record<string, number | string | boolean>;
   /** Notes about the plan (root only). */
   warnings?: PlanWarning[];

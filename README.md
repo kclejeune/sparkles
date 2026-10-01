@@ -86,6 +86,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | W3C Basic Geo (`wgs84_pos:lat`/`long` pairs, `geo.json` `"wgs84": true`) as indexed points for the `spatial:` functions and the map view | ✅ |
 | `GET /{ds}/geo?bbox=…`: the indexed geometries in a box as simplified CRS84 GeoJSON, for map views | ✅ |
 | Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | ✅ |
+| GeoSPARQL `boundingCircle`, `concaveHull`, `isSimple`; the six `geof:agg…` aggregates (GROUP BY, DISTINCT); Jena's 15 `spatialF:` filter functions; the 120 UTM zones (EPSG:326NN/327NN, Krüger's series); `POST /$/geo/convert` (literals as CRS84 GeoJSON for maps); Oxigraph's GeoSPARQL tests (37/44, the rest listed with reasons) and Jena-derived tests; see [docs/API.md](docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
@@ -300,9 +301,17 @@ result cache, and the web UI.
   key bytes (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in
   parallel, with no per-term string allocation. Terms added by updates are tested on
   their delta keys; inline values (numbers, dates) fall back to the general evaluator.
-* **Per-distinct-value filters.** A deterministic filter over one variable is
-  evaluated once per distinct id, and rows look up the outcome. When the column is
-  sorted on the variable, the distinct ids are its runs.
+* **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND,
+  ORDER BY key or aggregate argument that reads one variable, and gives the same result
+  for the same term, is evaluated once per distinct id of that variable. Rows look up
+  the result, errors included. RAND, UUID, STRUUID, BNODE and EXISTS are evaluated per
+  row; NOW and the base IRI are fixed for the query. When the column is sorted on the
+  variable, the distinct ids are its runs. Otherwise a sample estimates how often values
+  repeat, and inputs where fewer than half of the rows repeat a value are evaluated row
+  by row. EXPLAIN notes `[expr cache: …]` with the distinct count, or why the operator
+  ran row by row, and reports `exprCacheHits` / `exprCacheMisses` / `exprCacheSkipped`.
+  A constant regular expression is compiled once per thread and reused with its match
+  cache.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric
   constants reads only the id ranges that can match. Inline integers, and inline
   decimals of one scale, sort by value within their id segment. So each segment's
@@ -401,6 +410,7 @@ result cache, and the web UI.
 | GeoSPARQL literals in a CRS this build does not know are valid geometries: same-CRS planar relations, accessors and constructions work, metric functions and mixes with other CRSs are type errors, and the index leaves them out (counted in its status) | Jena logs a warning and treats the coordinates as CRS84 degrees, which gives wrong answers silently. |
 | GeoSPARQL relations follow DE-9IM: an empty geometry is disjoint from everything (`sfDisjoint` true, every other relation false), equal points are `sfEquals`, `sfCrosses` of two curves is `0********`, RCC8 relations hold between regions only | Jena returns false for every relation on an empty geometry and compares `sfEquals` with the tables' `TFFFTFFFT` pattern, under which two equal points are not equal. |
 | `geof:getSRID` returns an `xsd:anyURI`; `geof:dimension` of an empty geometry is its type's dimension (`-1` for an empty collection) | The GeoSPARQL 1.1 signature (Jena returns `xsd:string`); never a type error. |
+| `geof:concaveHull(g, targetPercent)` sets concaveman's concavity to `targetPercent / 25` (50 = the default 2.0, 100 = the convex hull); `geof:aggConcaveHull` uses the default; `spatialF:angle` follows Jena's documented meaning (clockwise from the y axis) in every quadrant | GeoSPARQL leaves the hull parameter to the implementation, and a SPARQL aggregate takes one expression. Jena's `angle` is a quarter turn off south-east and north-west of the first point. |
 | The spatial index is opt-in per dataset (`geo.json`); the `geof:` functions work without it, and every answer from the index is refined with the exact test, so answers are the same with or without it | Jena's index is built for the whole dataset at start-up and its `spatial:withinBox`/`intersectBox` return envelope hits for an unbound subject. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 

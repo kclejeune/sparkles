@@ -1,0 +1,41 @@
+{
+  "@context": {
+    "@vocab": "http://example.org/vocab#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#"
+  },
+  "@id": "http://example.org/s",
+  "label": [
+    {
+      "@value": "colour",
+      "@language": "en"
+    },
+    {
+      "@value": "left",
+      "@language": "en",
+      "@direction": "ltr"
+    }
+  ],
+  "count": {
+    "@type": "xsd:integer",
+    "@value": "3"
+  },
+  "tagged": {
+    "@value": "indexed",
+    "@index": "t1"
+  },
+  "ordered": { "@list": ["b", "a"] },
+  "bag": { "@set": ["x"] },
+  "data": {
+    "@type": "@json",
+    "@value": {
+      "z": 1,
+      "@id": "not a keyword here",
+      "a": [
+        {
+          "y": 2,
+          "x": 1
+        }
+      ]
+    }
+  }
+}
