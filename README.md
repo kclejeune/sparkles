@@ -84,6 +84,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), rebuilt on open and by compaction, within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
 | Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | ✅ |
 | GeoSPARQL `boundingCircle`, `concaveHull`, `isSimple`; the six `geof:agg…` aggregates (GROUP BY, DISTINCT); Jena's 15 `spatialF:` filter functions; the 120 UTM zones (EPSG:326NN/327NN, Krüger's series); `POST /$/geo/convert` (literals as CRS84 GeoJSON for maps); Oxigraph's GeoSPARQL tests (37/44, the rest listed with reasons) and Jena-derived tests; see [docs/API.md](docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) | ✅ |
+| Spatial joins (a GeoSPARQL relation, `relate` or distance bound between the geometries of two parts of a group: an index nested loop or trees packed per query, instead of a cross product) and nearest-neighbour `ORDER BY geof:metricDistance(?w, C) LIMIT k` from the index (`SpatialJoin`, `SpatialKnn` in EXPLAIN, `geo-not-joined`/`geo-not-knn` warnings); see [docs/API.md](docs/API.md#spatial-joins-and-nearest-neighbours) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
@@ -187,7 +188,7 @@ feature gaps are:
 | Streaming execution | lazy, block-wise evaluation of scans, joins, filters and GROUP BY; results streamed to the client | every operator materializes its full result (bounded by row and memory budgets); responses over 1 MiB are streamed to the client as they are serialized |
 | Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals); non-canonical numerals are still tested row by row |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts use index runs instead) |
-| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); GeoSPARQL functions and a spatial index, no spatial joins yet |
+| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); GeoSPARQL functions, a spatial index, spatial joins on GeoSPARQL FILTERs and nearest-neighbour ORDER BY |
 | Vocabulary compression | FSST string compression, IRI-as-id encoding for numeric IRIs | front coding, no IRI encoding |
 | Named / pinned results, materialized views | `pin-result-with-name`, materialized views | result cache only (no pinning) |
 | Live query monitoring | websocket runtime-information updates | executed plan returned after completion only |
@@ -728,7 +729,8 @@ database to an `fs` repository.
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 `scripts/gen-geo.py N` generates a GeoSPARQL one (points around cities, lines, polygons,
 an administrative hierarchy) with its queries, and `scripts/bench-geo.sh N` times them
-with and without the spatial index after checking that both give the same answers.
+with and without the spatial index (and the nearest-neighbour query with the spatial
+rewrites off) after checking that every run gives the same answers.
 `scripts/geosparql-benchmark.sh` runs the GeoSPARQL Compliance Benchmark (GPL-2.0, so it
 is fetched into `target/` at a pinned commit only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`,
 and never added to the repository).

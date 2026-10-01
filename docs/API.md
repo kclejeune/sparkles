@@ -1663,6 +1663,64 @@ and the 7 others are listed with the reason in
 `testsuite/geosparql/oxigraph/expected-failures.txt` (EPSG:4326 is supported, with its
 latitude-first axes; unclosed polygon rings are malformed literals).
 
+### Spatial joins and nearest neighbours
+
+**Spatial joins.** A FILTER conjunct that tests two geometry variables bound by different
+parts of a group (parts that share no variable) joins those parts on the test instead of
+forming their cross product (`SpatialJoin` in EXPLAIN):
+
+```sparql
+SELECT ?state (COUNT(?p) AS ?n) WHERE {
+  ?state a ex:State ; geo:hasDefaultGeometry/geo:asWKT ?sw .
+  ?p a ex:Place ; geo:hasDefaultGeometry/geo:asWKT ?pw .
+  FILTER(geof:sfContains(?sw, ?pw))
+} GROUP BY ?state
+```
+
+The tests are the relations (but the disjoint ones), `relate` with a pattern that needs an
+intersection, and `distance`/`metricDistance` below a constant (`<`, `<=`, or the bound
+first with `>`, `>=`). A part that is a single pattern `?x <indexed predicate> ?w` is
+searched in the spatial index when it is ready: per geometry of the other part when that
+part is small next to it (`[index nested loop on <…>]`), otherwise its rows near the
+other part are read once. Any other part is planned as usual, and its distinct geometries
+are packed into an R-tree for the query (`[tree join]`, also without an index). Each
+candidate pair is tested with the function itself, so the answer (duplicates included) is
+the cross product's with the filter: geometries in an unknown CRS are tested against those
+of the same CRS, and a relation with a literal the index does not hold reads the pattern
+instead of searching the index. A disjointness test, a lower bound on a distance, a
+pattern that holds without an intersection or a non-constant bound keep the cross product
+and add a `geo-not-joined` warning naming the reason. Candidate pairs count against the
+query's row limit: past it the query fails with `507`.
+
+**Nearest neighbours.** `ORDER BY ASC(geof:metricDistance(?w, C))` or
+`geof:distance(?w, C, unit)` with a length unit (or a variable bound to one of them), with
+a `LIMIT`, over a group where `?w` is the object of one pattern of an indexed predicate
+and the other patterns connect to that pattern, reads the pattern nearest first
+(`SpatialKnn` under the top-k): the group runs over batches of the nearest rows until the
+`k`-th distance found is below the bound of every row not read yet. Rows whose distance is
+an error (not a geometry, malformed, empty, a CRS without a transform) come first in
+SPARQL's order, so without a `FILTER(BOUND(?d))` or a bound on the distance in the group,
+the pattern's rows are also read once to find them:
+
+```sparql
+SELECT ?g ?d WHERE {
+  ?g geo:asWKT ?w
+  BIND(geof:metricDistance(?w, "POINT(9 1)"^^geo:wktLiteral) AS ?d)
+  FILTER(BOUND(?d))
+} ORDER BY ?d LIMIT 10
+```
+
+The answer is the generic sort's, up to the choice among rows tied at the `k`-th
+distance. A descending order, an angle unit, a constant that is empty or not in longitude
+and latitude, an index that is not ready, and a group whose other patterns do not connect
+to `?w`'s pattern keep the generic sort and add a `geo-not-knn` warning.
+
+Both operators report the counters of the other spatial operators, and `pairs` (geometry
+pairs that passed) and `indexProbes` for a join, `batches` (runs of the group) and
+`errorRows` for nearest neighbours. They are the `spatial_join` and `spatial_knn`
+optimizations (`QueryOptions::optimizations`, `SPARKLES_DISABLE_OPTIMIZATIONS`), on by
+default.
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
