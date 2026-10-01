@@ -462,6 +462,16 @@ async fn result_bytes_budget() {
 }
 
 #[tokio::test]
+async fn typing_pairs_fit_the_memory_budget() {
+    // 64 bytes per pair: one pair; alice's typing needs bob's too
+    let (_dir, app) = server_with(PEOPLE, |st| st.limits.query_memory_bytes = Some(64));
+    let node = enc("<http://ex.org/alice>");
+    let r = send(&app, post(&format!("/ds/shex?node={node}"), PERSON)).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "validation-work");
+}
+
+#[tokio::test]
 async fn file_imports_need_the_load_directory() {
     let files = tempfile::tempdir().unwrap();
     std::fs::write(

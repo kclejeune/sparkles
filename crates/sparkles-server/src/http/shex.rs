@@ -288,6 +288,15 @@ mod enabled {
         let (cancel, _cancel_on_drop) = cancel_on_drop();
         let max_bytes = st.limits.max_result_bytes;
         let max_results = crate::validation_common::max_results(&st.limits);
+        // the typing's pairs within the memory budget, at an estimated 64 bytes each
+        let max_pairs =
+            st.limits
+                .query_memory_bytes
+                .map_or(sparkles_shex::DEFAULT_MAX_PAIRS, |m| {
+                    usize::try_from(m / 64)
+                        .unwrap_or(usize::MAX)
+                        .min(sparkles_shex::DEFAULT_MAX_PAIRS)
+                });
         let too_large = move |requested: u64| -> ApiError {
             Error::BudgetExceeded(sparkles::Budget {
                 kind: BudgetKind::ResultBytes,
@@ -352,6 +361,7 @@ mod enabled {
                 timeout: Some(p.timeout),
                 cancel: Some(cancel),
                 max_results,
+                max_pairs: Some(max_pairs),
                 only_nonconformant: p.only_nonconformant,
                 semact_trace: p.semact_trace,
                 ..Default::default()
