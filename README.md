@@ -97,7 +97,7 @@ running queries.
 
 The full list, with what is not there yet, is in [docs/FEATURES.md](docs/FEATURES.md).
 
-## How it compares
+## Comparison
 
 | Engine | What it is | Where Sparkles stands |
 |---|---|---|
@@ -199,7 +199,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.
 
-## Using it as a library
+## Library usage
 
 `crates/sparkles` is an embeddable engine with no HTTP or async dependencies. The CLI and
 server are built on its public API.
