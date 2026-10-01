@@ -345,6 +345,20 @@ result cache, and the web UI.
   less than evaluating it per distinct outer key, and the EXISTS stays per row when
   the set does not fit in the memory budget (`[EXISTS decorrelated on ?y: …]` in
   EXPLAIN, or the reason it was not, with `exists*` counters).
+* **Batched index joins.** When the input of a join always binds a variable that a
+  triple pattern can be read sorted on, and has few distinct values of it for the
+  pattern's size, the pattern is read only for those values (`IndexJoin` in EXPLAIN).
+  The distinct keys, sorted, become key ranges, and ranges whose blocks are adjacent are
+  read by one scan: scattered keys cost a seek per region, dense keys one sweep. Each
+  input row then joins its key's rows, so the input's order and duplicates are kept.
+  The planner offers it next to the merge and hash joins when probing (seeks, touched
+  blocks, rows) is estimated at under half the cost of scanning the pattern. EXPLAIN
+  counts the keys, seeks, blocks and rows read (`batched_join`).
+* **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
+  ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It either
+  walks each subject's SPO run once, picking out the star's predicates, or probes each
+  pattern's own permutation, whichever touches fewer blocks, and forms the output once
+  instead of through the chain's intermediate tables (`star_fusion`).
 * Every one of these can be switched off per query (`QueryOptions::optimizations`) or
   per process (`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`), and EXPLAIN shows
   which one ran.

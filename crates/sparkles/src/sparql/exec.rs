@@ -270,6 +270,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let input = child(0, &mut infos)?;
             unpack(ctx, input, *t, parts, &n.vars)?
         }
+        Kind::IndexJoin(spec) => {
+            let l = child(0, &mut infos)?;
+            let (t, stats) = super::indexjoin::run(ctx, spec, &l, &n.vars)?;
+            note = Some(stats.note());
+            counters = Some(stats.counters());
+            t
+        }
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
@@ -630,6 +637,7 @@ fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table) -> Result<Table> {
         Kind::Project(vars) => t.project(vars),
         Kind::Unpack { t: tv, parts } => unpack(ctx, t, *tv, parts, &n.vars)?,
         Kind::Distinct => distinct(t),
+        Kind::IndexJoin(spec) => super::indexjoin::run(ctx, spec, &t, &n.vars)?.0,
         _ => unreachable!("not a unary streaming operator"),
     })
 }
@@ -661,7 +669,8 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
         | Kind::Extend(..)
         | Kind::Project(_)
         | Kind::Unpack { .. }
-        | Kind::Distinct => {
+        | Kind::Distinct
+        | Kind::IndexJoin(_) => {
             let mut budget = want.max(64);
             loop {
                 let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
@@ -1611,7 +1620,7 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     Some(out)
 }
 
-fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<()> {
+pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<()> {
     // EXISTS conjuncts answered from a key set first
     let rest = super::exists::apply(ctx, t, exprs)?;
     let exprs = rest.as_deref().unwrap_or(exprs);

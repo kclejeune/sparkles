@@ -6,6 +6,7 @@ pub mod exec;
 mod exists;
 pub mod expr;
 pub mod geopf;
+pub mod indexjoin;
 mod keyfilter;
 pub mod plan;
 pub mod results;
@@ -680,6 +681,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
 
 #[cfg(test)]
 mod exists_tests;
+#[cfg(test)]
+mod indexjoin_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]

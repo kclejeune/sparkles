@@ -319,6 +319,16 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             let _ = write!(s, "{:?}{:?}{:?}{}", t.graph, t.graph_var, t.subject, epoch);
             true
         }
+        Kind::IndexJoin(j) => {
+            for p in &j.probes {
+                let _ = write!(
+                    s,
+                    "{:?}{:?}{:?}{:?};",
+                    p.scan.perm, p.scan.prefix, p.scan.graph, p.scan.eqs
+                );
+            }
+            j.probes.iter().all(|p| p.filter.iter().all(deterministic))
+        }
         Kind::Filter(es) => es.iter().all(deterministic),
         Kind::Extend(_, e) => deterministic(e),
         Kind::LeftJoin { expr } => expr.as_ref().is_none_or(deterministic),

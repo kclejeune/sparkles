@@ -62,10 +62,16 @@ pub struct Optimizations {
     /// `FILTER (NOT) EXISTS` over a join group probes a key set built once from the
     /// pattern, instead of evaluating the substituted pattern per outer row
     pub decorrelate_exists: bool,
+    /// a join with a selective input reads a triple pattern only for the input's distinct
+    /// keys, by clustered seeks over a permutation sorted on the key
+    pub batched_join: bool,
+    /// index joins on one subject over constant predicates are read together, walking
+    /// each subject's run once when that touches fewer blocks
+    pub star_fusion: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 10] = [
+    pub const NAMES: [&str; 12] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -76,6 +82,8 @@ impl Optimizations {
         "selective_columns",
         "spatial_pushdown",
         "decorrelate_exists",
+        "batched_join",
+        "star_fusion",
     ];
 
     /// Everything on.
@@ -90,6 +98,8 @@ impl Optimizations {
         selective_columns: true,
         spatial_pushdown: true,
         decorrelate_exists: true,
+        batched_join: true,
+        star_fusion: true,
     };
 
     /// Everything off: the generic operators only.
@@ -104,6 +114,8 @@ impl Optimizations {
         selective_columns: false,
         spatial_pushdown: false,
         decorrelate_exists: false,
+        batched_join: false,
+        star_fusion: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -118,6 +130,8 @@ impl Optimizations {
             "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
             "decorrelate_exists" => &mut self.decorrelate_exists,
+            "batched_join" => &mut self.batched_join,
+            "star_fusion" => &mut self.star_fusion,
             _ => return None,
         })
     }
