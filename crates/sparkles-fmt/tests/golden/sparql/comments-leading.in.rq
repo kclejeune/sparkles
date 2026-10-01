@@ -1,0 +1,10 @@
+# the header is not the first declaration's
+PREFIX ex: <http://example.org/>
+    # the FOAF vocabulary
+  # (two lines, re-indented)
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+# the query itself
+SELECT ?name
+WHERE {
+  ?p foaf:name ?name .
+}

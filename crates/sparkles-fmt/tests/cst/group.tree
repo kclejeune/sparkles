@@ -125,26 +125,29 @@ QueryUnit
             RBrace "}"
         Filter
           Kw(Filter) "FILTER"
-          Opaque
+          Bracketed
             LParen "("
-            Var1 "?o"
-            NotEq "!="
-            Var1 "?z"
+            Binary
+              Var1 "?o"
+              NotEq "!="
+              Var1 "?z"
             RParen ")"
         Filter
           Kw(Filter) "FILTER"
-          Opaque
-            Word "regex"
-            LParen "("
-            Var1 "?v"
-            Comma ","
-            String2 "\"x\""
-            RParen ")"
+          Call
+            Kw(Regex) "regex"
+            ArgList
+              LParen "("
+              Arg
+                Var1 "?v"
+                Comma ","
+              Arg
+                String2 "\"x\""
+              RParen ")"
         Bind
           Kw(Bind) "BIND"
           LParen "("
-          Opaque
-            Var1 "?v"
+          Var1 "?v"
           Kw(As) "AS"
           Var1 "?bound"
           RParen ")"
