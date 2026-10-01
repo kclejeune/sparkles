@@ -521,9 +521,10 @@ fn config_discovery() {
             "sub/sparklesfmt.toml: error: line-width: expected an integer from 40 to 400, got 1000\n{ALIGN}\n"
         )
     );
-    // the dotfile wins over sparklesfmt.toml in one directory
+    // the dotfile wins over sparklesfmt.toml in one directory: its indent width applies (the
+    // file, formatted with 2 spaces, now needs changes) instead of the broken file's error
     write(dir, "sub/.sparklesfmt.toml", "indent-width = 4\n");
-    expect(dir, &["--check", "sub/mid.rq"], None, 0);
+    expect(dir, &["--check", "sub/mid.rq"], None, 1);
     expect(dir, &["--config", "nope.toml", "top.rq"], None, 2);
     let o = expect(dir, &["--config", "nope.toml", "top.rq"], None, 2);
     assert_eq!(stderr(&o), "nope.toml: error: No such file or directory\n");
