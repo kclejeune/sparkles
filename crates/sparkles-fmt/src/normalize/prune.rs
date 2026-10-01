@@ -268,6 +268,33 @@ mod tests {
     }
 
     #[test]
+    fn turtle_scopes_end_at_a_redefinition() {
+        let src = "@prefix a: <http://e/1#> .\nPREFIX b: <http://e/b#>\na:s a:p 1 .\n@prefix a: <http://e/2#> .\nPREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n<http://e/b#x> rdf:type \"2\"^^<http://e/2#t> .\n";
+        let tree = crate::turtle::parse::parse(src, lex(src, LexMode::Turtle), false).unwrap();
+        let scope = PrefixScope::from_tree(&tree);
+        let labels = |unused: HashSet<NodeId>| {
+            let mut v: Vec<&str> = unused.iter().map(|&n| tree.text(n)).collect();
+            v.sort();
+            v
+        };
+        // b: compacts <http://e/b#x>, rdf:type is printed `a`, the second a: compacts
+        // the datatype
+        assert_eq!(
+            labels(unused_declarations(&tree, &scope)),
+            ["PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>"]
+        );
+        let opts = Options {
+            compact_iris: false,
+            type_shorthand: false,
+            ..Options::default()
+        };
+        assert_eq!(
+            labels(unused_declarations_with(&tree, &scope, &opts, |_| false)),
+            ["@prefix a: <http://e/2#> .", "PREFIX b: <http://e/b#>"]
+        );
+    }
+
+    #[test]
     fn nodes_printed_as_written_keep_their_names() {
         let src = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX ex: <http://e/>\nSELECT * { ?s rdf:type <http://e/x> }";
         let tree =
