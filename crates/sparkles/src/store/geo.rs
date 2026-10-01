@@ -11,7 +11,14 @@
 //!   never fails the write: the index turns `failed` and queries run without it until a
 //!   rebuild (or a compaction) builds it again.
 //! * **Bulk commits and compactions** build the new generation's base under the writer
-//!   lock before it is published, keeping the epoch.
+//!   lock before it is published, keeping the epoch. Literals the previous generation's
+//!   column holds are taken from it (by their key), so only new literals are parsed.
+//! * **Files.** A persistent store writes each base it builds to `gen-NNNN/geo/` and
+//!   reads it back from there (in place, decoding geometries on demand), so opening the
+//!   store or enabling the same configuration again parses nothing. Files that are
+//!   missing, damaged or made for something else are removed and the base is built
+//!   again. A generation being replaced is retired first: its files are written no
+//!   more, so a compaction never races a write into the directory it removes.
 
 use super::{Snapshot, Store};
 use crate::error::Result;
@@ -20,10 +27,16 @@ use crate::id::Id;
 use std::sync::Arc;
 
 #[cfg(feature = "geo")]
+use crate::geo::column::Reuse;
+#[cfg(feature = "geo")]
 use crate::geo::index::{
     BuildCtl, GeoBase, GeoIndex, Lookup, Overlay, Row, TailRow, ViewState, build_base, overlay_of,
     tail_limit,
 };
+#[cfg(feature = "geo")]
+use crate::geo::persist::{self, Identity, Problem};
+#[cfg(feature = "geo")]
+use std::path::PathBuf;
 #[cfg(feature = "geo")]
 use std::sync::atomic::Ordering;
 
@@ -50,7 +63,7 @@ impl Store {
             }
             let epoch = self.geo.load_full().map_or(1, |g| g.epoch() + 1);
             let (idx, snap) = self.install_geo(c, epoch);
-            self.spawn_geo_build(idx.clone(), epoch, snap);
+            self.spawn_geo_build(idx.clone(), epoch, snap, true);
             self.wait_geo_epoch(&idx, epoch)
         }
     }
@@ -71,6 +84,16 @@ impl Store {
                 let mut s = (*snap).clone();
                 s.geo = None;
                 self.current.store(Arc::new(s));
+            }
+            // the index files go with the index (a build still running writes none: its
+            // index is retired)
+            #[cfg(feature = "geo")]
+            if let Some(root) = &self.root
+                && let Some(gdir) = snap.generation.dir.as_ref().filter(|d| d.starts_with(root))
+            {
+                snap.generation
+                    .geo
+                    .with_files(|| persist::remove(&persist::dir_of(gdir)));
             }
         }
         if let Some(root) = &self.root {
@@ -107,7 +130,8 @@ impl Store {
                 self.publish_geo(&snap, self.building_view(&idx, epoch, &snap))
             };
             drop(w);
-            self.spawn_geo_build(idx.clone(), epoch, snap);
+            // from RDF: the files are written again, not read
+            self.spawn_geo_build(idx.clone(), epoch, snap, false);
             self.wait_geo_epoch(&idx, epoch)
         }
     }
@@ -199,7 +223,7 @@ impl Store {
                 }
             };
             let (idx, snap) = self.install_geo(cfg, 1);
-            self.spawn_geo_build(idx, 1, snap);
+            self.spawn_geo_build(idx, 1, snap, true);
         }
     }
 
@@ -252,6 +276,8 @@ impl Store {
         let _ = prev;
         #[cfg(feature = "geo")]
         {
+            // the replaced generation's directory may go now: nothing writes there any more
+            prev.generation.geo.retire();
             let Some(idx) = self.geo.load_full() else {
                 new.geo = None;
                 return;
@@ -264,8 +290,27 @@ impl Store {
                 progress: &idx.progress,
                 cancel: &never,
             };
+            // the previous base's literals, if it indexed the same way
+            let prev_base = prev
+                .geo
+                .as_ref()
+                .filter(|v| v.config.index_hash() == idx.config.index_hash())
+                .and_then(|v| v.usable().cloned());
+            let reuse = prev_base.as_ref().map(|b| Reuse {
+                snap: prev,
+                column: &b.column,
+            });
+            let files = self.geo_files(new, &idx.config);
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_base(new, &idx.config, &lookup, &ctl)
+                base_for(
+                    new,
+                    &idx.config,
+                    &lookup,
+                    &ctl,
+                    files.as_ref(),
+                    false,
+                    reuse.as_ref(),
+                )
             }));
             let (view, message, last) = finish_view(&idx, epoch, new, lookup, built);
             new.geo = Some(Arc::new(view));
@@ -348,11 +393,37 @@ impl Store {
             .ok_or_else(|| crate::error::Error::invalid("spatial index is not enabled"))
     }
 
-    /// Build the base of `snap`'s generation on a background thread and publish it
-    /// (with the overlay of the snapshot current then) unless it was superseded: by a
-    /// newer build, a generation switch (which builds its own), a disable or the
-    /// store's closing.
-    fn spawn_geo_build(&self, idx: Arc<GeoIndex>, epoch: u64, snap: Arc<Snapshot>) {
+    /// Where the index files of `snap`'s generation go, and what they must match
+    /// (`None`: the store keeps none, being in memory, or this platform cannot read
+    /// them in place).
+    fn geo_files(&self, snap: &Snapshot, cfg: &GeoConfig) -> Option<(PathBuf, Identity)> {
+        if !persist::SUPPORTED {
+            return None;
+        }
+        let root = self.root.as_ref()?;
+        let gdir = snap
+            .generation
+            .dir
+            .as_ref()
+            .filter(|d| d.starts_with(root))?;
+        Some((
+            persist::dir_of(gdir),
+            Identity::of(
+                gdir,
+                snap.generation.meta.quads,
+                snap.generation.meta.terms,
+                cfg.index_hash(),
+            ),
+        ))
+    }
+
+    /// Build the base of `snap`'s generation on a background thread (or, with `load`,
+    /// read it from the generation's files when they fit) and publish it (with the
+    /// overlay of the snapshot current then) unless it was superseded: by a newer
+    /// build, a generation switch (which builds its own), a disable or the store's
+    /// closing.
+    fn spawn_geo_build(&self, idx: Arc<GeoIndex>, epoch: u64, snap: Arc<Snapshot>, load: bool) {
+        let files = self.geo_files(&snap, &idx.config);
         let current = Arc::downgrade(&self.current);
         let writer = Arc::downgrade(&self.writer);
         let uid = snap.generation.uid;
@@ -375,7 +446,15 @@ impl Store {
                 };
                 let reading = snap.without_cache_fill();
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_base(&reading, &idx.config, &lookup, &ctl)
+                    base_for(
+                        &reading,
+                        &idx.config,
+                        &lookup,
+                        &ctl,
+                        files.as_ref(),
+                        load,
+                        None,
+                    )
                 }));
                 drop(reading);
                 while idx.paused.load(Ordering::SeqCst) && !superseded() {
@@ -403,6 +482,71 @@ impl Store {
             tracing::error!("cannot start the spatial index build: {e}");
             failed.finish(epoch, Some(format!("build failed: {e}")), None);
         }
+    }
+}
+
+/// The base of `snap`'s generation: with `load`, read from the generation's index files
+/// (`files`) when they fit it (files that do not are removed); else built (taking what
+/// it can from `reuse`) and, with `files`, written there and read back, so the base is
+/// read in place like one opened later.
+#[cfg(feature = "geo")]
+fn base_for(
+    snap: &Snapshot,
+    cfg: &GeoConfig,
+    lookup: &Lookup,
+    ctl: &BuildCtl<'_>,
+    files: Option<&(PathBuf, Identity)>,
+    load: bool,
+    reuse: Option<&Reuse<'_>>,
+) -> Result<GeoBase> {
+    if let (Some((dir, ident)), true) = (files, load) {
+        match GeoBase::read_files(dir, ident, snap, cfg, true) {
+            Ok(b) => return Ok(b),
+            Err((_, Problem::Missing)) => {}
+            Err((f, p)) => {
+                tracing::warn!(
+                    "spatial index file {}: {p}; it is built again",
+                    dir.join(f).display()
+                );
+                snap.generation.geo.with_files(|| persist::remove(dir));
+            }
+        }
+    }
+    let base = build_base(snap, cfg, lookup, ctl, reuse)?;
+    let Some((dir, ident)) = files else {
+        return Ok(base);
+    };
+    let written = snap.generation.geo.with_files(|| {
+        if (ctl.cancel)() {
+            return None;
+        }
+        let r = base
+            .write_files(dir, ident)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                GeoBase::read_files(dir, ident, snap, cfg, false).map_err(|(_, p)| p.to_string())
+            });
+        if r.is_err() {
+            persist::remove(dir);
+        }
+        Some(r)
+    });
+    match written.flatten() {
+        Some(Ok(mut b)) => {
+            b.opened = false;
+            b.built_ms = base.built_ms;
+            b.column.parsed = base.column.parsed;
+            b.column.reused = base.column.reused;
+            Ok(b)
+        }
+        Some(Err(e)) => {
+            tracing::warn!(
+                "cannot write the spatial index files of {}: {e}; the index stays in memory",
+                snap.generation.name
+            );
+            Ok(base)
+        }
+        None => Ok(base),
     }
 }
 
@@ -576,11 +720,11 @@ mod tests {
     use crate::store::StoreOptions;
     use std::collections::BTreeSet;
 
-    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
-    const EX: &str = "http://example.org/";
+    pub(super) const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    pub(super) const EX: &str = "http://example.org/";
 
     /// The fixture of the GeoSPARQL acceptance examples.
-    const FIXTURE: &str = r#"
+    pub(super) const FIXTURE: &str = r#"
 @prefix ex: <http://example.org/> .
 @prefix geo: <http://www.opengis.net/ont/geosparql#> .
 ex:A geo:hasDefaultGeometry ex:gA . ex:gA geo:asWKT "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))"^^geo:wktLiteral .
@@ -595,28 +739,28 @@ ex:mars geo:hasGeometry ex:gM . ex:gM geo:asWKT "<http://example.org/crs/mars> P
 ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiteral . }
 "#;
 
-    const WORLD: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
-    const NEAR: [f64; 4] = [0.5, 0.5, 2.5, 2.5];
+    pub(super) const WORLD: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+    pub(super) const NEAR: [f64; 4] = [0.5, 0.5, 2.5, 2.5];
 
-    fn opts() -> StoreOptions {
+    pub(super) fn opts() -> StoreOptions {
         StoreOptions::default()
     }
 
     /// An in-memory dataset holding the fixture in its base.
-    fn fixture(o: StoreOptions) -> Dataset {
+    pub(super) fn fixture(o: StoreOptions) -> Dataset {
         let ds = Dataset::from_store(Store::in_memory(o));
         ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
         ds
     }
 
-    fn update(ds: &Dataset, op: &str, triples: &str) {
+    pub(super) fn update(ds: &Dataset, op: &str, triples: &str) {
         ds.update(&format!(
             "PREFIX geo: <{GEO}> PREFIX ex: <{EX}> {op} DATA {{ {triples} }}"
         ))
         .unwrap();
     }
 
-    fn preds(snap: &Snapshot) -> Vec<Id> {
+    pub(super) fn preds(snap: &Snapshot) -> Vec<Id> {
         ["asWKT", "asGeoJSON", "hasSerialization"]
             .iter()
             .filter_map(|p| snap.lookup_iri(&format!("{GEO}{p}")))
@@ -624,7 +768,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     /// Local names of the subjects of the rows in window `w`, and the statistics.
-    fn window(
+    pub(super) fn window(
         snap: Arc<Snapshot>,
         w: [f64; 4],
         graph: GraphFilter,
@@ -650,7 +794,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         (out, st, n)
     }
 
-    fn names(v: &[&str]) -> BTreeSet<String> {
+    pub(super) fn names(v: &[&str]) -> BTreeSet<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
 
@@ -659,7 +803,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     /// The snapshot without its index view (the searches then scan).
-    fn unindexed(snap: &Snapshot) -> Arc<Snapshot> {
+    pub(super) fn unindexed(snap: &Snapshot) -> Arc<Snapshot> {
         let mut s = snap.clone();
         s.geo = None;
         Arc::new(s)
@@ -769,7 +913,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     /// Splitmix64, for reproducible random data.
-    fn rng(seed: &mut u64) -> f64 {
+    pub(super) fn rng(seed: &mut u64) -> f64 {
         *seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = *seed;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1074,3 +1218,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert!(pts_on - pts_off < 1.0 + pts_off * 0.5);
     }
 }
+
+#[cfg(all(test, feature = "geo"))]
+#[path = "geo_files_tests.rs"]
+mod files_tests;

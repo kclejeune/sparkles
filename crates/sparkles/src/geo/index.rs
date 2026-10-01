@@ -12,10 +12,12 @@
 //!   delta keeps `ins` disjoint from the base and `del` within it, the rows of S are
 //!   exactly `(base − del) ∪ (overlay ∪ tail) ∩ ins`.
 
-use super::column::{Column, ColumnEntry, Counts, Slot};
+use super::column::{Column, ColumnEntry, Counts, Reuse, Slot};
 use super::config::{
-    FORMAT_VERSION, GeoBuild, GeoConfig, GeoMemory, GeoRows, GeoSkipped, GeoStatus, IndexState,
+    FORMAT_VERSION, GeoBuild, GeoConfig, GeoFiles, GeoMemory, GeoRows, GeoSkipped, GeoStatus,
+    IndexState,
 };
+use super::persist::{self, FileKind, Identity, Mapped, Problem};
 use super::tree::PackedTree;
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
@@ -24,11 +26,14 @@ use crate::store::Snapshot;
 use crate::text::PredicateSet;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::FxHashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// An indexed quad (raw ids).
+/// An indexed quad (raw ids). The layout is that of the rows in `rtree.spkg` (four
+/// little-endian `u64`), which are read in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(C)]
 pub(crate) struct Row {
     pub s: u64,
     pub p: u64,
@@ -60,8 +65,59 @@ pub(crate) struct TailRow {
     pub entry: Arc<ColumnEntry>,
 }
 
+/// Rows held in memory, or read in place from a mapped `rtree.spkg`.
+pub(crate) enum Rows {
+    Owned(Vec<Row>),
+    Mapped {
+        file: Arc<Mapped>,
+        /// byte offset in the file's data (a multiple of 8)
+        at: usize,
+        n: usize,
+    },
+}
+
+impl Rows {
+    /// The `n` rows at `at` of `file`'s data (`None`: out of bounds or misaligned).
+    fn mapped(file: Arc<Mapped>, at: usize, n: usize) -> Option<Rows> {
+        let len = n.checked_mul(std::mem::size_of::<Row>())?;
+        let b = file.data().get(at..at.checked_add(len)?)?;
+        if !persist::SUPPORTED || !(b.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Row>())
+        {
+            return None;
+        }
+        Some(Rows::Mapped { file, at, n })
+    }
+
+    /// Bytes held in memory.
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Rows::Owned(v) => (v.len() * std::mem::size_of::<Row>()) as u64,
+            Rows::Mapped { .. } => 0,
+        }
+    }
+}
+
+impl std::ops::Deref for Rows {
+    type Target = [Row];
+    fn deref(&self) -> &[Row] {
+        match self {
+            Rows::Owned(v) => v,
+            Rows::Mapped { file, at, n } => {
+                let b = &file.data()[*at..*at + n * std::mem::size_of::<Row>()];
+                // SAFETY: `Rows::mapped` checked that the bytes are in the mapping and
+                // aligned for `Row`, a `repr(C)` struct of four `u64` for which every bit
+                // pattern is valid; the files are little-endian, as this platform
+                // (`persist::SUPPORTED`), and the mapping lives as long as `file`.
+                unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<Row>(), *n) }
+            }
+        }
+    }
+}
+
 fn tree_bytes(t: &Option<PackedTree>) -> u64 {
-    t.as_ref().map_or(0, PackedTree::bytes)
+    t.as_ref()
+        .filter(|t| !t.is_mapped())
+        .map_or(0, PackedTree::bytes)
 }
 
 /// Whether the `f32` box `b` intersects the CRS84 window `w`.
@@ -185,7 +241,7 @@ pub(crate) struct GeoBase {
     pub generation: u64,
     pub generation_name: String,
     /// base rows in PSO order (the tree's items)
-    pub rows: Vec<Row>,
+    pub rows: Rows,
     /// base rows whose literal was skipped but may still match (see
     /// [`Slot::rechecked`]): candidates of every search
     pub skipped: Vec<Row>,
@@ -194,6 +250,10 @@ pub(crate) struct GeoBase {
     /// base rows per predicate slot
     pub slot_rows: Vec<u64>,
     pub built_ms: f64,
+    /// read from the generation's index files (not built in this process)
+    pub opened: bool,
+    /// the index files the base is read from (bytes)
+    pub files_bytes: u64,
 }
 
 impl GeoBase {
@@ -202,23 +262,166 @@ impl GeoBase {
         GeoBase {
             generation: snap.generation.uid,
             generation_name: snap.generation.name.clone(),
-            rows: Vec::new(),
+            rows: Rows::Owned(Vec::new()),
             skipped: Vec::new(),
             tree: None,
             column: Column::empty(),
             slot_rows: vec![0; cfg.predicates.len()],
             built_ms: 0.0,
+            opened: false,
+            files_bytes: 0,
         }
     }
 
-    /// Memory of rows, tree and column.
+    /// Memory of rows, tree and column (what is read from files in place excluded).
     pub fn bytes(&self) -> u64 {
         self.tree_bytes() + self.column.bytes()
     }
 
     fn tree_bytes(&self) -> u64 {
-        ((self.rows.len() + self.skipped.len()) * std::mem::size_of::<Row>()) as u64
+        self.rows.heap_bytes()
+            + (self.skipped.len() * std::mem::size_of::<Row>()) as u64
             + tree_bytes(&self.tree)
+    }
+
+    /// Write the base's files (`rtree.spkg`, `column.spkg`) into `dir` (a generation's
+    /// `geo/` directory) for `ident`, durably.
+    pub(crate) fn write_files(&self, dir: &Path, ident: &Identity) -> Result<()> {
+        std::fs::create_dir(dir).or_else(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => Ok(()),
+            _ => Err(e),
+        })?;
+        self.column.write(&dir.join(persist::COLUMN_FILE), ident)?;
+        let tree = self.tree.as_ref().map_or(&[][..], PackedTree::data);
+        let mut index = persist::index_prefix(ident);
+        for n in [
+            self.rows.len(),
+            self.skipped.len(),
+            self.slot_rows.len(),
+            tree.len(),
+            0, // W3C Basic Geo pairs
+        ] {
+            index.extend_from_slice(&(n as u64).to_le_bytes());
+        }
+        let row = |r: &Row| {
+            let mut b = [0u8; 32];
+            for (i, x) in [r.s, r.p, r.o, r.g].into_iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        persist::write_file(
+            &dir.join(persist::RTREE_FILE),
+            FileKind::Rtree,
+            ident,
+            self.rows.len() as u64,
+            &index,
+            |sink| {
+                let mut buf = Vec::with_capacity(32 * 4096);
+                for chunk in self.rows.chunks(4096).chain(self.skipped.chunks(4096)) {
+                    buf.clear();
+                    for r in chunk {
+                        buf.extend_from_slice(&row(r));
+                    }
+                    sink.put(&buf)?;
+                }
+                for n in &self.slot_rows {
+                    sink.put(&n.to_le_bytes())?;
+                }
+                sink.put(tree)?;
+                sink.align()
+            },
+        )?;
+        crate::store::sync_dir(dir)?;
+        if let Some(parent) = dir.parent() {
+            crate::store::sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
+    /// The base of `snap`'s generation read from the files in `dir` (built for `ident`);
+    /// with `verify`, every data checksum is checked too.
+    pub(crate) fn read_files(
+        dir: &Path,
+        ident: &Identity,
+        snap: &Snapshot,
+        cfg: &GeoConfig,
+        verify: bool,
+    ) -> std::result::Result<GeoBase, (&'static str, Problem)> {
+        let t0 = std::time::Instant::now();
+        let open = |k: FileKind| {
+            Mapped::open(&dir.join(k.file_name()), k, Some(ident), verify)
+                .map(Arc::new)
+                .map_err(|p| (k.file_name(), p))
+        };
+        let rt = open(FileKind::Rtree)?;
+        let col = open(FileKind::Column)?;
+        let bad = |m: &str| (persist::RTREE_FILE, Problem::Unusable(m.to_string()));
+        let count = |i: usize| usize::try_from(rt.u64_at(persist::INDEX_PREFIX + 8 * i)).ok();
+        let (Some(n), Some(m), Some(k), Some(t), Some(0)) =
+            (count(0), count(1), count(2), count(3), count(4))
+        else {
+            return Err(bad("damaged index section"));
+        };
+        if rt.index().len() != persist::pad8(persist::INDEX_PREFIX + 40)
+            || n as u64 != rt.header.rows
+            || k != cfg.predicates.len()
+        {
+            return Err(bad("damaged index section"));
+        }
+        let sections = (|| {
+            let skipped_at = n.checked_mul(32)?;
+            let slots_at = skipped_at.checked_add(m.checked_mul(32)?)?;
+            let tree_at = slots_at.checked_add(k.checked_mul(8)?)?;
+            let end = tree_at.checked_add(t)?;
+            (persist::pad8(end) == rt.data().len()).then_some((skipped_at, slots_at, tree_at))
+        })();
+        let Some((skipped_at, slots_at, tree_at)) = sections else {
+            return Err(bad("data sections have the wrong length"));
+        };
+        let rows = Rows::mapped(rt.clone(), 0, n).ok_or_else(|| bad("misaligned rows"))?;
+        let skipped: Vec<Row> = rt.data()[skipped_at..slots_at]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|b| {
+                let x = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+                Row {
+                    s: x(0),
+                    p: x(1),
+                    o: x(2),
+                    g: x(3),
+                }
+            })
+            .collect();
+        let slot_rows: Vec<u64> = rt.data()[slots_at..tree_at]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect();
+        let tree = match n {
+            0 if t == 0 => None,
+            0 => return Err(bad("a tree without rows")),
+            _ => Some(
+                PackedTree::mapped(rt.clone(), tree_at, t, n as u64)
+                    .ok_or_else(|| bad("damaged tree"))?,
+            ),
+        };
+        let files_bytes = rt.len() + col.len();
+        let column = Column::read(col).map_err(|m| (persist::COLUMN_FILE, Problem::Unusable(m)))?;
+        Ok(GeoBase {
+            generation: snap.generation.uid,
+            generation_name: snap.generation.name.clone(),
+            rows,
+            skipped,
+            tree,
+            column,
+            slot_rows,
+            built_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            opened: true,
+            files_bytes,
+        })
     }
 }
 
@@ -244,14 +447,16 @@ fn over_budget(limit: u64, requested: u64) -> Error {
 }
 
 /// Build the base of `snap`'s generation: rows of the configured predicates in the
-/// generation's own index (not the delta), their literals parsed in parallel blocks,
-/// and the packed tree. Fails with [`Error::BudgetExceeded`] past the budget and
-/// [`Error::Cancelled`] when told to stop.
+/// generation's own index (not the delta), their literals parsed in parallel blocks
+/// (or taken from the previous generation's column, `reuse`), and the packed tree.
+/// Fails with [`Error::BudgetExceeded`] past the budget and [`Error::Cancelled`] when
+/// told to stop.
 pub(crate) fn build_base(
     snap: &Snapshot,
     cfg: &GeoConfig,
     lookup: &Lookup,
     ctl: &BuildCtl<'_>,
+    reuse: Option<&Reuse<'_>>,
 ) -> Result<GeoBase> {
     let t0 = std::time::Instant::now();
     set_progress(ctl.progress, 0.0);
@@ -304,7 +509,7 @@ pub(crate) fn build_base(
     let total = objs.len().max(1) as f32;
     let done = AtomicU64::new(0);
     let used = AtomicU64::new(rows.len() as u64 * row_bytes);
-    let column = Column::build(snap, &objs, cfg, &|k, bytes| {
+    let column = Column::build(snap, &objs, cfg, reuse, &|k, bytes| {
         if (ctl.cancel)() {
             return Err(Error::Cancelled);
         }
@@ -339,8 +544,8 @@ pub(crate) fn build_base(
         return Err(Error::Cancelled);
     }
     base.tree = PackedTree::pack(boxes.into_iter());
-    base.rows = rows;
-    base.rows.shrink_to_fit();
+    rows.shrink_to_fit();
+    base.rows = Rows::Owned(rows);
     base.skipped = skipped;
     base.column = column;
     let need = base.bytes();
@@ -755,19 +960,44 @@ impl GeoIndex {
                 geometry_bytes: base.map_or(0, |b| b.column.bytes()),
                 overlay_bytes: view.map_or(0, |v| v.overlay_bytes()),
                 budget_bytes: self.budget,
+                mapped_bytes: base.map_or(0, |b| b.files_bytes),
             },
             config: (*self.config).clone(),
             format_version: FORMAT_VERSION,
             last_build: info.last_build.clone(),
+            files: base.filter(|b| b.files_bytes > 0).map(|b| GeoFiles {
+                bytes: b.files_bytes,
+                opened: b.opened,
+            }),
         }
     }
 }
 
 /// The spatial data of one generation. The base, its column and the overlay live in the
 /// views of the generation's snapshots (a reconfiguration replaces them for the same
-/// generation), so nothing is kept here yet.
+/// generation); what is kept here guards the generation's index files.
 #[derive(Default)]
-pub struct GenerationGeo {}
+pub struct GenerationGeo {
+    /// held while the files are written or removed; true once the generation is
+    /// replaced (its directory may be removed at any time then, so nothing writes
+    /// there any more)
+    files: Mutex<bool>,
+}
+
+impl GenerationGeo {
+    /// The generation is being replaced: wait for a running write of its files, and
+    /// let none start.
+    pub(crate) fn retire(&self) {
+        *self.files.lock() = true;
+    }
+
+    /// Run `f` (a write or removal of the generation's files) unless the generation was
+    /// replaced; no replacement completes meanwhile.
+    pub(crate) fn with_files<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let retired = self.files.lock();
+        (!*retired).then(f)
+    }
+}
 
 #[cfg(test)]
 mod tests {

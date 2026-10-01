@@ -247,6 +247,22 @@ pub struct GeoStatus {
     pub format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_build: Option<GeoBuild>,
+    /// the index files the base is read from (persistent stores)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<GeoFiles>,
+}
+
+/// The index files of the base (`gen-NNNN/geo/`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoFiles {
+    pub bytes: u64,
+    /// the base was read from files written before (no literal parsed), not built
+    pub opened: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Indexed rows: in the generation's base, the overlay of committed transactions, and
@@ -276,6 +292,9 @@ pub struct GeoMemory {
     pub geometry_bytes: u64,
     pub overlay_bytes: u64,
     pub budget_bytes: u64,
+    /// bytes of the index files read in place (not counted against the budget)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mapped_bytes: u64,
 }
 
 /// The last build of the base.
@@ -404,6 +423,7 @@ mod tests {
             config: GeoConfig::default(),
             format_version: FORMAT_VERSION,
             last_build: None,
+            files: None,
         };
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["state"], "over-budget");
@@ -411,6 +431,7 @@ mod tests {
         assert!(j["skipped"].get("unknownCrs").is_some());
         assert!(j["memory"].get("budgetBytes").is_some());
         assert!(j.get("progress").is_none() && j.get("lastBuild").is_none());
+        assert!(j.get("files").is_none() && j["memory"].get("mappedBytes").is_none());
         assert_eq!(IndexState::Building(0.37).to_string(), "building (37%)");
     }
 }
