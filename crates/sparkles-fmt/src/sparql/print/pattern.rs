@@ -206,10 +206,10 @@ pub(crate) mod tests {
             line_width: 40,
             ..Options::default()
         };
-        let src = format!("{P}SELECT * {{ BIND(ex:aVeryLongFunctionName(?argument) AS ?result) }}");
+        let src = format!("{P}SELECT * {{ BIND(ex:function(?argument) AS ?longResult) }}");
         assert_eq!(
             print_with(&src, NodeKind::Bind, &opts),
-            "BIND(\n  ex:aVeryLongFunctionName(?argument) AS ?result\n)"
+            "BIND(\n  ex:function(?argument) AS ?longResult\n)"
         );
     }
 

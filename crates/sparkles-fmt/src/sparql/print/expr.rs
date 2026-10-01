@@ -447,7 +447,7 @@ mod tests {
     fn exists() {
         assert_eq!(
             filter("not  exists {?s ?p ?o}"),
-            "  FILTER NOT EXISTS {?s ?p ?o}"
+            "  FILTER NOT EXISTS {\n    ?s ?p ?o .\n  }"
         );
         assert_eq!(filter("(exists{} || ?a)"), "  FILTER(EXISTS {} || ?a)");
     }
