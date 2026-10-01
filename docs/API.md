@@ -2055,7 +2055,9 @@ type PlanNode = {
   children: PlanNode[];
   counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
                              // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
-                             // "feature-links", …), fallback (see GeoSPARQL)
+                             // "feature-links", …), fallback (see GeoSPARQL); expressions evaluated
+                             // once per distinct value: exprCacheHits (rows that reused a result),
+                             // exprCacheMisses (evaluations), exprCacheSkipped (ran row by row)
   warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```

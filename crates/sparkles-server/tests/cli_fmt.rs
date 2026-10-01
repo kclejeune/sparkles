@@ -274,7 +274,6 @@ fn walks_and_explicit_paths() {
         "w/d.trig",
         "w/d.nt",
         "w/d.nq",
-        "w/d.jsonld",
         "w/x.rdf",
         "w/x.owl",
         "w/d.ttl.gz",
@@ -306,10 +305,6 @@ fn walks_and_explicit_paths() {
         (
             "w/d.nt",
             "w/d.nt: error: ntriples formatting is not available yet",
-        ),
-        (
-            "w/d.jsonld",
-            "w/d.jsonld: error: jsonld formatting is not available yet",
         ),
         (
             "w/x.rdf",
