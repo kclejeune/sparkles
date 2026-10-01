@@ -1,0 +1,6 @@
+# The shape map of the ShEx benchmark (bench.shex), for scripts/shex-diff.sh too.
+PREFIX ex: <http://example.org/>
+{FOCUS a ex:Researcher}@ex:Person, {FOCUS a ex:Manager}@ex:Person,
+{FOCUS a ex:Employee}@ex:Person, {FOCUS a ex:Student}@ex:Person,
+{FOCUS a ex:Article}@ex:Document, {FOCUS a ex:Book}@ex:Document,
+{FOCUS a ex:University}@ex:Org, {FOCUS a ex:Company}@ex:Org

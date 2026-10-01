@@ -235,12 +235,16 @@ cargo run --release -p sparkles-shacl --example bench -- "$f" - 5
 description = "ShEx validation benchmark on generated data"
 usage = '''
 arg "[people]" default="10000"
+flag "--compare-rudof" help="also compare the result map with an installed rudof (scripts/shex-diff.sh)"
 '''
 run = '''
 mkdir -p target/bench-data
 f="target/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
 cargo run --release -p sparkles-shex --example bench -- "$f" - 5
+if [ -n "${usage_compare_rudof:-}" ]; then
+  scripts/shex-diff.sh --compare-rudof "$f" crates/sparkles-shex/examples/bench.shex crates/sparkles-shex/examples/bench.smap
+fi
 '''
 
 [tasks."bench:shacl-write"]
