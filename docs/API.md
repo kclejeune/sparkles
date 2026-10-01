@@ -1543,8 +1543,27 @@ envelope has no place in longitude and latitude. Malformed literals, literals ov
 `maxVertices`, empty geometries and literals in an unknown CRS are never candidates: no
 relation or distance with a constant can hold for them (they are type errors or empty).
 A `spatial:` call with a constant subject reads that feature's links directly, index or
-not. The index lives in memory: it is built when the database is opened (queries run
-without it meanwhile), and again for each new generation (bulk loads, compaction).
+not. The index's base belongs to a generation: it is built when the index is enabled, and
+again for each new generation (bulk loads, compaction), where the literals the previous
+generation's index parsed are taken over and only new ones are parsed. A persistent
+database writes the base to `gen-NNNN/geo/` (`rtree.spkg`, `column.spkg`; checksummed,
+written to a temporary file and renamed) and reads it from there in place, decoding a
+geometry the first time a query needs it: opening the database, or enabling the same
+predicates, graphs and limits again, parses no literal. Files that are missing, damaged,
+written by another version or made for another configuration or generation are removed
+and the base is built again (queries run without the index meanwhile). `serve
+--read-only` writes no index files (it builds in memory when the files do not fit).
+The files are derived data: backups and clones leave them out, and they go with their
+generation or a `DELETE /$/geo/{ds}`.
+
+**W3C Basic Geo.** With `"wgs84": true`, a subject with `wgs84_pos:lat` and
+`wgs84_pos:long` (`http://www.w3.org/2003/01/geo/wgs84_pos#`) in the same graph is also
+a point of the index (several of either: every combination, as in Jena). Values are
+numbers of any XSD numeric type, or strings holding one, within ±90° and ±180°; other
+pairs are no points. A point lives while both of its quads do. The `spatial:` functions
+find such a subject as a feature (no feature link needed), and the map view reports it;
+`geof:` FILTERs do not see the pairs (there is no geometry literal), so they are not
+pushed down for them either.
 
 Each spatial operator in an executed plan reports `counters`: `candidates` (rows the index
 or the scan handed out), `rechecked` (those among them the index could not place),
@@ -1557,8 +1576,9 @@ rows came from a scan instead of the index).
 |--------|------|-------------|
 | GET | `/$/geo/{ds}` | `GeoStatus` (below), or `{ "enabled": false }` |
 | PUT | `/$/geo/{ds}` | Enable or reconfigure; the body is a `GeoConfig` (empty: defaults). `202` with the build `Task` (`kind: "geo-index"`); `400 invalid geo configuration: …`; `409 spatial index build already running` |
-| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` |
-| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` and the index files |
+| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base from RDF, its files too (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+| GET | `/{ds}/geo?bbox=minLon,minLat,maxLon,maxLat[&graph=IRI][&predicate=IRI][&limit=N][&tolerance=DEG]` | The indexed geometries meeting a CRS84 box (dataset read access), as `application/geo+json` (below). Without a ready index (off, building, failed) the same answer by a scan of the configuration's (or the default) predicates. `400` for a bad `bbox` (not four numbers, min after max, latitude out of ±90), `limit` outside 1–50,000 or a negative `tolerance`; `404` unknown dataset |
 
 ```ts
 type GeoConfig = {
@@ -1568,7 +1588,7 @@ type GeoConfig = {
   distance?: "geodesic" | "haversine";   // default "geodesic"
   maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
   maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
-  wgs84?: boolean;              // not supported yet (true: 400)
+  wgs84?: boolean;              // W3C Basic Geo lat/long pairs as points (default false)
   queryRewrite?: boolean;       // not supported yet (true: 400)
   formatVersion?: 1;
 };
@@ -1578,22 +1598,45 @@ type GeoStatus = {
   progress?: number; message?: string;
   generation: string;           // the generation the base was built for
   commit: number;               // the commit the status describes
-  rows: { base: number; overlay: number; tail: number };
+  rows: { base: number; overlay: number; tail: number; wgs84?: number };  // wgs84: W3C Basic Geo points among them
   literals: number;             // distinct parsed geometries
   skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
   crs: { [iri: string]: number };   // literals per CRS, unknown ones included
-  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number;
+            mappedBytes?: number };   // index files read in place (not counted against the budget)
   config: GeoConfig; formatVersion: 1;
   lastBuild?: { at: string; ms: number; rows: number };
+  files?: { bytes: number; opened: boolean };   // the base's index files; opened: read, not built
+};
+type GeoFeatureCollection = {   // GET /{ds}/geo
+  type: "FeatureCollection";
+  features: {
+    type: "Feature";
+    id: string;                 // the row's subject (an IRI, or _:label)
+    geometry: object;           // GeoJSON, CRS84, simplified with Douglas-Peucker
+    properties: {
+      subject: string;
+      feature?: string;         // a feature linked to the subject (one Feature per link; the subject itself for a W3C Basic Geo point)
+      graph: string | null;     // null: the default graph
+      predicate: string;        // the serialization predicate, or wgs84_pos:lat_long
+    };
+  }[];
+  truncated: boolean;           // more than `limit` features met the box
 };
 ```
+
+`GET /{ds}/geo` tests each geometry exactly against the box (in CRS84), transforms it to
+CRS84 and simplifies it with `tolerance` degrees (default: the box's width / 1024; a ring
+keeps at least four positions). `graph` narrows to one graph (`urn:x-arq:DefaultGraph` for
+the default graph), `predicate` to one serialization predicate (or
+`http://www.w3.org/2003/01/geo/wgs84_pos#lat_long` for the W3C Basic Geo points).
 
 `over-budget`: the index would need more than `serve --geo-mb` (4096 MiB); queries run
 without it. `failed`: a build or a commit's update of the index failed (the write itself
 never fails because of the index); queries run without it until a rebuild or a
 compaction. The configuration lives in the database directory (`geo.json`; `sparkles
 check` validates it, clones copy it, backups include it). CLI:
-`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
+`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--wgs84] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
 and `sparkles serve --geo NAME[=geo.json]`.
 
 ## Reasoning status and diagnostics
