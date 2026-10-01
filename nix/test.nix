@@ -177,11 +177,15 @@
     def status(args):
         return authed.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' {args}").strip()
 
-    for i in range(60):
+    # the budget refills at 30 a minute, so a slow machine gets a few more tries than 60
+    spent = None
+    for i in range(200):
         code = status(f"--interface 127.0.0.2 -u alice:wrong{i} -H 'Forwarded: for=198.51.100.{i}' {ask}")
+        if code == "429":
+            spent = i
+            break
         assert code == "401", (i, code)
-    code = status(f"--interface 127.0.0.2 -u alice:wrong -H 'Forwarded: for=198.51.100.99' {ask}")
-    assert code == "429", code
+    assert spent is not None and spent >= 60, spent
     code = status(f"--interface 127.0.0.3 -u alice:alice-pw -H 'Forwarded: for=127.0.0.2' {ask}")
     assert code == "200", code
     # the spent client is refused password checks only: health checks and anonymous

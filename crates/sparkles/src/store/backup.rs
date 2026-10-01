@@ -187,7 +187,8 @@ pub struct BackupCapture {
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
     /// and when present `text.json`, `origin.json`, `validation.json`,
-    /// `validation-shapes.ttl`). `reasoning.json` is the caller's to add (the server
+    /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`).
+    /// `reasoning.json` is the caller's to add (the server
     /// holds the current status and applies the "not after `s`" rule).
     pub files: Vec<CapturedFile>,
     /// how long the writer lock was held (metric `sparkles_backup_capture_lock_seconds`)
@@ -250,12 +251,14 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 5] = [
+const OPTIONAL_META: [&str; 7] = [
     "text.json",
     "geo.json",
     "origin.json",
-    "validation.json",
-    "validation-shapes.ttl",
+    crate::guard::config::CONFIG_FILE,
+    crate::guard::config::SHACL_SHAPES_FILE,
+    crate::guard::config::SHEX_SCHEMA_SHEXC_FILE,
+    crate::guard::config::SHEX_SCHEMA_SHEXJ_FILE,
 ];
 
 impl Store {

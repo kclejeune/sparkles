@@ -8,6 +8,9 @@ use crate::doc::DocId;
 use crate::lex::TokenKind;
 use crate::tree::{Element, NodeId};
 
+/// Whether `align-values` is implemented (until it is, it warns `option-not-implemented`).
+pub const ALIGN_IMPLEMENTED: bool = false;
+
 /// `ValuesClause`: the `VALUES` block after a query, as [`inline_values`].
 pub fn values_clause(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     data_block(cx, n)

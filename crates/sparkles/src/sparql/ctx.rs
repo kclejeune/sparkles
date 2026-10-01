@@ -59,13 +59,26 @@ pub struct Optimizations {
     pub selective_columns: bool,
     /// spatial FILTERs on an indexed predicate's object search the spatial index
     pub spatial_pushdown: bool,
+    /// `FILTER (NOT) EXISTS` over a join group probes a key set built once from the
+    /// pattern, instead of evaluating the substituted pattern per outer row
+    pub decorrelate_exists: bool,
+    /// a join with a selective input reads a triple pattern only for the input's distinct
+    /// keys, by clustered seeks over a permutation sorted on the key
+    pub batched_join: bool,
+    /// index joins on one subject over constant predicates are read together, walking
+    /// each subject's run once when that touches fewer blocks
+    pub star_fusion: bool,
+    /// a spatial FILTER between the geometries of two join components joins them
+    pub spatial_join: bool,
+    /// ORDER BY a distance to a constant with LIMIT searches the nearest geometries
+    pub spatial_knn: bool,
     /// pure expressions over one variable (FILTER, BIND, ORDER BY keys, aggregate
     /// arguments) are evaluated once per distinct value
     pub expr_cache: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 10] = [
+    pub const NAMES: [&str; 15] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -75,6 +88,11 @@ impl Optimizations {
         "ordered_topk",
         "selective_columns",
         "spatial_pushdown",
+        "decorrelate_exists",
+        "batched_join",
+        "star_fusion",
+        "spatial_join",
+        "spatial_knn",
         "expr_cache",
     ];
 
@@ -89,6 +107,11 @@ impl Optimizations {
         ordered_topk: true,
         selective_columns: true,
         spatial_pushdown: true,
+        decorrelate_exists: true,
+        batched_join: true,
+        star_fusion: true,
+        spatial_join: true,
+        spatial_knn: true,
         expr_cache: true,
     };
 
@@ -103,6 +126,11 @@ impl Optimizations {
         ordered_topk: false,
         selective_columns: false,
         spatial_pushdown: false,
+        decorrelate_exists: false,
+        batched_join: false,
+        star_fusion: false,
+        spatial_join: false,
+        spatial_knn: false,
         expr_cache: false,
     };
 
@@ -117,6 +145,11 @@ impl Optimizations {
             "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
+            "decorrelate_exists" => &mut self.decorrelate_exists,
+            "batched_join" => &mut self.batched_join,
+            "star_fusion" => &mut self.star_fusion,
+            "spatial_join" => &mut self.spatial_join,
+            "spatial_knn" => &mut self.spatial_knn,
             "expr_cache" => &mut self.expr_cache,
             _ => return None,
         })

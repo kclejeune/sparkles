@@ -60,6 +60,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/text/{ds}/rebuild", &["POST"]),
     ("/$/geo/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/geo/{ds}/rebuild", &["POST"]),
+    ("/$/geo/convert", &["POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
@@ -111,6 +112,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/explain", &["GET", "POST"]),
     ("/{ds}/shacl", &["POST"]),
     ("/{ds}/shex", &["POST"]),
+    ("/{ds}/geo", &["GET"]),
     ("/{ds}/prefixes", &["*"]),
 ];
 
@@ -163,6 +165,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/server" | "/$/tasks" | "/$/tasks/{id}" => Caller,
         // reads no dataset; `--format-endpoint authenticated|off` is the handler's
         "/$/format" => Caller,
+        // a pure computation over the request's literals
+        "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
         "/$/datasets" if get => Caller,
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
@@ -183,7 +187,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/explain"
         | "/{ds}/get"
         | "/{ds}/shacl"
-        | "/{ds}/shex" => Dataset(Read),
+        | "/{ds}/shex"
+        | "/{ds}/geo" => Dataset(Read),
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
@@ -970,6 +975,8 @@ mod tests {
         assert_eq!(n(Method::PUT, "/$/geo/{ds}"), adm);
         assert_eq!(n(Method::DELETE, "/$/geo/{ds}"), adm);
         assert_eq!(n(Method::POST, "/$/geo/{ds}/rebuild"), adm);
+        assert_eq!(n(Method::GET, "/{ds}/geo"), read);
+        assert_eq!(n(Method::POST, "/$/geo/convert"), Some(Need::Caller));
         let uri: Uri = "/$/geo/places/rebuild".parse().unwrap();
         assert_eq!(
             ds_of("/$/geo/{ds}/rebuild", &uri).as_deref(),

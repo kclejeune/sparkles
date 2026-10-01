@@ -16,7 +16,6 @@ use crate::id::{Id, Tag};
 use crate::index::{G, O, P, Perm, S};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term};
-use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
@@ -35,7 +34,7 @@ pub enum ActiveGraph {
     Var(VarId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GraphFilter {
     /// no restriction (graph is an output column or the prefix)
     All,
@@ -326,6 +325,17 @@ pub enum Kind {
     SpatialScan(Box<super::geopf::SpatialScanSpec>),
     /// a `spatial:` property function
     SpatialPf(Box<super::geopf::SpatialPfSpec>),
+    /// triple patterns read only for the keys of the input (child 0); see
+    /// [`super::indexjoin`]
+    IndexJoin(Box<super::indexjoin::IndexJoinSpec>),
+    /// two inputs joined on a spatial test of one geometry from each
+    SpatialJoin(Box<super::geojoin::SpatialJoinSpec>),
+    /// the template plan (child 0) over the nearest geometries first, until `k` rows are
+    /// proven
+    SpatialKnn(Box<super::geojoin::SpatialKnnSpec>),
+    /// a topological property matched against asserted and derived triples (Query
+    /// Rewrite), or `spatial:equals`
+    SpatialRelate(Box<super::georewrite::SpatialRelateSpec>),
 }
 
 #[derive(Clone)]
@@ -385,7 +395,7 @@ impl Node {
         matches!(self.kind, Kind::Empty)
     }
 
-    fn d(&self, v: VarId) -> f64 {
+    pub(super) fn d(&self, v: VarId) -> f64 {
         self.dist
             .get(&v)
             .copied()
@@ -437,6 +447,11 @@ impl Node {
             Kind::VectorSearch(_) => "VectorSearch",
             Kind::SpatialScan(_) => "SpatialScan",
             Kind::SpatialPf(_) => "SpatialPf",
+            Kind::IndexJoin(j) if j.probes.len() > 1 => "StarJoin",
+            Kind::IndexJoin(_) => "IndexJoin",
+            Kind::SpatialJoin(_) => "SpatialJoin",
+            Kind::SpatialKnn(_) => "SpatialKnn",
+            Kind::SpatialRelate(_) => "SpatialRelate",
         }
     }
 }
@@ -503,18 +518,18 @@ impl<'a> Planner<'a> {
     pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
         let ctx = self.ctx;
         let g = graph.clone();
+        let subst = &self.subst;
         let exists = move |p: &GraphPattern| -> Arc<ExistsSpec> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
             let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
             vars.sort_unstable();
             vars.dedup();
-            Arc::new(ExistsSpec {
-                pattern: p.clone(),
-                graph: g.clone(),
-                vars,
-                memo: Mutex::new(FxHashMap::default()),
-            })
+            let bound = vars
+                .iter()
+                .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
+                .collect();
+            Arc::new(ExistsSpec::new(p.clone(), g.clone(), vars, bound))
         };
         Compiler {
             ctx,
@@ -845,6 +860,8 @@ impl<'a> Planner<'a> {
                     crate::vector::VECTOR_SEARCH,
                     "spk:vectorSearch",
                 )?;
+                let (rcalls, patterns) =
+                    super::georewrite::take_rewrite_triples(patterns, self.ctx)?;
                 let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
                 for tp in &patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
@@ -857,6 +874,9 @@ impl<'a> Planner<'a> {
                 }
                 for c in scalls {
                     items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
+                }
+                for c in rcalls {
+                    items.push(Item::Node(super::georewrite::rewrite_leaf(self, c, g)?));
                 }
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
@@ -1770,6 +1790,8 @@ impl<'a> Planner<'a> {
             };
             parts.push(plan);
         }
+        // components connected by a spatial conjunct are joined on it
+        super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
         parts.sort_by(|a, b| a.est.total_cmp(&b.est));
         let mut it = parts.into_iter();
@@ -1777,7 +1799,7 @@ impl<'a> Planner<'a> {
         for p in it {
             acc = self.place_filters(join(acc, p, self.ctx), filters);
         }
-        Ok(acc)
+        Ok(super::indexjoin::fuse_stars(acc, self.ctx))
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
@@ -2120,7 +2142,7 @@ impl<'a> Planner<'a> {
 // node constructors (with estimates)
 // ------------------------------------------------------------------------------
 
-fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
+pub(super) fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
         let x = match (a.vars.contains(v), b.vars.contains(v)) {
@@ -2133,7 +2155,7 @@ fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
     d
 }
 
-fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
+pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
     if keys.is_empty() {
         return a.est * b.est;
     }
@@ -2250,6 +2272,7 @@ fn join_candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
             .join(" ")
     );
     out.push(h);
+    out.extend(super::indexjoin::candidates(a, b, ctx));
     out
 }
 
@@ -2820,7 +2843,7 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
-            ordered_topk(n, ctx)
+            ordered_topk(super::geojoin::spatial_knn(n, ctx), ctx)
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -2830,7 +2853,8 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             let order = n.children.pop().unwrap();
-            n.children.push(ordered_topk(order, ctx));
+            n.children
+                .push(ordered_topk(super::geojoin::spatial_knn(order, ctx), ctx));
             n
         }
         (n, _) => n,
@@ -3291,6 +3315,8 @@ fn substitute(e: &mut Expr, v: VarId, c: Id) {
             substitute(d, v, c);
         }
         Expr::Coalesce(l) | Expr::Call(_, l) => l.iter_mut().for_each(|x| substitute(x, v, c)),
+        // the EXISTS pattern is substituted when it is evaluated: it keeps the constant
+        Expr::Exists(spec) if spec.vars.contains(&v) => *spec = Arc::new(spec.with_bound(v, c)),
         _ => {}
     }
 }
@@ -3408,7 +3434,7 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
     walk(gp, out);
 }
 
-fn expr_vars(e: &Expression, out: &mut Vec<String>) {
+pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out.push(v.as_str().to_string()),

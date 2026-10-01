@@ -1,6 +1,7 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import type { ProxyOptions } from 'vite';
 import { defineConfig } from 'vitest/config';
+import { licenses } from './scripts/licenses.js';
 
 // Where the Sparkles backend (or `pnpm mock`) is listening.
 const target = process.env.SPARKLES_API ?? 'http://localhost:3030';
@@ -17,9 +18,10 @@ const proxy: Record<string, ProxyOptions> = {
 };
 
 export default defineConfig({
-  plugins: [sveltekit()],
+  // licenses.txt: the license notices of the npm packages in the bundle
+  plugins: [sveltekit(), licenses()],
   server: { port: 5173, proxy },
   preview: { port: 4173, proxy },
-  // Unit tests for the pure modules under src/lib (`pnpm test`).
-  test: { include: ['src/**/*.test.ts'], environment: 'node' },
+  // Unit tests for the pure modules under src/lib and the build scripts (`pnpm test`).
+  test: { include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'], environment: 'node' },
 });

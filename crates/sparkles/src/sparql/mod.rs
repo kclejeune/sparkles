@@ -1,11 +1,16 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
+pub mod aggext;
 pub mod cache;
 pub mod ctx;
 pub mod exec;
+mod exists;
 pub mod expr;
 mod exprcache;
+pub mod geojoin;
 pub mod geopf;
+pub mod georewrite;
+pub mod indexjoin;
 mod keyfilter;
 pub mod plan;
 pub mod results;
@@ -211,7 +216,7 @@ impl QueryResult {
 }
 
 pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -> Result<Query> {
-    let mut p = SparqlParser::new();
+    let mut p = aggext::register(SparqlParser::new());
     if let Some(b) = base {
         p = p
             .with_base_iri(b)
@@ -679,7 +684,11 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
 }
 
 #[cfg(test)]
+mod exists_tests;
+#[cfg(test)]
 mod exprcache_tests;
+#[cfg(test)]
+mod indexjoin_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]

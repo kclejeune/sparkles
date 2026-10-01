@@ -1,0 +1,5 @@
+# export 2026-09-30
+
+<http://example.org/a> <http://example.org/p> "1" <http://example.org/g> . # first
+<http://example.org/b> <http://example.org/p> "café"@fr <http://example.org/g> .
+_:x <http://example.org/p> <http://example.org/o> .

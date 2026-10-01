@@ -16,6 +16,8 @@ mod exposure;
 mod fmt;
 mod geo;
 mod http;
+#[cfg(feature = "fmt")]
+mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod obs;
@@ -30,7 +32,10 @@ mod shacl;
 mod shex_cmd;
 mod state;
 mod ui;
+#[cfg(any(feature = "shacl", feature = "shex"))]
+mod validation_cmd;
 mod validation_common;
+mod write_validation;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -72,7 +77,7 @@ struct Cli {
     /// data stops adding its prefixes
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
     max_prefixes: usize,
-    /// Write without write-time SHACL validation (load, update, infer)
+    /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
     /// Log format on stderr: text, or json (one object per line)
@@ -397,6 +402,14 @@ enum Cmd {
         /// hull, relate); larger ones are a type error
         #[arg(long, default_value_t = 2_000_000)]
         geo_op_vertices: u64,
+        /// Never rewrite GeoSPARQL topological properties, whatever a dataset's geo.json
+        /// says
+        #[arg(long)]
+        no_geo_rewrite: bool,
+        /// A MapLibre style JSON for the UI's maps (its origins are allowed by the
+        /// UI's Content Security Policy); without it the UI draws its bundled basemap
+        #[arg(long, value_name = "URL")]
+        map_style_url: Option<String>,
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
@@ -426,7 +439,7 @@ enum Cmd {
         /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
         #[arg(long, default_value_t = 4096)]
         vector_memory_mb: u64,
-        /// Honor `validate=false` on writes, which skips write-time SHACL validation
+        /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
         /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
@@ -582,6 +595,10 @@ enum Cmd {
     /// Format SPARQL queries and updates: print, check (--check, -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
+    /// A language server for editors (stdio): formatting and syntax diagnostics for the
+    /// languages `sparkles fmt` formats
+    #[cfg(feature = "fmt")]
+    Lsp(lsp::LspArgs),
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
         #[arg(long)]
@@ -620,6 +637,9 @@ enum Cmd {
         /// distances on geographic coordinates: geodesic (default) or haversine
         #[arg(long)]
         distance: Option<String>,
+        /// also index W3C Basic Geo (wgs84_pos:lat / wgs84_pos:long) pairs as points
+        #[arg(long)]
+        wgs84: bool,
         /// rebuild even if the index is current
         #[arg(long, conflicts_with_all = ["status", "disable"])]
         rebuild: bool,
@@ -728,42 +748,10 @@ enum Cmd {
         #[command(flatten)]
         compress: CompressArgs,
     },
-    /// Write-time SHACL validation of a database: status, set, or turn off
-    #[cfg(feature = "shacl")]
-    Validation {
-        #[arg(long)]
-        loc: PathBuf,
-        /// print the configuration and status and change nothing
-        #[arg(long)]
-        status: bool,
-        /// reject or warn
-        #[arg(long, value_parser = ["reject", "warn"])]
-        mode: Option<String>,
-        /// shapes graph of the dataset (repeatable)
-        #[arg(long)]
-        shapes_graph: Vec<String>,
-        /// a shapes file (Turtle), copied into the database
-        #[arg(long, conflicts_with = "shapes_graph")]
-        shapes: Option<PathBuf>,
-        /// default, union, or graph IRIs (repeatable)
-        #[arg(long)]
-        data_graph: Vec<String>,
-        #[arg(long)]
-        include_inferences: bool,
-        /// violation, warning or info
-        #[arg(long, default_value = "violation")]
-        threshold: String,
-        #[arg(long, default_value_t = 10.0)]
-        timeout: f64,
-        #[arg(long, default_value_t = 100)]
-        report_limit: usize,
-        /// turn validation off
-        #[arg(long, conflicts_with_all = ["mode", "status"])]
-        off: bool,
-        /// text or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
+    /// Write-time validation of a database (SHACL, or ShEx with --lang shex): status,
+    /// set, or turn off
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    Validation(validation_cmd::ValidationArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -858,6 +846,13 @@ enum Cmd {
         profile: Option<String>,
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Add a built-in vocabulary's axioms to the rules: geosparql (repeatable)
+        #[arg(long = "vocab", value_name = "NAME")]
+        vocab: Vec<String>,
+        /// Also materialize geo:hasDefaultGeometry for features with exactly one
+        /// geo:hasGeometry
+        #[arg(long)]
+        geo_default_geometry: bool,
         /// Remove materialized inferences instead
         #[arg(long)]
         clear: bool,
@@ -1142,6 +1137,16 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
         eprintln!("{r}");
         for res in r.summary.results.iter().take(10) {
             let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
+            if r.summary.language == sparkles::guard::GuardLanguage::Shex {
+                // a ShEx result: node, shape (or START) and the first failure
+                let shape = match res["shape"]["type"].as_str() {
+                    Some("start") => "START".to_string(),
+                    _ => t("shape"),
+                };
+                let reason = res["reason"].as_str().unwrap_or("");
+                eprintln!("  {} @ {shape}: {reason}", t("node"));
+                continue;
+            }
             let msg = res["messages"][0].as_str().unwrap_or("");
             eprintln!(
                 "  {} at {}{}",
@@ -1182,39 +1187,17 @@ fn validation_note(v: Option<&sparkles::guard::ValidationSummary>) -> String {
 
 /// The `sparkles stats` line of a validated database:
 /// `reject · 2 shape graphs · 20 shapes · last full 164 ms`.
-#[cfg(feature = "shacl")]
 fn validation_stats(store: &Store) -> Option<String> {
-    use sparkles_shacl::guard;
-    let cfg = match guard::read_config(store.root()?) {
-        Ok(c) => c?,
+    match sparkles::guard::config::config_language(store.root()?) {
+        Ok(None) => return None,
+        Ok(Some(_)) => {}
         Err(e) => return Some(format!("cannot be loaded: {e:#}")),
-    };
-    let mut parts = vec![
-        serde_json::to_string(&cfg.mode)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string(),
-        match &cfg.shapes.graphs {
-            Some(g) => format!(
-                "{} shape graph{}",
-                g.len(),
-                if g.len() == 1 { "" } else { "s" }
-            ),
-            None => "shapes file".to_string(),
-        },
-    ];
-    match guard::install(store) {
-        Ok(Some(g)) => {
-            let s = g.status();
-            parts.push(format!("{} shapes", s.shape_count));
-            if let Some(ms) = s.last_full_millis {
-                parts.push(format!("last full {ms} ms"));
-            }
-        }
-        Ok(None) => {}
-        Err(e) => parts.push(format!("shapes cannot be loaded: {e:#}")),
     }
-    Some(parts.join(" · "))
+    Some(match write_validation::install(store) {
+        Ok(Some(v)) => v.stats_line(),
+        Ok(None) => "off".to_string(),
+        Err(e) => format!("cannot be loaded: {e:#}"),
+    })
 }
 
 /// Open a database for a CLI write, with its write-time validation installed (unless
@@ -1231,8 +1214,7 @@ fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) 
         }
         return Ok(store);
     }
-    #[cfg(feature = "shacl")]
-    sparkles_shacl::guard::install(&store)?;
+    write_validation::install(&store)?;
     Ok(store)
 }
 
@@ -1304,6 +1286,8 @@ fn run() -> Result<()> {
             geo,
             geo_mb,
             geo_op_vertices,
+            no_geo_rewrite,
+            map_style_url,
             schema_max_entries,
             no_access_log,
             no_metrics,
@@ -1376,10 +1360,15 @@ fn run() -> Result<()> {
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
+            opts.geo_query_rewrite = !no_geo_rewrite;
+            if map_style_url.is_some() {
+                bail!("--map-style-url: not supported yet");
+            }
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
+            st.map_style_url = map_style_url;
             if let Some(w) = auth::proxy_host_warning(&st, !public_host.is_empty()) {
                 tracing::warn!("{w}");
             }
@@ -1602,6 +1591,8 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
+        #[cfg(feature = "fmt")]
+        Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Load {
             loc,
@@ -1807,6 +1798,7 @@ fn run() -> Result<()> {
             feature_link,
             exclude_graph,
             distance,
+            wgs84,
             rebuild,
             status,
             disable,
@@ -1818,6 +1810,7 @@ fn run() -> Result<()> {
                 feature_link,
                 exclude_graph,
                 distance,
+                wgs84,
                 rebuild,
                 status,
                 disable,
@@ -1886,110 +1879,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
-        #[cfg(feature = "shacl")]
-        Cmd::Validation {
-            loc,
-            status,
-            mode,
-            shapes_graph,
-            shapes,
-            data_graph,
-            include_inferences,
-            threshold,
-            timeout,
-            report_limit,
-            off,
-            format,
-        } => {
-            use sparkles_shacl::guard::{
-                self, DataGraphSel, SetOutcome, ShapesSource, ValidationConfig,
-            };
-            let mut opts = opts;
-            opts.unvalidated_writes = true;
-            let store = Store::open(&loc, opts)?;
-            if status || (mode.is_none() && !off) {
-                let g = guard::install(&store)?;
-                let j = match &g {
-                    Some(g) => serde_json::json!({ "config": g.config(), "status": g.status() }),
-                    None => serde_json::json!({ "config": null }),
-                };
-                if format == "json" {
-                    println!("{}", serde_json::to_string_pretty(&j)?);
-                } else {
-                    match g {
-                        Some(g) => {
-                            let s = g.status();
-                            println!(
-                                "validation {}",
-                                serde_json::to_string(&g.config().mode)?.trim_matches('"')
-                            );
-                            println!("shapes     {} shapes", s.shape_count);
-                            for w in s.warnings {
-                                println!("warning    {w}");
-                            }
-                        }
-                        None => println!("validation off"),
-                    }
-                }
-                return Ok(());
-            }
-            if off {
-                guard::set_config(&store, None)?;
-                println!("validation off");
-                return Ok(());
-            }
-            let mode: sparkles::guard::GuardMode =
-                serde_json::from_value(serde_json::json!(mode.unwrap()))?;
-            let threshold: sparkles::guard::Severity =
-                serde_json::from_value(serde_json::json!(threshold))
-                    .context("--threshold is violation, warning or info")?;
-            let data_graph = match data_graph.as_slice() {
-                [] => DataGraphSel::default(),
-                [g] if g == "default" || g == "union" => DataGraphSel::Named(g.clone()),
-                gs => DataGraphSel::Graphs(gs.to_vec()),
-            };
-            let shapes = match shapes {
-                Some(f) => ShapesSource {
-                    inline: Some(std::fs::read_to_string(&f)?),
-                    source: Some(f.display().to_string()),
-                    ..Default::default()
-                },
-                None if !shapes_graph.is_empty() => ShapesSource {
-                    graphs: Some(shapes_graph),
-                    ..Default::default()
-                },
-                None => bail!("give --shapes FILE or --shapes-graph IRI"),
-            };
-            let cfg = ValidationConfig {
-                format: 1,
-                mode,
-                shapes,
-                data_graph,
-                include_inferences,
-                threshold,
-                timeout_seconds: timeout,
-                report_limit,
-                updated: None,
-            };
-            match guard::set_config(&store, Some(cfg))? {
-                SetOutcome::Installed(_, s) => {
-                    println!(
-                        "validation on: {} results ({} blocking) in {} ms",
-                        s.total, s.blocking, s.millis
-                    );
-                    Ok(())
-                }
-                SetOutcome::NotConforming(s) => {
-                    println!("{}", serde_json::to_string_pretty(&s)?);
-                    eprintln!(
-                        "the data does not conform ({} blocking results); fix it or use --mode warn first",
-                        s.blocking
-                    );
-                    std::process::exit(1);
-                }
-                SetOutcome::Removed => Ok(()),
-            }
-        }
+        #[cfg(any(feature = "shacl", feature = "shex"))]
+        Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
@@ -2097,7 +1988,6 @@ fn run() -> Result<()> {
             if let Some(info) = state::read_reasoning_file(&loc) {
                 println!("reasoning       {}", reasoning::status_line(&info, &store));
             }
-            #[cfg(feature = "shacl")]
             if let Some(v) = validation_stats(&store) {
                 println!("validation      {v}");
             }
@@ -2127,6 +2017,8 @@ fn run() -> Result<()> {
             loc,
             profile,
             rules,
+            vocab,
+            geo_default_geometry,
             clear,
             status,
             check,
@@ -2150,6 +2042,8 @@ fn run() -> Result<()> {
                 eprintln!("error: unknown diagnostics check '{bad}'");
                 std::process::exit(2);
             }
+            let extras = sparkles_reasoner::Extras::parse(&vocab, geo_default_geometry)?;
+            extras.validate()?;
             if check && !(1..=diagnostics::MAX_LIMIT).contains(&limit) {
                 eprintln!(
                     "error: --limit must be between 1 and {}",
@@ -2170,7 +2064,7 @@ fn run() -> Result<()> {
                 eprintln!("removed {n} inferred triples");
                 return Ok(());
             }
-            if !check || profile.is_some() || rules.is_some() {
+            if !check || profile.is_some() || rules.is_some() || !extras.is_empty() {
                 let profile = match rules {
                     Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
                     None => {
@@ -2179,11 +2073,16 @@ fn run() -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("unknown profile '{p}'"))?
                     }
                 };
-                let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
+                let r = sparkles_reasoner::materialize_with(
+                    &store,
+                    &profile,
+                    &extras,
+                    &Default::default(),
+                )?;
                 // lets `sparkles serve` pick the inferences up for this database
                 state::write_reasoning_file(
                     &loc,
-                    Some(&reasoning::recorded(&profile, &r, &store)),
+                    Some(&reasoning::recorded(&profile, &extras, &r, &store)),
                 )?;
                 eprintln!(
                     "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",

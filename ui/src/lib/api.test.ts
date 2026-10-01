@@ -340,3 +340,38 @@ describe('CSRF', () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe('shex', () => {
+  it('posts the envelope with the options as parameters', async () => {
+    const report: api.ShexReport = {
+      conforms: true,
+      counts: { conformant: 1, nonconformant: 0 },
+      results: [],
+      warnings: [],
+      millis: 1,
+    };
+    const calls = stubFetch(() => jsonResponse(report));
+    const r = await api.shex('my ds', 'ex:S {}', '{FOCUS a ex:C}@ex:S', {
+      graph: 'union',
+      reasoning: false,
+      onlyNonconformant: true,
+    });
+    expect(r.counts.conformant).toBe(1);
+    const u = new URL(calls[0].url, 'http://x');
+    expect(u.pathname).toBe('/my%20ds/shex');
+    expect(u.searchParams.get('graph')).toBe('union');
+    expect(u.searchParams.get('reasoning')).toBe('false');
+    expect(u.searchParams.get('results')).toBe('nonconformant');
+    expect(u.searchParams.get('format')).toBeNull();
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({
+      schema: 'ex:S {}',
+      map: '{FOCUS a ex:C}@ex:S',
+    });
+  });
+
+  it('asks for other formats by name', async () => {
+    const calls = stubFetch(() => jsonResponse([]));
+    await api.shexRaw('ds', 's', 'm', 'shapemap');
+    expect(new URL(calls[0].url, 'http://x').searchParams.get('format')).toBe('shapemap');
+  });
+});

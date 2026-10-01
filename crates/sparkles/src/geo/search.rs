@@ -13,15 +13,15 @@
 use super::column::{ColumnEntry, Slot, classify, recheck};
 use super::config::GeoConfig;
 use super::geom::Geom;
-use super::index::{GeoBase, GeoView, Row, intersects, window_f32};
+use super::index::{GeoBase, GeoView, Row, intersects};
 use super::ops::distance::lower_bound_m;
+use super::tree::{PackedTree, Tree};
 use crate::error::Result;
 use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::plan::GraphFilter;
 use crate::store::{Chunk, Snapshot};
-use geo_index::rtree::{RTree, RTreeIndex};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -38,7 +38,7 @@ pub struct Hit {
 }
 
 impl Hit {
-    fn new(r: &Row, entry: Arc<ColumnEntry>) -> Hit {
+    pub(crate) fn new(r: &Row, entry: Arc<ColumnEntry>) -> Hit {
         Hit {
             s: Id(r.s),
             p: Id(r.p),
@@ -68,14 +68,14 @@ pub struct SearchStats {
 
 /// The geometries of skipped literals that searches hand out anyway, parsed once per
 /// search.
-struct Rechecked<'a> {
+pub(crate) struct Rechecked<'a> {
     snap: &'a Snapshot,
     cfg: Arc<GeoConfig>,
     memo: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
 }
 
 impl<'a> Rechecked<'a> {
-    fn new(snap: &'a Snapshot) -> Rechecked<'a> {
+    pub(crate) fn new(snap: &'a Snapshot) -> Rechecked<'a> {
         Rechecked {
             snap,
             cfg: snap
@@ -86,7 +86,7 @@ impl<'a> Rechecked<'a> {
         }
     }
 
-    fn entry(&mut self, o: u64) -> Option<Arc<ColumnEntry>> {
+    pub(crate) fn entry(&mut self, o: u64) -> Option<Arc<ColumnEntry>> {
         let (snap, cfg) = (self.snap, &self.cfg);
         self.memo
             .entry(o)
@@ -139,7 +139,7 @@ pub fn window_with(
     };
     // base rows
     if let Some(t) = &base.tree {
-        let found = search_tree(t, windows, &mut st.nodes);
+        let found = t.search(windows, &mut st.nodes);
         for (n, &i) in found.iter().enumerate() {
             if n % CHUNK == 0 {
                 ctx.check()?;
@@ -155,7 +155,7 @@ pub fn window_with(
     }
     // overlay and tail rows
     if let Some(t) = &view.overlay.tree {
-        let found = search_tree(t, windows, &mut st.nodes);
+        let found = t.search(windows, &mut st.nodes);
         for (n, &i) in found.iter().enumerate() {
             if n % CHUNK == 0 {
                 ctx.check()?;
@@ -237,8 +237,8 @@ pub fn nearest_with(
     };
     let mut f = Filter::new(snap, preds, graph, dedup);
     let trees = [
-        base.tree.as_ref().map(Tree::new),
-        view.overlay.tree.as_ref().map(Tree::new),
+        base.tree.as_ref().map(PackedTree::tree),
+        view.overlay.tree.as_ref().map(PackedTree::tree),
     ];
     let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
     for (t, src) in trees.iter().zip([Src::Base, Src::Overlay]) {
@@ -344,7 +344,10 @@ pub fn nearest_with(
 }
 
 /// The view and base when `snap`'s index can answer for every predicate of `preds`.
-fn indexed<'a>(snap: &'a Snapshot, preds: &[Id]) -> Option<(&'a GeoView, &'a Arc<GeoBase>)> {
+pub(crate) fn indexed<'a>(
+    snap: &'a Snapshot,
+    preds: &[Id],
+) -> Option<(&'a GeoView, &'a Arc<GeoBase>)> {
     let view = snap.geo.as_deref()?;
     let base = view.usable()?;
     preds
@@ -353,100 +356,8 @@ fn indexed<'a>(snap: &'a Snapshot, preds: &[Id]) -> Option<(&'a GeoView, &'a Arc
         .then_some((view, base))
 }
 
-/// A packed tree read through its layout: nodes are positions in `boxes` (four
-/// coordinates each), level by level from the items up to the root; a node's index entry
-/// is its first child's position, an item's its insertion index.
-struct Tree<'a> {
-    boxes: &'a [f32],
-    indices: geo_index::indices::Indices<'a>,
-    /// positions below this are items
-    items: usize,
-    node: usize,
-    bounds: &'a [usize],
-}
-
-impl<'a> Tree<'a> {
-    fn new(t: &'a RTree<f32>) -> Tree<'a> {
-        Tree {
-            boxes: t.boxes(),
-            indices: t.indices(),
-            items: t.num_items() as usize * 4,
-            node: t.node_size() as usize * 4,
-            bounds: t.level_bounds(),
-        }
-    }
-
-    fn root(&self) -> usize {
-        self.boxes.len() - 4
-    }
-
-    fn bbox(&self, pos: usize) -> [f32; 4] {
-        [
-            self.boxes[pos],
-            self.boxes[pos + 1],
-            self.boxes[pos + 2],
-            self.boxes[pos + 3],
-        ]
-    }
-
-    fn is_item(&self, pos: usize) -> bool {
-        pos < self.items
-    }
-
-    /// The insertion index of the item at `pos`.
-    fn item(&self, pos: usize) -> usize {
-        self.indices.get(pos >> 2)
-    }
-
-    /// The positions of the children of the node at `pos`.
-    fn children(&self, pos: usize) -> impl Iterator<Item = usize> + use<> {
-        let start = self.indices.get(pos >> 2);
-        // the end of the children's level
-        let level_end = self
-            .bounds
-            .iter()
-            .copied()
-            .find(|&b| b > start)
-            .unwrap_or(self.boxes.len());
-        (start..(start + self.node).min(level_end)).step_by(4)
-    }
-}
-
-/// The tree items whose box intersects one of `windows` (each once).
-fn search_tree(t: &RTree<f32>, windows: &[[f64; 4]], nodes: &mut u64) -> Vec<u32> {
-    let ws: Vec<[f32; 4]> = windows.iter().map(window_f32).collect();
-    let hits = |b: [f32; 4]| {
-        ws.iter()
-            .any(|w| b[0] <= w[2] && b[2] >= w[0] && b[1] <= w[3] && b[3] >= w[1])
-    };
-    let t = Tree::new(t);
-    let mut out = Vec::new();
-    let root = t.root();
-    if t.is_item(root) {
-        if hits(t.bbox(root)) {
-            out.push(t.item(root) as u32);
-        }
-        return out;
-    }
-    let mut stack = vec![root];
-    while let Some(n) = stack.pop() {
-        *nodes += 1;
-        for c in t.children(n) {
-            if !hits(t.bbox(c)) {
-                continue;
-            }
-            if t.is_item(c) {
-                out.push(t.item(c) as u32);
-            } else {
-                stack.push(c);
-            }
-        }
-    }
-    out
-}
-
 /// The row checks of a search: predicate, graph, validity in the snapshot, duplicates.
-struct Filter<'a> {
+pub(crate) struct Filter<'a> {
     snap: &'a Snapshot,
     preds: &'a [Id],
     graph: &'a GraphFilter,
@@ -459,7 +370,12 @@ struct Filter<'a> {
 }
 
 impl<'a> Filter<'a> {
-    fn new(snap: &'a Snapshot, preds: &'a [Id], graph: &'a GraphFilter, dedup: bool) -> Self {
+    pub(crate) fn new(
+        snap: &'a Snapshot,
+        preds: &'a [Id],
+        graph: &'a GraphFilter,
+        dedup: bool,
+    ) -> Self {
         Filter {
             snap,
             preds,
@@ -471,22 +387,22 @@ impl<'a> Filter<'a> {
     }
 
     #[inline]
-    fn wanted(&self, r: &Row) -> bool {
+    pub(crate) fn wanted(&self, r: &Row) -> bool {
         self.graph.accepts(r.g) && self.preds.iter().any(|p| p.0 == r.p)
     }
 
     #[inline]
-    fn unseen_triple(&mut self, r: &Row) -> bool {
+    pub(crate) fn unseen_triple(&mut self, r: &Row) -> bool {
         !self.dedup || self.triples.insert((r.s, r.p, r.o))
     }
 
     /// A base row: valid unless the snapshot deleted its quad.
-    fn base_row(&mut self, r: &Row) -> bool {
+    pub(crate) fn base_row(&mut self, r: &Row) -> bool {
         self.base_valid(r) && self.unseen_triple(r)
     }
 
     /// [`Self::base_row`] without the triple check (done at emission).
-    fn base_valid(&self, r: &Row) -> bool {
+    pub(crate) fn base_valid(&self, r: &Row) -> bool {
         if !self.wanted(r) {
             return false;
         }
@@ -495,19 +411,19 @@ impl<'a> Filter<'a> {
     }
 
     /// An overlay or tail row: valid if the snapshot inserted its quad.
-    fn delta_row(&mut self, r: &Row) -> bool {
+    pub(crate) fn delta_row(&mut self, r: &Row) -> bool {
         self.delta_row_unseen(r) && self.unseen_triple(r)
     }
 
     /// [`Self::delta_row`] without the triple check (done at emission).
-    fn delta_row_unseen(&mut self, r: &Row) -> bool {
+    pub(crate) fn delta_row_unseen(&mut self, r: &Row) -> bool {
         self.wanted(r)
             && self.snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
             && self.quads.insert(*r)
     }
 
     /// Whether a row taken from the queue goes out: tail rows are checked now.
-    fn emit(&mut self, r: &Row, from_tail: bool) -> bool {
+    pub(crate) fn emit(&mut self, r: &Row, from_tail: bool) -> bool {
         if from_tail && !self.delta_row_unseen(r) {
             return false;
         }

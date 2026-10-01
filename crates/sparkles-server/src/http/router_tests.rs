@@ -398,6 +398,7 @@ async fn shacl_with_inferences() {
     assert!(rep.inferred > 0);
     *ds.reasoning.write() = Some(crate::reasoning::recorded(
         &sparkles_reasoner::Profile::Rdfs,
+        &Default::default(),
         &rep,
         &ds.store,
     ));

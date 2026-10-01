@@ -9,7 +9,14 @@ export type DatasetType = 'persistent' | 'mem';
 export type DatasetInfo = {
   name: string;
   type: DatasetType;
-  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string };
+  endpoints: {
+    query: string;
+    update: string;
+    gsp: string;
+    upload: string;
+    shacl?: string;
+    shex?: string;
+  };
   quads: number;
   reasoning: null | {
     profile: string;
@@ -64,6 +71,8 @@ export type ServerInfo = {
   limits?: Limits;
   /** Absent on servers that predate it. */
   readOnly?: boolean;
+  /** The MapLibre style of maps (`serve --map-style-url`); null: the bundled basemap. */
+  mapStyleUrl?: string | null;
 };
 
 /** `GET /$/ready` (the same document with status 503 when not ready). */
@@ -917,6 +926,104 @@ export async function shaclRaw(
   return res.blob();
 }
 
+// --- ShEx ---------------------------------------------------------------------
+
+/** Why a node does not conform to a shape (`appinfo.failures` of a ShEx result). */
+export type ShexFailure =
+  | { kind: 'nodeKind' | 'datatype' | 'facet' | 'valueSet'; value: Term; constraint: string }
+  | {
+      kind: 'cardinality';
+      predicate: string;
+      inverse: boolean;
+      min: number;
+      max: number | null;
+      count: number;
+    }
+  | { kind: 'closed' | 'extra'; predicate: string; value: Term }
+  | { kind: 'noMatch'; detail: string }
+  | { kind: 'reference'; shape: string; value: Term }
+  | { kind: 'not' | 'external'; shape: string }
+  | { kind: 'semAct'; extension: string; message: string };
+
+/** One association of the result map of `/{ds}/shex`. */
+export type ShexResult = {
+  node: Term;
+  shape: Term | { type: 'start' };
+  status: 'conformant' | 'nonconformant';
+  /** The first failure, in one line. */
+  reason?: string;
+  appinfo?: { failures: ShexFailure[]; prints?: string[] };
+};
+
+export type ShexReport = {
+  conforms: boolean;
+  counts: { conformant: number; nonconformant: number };
+  results: ShexResult[];
+  warnings: string[];
+  millis: number;
+};
+
+export type ShexOptions = {
+  /** `default`, `union` or a graph IRI. */
+  graph?: string;
+  /** Include materialized inferences (server default: yes, when present). */
+  reasoning?: boolean;
+  /** Report only nonconformant associations (the counts still cover all). */
+  onlyNonconformant?: boolean;
+  /** Base IRI of the schema's (and the shape map's) relative IRIs. */
+  base?: string;
+  signal?: AbortSignal;
+};
+
+/** Report formats of `/{ds}/shex` besides the JSON report. */
+export type ShexFormat = 'shapemap' | 'smap' | 'text';
+
+function shexRequest(
+  ds: string,
+  schema: string,
+  map: string,
+  format: 'json' | ShexFormat,
+  opts: ShexOptions,
+): Promise<Response> {
+  const p = new URLSearchParams();
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.onlyNonconformant) p.set('results', 'nonconformant');
+  if (opts.base) p.set('base', opts.base);
+  if (format !== 'json') p.set('format', format);
+  const qs = p.toString();
+  return request(`/${enc(ds)}/shex${qs ? `?${qs}` : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/plain' },
+    // the envelope: the schema is sniffed (ShExJ when it starts with `{`, else ShExC)
+    body: JSON.stringify({ schema, map }),
+    signal: opts.signal,
+  });
+}
+
+/** Validate a data graph against a ShEx schema (ShExC or ShExJ) and a compact shape map. */
+export async function shex(
+  ds: string,
+  schema: string,
+  map: string,
+  opts: ShexOptions = {},
+): Promise<ShexReport> {
+  const res = await shexRequest(ds, schema, map, 'json', opts);
+  return (await res.json()) as ShexReport;
+}
+
+/** Same validation, the result map in another format (e.g. `shapemap` JSON) for download. */
+export async function shexRaw(
+  ds: string,
+  schema: string,
+  map: string,
+  format: ShexFormat,
+  opts: ShexOptions = {},
+): Promise<Blob> {
+  const res = await shexRequest(ds, schema, map, format, opts);
+  return res.blob();
+}
+
 // --- upload -------------------------------------------------------------------
 
 export type UploadProgress = { loaded: number; total: number };
@@ -1243,6 +1350,88 @@ export type GeoStatus = {
   formatVersion: number;
   lastBuild?: { at: string; ms: number; rows: number };
 };
+
+/**
+ * `GET /$/geo/{ds}`: the spatial index status, or null when the index is disabled for
+ * the dataset. Throws an ApiError with status 501 on servers built without GeoSPARQL.
+ */
+export async function geoStatus(ds: string, signal?: AbortSignal): Promise<GeoStatus | null> {
+  const body = await json<GeoStatus | { enabled: false }>(`/$/geo/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body && body.enabled ? body : null;
+}
+
+/** Enable or reconfigure the spatial index; the index is built by the returned task. */
+export const geoConfigure = (ds: string, config: GeoConfig = {}) =>
+  json<Task>(`/$/geo/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+/** Disable the spatial index (removes geo.json). */
+export const geoDisable = (ds: string) => json<unknown>(`/$/geo/${enc(ds)}`, { method: 'DELETE' });
+
+/** Rebuild the index from the current data (`409` while a build runs). */
+export const geoRebuild = (ds: string) =>
+  json<Task>(`/$/geo/${enc(ds)}/rebuild`, { method: 'POST' });
+
+/** A GeoJSON geometry in CRS84 (longitude, latitude). */
+export type GeoJsonGeometry = {
+  type: string;
+  coordinates?: unknown;
+  geometries?: GeoJsonGeometry[];
+};
+
+/** An indexed geometry of `GET /{ds}/geo`; `id` is the row's subject. */
+export type GeoFeature = {
+  type: 'Feature';
+  id: string;
+  geometry: GeoJsonGeometry;
+  properties: { subject: string; feature?: string; graph: string | null; predicate: string };
+};
+
+export type GeoFeatureCollection = {
+  type: 'FeatureCollection';
+  features: GeoFeature[];
+  /** More geometries meet the box than `limit`. */
+  truncated: boolean;
+};
+
+export type GeoBoxQuery = {
+  /** [minLon, minLat, maxLon, maxLat] in degrees. */
+  bbox: [number, number, number, number];
+  graph?: string;
+  predicate?: string;
+  /** Default 5,000, at most 50,000. */
+  limit?: number;
+  /** Simplification tolerance in degrees; default the box width / 1024. */
+  tolerance?: number;
+};
+
+/** `GET /{ds}/geo`: the indexed geometries meeting a box, simplified for its scale. */
+export function geoBox(ds: string, q: GeoBoxQuery, signal?: AbortSignal) {
+  const p = new URLSearchParams({ bbox: q.bbox.join(',') });
+  if (q.graph) p.set('graph', q.graph);
+  if (q.predicate) p.set('predicate', q.predicate);
+  if (q.limit != null) p.set('limit', String(q.limit));
+  if (q.tolerance != null) p.set('tolerance', String(q.tolerance));
+  return json<GeoFeatureCollection>(`/${enc(ds)}/geo?${p}`, { signal });
+}
+
+/** One literal's outcome of `POST /$/geo/convert`. */
+export type GeoConverted = { geometry: GeoJsonGeometry } | { error: string };
+
+/** `POST /$/geo/convert`: geometry literals as CRS84 GeoJSON, in order. */
+export const geoConvert = (literals: { value: string; datatype: string }[], signal?: AbortSignal) =>
+  json<{ results: GeoConverted[] }>(`/$/geo/convert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ literals }),
+    signal,
+  });
 
 // --- full-text search --------------------------------------------------------------
 

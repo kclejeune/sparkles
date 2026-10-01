@@ -273,6 +273,13 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             let input = child(0, &mut infos)?;
             unpack(ctx, input, *t, parts, &n.vars)?
         }
+        Kind::IndexJoin(spec) => {
+            let l = child(0, &mut infos)?;
+            let (t, stats) = super::indexjoin::run(ctx, spec, &l, &n.vars)?;
+            note = Some(stats.note());
+            counters = Some(stats.counters());
+            t
+        }
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
@@ -294,6 +301,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::Filter(es) => {
             let mut t = child(0, &mut infos)?;
             expr_report = apply_filter(ctx, &mut t, es)?;
+            (note, counters) = super::exists::explain(ctx, es);
             t
         }
         Kind::Extend(v, e) => {
@@ -365,6 +373,27 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::SpatialJoin(spec) => {
+            let mut inputs = Vec::with_capacity(n.children.len());
+            for i in 0..n.children.len() {
+                inputs.push(child(i, &mut infos)?);
+            }
+            let (t, c) = spatial_join(ctx, spec, inputs, &n.vars)?;
+            counters = Some(c);
+            t
+        }
+        Kind::SpatialKnn(spec) => {
+            // the template runs once per batch of candidates
+            let (t, c, runs) = spatial_knn(ctx, spec, &n.children[0], &n.vars)?;
+            infos.extend(runs);
+            counters = Some(c);
+            t
+        }
+        Kind::SpatialRelate(spec) => {
+            let (t, c) = spatial_relate(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::Service {
             endpoint,
             query,
@@ -396,7 +425,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     }
     if let Some(x) = expr_report.note() {
         note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
-        counters = counters.or_else(|| expr_report.counters());
+        counters = merge_counters(counters, expr_report.counters());
     }
     ctx.check()?;
     // the inputs are gone (or became the output): only the output is alive now
@@ -420,6 +449,20 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         warnings: Vec::new(),
     };
     Ok((table, info))
+}
+
+/// Both operators' counters (the expression cache's next to those of EXISTS).
+fn merge_counters(
+    a: Option<serde_json::Map<String, serde_json::Value>>,
+    b: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match (a, b) {
+        (Some(mut a), Some(b)) => {
+            a.extend(b);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    }
 }
 
 // ------------------------------------------------------------------ scans ------
@@ -636,6 +679,7 @@ fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table, report: &mut ExprReport) -> Re
         Kind::Project(vars) => t.project(vars),
         Kind::Unpack { t: tv, parts } => unpack(ctx, t, *tv, parts, &n.vars)?,
         Kind::Distinct => distinct(t),
+        Kind::IndexJoin(spec) => super::indexjoin::run(ctx, spec, &t, &n.vars)?.0,
         _ => unreachable!("not a unary streaming operator"),
     })
 }
@@ -667,21 +711,23 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
         | Kind::Extend(..)
         | Kind::Project(_)
         | Kind::Unpack { .. }
-        | Kind::Distinct => {
+        | Kind::Distinct
+        | Kind::IndexJoin(_) => {
             let mut budget = want.max(64);
             loop {
                 let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
                 let mut report = ExprReport::default();
                 let out = apply_unary(ctx, n, input, &mut report)?;
                 if out.len() >= want || complete {
-                    let r = finish(out, vec![cinfo], complete);
-                    return r.map(|(t, mut info, complete)| {
-                        if let Some(x) = report.note() {
-                            info.description = format!("{} {x}", info.description);
-                            info.counters = report.counters();
-                        }
-                        (t, info, complete)
-                    });
+                    let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
+                    if let Kind::Filter(exprs) = &n.kind {
+                        super::exists::annotate(ctx, &mut info, exprs);
+                    }
+                    if let Some(x) = report.note() {
+                        info.description = format!("{} {x}", info.description);
+                        info.counters = merge_counters(info.counters.take(), report.counters());
+                    }
+                    return Ok((t, info, complete));
                 }
                 budget = budget.saturating_mul(8);
             }
@@ -1621,11 +1667,16 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     Some(out)
 }
 
-/// Keep the rows that pass every conjunct: conjuncts that are pure over one variable
-/// are tested once per distinct value (see [`super::exprcache`]), the others row by row
-/// on the rows that are left.
-fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<ExprReport> {
+/// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
+/// first, then conjuncts that are pure over one variable once per distinct value (see
+/// [`super::exprcache`]), the others row by row on the rows that are left.
+pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<ExprReport> {
     let mut report = ExprReport::default();
+    let rest = super::exists::apply(ctx, t, exprs)?;
+    let exprs = rest.as_deref().unwrap_or(exprs);
+    if exprs.is_empty() {
+        return Ok(report);
+    }
     let sorted = t.sorted.clone();
     match super::exprcache::filter(ctx, t, exprs, &mut report)? {
         Some((keep, rest)) => {
@@ -2278,7 +2329,9 @@ fn aggregate(
             // SPARQL 1.1: the result is a simple literal (language tags are dropped)
             Some(Value::Str(parts.join(sep).into()))
         }
-        AggregateFunction::Custom(_) => None,
+        AggregateFunction::Custom(iri) => {
+            return super::aggext::aggregate(ctx, iri.as_str(), &vals);
+        }
     };
     result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
 }
@@ -2661,6 +2714,12 @@ fn path(
 /// Exact top-k vector search (`spk:vectorSearch`).
 #[cfg(feature = "geo")]
 use crate::geo::exec::{spatial_pf, spatial_scan};
+#[cfg(feature = "geo")]
+use crate::geo::join::spatial_join;
+#[cfg(feature = "geo")]
+use crate::geo::knn::spatial_knn;
+#[cfg(feature = "geo")]
+use crate::geo::rewrite::spatial_relate;
 
 #[cfg(not(feature = "geo"))]
 type Counters = serde_json::Map<String, serde_json::Value>;
@@ -2676,6 +2735,35 @@ fn spatial_scan(
 
 #[cfg(not(feature = "geo"))]
 fn spatial_pf(_: &Ctx, _: &super::geopf::SpatialPfSpec, _: &[VarId]) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_join(
+    _: &Ctx,
+    _: &super::geojoin::SpatialJoinSpec,
+    _: Vec<Table>,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_knn(
+    _: &Ctx,
+    _: &super::geojoin::SpatialKnnSpec,
+    _: &Node,
+    _: &[VarId],
+) -> Result<(Table, Counters, Vec<PlanInfo>)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_relate(
+    _: &Ctx,
+    _: &super::georewrite::SpatialRelateSpec,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
     Err(crate::geo::not_built())
 }
 

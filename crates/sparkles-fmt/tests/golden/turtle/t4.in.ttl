@@ -1,0 +1,13 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+# Classes
+
+ex:Zebra rdfs:subClassOf ex:Animal ; rdfs:label "Zebra" .
+# the root class
+ex:Animal rdfs:label "Animal" ; a rdfs:Class .
+
+# Properties
+
+ex:weight rdfs:label "weight" ; rdfs:domain ex:Animal .
+ex:age rdfs:domain ex:Animal .

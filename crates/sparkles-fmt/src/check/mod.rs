@@ -5,6 +5,8 @@
 
 pub mod algebra;
 pub mod comments;
+pub mod graph;
+pub mod json;
 
 use crate::doc::Printed;
 use crate::lex::{LexMode, Token, TokenKind, lex};
@@ -71,7 +73,7 @@ pub fn run<L: LangImpl>(lang: &L, text: &str, opts: &Options) -> Result<Formatte
     }
     let r = lang.reference(text, &tokens)?;
     let mut warnings = lang.warnings(&r);
-    warnings.extend(crate::option_warnings(opts));
+    warnings.extend(crate::option_warnings(opts, lang.language()));
     deadline(opts.deadline)?;
 
     let (tree, printed, moved) = format_once(lang, text, tokens, &r, opts)?;

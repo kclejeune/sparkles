@@ -20,9 +20,12 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 smallvec.workspace = true
+# write-time validation (the guard), ShExR and SPARQL selectors
+parking_lot.workspace = true
+oxrdfio.workspace = true
+spargebra.workspace = true
 
 [dev-dependencies]
 oxttl.workspace = true
-oxrdfio.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

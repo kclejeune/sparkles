@@ -125,6 +125,15 @@
 
           checks = {
             inherit (self'.packages) sparkles sparkles-cli;
+            # THIRD_PARTY_LICENSES-UI.md is the notices file the UI build writes (the build
+            # itself fails on a non-permissive license)
+            ui-licenses = pkgs.runCommand "sparkles-ui-licenses" { } ''
+              if ! cmp -s ${self'.packages.sparkles-ui}/licenses.txt ${./THIRD_PARTY_LICENSES-UI.md}; then
+                echo "THIRD_PARTY_LICENSES-UI.md is out of date: run 'mise run licenses'" >&2
+                exit 1
+              fi
+              touch $out
+            '';
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });

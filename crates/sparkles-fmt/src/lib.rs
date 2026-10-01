@@ -1,5 +1,7 @@
-//! `sparkles-fmt`: an opinionated formatter for SPARQL 1.2 queries and updates (Turtle,
-//! TriG, N-Triples, N-Quads and JSON-LD come later).
+//! `sparkles-fmt`: an opinionated formatter for SPARQL 1.2 queries and updates, Turtle 1.2
+//! and TriG 1.2, N-Triples 1.2 and N-Quads 1.2, and JSON-LD 1.1. Each language formats
+//! once its module says so ([`Language::is_implemented`]); the others are refused with
+//! [`FormatError::UnsupportedLanguage`].
 //!
 //! Output depends only on the syntax tree, the comments, the blank-line groups and the
 //! [`Options`]. Formatting never loses a comment, and it refuses its own output unless the
@@ -14,12 +16,14 @@
 //! ```
 //!
 //! The pipeline: a lossless lexer ([`lex`]) and concrete syntax tree ([`tree`]), a
-//! reference parse with spargebra ([`check`]), the language's printer building a document
-//! ([`doc`]) with comments attached ([`trivia`]), the printer, then the safety checks.
-//! Only [`format`], [`detect`], [`Options`] and the types around them are the stable API;
-//! the other modules are public for the crate's own test suites.
+//! reference parse (spargebra, oxttl, json-event-parser; [`check`]), the language's
+//! printer building a document ([`doc`]) with comments attached ([`trivia`]), the printer,
+//! then the safety checks. N-Triples and N-Quads skip the tree: they are formatted and
+//! checked statement by statement ([`lines`]), and [`format_lines`] streams them.
+//! Only [`format`], [`format_lines`], [`detect`], [`Options`] and the types around them
+//! are the stable API; the other modules are public for the crate's own test suites.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[doc(hidden)]
@@ -29,7 +33,11 @@ pub mod cursor;
 #[doc(hidden)]
 pub mod doc;
 #[doc(hidden)]
+pub mod jsonld;
+#[doc(hidden)]
 pub mod lex;
+#[doc(hidden)]
+pub mod lines;
 #[doc(hidden)]
 pub mod normalize;
 pub mod options;
@@ -43,6 +51,8 @@ pub mod syntax;
 pub mod tree;
 #[doc(hidden)]
 pub mod trivia;
+#[doc(hidden)]
+pub mod turtle;
 
 // ------------------------------------------------------------------ languages ------
 
@@ -120,9 +130,21 @@ impl Language {
         })
     }
 
-    /// Whether this build formats the language (SPARQL only, for now).
+    /// Whether this build formats the language. Each language's module says so, so a
+    /// language turns on with the module that implements it.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Language::Sparql)
+        match self {
+            Language::Sparql => true,
+            Language::Turtle | Language::TriG => turtle::IMPLEMENTED,
+            Language::NTriples | Language::NQuads => lines::IMPLEMENTED,
+            Language::JsonLd => jsonld::IMPLEMENTED,
+        }
+    }
+
+    /// N-Triples or N-Quads: formatted statement by statement, and streamed by
+    /// [`format_lines`].
+    pub fn is_line_format(self) -> bool {
+        matches!(self, Language::NTriples | Language::NQuads)
     }
 }
 
@@ -369,7 +391,10 @@ pub struct Formatted {
 /// Something the caller should know that did not stop formatting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Warning {
-    /// `undeclared-prefix`, `comment-moved` or `option-not-implemented`
+    /// `undeclared-prefix`, `comment-moved`, `option-not-implemented`,
+    /// `comments-dropped` (`canonicalize` drops every comment; the message counts them)
+    /// or `unstable-labels` (`canonicalize` labeled blank nodes inside triple terms, which
+    /// RDFC-1.0 does not define)
     pub code: &'static str,
     pub message: String,
     /// 1-based line of the input; 0 when the warning has no position
@@ -476,14 +501,40 @@ impl FormatError {
 pub struct LineStats {
     /// statements read
     pub statements: u64,
-    /// whether any output line differs from its input line (or the order changed)
+    /// whether the output differs from the input
     pub changed: bool,
+    pub warnings: Vec<Warning>,
+}
+
+/// What [`format_lines`] needs beyond the [`Options`]: where and how much to sort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinesConfig {
+    /// where sorted runs spill when the statements outgrow `sort_memory`
+    pub spill_dir: PathBuf,
+    /// bytes of statements sorted in memory before a run spills (`--sort-memory`)
+    pub sort_memory: u64,
+    /// the most quads `canonicalize` holds (`--max-canonicalize-quads`); beyond it the
+    /// input is refused with [`FormatError::TooLarge`]
+    pub max_canonicalize_quads: u64,
+    /// threads formatting chunks of statements (0: one per core)
+    pub threads: usize,
+}
+
+impl Default for LinesConfig {
+    fn default() -> LinesConfig {
+        LinesConfig {
+            spill_dir: std::env::temp_dir(),
+            sort_memory: 1 << 30,
+            max_canonicalize_quads: 20_000_000,
+            threads: 0,
+        }
+    }
 }
 
 // ------------------------------------------------------------------ formatting ------
 
-/// Format `text` as `lang`. A leading UTF-8 BOM is dropped; `# sparkles-fmt: ignore-file`
-/// in the file header returns the input unchanged.
+/// Format `text` as `lang`, in memory. A leading UTF-8 BOM is dropped;
+/// `# sparkles-fmt: ignore-file` in the file header returns the input unchanged.
 pub fn format(text: &str, lang: Language, opts: &Options) -> Result<Formatted, FormatError> {
     if !lang.is_implemented() {
         return Err(FormatError::unsupported_language(lang));
@@ -495,21 +546,28 @@ pub fn format(text: &str, lang: Language, opts: &Options) -> Result<Formatted, F
     let opts = clamped(opts);
     match lang {
         Language::Sparql => check::run(&sparql::Sparql, text, &opts),
-        _ => Err(FormatError::unsupported_language(lang)),
+        Language::Turtle => check::run(&turtle::Turtle { trig: false }, text, &opts),
+        Language::TriG => check::run(&turtle::Turtle { trig: true }, text, &opts),
+        Language::NTriples | Language::NQuads => lines::format_str(text, lang, &opts),
+        Language::JsonLd => check::run(&jsonld::JsonLd, text, &opts),
     }
 }
 
-/// Format N-Triples or N-Quads from `r` to `w` in one streaming pass (sorting spills runs
-/// under `spill`). Not implemented yet: every language is refused.
+/// Format N-Triples or N-Quads from `r` to `w` in one streaming pass, in bounded memory:
+/// the output is the same as [`format`]'s. Sorting (`sort`, `canonicalize`) spills
+/// sorted runs under [`LinesConfig::spill_dir`] once they outgrow
+/// [`LinesConfig::sort_memory`]. Any other language is refused.
 pub fn format_lines(
     r: impl std::io::BufRead,
     w: impl std::io::Write,
     lang: Language,
     opts: &Options,
-    spill: &Path,
+    cfg: &LinesConfig,
 ) -> Result<LineStats, FormatError> {
-    let _ = (r, w, opts, spill);
-    Err(FormatError::unsupported_language(lang))
+    if !lang.is_line_format() || !lang.is_implemented() {
+        return Err(FormatError::unsupported_language(lang));
+    }
+    lines::format_stream(r, w, lang, &clamped(opts), cfg)
 }
 
 /// `opts` with the widths in range, for library callers that skipped validation.
@@ -526,12 +584,43 @@ fn clamped(opts: &Options) -> Options {
     o
 }
 
-/// The `option-not-implemented` warnings of keys that are accepted but do nothing yet.
-pub(crate) fn option_warnings(opts: &Options) -> Vec<Warning> {
+/// The `option-not-implemented` warnings of keys that are set, act on `lang`, and do
+/// nothing yet. Keys that do not act on a language at all (`sort` for SPARQL) are inert
+/// and say nothing.
+pub(crate) fn option_warnings(opts: &Options, lang: Language) -> Vec<Warning> {
+    use Language::*;
+    let turtle = matches!(lang, Turtle | TriG);
     let mut w = Vec::new();
     for (on, key) in [
-        (opts.prune_prefixes, "prune-prefixes"),
-        (opts.align_values, "align-values"),
+        (
+            opts.prune_prefixes
+                && matches!(lang, Sparql | Turtle | TriG)
+                && !normalize::prune::IMPLEMENTED,
+            "prune-prefixes",
+        ),
+        (
+            opts.align_values && lang == Sparql && !sparql::print::values::ALIGN_IMPLEMENTED,
+            "align-values",
+        ),
+        (
+            opts.turtle_layout == TurtleLayout::Conventional
+                && turtle
+                && !turtle::print::CONVENTIONAL_IMPLEMENTED,
+            "turtle-layout",
+        ),
+        (opts.sort && turtle && !turtle::sort::IMPLEMENTED, "sort"),
+        (
+            opts.sort && lang == JsonLd && !jsonld::SORT_IMPLEMENTED,
+            "sort",
+        ),
+        (
+            opts.sort && lang.is_line_format() && !lines::SORT_IMPLEMENTED,
+            "sort",
+        ),
+        (
+            opts.canonicalize && lang.is_line_format() && !lines::CANONICALIZE_IMPLEMENTED,
+            "canonicalize",
+        ),
     ] {
         if on {
             w.push(Warning {
@@ -584,6 +673,28 @@ pub fn offset_of(src: &str, line: u32, column: u32) -> usize {
 
 fn bom_len(src: &str) -> usize {
     if src.starts_with('\u{feff}') { 3 } else { 0 }
+}
+
+/// The byte offset of a UTF-16 offset (an editor's cursor; inside a surrogate pair: the
+/// next character); `None` past the end.
+pub fn utf16_to_byte(text: &str, units: u64) -> Option<usize> {
+    let mut at = 0u64;
+    for (i, c) in text.char_indices() {
+        if at >= units {
+            return Some(i);
+        }
+        at += c.len_utf16() as u64;
+    }
+    (at >= units).then_some(text.len())
+}
+
+/// The UTF-16 offset of a byte offset (inside a character: its start).
+pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
+    let mut b = byte.min(text.len());
+    while !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    text[..b].encode_utf16().count()
 }
 
 #[cfg(test)]
@@ -779,6 +890,23 @@ mod tests {
     }
 
     #[test]
+    fn utf16_offsets() {
+        let t = "a😀b\u{e9}";
+        assert_eq!(utf16_to_byte(t, 0), Some(0));
+        assert_eq!(utf16_to_byte(t, 1), Some(1));
+        // inside the surrogate pair: the next character
+        assert_eq!(utf16_to_byte(t, 2), Some(5));
+        assert_eq!(utf16_to_byte(t, 3), Some(5));
+        assert_eq!(utf16_to_byte(t, 4), Some(6));
+        assert_eq!(utf16_to_byte(t, 5), Some(t.len()));
+        assert_eq!(utf16_to_byte(t, 6), None);
+        for (bytes, units) in [(0, 0), (1, 1), (5, 3), (6, 4), (t.len(), 5)] {
+            assert_eq!(byte_to_utf16(t, bytes), units);
+        }
+        assert_eq!(utf16_to_byte("", 0), Some(0));
+    }
+
+    #[test]
     fn a_bom_is_dropped() {
         let f = format("\u{feff}ASK {}\n", Language::Sparql, &Options::default()).unwrap();
         assert_eq!(f.text, "ASK {}\n");
@@ -786,8 +914,53 @@ mod tests {
     }
 
     #[test]
-    fn other_languages_are_refused() {
-        let e = format("<a> <b> <c> .", Language::Turtle, &Options::default()).unwrap_err();
-        assert_eq!(e, FormatError::unsupported_language(Language::Turtle));
+    fn languages_not_implemented_are_refused() {
+        for lang in Language::ALL {
+            if lang.is_implemented() {
+                continue;
+            }
+            let e = format("<a> <b> <c> .", lang, &Options::default()).unwrap_err();
+            assert_eq!(e, FormatError::unsupported_language(lang), "{lang:?}");
+            let e = format_lines(
+                "<a> <b> <c> .\n".as_bytes(),
+                std::io::sink(),
+                lang,
+                &Options::default(),
+                &LinesConfig::default(),
+            )
+            .unwrap_err();
+            assert_eq!(e, FormatError::unsupported_language(lang), "{lang:?}");
+        }
+        // only the line formats stream
+        let e = format_lines(
+            "ASK {}".as_bytes(),
+            std::io::sink(),
+            Language::Sparql,
+            &Options::default(),
+            &LinesConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(e, FormatError::unsupported_language(Language::Sparql));
+    }
+
+    #[test]
+    fn unimplemented_keys_warn_only_where_they_act() {
+        let keys = |opts: &Options, lang| option_warnings(opts, lang).len();
+        let sort = Options {
+            sort: true,
+            canonicalize: true,
+            ..Options::default()
+        };
+        // inert for SPARQL
+        assert_eq!(keys(&sort, Language::Sparql), 0);
+        let layout = Options {
+            turtle_layout: TurtleLayout::Conventional,
+            ..Options::default()
+        };
+        assert_eq!(keys(&layout, Language::Sparql), 0);
+        assert_eq!(keys(&layout, Language::JsonLd), 0);
+        if !turtle::print::CONVENTIONAL_IMPLEMENTED {
+            assert_eq!(keys(&layout, Language::TriG), 1);
+        }
     }
 }

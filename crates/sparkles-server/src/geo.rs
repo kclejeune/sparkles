@@ -1,15 +1,19 @@
 //! GeoSPARQL in the server: `/$/geo/{ds}` (status, enable, disable, rebuild), the
-//! spatial index in dataset listings and statistics, its metrics, `serve --geo` and
-//! `sparkles geo-index`.
+//! map endpoints `GET /{ds}/geo` (indexed geometries in a box) and `POST /$/geo/convert`
+//! (literals as GeoJSON), the spatial index in dataset listings and statistics, its
+//! metrics, `serve --geo` and `sparkles geo-index`.
 //!
-//! Authorization (the route table in `auth/routes.rs`): `GET /$/geo/{ds}` needs `read`
-//! on `{ds}`; `PUT`, `DELETE` and `POST …/rebuild` need `admin`.
+//! Authorization (the route table in `auth/routes.rs`): `GET /$/geo/{ds}` and
+//! `GET /{ds}/geo` need `read` on `{ds}`; `PUT`, `DELETE` and `POST …/rebuild` need
+//! `admin`; `POST /$/geo/convert` reads no dataset and is open to any caller.
 
-use crate::http::{AdminBody, ApiError, ApiResult, blocking, dataset, err, task_start_check};
+use crate::http::{
+    AdminBody, ApiError, ApiResult, QueryBody, blocking, dataset, err, task_start_check,
+};
 use crate::state::{AppState, Dataset};
 use anyhow::{Context, Result, bail};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,6 +31,8 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/$/geo/{ds}", get(status).put(enable).delete(disable))
         .route("/$/geo/{ds}/rebuild", post(rebuild))
+        .route("/$/geo/convert", post(convert))
+        .route("/{ds}/geo", get(features))
 }
 
 fn not_built() -> ApiError {
@@ -136,6 +142,125 @@ async fn rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
     start_build(&st, &name, ds, "rebuilding the spatial index", |ds| {
         ds.store.rebuild_geo()
     })
+}
+
+/// `GET /{ds}/geo?bbox=minLon,minLat,maxLon,maxLat&graph=&predicate=&limit=&tolerance=`:
+/// the indexed geometries meeting a CRS84 box as a GeoJSON `FeatureCollection`.
+async fn features(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
+    if !cfg!(feature = "geo") {
+        return Err(not_built());
+    }
+    let ds = dataset(&st, &name)?;
+    #[cfg(feature = "geo")]
+    {
+        let q = box_query(&uri)?;
+        let fc = blocking(move || {
+            Ok(sparkles::geo::map::features_in_box(
+                &ds.store.snapshot(),
+                &q,
+            )?)
+        })
+        .await?;
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/geo+json")],
+            Json(fc),
+        )
+            .into_response())
+    }
+    #[cfg(not(feature = "geo"))]
+    {
+        let _ = (ds, uri);
+        Err(not_built())
+    }
+}
+
+/// The parameters of `GET /{ds}/geo` (`400` naming the bad one).
+#[cfg(feature = "geo")]
+fn box_query(uri: &Uri) -> ApiResult<sparkles::geo::map::BoxQuery> {
+    use sparkles::geo::map::{BoxQuery, DEFAULT_LIMIT, MAX_LIMIT};
+    let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+    let params: Vec<(String, String)> = uri
+        .query()
+        .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    let get = |k: &str| params.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+    let raw =
+        get("bbox").ok_or_else(|| bad("bbox: required (minLon,minLat,maxLon,maxLat)".into()))?;
+    let v: Vec<f64> = raw
+        .split(',')
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| bad(format!("bbox: {raw:?} is not four numbers")))?;
+    let [min_lon, min_lat, max_lon, max_lat] = v[..] else {
+        return Err(bad(format!("bbox: {raw:?} is not four numbers")));
+    };
+    if !(v.iter().all(|x| x.is_finite())
+        && min_lon <= max_lon
+        && min_lat <= max_lat
+        && (-90.0..=90.0).contains(&min_lat)
+        && (-90.0..=90.0).contains(&max_lat))
+    {
+        return Err(bad(format!(
+            "bbox: {raw:?} is not a box of longitudes and latitudes (min before max)"
+        )));
+    }
+    let limit = match get("limit") {
+        None => DEFAULT_LIMIT,
+        Some(l) => match l.parse::<usize>() {
+            Ok(n) if (1..=MAX_LIMIT).contains(&n) => n,
+            _ => return Err(bad(format!("limit: between 1 and {MAX_LIMIT}"))),
+        },
+    };
+    let tolerance = match get("tolerance") {
+        None => None,
+        Some(t) => match t.parse::<f64>() {
+            Ok(x) if x.is_finite() && x >= 0.0 => Some(x),
+            _ => return Err(bad("tolerance: a number of degrees, at least 0".into())),
+        },
+    };
+    Ok(BoxQuery {
+        bbox: [min_lon, min_lat, max_lon, max_lat],
+        graph: get("graph").map(str::to_string),
+        predicate: get("predicate").map(str::to_string),
+        limit,
+        tolerance,
+    })
+}
+
+/// `POST /$/geo/convert` `{"literals": [{"value", "datatype"}]}`: each literal as a
+/// CRS84 GeoJSON geometry, or the reason it has none, in order:
+/// `{"results": [{"geometry": {…}} | {"error": "…"}]}`.
+async fn convert(QueryBody(body): QueryBody) -> ApiResult<Json<J>> {
+    if !cfg!(feature = "geo") {
+        return Err(not_built());
+    }
+    #[cfg(feature = "geo")]
+    {
+        use sparkles::geo::convert::{ConvertItem, MAX_ITEMS};
+        #[derive(serde::Deserialize)]
+        struct Req {
+            literals: Vec<ConvertItem>,
+        }
+        let req: Req = serde_json::from_slice(&body).map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("expected {{\"literals\": [{{\"value\", \"datatype\"}}]}}: {e}"),
+            )
+        })?;
+        if req.literals.len() > MAX_ITEMS {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("literals: at most {MAX_ITEMS} per request"),
+            ));
+        }
+        let results = blocking(move || Ok(sparkles::geo::convert::convert(&req.literals)?)).await?;
+        Ok(Json(json!({ "results": results })))
+    }
+    #[cfg(not(feature = "geo"))]
+    {
+        let _ = body;
+        Err(not_built())
+    }
 }
 
 /// Start a build task (`409` while one runs for the dataset).
@@ -384,6 +509,7 @@ pub struct IndexArgs {
     pub feature_link: Vec<String>,
     pub exclude_graph: Vec<String>,
     pub distance: Option<String>,
+    pub wgs84: bool,
     pub rebuild: bool,
     pub status: bool,
     pub disable: bool,
@@ -418,7 +544,8 @@ pub fn geo_index(loc: &std::path::Path, opts: StoreOptions, a: IndexArgs) -> Res
     let configured = !a.predicate.is_empty()
         || !a.feature_link.is_empty()
         || !a.exclude_graph.is_empty()
-        || a.distance.is_some();
+        || a.distance.is_some()
+        || a.wgs84;
     let s = match current {
         Some(_) if !configured && a.rebuild => store.rebuild_geo()?,
         Some(s) if !configured => s,
@@ -432,6 +559,9 @@ pub fn geo_index(loc: &std::path::Path, opts: StoreOptions, a: IndexArgs) -> Res
             }
             if !a.exclude_graph.is_empty() {
                 cfg.graphs.exclude = a.exclude_graph;
+            }
+            if a.wgs84 {
+                cfg.wgs84 = true;
             }
             if let Some(d) = a.distance {
                 cfg.distance = serde_json::from_value(J::String(d.clone()))

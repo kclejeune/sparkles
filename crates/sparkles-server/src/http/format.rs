@@ -15,7 +15,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use serde_json::{Value as J, json};
 use sparkles_fmt::options::{self, OptionError, Value};
-use sparkles_fmt::{Detection, FormatError, Language, Options};
+use sparkles_fmt::{Detection, FormatError, Language, Options, byte_to_utf16, utf16_to_byte};
 use std::sync::Arc;
 
 /// `true` or `false`: whether a raw body's formatted text differs from it.
@@ -403,48 +403,4 @@ fn sha256_hex(text: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// The byte offset of a UTF-16 offset (inside a surrogate pair: the next character);
-/// `None` past the end.
-fn utf16_to_byte(text: &str, units: u64) -> Option<usize> {
-    let mut at = 0u64;
-    for (i, c) in text.char_indices() {
-        if at >= units {
-            return Some(i);
-        }
-        at += c.len_utf16() as u64;
-    }
-    (at >= units).then_some(text.len())
-}
-
-/// The UTF-16 offset of a byte offset.
-fn byte_to_utf16(text: &str, byte: usize) -> usize {
-    let mut b = byte.min(text.len());
-    while !text.is_char_boundary(b) {
-        b -= 1;
-    }
-    text[..b].encode_utf16().count()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn utf16_offsets() {
-        let t = "a😀b\u{e9}";
-        assert_eq!(utf16_to_byte(t, 0), Some(0));
-        assert_eq!(utf16_to_byte(t, 1), Some(1));
-        // inside the surrogate pair: the next character
-        assert_eq!(utf16_to_byte(t, 2), Some(5));
-        assert_eq!(utf16_to_byte(t, 3), Some(5));
-        assert_eq!(utf16_to_byte(t, 4), Some(6));
-        assert_eq!(utf16_to_byte(t, 5), Some(t.len()));
-        assert_eq!(utf16_to_byte(t, 6), None);
-        for (bytes, units) in [(0, 0), (1, 1), (5, 3), (6, 4), (t.len(), 5)] {
-            assert_eq!(byte_to_utf16(t, bytes), units);
-        }
-        assert_eq!(utf16_to_byte("", 0), Some(0));
-    }
 }

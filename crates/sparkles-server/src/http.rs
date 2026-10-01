@@ -2155,6 +2155,8 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
         "readOnly": st.read_only,
         "datasets": visible_datasets(&st, &p),
         "auth": crate::auth::server_json(&st),
+        // the UI's pages name its origins in their CSP anyway
+        "mapStyleUrl": st.map_style_url,
     });
     if !p.is_anonymous() {
         doc["version"] = env!("CARGO_PKG_VERSION").into();
@@ -2752,14 +2754,35 @@ async fn reason(
     }
     let ds = dataset(&st, &name)?;
     let query = Params::from_query(&uri);
-    let (profile_name, rules, rerun) =
+    let (profile_name, rules, rerun, vocabularies, geo_default_geometry) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let vocabularies = match &v["vocabularies"] {
+                J::Null => Vec::new(),
+                J::Array(a) => a
+                    .iter()
+                    .map(|x| x.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        err(
+                            StatusCode::BAD_REQUEST,
+                            "vocabularies must be an array of names",
+                        )
+                    })?,
+                _ => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "vocabularies must be an array of names",
+                    ));
+                }
+            };
             (
                 v["profile"].as_str().unwrap_or("rdfs").to_string(),
                 v["rules"].as_str().map(str::to_string),
                 v["rerun"].as_bool().unwrap_or(false),
+                vocabularies,
+                v["geoDefaultGeometry"].as_bool().unwrap_or(false),
             )
         } else {
             let mut p = Params::default();
@@ -2768,17 +2791,36 @@ async fn reason(
                 p.get("profile").unwrap_or("rdfs").to_string(),
                 p.get("rules").map(str::to_string),
                 p.get("rerun").is_some_and(truthy),
+                p.all("vocabulary"),
+                p.get("geoDefaultGeometry").is_some_and(truthy),
             )
         };
-    let profile: sparkles_reasoner::Profile = if rerun || query.get("rerun").is_some_and(truthy) {
-        // the recorded profile, including its custom rules
+    let rerun = rerun || query.get("rerun").is_some_and(truthy);
+    let recorded = if rerun {
+        // the recorded profile, including its custom rules and extras
         let info = ds
             .reasoning
             .read()
             .clone()
             .ok_or_else(|| err(StatusCode::CONFLICT, "no recorded reasoning to re-run"))?;
-        crate::reasoning::recorded_profile(&info)
-            .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
+        let conflict = |e: anyhow::Error| err(StatusCode::CONFLICT, format!("{e:#}"));
+        Some((
+            crate::reasoning::recorded_profile(&info).map_err(conflict)?,
+            crate::reasoning::recorded_extras(&info).map_err(conflict)?,
+        ))
+    } else {
+        None
+    };
+    let extras = match &recorded {
+        Some((_, e)) => e.clone(),
+        None => sparkles_reasoner::Extras::parse(&vocabularies, geo_default_geometry)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
+    };
+    extras
+        .validate()
+        .map_err(|e| err(StatusCode::NOT_IMPLEMENTED, format!("{e:#}")))?;
+    let profile: sparkles_reasoner::Profile = if let Some((p, _)) = recorded {
+        p
     } else if profile_name == "rules" {
         sparkles_reasoner::Profile::Rules(rules.unwrap_or_default())
     } else {
@@ -2790,7 +2832,7 @@ async fn reason(
         })?
     };
     task_start_check(&st, None, &name)?;
-    let task = crate::reasoning::start_reason(&st, ds, profile, false);
+    let task = crate::reasoning::start_reason(&st, ds, profile, extras, false);
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 

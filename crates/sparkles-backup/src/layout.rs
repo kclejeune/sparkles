@@ -117,7 +117,7 @@ pub fn valid_blob_id(s: &str) -> bool {
 }
 
 /// Files at the database root that a backup may hold.
-pub const ROOT_FILES: [&str; 10] = [
+pub const ROOT_FILES: [&str; 12] = [
     "CURRENT",
     "dataset.json",
     "commits.bin",
@@ -128,6 +128,8 @@ pub const ROOT_FILES: [&str; 10] = [
     "origin.json",
     "validation.json",
     "validation-shapes.ttl",
+    "validation-schema.shex",
+    "validation-schema.json",
 ];
 
 /// A manifest file path: one of [`ROOT_FILES`], or `gen-NNNN/<file>` with 4 to 8 digits
@@ -311,6 +313,8 @@ mod tests {
             "CURRENT",
             "commits.bin",
             "validation-shapes.ttl",
+            "validation-schema.shex",
+            "validation-schema.json",
             "gen-0001/spo.dat",
             "gen-12345678/wal.log",
             "gen-0001/.hidden",

@@ -1,4 +1,4 @@
-//! Write-time SHACL validation: `/$/validation/{ds}`, per-write options, the
+//! Write-time validation (SHACL or ShEx): `/$/validation/{ds}`, per-write options, the
 //! `Sparkles-Validation` header and 422 rejections.
 
 use super::*;
@@ -75,16 +75,85 @@ pub(super) fn rejection(r: &sparkles::guard::Rejection) -> ApiError {
     ApiError(StatusCode::UNPROCESSABLE_ENTITY, body)
 }
 
-#[cfg(feature = "shacl")]
+#[cfg(any(feature = "shacl", feature = "shex"))]
 mod handlers {
     use super::*;
-    use sparkles_shacl::guard::{self, SetOutcome, ValidationConfig};
+    use crate::write_validation::{Validation, none_json};
+    use sparkles::guard::GuardLanguage;
 
     fn status_json(ds: &Dataset) -> J {
         match ds.validation.read().as_ref() {
-            Some(g) => json!({ "config": g.config(), "status": g.status() }),
-            None => json!({ "config": null }),
+            Some(g) => g.json(),
+            None => none_json(),
         }
+    }
+
+    /// The outcome of setting a configuration, in either language.
+    enum Outcome {
+        Installed(Validation),
+        NotConforming(sparkles::guard::ValidationSummary),
+        Removed,
+    }
+
+    /// The language a `PUT` body asks for: `language`, or SHACL without one.
+    fn language_of(j: &J) -> ApiResult<GuardLanguage> {
+        match j.get("language") {
+            None | Some(J::Null) => Ok(GuardLanguage::Shacl),
+            Some(l) => serde_json::from_value(l.clone()).map_err(|_| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid configuration: unknown language {l} (\"shacl\" or \"shex\")"),
+                )
+            }),
+        }
+    }
+
+    fn invalid(e: serde_json::Error) -> ApiError {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid configuration: {e}"),
+        )
+    }
+
+    /// Set a SHACL configuration (`format` 1 unless the body says otherwise).
+    #[cfg(feature = "shacl")]
+    fn set_shacl(ds: &Dataset, mut j: J) -> ApiResult<Outcome> {
+        use sparkles_shacl::guard::{self, SetOutcome, ValidationConfig};
+        if let Some(o) = j.as_object_mut() {
+            o.entry("format").or_insert(json!(1));
+        }
+        let cfg: ValidationConfig = serde_json::from_value(j).map_err(invalid)?;
+        Ok(
+            match guard::set_config(&ds.store, Some(cfg)).map_err(config_error)? {
+                SetOutcome::Installed(g, _) => Outcome::Installed(Validation::Shacl(g)),
+                SetOutcome::NotConforming(s) => Outcome::NotConforming(s),
+                SetOutcome::Removed => Outcome::Removed,
+            },
+        )
+    }
+
+    /// Set a ShEx configuration (format 2). The schema's imports resolve as for
+    /// `/{ds}/shex`: `file:` IRIs under `--load-dir`, http(s) through the outbound policy.
+    #[cfg(feature = "shex")]
+    fn set_shex(st: &AppState, ds: &Dataset, mut j: J) -> ApiResult<Outcome> {
+        use sparkles_shex::guard::{self, SetOutcome, ShexValidationConfig};
+        if let Some(o) = j.as_object_mut() {
+            o.entry("format").or_insert(json!(guard::CONFIG_FORMAT));
+        }
+        let cfg: ShexValidationConfig = serde_json::from_value(j).map_err(invalid)?;
+        let budget = sparkles::outbound::RequestBudget::new(&st.outbound);
+        let resolver = sparkles_shex::FileResolver {
+            files: st.file_loads.clone(),
+            outbound: Some((st.outbound.clone(), budget)),
+            ..Default::default()
+        };
+        Ok(
+            match guard::set_config(&ds.store, Some(cfg), &resolver).map_err(config_error)? {
+                SetOutcome::Installed(g, _) => Outcome::Installed(Validation::Shex(g)),
+                SetOutcome::NotConforming(s) => Outcome::NotConforming(s),
+                SetOutcome::Removed => Outcome::Removed,
+            },
+        )
     }
 
     pub(in crate::http) async fn get(
@@ -107,30 +176,37 @@ mod handlers {
         let mut j: J = serde_json::from_slice(&body)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
         if let Some(o) = j.as_object_mut() {
-            o.entry("format").or_insert(json!(1));
             o.remove("updated");
         }
-        let cfg: ValidationConfig = serde_json::from_value(j).map_err(|e| {
-            err(
-                StatusCode::BAD_REQUEST,
-                format!("invalid configuration: {e}"),
-            )
-        })?;
+        let language = language_of(&j)?;
         blocking(move || {
-            let outcome = guard::set_config(&ds.store, Some(cfg)).map_err(config_error)?;
+            let outcome = match language {
+                #[cfg(feature = "shacl")]
+                GuardLanguage::Shacl => set_shacl(&ds, j)?,
+                #[cfg(feature = "shex")]
+                GuardLanguage::Shex => set_shex(&st, &ds, j)?,
+                #[allow(unreachable_patterns)]
+                l => {
+                    let _ = (&st, j);
+                    return Err(err(
+                        StatusCode::NOT_IMPLEMENTED,
+                        format!("built without the `{}` feature", l.name()),
+                    ));
+                }
+            };
             match outcome {
-                SetOutcome::Installed(g, _) => {
+                Outcome::Installed(g) => {
                     *ds.validation.write() = Some(g);
                     Ok(Json(status_json(&ds)).into_response())
                 }
-                SetOutcome::NotConforming(s) => Err(ApiError(
+                Outcome::NotConforming(s) => Err(ApiError(
                     StatusCode::CONFLICT,
                     json!({
                         "error": "dataset does not conform; fix the data or use mode 'warn' first",
                         "validation": s,
                     }),
                 )),
-                SetOutcome::Removed => {
+                Outcome::Removed => {
                     *ds.validation.write() = None;
                     Ok(Json(status_json(&ds)).into_response())
                 }
@@ -145,7 +221,12 @@ mod handlers {
         }
         let ds = dataset(&st, &name)?;
         blocking(move || {
-            guard::set_config(&ds.store, None).map_err(config_error)?;
+            // either language's removal takes every validation file away
+            #[cfg(feature = "shacl")]
+            sparkles_shacl::guard::set_config(&ds.store, None).map_err(config_error)?;
+            #[cfg(all(feature = "shex", not(feature = "shacl")))]
+            sparkles_shex::guard::set_config(&ds.store, None, &sparkles_shex::NoImports)
+                .map_err(config_error)?;
             *ds.validation.write() = None;
             Ok(StatusCode::NO_CONTENT.into_response())
         })
@@ -162,19 +243,19 @@ mod handlers {
     }
 }
 
-#[cfg(feature = "shacl")]
+#[cfg(any(feature = "shacl", feature = "shex"))]
 pub(super) use handlers::{
     delete as delete_validation, get as get_validation, put as put_validation,
 };
 
-#[cfg(not(feature = "shacl"))]
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
 pub(super) async fn get_validation() -> ApiResult {
     Err(err(
         StatusCode::NOT_IMPLEMENTED,
-        "built without the `shacl` feature",
+        "built without the `shacl` and `shex` features",
     ))
 }
-#[cfg(not(feature = "shacl"))]
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
 pub(super) use get_validation as put_validation;
-#[cfg(not(feature = "shacl"))]
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
 pub(super) use get_validation as delete_validation;

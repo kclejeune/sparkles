@@ -16,20 +16,16 @@ use super::column::{Column, ColumnEntry, Counts, Slot};
 use super::config::{
     FORMAT_VERSION, GeoBuild, GeoConfig, GeoMemory, GeoRows, GeoSkipped, GeoStatus, IndexState,
 };
+use super::tree::PackedTree;
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{Key, Perm};
 use crate::store::Snapshot;
 use crate::text::PredicateSet;
-use geo_index::rtree::sort::HilbertSort;
-use geo_index::rtree::{RTree, RTreeBuilder, RTreeIndex};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-
-/// Entries per tree node.
-pub(crate) const NODE_SIZE: u16 = 16;
 
 /// An indexed quad (raw ids).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,23 +60,8 @@ pub(crate) struct TailRow {
     pub entry: Arc<ColumnEntry>,
 }
 
-/// Pack boxes into a Hilbert-sorted R-tree (`None` without boxes); the tree's item `i`
-/// is the `i`-th box.
-pub(crate) fn pack(boxes: impl ExactSizeIterator<Item = [f32; 4]>) -> Option<RTree<f32>> {
-    let n = boxes.len();
-    if n == 0 {
-        return None;
-    }
-    let mut b = RTreeBuilder::<f32>::new_with_node_size(n as u32, NODE_SIZE);
-    for x in boxes {
-        b.add(x[0], x[1], x[2], x[3]);
-    }
-    Some(b.finish::<HilbertSort>())
-}
-
-fn tree_bytes(t: &Option<RTree<f32>>) -> u64 {
-    t.as_ref()
-        .map_or(0, |t| t.metadata().data_buffer_length() as u64)
+fn tree_bytes(t: &Option<PackedTree>) -> u64 {
+    t.as_ref().map_or(0, PackedTree::bytes)
 }
 
 /// Whether the `f32` box `b` intersects the CRS84 window `w`.
@@ -95,37 +76,6 @@ pub(crate) fn intersects(b: &[f32; 4], w: &[f64; 4]) -> bool {
 /// The window as tree coordinates, rounded outward (so no box touching it is missed).
 pub(crate) fn window_f32(w: &[f64; 4]) -> [f32; 4] {
     super::column::round_out(*w)
-}
-
-/// Estimated rows of `tree` whose box intersects one of `windows`: the subtree sizes of
-/// the intersecting nodes of the highest level with at least 256 nodes (an upper bound
-/// within one node per window boundary).
-fn tree_estimate(tree: &RTree<f32>, windows: &[[f64; 4]]) -> f64 {
-    let n = tree.num_items() as usize;
-    let ws: Vec<[f32; 4]> = windows.iter().map(window_f32).collect();
-    let levels = tree.num_levels();
-    let mut level = 0;
-    for l in (0..levels).rev() {
-        if tree.boxes_at_level(l).map_or(0, |b| b.len() / 4) >= 256 {
-            level = l;
-            break;
-        }
-    }
-    let Ok(boxes) = tree.boxes_at_level(level) else {
-        return n as f64;
-    };
-    let span = (NODE_SIZE as usize).saturating_pow(level as u32);
-    let mut total = 0usize;
-    for (j, b) in boxes.as_chunks::<4>().0.iter().enumerate() {
-        let hit = ws
-            .iter()
-            .any(|w| b[0] <= w[2] && b[2] >= w[0] && b[1] <= w[3] && b[3] >= w[1]);
-        if hit {
-            let lo = j.saturating_mul(span);
-            total += j.saturating_add(1).saturating_mul(span).min(n) - lo.min(n);
-        }
-    }
-    total as f64
 }
 
 /// Predicate and graph decisions of one generation and configuration, cached by id: the
@@ -239,7 +189,7 @@ pub(crate) struct GeoBase {
     /// base rows whose literal was skipped but may still match (see
     /// [`Slot::rechecked`]): candidates of every search
     pub skipped: Vec<Row>,
-    pub tree: Option<RTree<f32>>,
+    pub tree: Option<PackedTree>,
     pub column: Column,
     /// base rows per predicate slot
     pub slot_rows: Vec<u64>,
@@ -388,7 +338,7 @@ pub(crate) fn build_base(
     if (ctl.cancel)() {
         return Err(Error::Cancelled);
     }
-    base.tree = pack(boxes.into_iter());
+    base.tree = PackedTree::pack(boxes.into_iter());
     base.rows = rows;
     base.rows.shrink_to_fit();
     base.skipped = skipped;
@@ -405,7 +355,7 @@ pub(crate) fn build_base(
 /// Rows inserted by commits, in a packed tree.
 pub(crate) struct Overlay {
     pub rows: Vec<TailRow>,
-    pub tree: Option<RTree<f32>>,
+    pub tree: Option<PackedTree>,
     /// inserted rows whose literal was skipped but may still match
     /// ([`Slot::rechecked`])
     pub skipped: Vec<Row>,
@@ -433,7 +383,7 @@ impl Overlay {
     fn tree(mut rows: Vec<TailRow>) -> Overlay {
         rows.sort_unstable_by_key(|r| r.row);
         rows.dedup_by_key(|r| r.row);
-        let tree = pack(
+        let tree = PackedTree::pack(
             rows.iter()
                 .map(|r| r.entry.bbox())
                 .collect::<Vec<_>>()
@@ -629,13 +579,9 @@ impl GeoView {
                 .sum();
             mine as f64 / all as f64
         };
-        let mut est = base
-            .tree
-            .as_ref()
-            .map_or(0.0, |t| tree_estimate(t, windows))
-            * frac;
+        let mut est = base.tree.as_ref().map_or(0.0, |t| t.estimate(windows)) * frac;
         if let Some(t) = &self.overlay.tree {
-            est += tree_estimate(t, windows) * frac;
+            est += t.estimate(windows) * frac;
         }
         est + self
             .tail
@@ -837,17 +783,17 @@ mod tests {
                 boxes.push([x, y, x + 0.5, y + 0.5]);
             }
         }
-        let tree = pack(boxes.clone().into_iter()).unwrap();
+        let tree = PackedTree::pack(boxes.clone().into_iter()).unwrap();
         let w = [10.0, 10.0, 19.9, 19.9];
         let exact = boxes.iter().filter(|b| intersects(b, &w)).count() as f64;
         assert_eq!(exact, 100.0);
-        let est = tree_estimate(&tree, &[w]);
+        let est = tree.estimate(&[w]);
         assert!(est >= exact && est <= 10_000.0 / 4.0, "{est}");
-        assert_eq!(tree_estimate(&tree, &[[500.0, 500.0, 600.0, 600.0]]), 0.0);
-        let world = tree_estimate(&tree, &[[-1000.0, -1000.0, 1000.0, 1000.0]]);
+        assert_eq!(tree.estimate(&[[500.0, 500.0, 600.0, 600.0]]), 0.0);
+        let world = tree.estimate(&[[-1000.0, -1000.0, 1000.0, 1000.0]]);
         assert_eq!(world, 10_000.0);
         assert!(
-            pack(
+            PackedTree::pack(
                 std::iter::empty::<[f32; 4]>()
                     .collect::<Vec<_>>()
                     .into_iter()

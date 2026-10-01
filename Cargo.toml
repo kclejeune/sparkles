@@ -69,6 +69,14 @@ ignore = "0.4"
 similar = "2"
 proptest = "1"
 toml = "1"
+# the formatter's JSON-LD reader and check, and its tests' JSON-LD datasets
+json-event-parser = "0.2"
+oxjsonld = { version = "0.2", features = ["rdf-12"] }
+# `sparkles lsp`: the language server scaffold and protocol types of rust-analyzer
+lsp-server = "0.10"
+lsp-types = "0.97"
+# the formatter built for the browser (crates/sparkles-fmt-wasm)
+wasm-bindgen = "0.2"
 # GeoSPARQL (feature `geo` of crates/sparkles); the `geo` crate is renamed so it does not
 # clash with the `sparkles::geo` module
 georust = { package = "geo", version = "0.33", default-features = false }

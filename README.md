@@ -343,6 +343,30 @@ result cache, and the web UI.
 * **Selective column decoding.** The block cache holds decoded columns. Scans decode
   only the key columns they read (variables, graph, repeated variables), which also
   leaves room for more of the cache.
+* **Decorrelated EXISTS.** `FILTER EXISTS { P }` / `FILTER NOT EXISTS { P }`, where `P`
+  is made of triple patterns, paths without `*` or `?`, `GRAPH` and deterministic
+  FILTERs, evaluates `P` once and keeps the distinct values of the variables the outer
+  rows bind. Each outer row then probes that set instead of evaluating the substituted
+  pattern. A row that leaves some of them unbound (after OPTIONAL) probes the set of
+  its bound ones. A row that binds a variable only a FILTER inside `P` uses is still
+  evaluated by substitution. The key set is built once per query, only when `P` costs
+  less than evaluating it per distinct outer key, and the EXISTS stays per row when
+  the set does not fit in the memory budget (`[EXISTS decorrelated on ?y: …]` in
+  EXPLAIN, or the reason it was not, with `exists*` counters).
+* **Batched index joins.** When the input of a join always binds a variable that a
+  triple pattern can be read sorted on, and has few distinct values of it for the
+  pattern's size, the pattern is read only for those values (`IndexJoin` in EXPLAIN).
+  The distinct keys, sorted, become key ranges, and ranges whose blocks are adjacent are
+  read by one scan: scattered keys cost a seek per region, dense keys one sweep. Each
+  input row then joins its key's rows, so the input's order and duplicates are kept.
+  The planner offers it next to the merge and hash joins when probing (seeks, touched
+  blocks, rows) is estimated at under half the cost of scanning the pattern. EXPLAIN
+  counts the keys, seeks, blocks and rows read (`batched_join`).
+* **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
+  ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It either
+  walks each subject's SPO run once, picking out the star's predicates, or probes each
+  pattern's own permutation, whichever touches fewer blocks, and forms the output once
+  instead of through the chain's intermediate tables (`star_fusion`).
 * Every one of these can be switched off per query (`QueryOptions::optimizations`) or
   per process (`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`), and EXPLAIN shows
   which one ran.
@@ -624,6 +648,8 @@ sparkles fmt --stdin-filepath queries/q.rq < q.rq   # stdin named for detection,
 - **Messages.** Errors read `path:LINE:COL: error: …` (1-based lines and columns, in
   characters); a refused output reads `path: error: formatter refused its own output
   (algebra differs); input left unchanged; please report`.
+- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`;
+  sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix); a larger file is an error.
 
 Backup repositories (see [docs/API.md](docs/API.md#backup-repositories)) work offline
 too, on a stopped database; a server's own datasets are backed up through its HTTP API or
@@ -842,7 +868,7 @@ mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
-mise run licenses     # regenerate THIRD_PARTY_LICENSES.md after a Cargo.lock change (licenses:check)
+mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
 ```
 
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) holds the license and NOTICE files of
@@ -850,6 +876,23 @@ every crate the binary links (on Linux and macOS), each text once; crates that s
 license file get their license's standard text. `scripts/third-party-licenses.py`
 generates it from `cargo metadata`, so it only changes with `Cargo.lock`; ship it with
 binaries (the Nix packages install it as `share/doc/sparkles/THIRD_PARTY_LICENSES.md`).
+
+[`THIRD_PARTY_LICENSES-UI.md`](THIRD_PARTY_LICENSES-UI.md) does the same for the npm
+packages whose code or fonts end up in the embedded web UI (CodeMirror, Cytoscape, the
+Svelte and SvelteKit runtime, Vite's and Rolldown's runtime helpers, the Fontsource fonts and
+their dependencies), whether dependencies or devDependencies; build tools that ship nothing
+are left out. A Vite plugin
+(`ui/scripts/licenses.js`) takes them from the bundle's module graph and the source files
+of its assets, reads their license files from `node_modules`, and writes the notices into
+the build as `licenses.txt`, which the server serves at `/ui/licenses.txt` (the `sparkles`
+Nix package also installs it as `share/doc/sparkles/THIRD_PARTY_LICENSES-UI.md`). The UI
+build fails when a shipped package's license allows none of MIT, MIT-0, ISC, 0BSD,
+BSD-2-Clause, BSD-3-Clause, Apache-2.0, Zlib, Unlicense, CC0-1.0, BlueOak-1.0.0 or
+OFL-1.1 (the fonts' license). The UI notices are a separate file because they change with
+`ui/pnpm-lock.yaml` and need the UI build, and `sparkles-cli` ships without the UI.
+`mise run licenses` builds the UI and copies the file; `mise run licenses:check` (part of
+`mise run ci`) fails when either file is out of date, and so does the flake check
+`ui-licenses`.
 
 Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with
 [prek](https://github.com/j178/prek) (plain `pre-commit` reads the same file). On staged files
@@ -879,7 +922,8 @@ provides:
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
-  * `checks`: the packages; on Linux also a NixOS VM test of the module behind nginx and
+  * `checks`: the packages, `ui-licenses` (`THIRD_PARTY_LICENSES-UI.md` matches the UI
+    build); on Linux also a NixOS VM test of the module behind nginx and
     `ui-e2e`, the Playwright UI tests against the release binary in nixpkgs' headless
     Chromium (in the build sandbox, on 127.0.0.1);
   * `nixosModules.default`.

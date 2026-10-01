@@ -47,9 +47,14 @@ rustPlatform.buildRustPackage {
   ];
 
   # the licenses and notices of the linked crates (Apache-2.0 asks for NOTICE files to
-  # travel with the binary); `mise run licenses` regenerates the file
+  # travel with the binary), and of the npm packages in the embedded UI (written by the UI
+  # build; the check `ui-licenses` compares them with THIRD_PARTY_LICENSES-UI.md);
+  # `mise run licenses` regenerates both files
   postInstall = ''
     install -Dm644 THIRD_PARTY_LICENSES.md $out/share/doc/sparkles/THIRD_PARTY_LICENSES.md
+  ''
+  + lib.optionalString (ui != null) ''
+    install -Dm644 ${ui}/licenses.txt $out/share/doc/sparkles/THIRD_PARTY_LICENSES-UI.md
   '';
 
   meta = {

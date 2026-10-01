@@ -302,7 +302,9 @@ impl Store {
 impl Store {
     /// Make a new index current (retiring the previous one) and publish the current
     /// snapshot with a `building` view; returns the index and that snapshot.
-    fn install_geo(&self, cfg: GeoConfig, epoch: u64) -> (Arc<GeoIndex>, Arc<Snapshot>) {
+    fn install_geo(&self, mut cfg: GeoConfig, epoch: u64) -> (Arc<GeoIndex>, Arc<Snapshot>) {
+        // the server can switch query rewrite off whatever `geo.json` says
+        cfg.query_rewrite &= self.opts.geo_query_rewrite;
         let _w = self.writer.lock();
         let idx = Arc::new(GeoIndex::new(cfg, epoch, self.opts.geo_budget_bytes));
         #[cfg(any(test, feature = "failpoints"))]

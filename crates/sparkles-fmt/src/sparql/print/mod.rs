@@ -539,6 +539,15 @@ pub fn node(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             K::Exists => expr::exists(cx, n),
             K::NotExists => expr::not_exists(cx, n),
             K::Opaque => cx.verbatim(n),
+            // never in a SPARQL tree
+            K::TurtleDoc
+            | K::TrigDoc
+            | K::GraphBlock
+            | K::JsonDocument
+            | K::JsonObject
+            | K::JsonMember
+            | K::JsonArray
+            | K::JsonScalar => cx.verbatim(n),
         }
     };
     crate::trivia::wrap(&mut cx.arena, cx.comments, n, doc)
