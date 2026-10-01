@@ -4,7 +4,11 @@
 //! two are interchangeable: `{ text, language?, cursorOffset?, options? }` in (the cursor
 //! in UTF-16 code units, the options in camelCase), and out either
 //! `{ text, changed, language, cursorOffset, warnings }` or an error object with the
-//! endpoint's `status`, `error`, `code` and, for syntax errors, `line` and `column`.
+//! endpoint's `status`, `error`, `code` and, for syntax errors, `line`, `column`,
+//! `language` and (when `error` holds only the head of the parser's message) `detail`.
+//!
+//! `mise run ui:wasm` builds it into the UI (`scripts/build-fmt-wasm.sh`). The module has
+//! no deadline (`std` reads no clock on this target): the UI formats an editor's text.
 
 use serde_json::{Map, Value as J, json};
 use sparkles_fmt::options::{self, Value};
@@ -124,12 +128,8 @@ fn set_options(v: &J, o: &mut Options) -> Result<(), J> {
                         Some(name),
                     )
                 })?,
-            J::Object(_) => {
-                return Err(bad_request(
-                    &format!("{name}: unexpected object"),
-                    Some(name),
-                ));
-            }
+            // refused by `options::set`, in the endpoint's words
+            J::Object(_) => Value::Str(v.to_string()),
         };
         options::set(o, key, value)
             .map_err(|e| bad_request(&format!("{name}: {}", e.message), Some(name)))?;
@@ -146,10 +146,12 @@ fn format_error(e: &FormatError, lang: Language) -> J {
             column,
             ..
         } => {
+            // the head of the parser's message; the whole of it in `detail`
+            let short = short_message(message);
             let mut j = error(
                 400,
                 &format!(
-                    "{} syntax error at line {line}, column {column}: {message}",
+                    "{} syntax error at line {line}, column {column}: {short}",
                     lang.display_name()
                 ),
                 Some("syntax"),
@@ -157,6 +159,9 @@ fn format_error(e: &FormatError, lang: Language) -> J {
             j["line"] = json!(line);
             j["column"] = json!(column);
             j["language"] = json!(lang.name());
+            if short != message.trim() {
+                j["detail"] = json!(message);
+            }
             j
         }
         FormatError::UnsupportedLanguage { message, .. } => error(415, message, None),
@@ -165,6 +170,26 @@ fn format_error(e: &FormatError, lang: Language) -> J {
         FormatError::Unsupported { .. } | FormatError::Unsafe { .. } => {
             error(422, &e.to_string(), Some(e.code()))
         }
+    }
+}
+
+/// A parser message cut to its first line and about 120 characters, at a list separator,
+/// as the endpoint and `sparkles fmt` print it (spargebra lists every token it expected).
+fn short_message(message: &str) -> String {
+    const MAX: usize = 120;
+    let message = message.trim();
+    let first = message.lines().next().unwrap_or("").trim_end();
+    if first.len() == message.len() && first.chars().count() <= MAX {
+        return first.to_string();
+    }
+    let end = first
+        .char_indices()
+        .nth(MAX)
+        .map_or(first.len(), |(i, _)| i);
+    let head = &first[..end];
+    match head.rfind(", ") {
+        Some(i) if i > 0 => format!("{}, …", &head[..i]),
+        _ => format!("{}…", head.trim_end()),
     }
 }
 
@@ -210,13 +235,67 @@ mod tests {
     }
 
     #[test]
+    fn formats_every_language() {
+        for (language, text) in [
+            (
+                "turtle",
+                "@prefix ex: <http://example.org/> . ex:a ex:b ex:c .",
+            ),
+            (
+                "trig",
+                "<http://example.org/g> { <http://example.org/a> <http://example.org/b> 1 }",
+            ),
+            ("ntriples", "<http://a>   <http://b> <http://c>."),
+            ("nquads", "<http://a> <http://b> \"c\"   <http://g>  ."),
+            ("jsonld", r#"{"@id":"http://a","http://b":1}"#),
+        ] {
+            let r = call(json!({ "text": text, "language": language }));
+            assert_eq!(
+                (r["language"].as_str(), r["changed"].as_bool()),
+                (Some(language), Some(true)),
+                "{r}"
+            );
+            let again = call(json!({ "text": r["text"], "language": language }));
+            assert_eq!(again["changed"], false, "{language}: {again}");
+        }
+    }
+
+    #[test]
     fn errors_carry_the_endpoint_status() {
         let r = call(json!({ "text": "select * {", "language": "sparql" }));
         assert_eq!(
             (r["status"].as_u64(), r["code"].as_str()),
             (Some(400), Some("syntax"))
         );
-        assert_eq!(r["line"], 1);
+        assert_eq!(
+            (r["line"].as_u64(), r["column"].as_u64()),
+            (Some(1), Some(11))
+        );
+        assert_eq!(r["language"], "sparql");
+        // the endpoint's words: the head of spargebra's list of expected tokens, all of it
+        // in `detail`
+        let e = r["error"].as_str().unwrap();
+        assert!(
+            e.starts_with("SPARQL syntax error at line 1, column 11: expected") && e.ends_with('…'),
+            "{e}"
+        );
+        assert!(r["detail"].as_str().unwrap().len() > e.len(), "{r}");
+        let r = call(json!({ "text": "<a> <b> .", "language": "turtle" }));
+        assert_eq!(
+            (r["code"].as_str(), r["language"].as_str()),
+            (Some("syntax"), Some("turtle"))
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Turtle syntax error at line 1")
+        );
+        let r = call(json!({ "text": "x", "options": { "lineWidth": {} } }));
+        assert_eq!(
+            (r["code"].as_str(), r["option"].as_str()),
+            (Some("bad-request"), Some("lineWidth"))
+        );
         let r = call(json!({ "text": "x", "language": "sparql", "options": { "lineWidth": 7 } }));
         assert_eq!(r["code"], "bad-request");
         assert_eq!(r["option"], "lineWidth");

@@ -9,3 +9,6 @@ build/
 !.env.example
 vite.config.*.timestamp-*
 *.log
+
+# the formatter for the browser (`mise run ui:wasm`)
+/src/lib/wasm/

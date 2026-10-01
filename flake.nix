@@ -30,7 +30,7 @@
           };
         nixosModules.sparkles = self.nixosModules.default;
 
-        # Adds `sparkles`, `sparkles-cli` and `sparkles-ui` to a package set.
+        # Adds `sparkles`, `sparkles-cli`, `sparkles-ui` and `sparkles-fmt-wasm` to a package set.
         overlays.default =
           final: prev:
           let
@@ -40,9 +40,11 @@
               cargo = toolchain;
               rustc = toolchain;
             };
-            ui = final.callPackage ./nix/ui.nix { };
+            fmtWasm = final.callPackage ./nix/fmt-wasm.nix { inherit rustPlatform; };
+            ui = final.callPackage ./nix/ui.nix { inherit fmtWasm; };
           in
           {
+            sparkles-fmt-wasm = fmtWasm;
             sparkles-ui = ui;
             sparkles = final.callPackage ./nix/package.nix { inherit rustPlatform ui; };
             sparkles-cli = final.callPackage ./nix/package.nix {
@@ -80,8 +82,10 @@
           };
 
           packages = {
+            # the formatter for the browser (WebAssembly), built into the UI
+            sparkles-fmt-wasm = pkgs.callPackage ./nix/fmt-wasm.nix { inherit rustPlatform; };
             # the web UI (static SvelteKit build)
-            sparkles-ui = pkgs.callPackage ./nix/ui.nix { };
+            sparkles-ui = pkgs.callPackage ./nix/ui.nix { fmtWasm = self'.packages.sparkles-fmt-wasm; };
             # `sparkles` binary: CLI + server with the UI embedded
             sparkles = pkgs.callPackage ./nix/package.nix {
               inherit rustPlatform;

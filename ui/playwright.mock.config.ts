@@ -30,7 +30,8 @@ export default defineConfig({
     {
       command: `pnpm exec vite dev --host 127.0.0.1 --port ${uiPort} --strictPort`,
       url: `http://127.0.0.1:${uiPort}/ui/`,
-      env: { SPARKLES_API: `http://127.0.0.1:${mockPort}` },
+      // the mock's stand-in formatter, not the browser formatter of `mise run ui:wasm`
+      env: { SPARKLES_API: `http://127.0.0.1:${mockPort}`, VITE_FMT_WASM: 'off' },
       reuseExistingServer: false,
       timeout: 120_000,
     },

@@ -100,8 +100,9 @@ fn file(path: &str, headers: &HeaderMap) -> Option<Response> {
 
 /// The Content Security Policy of a UI page: everything from the UI's own origin, the
 /// page's inline scripts by their SHA-256 (SvelteKit's start-up script and the theme
-/// script of `app.html`), inline styles (components set `style` attributes), and never
-/// in a frame.
+/// script of `app.html`), WebAssembly compiled from the UI's own modules (the formatter
+/// in the browser; `'wasm-unsafe-eval'` allows nothing of JavaScript's `eval`), inline
+/// styles (components set `style` attributes), and never in a frame.
 pub fn page_csp(html: &[u8]) -> String {
     use base64::Engine as _;
     use sha2::Digest as _;
@@ -113,7 +114,8 @@ pub fn page_csp(html: &[u8]) -> String {
         scripts.push('\'');
     }
     format!(
-        "default-src 'self'; script-src 'self'{scripts}; style-src 'self' 'unsafe-inline'; \
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'{scripts}; \
+         style-src 'self' 'unsafe-inline'; \
          img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; \
          worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; \
          frame-ancestors 'none'"
@@ -189,7 +191,7 @@ mod tests {
         };
         assert!(
             csp.contains(&format!(
-                "script-src 'self' 'sha256-{}' 'sha256-{}';",
+                "script-src 'self' 'wasm-unsafe-eval' 'sha256-{}' 'sha256-{}';",
                 hash("let a = 1;"),
                 hash("\n  go();\n")
             )),
