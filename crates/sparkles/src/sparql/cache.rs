@@ -277,6 +277,14 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
             range.filter.iter().all(deterministic)
         }
+        Kind::OrderedTopK(t) => {
+            let _ = write!(
+                s,
+                "{:?}{:?}{:?}{:?}",
+                t.scan.prefix, t.scan.graph, t.scan.eqs, t.pieces
+            );
+            t.filter.iter().chain(&t.range_filter).all(deterministic)
+        }
         Kind::TextSearch(t) => {
             // the view's epoch changes with every rebuild of the index
             let epoch = ctx.snap.text.as_ref().map_or(0, |v| v.epoch);

@@ -2,7 +2,9 @@
 
 use super::ctx::Ctx;
 use super::expr::{Expr, Row, Val, ebv, eval};
-use super::plan::{Agg, GraphFilter, JoinAlgo, Kind, Node, PathEnd, PathSpec, RangeSpec, ScanSpec};
+use super::plan::{
+    Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
+};
 use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
@@ -154,6 +156,19 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             note = column_note(ctx, spec);
             range_scan(ctx, spec, range, &n.vars)?
         }
+        Kind::OrderedTopK(spec) => match ordered_topk(ctx, spec, &n.vars)? {
+            Some((t, read)) => {
+                note = Some(format!("[read {read} rows]"));
+                t
+            }
+            None => {
+                // the values are not totally ordered: the generic plan decides
+                let (t, info) = execute(ctx, &spec.fallback)?;
+                infos.push(info);
+                note = Some("[values not totally ordered: ran the generic plan]".into());
+                t
+            }
+        },
         Kind::GroupCountScan {
             spec,
             key: _,
@@ -760,6 +775,252 @@ fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> 
         ctx.check_output(t.len(), t.width())?;
     }
     Ok(t)
+}
+
+// ---------------------------------------------------------- ordered top-k ------
+
+/// The unread part `[lo, hi]` of a monotone piece of an [`OrderedTopK`] scan.
+struct TopKRun {
+    lo: u64,
+    hi: u64,
+    exact: bool,
+    /// the best values are at the high end of the id range
+    best_high: bool,
+    /// the rows read so far that can still be among the first k
+    kept: Table,
+    /// base rows to read in the next step (grows geometrically)
+    want: usize,
+    /// no unread row of the piece can be among the first k
+    done: bool,
+}
+
+/// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
+/// with the filters applied; also returns how many rows were scanned.
+fn topk_read(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    lo: u64,
+    hi: u64,
+    exact: bool,
+    vars: &[VarId],
+) -> Result<(Table, usize)> {
+    let scan = &spec.scan;
+    let bound = |v: u64, fill: u64| {
+        let mut k = pad(&scan.prefix, fill);
+        k[scan.prefix.len()] = v;
+        k
+    };
+    let mut t = Table::new(vars.to_vec());
+    scan_into(ctx, scan, bound(lo, 0), bound(hi, u64::MAX), None, &mut t)?;
+    let scanned = t.len();
+    if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
+        apply_filter(ctx, &mut t, &spec.range_filter)?;
+    }
+    if !spec.filter.is_empty() && !t.is_empty() {
+        apply_filter(ctx, &mut t, &spec.filter)?;
+    }
+    Ok((t, scanned))
+}
+
+/// The order-column id of the base row `want` rows from the best end of the ids
+/// `[lo, hi]` of an [`OrderedTopK`] scan (`lo` or `hi` when there are fewer). Only the
+/// leading key columns of the blocks at that end are decoded.
+fn topk_boundary(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    lo: u64,
+    hi: u64,
+    best_high: bool,
+    mut want: usize,
+) -> Result<u64> {
+    let scan = &spec.scan;
+    let c = scan.prefix.len();
+    let bound = |v: u64, fill: u64| {
+        let mut k = pad(&scan.prefix, fill);
+        k[c] = v;
+        k
+    };
+    let (klo, khi) = (bound(lo, 0), bound(hi, u64::MAX));
+    let perm = ctx.snap.perm(scan.perm);
+    let (b0, b1) = perm.key_block_range(&klo, &khi);
+    let mask = crate::index::bound_cols(&klo, &khi);
+    let mut visit = |b: usize| -> Result<Option<u64>> {
+        let blk = ctx.snap.cache.get_cols(perm, b, mask)?;
+        let (s, e) = blk.key_range(&klo, &khi);
+        if e - s >= want {
+            let col = &blk.cols[c];
+            return Ok(Some(if best_high {
+                col[e - want]
+            } else {
+                col[s + want - 1]
+            }));
+        }
+        want -= e - s;
+        Ok(None)
+    };
+    if best_high {
+        for b in (b0..b1).rev() {
+            if let Some(id) = visit(b)? {
+                return Ok(id);
+            }
+        }
+        Ok(lo)
+    } else {
+        for b in b0..b1 {
+            if let Some(id) = visit(b)? {
+                return Ok(id);
+            }
+        }
+        Ok(hi)
+    }
+}
+
+/// Read the next rows of a monotone piece from its best end, keeping those that can
+/// still be among the first k; returns the rows scanned.
+fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -> Result<usize> {
+    // base rows only: delta rows in between are merged by the scan
+    let edge = topk_boundary(ctx, spec, run.lo, run.hi, run.best_high, run.want)?;
+    let (a, b) = if run.best_high {
+        (edge, run.hi)
+    } else {
+        (run.lo, edge)
+    };
+    let (mut part, scanned) = topk_read(ctx, spec, a, b, run.exact, vars)?;
+    if run.best_high {
+        run.done |= a == run.lo;
+        run.hi = a.saturating_sub(1);
+    } else {
+        run.done |= b == run.hi;
+        run.lo = b.saturating_add(1);
+    }
+    run.want = run.want.saturating_mul(4);
+    // the rows come in id order, and earlier steps read only better ids: the `need`-th
+    // best row of this step and its ties complete the piece's best k, and every other
+    // row of the piece has k rows with strictly better values ahead of it (distinct ids
+    // of a monotone piece are distinct numbers)
+    let need = spec.k - run.kept.len();
+    if part.len() >= need {
+        let col = &part.cols[0];
+        let keep: Vec<bool> = if run.best_high {
+            let cut = col[part.len() - need];
+            col.iter().map(|&id| id >= cut).collect()
+        } else {
+            let cut = col[need - 1];
+            col.iter().map(|&id| id <= cut).collect()
+        };
+        part.filter_rows(&keep);
+        run.done = true;
+    }
+    run.kept.append(part);
+    Ok(scanned)
+}
+
+/// Whether ORDER BY's comparison of `id` with other values is a total order (it is not
+/// for NaN, which compares with numbers by its lexical form, nor for partially ordered
+/// dates, times and durations).
+fn totally_ordered(ctx: &Ctx, id: Id) -> bool {
+    use crate::id::Tag;
+    match id.tag() {
+        Tag::Double => !id.as_f64().is_nan(),
+        Tag::DateTime | Tag::Date => false,
+        Tag::Vocab | Tag::Delta => match ctx.value(id) {
+            Some(Value::Double(d)) => !d.is_nan(),
+            Some(Value::Float(f)) => !f.is_nan(),
+            Some(
+                Value::DateTime(_)
+                | Value::Date(_)
+                | Value::Time(_)
+                | Value::Duration(_)
+                | Value::YearMonth(_)
+                | Value::DayTime(_)
+                | Value::Triple(_),
+            ) => false,
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// [`OrderedTopK`]: the first k rows of the ORDER BY, in its order; `None` when a value
+/// outside the monotone pieces is not totally ordered (the generic plan must decide).
+/// Also returns how many rows were scanned.
+fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(Table, usize)>> {
+    let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
+    debug_assert_eq!(vars.first(), Some(&spec.var));
+    let mut scanned = 0;
+    // the pieces without value order are read whole
+    let mut rest = Table::new(vars.clone());
+    let mut runs = Vec::new();
+    for p in &spec.pieces {
+        match p.mono {
+            None => {
+                let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, &vars)?;
+                scanned += n;
+                rest.append(t);
+                ctx.check_output(rest.len(), rest.width())?;
+            }
+            Some(up) => runs.push(TopKRun {
+                lo: p.lo,
+                hi: p.hi,
+                exact: p.exact,
+                best_high: up != spec.asc,
+                kept: Table::new(vars.clone()),
+                want: spec.k.max(16) * 2,
+                done: false,
+            }),
+        }
+    }
+    let total = |id: &Id| totally_ordered(ctx, *id);
+    if !(if rest.len() > PAR_THRESHOLD / 4 {
+        rest.cols[0].par_iter().all(total)
+    } else {
+        rest.cols[0].iter().all(total)
+    }) {
+        return Ok(None);
+    }
+    let keys = [(Expr::Var(spec.var), spec.asc)];
+    // only their first k can be among the first k of all rows (the order of two rows
+    // does not depend on the others)
+    if rest.len() > spec.k {
+        rest = order_by(ctx, rest, &keys, Some(spec.k))?.0;
+    }
+    let held = ctx.charge(rest.mem_bytes())?;
+    let better = if spec.asc {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    };
+    loop {
+        ctx.check()?;
+        for run in runs.iter_mut().filter(|r| !r.done) {
+            scanned += topk_step(ctx, spec, run, &vars)?;
+        }
+        // the candidates in the generic plan's row order, ranked by the generic ORDER BY
+        let n = rest.len() + runs.iter().map(|r| r.kept.len()).sum::<usize>();
+        ctx.check_output(n, vars.len())?;
+        let mut cand = rest.clone();
+        for run in &runs {
+            cand.append(run.kept.clone());
+        }
+        cand.sorted.clear();
+        cand.sort_by_vars(&spec.tie_order);
+        let (top, _) = order_by(ctx, cand, &keys, Some(spec.k))?;
+        if top.len() == spec.k {
+            // a piece is finished once the k-th row is strictly better than its best
+            // unread value, and so than every unread value
+            let kth = ctx.value(top.cols[0][spec.k - 1]);
+            for run in runs.iter_mut().filter(|r| !r.done) {
+                let best = Id(if run.best_high { run.hi } else { run.lo });
+                if order_cmp(kth.as_ref(), ctx.value(best).as_ref()) == better {
+                    run.done = true;
+                }
+            }
+        }
+        if runs.iter().all(|r| r.done) {
+            drop(held);
+            return Ok(Some((top.project(out), scanned)));
+        }
+    }
 }
 
 /// Append the scan's rows with keys in `[lo, hi]` to `t`, stopping after `limit` rows in

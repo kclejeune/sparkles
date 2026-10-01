@@ -525,6 +525,8 @@ fn optimizations_can_be_disabled_by_name() {
         .disable("range_pushdown, metadata_counts")
         .unwrap();
     assert!(!o.range_pushdown && !o.metadata_counts && o.incremental_group);
+    let o = Optimizations::ALL.disable("ordered_topk").unwrap();
+    assert!(!o.ordered_topk && o.topk_prefilter);
     assert_eq!(
         Optimizations::ALL.disable("all").unwrap(),
         Optimizations::NONE
@@ -562,10 +564,14 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
     ] {
         // row order matters here, not just the multiset; ties keep their input order, so
         // compare with the same plan minus the prefilter
-        let fast = run(&s, q, Optimizations::ALL);
+        let with = Optimizations {
+            ordered_topk: false,
+            ..Optimizations::ALL
+        };
+        let fast = run(&s, q, with);
         let without = Optimizations {
             topk_prefilter: false,
-            ..Optimizations::ALL
+            ..with
         };
         let slow = run(&s, q, without);
         assert_eq!(fast.rows(), slow.rows(), "{q}");
@@ -580,6 +586,361 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
         solutions(&fast),
         solutions(&run(&s, q, Optimizations::NONE))
     );
+}
+
+// ------------------------------------------------------- ordered scan top-k ------
+
+fn without_ordered_topk() -> Optimizations {
+    Optimizations {
+        ordered_topk: false,
+        ..Optimizations::ALL
+    }
+}
+
+/// Run `q` with the ordered top-k scan (chosen whenever it applies) and without it: the
+/// rows must be equal in order, ties included. Returns the optimized result.
+fn topk_check(s: &Store, q: &str) -> QueryResult {
+    super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(true));
+    let fast = run(s, q, Optimizations::ALL);
+    super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
+    let slow = run(s, q, without_ordered_topk());
+    assert_eq!(fast.rows(), slow.rows(), "{q}");
+    assert!(!has_op(&slow.plan, "IndexTopK"), "{q}");
+    fast
+}
+
+/// A pseudo-random object of every kind: inline integers, decimals of several scales
+/// and doubles of both signs (with their boundaries), non-canonical numerals and other
+/// numeric types from the vocabulary, strings, IRIs, blank nodes and booleans; small
+/// ranges, so that many values tie.
+fn topk_value(r: u64) -> String {
+    let small = (r >> 8) as i64 % 40 - 20;
+    let frac = (r >> 20) % 1000;
+    match r % 17 {
+        0 | 1 => format!("{small}"),
+        2 => format!("{small}.{}", frac % 10),
+        3 => format!("{small}.{frac:03}"),
+        4 => format!("\"{small}.{}0\"^^xsd:decimal", frac % 10),
+        5 => format!("{small}.5e0"),
+        6 => [
+            "0.0e0",
+            "-0.0e0",
+            "\"INF\"^^xsd:double",
+            "\"-INF\"^^xsd:double",
+            "1.0e300",
+        ][(r >> 8) as usize % 5]
+            .to_string(),
+        7 => format!("\"0{}\"^^xsd:integer", small.abs()),
+        8 => format!("\"{small}\"^^xsd:int"),
+        9 => format!("\"{small}.25\"^^xsd:float"),
+        10 => format!("\"s{}\"", small.abs()),
+        11 => format!("\"l{}\"@en", small.abs() % 5),
+        12 => format!("ex:o{}", small.abs() % 7),
+        13 => format!("_:b{}", small.abs() % 4),
+        14 => ["true", "false"][(r >> 8) as usize % 2].to_string(),
+        15 => [
+            "576460752303423487",
+            "-576460752303423488",
+            "576460752303423488",
+            "99999999999999999999",
+            "-0.000000000000001",
+            "123456789.123456789",
+        ][(r >> 8) as usize % 6]
+            .to_string(),
+        _ => format!("{}", small * 1000),
+    }
+}
+
+/// `n` pseudo-random values of `ex:v`, some subjects with several, in the default graph
+/// and two named graphs (some triples in several graphs); `ex:w` holds integers only.
+fn topk_store(seed: u64, n: usize, opts: StoreOptions) -> Store {
+    let mut x = seed;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let s = Store::in_memory(opts);
+    let mut trig = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for i in 0..n {
+        let r = next();
+        let subj = format!("ex:s{}", i % (n / 2 + 1));
+        let triple = format!("{subj} ex:v {} .", topk_value(r));
+        match (r >> 40) % 10 {
+            0..=5 => trig.push_str(&format!("{triple}\n")),
+            6 | 7 => trig.push_str(&format!("ex:g1 {{ {triple} }}\n")),
+            8 => trig.push_str(&format!("ex:g2 {{ {triple} }}\n")),
+            _ => trig.push_str(&format!(
+                "{triple}\nex:g1 {{ {triple} }}\nex:g2 {{ {triple} }}\n"
+            )),
+        }
+        trig.push_str(&format!("{subj} ex:w {} .\n", (r >> 16) as i64 % 500 - 250));
+    }
+    load(&s, &trig, RdfFormat::TriG);
+    s
+}
+
+/// ORDER BY + LIMIT queries the ordered scan applies to.
+fn topk_queries() -> Vec<String> {
+    let mut out = Vec::new();
+    let patterns = [
+        "SELECT ?s ?v WHERE { ?s ex:v ?v }",
+        "SELECT ?v ?s WHERE { ?s ex:v ?v FILTER(?v > 0) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v >= -10 && ?v < 12.5) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v <= 3 && ?s != ex:s3) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(!isNumeric(?v)) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/s1\")) }",
+        "SELECT ?s ?v ?g WHERE { GRAPH ?g { ?s ex:v ?v } }",
+        "SELECT ?s ?v WHERE { GRAPH ex:g1 { ?s ex:v ?v } }",
+        "SELECT ?s ?v WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s ex:v ?v } }",
+        "SELECT ?s ?v WHERE { ?s ex:w ?v }",
+        "SELECT * WHERE { ?s ex:w ?v FILTER(?v > 100) }",
+        "SELECT * WHERE { ?s ?p ?v }",
+    ];
+    for (i, p) in patterns.iter().enumerate() {
+        for (dir, k, off) in [
+            ("DESC", 10, 0),
+            ("ASC", 10, 0),
+            ("DESC", 1, 0),
+            ("ASC", 3, 7),
+            ("DESC", 37, 5),
+            ("ASC", 250, 0),
+        ] {
+            let limit = k + i;
+            out.push(format!("{p} ORDER BY {dir}(?v) LIMIT {limit} OFFSET {off}"));
+        }
+    }
+    // other order variables: the scan is re-targeted to a permutation sorted on them
+    out.push("SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?s) LIMIT 7".into());
+    out.push("SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 3) } ORDER BY ?s LIMIT 4".into());
+    out.push("SELECT ?s ?v ?g WHERE { GRAPH ?g { ?s ex:v ?v } } ORDER BY ?s LIMIT 9".into());
+    out
+}
+
+#[test]
+fn ordered_top_k_matches_the_sort_on_random_data() {
+    for (seed, union) in [
+        (0x2545_f491_4f6c_dd1d, false),
+        (0x9e37_79b9_7f4a_7c15, true),
+    ] {
+        let s = topk_store(
+            seed,
+            6000,
+            StoreOptions {
+                union_default_graph: union,
+                ..Default::default()
+            },
+        );
+        let before = s.snapshot();
+        let queries = topk_queries();
+        let mut chosen = 0;
+        let mut answers = Vec::new();
+        for q in &queries {
+            let r = topk_check(&s, q);
+            chosen += has_op(&r.plan, "IndexTopK") as usize;
+            answers.push(r.rows());
+        }
+        assert!(
+            chosen * 10 >= queries.len() * 9,
+            "{chosen} of {}",
+            queries.len()
+        );
+        // updates after the base build: inserts at both ends and in the middle (new
+        // inline values and new vocabulary terms), deletes of extreme rows
+        update(
+            &s,
+            "INSERT DATA { ex:n1 ex:v 99 . ex:n2 ex:v -99.5 . ex:n3 ex:v \"0099\"^^xsd:integer . \
+             ex:n4 ex:v \"zz\" . ex:n5 ex:v 1.5e10 . ex:n6 ex:v ex:new . ex:n7 ex:v 3 . \
+             ex:n8 ex:v \"-7.70\"^^xsd:decimal . ex:n9 ex:w 1000 . \
+             GRAPH ex:g1 { ex:n1 ex:v 99 . ex:n10 ex:v -1000 } }",
+        );
+        update(
+            &s,
+            "DELETE WHERE { ?s ex:v 1.0e300 } ; DELETE WHERE { ?s ex:v \"INF\"^^xsd:double } ; \
+             DELETE WHERE { ?s ex:w 249 }",
+        );
+        update(&s, "DELETE DATA { ex:n7 ex:v 3 }");
+        for q in &queries {
+            topk_check(&s, q);
+        }
+        // the snapshot taken before the updates still answers as before
+        let opts = QueryOptions {
+            optimizations: Some(Optimizations::ALL),
+            no_cache: true,
+            ..Default::default()
+        };
+        for (q, rows) in queries.iter().zip(&answers) {
+            super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(true));
+            let r = query(before.clone(), &format!("{PREFIXES}{q}"), &opts).unwrap();
+            super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
+            assert_eq!(&r.rows(), rows, "{q}");
+        }
+    }
+}
+
+/// Many small random stores, random directions, limits and offsets.
+#[test]
+fn ordered_top_k_matches_the_sort_on_random_limits() {
+    let mut x: u64 = 0x5851_f42d_4c95_7f2d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let patterns = [
+        "SELECT ?s ?v WHERE { ?s ex:v ?v }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v < 5) }",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > -3 && ?s != ex:s1) }",
+        "SELECT ?s ?v ?g WHERE { GRAPH ?g { ?s ex:v ?v } }",
+        "SELECT ?s ?v WHERE { ?s ex:w ?v FILTER(STRENDS(STR(?s), \"7\")) }",
+    ];
+    for round in 0..8 {
+        let opts = StoreOptions {
+            union_default_graph: round % 2 == 1,
+            ..Default::default()
+        };
+        let s = topk_store(next(), 300 + (next() % 1500) as usize, opts);
+        if round % 3 == 2 {
+            update(
+                &s,
+                "INSERT DATA { ex:d1 ex:v 7 . ex:d2 ex:v \"07\"^^xsd:integer . ex:d3 ex:v 7.0 } ; \
+                 DELETE WHERE { ?s ex:v 0 }",
+            );
+        }
+        for p in patterns {
+            let dir = ["ASC", "DESC"][(next() % 2) as usize];
+            let (limit, offset) = (1 + next() % 60, next() % 20);
+            topk_check(
+                &s,
+                &format!("{p} ORDER BY {dir}(?v) LIMIT {limit} OFFSET {offset}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn ordered_top_k_falls_back_on_values_that_are_not_totally_ordered() {
+    let s = topk_store(0x1234_5678_9abc_def1, 2000, StoreOptions::default());
+    update(
+        &s,
+        "INSERT DATA { ex:x1 ex:v \"NaN\"^^xsd:double . ex:x2 ex:w \"2024-01-01\"^^xsd:date }",
+    );
+    for q in [
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 5",
+        "SELECT ?s ?v WHERE { ?s ex:w ?v } ORDER BY ?v LIMIT 5",
+    ] {
+        let r = topk_check(&s, q);
+        assert!(has_desc(&r.plan, "ran the generic plan"), "{q}");
+    }
+    // NaN fails the range filter: the ordered scan decides
+    let r = topk_check(
+        &s,
+        "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 2) } ORDER BY DESC(?v) LIMIT 5",
+    );
+    assert!(has_desc(&r.plan, "[read "), "{:#?}", r.plan);
+}
+
+/// A piece whose best rows mostly fail the filter is read on, step by step, while its
+/// unread values can still beat the k-th candidate from the other pieces; ties at the
+/// cut stay.
+#[test]
+fn ordered_top_k_reads_a_piece_until_it_cannot_win() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for i in 1..=3000 {
+        // integers and negative doubles: only every 50th subject passes the filter
+        let tag = if i % 50 == 0 { "keep" } else { "drop" };
+        ttl.push_str(&format!("ex:{tag}{i} ex:u {i} , -{i}.0e0 .\n"));
+        // decimals below the kept integers, and a tie run on 2000
+        ttl.push_str(&format!("ex:keep_d{i} ex:u {}.5 .\n", i % 1500));
+        if i % 7 == 0 {
+            ttl.push_str(&format!("ex:keep_t{i} ex:u 2000 , -2000.0e0 .\n"));
+        }
+    }
+    // the second row is an inline 12 that ties with a vocabulary "012" read earlier and
+    // comes first in the scan: the piece must be read up to and including 12
+    ttl.push_str("ex:keep_a ex:t 12 . ex:keep_b ex:t \"012\"^^xsd:integer . ex:keep_c ex:t 50 .\n");
+    for i in 51..=100 {
+        ttl.push_str(&format!("ex:drop_t{i} ex:t {i} .\n"));
+    }
+    for i in 0..1000 {
+        ttl.push_str(&format!("ex:drop_u{i} ex:t 13 .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let r = topk_check(
+        &s,
+        "SELECT ?s WHERE { ?s ex:t ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY DESC(?v) LIMIT 2",
+    );
+    assert!(has_op(&r.plan, "IndexTopK"));
+    assert_eq!(
+        solutions(&r),
+        ["<http://ex.org/keep_a>", "<http://ex.org/keep_c>"]
+    );
+    for q in [
+        "SELECT ?s ?v WHERE { ?s ex:u ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY DESC(?v) LIMIT 30",
+        "SELECT ?s ?v WHERE { ?s ex:u ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\")) } ORDER BY ?v LIMIT 30 OFFSET 4",
+        "SELECT ?s ?v WHERE { ?s ex:u ?v FILTER(STRSTARTS(STR(?s), \"http://ex.org/keep\") && ?v > 10) } ORDER BY DESC(?v) LIMIT 50",
+        "SELECT ?s ?v WHERE { ?s ex:u ?v } ORDER BY DESC(?v) LIMIT 300",
+        "SELECT ?s ?v WHERE { ?s ex:u ?v } ORDER BY ?v LIMIT 320",
+    ] {
+        let r = topk_check(&s, q);
+        assert!(has_op(&r.plan, "IndexTopK"), "{q}");
+    }
+}
+
+/// The `[read N rows]` note of the ordered scan in an executed plan.
+fn topk_rows_read(p: &PlanInfo) -> Option<u64> {
+    if p.operator == "IndexTopK" {
+        let n = p.description.split("[read ").nth(1)?;
+        return n[..n.find(' ')?].parse().ok();
+    }
+    p.children.iter().find_map(topk_rows_read)
+}
+
+/// Salaries as in the benchmark: inline decimals, a tenth of them non-canonical
+/// (vocabulary literals). The planner picks the ordered scan on its own, and it reads
+/// far fewer rows than the plain scan.
+#[test]
+fn ordered_top_k_is_chosen_when_it_reads_less() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    for i in 0..120_000u64 {
+        let cents = (i * 7919) % 10_000_000;
+        let v = if i % 10 == 0 {
+            format!("\"{}.{:02}0\"^^xsd:decimal", cents / 100, cents % 100)
+        } else {
+            format!("{}.{:02}", cents / 100, cents % 100)
+        };
+        ttl.push_str(&format!("ex:p{i} ex:salary {v} .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    for q in [
+        "SELECT ?p ?s WHERE { ?p ex:salary ?s FILTER(?s > 15000) } ORDER BY DESC(?s) LIMIT 10",
+        "SELECT ?p ?s WHERE { ?p ex:salary ?s } ORDER BY ?s LIMIT 10 OFFSET 3",
+    ] {
+        let fast = run(&s, q, Optimizations::ALL);
+        let slow = run(&s, q, without_ordered_topk());
+        assert_eq!(fast.rows(), slow.rows(), "{q}");
+        assert_eq!(fast.rows().len(), 10);
+        let read = topk_rows_read(&fast.plan);
+        assert!(read.is_some_and(|n| n < 60_000), "{q}: {:#?}", fast.plan);
+    }
+    // ordering by a column of IRIs reads every row: the plain sort stays
+    let r = run(
+        &s,
+        "SELECT ?p ?s WHERE { ?p ex:salary ?s } ORDER BY DESC(?p) LIMIT 10",
+        Optimizations::ALL,
+    );
+    assert!(!has_op(&r.plan, "IndexTopK"));
 }
 
 // ---------------------------------------------------------- batched frontiers ------
@@ -775,7 +1136,13 @@ fn optimized_operators_obey_the_memory_budget() {
             "SELECT * WHERE { ?a ex:org ?o . ?b ex:org ?o }",
             "MergeJoin",
         ),
+        (
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 100) } ORDER BY ?v LIMIT 5",
+            "IndexTopK",
+        ),
     ] {
+        // the data is too small for the ordered scan to pay off
+        super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(op == "IndexTopK"));
         let text = format!("{PREFIXES}{q}");
         let full = query(s.snapshot(), &text, &budget(None)).unwrap();
         let taken = match op.strip_prefix("desc:") {
@@ -798,4 +1165,5 @@ fn optimized_operators_obey_the_memory_budget() {
             r => panic!("{q}: {:?}", r.map(|r| r.len())),
         }
     }
+    super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
 }

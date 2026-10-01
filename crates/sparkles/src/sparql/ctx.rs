@@ -52,18 +52,22 @@ pub struct Optimizations {
     pub batched_paths: bool,
     /// ORDER BY one numeric variable with LIMIT ranks rounded keys first
     pub topk_prefilter: bool,
+    /// ORDER BY a scan's variable with LIMIT reads the scan in value order and stops once
+    /// the first rows are proven
+    pub ordered_topk: bool,
     /// scans decode (and cache) only the key columns they read
     pub selective_columns: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 7] = [
+    pub const NAMES: [&str; 8] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
         "metadata_counts",
         "batched_paths",
         "topk_prefilter",
+        "ordered_topk",
         "selective_columns",
     ];
 
@@ -75,6 +79,7 @@ impl Optimizations {
         metadata_counts: true,
         batched_paths: true,
         topk_prefilter: true,
+        ordered_topk: true,
         selective_columns: true,
     };
 
@@ -86,6 +91,7 @@ impl Optimizations {
         metadata_counts: false,
         batched_paths: false,
         topk_prefilter: false,
+        ordered_topk: false,
         selective_columns: false,
     };
 
@@ -97,6 +103,7 @@ impl Optimizations {
             "metadata_counts" => &mut self.metadata_counts,
             "batched_paths" => &mut self.batched_paths,
             "topk_prefilter" => &mut self.topk_prefilter,
+            "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
             _ => return None,
         })
