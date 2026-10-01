@@ -1232,7 +1232,18 @@ access wherever they like:
   `[credentials.<name>]` source of the config file (`400 invalid-config`, `field:
   "credentials"` or `"credentials.name"`, otherwise); never environment variables, files
   or the default provider chain of the caller's choosing. Without a config file an `s3`
-  repository cannot be registered through the API.
+  repository cannot be registered through the API. The flow: define the source in the
+  config file (by hand, or `sparkles repo add NAME --s3 BUCKET … --credentials-name lab
+  --credentials env:LAB_ACCESS_KEY,LAB_SECRET_KEY`, which writes `[credentials.lab]`
+  next to its own repository, or names an existing one without `--credentials`), start
+  the server with `--backup-config` on that file or send it SIGHUP, then register:
+
+  ```sh
+  curl -X POST http://localhost:3030/$/repositories -H 'Content-Type: application/json' -d '{
+    "name": "lab", "type": "s3", "bucket": "lab", "endpoint": "http://127.0.0.1:9000",
+    "pathStyle": true, "allowHttp": true,
+    "credentials": {"source": "named", "name": "lab"}}'
+  ```
 * An `s3` endpoint, and every address its host name resolves to, must pass the server's
   outbound policy (the `--outbound-*` flags of `SERVICE` and `LOAD`: public addresses
   only by default), and connections go only to the addresses checked. A MinIO on

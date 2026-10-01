@@ -549,6 +549,10 @@ sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0
 sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
 #   --endpoint URL --path-style --allow-http (MinIO, R2, …); --credentials default | env |
 #   env:KEY_VAR,SECRET_VAR[,TOKEN_VAR] | file:PATH; --readonly; --no-init (attach only)
+sparkles repo add lab --s3 lab --endpoint http://127.0.0.1:9000 --path-style --allow-http \
+  --credentials-name minio --credentials env:MINIO_ACCESS_KEY,MINIO_SECRET_KEY
+#   keeps the source as [credentials.minio], which the repository names (without
+#   --credentials: uses the one defined); a server reading the file can then name it too
 sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
 sparkles repo verify local --level data          # every backup, plus orphaned blobs
 sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
@@ -588,6 +592,11 @@ secret_access_key_var = "MINIO_SECRET_KEY"
 [api]
 fs_roots = ["/srv/backups"]
 ```
+
+So to register an S3 repository through the API, define its credential source in the
+file first (by hand, or with `sparkles repo add … --credentials-name minio --credentials
+…` on the same file), start the server with it (or send it SIGHUP), then
+`POST /$/repositories` with `"credentials": {"source": "named", "name": "minio"}`.
 
 `scripts/backup-bench.sh DB` (`mise run bench:backup DB`) measures a full backup, an
 incremental one after small commits, a restore and a data verification of an existing
