@@ -1,4 +1,10 @@
 # shexTest cases (jena-shex/src/test/files/spec, or an upstream shexTest checkout) that
-# currently fail, with the reason. One test id per line, as the harness prints it, e.g.
+# currently fail, with the reason. One test id per line, as the harness prints it
+# (group/name; the groups are syntax, negativeSyntax, negativeStructure, representation,
+# validation and validation-shexj), then the reason, e.g.
 #   validation/1dot_fail-empty  the reason
 # The suite fails on any failure not listed here, and reports listed tests that pass.
+#
+# Not listed: Jena skips syntax/_all and syntax/1refbnode_with_spanning_PN_CHARS_BASE1
+# as "ill-formed surrogate pairs", but both files are valid UTF-8 whose characters
+# outside the BMP (U+10000, U+EFFFD, ...) trip Java's UTF-16 strings, not the grammar.
