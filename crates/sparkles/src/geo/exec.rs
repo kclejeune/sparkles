@@ -492,34 +492,23 @@ pub fn spatial_scan(
     };
     let mut st = SearchStats::default();
     let mut cands = Candidates::default();
-    if state.ready() {
-        search::window(
-            ctx,
-            &[spec.pred],
-            &spec.windows,
-            &graph,
-            &mut st,
-            &mut |hits| {
-                for h in hits {
-                    if subj.is_none_or(|s| s == h.s) {
-                        cands.push(ctx, h.s, h.o, h.g, || Src::Entry(h.entry.clone()))?;
-                    }
+    // the index's window search (a scan of the predicate when the index cannot serve)
+    search::window_with(
+        ctx,
+        &[spec.pred],
+        &spec.windows,
+        &graph,
+        spec.scan.dedup,
+        &mut st,
+        &mut |hits| {
+            for h in hits {
+                if subj.is_none_or(|s| s == h.s) {
+                    cands.push(ctx, h.s, h.o, h.g, || Src::Entry(h.entry.clone()))?;
                 }
-                Ok(())
-            },
-        )?;
-    } else {
-        // the index became unusable since planning: read the predicate
-        st.fallback = true;
-        let s = &spec.scan;
-        scan_keys(ctx, s.perm, &s.prefix, |k| {
-            let q = s.perm.to_quad(&k);
-            if graph.accepts(q[3].0) && subj.is_none_or(|x| x == q[0]) {
-                cands.push(ctx, q[0], q[2], q[3], || Src::Literal)?;
             }
             Ok(())
-        })?;
-    }
+        },
+    )?;
     let check = Check {
         windows: &spec.windows,
         tests: &spec.tests,
@@ -622,17 +611,16 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
     let mut st = SearchStats::default();
     // feature (and graph, under GRAPH ?g) → its ranking distance
     let mut feats: FxHashMap<(Id, Id), f64> = FxHashMap::default();
-    let ready = state.ready() && !windows.is_empty();
     match (&spec.subject, spec.limit) {
-        (PathEnd::Var(_), Some(k)) if ready && nearby => {
+        _ if windows.is_empty() => {}
+        (PathEnd::Var(_), Some(k)) if nearby => {
             knn(ctx, spec, &preds, &links, &check, k, &mut st, &mut feats)?;
         }
-        _ if windows.is_empty() => {}
         (subject, _) => {
             let mut cands = Candidates::default();
-            let mut scope = Scope::new(&cfg);
             if let PathEnd::Const(f) = subject {
                 // a given feature: its links, then its geometries' literals
+                let mut scope = Scope::new(&cfg);
                 for l in &links {
                     scan_keys(ctx, Perm::Spo, &[f.0, l.0], |k| {
                         let (geom, g1) = (k[2], k[3]);
@@ -651,24 +639,22 @@ pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Ta
                         Ok(())
                     })?;
                 }
-            } else if ready {
-                search::window(ctx, &preds, &windows, &spec.graph, &mut st, &mut |hits| {
-                    for h in hits {
-                        cands.push(ctx, h.s, h.o, h.g, || Src::Entry(h.entry.clone()))?;
-                    }
-                    Ok(())
-                })?;
             } else {
-                st.fallback = true;
-                for p in &preds {
-                    scan_keys(ctx, Perm::Pso, &[p.0], |k| {
-                        let g = k[3];
-                        if spec.graph.accepts(g) && scope.contains(ctx, g) {
-                            cands.push(ctx, Id(k[1]), Id(k[2]), Id(g), || Src::Literal)?;
+                // the index's window search (a scan of the predicates when it cannot serve)
+                search::window_with(
+                    ctx,
+                    &preds,
+                    &windows,
+                    &spec.graph,
+                    spec.dedup,
+                    &mut st,
+                    &mut |hits| {
+                        for h in hits {
+                            cands.push(ctx, h.s, h.o, h.g, || Src::Entry(h.entry.clone()))?;
                         }
                         Ok(())
-                    })?;
-                }
+                    },
+                )?;
             }
             let (rows, pass) = cands.refine(ctx, &check, &mut st)?;
             // each geometry (in its graph) once, at its nearest literal
@@ -778,25 +764,14 @@ fn knn(
     let mut matched = 0u64;
     let mut candidates = 0u64;
     let mut nth = Vec::new();
-    search::nearest(
+    search::nearest_with(
         ctx,
         preds,
         &spec.query,
         &spec.graph,
+        spec.dedup,
         st,
         &mut |hits, bound| {
-            if bound >= radius {
-                return Ok(false);
-            }
-            if feats.len() >= k {
-                // the k-th nearest feature so far; nothing left can come closer than `bound`
-                nth.clear();
-                nth.extend(feats.values().copied());
-                let (_, kth, _) = nth.select_nth_unstable_by(k - 1, f64::total_cmp);
-                if *kth < bound {
-                    return Ok(false);
-                }
-            }
             for h in hits {
                 candidates += 1;
                 let d = match seen.get(&h.o) {
@@ -816,6 +791,18 @@ fn knn(
                     features(ctx, spec, links, h.s, h.g, d, feats)?;
                 }
             }
+            // no later row is nearer than `bound`
+            if bound >= radius {
+                return Ok(false);
+            }
+            if feats.len() >= k {
+                nth.clear();
+                nth.extend(feats.values().copied());
+                let (_, kth, _) = nth.select_nth_unstable_by(k - 1, f64::total_cmp);
+                if *kth < bound {
+                    return Ok(false);
+                }
+            }
             Ok(true)
         },
     )?;
@@ -823,4 +810,111 @@ fn knn(
     st.refined = refined;
     st.matched = matched;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geoms() -> Vec<GeomRef> {
+        [
+            "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))",
+            "POLYGON((5 5, 15 5, 15 15, 5 15, 5 5))",
+            "POLYGON((10 0, 20 0, 20 10, 10 10, 10 0))",
+            "POLYGON((2 2, 4 2, 4 4, 2 4, 2 2))",
+            "POINT(2 2)",
+            "POINT(10 5)",
+            "POINT(0 0)",
+            "LINESTRING(0 1, 5 1)",
+            "LINESTRING(-5 5, 25 5)",
+            "LINESTRING(10 -5, 10 15)",
+            "MULTIPOINT((1 1), (30 30))",
+            "<http://www.opengis.net/def/crs/EPSG/0/4326> POINT(2 12)",
+            "<http://www.opengis.net/def/crs/EPSG/0/4326> POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))",
+            "<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(222638.98 222684.21)",
+            "<http://example.org/crs/mars> POINT(1 1)",
+            "POINT EMPTY",
+            "",
+        ]
+        .iter()
+        .map(|l| Arc::new(crate::geo::parse(l, crate::geo::WKT_LITERAL).unwrap()))
+        .collect()
+    }
+
+    /// The prepared, converse form of a test answers exactly as the `geof:` functions'
+    /// relation code does.
+    #[test]
+    fn spatial_tests_agree_with_the_functions() {
+        let gs = geoms();
+        for q in &gs {
+            for r in Relation::ALL {
+                let t = SpatialTest::Relation(r, q.clone());
+                let mut prep = None;
+                for w in &gs {
+                    let want = relate::relation(w, q, r).unwrap_or(false);
+                    assert_eq!(
+                        holds(&t, &mut prep, None, w, u64::MAX),
+                        want,
+                        "{r:?}({:?}, {:?})",
+                        w.g,
+                        q.g
+                    );
+                }
+            }
+            for p in [
+                "T********",
+                "T*F**F***",
+                "*T*******",
+                "FF*FF****",
+                "1********",
+                "0FFFFF212",
+            ] {
+                let t = SpatialTest::Relate(p.into(), q.clone());
+                let tp = transpose(p);
+                let mut prep = None;
+                for w in &gs {
+                    let want = relate::relate(w, q, p).unwrap_or(false);
+                    assert_eq!(
+                        holds(&t, &mut prep, Some(&tp), w, u64::MAX),
+                        want,
+                        "relate {p} ({:?}, {:?})",
+                        w.g,
+                        q.g
+                    );
+                }
+            }
+        }
+        // over the operation limit: false, as the function's type error is in a FILTER
+        let t = SpatialTest::Relation(Relation::SfIntersects, gs[0].clone());
+        assert!(holds(&t, &mut None, None, &gs[0], 100));
+        assert!(!holds(&t, &mut None, None, &gs[0], 9));
+    }
+
+    #[test]
+    fn transposed_patterns_and_cardinal_windows() {
+        assert_eq!(transpose("012345678"), "036147258");
+        let p = envelope_geom([0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            pf_windows(SpatialPfKind::East, &p, None),
+            vec![[0.0, -90.0, 180.0, 90.0]]
+        );
+        let p = envelope_geom([170.0, 0.0, 170.0, 0.0]);
+        assert_eq!(
+            pf_windows(SpatialPfKind::East, &p, None),
+            vec![[170.0, -90.0, 180.0, 90.0], [-180.0, -90.0, -10.0, 90.0]]
+        );
+        assert_eq!(
+            pf_windows(SpatialPfKind::West, &p, None),
+            vec![[-10.0, -90.0, 170.0, 90.0]]
+        );
+        assert_eq!(summary(&p), "POINT(170 0)");
+        assert_eq!(
+            summary(&envelope_geom([0.0, 0.0, 1.0, 1.0])),
+            "POLYGON(5 pts)"
+        );
+        assert_eq!(
+            summary(&envelope_geom([0.0, 0.0, 1.0, 0.0])),
+            "LINESTRING(2 pts)"
+        );
+    }
 }

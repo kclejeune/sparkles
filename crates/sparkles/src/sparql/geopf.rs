@@ -995,7 +995,11 @@ mod on {
         let window_rows = view.estimate(&[slot], &windows).min(n.est);
         let sel: f64 = atoms.iter().map(|a| a.sel).product();
         let refine: f64 = atoms.iter().map(|a| refine_cost(&a.q)).sum();
-        let cost = window_rows * (1.0 + refine) + 4.0 * view.levels() as f64;
+        // window rows with their exact tests, the tree's levels, and sorting the matches
+        // by subject (a scan's rows come sorted)
+        let cost = window_rows * (1.0 + refine)
+            + 4.0 * view.levels() as f64
+            + 0.25 * window_rows * window_rows.max(2.0).log2();
         // the plain scan reads every row and tests it in the filter
         let plain = n.est * (1.0 + refine);
         if cost >= plain {
@@ -1177,6 +1181,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
                     .collect::<Vec<_>>()
                     .join(" ")
             })
+            .filter(|r: &String| !r.contains("fill/"))
             .collect();
         v.sort();
         v
@@ -1194,7 +1199,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the relation and distance operations"]
     fn nearby_finds_features_by_distance() {
         let s = store();
         let r = run(&s, "SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre) }").unwrap();
@@ -1237,7 +1241,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the relation and distance operations"]
     fn boxes_are_latitude_first() {
         let s = store();
         assert_eq!(
@@ -1291,7 +1294,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the relation and distance operations"]
     fn a_limit_keeps_the_nearest_features() {
         let s = store();
         assert_eq!(
@@ -1314,7 +1316,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the relation and distance operations"]
     fn graphs_bind_the_serialization_graph() {
         let s = store();
         assert_eq!(
@@ -1339,7 +1340,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the relation and distance operations"]
     fn a_constant_subject_restricts_the_answer() {
         let s = store();
         let ask = |q: &str| run(&s, q).unwrap().boolean;
@@ -1427,8 +1427,27 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     const GA: &str = "\"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral";
     const GC: &str = "\"POLYGON((10 0, 20 0, 20 10, 10 10, 10 0))\"^^geo:wktLiteral";
 
-    /// The store's snapshot with the spatial index enabled and built.
+    /// Points far from the fixture (no features link them), so that the index is worth
+    /// using: a plain scan of `geo:asWKT` reads them all.
+    fn fill(s: &Store, n: usize) {
+        let mut ttl = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+        for i in 0..n {
+            ttl.push_str(&format!(
+                "<http://example.org/fill/{i}> geo:asWKT \"POINT({} -60)\"^^geo:wktLiteral .\n",
+                (i % 3000) as f64 / 10.0 - 150.0
+            ));
+        }
+        s.load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    }
+
+    /// The store's snapshot with filler points and the spatial index enabled and built.
     fn indexed(s: &Store) -> Arc<Snapshot> {
+        fill(s, 3000);
         s.enable_geo(GeoConfig::default()).unwrap();
         s.snapshot()
     }
@@ -1455,7 +1474,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the spatial index"]
     fn relation_filters_search_the_index() {
         let s = store();
         let snap = indexed(&s);
@@ -1507,7 +1525,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the spatial index"]
     fn distance_filters_search_the_index() {
         let s = store();
         let snap = indexed(&s);
@@ -1530,7 +1547,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the spatial index"]
     fn filters_the_index_cannot_serve_warn() {
         let s = store();
         let snap = indexed(&s);
@@ -1562,7 +1578,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         warned(&q, "lower bound");
         // without an index
         let r = run(
-            &s,
+            &store(),
             &format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}"),
         )
         .unwrap();
@@ -1612,7 +1628,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the spatial index"]
     fn constants_with_the_same_description_have_different_cache_keys() {
         let s = store();
         let snap = indexed(&s);
@@ -1638,7 +1653,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
-    #[ignore = "needs the spatial index"]
     fn property_functions_search_the_index() {
         let s = store();
         let snap = indexed(&s);
@@ -1673,6 +1687,83 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
     }
 
     #[test]
+    fn the_index_is_used_when_it_reads_fewer_rows() {
+        let s = store();
+        let snap = indexed(&s);
+        // a window holding every row: the plain scan is cheaper
+        let q = "SELECT ?g { ?g geo:asWKT ?w FILTER(geof:sfIntersects(?w, \
+                 \"POLYGON((-180 -90, 180 -90, 180 90, -180 90, -180 -90))\"^^geo:wktLiteral)) }";
+        let r = run_on(&snap, q, true);
+        assert!(find(&r.plan, "SpatialScan").is_none(), "{:#?}", r.plan);
+        assert_eq!(names(&r), names(&run_on(&snap, q, false)));
+        assert!(r.plan.warnings.is_empty(), "{:?}", r.plan.warnings);
+        // a small window: the index
+        let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
+        let r = run_on(&snap, &q, true);
+        let scan = find(&r.plan, "SpatialScan").expect("pushed");
+        assert!(scan.estimated_cost < 1000.0, "{}", scan.estimated_cost);
+        // joined with the feature links, the scan's subject order serves a merge join
+        let q = format!(
+            "SELECT ?f {{ ?f geo:hasDefaultGeometry ?g . ?g geo:asWKT ?w \
+             FILTER(geof:sfWithin(?w, {GA})) }}"
+        );
+        assert_eq!(pushed(&snap, &q).0, ["A"]);
+    }
+
+    #[test]
+    fn a_building_index_falls_back_with_the_same_answers() {
+        let s = store();
+        s.pause_geo_build(true);
+        s.enable_geo(GeoConfig::default()).unwrap();
+        let snap = s.snapshot();
+        let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
+        let r = run_on(&snap, &q, true);
+        assert_eq!(names(&r), ["g1", "gA"]);
+        assert!(find(&r.plan, "SpatialScan").is_none());
+        assert!(
+            r.plan
+                .warnings
+                .iter()
+                .any(|w| w.code == "geo-index-building"),
+            "{:?}",
+            r.plan.warnings
+        );
+        let r = run_on(
+            &snap,
+            "SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre) }",
+            true,
+        );
+        assert_eq!(names(&r), ["A", "p1"]);
+        let c = find(&r.plan, "SpatialPf")
+            .unwrap()
+            .counters
+            .clone()
+            .unwrap();
+        assert_eq!(c["fallback"], true);
+        assert!(
+            c["index"].as_str().unwrap().starts_with("building"),
+            "{c:?}"
+        );
+        s.pause_geo_build(false);
+        s.wait_geo();
+        let r = run_on(
+            &s.snapshot(),
+            "SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre) }",
+            true,
+        );
+        assert_eq!(names(&r), ["A", "p1"]);
+        let c = find(&r.plan, "SpatialPf")
+            .unwrap()
+            .counters
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (&c["fallback"], &c["index"]),
+            (&false.into(), &"ready".into())
+        );
+    }
+
+    #[test]
     fn the_stores_operation_limit_reaches_queries() {
         let s = Store::in_memory(StoreOptions {
             geo_op_vertices: 9,
@@ -1682,6 +1773,12 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         assert_eq!(ctx.geo.op_vertices(), 9);
         let ctx = super::super::make_ctx(store().snapshot(), &QueryOptions::default(), None, None);
         assert_eq!(ctx.geo.op_vertices(), 2_000_000);
+        // a union of two 5-point polygons is over a limit of 9 vertices: unbound
+        let q = format!("SELECT ?u {{ BIND(geof:union({GA}, {GC}) AS ?u) }}");
+        let u = query(s.snapshot(), &format!("{PREFIXES}{q}"), &opts(true)).unwrap();
+        assert_eq!(names(&u), ["UNDEF"]);
+        let u = run(&store(), &q).unwrap();
+        assert!(names(&u)[0].contains("POLYGON"), "{:?}", names(&u));
     }
 
     #[test]
@@ -1698,5 +1795,21 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         )
         .unwrap();
         assert_eq!(select(&s, "SELECT ?f { ?f a ex:Northern }"), ["p5"]);
+        // with the index: the transaction's own view runs without it
+        s.enable_geo(GeoConfig::default()).unwrap();
+        super::super::update::update(
+            &s,
+            &format!(
+                "{PREFIXES} INSERT DATA {{ ex:p6 geo:hasGeometry ex:g6 . \
+                 ex:g6 geo:asWKT \"POINT(1 -80)\"^^geo:wktLiteral }} ; \
+                 INSERT {{ ?f a ex:Southern }} WHERE {{ ?f spatial:south (-75 0) }} ; \
+                 INSERT {{ ?g a ex:Polar }} WHERE {{ ?g geo:asWKT ?w \
+                   FILTER(geof:sfIntersects(?w, \"LINESTRING(-180 -80, 180 -80)\"^^geo:wktLiteral)) }}"
+            ),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(select(&s, "SELECT ?f { ?f a ex:Southern }"), ["p6"]);
+        assert_eq!(select(&s, "SELECT ?g { ?g a ex:Polar }"), ["g6"]);
     }
 }
