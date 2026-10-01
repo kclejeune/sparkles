@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.org/>
+SELECT * {
+  ?s a ex:C ; ex:p 1, -2.5, 3e0 ; ; ex:q "x"@en-GB, "y"^^ex:dt, 'z', """long""", true ;
+  ex:b _:label, [], [ ex:p ?o ; ex:q [ ex:r () ] ] .
+  [ ex:p ?o ] .
+  [ ex:p ?o ] ex:q ?r .
+  ( 1 ?x ( ex:a ) [ ex:p 2 ] ) ex:p ( ) .
+  () ex:p ?o .
+  _:b ex:p "a" ; .
+}

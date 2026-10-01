@@ -1,0 +1,26 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  DescribeQuery
+    DescribeClause
+      Kw(Describe) "DESCRIBE"
+      Var1 "?s"
+      PnameLn "ex:thing"
+      IriRef "<http://example.org/other>"
+    DatasetClause
+      Kw(From) "FROM"
+      PnameLn "ex:g"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            Kw(A) "a"
+            Object
+              PnameLn "ex:C"
+        RBrace "}"

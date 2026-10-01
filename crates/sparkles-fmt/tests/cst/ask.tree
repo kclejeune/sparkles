@@ -1,0 +1,24 @@
+QueryUnit
+  AskQuery
+    Kw(Ask) "ASK"
+    DatasetClause
+      Kw(From) "FROM"
+      Kw(Named) "NAMED"
+      IriRef "<http://example.org/g>"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        GraphPattern
+          Kw(Graph) "GRAPH"
+          Var1 "?g"
+          GroupGraphPattern
+            LBrace "{"
+            TriplesStmt
+              Var1 "?s"
+              PropertyListEntry
+                Var1 "?p"
+                Object
+                  Var1 "?o"
+            RBrace "}"
+        RBrace "}"

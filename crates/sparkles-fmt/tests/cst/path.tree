@@ -1,0 +1,138 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "rdfs:"
+      IriRef "<http://www.w3.org/2000/01/rdf-schema#>"
+  SelectQuery
+    SelectClause
+      Kw(Select) "SELECT"
+      Star "*"
+    WhereClause
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathSequence
+              Kw(A) "a"
+              Slash "/"
+              PathElt
+                PnameLn "rdfs:subClassOf"
+                Star "*"
+            Object
+              Var1 "?c"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathInverse
+              Hat "^"
+              PnameLn "ex:p"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathElt
+              PathBracketed
+                LParen "("
+                PathAlternative
+                  PnameLn "ex:a"
+                  Pipe "|"
+                  PnameLn "ex:b"
+                RParen ")"
+              Plus "+"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathAlternative
+              PnameLn "ex:a"
+              Pipe "|"
+              PathSequence
+                PnameLn "ex:b"
+                Slash "/"
+                PnameLn "ex:c"
+              Pipe "|"
+              PathInverse
+                Hat "^"
+                PathElt
+                  PnameLn "ex:d"
+                  Question "?"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathNegated
+              Bang "!"
+              LParen "("
+              Kw(A) "a"
+              Pipe "|"
+              PathInverse
+                Hat "^"
+                Kw(A) "a"
+              Pipe "|"
+              PnameLn "ex:p"
+              RParen ")"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathNegated
+              Bang "!"
+              PathInverse
+                Hat "^"
+                PnameLn "ex:p"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathNegated
+              Bang "!"
+              PnameLn "ex:p"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PathBracketed
+              LParen "("
+              PathBracketed
+                LParen "("
+                PnameLn "ex:p"
+                RParen ")"
+              RParen ")"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            Var1 "?var"
+            Object
+              Var1 "?o"
+            Semicolon ";"
+          PropertyListEntry
+            PathSequence
+              PnameLn "ex:p"
+              Slash "/"
+              PnameLn "ex:q"
+            Object
+              Var1 "?o2"
+          Dot "."
+        RBrace "}"
