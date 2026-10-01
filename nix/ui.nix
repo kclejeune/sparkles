@@ -1,4 +1,5 @@
-# Static SvelteKit build of the web UI (served by the server under /ui/).
+# Static SvelteKit build of the web UI (served by the server under /ui/). With `fmtWasm`
+# (nix/fmt-wasm.nix) it formats in the browser; without, through POST /$/format.
 {
   lib,
   stdenvNoCC,
@@ -6,6 +7,7 @@
   pnpm_10,
   fetchPnpmDeps,
   pnpmConfigHook,
+  fmtWasm ? null,
 }:
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "sparkles-ui";
@@ -18,6 +20,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
         (lib.fileset.maybeMissing ../ui/node_modules)
         (lib.fileset.maybeMissing ../ui/build)
         (lib.fileset.maybeMissing ../ui/.svelte-kit)
+        # a local `mise run ui:wasm` build (`fmtWasm` is this package's)
+        (lib.fileset.maybeMissing ../ui/src/lib/wasm)
         # documentation edits do not rebuild the UI (and the server that embeds it)
         ../ui/README.md
         # the Playwright tests and their output are not part of the build
@@ -41,6 +45,11 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     fetcherVersion = 4;
     hash = "sha256-yoW2EwJhi6qeFvxidWX8AaTHbd6OH1q9Ghh1e/UCjaY=";
   };
+
+  preBuild = lib.optionalString (fmtWasm != null) ''
+    mkdir -p src/lib/wasm
+    cp ${fmtWasm}/* src/lib/wasm/
+  '';
 
   buildPhase = ''
     runHook preBuild
