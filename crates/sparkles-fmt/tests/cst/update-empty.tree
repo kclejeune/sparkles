@@ -1,0 +1,6 @@
+UpdateUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"

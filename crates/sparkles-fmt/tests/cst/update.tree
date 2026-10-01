@@ -1,0 +1,241 @@
+UpdateUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex2:"
+      IriRef "<http://example.org/2/>"
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  LoadOp
+    Kw(Load) "LOAD"
+    Kw(Silent) "SILENT"
+    IriRef "<http://example.org/data>"
+    Kw(Into) "INTO"
+    Kw(Graph) "GRAPH"
+    PnameLn "ex:g"
+  Semicolon ";"
+  LoadOp
+    Kw(Load) "LOAD"
+    IriRef "<http://example.org/data>"
+  Semicolon ";"
+  ClearOp
+    Kw(Clear) "CLEAR"
+    Kw(Silent) "SILENT"
+    Kw(Graph) "GRAPH"
+    PnameLn "ex:g"
+  Semicolon ";"
+  ClearOp
+    Kw(Clear) "CLEAR"
+    Kw(Default) "DEFAULT"
+  Semicolon ";"
+  DropOp
+    Kw(Drop) "DROP"
+    Kw(Named) "NAMED"
+  Semicolon ";"
+  DropOp
+    Kw(Drop) "DROP"
+    Kw(All) "ALL"
+  Semicolon ";"
+  CreateOp
+    Kw(Create) "CREATE"
+    Kw(Silent) "SILENT"
+    Kw(Graph) "GRAPH"
+    PnameLn "ex:g"
+  Semicolon ";"
+  AddOp
+    Kw(Add) "ADD"
+    Kw(Silent) "SILENT"
+    Kw(Default) "DEFAULT"
+    Kw(To) "TO"
+    Kw(Graph) "GRAPH"
+    PnameLn "ex:g"
+  Semicolon ";"
+  MoveOp
+    Kw(Move) "MOVE"
+    PnameLn "ex:a"
+    Kw(To) "TO"
+    Kw(Default) "DEFAULT"
+  Semicolon ";"
+  CopyOp
+    Kw(Copy) "COPY"
+    Kw(Graph) "GRAPH"
+    PnameLn "ex:a"
+    Kw(To) "TO"
+    PnameLn "ex:b"
+  Semicolon ";"
+  InsertDataOp
+    Kw(Insert) "INSERT"
+    Kw(Data) "DATA"
+    QuadPattern
+      LBrace "{"
+      TriplesStmt
+        PnameLn "ex:s"
+        PropertyListEntry
+          PnameLn "ex:p"
+          Object
+            BlankNodeLabel "_:b"
+        Dot "."
+      QuadsGraph
+        Kw(Graph) "GRAPH"
+        PnameLn "ex:g"
+        LBrace "{"
+        TriplesStmt
+          PnameLn "ex:s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              BNodePropertyList
+                LBracket "["
+                PropertyListEntry
+                  PnameLn "ex:q"
+                  Object
+                    Integer "1"
+                RBracket "]"
+        RBrace "}"
+      Dot "."
+      TriplesStmt
+        PnameLn "ex:t"
+        PropertyListEntry
+          PnameLn "ex:p"
+          Object
+            Collection
+              LParen "("
+              CollectionItem
+                Integer "1"
+              CollectionItem
+                Integer "2"
+              RParen ")"
+      RBrace "}"
+  Semicolon ";"
+  DeleteDataOp
+    Kw(Delete) "DELETE"
+    Kw(Data) "DATA"
+    QuadPattern
+      LBrace "{"
+      TriplesStmt
+        PnameLn "ex:s"
+        PropertyListEntry
+          PnameLn "ex:p"
+          Object
+            String2 "\"o\""
+      QuadsGraph
+        Kw(Graph) "GRAPH"
+        PnameLn "ex:g"
+        LBrace "{"
+        RBrace "}"
+      RBrace "}"
+  Semicolon ";"
+  DeleteWhereOp
+    Kw(Delete) "DELETE"
+    Kw(Where) "WHERE"
+    QuadPattern
+      LBrace "{"
+      TriplesStmt
+        Var1 "?s"
+        PropertyListEntry
+          PnameLn "ex2:p"
+          Object
+            Var1 "?o"
+        Dot "."
+      QuadsGraph
+        Kw(Graph) "GRAPH"
+        Var1 "?g"
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            Var1 "?p"
+            Object
+              Var1 "?o"
+        RBrace "}"
+      RBrace "}"
+  Semicolon ";"
+  ModifyOp
+    WithClause
+      Kw(With) "WITH"
+      PnameLn "ex:g"
+    DeleteClause
+      Kw(Delete) "DELETE"
+      QuadPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+        RBrace "}"
+    InsertClause
+      Kw(Insert) "INSERT"
+      QuadPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              BlankNodeLabel "_:new"
+        RBrace "}"
+    UsingClause
+      Kw(Using) "USING"
+      PnameLn "ex:u"
+    UsingClause
+      Kw(Using) "USING"
+      Kw(Named) "NAMED"
+      PnameLn "ex:v"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+        RBrace "}"
+  Semicolon ";"
+  ModifyOp
+    InsertClause
+      Kw(Insert) "INSERT"
+      QuadPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Var1 "?o"
+        RBrace "}"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        RBrace "}"
+  Semicolon ";"
+  ModifyOp
+    DeleteClause
+      Kw(Delete) "DELETE"
+      QuadPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Var1 "?o"
+        RBrace "}"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Var1 "?o"
+        RBrace "}"
+  Semicolon ";"

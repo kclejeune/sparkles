@@ -1,0 +1,71 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  SelectQuery
+    SelectClause
+      Kw(Select) "SELECT"
+      Star "*"
+    WhereClause
+      GroupGraphPattern
+        LBrace "{"
+        InlineValues
+          Kw(Values) "VALUES"
+          LParen "("
+          Var1 "?a"
+          Var2 "$b"
+          RParen ")"
+          LBrace "{"
+          ValuesRow
+            LParen "("
+            DataValue
+              PnameLn "ex:a"
+            DataValue
+              Literal
+                String2 "\"b\""
+                LangDir "@en"
+            RParen ")"
+          ValuesRow
+            LParen "("
+            DataValue
+              Kw(Undef) "UNDEF"
+            DataValue
+              Integer "1"
+            RParen ")"
+          ValuesRow
+            LParen "("
+            DataValue
+              TripleTerm
+                LtLtParen "<<("
+                PnameLn "ex:s"
+                Kw(A) "a"
+                String2 "\"o\""
+                ParenGtGt ")>>"
+            DataValue
+              Kw(False) "false"
+            RParen ")"
+          RBrace "}"
+        InlineValues
+          Kw(Values) "VALUES"
+          Nil "()"
+          LBrace "{"
+          ValuesRow
+            Nil "()"
+          ValuesRow
+            Nil "()"
+          RBrace "}"
+        InlineValues
+          Kw(Values) "VALUES"
+          Var1 "?x"
+          LBrace "{"
+          RBrace "}"
+        RBrace "}"
+    ValuesClause
+      Kw(Values) "VALUES"
+      Nil "( )"
+      LBrace "{"
+      ValuesRow
+        Nil "( )"
+      RBrace "}"

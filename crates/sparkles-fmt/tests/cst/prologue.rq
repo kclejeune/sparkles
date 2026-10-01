@@ -1,0 +1,8 @@
+# comments and blank lines are trivia, outside the tree
+VERSION "1.2"
+BASE <http://example.org/>
+PREFIX ex: <http://example.org/ns#>
+PREFIX : <http://example.org/default#>
+base <relative/>
+
+ASK {}

@@ -1,0 +1,16 @@
+QueryUnit
+  SelectQuery
+    SelectClause
+      Kw(Select) "SELECT"
+      Kw(Reduced) "REDUCED"
+      Star "*"
+    WhereClause
+      GroupGraphPattern
+        LBrace "{"
+        RBrace "}"
+    Offset
+      Kw(Offset) "OFFSET"
+      Integer "1"
+    Limit
+      Kw(Limit) "LIMIT"
+      Integer "2"

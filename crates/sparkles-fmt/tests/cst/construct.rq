@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+CONSTRUCT { ?s ex:p ?o . ?o a ex:C }
+FROM <http://example.org/g>
+WHERE { ?s ex:q ?o }
+ORDER BY ?s
+LIMIT 3
