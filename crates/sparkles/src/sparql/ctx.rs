@@ -59,10 +59,14 @@ pub struct Optimizations {
     pub selective_columns: bool,
     /// spatial FILTERs on an indexed predicate's object search the spatial index
     pub spatial_pushdown: bool,
+    /// a spatial FILTER between the geometries of two join components joins them
+    pub spatial_join: bool,
+    /// ORDER BY a distance to a constant with LIMIT searches the nearest geometries
+    pub spatial_knn: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 9] = [
+    pub const NAMES: [&str; 11] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -72,6 +76,8 @@ impl Optimizations {
         "ordered_topk",
         "selective_columns",
         "spatial_pushdown",
+        "spatial_join",
+        "spatial_knn",
     ];
 
     /// Everything on.
@@ -85,6 +91,8 @@ impl Optimizations {
         ordered_topk: true,
         selective_columns: true,
         spatial_pushdown: true,
+        spatial_join: true,
+        spatial_knn: true,
     };
 
     /// Everything off: the generic operators only.
@@ -98,6 +106,8 @@ impl Optimizations {
         ordered_topk: false,
         selective_columns: false,
         spatial_pushdown: false,
+        spatial_join: false,
+        spatial_knn: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -111,6 +121,8 @@ impl Optimizations {
             "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
+            "spatial_join" => &mut self.spatial_join,
+            "spatial_knn" => &mut self.spatial_knn,
             _ => return None,
         })
     }

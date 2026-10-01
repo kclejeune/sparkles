@@ -683,6 +683,9 @@ pub struct StoreOptions {
     /// Largest sum of input vertices of one geometry operation (overlay, buffer, hull,
     /// relate); larger ones are a type error.
     pub geo_op_vertices: u64,
+    /// Honour `queryRewrite` of a dataset's `geo.json`; `false` never rewrites
+    /// topological properties (`serve --no-geo-rewrite`).
+    pub geo_query_rewrite: bool,
 }
 
 /// Default of [`StoreOptions::max_prefixes`].
@@ -711,6 +714,7 @@ impl Default for StoreOptions {
             max_prefixes: DEFAULT_MAX_PREFIXES,
             geo_budget_bytes: 4 << 30,
             geo_op_vertices: 2_000_000,
+            geo_query_rewrite: true,
         }
     }
 }

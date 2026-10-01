@@ -149,6 +149,23 @@ impl GeoConfig {
         h.finish()
     }
 
+    /// FNV-1a of the fields that decide what is indexed (predicates, graphs, `wgs84`,
+    /// the size limits, the format version): the identity of persisted index files, which
+    /// a change of distance model, feature links or query rewrite leaves valid.
+    pub fn index_hash(&self) -> u64 {
+        let key = serde_json::json!([
+            self.predicates,
+            self.graphs,
+            self.wgs84,
+            self.max_geometry_bytes,
+            self.max_vertices,
+            self.format_version,
+        ]);
+        let mut h = super::Fnv::new();
+        h.bytes(&serde_json::to_vec(&key).expect("serializable"));
+        h.finish()
+    }
+
     /// Whether quads of graph `g` (an IRI; [`crate::text::DEFAULT_GRAPH_IRI`] for the
     /// default graph) are indexed.
     pub fn graph_in_scope(&self, g: &str) -> bool {
@@ -361,6 +378,13 @@ mod tests {
             ..GeoConfig::default()
         };
         assert_ne!(a.hash(), b.hash());
+        // the distance model does not change what is indexed; the predicates do
+        assert_eq!(a.index_hash(), b.index_hash());
+        let c = GeoConfig {
+            predicates: vec![vocab::AS_WKT.into()],
+            ..GeoConfig::default()
+        };
+        assert_ne!(a.index_hash(), c.index_hash());
     }
 
     #[test]

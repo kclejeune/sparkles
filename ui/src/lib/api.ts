@@ -64,6 +64,8 @@ export type ServerInfo = {
   limits?: Limits;
   /** Absent on servers that predate it. */
   readOnly?: boolean;
+  /** The MapLibre style of maps (`serve --map-style-url`); null: the bundled basemap. */
+  mapStyleUrl?: string | null;
 };
 
 /** `GET /$/ready` (the same document with status 503 when not ready). */
@@ -1243,6 +1245,88 @@ export type GeoStatus = {
   formatVersion: number;
   lastBuild?: { at: string; ms: number; rows: number };
 };
+
+/**
+ * `GET /$/geo/{ds}`: the spatial index status, or null when the index is disabled for
+ * the dataset. Throws an ApiError with status 501 on servers built without GeoSPARQL.
+ */
+export async function geoStatus(ds: string, signal?: AbortSignal): Promise<GeoStatus | null> {
+  const body = await json<GeoStatus | { enabled: false }>(`/$/geo/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body && body.enabled ? body : null;
+}
+
+/** Enable or reconfigure the spatial index; the index is built by the returned task. */
+export const geoConfigure = (ds: string, config: GeoConfig = {}) =>
+  json<Task>(`/$/geo/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+/** Disable the spatial index (removes geo.json). */
+export const geoDisable = (ds: string) => json<unknown>(`/$/geo/${enc(ds)}`, { method: 'DELETE' });
+
+/** Rebuild the index from the current data (`409` while a build runs). */
+export const geoRebuild = (ds: string) =>
+  json<Task>(`/$/geo/${enc(ds)}/rebuild`, { method: 'POST' });
+
+/** A GeoJSON geometry in CRS84 (longitude, latitude). */
+export type GeoJsonGeometry = {
+  type: string;
+  coordinates?: unknown;
+  geometries?: GeoJsonGeometry[];
+};
+
+/** An indexed geometry of `GET /{ds}/geo`; `id` is the row's subject. */
+export type GeoFeature = {
+  type: 'Feature';
+  id: string;
+  geometry: GeoJsonGeometry;
+  properties: { subject: string; feature?: string; graph: string | null; predicate: string };
+};
+
+export type GeoFeatureCollection = {
+  type: 'FeatureCollection';
+  features: GeoFeature[];
+  /** More geometries meet the box than `limit`. */
+  truncated: boolean;
+};
+
+export type GeoBoxQuery = {
+  /** [minLon, minLat, maxLon, maxLat] in degrees. */
+  bbox: [number, number, number, number];
+  graph?: string;
+  predicate?: string;
+  /** Default 5,000, at most 50,000. */
+  limit?: number;
+  /** Simplification tolerance in degrees; default the box width / 1024. */
+  tolerance?: number;
+};
+
+/** `GET /{ds}/geo`: the indexed geometries meeting a box, simplified for its scale. */
+export function geoBox(ds: string, q: GeoBoxQuery, signal?: AbortSignal) {
+  const p = new URLSearchParams({ bbox: q.bbox.join(',') });
+  if (q.graph) p.set('graph', q.graph);
+  if (q.predicate) p.set('predicate', q.predicate);
+  if (q.limit != null) p.set('limit', String(q.limit));
+  if (q.tolerance != null) p.set('tolerance', String(q.tolerance));
+  return json<GeoFeatureCollection>(`/${enc(ds)}/geo?${p}`, { signal });
+}
+
+/** One literal's outcome of `POST /$/geo/convert`. */
+export type GeoConverted = { geometry: GeoJsonGeometry } | { error: string };
+
+/** `POST /$/geo/convert`: geometry literals as CRS84 GeoJSON, in order. */
+export const geoConvert = (literals: { value: string; datatype: string }[], signal?: AbortSignal) =>
+  json<{ results: GeoConverted[] }>(`/$/geo/convert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ literals }),
+    signal,
+  });
 
 // --- full-text search --------------------------------------------------------------
 

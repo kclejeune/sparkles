@@ -31,6 +31,9 @@ const SQUARE_METRE: Unit = Unit {
 
 /// Evaluate the GeoSPARQL function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
+    if iri.starts_with(super::vocab::SPATIALF) {
+        return super::spatialf::call(iri, args, row, ctx);
+    }
     let local = iri.strip_prefix(GEOF)?;
     let f = Call { args, row, ctx };
     if let Some(r) = Relation::from_local(local) {

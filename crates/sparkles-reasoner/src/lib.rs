@@ -14,10 +14,12 @@
 mod builtins;
 pub mod diagnostics;
 mod engine;
+pub mod extras;
 mod graph;
 pub mod parser;
 mod terms;
 
+pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
@@ -234,6 +236,17 @@ impl Derivation {
             && self.terms.kind(t[1]) == Kind::Iri
             && self.terms.kind(t[2]) != Kind::Other
     }
+}
+
+/// [`materialize`] with the vocabularies and switches of `extras` added to the profile.
+pub fn materialize_with(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    opts: &ReasonOptions,
+) -> anyhow::Result<ReasonReport> {
+    extras.validate()?;
+    materialize(store, profile, opts)
 }
 
 /// Clear [`INFERRED_GRAPH`], run the rules over the default graph, and write every

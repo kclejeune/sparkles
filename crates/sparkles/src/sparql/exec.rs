@@ -362,6 +362,27 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             counters = Some(c);
             t
         }
+        Kind::SpatialJoin(spec) => {
+            let mut inputs = Vec::with_capacity(n.children.len());
+            for i in 0..n.children.len() {
+                inputs.push(child(i, &mut infos)?);
+            }
+            let (t, c) = spatial_join(ctx, spec, inputs, &n.vars)?;
+            counters = Some(c);
+            t
+        }
+        Kind::SpatialKnn(spec) => {
+            // the template runs once per batch of candidates
+            let (t, c, runs) = spatial_knn(ctx, spec, &n.children[0], &n.vars)?;
+            infos.extend(runs);
+            counters = Some(c);
+            t
+        }
+        Kind::SpatialRelate(spec) => {
+            let (t, c) = spatial_relate(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::Service {
             endpoint,
             query,
@@ -2284,7 +2305,9 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
             // SPARQL 1.1: the result is a simple literal (language tags are dropped)
             Some(Value::Str(parts.join(sep).into()))
         }
-        AggregateFunction::Custom(_) => None,
+        AggregateFunction::Custom(iri) => {
+            return super::aggext::aggregate(ctx, iri.as_str(), &vals);
+        }
     };
     result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
 }
@@ -2667,6 +2690,12 @@ fn path(
 /// Exact top-k vector search (`spk:vectorSearch`).
 #[cfg(feature = "geo")]
 use crate::geo::exec::{spatial_pf, spatial_scan};
+#[cfg(feature = "geo")]
+use crate::geo::join::spatial_join;
+#[cfg(feature = "geo")]
+use crate::geo::knn::spatial_knn;
+#[cfg(feature = "geo")]
+use crate::geo::rewrite::spatial_relate;
 
 #[cfg(not(feature = "geo"))]
 type Counters = serde_json::Map<String, serde_json::Value>;
@@ -2682,6 +2711,35 @@ fn spatial_scan(
 
 #[cfg(not(feature = "geo"))]
 fn spatial_pf(_: &Ctx, _: &super::geopf::SpatialPfSpec, _: &[VarId]) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_join(
+    _: &Ctx,
+    _: &super::geojoin::SpatialJoinSpec,
+    _: Vec<Table>,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_knn(
+    _: &Ctx,
+    _: &super::geojoin::SpatialKnnSpec,
+    _: &Node,
+    _: &[VarId],
+) -> Result<(Table, Counters, Vec<PlanInfo>)> {
+    Err(crate::geo::not_built())
+}
+
+#[cfg(not(feature = "geo"))]
+fn spatial_relate(
+    _: &Ctx,
+    _: &super::georewrite::SpatialRelateSpec,
+    _: &[VarId],
+) -> Result<(Table, Counters)> {
     Err(crate::geo::not_built())
 }
 
