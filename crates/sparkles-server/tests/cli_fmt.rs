@@ -639,17 +639,6 @@ fn documents_over_max_bytes_are_refused() {
 }
 
 #[test]
-fn the_language_server_is_not_available_yet() {
-    let o = Command::new(BIN).args(["lsp", "--stdio"]).output().unwrap();
-    assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("sparkles lsp is not available yet"),
-        "{}",
-        stderr(&o)
-    );
-}
-
-#[test]
 fn refused_output_is_never_written() {
     let d = tempdir();
     let dir = d.path();

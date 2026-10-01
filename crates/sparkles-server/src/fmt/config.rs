@@ -63,6 +63,16 @@ impl Source {
     }
 }
 
+/// The options of a file in `dir` (an absolute directory) from the nearest config file,
+/// read afresh (so an edited file takes effect at once), or the defaults when there is
+/// none. The error names the file by its absolute path. For `sparkles lsp`.
+pub(crate) fn options_for_dir(dir: &Path) -> Result<Options, String> {
+    match discover(Path::new(""), &mut HashMap::new(), dir) {
+        None => Ok(Options::default()),
+        Some(c) => c.options.clone(),
+    }
+}
+
 /// The nearest config file at or above `dir`, remembering the answer for every directory
 /// on the way up.
 fn discover(
