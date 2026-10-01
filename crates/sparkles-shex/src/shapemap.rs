@@ -1,18 +1,28 @@
 //! Shape maps: the compact syntax (ShapeMap draft plus Jena's `BASE`/`PREFIX`
 //! directives, commas, a trailing `.` and `a`), the JSON syntax, and the expansion of a
 //! query map into a fixed map over the data graph.
+//!
+//! `SPARQL """…"""` selectors (an extension from other ShEx tools) are checked when the
+//! map is parsed (a SELECT query that projects a variable, without SERVICE; its prefixes
+//! and base are its own, none come from the map or the schema) and run on the data graph
+//! when the map is expanded.
 
 use crate::ir::PairKind;
 use crate::{
     Association, CompiledSchema, NodeSelector, ParseError, PrefixMap, SchemaError, ShapeLabel,
-    ShapeMap,
+    ShapeMap, ValidateOptions,
 };
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use rustc_hash::FxHashSet;
-use sparkles::id::Id;
+use spargebra::Query;
+use spargebra::algebra::GraphPattern;
+use spargebra::term::Variable;
+use sparkles::id::{Id, Tag};
+use sparkles::sparql::ctx::DEFAULT_GRAPH_IRI;
 use sparkles::store::parse_bnode_label;
 use sparkles::validation::DataGraph;
+use std::time::Instant;
 
 /// Parse the compact syntax (see [`ShapeMap::parse`]).
 pub fn parse(text: &str, prefixes: &PrefixMap, base: Option<&str>) -> Result<ShapeMap, ParseError> {
@@ -163,10 +173,16 @@ impl<'a> Parser<'a> {
         self.error_at(self.pos, msg)
     }
 
-    fn error_at(&self, pos: usize, msg: impl Into<String>) -> ParseError {
+    /// The 1-based line and column of a position.
+    fn place(&self, pos: usize) -> (usize, usize) {
         let before = &self.src[..pos.min(self.src.len())];
         let line = before.matches('\n').count() + 1;
         let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        (line, column)
+    }
+
+    fn error_at(&self, pos: usize, msg: impl Into<String>) -> ParseError {
+        let (line, column) = self.place(pos);
         let mut msg = msg.into();
         match self.src[pos.min(self.src.len())..].chars().next() {
             Some(c) => msg.push_str(&format!(", found '{c}'")),
@@ -269,12 +285,18 @@ impl<'a> Parser<'a> {
         if self.eat('{') {
             return self.pattern();
         }
+        let start = self.pos;
         if self.keyword("sparql") {
             self.ws();
             if !matches!(self.peek(), Some('"' | '\'')) {
                 return Err(self.error("expected the query of a SPARQL selector as a string"));
             }
-            return Ok(NodeSelector::Sparql(self.string()?));
+            let q = self.string()?;
+            if let Err(m) = selector_query(&q) {
+                let (line, column) = self.place(start);
+                return Err(ParseError::new(m, line, column));
+            }
+            return Ok(NodeSelector::Sparql(q));
         }
         Ok(NodeSelector::Term(self.object_term()?))
     }
@@ -670,14 +692,148 @@ pub fn label_kind(schema: &CompiledSchema, label: &ShapeLabel) -> Result<PairKin
     }
 }
 
+/// Check the query of a `SPARQL` selector, and parse it: a SELECT query that projects a
+/// variable and has no SERVICE. It has no prefixes or base IRI but its own.
+pub fn selector_query(q: &str) -> Result<Query, String> {
+    let parsed = sparkles::sparql::parse_query(q, None, &[])
+        .map_err(|e| format!("invalid SPARQL selector query: {e}"))?;
+    let Query::Select { pattern, .. } = &parsed else {
+        return Err("a SPARQL selector's query is a SELECT query".into());
+    };
+    if projected(pattern).is_empty() {
+        return Err("a SPARQL selector's query projects no variable".into());
+    }
+    if has_service(pattern) {
+        return Err("SERVICE is not allowed in a SPARQL selector".into());
+    }
+    Ok(parsed)
+}
+
+fn projected(p: &GraphPattern) -> &[Variable] {
+    match p {
+        GraphPattern::Project { variables, .. } => variables,
+        GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => projected(inner),
+        _ => &[],
+    }
+}
+
+fn has_service(p: &GraphPattern) -> bool {
+    use GraphPattern as G;
+    match p {
+        G::Service { .. } => true,
+        G::Join { left, right }
+        | G::LeftJoin { left, right, .. }
+        | G::Union { left, right }
+        | G::Minus { left, right } => has_service(left) || has_service(right),
+        G::Filter { inner, .. }
+        | G::Graph { inner, .. }
+        | G::Extend { inner, .. }
+        | G::OrderBy { inner, .. }
+        | G::Project { inner, .. }
+        | G::Distinct { inner }
+        | G::Reduced { inner }
+        | G::Slice { inner, .. }
+        | G::Group { inner, .. } => has_service(inner),
+        _ => false,
+    }
+}
+
+/// The nodes a `SPARQL` selector selects: the bindings of `?focus`, or of the first
+/// projected variable, in the order of the solutions (unbound ones skipped), with their
+/// store ids. The query's default graph is the data graph (and it has no named graphs);
+/// it runs with the budgets of [`ValidateOptions::selector_query`], the validation's
+/// cancel flag and what is left of its time, and never runs SERVICE. Timeouts,
+/// cancellation and budgets are [`sparkles::Error`]s; other failures [`SchemaError`]s.
+fn sparql_nodes(
+    q: &str,
+    data: &DataGraph,
+    opts: &ValidateOptions,
+    deadline: Option<Instant>,
+) -> anyhow::Result<Vec<(Term, Option<Id>)>> {
+    let parsed = selector_query(q).map_err(SchemaError::new)?;
+    let snap = &data.snap;
+    // the graphs of the data graph by name (the store's default graph included, which
+    // `urn:x-arq:UnionGraph` would leave out)
+    let default_graph_uris: Vec<String> = data
+        .sel
+        .ids(snap)?
+        .into_iter()
+        .filter_map(|g| {
+            if g == Id::DEFAULT_GRAPH {
+                return Some(DEFAULT_GRAPH_IRI.to_string());
+            }
+            match snap.term(g)? {
+                Term::NamedNode(n) => Some(n.into_string()),
+                _ => None,
+            }
+        })
+        .collect();
+    if default_graph_uris.is_empty() {
+        // no default graph given would be the store's
+        return Ok(Vec::new());
+    }
+    let base = opts.selector_query.clone().unwrap_or_default();
+    let qo = sparkles::sparql::QueryOptions {
+        timeout: deadline.map(|d| d.saturating_duration_since(Instant::now())),
+        cancel: opts.cancel.clone(),
+        default_graph_uris,
+        named_graph_uris: Vec::new(),
+        default_graph_extra: Vec::new(),
+        initial_bindings: Vec::new(),
+        prefixes: Vec::new(),
+        base_iri: None,
+        allow_service: false,
+        forbid_service: true,
+        no_cache: true,
+        ..base
+    };
+    let failed = |e: sparkles::Error| -> anyhow::Error {
+        match e {
+            sparkles::Error::Timeout
+            | sparkles::Error::Cancelled
+            | sparkles::Error::BudgetExceeded(_) => e.into(),
+            e => SchemaError::new(format!("the SPARQL selector failed: {e}")).into(),
+        }
+    };
+    let mut r = sparkles::sparql::execute_query(snap.clone(), &parsed, &qo, 0.0).map_err(failed)?;
+    sparkles::sparql::select_star_order(q, &mut r);
+    let Some(col) = r
+        .vars
+        .iter()
+        .position(|v| v == "focus")
+        .or((!r.vars.is_empty()).then_some(0))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for &id in &r.table.cols[col] {
+        let Some(t) = r.term(id) else {
+            continue;
+        };
+        // values the query computed have no store ids, though the store may hold them
+        let sid = if matches!(id.tag(), Tag::Local | Tag::Undef) {
+            snap.lookup_term(&t)
+        } else {
+            Some(id)
+        };
+        out.push((t, sid));
+    }
+    Ok(out)
+}
+
 /// The fixed map of a query map: each selector expanded over the data graph, the
 /// associations deduplicated per (node, label) in first-seen order; and the warnings
 /// (blank-node labels that select nothing). A label the schema does not define, or
-/// START without a start shape, is a [`crate::SchemaError`].
+/// START without a start shape, is a [`crate::SchemaError`]. `SPARQL` selectors run as
+/// [`sparql_nodes`] says, until `deadline`.
 pub fn expand(
     map: &ShapeMap,
     data: &DataGraph,
     schema: &CompiledSchema,
+    opts: &ValidateOptions,
+    deadline: Option<Instant>,
 ) -> anyhow::Result<(Vec<FixedEntry>, Vec<String>)> {
     let snap = &data.snap;
     let mut out = Vec::new();
@@ -740,8 +896,10 @@ pub fn expand(
                     }
                 }
             }
-            NodeSelector::Sparql(_) => {
-                return Err(SchemaError::new("SPARQL node selectors are not supported yet").into());
+            NodeSelector::Sparql(q) => {
+                for (t, id) in sparql_nodes(q, data, opts, deadline)? {
+                    push(&mut out, t, id, a, kind);
+                }
             }
         }
     }
@@ -1026,7 +1184,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (fixed, warnings) = expand(&map, &data, &schema).unwrap();
+        let (fixed, warnings) = expand(&map, &data, &schema, &Default::default(), None).unwrap();
         let n = names(&fixed);
         // {FOCUS a ex:Person} in the default graph; ex:alice again is a duplicate
         assert_eq!(sorted(n[..2].to_vec()), ["alice", "bob"]);
@@ -1053,13 +1211,13 @@ mod tests {
         // over a named graph, and the union of all graphs
         let g1 = DataGraph::new(snap.clone(), Some(&ex("g1")), &[], &[]).unwrap();
         let map = parse("{FOCUS a ex:Person}@ex:Person", &schema_prefixes(), None).unwrap();
-        let (fixed, _) = expand(&map, &g1, &schema).unwrap();
+        let (fixed, _) = expand(&map, &g1, &schema, &Default::default(), None).unwrap();
         assert_eq!(names(&fixed), ["carol"]);
         let all = DataGraph::new(snap.clone(), Some("urn:x-arq:UnionGraph"), &[], &[]).unwrap();
-        let (fixed, _) = expand(&map, &all, &schema).unwrap();
+        let (fixed, _) = expand(&map, &all, &schema, &Default::default(), None).unwrap();
         assert_eq!(sorted(names(&fixed)), ["alice", "bob", "carol"]);
         let map = parse("{_ ex:knows FOCUS}@ex:Person", &schema_prefixes(), None).unwrap();
-        let (fixed, _) = expand(&map, &g1, &schema).unwrap();
+        let (fixed, _) = expand(&map, &g1, &schema, &Default::default(), None).unwrap();
         assert_eq!(names(&fixed), ["dave"]);
     }
 
@@ -1077,7 +1235,8 @@ mod tests {
         let label = sparkles::store::bnode_for(b);
         let text = format!("_:{}@ex:Person", label.as_str());
         let map = parse(&text, &schema_prefixes(), None).unwrap();
-        let (fixed, warnings) = expand(&map, &data, &schema(false)).unwrap();
+        let (fixed, warnings) =
+            expand(&map, &data, &schema(false), &Default::default(), None).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(fixed[0].id, Some(b));
         // a focus pattern finds the blank node too
@@ -1087,7 +1246,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (fixed, _) = expand(&map, &data, &schema(false)).unwrap();
+        let (fixed, _) = expand(&map, &data, &schema(false), &Default::default(), None).unwrap();
         assert!(fixed.iter().any(|e| e.id == Some(b)), "{fixed:?}");
     }
 
@@ -1098,7 +1257,7 @@ mod tests {
         let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
         let err = |m: &str, start: bool| {
             let map = parse(m, &schema_prefixes(), None).unwrap();
-            expand(&map, &data, &schema(start))
+            expand(&map, &data, &schema(start), &Default::default(), None)
                 .unwrap_err()
                 .downcast::<SchemaError>()
                 .unwrap()
@@ -1106,9 +1265,133 @@ mod tests {
         };
         assert!(err("ex:a@ex:Nope", true).contains("<http://ex.org/Nope>"));
         assert!(err("ex:a@START", false).contains("no start shape"));
-        let sparql = err("SPARQL 'SELECT ?focus {}'@ex:Person", true);
-        assert!(sparql.contains("not supported yet"), "{sparql}");
+        let sparql = err("SPARQL 'SELECT ?focus {}'@ex:Nope", true);
+        assert!(sparql.contains("Nope"), "{sparql}");
         // a label is checked even when its selector selects nothing
         assert!(err("{FOCUS ex:absent _}@ex:Nope", true).contains("Nope"));
+    }
+
+    #[test]
+    fn sparql_selectors_are_checked_when_parsed() {
+        let err = |t: &str| parse(t, &schema_prefixes(), None).unwrap_err();
+        let e = err("ex:a@ex:S,\n  SPARQL 'ASK {}'@ex:S");
+        assert_eq!((e.line, e.column), (2, 3), "{e}");
+        assert!(e.message.contains("SELECT query"), "{e}");
+        let e = err("SPARQL 'SELECT * {}'@ex:S");
+        assert!(e.message.contains("projects no variable"), "{e}");
+        let e = err("SPARQL 'SELECT ?x { SERVICE <http://ex.org/sparql> { ?x ?p ?o } }'@ex:S");
+        assert!(e.message.contains("SERVICE"), "{e}");
+        // the query does not see the map's or the schema's prefixes
+        let e = err("PREFIX ex: <http://ex.org/> SPARQL 'SELECT ?x { ?x a ex:Person }'@ex:S");
+        assert!(e.message.contains("invalid SPARQL selector query"), "{e}");
+        assert_eq!((e.line, e.column), (1, 29), "{e}");
+        let e = err("SPARQL 'SELECT ?x { ?x a '@ex:S");
+        assert!(e.message.contains("invalid SPARQL selector query"), "{e}");
+        // the JSON form too
+        let e =
+            from_json(r#"[{"node": "SPARQL 'ASK {}'", "shape": "http://ex.org/S"}]"#).unwrap_err();
+        assert!(e.message.contains("association 1"), "{e}");
+        let m = from_json(
+            r#"[{"node": "SPARQL \"\"\"SELECT ?x { ?x ?p ?o }\"\"\"", "shape": "http://ex.org/S"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.0[0].node,
+            NodeSelector::Sparql("SELECT ?x { ?x ?p ?o }".into())
+        );
+    }
+
+    #[test]
+    fn sparql_selectors() {
+        let store = store();
+        let snap = store.snapshot();
+        let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
+        let schema = schema(true);
+        let run = |m: &str, data: &DataGraph, opts: &ValidateOptions| {
+            let map = parse(m, &schema_prefixes(), None).unwrap();
+            expand(&map, data, &schema, opts, None).map(|(f, _)| f)
+        };
+        let ok = |m: &str, data: &DataGraph| run(m, data, &Default::default()).unwrap();
+        let person = "SPARQL '''PREFIX ex: <http://ex.org/>
+            SELECT ?focus { ?focus a ex:Person } ORDER BY DESC(?focus)'''@ex:Person";
+        // the solutions' order; the default graph only
+        let fixed = ok(person, &data);
+        assert_eq!(names(&fixed), ["bob", "alice"]);
+        assert!(fixed.iter().all(|e| e.id.is_some()));
+        // deduplicated with the other selectors, in first-seen order
+        let fixed = ok(
+            &format!("ex:alice@ex:Person, {person}, ex:acme@ex:Org"),
+            &data,
+        );
+        assert_eq!(names(&fixed), ["alice", "bob", "acme"]);
+        // the union of all graphs, and a named graph
+        let all = DataGraph::new(snap.clone(), Some("urn:x-arq:UnionGraph"), &[], &[]).unwrap();
+        assert_eq!(names(&ok(person, &all)), ["carol", "bob", "alice"]);
+        let g1 = DataGraph::new(snap.clone(), Some(&ex("g1")), &[], &[]).unwrap();
+        assert_eq!(names(&ok(person, &g1)), ["carol"]);
+        // FROM and GRAPH do not reach past the data graph
+        let fixed = ok(
+            "SPARQL 'SELECT ?x FROM NAMED <http://ex.org/g1> { GRAPH ?g { ?x ?p ?o } }'@ex:Person",
+            &data,
+        );
+        assert!(fixed.is_empty(), "{fixed:?}");
+        // ?focus, else the first projected variable; unbound values are skipped, and
+        // values the store does not hold are absent nodes
+        let fixed = ok(
+            "SPARQL 'SELECT ?y ?focus { VALUES (?y ?focus) { (1 <http://ex.org/alice>) \
+             (2 UNDEF) (3 <http://ex.org/new>) } }'@ex:Person",
+            &data,
+        );
+        assert_eq!(names(&fixed), ["alice", "new"]);
+        assert!(fixed[0].id.is_some() && fixed[1].id.is_none());
+        let fixed = ok(
+            "SPARQL 'SELECT ?x ?y { VALUES (?x ?y) { (\"a\" 1) } }'@ex:Person",
+            &data,
+        );
+        assert_eq!(
+            fixed[0].node,
+            Term::Literal(Literal::new_simple_literal("a"))
+        );
+        // SELECT * takes the variables in the order they appear
+        let fixed = ok(
+            "SPARQL 'SELECT * { VALUES (?b ?a) { (<http://ex.org/bob> <http://ex.org/alice>) } }'@ex:Person",
+            &data,
+        );
+        assert_eq!(names(&fixed), ["bob"]);
+
+        // budgets, the timeout and failures
+        let opts = ValidateOptions {
+            selector_query: Some(sparkles::sparql::QueryOptions {
+                max_rows: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let e = run(person, &data, &opts).unwrap_err();
+        assert!(
+            matches!(
+                e.downcast_ref::<sparkles::Error>(),
+                Some(sparkles::Error::BudgetExceeded(_))
+            ),
+            "{e:#}"
+        );
+        let map = parse(person, &schema_prefixes(), None).unwrap();
+        let past = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let e = expand(&map, &data, &schema, &Default::default(), past).unwrap_err();
+        assert!(
+            matches!(
+                e.downcast_ref::<sparkles::Error>(),
+                Some(sparkles::Error::Timeout)
+            ),
+            "{e:#}"
+        );
+        let e = run(
+            "SPARQL 'SELECT ?x { BIND(<http://ex.org/f>(1) AS ?x) }'@ex:Person",
+            &data,
+            &Default::default(),
+        );
+        if let Err(e) = e {
+            assert!(e.downcast_ref::<SchemaError>().is_some(), "{e:#}");
+        }
     }
 }
