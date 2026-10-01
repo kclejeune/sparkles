@@ -12,11 +12,12 @@ pub mod triples;
 pub mod update;
 pub mod values;
 
-use crate::doc::{DocArena, DocId, Printed};
+use crate::doc::{DocArena, DocId, GroupId, Printed};
 use crate::lex::TokenKind;
+use crate::sparql::keywords::Kw;
 use crate::syntax::NodeKind;
-use crate::tree::{NodeId, Tree};
-use crate::trivia::{CommentRules, Comments};
+use crate::tree::{Element, NodeId, TokenId, Tree};
+use crate::trivia::{self, CommentRules, Comments};
 use crate::{FormatError, Options};
 
 /// What every node printer works with.
@@ -27,11 +28,354 @@ pub struct Ctx<'a, 's> {
     pub comments: &'a Comments,
 }
 
+/// Helpers for the node printers. Build each child's document once with [`Ctx::node`]
+/// (which adds its comments) and reuse the `DocId` when it appears in two branches of an
+/// `if_break`.
 impl Ctx<'_, '_> {
-    /// The node exactly as written.
+    // ------------------------------------------------------------------ nodes ------
+
+    /// Node `n`'s document, with its comments.
+    pub fn node(&mut self, n: NodeId) -> DocId {
+        node(self, n)
+    }
+
+    /// The node exactly as written, comments inside it included. Comments of nodes
+    /// inside it that sit outside its range (the trailing comment of its last element,
+    /// say, when `n` itself takes no comments) go around it.
     pub fn verbatim(&mut self, n: NodeId) -> DocId {
         let r = self.tree.range(n);
-        self.arena.verbatim(r)
+        self.comments.mark_copied(self.tree, r.clone());
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        let mut inside: Vec<NodeId> = self.tree.child_nodes(n).collect();
+        while let Some(d) = inside.pop() {
+            for c in self.comments.own(d) {
+                let start = self.tree.token(c).start as usize;
+                if self.comments.copied(c) || r.contains(&start) {
+                    continue;
+                }
+                match start < r.start {
+                    true => before.push(c),
+                    false => after.push(c),
+                }
+            }
+            inside.extend(self.tree.child_nodes(d));
+        }
+        let v = self.arena.verbatim(r);
+        if before.is_empty() && after.is_empty() {
+            return v;
+        }
+        for v in [&mut before, &mut after] {
+            v.sort();
+            v.dedup();
+        }
+        for &c in before.iter().chain(&after) {
+            self.comments.mark_printed(c);
+        }
+        let mut parts = Vec::new();
+        if !before.is_empty() {
+            parts.push(trivia::comment_lines(
+                &mut self.arena,
+                self.comments,
+                &before,
+            ));
+            parts.push(self.arena.hard_line());
+        }
+        parts.push(v);
+        for c in after {
+            parts.push(trivia::trailing_comment(&mut self.arena, self.comments, c));
+        }
+        self.arena.concat(parts)
+    }
+
+    /// A child element: a node with [`Ctx::node`], a token with [`Ctx::kw`].
+    pub fn element(&mut self, e: Element) -> DocId {
+        match e {
+            Element::Node(c) => self.node(c),
+            Element::Token(t) => self.kw(t),
+        }
+    }
+
+    /// Every child of `n`, one space between: `PREFIX ex: <…>`, `LIMIT 10`,
+    /// `FROM NAMED <g>`, `LOAD SILENT <x> INTO GRAPH <g>`.
+    pub fn words(&mut self, n: NodeId) -> DocId {
+        let docs: Vec<DocId> = self
+            .children(n)
+            .into_iter()
+            .map(|e| self.element(e))
+            .collect();
+        self.spaced(docs)
+    }
+
+    // ----------------------------------------------------------------- tokens ------
+
+    /// A token as written.
+    pub fn tok(&mut self, t: TokenId) -> DocId {
+        self.arena.token(t, None)
+    }
+
+    /// A token printed as `printed` (a normalization's result).
+    pub fn tok_as(&mut self, t: TokenId, printed: impl Into<Box<str>>) -> DocId {
+        let printed: Box<str> = printed.into();
+        let same = *printed == *self.tree.token_text(t);
+        self.arena.token(t, (!same).then_some(printed))
+    }
+
+    /// A token, a keyword in the grammar's spelling (`select` → `SELECT`, `SAMETERM` →
+    /// `sameTerm`, `TRUE` → `true`).
+    pub fn kw(&mut self, t: TokenId) -> DocId {
+        match self.tree.token_kind(t) {
+            TokenKind::Kw(k) => self.tok_as(t, k.canonical()),
+            _ => self.tok(t),
+        }
+    }
+
+    // ------------------------------------------------------------- documents ------
+
+    pub fn text(&mut self, s: &str) -> DocId {
+        self.arena.text(s)
+    }
+
+    pub fn space(&mut self) -> DocId {
+        self.arena.text(" ")
+    }
+
+    pub fn nil(&mut self) -> DocId {
+        self.arena.nil()
+    }
+
+    pub fn line(&mut self) -> DocId {
+        self.arena.line()
+    }
+
+    pub fn soft_line(&mut self) -> DocId {
+        self.arena.soft_line()
+    }
+
+    pub fn hard_line(&mut self) -> DocId {
+        self.arena.hard_line()
+    }
+
+    pub fn empty_line(&mut self) -> DocId {
+        self.arena.empty_line()
+    }
+
+    pub fn concat(&mut self, ds: impl IntoIterator<Item = DocId>) -> DocId {
+        self.arena.concat(ds)
+    }
+
+    pub fn indent(&mut self, d: DocId) -> DocId {
+        self.arena.indent(d)
+    }
+
+    /// A group, when nothing refers to its id.
+    pub fn group(&mut self, d: DocId) -> DocId {
+        self.arena.group(d).0
+    }
+
+    pub fn group_with_id(&mut self, d: DocId) -> (DocId, GroupId) {
+        self.arena.group(d)
+    }
+
+    pub fn if_break(&mut self, broken: DocId, flat: DocId, group: Option<GroupId>) -> DocId {
+        self.arena.if_break(broken, flat, group)
+    }
+
+    /// `ds` with one space between each two.
+    pub fn spaced(&mut self, ds: impl IntoIterator<Item = DocId>) -> DocId {
+        let mut parts = Vec::new();
+        for d in ds {
+            if !parts.is_empty() {
+                parts.push(self.space());
+            }
+            parts.push(d);
+        }
+        self.concat(parts)
+    }
+
+    // ------------------------------------------------------------------- tree ------
+
+    /// `n`'s children (nodes and significant tokens), copied out of the tree.
+    pub fn children(&self, n: NodeId) -> Vec<Element> {
+        self.tree.children(n).to_vec()
+    }
+
+    /// `n`'s child nodes.
+    pub fn child_nodes(&self, n: NodeId) -> Vec<NodeId> {
+        self.tree.child_nodes(n).collect()
+    }
+
+    /// `n`'s first child token of `kind`.
+    pub fn child_token(&self, n: NodeId, kind: TokenKind) -> Option<TokenId> {
+        self.tree.children(n).iter().find_map(|e| match *e {
+            Element::Token(t) if self.tree.token_kind(t) == kind => Some(t),
+            _ => None,
+        })
+    }
+
+    /// `n`'s child keyword `kw`.
+    pub fn child_kw(&self, n: NodeId, kw: Kw) -> Option<TokenId> {
+        self.child_token(n, TokenKind::Kw(kw))
+    }
+
+    // --------------------------------------------------------------- comments ------
+
+    /// Whether `n` has comments of its own still to print (detached, leading,
+    /// trailing or dangling): a list that must break, a `VALUES` that cannot stay
+    /// inline.
+    pub fn has_comments(&self, n: NodeId) -> bool {
+        self.comments.has_comments(n)
+    }
+
+    /// Whether `n` will print a leading comment, so it must start its own line.
+    pub fn has_leading(&self, n: NodeId) -> bool {
+        let live = |c: &TokenId| !self.comments.copied(*c);
+        self.comments.leading(n).iter().any(live)
+            || self.comments.detached_before(n).iter().flatten().any(live)
+    }
+
+    /// Container `n`'s dangling comments, each on its own line: starts with a line
+    /// break, so it goes inside the container's indentation right before the closing
+    /// bracket. `after_items`: elements come before it, so a blank line before the
+    /// first comment is kept.
+    pub fn dangling(&mut self, n: NodeId, after_items: bool) -> Option<DocId> {
+        let cs: Vec<TokenId> = self
+            .comments
+            .dangling(n)
+            .iter()
+            .copied()
+            .filter(|&c| !self.comments.copied(c))
+            .collect();
+        let first = *cs.first()?;
+        let lead = match after_items && self.comments.blank_before_comment(first) {
+            true => self.empty_line(),
+            false => self.hard_line(),
+        };
+        let lines = trivia::comment_lines(&mut self.arena, self.comments, &cs);
+        Some(self.concat([lead, lines]))
+    }
+
+    /// The file header: its comments with their blank lines, then the line break (or
+    /// blank line, as written) before the first node. `None` without a header.
+    pub fn header(&mut self) -> Option<DocId> {
+        let header = self.comments.header();
+        if header.is_empty() {
+            return None;
+        }
+        let lines = trivia::comment_lines(&mut self.arena, self.comments, header);
+        let first = self.tree.next_significant(header[header.len() - 1]);
+        let gap = match first.is_some_and(|t| self.comments.blank_before_token(t)) {
+            true => self.empty_line(),
+            false => self.hard_line(),
+        };
+        Some(self.concat([lines, gap]))
+    }
+
+    // ------------------------------------------------------- lists and blocks ------
+
+    /// Items one per line; a blank line before an item where the source had one
+    /// (collapsed to one), never before the first.
+    pub fn stack(&mut self, items: &[(NodeId, DocId)]) -> DocId {
+        let mut parts = Vec::with_capacity(items.len() * 2);
+        for (i, &(n, d)) in items.iter().enumerate() {
+            if i > 0 {
+                parts.push(match self.comments.blank_before(n) {
+                    true => self.empty_line(),
+                    false => self.hard_line(),
+                });
+            }
+            parts.push(d);
+        }
+        self.concat(parts)
+    }
+
+    /// The child nodes of `n` one per line, as [`Ctx::stack`].
+    pub fn lines(&mut self, items: &[NodeId]) -> DocId {
+        let docs: Vec<(NodeId, DocId)> = items.iter().map(|&n| (n, self.node(n))).collect();
+        self.stack(&docs)
+    }
+
+    /// The child nodes of `n`, each with the `sep` token that follows it (`,` in an
+    /// argument list), ready for [`Ctx::delimited`] or [`Ctx::stack`]. A trailing
+    /// comment on an item prints after its separator.
+    pub fn separated(&mut self, n: NodeId, sep: TokenKind) -> Vec<(NodeId, DocId)> {
+        let children = self.children(n);
+        let mut out = Vec::new();
+        for (i, e) in children.iter().enumerate() {
+            let Element::Node(c) = *e else { continue };
+            let mut d = self.node(c);
+            if let Some(&Element::Token(t)) = children.get(i + 1)
+                && self.tree.token_kind(t) == sep
+            {
+                let s = self.tok(t);
+                d = self.concat([d, s]);
+            }
+            out.push((c, d));
+        }
+        out
+    }
+
+    /// An always expanded block: `open`, the items one per line at +1 indent (as
+    /// [`Ctx::stack`]) with the container's dangling comments after them, then `close`
+    /// on its own line. Empty, without comments: `open` and `close` together (`{}`).
+    pub fn block(
+        &mut self,
+        container: NodeId,
+        open: DocId,
+        items: &[(NodeId, DocId)],
+        close: DocId,
+    ) -> DocId {
+        let dangling = self.dangling(container, !items.is_empty());
+        if items.is_empty() && dangling.is_none() {
+            return self.concat([open, close]);
+        }
+        let mut inner = Vec::new();
+        if !items.is_empty() {
+            inner.push(self.hard_line());
+            inner.push(self.stack(items));
+        }
+        inner.extend(dangling);
+        let inner = self.concat(inner);
+        let inner = self.indent(inner);
+        let hl = self.hard_line();
+        self.concat([open, inner, hl, close])
+    }
+
+    /// A group that stays on one line when it fits: `open`, the items (separators
+    /// included) one space apart, `close`; broken, the items go one per line at +1
+    /// indent. `pad` puts spaces inside the brackets when flat (`[ p o ]`, `{ a b }`)
+    /// instead of none (`(a, b)`). Dangling comments go before `close` and break it.
+    pub fn delimited(
+        &mut self,
+        container: NodeId,
+        open: DocId,
+        items: &[DocId],
+        close: DocId,
+        pad: bool,
+    ) -> DocId {
+        let dangling = self.dangling(container, !items.is_empty());
+        if items.is_empty() && dangling.is_none() {
+            return self.concat([open, close]);
+        }
+        let mut edge = || match pad {
+            true => self.arena.line(),
+            false => self.arena.soft_line(),
+        };
+        let mut inner = vec![edge()];
+        for (i, &d) in items.iter().enumerate() {
+            if i > 0 {
+                inner.push(self.arena.line());
+            }
+            inner.push(d);
+        }
+        inner.extend(dangling);
+        let inner = self.concat(inner);
+        let inner = self.indent(inner);
+        let end = match pad {
+            true => self.line(),
+            false => self.soft_line(),
+        };
+        let all = self.concat([open, inner, end, close]);
+        self.group(all)
     }
 }
 
@@ -246,5 +590,143 @@ impl CommentRules for SparqlRules {
 
     fn is_closer(&self, kind: TokenKind) -> bool {
         crate::sparql::parse::is_closer(kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trivia::test_tree::tree;
+
+    /// Attach `tree`'s comments, print the group graph pattern `NodeId(1)` with
+    /// [`Ctx::block`] (its elements through [`Ctx::node`]), and return the text and the
+    /// `comment-moved` warnings.
+    fn group(src: &str, shape: &str) -> (String, usize) {
+        let t = tree(src, shape);
+        let comments = Comments::attach(&t, &RULES);
+        let opts = Options::default();
+        let mut cx = Ctx {
+            tree: &t,
+            arena: DocArena::new(&t.tokens),
+            opts: &opts,
+            comments: &comments,
+        };
+        let g = NodeId(1);
+        let items: Vec<(NodeId, DocId)> = cx
+            .child_nodes(g)
+            .into_iter()
+            .map(|n| (n, cx.node(n)))
+            .collect();
+        let open = cx.tok(t.first_token(g).unwrap());
+        let close = cx.tok(t.last_token(g).unwrap());
+        let body = cx.block(g, open, &items, close);
+        let dangling = cx.dangling(t.root(), true);
+        let hl = cx.hard_line();
+        let root = cx.concat([body].into_iter().chain(dangling).chain([hl]));
+        let p = crate::doc::print(&cx.arena, root, t.src, 100, 2, None).unwrap();
+        (p.text, comments.warnings().len())
+    }
+
+    const STMTS: &str = "(Q (G _ (S _ (E _ (O _)) _) (S _ (E _ (O _)) _) _))";
+
+    #[test]
+    fn blocks_print_every_kind_of_comment() {
+        let src = "{ # lead\n  ?s   ?p ?o . # trailing\n\n\n  # detached\n\n  # leading\n ?a ?b ?c .\n\n # dangling\n}\n\n# end";
+        let (out, moved) = group(src, STMTS);
+        assert_eq!(
+            out,
+            "{\n  # lead\n  ?s   ?p ?o . # trailing\n\n  # detached\n\n  # leading\n  ?a ?b ?c .\n\n  # dangling\n}\n\n# end\n"
+        );
+        assert_eq!(moved, 0);
+        // blank lines just inside the brackets go
+        let src = "{\n\n  ?s ?p ?o .\n\n  ?a ?b ?c .\n\n}";
+        assert_eq!(group(src, STMTS).0, "{\n  ?s ?p ?o .\n\n  ?a ?b ?c .\n}\n");
+        assert_eq!(group("{  }", "(Q (G _ _))").0, "{}\n");
+        assert_eq!(group("{ # c\n}", "(Q (G _ _))").0, "{\n  # c\n}\n");
+    }
+
+    #[test]
+    fn verbatim_nodes_print_their_comments_once() {
+        // a displaced comment inside a node printed as written stays where it was
+        let (out, moved) = group("{ FILTER # c\n (?x) }", "(Q (G _ (F _ (B _ _ _)) _))");
+        assert_eq!(out, "{\n  FILTER # c\n (?x)\n}\n");
+        assert_eq!(moved, 0);
+        // a trailing comment of the last branch of a union printed as written
+        let shape = "(Q (G _ (U (R (G _ (S _ (E _ (O _))) _)) _ (R (G _ (S _ (E _ (O _))) _))) _))";
+        let (out, _) = group("{ {?a ?b ?c} UNION {?d ?e ?f} # t\n}", shape);
+        assert_eq!(out, "{\n  {?a ?b ?c} UNION {?d ?e ?f} # t\n}\n");
+    }
+
+    #[test]
+    fn helpers_for_lists() {
+        let src = "{ ?s ?p ?a, ?b, # c\n ?d }";
+        let t = tree(src, "(Q (G _ (S _ (E _ (O _ _) (O _ _) (O _))) _))");
+        let comments = Comments::attach(&t, &RULES);
+        let opts = Options::default();
+        let mut cx = Ctx {
+            tree: &t,
+            arena: DocArena::new(&t.tokens),
+            opts: &opts,
+            comments: &comments,
+        };
+        // objects, their commas inside them, through `delimited` (a group that broke
+        // because of the trailing comment)
+        let entry = NodeId(3);
+        let objects: Vec<DocId> = cx
+            .child_nodes(entry)
+            .into_iter()
+            .map(|o| {
+                let parts: Vec<DocId> = cx.children(o).into_iter().map(|e| cx.element(e)).collect();
+                let d = cx.concat(parts);
+                trivia::wrap(&mut cx.arena, cx.comments, o, d)
+            })
+            .collect();
+        let open = cx.text("(");
+        let close = cx.text(")");
+        let list = cx.delimited(entry, open, &objects, close, false);
+        let p = crate::doc::print(&cx.arena, list, t.src, 100, 2, None).unwrap();
+        assert_eq!(p.text, "(\n  ?a,\n  ?b, # c\n  ?d\n)");
+
+        let mut cx = Ctx {
+            tree: &t,
+            arena: DocArena::new(&t.tokens),
+            opts: &opts,
+            comments: &Comments::default(),
+        };
+        let objects: Vec<DocId> = cx
+            .child_nodes(entry)
+            .into_iter()
+            .map(|o| cx.words(o))
+            .collect();
+        let open = cx.text("[");
+        let close = cx.text("]");
+        let list = cx.delimited(entry, open, &objects, close, true);
+        let p = crate::doc::print(&cx.arena, list, t.src, 100, 2, None).unwrap();
+        assert_eq!(p.text, "[ ?a , ?b , ?d ]");
+    }
+
+    #[test]
+    fn keywords_print_in_the_grammar_spelling() {
+        let src = "select ?x";
+        let mut tokens = crate::lex::lex(src, crate::lex::LexMode::Sparql);
+        tokens[0].kind = TokenKind::Kw(Kw::Select);
+        let t = Tree {
+            src,
+            tokens,
+            nodes: Vec::new(),
+        };
+        let comments = Comments::default();
+        let opts = Options::default();
+        let mut cx = Ctx {
+            tree: &t,
+            arena: DocArena::new(&t.tokens),
+            opts: &opts,
+            comments: &comments,
+        };
+        let a = cx.kw(TokenId(0));
+        let b = cx.kw(TokenId(2));
+        let both = cx.spaced([a, b]);
+        let p = crate::doc::print(&cx.arena, both, t.src, 100, 2, None).unwrap();
+        assert_eq!(p.text, "SELECT ?x");
     }
 }
