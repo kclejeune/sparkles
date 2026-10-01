@@ -15,6 +15,10 @@ things for <engine> under <query-name> in <answers.json>:
 * `value`: the same digest with numeric literals compared by value, so for example
   `"34.50"^^xsd:decimal` equals `"34.5"^^xsd:decimal`, rounded to 12 significant digits
   (engines print non-terminating decimals such as averages to different precisions).
+  Geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`) compare by their
+  coordinates rounded to `GEO_DECIMALS` decimal places (default 6, about 0.1 m in
+  degrees), with keyword case, spacing, number formatting and the default CRS84 prefix
+  normalized; vertex order and ring starts are not.
 
 Solutions are compared as multisets over variables sorted by name, since ORDER BY ties
 may be broken differently and engines list the result variables in different orders.
@@ -25,6 +29,7 @@ solutions are legitimately engine-dependent. A failed request records `error`.
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -35,6 +40,44 @@ NUMERIC = {XSD + t for t in (
     "integer", "decimal", "double", "float", "int", "long", "short", "byte",
     "nonNegativeInteger", "positiveInteger", "negativeInteger", "nonPositiveInteger",
     "unsignedLong", "unsignedInt", "unsignedShort", "unsignedByte")}
+
+
+GEO = "http://www.opengis.net/ont/geosparql#"
+WKT, GEOJSON = GEO + "wktLiteral", GEO + "geoJSONLiteral"
+CRS84 = "<http://www.opengis.net/def/crs/OGC/1.3/CRS84>"
+GEO_DECIMALS = int(os.environ.get("GEO_DECIMALS", "6"))
+NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def coord(x):
+    v = round(float(x), GEO_DECIMALS)
+    return "0" if v == 0 else repr(v)
+
+
+def geometry(value, dt):
+    """A geometry literal's canonical form, or None when it does not parse."""
+    if dt == GEOJSON:
+        def walk(v):
+            if isinstance(v, list):
+                return [walk(x) for x in v]
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return coord(v)
+            if isinstance(v, dict):
+                return {k: walk(x) for k, x in v.items()}
+            return v
+        try:
+            return json.dumps(walk(json.loads(value)), sort_keys=True)
+        except ValueError:
+            return None
+    text = value.strip()
+    crs = ""
+    if text.startswith("<"):
+        crs, _, text = text.partition(">")
+        crs = "" if crs + ">" == CRS84 else crs + ">"
+    # keywords upper case and single-spaced, numbers rounded, no other spacing
+    words = re.sub(r"\s+", " ", NUMBER.sub(lambda m: " " + coord(m.group()) + " ", text.upper()))
+    words = re.sub(r" ?([(),]) ?", r"\1", words).strip()
+    return crs + words
 
 
 def term(t, by_value):
@@ -50,6 +93,10 @@ def term(t, by_value):
         if lang:
             return ("lang", t["value"], lang.lower(), t.get("its:dir", ""))
         dt = t.get("datatype", XSD + "string")
+        if by_value and dt in (WKT, GEOJSON):
+            g = geometry(t["value"], dt)
+            if g is not None:
+                return ("geom", g, dt)
         if by_value and dt in NUMERIC:
             try:
                 # 12 significant digits: the precision of a non-terminating decimal
