@@ -176,13 +176,16 @@ pub fn crc32(parts: &[&[u8]]) -> u32 {
 /// files written by another build are rebuilt, since it may classify literals
 /// differently.
 pub fn engine_hash() -> u64 {
-    let mut h = super::Fnv::new();
-    h.field(env!("CARGO_PKG_VERSION").as_bytes());
-    h.field(&FILE_VERSION.to_le_bytes());
-    for id in super::crs::CrsId::all() {
-        h.field(id.iri().as_bytes());
-    }
-    h.finish()
+    static HASH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *HASH.get_or_init(|| {
+        let mut h = super::Fnv::new();
+        h.field(env!("CARGO_PKG_VERSION").as_bytes());
+        h.field(&FILE_VERSION.to_le_bytes());
+        for id in super::crs::CrsId::all() {
+            h.field(id.iri().as_bytes());
+        }
+        h.finish()
+    })
 }
 
 /// What the files of a generation must match: the configuration's [`index_hash`], the
