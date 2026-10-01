@@ -1,0 +1,18 @@
+# A sectioned prologue: comments move with their declarations, sections stay
+
+# --- vocabularies ---
+
+PREFIX dc: <http://purl.org/dc/terms/>
+# the people vocabulary
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#> # concepts
+
+# --- ours ---
+
+PREFIX ab: <http://example.org/ab#>
+PREFIX ex: <http://example.org/> # kept: it has a comment
+
+SELECT *
+WHERE {
+  ?s ?p ?o .
+}

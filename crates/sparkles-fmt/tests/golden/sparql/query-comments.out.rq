@@ -1,0 +1,13 @@
+PREFIX ex: <http://example.org/>
+
+SELECT
+  ?a # first
+  ?b
+# the pattern
+WHERE {
+  ?a ex:p ?b .
+} # after the pattern
+ORDER BY
+  # the key follows
+  ?a
+LIMIT 10 # enough
