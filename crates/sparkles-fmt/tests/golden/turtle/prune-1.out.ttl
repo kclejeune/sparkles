@@ -1,0 +1,23 @@
+# Unused prefixes
+
+PREFIX ex: <http://example.org/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#> # kept: it has a comment
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+# --- vocabularies for later ---
+
+PREFIX dct: <http://purl.org/dc/terms/>
+
+ex:alice
+  a foaf:Person ;
+  foaf:age 42 ;
+  foaf:knows foaf:bob ;
+.
+
+PREFIX later: <http://example.org/later#>
+PREFIX unused: <http://example.org/unused#>
+
+later:thing ex:p ex:o .
