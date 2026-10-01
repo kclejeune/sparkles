@@ -12,8 +12,9 @@ pub fn error_line(name: &str, lang: Language, e: &FormatError) -> String {
             column,
             ..
         } => format!(
-            "{name}:{line}:{column}: error: {} syntax error: {message}",
-            lang.display_name()
+            "{name}:{line}:{column}: error: {} syntax error: {}",
+            lang.display_name(),
+            short_message(message)
         ),
         FormatError::Unsupported {
             message,
@@ -23,6 +24,27 @@ pub fn error_line(name: &str, lang: Language, e: &FormatError) -> String {
             "{name}:{line}:{column}: error: the formatter cannot handle this yet ({message}); input left unchanged; please report"
         ),
         e => format!("{name}: error: {e}"),
+    }
+}
+
+/// A parser message cut to its first line and about 120 characters, at a list separator.
+/// spargebra lists every token it expected, character classes over several lines included;
+/// the position says where, and the head of the list is enough to say what.
+pub fn short_message(message: &str) -> String {
+    const MAX: usize = 120;
+    let message = message.trim();
+    let first = message.lines().next().unwrap_or("").trim_end();
+    if first.len() == message.len() && first.chars().count() <= MAX {
+        return first.to_string();
+    }
+    let end = first
+        .char_indices()
+        .nth(MAX)
+        .map_or(first.len(), |(i, _)| i);
+    let head = &first[..end];
+    match head.rfind(", ") {
+        Some(i) if i > 0 => format!("{}, …", &head[..i]),
+        _ => format!("{}…", head.trim_end()),
     }
 }
 
@@ -100,6 +122,36 @@ mod tests {
         assert_eq!(
             warning_line("q.rq", &w),
             "q.rq:2:7: warning: prefix ex: is not declared"
+        );
+    }
+
+    #[test]
+    fn short_messages() {
+        assert_eq!(
+            short_message("expected one of BIND, [_]"),
+            "expected one of BIND, [_]"
+        );
+        let long = format!(
+            "expected one of {}, ['A' ..= 'Z' | 'a' ..= 'z'\n| '\\u{{00F8}}'..='\\u{{02FF}}'], [_]",
+            (0..30)
+                .map(|i| format!("K{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let s = short_message(&long);
+        assert!(s.starts_with("expected one of K0, K1, "), "{s}");
+        assert!(
+            s.ends_with(", …") && !s.contains('\n') && s.chars().count() <= 123,
+            "{s}"
+        );
+        // a short first line, then more lines: the last item of the first line is cut
+        assert_eq!(
+            short_message("expected one of A, ['a'..='z'\n| 'é']"),
+            "expected one of A, …"
+        );
+        assert_eq!(
+            short_message(&"x".repeat(200)),
+            format!("{}…", "x".repeat(120))
         );
     }
 

@@ -20,6 +20,7 @@ every route needs credentials or a grant to `anonymous`; see
 | GET    | `/$/ready/{ds}` | The same for one dataset (`datasets` has one entry); `404` if the dataset is unknown. |
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`; anonymous callers of a server with auth get no `version` or `limits` |
 | GET    | `/$/whoami`   | The caller and its permissions (see [whoami](#whoami)). |
+| POST   | `/$/format`   | Format a SPARQL query or update; see [Formatting](#formatting). |
 | GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`), see [Metrics](#metrics). `?format=json` returns a JSON snapshot of the same counters (`MetricsSnapshot`) for the UI. `404` when started with `--no-metrics`. |
 
 ```ts
@@ -221,9 +222,9 @@ Off by default, except for failed authentications when authentication is on (see
 | Class | Requests |
 |-------|----------|
 | `auth` | every path under `/$/auth/` (login, token minting, device flow, OIDC callback), matched or not |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics` |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write (a form POST to `/{ds}` counts as an update) |
-| `admin` | `/$/…` requests other than `GET`/`HEAD` (dataset management, compaction, backups, reasoning, caches, full-text) |
+| `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format` (dataset management, compaction, backups, reasoning, caches, full-text) |
 | `preauth` | every request, before authentication: failed credential checks per client address and IPv6 /48 (no per-dataset form) |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
@@ -1638,6 +1639,102 @@ The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph defa
 files in memory); like Jena's `shacl validate` it exits with status 1 when the data does not
 conform.
 
+## Formatting
+
+`POST /$/format` formats a SPARQL query or update (Turtle, TriG, N-Triples, N-Quads and
+JSON-LD later) and answers the formatted text, in the style of `sparkles fmt` (see the
+README). It reads no dataset and no config file: the style options come with the request,
+and omitted ones take their defaults. The formatter checks its own output before answering:
+it must parse to the same SPARQL algebra as the input, keep every comment and format to
+itself; when a check fails, the request fails and nothing is returned.
+
+**JSON body** (`Content-Type: application/json`, what the UI sends):
+
+```ts
+type FormatRequest = {
+  text: string;
+  language?: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld"; // default: detected
+  cursorOffset?: number;   // in UTF-16 code units, like the editor's
+  options?: FormatOptions;
+};
+type FormatOptions = {
+  lineWidth?: number;            // 40..=400, default 100
+  indentWidth?: number;          // 1..=8, default 2 (spaces)
+  prefixGroups?: string[][];     // default []; e.g. [["rdf", "rdfs", "xsd", "owl"]], "" is the empty prefix
+  typeShorthand?: boolean;       // default true: rdf:type → a
+  compactIris?: boolean;         // default true: full IRI → prefixed name
+  quoteStyle?: "double" | "preserve";           // default "double"
+  operatorPosition?: "leading" | "trailing";    // default "leading": where a broken || or && chain puts its operator
+  // accepted for the formats to come; no effect on SPARQL
+  sort?: boolean; directiveStyle?: "sparql" | "turtle"; turtleLayout?: "diff" | "conventional";
+  // accepted, not implemented yet (a warning says so)
+  prunePrefixes?: boolean; alignValues?: boolean;
+};
+type FormatResult = {
+  text: string;
+  changed: boolean;                // text differs from the input
+  language: string;
+  cursorOffset: number | null;     // the cursor mapped into text (UTF-16 code units)
+  warnings: { code: "undeclared-prefix" | "comment-moved" | "option-not-implemented";
+              message: string; line: number; column: number }[];  // 0 when it has no position
+};
+```
+
+```sh
+curl -s localhost:3030/'$/format' -H 'Content-Type: application/json' \
+  -d '{"text": "select * { ?s ?p ?o }", "cursorOffset": 9, "options": {"lineWidth": 80}}'
+```
+
+Without `language`, the text's first keyword after the prologue decides (`SELECT`,
+`INSERT`, … is SPARQL). The cursor is kept next to the same token; a byte order mark is
+dropped.
+
+**Raw body** (curl): the body is the document, and its media type names the language unless
+`language` is in the query string. The answer is `200` with the same media type, the
+formatted text as the body, and `Sparkles-Format-Changed: true|false` (exposed to browsers
+through CORS).
+
+| `Content-Type` | Language |
+|---|---|
+| `application/sparql-query`, `application/sparql-update` | `sparql` |
+| `text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`, `application/ld+json` | `turtle`, `trig`, `ntriples`, `nquads`, `jsonld` (`415` until they are implemented) |
+| `text/plain` | needs `?language=` |
+
+```sh
+curl -s --data-binary @q.rq -H 'Content-Type: application/sparql-query' \
+  'localhost:3030/$/format?lineWidth=80&operatorPosition=trailing'
+```
+
+**Query-string options.** Every option can also be a query parameter of either body form,
+with the same camelCase name (`lineWidth=80`, `typeShorthand=false`); each `prefixGroup=rdf,rdfs,xsd,owl`
+is one group, repeatable, in order (`""` is the empty prefix). Options in a JSON body win
+over the query string's; both are checked.
+
+**Errors** (JSON, with `requestId` as everywhere):
+
+| Status | Body | When |
+|---|---|---|
+| `400` | `{error, detail?, line, column, code: "syntax", language}` | the input does not parse. `error` reads `SPARQL syntax error at line L, column C: …` with the head of the parser's message (1-based line, column in characters); `detail` holds the whole message when it was cut |
+| `400` | `{error, code: "bad-request", option?}` | a bad option (`option` names it: an unknown name, a wrong type, a value out of range or not one of the choices, a prefix label in two groups), an unknown `language`, a body that is not a JSON object with `text`, a non-UTF-8 raw body, `text/plain` without `language`, a language that cannot be detected, or a `cursorOffset` past the end of the text |
+| `401` | `{error}` | an anonymous caller under `--format-endpoint authenticated` |
+| `404` | `{error}` | `--format-endpoint off` |
+| `408` | `{error}` | the request took longer than `--format-timeout`, waiting for a slot included |
+| `413` | `{error}` | a body larger than `--format-max-mb` |
+| `415` | `{error}` | RDF/XML (`application/rdf+xml` or `language=rdfxml`: "RDF/XML formatting is not supported; convert to Turtle to format"), a language this build does not format yet ("turtle formatting is not available yet"), or another media type |
+| `422` | `{error, code}` | the formatter refused its own output: `unsafe-format` (`algebra differs`, `comment lost`), `unstable-format` (`not idempotent`), or `unsupported-syntax` (the reference parser accepts a construct the formatter cannot handle yet). Logged at `warn` with the SHA-256 of the input (never the text); please report |
+
+**Server settings and access.**
+
+| `sparkles serve` flag | Default | |
+|---|---|---|
+| `--format-endpoint on\|authenticated\|off` | `on` | who may format: every caller the server admits (anonymous ones included when the server admits them), every caller but the anonymous principal (`401`), or nobody (`404`) |
+| `--format-max-mb N` | `16` | the largest request body (`0`: unlimited) |
+| `--format-timeout S` | `10` | seconds a request may take, waiting for a slot included; formatting runs on one slot per core |
+
+With authentication, the route needs any caller (no dataset permission), like `/$/server`;
+cookie sessions send the CSRF header as for every other `POST`. Rate limits count it in the
+`query` class.
+
 ## `application/x-sparkles+json` (UI result format)
 
 Rich result format inspired by QLever's `qlever-json`, used by the UI for results
@@ -1899,7 +1996,7 @@ the permission is `403` before any connection or file is opened, even under `SIL
 |---|---|---|
 | `/ui/*`, `/$/ping`, `/$/ready` | GET | nothing (`/$/ready` lists only readable datasets without `metrics`) |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*`, `/$/auth/device`, `/$/auth/token` | | nothing (invalid credentials are still `401`) |
-| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout` | | any caller; listings show readable datasets only (server-wide tasks: `server-admin`); cancelling a task (DELETE) needs `admin` on its dataset |
+| `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | any caller (`/$/format`: none under `--format-endpoint off`, signed-in callers under `authenticated`); listings show readable datasets only (server-wide tasks: `server-admin`); cancelling a task (DELETE) needs `admin` on its dataset |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
