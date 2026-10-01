@@ -4,13 +4,36 @@
 
 use super::Ctx;
 use crate::doc::DocId;
-use crate::tree::NodeId;
+use crate::syntax::NodeKind;
+use crate::tree::{Element, NodeId};
 
-/// `QueryUnit`.
-///
-/// TODO: the layout (stub: as written).
+/// `QueryUnit`: the file header, the prologue, one blank line, the query, the trailing
+/// `VALUES`, then the comments at the end of the file and one final newline.
 pub fn query_unit(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    cx.verbatim(n)
+    let mut parts = Vec::new();
+    parts.extend(cx.header());
+    let mut prev: Option<NodeId> = None;
+    for e in cx.children(n) {
+        let doc = cx.element(e);
+        if let Some(p) = prev {
+            let blank = match e {
+                Element::Node(c) => cx.comments.blank_before(c),
+                Element::Token(t) => cx.comments.blank_before_token(t),
+            };
+            parts.push(match blank || cx.tree.kind(p) == NodeKind::Prologue {
+                true => cx.empty_line(),
+                false => cx.hard_line(),
+            });
+        }
+        parts.push(doc);
+        prev = match e {
+            Element::Node(c) => Some(c),
+            Element::Token(_) => prev.or(Some(n)),
+        };
+    }
+    parts.extend(cx.dangling(n, prev.is_some()));
+    parts.push(cx.hard_line());
+    cx.concat(parts)
 }
 
 /// `SelectQuery`.

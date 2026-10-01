@@ -29,7 +29,7 @@ async fn post_json(app: &Router, uri: &str, body: J) -> Resp {
 async fn formats_json_bodies() {
     let (_d, app) = fmt_server(|_| {});
     // the cursor counts UTF-16 code units: after the emoji (two units) is 11
-    let text = "SELECT ('😀' AS ?x) {}";
+    let text = "SELECT ('😀' AS ?x) {}\n";
     let r = post_json(
         &app,
         "/$/format",
@@ -213,7 +213,7 @@ async fn raw_bodies() {
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     let r = post_as(&app, "/$/format?language=sparql", "text/plain", "ASK {}").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-    assert_eq!(r.text(), "ASK {}");
+    assert_eq!(r.text(), "ASK {}\n");
     // errors stay JSON
     let r = post_as(&app, "/$/format", "application/sparql-query", "ASK {").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);

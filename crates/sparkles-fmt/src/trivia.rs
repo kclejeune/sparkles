@@ -257,7 +257,7 @@ impl Comments {
     /// `n`.
     fn run(&mut self, shape: &Shape<'_, '_>, p: Option<TokenId>, comments: &[TokenId], n: TokenId) {
         let tree = shape.tree;
-        // the whitespace right before token `t` breaks the line `breaks` times
+        // the line breaks in the whitespace right before token `t`
         let breaks_before = |t: TokenId| -> usize {
             match t.0.checked_sub(1).map(|i| tree.token(TokenId(i))) {
                 Some(ws) if ws.kind == TokenKind::Whitespace => line_breaks(ws.text(tree.src)),
