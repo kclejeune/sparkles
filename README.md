@@ -100,7 +100,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
 | MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits, full-text and vector similarity search; `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
-| SPARQL formatter (`sparkles-fmt`, `sparkles fmt`, `POST /$/format`; `fmt` cargo feature, on by default): comment-preserving, self-checking (the output must parse to the same algebra, keep every comment and format to itself); the pipeline, the style options and the endpoint are in place, the formatting rules are not yet (documents come back as written, syntax errors with their position) | 🚧 |
+| SPARQL formatter (`sparkles-fmt`, `sparkles fmt`, `POST /$/format`; `fmt` cargo feature, on by default): comment-preserving, self-checking (the output must parse to the same algebra, keep every comment and format to itself); the pipeline, the style options, the endpoint and the command line (directory walks with ignore files, config discovery, `--check`, `--write`, `--diff`, Prettier's exit codes) are in place, the formatting rules are not yet (documents come back as written, syntax errors with their position) | 🚧 |
 | Observability: `X-Request-Id`, one structured access-log line per request (text or JSON), Prometheus `/$/metrics`, readiness `/$/ready`, graceful drain on SIGTERM | ✅ |
 | Per-query budgets (estimated intermediate-result memory, response size, rows) failing with `507`; queries and writes stop when their client disconnects | ✅ |
 | OpenTelemetry (`otel` cargo feature, off at run time unless `--otel` or `OTEL_*` enable it): OTLP traces with W3C `traceparent` in and out (SERVICE, LOAD), HTTP/database semantic-convention attributes, query phase and operator-tree spans synthesized from recorded timings, commit and background-task spans; metrics (`http.server.request.duration` plus the Prometheus registry, bridged); optional OTLP logs with trace correlation | ✅ |
@@ -546,6 +546,52 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
+
+`sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`) with
+Prettier's modes and exit codes: 0 when everything is formatted (or was written), 1 when
+`--check` or `-l` found a file that would change, 2 on any error (a syntax error, a
+refused output, an unreadable file, a bad option). Every file is processed, so one run
+reports every problem, and many files are formatted in parallel (`--threads N`).
+
+```sh
+sparkles fmt q.rq                    # print the formatted query (stdin to stdout without a path)
+sparkles fmt --write queries/        # rewrite in place: temporary file, fsync, rename; unchanged files keep their mtime
+sparkles fmt --check queries/        # [warn] per unformatted file on stderr; --diff adds unified diffs on stdout
+sparkles fmt -l queries/             # names of the files that would change
+sparkles fmt --stdin-filepath queries/q.rq < q.rq   # stdin named for detection, config and ignore files
+```
+
+- **Files.** Directories are walked recursively for the extensions of the languages this
+  build formats, with `.gitignore`, `.git/info/exclude` and the global gitignore applied
+  (hidden files included; never `.git`, `node_modules` or `target`). A file named on the
+  command line is formatted whatever its extension: `--language` names its language, else
+  the extension does, else (an unknown extension) its content. Turtle, TriG, N-Triples, N-Quads and
+  JSON-LD files are skipped by walks and refused when named ("… formatting is not
+  available yet"); RDF/XML and compressed files are refused too.
+- **Ignore file.** `.sparklesfmtignore` in the current directory (gitignore syntax), or
+  `--ignore-path FILE` (repeatable). It applies to walks and to named files, which it
+  skips silently; an ignored `--stdin-filepath` passes stdin through unchanged.
+- **Config.** `.sparklesfmt.toml` (or `sparklesfmt.toml`), found by walking up from each
+  file's directory; the nearest one wins and files are not merged. Flags override it;
+  `--config FILE` uses one file for every input and `--no-config` the defaults. An unknown
+  key or a bad value is an error naming the key and the file.
+
+  ```toml
+  line-width = 100               # 40..=400
+  indent-width = 2               # 1..=8
+  prefix-groups = []             # e.g. [["rdf", "rdfs", "xsd", "owl"]]; --prefix-group rdf,rdfs,xsd,owl
+  type-shorthand = true          # rdf:type → a
+  compact-iris = true            # full IRI → prefixed name
+  quote-style = "double"         # "double" | "preserve"
+  operator-position = "leading"  # "leading" | "trailing": where a broken || or && chain puts its operator
+  # also accepted, for the RDF formats to come: sort, prune-prefixes, directive-style,
+  # turtle-layout, align-values
+  ```
+
+  Every key has a flag of the same name (`--no-type-shorthand`, `--quote-style preserve`, …).
+- **Messages.** Errors read `path:LINE:COL: error: …` (1-based lines and columns, in
+  characters); a refused output reads `path: error: formatter refused its own output
+  (algebra differs); input left unchanged; please report`.
 
 Backup repositories (see [docs/API.md](docs/API.md#backup-repositories)) work offline
 too, on a stopped database; a server's own datasets are backed up through its HTTP API or
