@@ -1,0 +1,23 @@
+PREFIX ex: <http://example.org/>
+
+# bump versions
+WITH <http://example.org/g>
+DELETE {
+  ?d ex:version ?v .
+}
+INSERT {
+  ?d ex:version ?v2 ;
+    ex:modified ?now .
+}
+WHERE {
+  ?d ex:version ?v .
+  BIND(?v + 1 AS ?v2)
+  BIND(NOW() AS ?now)
+};
+
+INSERT DATA {
+  GRAPH <http://example.org/log> {
+    ex:run1 ex:note """bumped
+all""" .
+  }
+}

@@ -1,0 +1,22 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT
+  ?type
+  (COUNT(DISTINCT ?item) AS ?n)
+  (GROUP_CONCAT(?label; SEPARATOR = ", ") AS ?labels)
+  (SAMPLE(?item) AS ?example)
+WHERE {
+  ?item a/rdfs:subClassOf* ?type ;
+    rdfs:label ?label .
+  {
+    SELECT ?item
+    WHERE {
+      ?item ex:partOf+ ex:catalog .
+    }
+    LIMIT 1000
+  }
+}
+GROUP BY ?type
+HAVING(COUNT(DISTINCT ?item) > 5)
+ORDER BY DESC(?n)
