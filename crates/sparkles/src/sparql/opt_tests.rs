@@ -594,6 +594,65 @@ fn distinct_counts_from_statistics_only_when_exact() {
     );
 }
 
+// ---------------------------------------------------------------- anti-join ------
+
+#[test]
+fn minus_on_one_bound_variable_is_an_anti_join() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..4000 {
+        ttl.push_str(&format!("ex:s{i} a ex:C{} .\n", i % 3));
+        if i % 5 != 0 {
+            ttl.push_str(&format!("ex:s{i} ex:wrote ex:d{} .\n", i % 50));
+        }
+        if i % 7 == 0 {
+            ttl.push_str(&format!("ex:s{i} ex:age {} .\n", i % 90));
+        }
+        if i % 7 == 0 && i < 140 {
+            ttl.push_str(&format!("ex:d{} ex:by ex:s{i} .\n", i % 50));
+        }
+        ttl.push_str(&format!("ex:s{i} ex:v {} .\n", i % 11 * 10));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    for q in [
+        // both sides sorted on ?p: merge
+        "SELECT ?p WHERE { ?p a ex:C1 MINUS { ?p ex:wrote ?d } }",
+        "SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:C0 MINUS { ?p ex:wrote ?d } }",
+        // the right side sorted on another variable: hash probe
+        "SELECT ?p ?d WHERE { ?p ex:wrote ?d MINUS { ?d ex:by ?q } }",
+        "SELECT ?d WHERE { ?p ex:wrote ?d MINUS { ?x ex:by ?p } }",
+        // literals and duplicates on the left
+        "SELECT ?v WHERE { ?p ex:v ?v MINUS { ?q ex:age ?v } }",
+    ] {
+        let a = same_answer(&s, q, "desc:anti-join on");
+        assert!(!a.is_empty(), "{q}");
+        let r = run(&s, q, Optimizations::ALL);
+        let mut stack = vec![&r.plan];
+        while let Some(p) = stack.pop() {
+            if p.operator == "Minus" {
+                let how = if q.contains("ex:by") || q.contains("ex:age") {
+                    "hash"
+                } else {
+                    "merge"
+                };
+                assert!(p.description.contains(how), "{q}: {}", p.description);
+            }
+            stack.extend(&p.children);
+        }
+    }
+    // unbound shared variables, several shared variables, none: the generic MINUS
+    for q in [
+        "SELECT ?p ?a WHERE { ?p a ex:C2 OPTIONAL { ?p ex:age ?a } MINUS { ?q ex:age ?a } }",
+        "SELECT ?p WHERE { ?p a ex:C2 MINUS { { ?p ex:age ?a } UNION { ?x ex:by ?y } } }",
+        "SELECT ?p ?d WHERE { ?p ex:wrote ?d MINUS { ?d ex:by ?p } }",
+        "SELECT ?p WHERE { ?p a ex:C2 MINUS { ?x ex:by ?y } }",
+    ] {
+        let r = run(&s, q, Optimizations::ALL);
+        assert!(!has_desc(&r.plan, "anti-join on"), "{q}");
+        same_rows(&s, q);
+    }
+}
+
 #[test]
 fn optimizations_can_be_disabled_by_name() {
     let o = Optimizations::ALL

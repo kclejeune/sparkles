@@ -277,6 +277,11 @@ ran.
   less than evaluating it per distinct outer key, and the EXISTS stays per row when
   the set does not fit in the memory budget (`[EXISTS decorrelated on ?y: …]` in
   EXPLAIN, or the reason it was not, with `exists*` counters).
+* **Anti-join MINUS** (`anti_join`). A MINUS whose sides share one variable, bound on
+  every row of both, removes the left rows whose value appears on the right. That is a
+  merge when both sides are sorted on it, else a probe of a set of single ids
+  (`[anti-join on ?p by merge]` in EXPLAIN). Other MINUS shapes keep the generic
+  compatibility test.
 * **Batched index joins.** When the input of a join always binds a variable that a
   triple pattern can be read sorted on, and has few distinct values of it for the
   pattern's size, the pattern is read only for those values (`IndexJoin` in EXPLAIN).

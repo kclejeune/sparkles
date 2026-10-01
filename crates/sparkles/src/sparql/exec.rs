@@ -295,7 +295,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::Minus => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
-            minus(ctx, l, &r)?
+            minus(ctx, l, &r, &mut note)?
         }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
@@ -1573,12 +1573,27 @@ fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Tab
     Ok(joined)
 }
 
-fn minus(ctx: &Ctx, mut l: Table, r: &Table) -> Result<Table> {
+fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
     let lay = layout(&l, r);
     if lay.shared.is_empty() || r.is_empty() {
         return Ok(l);
     }
     let r_undef = lay.shared.iter().any(|&(_, rc)| has_undef(r, rc));
+    if ctx.opt.anti_join
+        && let [(lc, rc)] = lay.shared[..]
+        && !r_undef
+        && !has_undef(&l, lc)
+    {
+        let (keep, how) = anti_join(ctx, &l, lc, r, rc)?;
+        *note = Some(format!(
+            "[anti-join on ?{} by {how}]",
+            ctx.var_name(l.vars[lc])
+        ));
+        let sorted = l.sorted.clone();
+        l.filter_rows(&keep);
+        l.sorted = sorted;
+        return Ok(l);
+    }
     let set: FxHashSet<Vec<Id>> = if r_undef {
         FxHashSet::default()
     } else {
@@ -1610,6 +1625,52 @@ fn minus(ctx: &Ctx, mut l: Table, r: &Table) -> Result<Table> {
     l.filter_rows(&keep);
     l.sorted = sorted;
     Ok(l)
+}
+
+/// The rows of `l` whose id in column `lc` is not in column `rc` of `r` (neither column
+/// holds UNDEF, so compatibility is equality): a galloping merge when both sides are
+/// sorted on the key, else a probe of the right side's ids. Also names the method.
+fn anti_join(
+    ctx: &Ctx,
+    l: &Table,
+    lc: usize,
+    r: &Table,
+    rc: usize,
+) -> Result<(Vec<bool>, &'static str)> {
+    let (a, b) = (&l.cols[lc], &r.cols[rc]);
+    let lsorted = l.sorted.first().is_some_and(|v| l.col_of(*v) == Some(lc));
+    let rsorted = r.sorted.first().is_some_and(|v| r.col_of(*v) == Some(rc));
+    if lsorted && rsorted {
+        let mut keep = vec![true; a.len()];
+        let (mut i, mut j) = (0, 0);
+        if b.len() > 8 * a.len() {
+            // gallop over a much larger right side
+            for (i, &x) in a.iter().enumerate() {
+                if j < b.len() && b[j] < x {
+                    j = gallop(b, j, x);
+                }
+                keep[i] = j == b.len() || b[j] != x;
+            }
+            return Ok((keep, "merge"));
+        }
+        // branch-free zipper: each step advances the side with the smaller id (the left
+        // one on equal ids, which may repeat), and the left row's flag is final once it
+        // advances
+        while i < a.len() && j < b.len() {
+            if (i + j) % 65536 == 0 {
+                ctx.check()?;
+            }
+            let (x, y) = (a[i], b[j]);
+            keep[i] = x != y;
+            i += (x <= y) as usize;
+            j += (x > y) as usize;
+        }
+        return Ok((keep, "merge"));
+    }
+    let _held = ctx.charge((b.len() * 16) as u64)?;
+    let set: FxHashSet<Id> = b.iter().copied().collect();
+    ctx.check()?;
+    Ok((a.par_iter().map(|id| !set.contains(id)).collect(), "hash"))
 }
 
 // ------------------------------------------------------------ expressions ------

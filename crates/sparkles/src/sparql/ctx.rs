@@ -75,10 +75,13 @@ pub struct Optimizations {
     /// pure expressions over one variable (FILTER, BIND, ORDER BY keys, aggregate
     /// arguments) are evaluated once per distinct value
     pub expr_cache: bool,
+    /// MINUS on one variable that both sides always bind removes rows by a merge or a
+    /// probe of single ids instead of hashing a key per row
+    pub anti_join: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 15] = [
+    pub const NAMES: [&str; 16] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -94,6 +97,7 @@ impl Optimizations {
         "spatial_join",
         "spatial_knn",
         "expr_cache",
+        "anti_join",
     ];
 
     /// Everything on.
@@ -113,6 +117,7 @@ impl Optimizations {
         spatial_join: true,
         spatial_knn: true,
         expr_cache: true,
+        anti_join: true,
     };
 
     /// Everything off: the generic operators only.
@@ -132,6 +137,7 @@ impl Optimizations {
         spatial_join: false,
         spatial_knn: false,
         expr_cache: false,
+        anti_join: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -151,6 +157,7 @@ impl Optimizations {
             "spatial_join" => &mut self.spatial_join,
             "spatial_knn" => &mut self.spatial_knn,
             "expr_cache" => &mut self.expr_cache,
+            "anti_join" => &mut self.anti_join,
             _ => return None,
         })
     }
