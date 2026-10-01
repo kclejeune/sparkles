@@ -5,9 +5,9 @@
 
 use crate::{Check, FormatError, Language};
 use oxrdf::dataset::CanonicalizationAlgorithm;
-use oxrdf::{BlankNode, Dataset, GraphName, NamedOrBlankNode, Quad, Term, Triple};
+use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedOrBlankNode, Quad, Term, Triple};
 use oxttl::{NQuadsParser, NTriplesParser, TriGParser, TurtleParser};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The base IRI of both parses, so relative IRIs resolve (a `BASE` in the text wins).
 pub const RDF_BASE: &str = super::SPARQL_BASE;
@@ -86,7 +86,7 @@ pub fn parse(text: &str, lang: Language) -> Result<Vec<Quad>, FormatError> {
 }
 
 /// Whether `a` and `b` denote isomorphic datasets (duplicates do not count). The fast
-/// path relabels blank nodes in order of first occurrence and compares the sorted quads;
+/// path relabels blank nodes in order of first occurrence and compares the sets of quads;
 /// when a reordering moved first occurrences, both sides are canonicalized.
 pub fn isomorphic(a: &[Quad], b: &[Quad]) -> bool {
     if relabeled(a) == relabeled(b) {
@@ -100,58 +100,63 @@ pub fn isomorphic(a: &[Quad], b: &[Quad]) -> bool {
     canonical(a) == canonical(b)
 }
 
-/// The quads with blank nodes renamed `b0`, `b1`, … in order of first occurrence, sorted
-/// and deduplicated.
-fn relabeled(quads: &[Quad]) -> Vec<String> {
-    let mut names = HashMap::new();
-    let mut out: Vec<String> = quads
-        .iter()
-        .map(|q| {
-            let mut r = Relabel(&mut names);
-            Quad {
-                subject: r.subject(&q.subject),
-                predicate: q.predicate.clone(),
-                object: r.term(&q.object),
-                graph_name: match &q.graph_name {
-                    GraphName::BlankNode(b) => GraphName::BlankNode(r.blank(b)),
-                    g => g.clone(),
-                },
-            }
-            .to_string()
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
+/// A term with its blank node numbered by first occurrence, borrowing the rest: the fast
+/// path compares these without copying any string.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Key<'a> {
+    Named(&'a str),
+    Blank(usize),
+    Literal(&'a Literal),
+    Triple(Box<(Key<'a>, &'a str, Key<'a>)>),
+    DefaultGraph,
+}
+
+/// The set of the quads with blank nodes numbered in order of first occurrence.
+fn relabeled(quads: &[Quad]) -> HashSet<(Key<'_>, &str, Key<'_>, Key<'_>)> {
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    let mut out = HashSet::with_capacity(quads.len());
+    for q in quads {
+        let mut r = Relabel(&mut names);
+        let quad = (
+            r.subject(&q.subject),
+            q.predicate.as_str(),
+            r.term(&q.object),
+            match &q.graph_name {
+                GraphName::NamedNode(n) => Key::Named(n.as_str()),
+                GraphName::BlankNode(b) => r.blank(b),
+                GraphName::DefaultGraph => Key::DefaultGraph,
+            },
+        );
+        out.insert(quad);
+    }
     out
 }
 
-struct Relabel<'a>(&'a mut HashMap<BlankNode, BlankNode>);
+struct Relabel<'m, 'a>(&'m mut HashMap<&'a str, usize>);
 
-impl Relabel<'_> {
-    fn blank(&mut self, b: &BlankNode) -> BlankNode {
+impl<'a> Relabel<'_, 'a> {
+    fn blank(&mut self, b: &'a BlankNode) -> Key<'a> {
         let n = self.0.len();
-        self.0
-            .entry(b.clone())
-            .or_insert_with(|| BlankNode::new_unchecked(format!("b{n}")))
-            .clone()
+        Key::Blank(*self.0.entry(b.as_str()).or_insert(n))
     }
 
-    fn subject(&mut self, s: &NamedOrBlankNode) -> NamedOrBlankNode {
+    fn subject(&mut self, s: &'a NamedOrBlankNode) -> Key<'a> {
         match s {
-            NamedOrBlankNode::BlankNode(b) => NamedOrBlankNode::BlankNode(self.blank(b)),
-            s => s.clone(),
+            NamedOrBlankNode::NamedNode(n) => Key::Named(n.as_str()),
+            NamedOrBlankNode::BlankNode(b) => self.blank(b),
         }
     }
 
-    fn term(&mut self, t: &Term) -> Term {
+    fn term(&mut self, t: &'a Term) -> Key<'a> {
         match t {
-            Term::BlankNode(b) => Term::BlankNode(self.blank(b)),
-            Term::Triple(t) => Term::Triple(Box::new(Triple {
-                subject: self.subject(&t.subject),
-                predicate: t.predicate.clone(),
-                object: self.term(&t.object),
-            })),
-            t => t.clone(),
+            Term::NamedNode(n) => Key::Named(n.as_str()),
+            Term::BlankNode(b) => self.blank(b),
+            Term::Literal(l) => Key::Literal(l),
+            Term::Triple(t) => Key::Triple(Box::new((
+                self.subject(&t.subject),
+                t.predicate.as_str(),
+                self.term(&t.object),
+            ))),
         }
     }
 }
