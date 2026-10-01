@@ -1,6 +1,6 @@
 //! Turtle 1.2 and TriG 1.2 (SHACL shapes graphs included): the lossless parser
-//! ([`parse`]), the printing rules ([`print`]), the opt-in sorting ([`sort`]) and their
-//! place in the pipeline ([`Turtle`]). The reference parser is oxttl, and the output must
+//! ([`parse`]), the printing rules ([`print`]), the opt-in sorting ([`sort`]), their
+//! place in the pipeline ([`Turtle`]) and streaming ([`stream`]). The reference parser is oxttl, and the output must
 //! parse to an isomorphic graph or dataset ([`crate::check::graph`]).
 //!
 //! The tree reuses SPARQL's node kinds for what the grammars share (directives, triples
@@ -11,6 +11,7 @@
 pub mod parse;
 pub mod print;
 pub mod sort;
+pub mod stream;
 
 use crate::check::LangImpl;
 use crate::check::graph::{RdfReference, rdf_equivalent, rdf_reference};
