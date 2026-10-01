@@ -195,7 +195,7 @@ async fn raw_bodies() {
     let (_d, app) = fmt_server(|_| {});
     let req = Request::post("/$/format")
         .header(header::CONTENT_TYPE, "application/sparql-update")
-        .body(Body::from("CLEAR ALL"))
+        .body(Body::from("CLEAR ALL\n"))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -207,7 +207,7 @@ async fn raw_bodies() {
     let body = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&body[..], b"CLEAR ALL");
+    assert_eq!(&body[..], b"CLEAR ALL\n");
     // text/plain needs the language
     let r = post_as(&app, "/$/format", "text/plain", "ASK {}").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);

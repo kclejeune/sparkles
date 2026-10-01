@@ -14,7 +14,7 @@ use crate::doc::DocId;
 use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId};
-use crate::{OperatorPosition, QuoteStyle, trivia};
+use crate::{OperatorPosition, trivia};
 
 /// `OrChain`: one group, broken one operand per line.
 pub fn or_chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
@@ -31,9 +31,10 @@ pub fn and_chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 /// line before it (`trailing`).
 ///
 /// The chain prints its operands' comments itself rather than through [`node`]: in the
-/// leading position an operand's own-line comments go before the operator that starts
-/// its line, and its trailing comment (one after the operator, too) goes after the
-/// operand, which now ends the line.
+/// leading position a later operand's own-line comments go between its operator and the
+/// operand (before the operator they would belong to the operand before it), and its
+/// trailing comment (one after the operator, too) goes after the operand, which now ends
+/// the line.
 fn chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let leading = cx.opts.operator_position == OperatorPosition::Leading;
     let mut first = Vec::new();
@@ -47,14 +48,26 @@ fn chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             rest.push(cx.line());
             &mut rest
         };
-        out.extend(operand_leading(cx, o));
+        let comments = operand_leading(cx, o);
         if leading {
-            if let Some(op) = prev_op {
-                out.push(cx.tok(op));
-                out.push(cx.space());
+            match prev_op {
+                // the operator, then the operand's own-line comments, so that they still
+                // come right before the operand: before the operator they would belong
+                // to the operand before it
+                Some(op) if !comments.is_empty() => {
+                    out.push(cx.tok(op));
+                    out.push(cx.hard_line());
+                    out.extend(comments);
+                }
+                Some(op) => {
+                    out.push(cx.tok(op));
+                    out.push(cx.space());
+                }
+                None => out.extend(comments),
             }
             out.push(body);
         } else {
+            out.extend(comments);
             out.push(body);
             if let Some(op) = op {
                 out.push(cx.space());
@@ -226,7 +239,7 @@ pub fn call(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 }
 
 /// `ArgList`: `()`, or `(a, b)` broken one argument per line. `DISTINCT` goes before the
-/// first argument, and `GROUP_CONCAT`'s `SEPARATOR = "…"` after the last.
+/// first argument.
 pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let children = cx.children(n);
     let (open, close) = match (children.first(), children.last()) {
@@ -243,15 +256,11 @@ pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
                 item.push(node(cx, a));
                 items.push(item);
             }
+            // `DISTINCT`
             Element::Token(t) => {
                 let doc = term_token(cx, t);
                 let space = cx.space();
-                match items.last_mut() {
-                    // `SEPARATOR = "…"` after the last argument
-                    Some(item) => item.extend([space, doc]),
-                    // `DISTINCT`
-                    None => before_first.extend([doc, space]),
-                }
+                before_first.extend([doc, space]);
             }
         }
     }
@@ -261,9 +270,21 @@ pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     cx.delimited(n, open, &items, close, false)
 }
 
-/// `Arg`: the expression and the `,` or `;` after it.
+/// `Arg`: the expression and the `,` after it, or `GROUP_CONCAT`'s `?n; SEPARATOR =
+/// ", "`.
 pub fn arg(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    call(cx, n)
+    let mut parts = Vec::new();
+    let mut after_semicolon = false;
+    for e in cx.children(n) {
+        if after_semicolon {
+            parts.push(cx.space());
+        }
+        if let Element::Token(t) = e {
+            after_semicolon |= cx.tree.token_kind(t) == TokenKind::Semicolon;
+        }
+        parts.push(element(cx, e));
+    }
+    cx.concat(parts)
 }
 
 /// `Aggregate`: as a call, `COUNT(DISTINCT ?x)`, `GROUP_CONCAT(?n; SEPARATOR = ", ")`.
@@ -309,30 +330,21 @@ fn element(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
     }
 }
 
-/// A token of an expression: keywords and built-in names in the grammar's spelling,
-/// `NIL` as `()`, strings in double quotes unless `quote-style = "preserve"`; anything
-/// else as written.
+/// A token of an expression: `NIL` as `()`, anything else as [`Ctx::term`] prints it
+/// (keywords in the grammar's spelling, IRIs compacted, strings requoted).
 pub fn term_token(cx: &mut Ctx<'_, '_>, t: TokenId) -> DocId {
-    let kind = cx.tree.token_kind(t);
-    match kind {
-        TokenKind::Kw(_) => cx.kw(t),
+    match cx.tree.token_kind(t) {
         TokenKind::Nil => cx.tok_as(t, "()"),
-        k if k.is_string() && cx.opts.quote_style == QuoteStyle::Double => {
-            match crate::normalize::requote(cx.tree.token_text(t), k) {
-                Some(s) => cx.tok_as(t, s),
-                None => cx.tok(t),
-            }
-        }
-        _ => cx.tok(t),
+        _ => cx.term(t),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Options;
     use crate::sparql::parse::expr;
     use crate::trivia::Comments;
+    use crate::{Options, QuoteStyle};
 
     /// `FILTER` and the constraint `src`, printed one level deep (as in a `WHERE`
     /// group) with `opts`.
@@ -610,14 +622,15 @@ mod tests {
                 "{src:?}"
             );
         }
-        // an own-line comment before an operand goes before its operator
+        // an own-line comment before an operand stays right before it: after the operator
         let src = "(?a &&\n # c\n ?b || ?d)";
         assert_eq!(
             filter(src),
             "  FILTER(
     ?a
+      &&
       # c
-      && ?b
+      ?b
       || ?d
   )"
         );

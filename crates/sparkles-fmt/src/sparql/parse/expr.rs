@@ -17,8 +17,8 @@
 //!   name, then an `ArgList`), `Exists` and `NotExists` (the keywords, then the group);
 //! - `e IN (…)` and `e NOT IN (…)` are `InList` (the operand, the keywords, an `ArgList`);
 //! - an `ArgList` is `NIL`, or `(`, an optional `DISTINCT`, the `Arg`s (each an
-//!   expression, or the `*` of `COUNT(*)`, with the `,` or `;` after it), the
-//!   `SEPARATOR = "…"` of `GROUP_CONCAT`, and `)`;
+//!   expression, or the `*` of `COUNT(*)`, with the `,` after it, or the `;
+//!   SEPARATOR = "…"` of `GROUP_CONCAT`), and `)`;
 //! - `<<( s p o )>>` is a `TripleTerm` of its tokens (the object may be a `Literal` or a
 //!   nested `TripleTerm`).
 //!
@@ -338,9 +338,9 @@ fn aggregate_args(p: &mut Parser<'_>, kw: Kw) {
             p.error("aggregate functions cannot be nested");
         }
     }
-    let separator = kw == Kw::GroupConcat && p.eat(TokenKind::Semicolon);
-    a.complete(p);
-    if separator {
+    // the separator goes with the argument, so that a comment after the argument stays
+    // the argument's wherever it is printed
+    if kw == Kw::GroupConcat && p.eat(TokenKind::Semicolon) {
         p.expect_kw(Kw::Separator);
         p.expect(TokenKind::Eq);
         if p.current().is_string() && !matches!(p.nth(1), TokenKind::LangDir | TokenKind::HatHat) {
@@ -350,6 +350,7 @@ fn aggregate_args(p: &mut Parser<'_>, kw: Kw) {
             p.error("expected a string");
         }
     }
+    a.complete(p);
     p.expect(TokenKind::RParen);
     m.complete(p);
 }
@@ -601,9 +602,9 @@ mod tests {
       Arg
         Var1 \"?n\"
         Semicolon \";\"
-      Kw(Separator) \"separator\"
-      Eq \"=\"
-      String2 \"\\\", \\\"\"
+        Kw(Separator) \"separator\"
+        Eq \"=\"
+        String2 \"\\\", \\\"\"
       RParen \")\"
 "
         );
