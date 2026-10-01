@@ -240,6 +240,12 @@ pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
     eval(e, &row, ctx).ok()?.value(ctx).ok()
 }
 
+/// Helpers the spatial join and nearest-neighbour planning share.
+#[cfg(feature = "geo")]
+pub(crate) use on::{
+    constant_geom, distance_text, geof_call, number, scope_covers, unit_iri, warn,
+};
+
 #[cfg(feature = "geo")]
 mod on {
     use super::super::expr::{CmpOp, Func};
@@ -260,7 +266,7 @@ mod on {
     /// Exact tests per window row of a cheap test (a point in a prepared polygon).
     const REFINE_POINT: f64 = 0.5;
 
-    fn warn(ctx: &Ctx, code: &'static str, message: String) {
+    pub(crate) fn warn(ctx: &Ctx, code: &'static str, message: String) {
         ctx.warn(PlanWarning { code, message });
     }
 
@@ -275,13 +281,13 @@ mod on {
         Some(crate::geo::parse_limited(lex, dt, cfg.max_vertices).map_err(|e| malformed(dt, &e)))
     }
 
-    fn number(v: &Value) -> Option<f64> {
+    pub(crate) fn number(v: &Value) -> Option<f64> {
         let x: f64 = Num::of(v).ok()?.to_double().into();
         x.is_finite().then_some(x)
     }
 
     /// The unit IRI of an argument: an IRI, or an `xsd:anyURI` or string literal.
-    fn unit_iri(v: &Value) -> Option<Arc<str>> {
+    pub(crate) fn unit_iri(v: &Value) -> Option<Arc<str>> {
         match v {
             Value::Iri(i) => Some(i.clone()),
             Value::Str(s) => Some(s.clone()),
@@ -634,7 +640,7 @@ mod on {
     }
 
     /// `geof:<name>(…)` calls: the local name and the arguments.
-    fn geof_call(e: &Expr) -> Option<(&str, &[Expr])> {
+    pub(crate) fn geof_call(e: &Expr) -> Option<(&str, &[Expr])> {
         match e {
             Expr::Call(Func::Ext(iri), args) => Some((iri.strip_prefix(vocab::GEOF)?, args)),
             _ => None,
@@ -658,7 +664,11 @@ mod on {
     }
 
     /// The constant geometry of an argument (a literal or a constant expression).
-    fn constant_geom(e: &Expr, ctx: &Ctx, cfg: &GeoConfig) -> std::result::Result<Geom, String> {
+    pub(crate) fn constant_geom(
+        e: &Expr,
+        ctx: &Ctx,
+        cfg: &GeoConfig,
+    ) -> std::result::Result<Geom, String> {
         let Some(v) = fold_const(e, ctx) else {
             return Err("the other geometry is not a constant".into());
         };
@@ -866,7 +876,7 @@ mod on {
 
     /// Whether the index covers every graph of `gf` (the index skips graphs out of its
     /// scope, a plain scan does not).
-    fn scope_covers(cfg: &GeoConfig, gf: &GraphFilter, ctx: &Ctx) -> bool {
+    pub(crate) fn scope_covers(cfg: &GeoConfig, gf: &GraphFilter, ctx: &Ctx) -> bool {
         use crate::text::PredicateSet;
         if matches!(cfg.graphs.include, PredicateSet::All) && cfg.graphs.exclude.is_empty() {
             return true;
