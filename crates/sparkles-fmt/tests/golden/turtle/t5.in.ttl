@@ -1,0 +1,9 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <http://example.org/> .
+ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path ex:name ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount "1"^^xsd:integer ] , [ sh:path ex:email ; sh:pattern '^[^@]+@[^@]+$' ] ;
+  sh:property [ sh:path ex:status ; sh:in ( "active" "inactive" "suspended" ) ] ;
+  sh:sparql [ sh:message "No self-knows" ; sh:select """
+    SELECT $this WHERE { $this ex:knows $this }
+  """ ] .

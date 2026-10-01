@@ -640,6 +640,8 @@ sparkles fmt --stdin-filepath queries/q.rq < q.rq   # stdin named for detection,
 - **Messages.** Errors read `path:LINE:COL: error: …` (1-based lines and columns, in
   characters); a refused output reads `path: error: formatter refused its own output
   (algebra differs); input left unchanged; please report`.
+- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`;
+  sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix); a larger file is an error.
 
 Backup repositories (see [docs/API.md](docs/API.md#backup-repositories)) work offline
 too, on a stopped database; a server's own datasets are backed up through its HTTP API or

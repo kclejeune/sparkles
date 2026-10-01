@@ -3,6 +3,8 @@
 //! (N10). Pure functions over the tree; printers pass what they return to
 //! [`crate::doc::DocArena::token`].
 
+pub mod prune;
+
 use crate::lex::{TokenKind, is_pn_chars, is_pn_chars_u};
 use crate::sparql::keywords::Kw;
 use crate::tree::{NodeId, TokenId, Tree};
@@ -43,6 +45,8 @@ impl PrefixScope {
             let is_prefix = match tree.token_kind(w[0]) {
                 TokenKind::Kw(Kw::Prefix) => true,
                 TokenKind::Word => tree.token_text(w[0]).eq_ignore_ascii_case("prefix"),
+                // Turtle's `@prefix` (case-sensitive)
+                TokenKind::LangDir => tree.token_text(w[0]) == "@prefix",
                 _ => false,
             };
             if is_prefix

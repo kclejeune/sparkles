@@ -335,7 +335,8 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn finish(self) -> Result<Vec<Event>, FormatError> {
+    /// The events, or the first error as [`FormatError::Unsupported`].
+    pub fn finish(self) -> Result<Vec<Event>, FormatError> {
         match self.error {
             None => Ok(self.events),
             Some((message, at)) => {

@@ -1,0 +1,1 @@
+{"name":"Alice","@type":"Person","knows":[{"@id":"http://example.org/bob"},{"name":"Carol","@id":"http://example.org/carol"}],"@id":"http://example.org/alice","@context":{"name":"http://schema.org/name","@vocab":"http://schema.org/","knows":{"@type":"@id","@id":"http://schema.org/knows"}},"tags":["a","b"]}

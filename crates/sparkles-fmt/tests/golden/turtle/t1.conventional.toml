@@ -1,0 +1,3 @@
+directive-style = "turtle"
+prefix-groups = [["rdf", "rdfs", "xsd", "owl"]]
+turtle-layout = "conventional"

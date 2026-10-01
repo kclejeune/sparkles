@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use rayon::prelude::*;
 use sparkles_fmt::options::{self, OptionError, Value};
-use sparkles_fmt::{Detection, FormatError, Language, Options, Warning};
+use sparkles_fmt::{Detection, FormatError, Language, LinesConfig, Options, Warning};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -103,9 +103,17 @@ pub struct FmtArgs {
     /// Ignore file (repeatable; default ./.sparklesfmtignore)
     #[arg(long, value_name = "PATH")]
     pub ignore_path: Vec<PathBuf>,
-    /// Line formats: in-memory sort budget before spilling
-    #[arg(long, value_name = "SIZE", default_value = "1GiB")]
-    pub sort_memory: String,
+    /// Line formats: in-memory sort budget before spilling (bytes, or with a KiB, MiB, GiB
+    /// or TiB suffix)
+    #[arg(long, value_name = "SIZE", default_value = "1GiB", value_parser = parse_size)]
+    pub sort_memory: u64,
+    /// Line formats: the most quads --canonicalize holds in memory
+    #[arg(long, value_name = "N", default_value_t = 20_000_000)]
+    pub max_canonicalize_quads: u64,
+    /// The largest document formatted in memory: every language but N-Triples and
+    /// N-Quads, which stream (bytes, or with a KiB, MiB, GiB or TiB suffix)
+    #[arg(long, value_name = "SIZE", default_value = "256MiB", value_parser = parse_size)]
+    pub max_bytes: u64,
     /// Files formatted in parallel (default: available cores)
     #[arg(long, value_name = "N")]
     pub threads: Option<usize>,
@@ -114,6 +122,26 @@ pub struct FmtArgs {
 fn parse_language(s: &str) -> Result<Language, String> {
     Language::from_name(s)
         .ok_or_else(|| "expected sparql, turtle, trig, ntriples, nquads or jsonld".to_string())
+}
+
+/// A size: bytes, or a number with a binary suffix (`K`/`KiB`, `M`/`MiB`, `G`/`GiB`,
+/// `T`/`TiB`; ASCII case-insensitive, a space allowed before it).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let n: u64 = s[..digits]
+        .parse()
+        .map_err(|_| format!("expected a size like 512MiB, not '{s}'"))?;
+    let shift = match s[digits..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kib" => 10,
+        "m" | "mib" => 20,
+        "g" | "gib" => 30,
+        "t" | "tib" => 40,
+        _ => return Err(format!("expected a size like 512MiB, not '{s}'")),
+    };
+    n.checked_mul(1 << shift)
+        .ok_or_else(|| format!("'{s}' is too large"))
 }
 
 /// `--x` / `--no-x`: the last one given wins (clap's `overrides_with`).
@@ -183,6 +211,21 @@ impl FmtArgs {
         }
         o.canonicalize = self.canonicalize;
         Ok(o)
+    }
+
+    /// What the line formats' streaming needs: the sort budget, the canonicalization
+    /// limit and the threads, spilling to the system's temporary directory.
+    #[allow(
+        dead_code,
+        reason = "the streaming of N-Triples and N-Quads calls it once they format"
+    )]
+    pub fn lines_config(&self) -> LinesConfig {
+        LinesConfig {
+            sort_memory: self.sort_memory,
+            max_canonicalize_quads: self.max_canonicalize_quads,
+            threads: self.threads.unwrap_or(0),
+            ..LinesConfig::default()
+        }
     }
 }
 
@@ -384,15 +427,9 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
             .num_threads(args.threads.unwrap_or(0))
             .build()
             .context("starting the formatting threads")?;
-        pool.install(|| {
-            jobs.par_iter()
-                .map(|j| process(j, args.language, mode))
-                .collect()
-        })
+        pool.install(|| jobs.par_iter().map(|j| process(j, args, mode)).collect())
     } else {
-        jobs.iter()
-            .map(|j| process(j, args.language, mode))
-            .collect()
+        jobs.iter().map(|j| process(j, args, mode)).collect()
     };
 
     let mut changed = 0;
@@ -438,14 +475,14 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
 }
 
 /// Format one document and do with it what `mode` says.
-fn process(job: &Job, flag: Option<Language>, mode: Mode) -> Outcome {
+fn process(job: &Job, args: &FmtArgs, mode: Mode) -> Outcome {
     let name = job.name.as_str();
     let fail = |message: &str| Outcome::error(Some(format!("{name}: error: {message}")));
     let Some(opts) = job.options.as_deref() else {
         return Outcome::error(None);
     };
     // the language by name first, so files that are never formatted are not read
-    let by_name = match language_by_name(flag, job.lang_path.as_deref()) {
+    let by_name = match language_by_name(args.language, job.lang_path.as_deref()) {
         Ok(l) => l,
         Err(e) => return fail(&e),
     };
@@ -453,6 +490,17 @@ fn process(job: &Job, flag: Option<Language>, mode: Mode) -> Outcome {
         && !l.is_implemented()
     {
         return fail(&FormatError::unsupported_language(l).to_string());
+    }
+    // documents formatted in memory have a size limit; the line formats stream
+    let over_limit = |len: u64, lang: Option<Language>| {
+        (len > args.max_bytes && !lang.is_some_and(Language::is_line_format))
+            .then(|| fail(&too_large_message(len, args.max_bytes, lang)))
+    };
+    if let (None, Some(path)) = (&job.text, &job.file)
+        && let Ok(meta) = std::fs::metadata(path)
+        && let Some(o) = over_limit(meta.len(), by_name)
+    {
+        return o;
     }
     let read;
     let text = match (&job.text, &job.file) {
@@ -483,6 +531,9 @@ fn process(job: &Job, flag: Option<Language>, mode: Mode) -> Outcome {
             Err(e) => return fail(&e),
         },
     };
+    if let Some(o) = over_limit(text.len() as u64, Some(lang)) {
+        return o;
+    }
     let f = match sparkles_fmt::format(text, lang, opts) {
         Ok(f) => f,
         Err(e) => return Outcome::error(Some(report::error_line(name, lang, &e))),
@@ -514,6 +565,17 @@ fn process(job: &Job, flag: Option<Language>, mode: Mode) -> Outcome {
         _ => {}
     }
     o
+}
+
+/// The message for a document over `--max-bytes`.
+fn too_large_message(len: u64, max: u64, lang: Option<Language>) -> String {
+    let hint = match lang {
+        Some(Language::Turtle | Language::TriG | Language::JsonLd) => {
+            "; convert it to N-Triples or N-Quads, which stream, to format it"
+        }
+        _ => "",
+    };
+    format!("{len} bytes is more than --max-bytes ({max}) allows to format in memory{hint}")
 }
 
 /// The language from `--language` or the path's extension; `Ok(None)` when the content
@@ -656,6 +718,33 @@ mod tests {
             .options_over(base)
             .unwrap();
         assert_eq!((o.line_width, o.indent_width, o.sort), (120, 3, true));
+    }
+
+    #[test]
+    fn sizes_and_the_line_formats_config() {
+        assert_eq!(parse_size("1024"), Ok(1024));
+        assert_eq!(parse_size("1GiB"), Ok(1 << 30));
+        assert_eq!(parse_size("256 MiB"), Ok(256 << 20));
+        assert_eq!(parse_size("64k"), Ok(64 << 10));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        assert!(parse_size("1.5GiB").is_err());
+        assert!(parse_size("1GB").is_err());
+        assert!(parse_size("99999999999TiB").is_err());
+        let a = parse(&[]).unwrap();
+        assert_eq!((a.sort_memory, a.max_bytes), (1 << 30, 256 << 20));
+        assert_eq!(a.lines_config(), LinesConfig::default());
+        let a = parse(&[
+            "--sort-memory=64MiB",
+            "--max-canonicalize-quads=10",
+            "--threads=3",
+        ])
+        .unwrap();
+        let c = a.lines_config();
+        assert_eq!(
+            (c.sort_memory, c.max_canonicalize_quads, c.threads),
+            (64 << 20, 10, 3)
+        );
+        assert!(parse(&["--max-bytes=lots"]).is_err());
     }
 
     #[test]

@@ -1,0 +1,21 @@
+{
+  "@context": {
+    "@vocab": "http://schema.org/",
+    "name": "http://schema.org/name",
+    "knows": {
+      "@id": "http://schema.org/knows",
+      "@type": "@id"
+    }
+  },
+  "@id": "http://example.org/alice",
+  "@type": "Person",
+  "name": "Alice",
+  "knows": [
+    { "@id": "http://example.org/bob" },
+    {
+      "@id": "http://example.org/carol",
+      "name": "Carol"
+    }
+  ],
+  "tags": ["a", "b"]
+}

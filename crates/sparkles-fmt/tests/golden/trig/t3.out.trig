@@ -1,0 +1,19 @@
+VERSION "1.2"
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+GRAPH ex:g1 {
+  ex:alice
+    ex:knows ex:bob ~ ex:r1 {|
+      ex:since "2020"^^xsd:gYear ;
+      ex:source ex:hr ;
+    |} ;
+  .
+
+  ex:r1 ex:confidence 0.9 .
+}
+
+GRAPH ex:g2 {
+  << ex:alice ex:worksFor ex:acme >> ex:statedBy ex:carol .
+  ex:carol ex:says <<( ex:acme ex:size "big"@en--ltr )>> .
+}

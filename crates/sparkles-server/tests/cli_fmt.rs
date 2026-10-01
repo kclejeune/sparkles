@@ -618,6 +618,43 @@ fn config_errors_name_the_key_and_the_file() {
 /// With the test-only fault switch the printer drops a token: the check refuses the
 /// output, `--write` leaves the file alone, and the endpoint answers 422.
 #[test]
+fn documents_over_max_bytes_are_refused() {
+    let d = tempdir();
+    let dir = d.path();
+    write(dir, "big.rq", QUERY);
+    let o = expect(dir, &["--max-bytes", "16", "big.rq"], None, 2);
+    assert!(
+        stderr(&o).contains(&format!(
+            "big.rq: error: {} bytes is more than --max-bytes (16) allows to format in memory",
+            QUERY.len()
+        )),
+        "{}",
+        stderr(&o)
+    );
+    // stdin too
+    let o = expect(
+        dir,
+        &["--max-bytes=16", "--language", "sparql"],
+        Some(QUERY),
+        2,
+    );
+    assert!(stderr(&o).contains("--max-bytes"), "{}", stderr(&o));
+    expect(dir, &["--max-bytes", "1KiB", "big.rq"], None, 0);
+    expect(dir, &["--max-bytes", "lots", "big.rq"], None, 2);
+}
+
+#[test]
+fn the_language_server_is_not_available_yet() {
+    let o = Command::new(BIN).args(["lsp", "--stdio"]).output().unwrap();
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("sparkles lsp is not available yet"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
 fn refused_output_is_never_written() {
     let d = tempdir();
     let dir = d.path();

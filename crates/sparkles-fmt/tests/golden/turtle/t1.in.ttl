@@ -1,0 +1,10 @@
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# --- People ---
+
+<http://example.org/alice> foaf:name 'Alice' ; rdf:type foaf:Person ;   # the founder
+    foaf:age "42"^^xsd:integer ; foaf:knows ex:bob , ex:carol .
+ex:bob a foaf:Person .
