@@ -39,57 +39,10 @@ const DIVERGENCES: &[(&str, &str)] = &[
     ("sparql12/syntax/group-by-scope-bad-1.rq", SCOPE),
     ("sparql12/syntax/group-by-scope-bad-2.rq", SCOPE),
     ("sparql12/syntax/group-by-scope-bad-3.rq", SCOPE),
-    ("sparql10/syntax-sparql3/syn-bad-26.rq", EXPR),
-    ("sparql10/syntax-sparql3/syn-bad-29.rq", EXPR),
-    ("sparql10/syntax-sparql3/syn-bad-30.rq", EXPR),
-    ("sparql11/syntax-query/syn-bad-06.rq", EXPR),
-    ("sparql12/syntax/nested-aggregate-functions.rq", EXPR),
-    (
-        "sparql12/syntax-triple-terms-negative/bind-anonreified.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/bind-reified.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/bindbnode-anonreifier.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/bindbnode-reifier.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/bindbnode-tripleterm.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/quoted-path-bind-anonreifier.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/quoted-path-bind-reifier.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/quoted-path-bind-tripleterm.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/tripleterm-subject-03.rq",
-        EXPR,
-    ),
-    (
-        "sparql12/syntax-triple-terms-negative/tripleterm-subject-06.rq",
-        EXPR,
-    ),
 ];
 
 const SCOPE: &str =
     "variable scope (SPARQL 1.2 §18.2.1, §11.4): checked while building the algebra";
-/// remove each entry when the expression parser rejects it
-const EXPR: &str = "an expression the expression parser does not check yet";
 
 fn suite_dir() -> Option<PathBuf> {
     let p = std::env::var("SPARKLES_W3C_DIR")
