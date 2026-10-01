@@ -64,7 +64,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | N-Quads backups (`/$/backup`) and dumps (zstd by default, or gzip, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
-| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums; safe next to a running server | ✅ |
+| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums, the spatial index's `geo.json`; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
 ### SPARQL (ARQ equivalent)
@@ -80,6 +80,9 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SERVICE (federated query, SILENT), under an outbound network policy: public destinations only by default on a server (the local `query` and `update` also reach private ones), allowlists, DNS pinning, checked redirects, timeouts, response ceiling | ✅ |
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit (staged, committed by the next search or a 1 s tick), graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
+| GeoSPARQL 1.1 functions (`geo` cargo feature, on in the server): `geo:wktLiteral` and `geo:geoJSONLiteral` (Z/M layouts, EMPTY, byte offsets in parse errors), built-in CRSs (CRS84, CRS84h, EPSG:4326/4979 with their latitude-first axes, Web Mercator) and OGC/QUDT/EPSG units, the 24 topological relations and `relate` on DE-9IM, `distance` (geodesic on WGS 84 by default, haversine per dataset, Euclidean for projected CRSs), `buffer` (metric buffers through a local projection), `convexHull`, `envelope`, `boundary`, `centroid`, the four overlay operations, `area`/`length`/`perimeter` (geodesic) and the accessors; see [docs/API.md](docs/API.md#geosparql) | ✅ |
+| Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), rebuilt on open and by compaction, within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
+| Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | 🚧 |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
 | W3C conformance: SPARQL 1.1 query **328/328**, SPARQL 1.1 update **157/157**, SPARQL 1.0 **482/482**, SPARQL 1.2 **269/269** (with the vendored, patched `spargebra`, see `vendor/spargebra/PATCHED.md`) | ✅ |
 
@@ -162,7 +165,7 @@ feature gaps are:
 | Area | Jena / Fuseki has | Sparkles |
 |---|---|---|
 | Full-text search | jena-text (Lucene), `text:query` | `text:query` subset over string literals (Tantivy, BM25), updated in the commit path; no highlighting, per-language stemming or entity-style multi-field documents yet |
-| Spatial | GeoSPARQL (`geof:` functions, spatial index) | ✗ none |
+| Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions with a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | the GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs, and a spatial index per dataset; `spatial:` property functions are being added; no `spatialF:` functions, query rewrite, geometry-type entailment, GML/KML literals or EPSG database yet (see `docs/AUDIT.md` §5) |
 | Shape languages | ShEx (jena-shex) | SHACL and ShEx 2.1 (ShExC, ShExJ); no ShExR (RDF) schemas, ShEx 2.2 or ShEx write-time validation |
 | Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
@@ -183,7 +186,7 @@ feature gaps are:
 | Streaming execution | lazy, block-wise evaluation of scans, joins, filters and GROUP BY; results streamed to the client | every operator materializes its full result (bounded by row and memory budgets); responses over 1 MiB are streamed to the client as they are serialized |
 | Block prefiltering | FILTER ranges / STRSTARTS evaluated against block min/max to skip blocks | numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals); non-canonical numerals are still tested row by row |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts use index runs instead) |
-| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); no spatial |
+| Text / spatial | `ql:contains-word`, BM25 scoring, spatial joins, geo index | BM25 full-text search via `text:query` (no text/entity co-occurrence index); GeoSPARQL functions and a spatial index, no spatial joins yet |
 | Vocabulary compression | FSST string compression, IRI-as-id encoding for numeric IRIs | front coding, no IRI encoding |
 | Named / pinned results, materialized views | `pin-result-with-name`, materialized views | result cache only (no pinning) |
 | Live query monitoring | websocket runtime-information updates | executed plan returned after completion only |
@@ -207,7 +210,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 | History | immutable commit chain (content-addressed), time travel (`@t:`, `@iso:`, `@commit:`), history queries, branches / merge / revert | durable, ordered commit ids and a commit catalog; point-in-time reads of every commit since the last compaction, and of older ones kept by named snapshots or a retention window; no history queries across commits, diffs, branches or merges yet |
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers; no policy language, signed requests or encryption at rest |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL, the Rust API and an MCP server (stdio, read-only tools); JSON-LD as an RDF format only |
-| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |
+| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), exact vector search (`spk:vectorSearch`) and GeoSPARQL with a spatial index; no approximate (HNSW) vector index yet |
 | Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk, plus incremental, deduplicated backups to a file system or S3 |
 | Reasoning | at query time (RDFS / OWL 2 QL rewriting, OWL 2 RL / Datalog with a fact budget) | materialized (RDFS, OWL 2 RL, Jena rules) |
 
@@ -239,7 +242,7 @@ queries run.
 |---|---|---|
 | Embedding | Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | Rust library (persistent or in-memory); no Python or WebAssembly bindings |
 | Storage | RocksDB (an LSM tree; C++), 9 index orders (6 for named graphs, 3 for the default graph) plus a string dictionary; updates in place; online backups via RocksDB checkpoints (each a complete database in a new local directory, hard-linked when on the same file system) | immutable sorted blocks in 7 orders plus a WAL-logged in-memory delta, merged by compaction; online backups into backup repositories on a file system or S3 (incremental and deduplicated across backups and datasets), with restore, verification, schedules and retention |
-| Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI; no spatial index) | ✗ none |
+| Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI; no spatial index) | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a spatial index per dataset |
 | Write durability | a RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default write options) | the WAL is fsynced before a write is acknowledged |
 
 Oxigraph describes its query evaluation as "not optimized yet": it evaluates lazily,
@@ -366,7 +369,13 @@ result cache, and the web UI.
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0`: no cap) for queries, updates and Graph Store writes alike; the default query timeout stays 60 s, and writes have no default deadline (`--update-timeout 0`) but are cancelled when their client disconnects | A request may ask for a longer timeout than the default, but not hold a worker indefinitely; a long load is not cut off by a default it did not ask for, and a disconnected one stops (its rate-limit concurrency slot stays taken until it has). |
 | The full-text index is committed lazily: a write stages its documents, and the next text query that needs them (or a tick about once a second) commits them | A Tantivy commit flushes a segment and cost more than the indexing itself; a burst of writes now shares one. Each snapshot still searches exactly its own documents (later ones are filtered out against it, removed ones are kept until their batch is committed), and after a crash the WAL restores what was only staged. Jena's text index commits with each transaction. |
 | N-Quads backups (`/$/backup/{ds}`, `sparkles backup`) are zstd (level 3, `.nq.zst`) by default, where Fuseki writes gzip (`.nq.gz`); `?compression=gzip` or `--compress gzip` writes Fuseki's format | At 10.5M triples zstd took 8.2 s for 81.5 MB and gzip (level 6) 41 s for 74.9 MB: five times faster for a file 9% larger. `sparkles load` and uploads read both. |
-| Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
+| GeoSPARQL distances, lengths and areas on geographic CRSs are geodesic on the WGS 84 ellipsoid (Karney); `geo.json` `"distance": "haversine"` gives Jena's sphere (R = 6,371,008.7714 m) | Up to 0.5% more accurate than the sphere, at a small cost per call. Jena computes great-circle distances on a sphere. |
+| GeoSPARQL literals are read with their CRS's own axis order (EPSG:4326 is latitude first); the legacy `…/def/crs/EPSG/4326` (without `/0/`) is CRS84, as in Jena | GeoSPARQL Req 16. `minX`…`maxY` report the literal's own axes, as in Jena. |
+| GeoSPARQL literals in a CRS this build does not know are valid geometries: same-CRS planar relations, accessors and constructions work, metric functions and mixes with other CRSs are type errors, and the index leaves them out (counted in its status) | Jena logs a warning and treats the coordinates as CRS84 degrees, which gives wrong answers silently. |
+| GeoSPARQL relations follow DE-9IM: an empty geometry is disjoint from everything (`sfDisjoint` true, every other relation false), equal points are `sfEquals`, `sfCrosses` of two curves is `0********`, RCC8 relations hold between regions only | Jena returns false for every relation on an empty geometry and compares `sfEquals` with the tables' `TFFFTFFFT` pattern, under which two equal points are not equal. |
+| `geof:getSRID` returns an `xsd:anyURI`; `geof:dimension` of an empty geometry is its type's dimension (`-1` for an empty collection) | The GeoSPARQL 1.1 signature (Jena returns `xsd:string`); never a type error. |
+| The spatial index is opt-in per dataset (`geo.json`); the `geof:` functions work without it, and every answer from the index is refined with the exact test, so answers are the same with or without it | Jena's index is built for the whole dataset at start-up and its `spatial:withinBox`/`intersectBox` return envelope hits for an unbound subject. |
+| Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Using the library (no server)
 
@@ -495,13 +504,17 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--max-upload-mb N` | `4096` | largest Graph Store write or upload body, streamed to a temporary file and counted after HTTP decompression (`0`: unlimited) |
 | `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free, and to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) once the data directory's would (`0`: no check) |
 | `--max-mem-dataset-mb N` | `4096` | largest in-memory dataset; a commit that would grow one past it fails with `507` (`0`: unlimited) |
-| `--max-tasks N` | `4` | background tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) running at once; more wait `queued` (`0`: no limit) |
+| `--max-tasks N` | `4` | background tasks (compaction, clones, reasoning, full-text and spatial index builds, N-Quads backups) running at once; more wait `queued` (`0`: no limit) |
 | `--backup-config FILE` | | backup repositories, policies, credential sources and the limits of repositories registered through the API (TOML, also `$SPARKLES_BACKUP_CONFIG`; re-read on SIGHUP; read-only through the API) |
 | `--backup-max-tasks N` | `2` | backup, restore, verify and GC tasks running at once; more wait `queued` |
 | `--format-endpoint on\|authenticated\|off` | `on` | who may use `POST /$/format` (see `docs/API.md`, Formatting): every caller the server admits, every caller but the anonymous principal (`401`), or nobody (`404`) |
 | `--format-max-mb N` | `16` | largest `POST /$/format` body (`0`: unlimited) |
 | `--format-timeout S` | `10` | seconds a `POST /$/format` request may take, waiting for a free slot (one per core) included; `408` past it |
 | `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
+| `--text NAME[=FILE]` | | enable full-text search for a dataset (with a `text.json`-shaped configuration file) |
+| `--geo NAME[=FILE]` | | enable the spatial index for a dataset (with a `geo.json`-shaped configuration file); the build runs before the server starts listening |
+| `--geo-mb N` | `4096` | memory for each dataset's spatial index (geometry column and trees); a build that would exceed it is refused, the status says `over-budget`, and queries run without the index |
+| `--geo-op-vertices N` | `2000000` | largest sum of input vertices of one geometry operation (overlay, buffer, hull, relate); larger ones are a type error |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |
 | `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |
@@ -548,7 +561,15 @@ sparkles check   --loc db                     # verify the files, read-only (--q
 sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
+sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
+sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph,
+                                              #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 ```
+
+`sparkles geo-index` enables the spatial index with the defaults when it is off (or with
+the given options), builds it and prints its status to stderr; on an enabled index it
+reports the status after the build that opening the database starts. It exits 2 when the
+binary was built without the `geo` feature.
 
 `sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`) with
 Prettier's modes and exit codes: 0 when everything is formatted (or was written), 1 when
@@ -669,6 +690,12 @@ incremental one after small commits, a restore and a data verification of an exi
 database to an `fs` repository.
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
+`scripts/gen-geo.py N` generates a GeoSPARQL one (points around cities, lines, polygons,
+an administrative hierarchy) with its queries, and `scripts/bench-geo.sh N` times them
+with and without the spatial index after checking that both give the same answers.
+`scripts/geosparql-benchmark.sh` runs the GeoSPARQL Compliance Benchmark (GPL-2.0, so it
+is fetched into `target/` at a pinned commit only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`,
+and never added to the repository).
 
 ### Outbound requests (SERVICE and LOAD)
 
@@ -776,6 +803,7 @@ prints the same report as JSON. The exit status is **0** when everything is clea
 | `wal` | records are well formed; every commit record's checksum matches (a damaged final transaction is a warning: open truncates it); commit numbers continue from the generation's base commit; ids resolve |
 | `catalog` | `commits.bin` record checksums and continuity, its dataset id, and agreement with the WAL; a lagging catalog, or damage open can rebuild from the WAL, is a warning, lost history before the generation an error |
 | `text` | `text.json` parses; the index opens read-only, every committed segment file exists and matches its checksum; its commit against the WAL (behind is a warning: caught up or rebuilt on open) |
+| `geo` | `geo.json` parses and is a valid configuration (the index itself is built in memory when the database is opened) |
 | `reasoning` | `reasoning.json` parses and names an existing commit |
 
 Errors are what `Store::open` refuses, what loses acknowledged data or history, or what

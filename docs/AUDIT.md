@@ -15,7 +15,8 @@ Source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5, 2026‑09‑28), QLe
 | jena-fuseki2 | ~36K | SPARQL server: query/update/GSP/upload/patch/shacl, `/$/` admin (datasets, stats, compact, backup, tasks, metrics) | `sparkles-server` |
 | jena-ontapi | 35K | OWL2 object API (profiles DL/EL/QL/RL, no DL reasoner) | out of scope (see §5) |
 | jena-shacl / jena-shex | 23K / 18K | SHACL Core + SPARQL; ShEx 2 | `sparkles-shacl`: SHACL Core + SHACL-SPARQL (W3C 98/98 + 20/20); `sparkles-shex`: ShEx 2.1 (ShExC, ShExJ, shape maps; shexTest validation 99.9%) |
-| jena-text / jena-geosparql | 7.5K / 23K | Lucene text index; GeoSPARQL (JTS/SIS) | `text:query` subset over string literals (Tantivy, BM25; not jena-text's Lucene format or assembler); GeoSPARQL out of scope for v1 |
+| jena-text | 7.5K | Lucene text index | `text:query` subset over string literals (Tantivy, BM25; not jena-text's Lucene format or assembler) |
+| jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS: `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML/KML/WKT/GeoJSON literals, EPSG CRSs | `sparkles::geo` (`geo` cargo feature) on the `geo`, `wkt`, `geojson`, `geo-index` and `geographiclib-rs` crates: the `geof:` functions over WKT and GeoJSON in built-in CRSs, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions; Jena's behaviour where GeoSPARQL leaves room, with the divergences listed in the README. Not yet: `spatialF:`, query rewrite, GML/KML, other CRSs (§5) |
 | jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | patch logs, client APIs, builders, CLI | CLI → `sparkles` binary; others n/a in Rust |
 | jena-tdb1, commonsrdf | — | deprecated | skipped |
 
@@ -48,7 +49,7 @@ Conformance suites available in the Jena checkout (to be used by `sparkles` test
 | Cache | concurrent LRU keyed by subtree + delta version; pinning | ✅ LRU keyed by canonical plan + snapshot version |
 | Limits | cancellation handle, memory-limited allocator, timeouts | ✅ cancellation (also on client disconnect) / timeouts; per-query budgets for estimated intermediate-result memory, response bytes and rows (estimates, not an allocator limit) |
 | Server | streaming results, `qlever-json` with runtime-information tree, websockets for live plan | ✅ `x-sparkles+json` with executed plan tree (see API.md) |
-| Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | text: BM25 full-text search through `text:query` (Tantivy), no text/entity co-occurrence index; patterns and spatial ⏭ future work |
+| Patterns / text / spatial | `ql:has-predicate` patterns, text index, spatial joins | text: BM25 full-text search through `text:query` (Tantivy), no text/entity co-occurrence index; spatial: GeoSPARQL functions and a packed R-tree per dataset (ideas from QLever's geometry precomputation, not its code), no spatial joins yet; patterns ⏭ future work |
 
 ## 2a. Oxigraph — what Sparkles reuses
 
@@ -65,7 +66,7 @@ libraries. Sparkles uses the libraries and replaces the database:
 | `oxsdatatypes` 0.2 | XSD value space (decimal, dateTime, durations) | ✅ literal values and arithmetic |
 | `sparopt`, `spareval` | algebra optimizer and evaluator | ✗ Sparkles has its own DP planner and columnar executor |
 | `oxigraph` (store) | RocksDB storage, 9 index orders, in-place updates | ✗ Sparkles uses QLever-style sorted blocks (§2) |
-| `spargeo` | GeoSPARQL functions | ✗ not used (GeoSPARQL is out of scope for v1) |
+| `spargeo` | GeoSPARQL functions on `geo` | ✗ not used: `sparkles::geo` has its own literal parsing (EPSG:4326 axes, CRS IRIs, byte offsets), geodesic measures and a spatial index; `spargeo` was a reference for the `geo` crate family |
 
 Oxigraph is also one of the benchmark engines (`docs/BENCHMARKS.md`).
 
@@ -115,6 +116,7 @@ sparkles (library)
  │            compaction, backup capture
  ├─ sparql    spargebra → planner (DP + interesting orders) → columnar operators → results
  ├─ text      full-text index (Tantivy)
+ ├─ geo       GeoSPARQL: literals, CRSs, units, the geof: functions, the spatial index (geo, geo-index)
  ├─ vector    exact vector similarity
  ├─ codec     gzip / zstd / brotli / LZ4
  └─ io        RDF & result-format parsing/serialization (Oxigraph crates)
@@ -124,6 +126,20 @@ sparkles (library)
 
 JavaScript scripting functions, RDF Thrift/Protobuf, TriX, jena-ontapi's object mapping API,
 jena-text's Lucene index format and assembler configuration (Sparkles implements
-`text:query` itself), GeoSPARQL, RDF Patch, backward-chaining (LP) rules, Shiro auth
+`text:query` itself), RDF Patch, backward-chaining (LP) rules, Shiro auth
 (Sparkles has its own authentication). These are documented extension points rather than
 hidden gaps.
+
+GeoSPARQL is in, with these parts left out for now:
+
+* **`spatialF:` functions** (Jena's filter functions: `convertLatLon`, `nearby`,
+  `greatCircle`, `azimuth`, …) are deferred; the `geof:` functions cover the same ground.
+* **Computed geometries are 2D.** Z and M values are read (`is3D`, `isMeasured`, `minZ`,
+  `maxZ` report them) but not kept, so buffers, hulls, overlays and conversions return 2D
+  geometries.
+* **Unions of curves are not noded:** two lines that cross stay two lines, not split at the
+  crossing point as JTS would (the result covers the same points).
+* GML and KML literals, query rewrite of the topological properties, RDFS entailment of
+  the geometry hierarchy, W3C Basic Geo points in the index, spatial joins, k-nearest
+  ORDER BY, the map view in the UI, and CRSs beyond the built-in ones (no EPSG database is
+  shipped).

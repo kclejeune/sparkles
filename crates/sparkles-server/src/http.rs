@@ -880,6 +880,7 @@ async fn query_endpoint(
         rows: Some(r.len() as u64),
         mem_peak_bytes: Some(r.mem_peak_bytes),
         timing: Some(r.timing.clone()),
+        geo_work: crate::geo::plan_work(&r.plan),
         ..Default::default()
     };
     let dataset_id = ds.store.dataset_id().to_string();

@@ -87,6 +87,9 @@ JSON object per line.
 | `sparkles_validation_total` | counter | `dataset`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter (results found by validated writes) | `dataset`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_geo_rows` | gauge (rows of the spatial index) | `dataset`, `part` = `base` \| `overlay` \| `tail` |
+| `sparkles_geo_build_seconds` | gauge (the last build of the index's base) | `dataset` |
+| `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total` | counter (rows found by the index, exact geometry tests, rows that passed them, over the spatial operators of queries) | `dataset` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded: `dataset` is an existing dataset name (at most
@@ -366,7 +369,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | Method | Path                         | Description |
 |--------|------------------------------|-------------|
 | GET    | `/$/datasets`                | `{ "datasets": [DatasetInfo] }` |
-| POST   | `/$/datasets`                | Create. Form or JSON body: `dbName`, `dbType` = `persistent` \| `mem`. `201` on success, `409` if exists. |
+| POST   | `/$/datasets`                | Create. Form or JSON body: `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo` = `true` (a spatial index with the defaults) or, in a JSON body, a `GeoConfig` (see [GeoSPARQL](#geosparql); `400` for an invalid one, `501` in a build without the `geo` feature). `201` on success, `409` if exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | DELETE | `/$/datasets/{ds}`           | Remove dataset (and its files). |
 | POST   | `/$/datasets/{ds}/clone`     | Copy the dataset into a new persistent dataset. See [Clone](#clone). `202` with a `Task`. |
@@ -406,6 +409,8 @@ type DatasetInfo = {
   restoredFrom?: { repository: string; backup: string; datasetId: string; seq: number };
                                               // restored from a backup repository
   access?: "read" | "write" | "admin";        // with auth: the caller's level (absent without)
+  text: null | { state: string; docs: number };     // full-text index (see Full-text search)
+  geo: null | { state: string; rows: number };      // spatial index: state and rows (base + overlay + tail)
 };
 
 type DatasetStats = {
@@ -422,11 +427,12 @@ type DatasetStats = {
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
+  geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
 };
 
 type Task = {
   id: string;
-  kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild"
+  kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild" | "geo-index"
       | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy";
   dataset: string;          // "" for a server-wide task (listed for server admins only)
   target?: string;          // the dataset a clone creates; for backup tasks see Backup repositories
@@ -440,7 +446,7 @@ type Task = {
 ```
 
 **Task slots.** At most `sparkles serve --max-tasks` (default 4; `0`: no limit) background
-tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) run at once; the
+tasks (compaction, clones, reasoning, full-text and spatial index builds, N-Quads backups) run at once; the
 others wait `queued`, in start order, and may be cancelled while they wait. Backup
 repository tasks (`backup-*` kinds) wait for their own `--backup-max-tasks` slots instead.
 Starting a task while 1000 already wait answers `503`. The task list keeps every queued
@@ -1428,6 +1434,149 @@ as written; one that does not parse is stored but never matched.
   for the predicates packed so far in the current generation (packing happens on a
   predicate's first search; `vectors` counts a vector once per graph it is in).
 
+## GeoSPARQL
+
+Built with the `geo` cargo feature (on in the server), Sparkles implements the GeoSPARQL
+1.1 functions over geometry literals, Jena's `spatial:` property functions, and a spatial
+index per dataset. Prefixes: `geo:` `<http://www.opengis.net/ont/geosparql#>`, `geof:`
+`<http://www.opengis.net/def/function/geosparql/>`, `uom:`
+`<http://www.opengis.net/def/uom/OGC/1.0/>`, `sf:` `<http://www.opengis.net/ont/sf#>`,
+`spatial:` `<http://jena.apache.org/spatial#>`.
+
+```sparql
+SELECT ?f ?d WHERE {
+  ?f geo:hasDefaultGeometry/geo:asWKT ?w .
+  FILTER(geof:sfWithin(?w, "POLYGON((2.2 48.8, 2.5 48.8, 2.5 48.9, 2.2 48.9, 2.2 48.8))"^^geo:wktLiteral))
+  BIND(geof:distance(?w, "POINT(2.2945 48.8584)"^^geo:wktLiteral, uom:kilometre) AS ?d)
+} ORDER BY ?d
+```
+
+**Literals.**
+
+* `geo:wktLiteral`: WKT with an optional leading CRS IRI (`<http://…/EPSG/0/4326> POINT(48.86 2.34)`),
+  Z, M and ZM layouts, `EMPTY`, and the empty string (an empty geometry). `LINEARRING`,
+  `TRIANGLE`, `TIN` and `POLYHEDRALSURFACE` are read as line strings and polygons, keeping
+  their type for `geof:geometryType`.
+* `geo:geoJSONLiteral`: an RFC 7946 geometry (always CRS84).
+* Literals are stored as written: `"POINT(1 2)"` and `"Point (1.0 2.0)"` are different
+  terms with equal geometries (`=` compares terms, `geof:sfEquals` geometries). A literal
+  that does not parse is stored all the same; functions give a type error on it and the
+  index skips it. A malformed geometry **constant** in a query is a `400`
+  (`geo: malformed wktLiteral at offset N: …`).
+* **CRSs.** CRS84 (the default, longitude first), CRS84h, EPSG:4326 and EPSG:4979
+  (latitude first, as the EPSG definition says; GeoSPARQL Req 16), the legacy
+  `http://www.opengis.net/def/crs/EPSG/4326` (longitude first, as in Jena), and Web
+  Mercator (EPSG:3857); `https` forms, URNs and other EPSG versions are accepted as
+  aliases. A literal in another CRS is a valid geometry: accessors, constructions and
+  relations between geometries of that same CRS work, metric functions and mixes with
+  other CRSs are type errors, and the index leaves it out.
+* **Units.** OGC (`uom:metre`, `uom:kilometre`, `uom:mile`, `uom:degree`, `uom:radian`,
+  …), QUDT (`http://qudt.org/vocab/unit/KiloM`, …) and EPSG URNs, as IRIs or
+  `xsd:anyURI` literals; an unknown unit is a type error.
+
+**Functions** (a type error on any bad argument: unbound in BIND, false in FILTER). A
+geometry result has the datatype and CRS of the first geometry argument; the second
+geometry of a binary function is transformed into the first one's CRS.
+
+| Functions | Result |
+|---|---|
+| the 24 relations: `sfEquals` `sfDisjoint` `sfIntersects` `sfTouches` `sfWithin` `sfContains` `sfOverlaps` `sfCrosses`, `ehEquals` `ehDisjoint` `ehMeet` `ehOverlap` `ehCovers` `ehCoveredBy` `ehInside` `ehContains`, `rcc8eq` `rcc8dc` `rcc8ec` `rcc8po` `rcc8tppi` `rcc8tpp` `rcc8ntpp` `rcc8ntppi`; `relate(g1, g2, "T*F**FFF*")` | `xsd:boolean`, from the DE-9IM matrix (planar, in longitude/latitude for geographic CRSs) |
+| `distance(g1, g2, unit)`, `metricDistance(g1, g2)` | `xsd:double`: geodesic on WGS 84 by default (`"distance": "haversine"` in `geo.json`: on a sphere), Euclidean in projected CRSs; an angle unit gives the central angle |
+| `buffer(g, r, unit)`, `metricBuffer(g, r)`, `convexHull`, `envelope`, `boundary`, `centroid`, `intersection`, `union`, `difference`, `symDifference` | geometry (2D). A metric buffer on geographic data goes through a local projection (up to 1000 km) |
+| `area(g, unit)`, `length`, `perimeter` and their `metric…` forms | `xsd:double`, geodesic on geographic CRSs |
+| `getSRID` | `xsd:anyURI` |
+| `transform(g, crs)`, `asWKT`, `asGeoJSON` | geometry |
+| `dimension`, `coordinateDimension`, `spatialDimension`, `numGeometries` | `xsd:integer` |
+| `is3D`, `isMeasured`, `isEmpty` | `xsd:boolean` |
+| `geometryType` | `xsd:anyURI` (`sf:Point`, …) |
+| `geometryN(g, n)` (1-based) | geometry |
+| `minX` `minY` `maxX` `maxY` (in the literal's own axis order), `minZ` `maxZ` | `xsd:double` |
+
+Operations over more input vertices than `serve --geo-op-vertices` (2,000,000) are type
+errors; constructed geometries count against the query's memory budget.
+
+**`spatial:` property functions** (Jena's syntax; constant arguments). *Being added:
+until they land, a `spatial:` call answers `501`, and spatial FILTERs are evaluated row by
+row without the index.*
+
+```sparql
+SELECT ?f WHERE { ?f spatial:nearby (48.8566 2.3522 5 uom:kilometre 10) }   # lat lon radius [unit [limit]]
+```
+
+| Function | Arguments | Features whose geometry … |
+|---|---|---|
+| `nearby`, `withinCircle` | `(lat lon radius [unit [limit]])` | is within the radius (default unit kilometres) of the EPSG:4326 point |
+| `nearbyGeom`, `withinCircleGeom` | `(geom radius [unit [limit]])` | is within the radius of `geom` |
+| `withinBox` / `intersectBox` | `(latMin lonMin latMax lonMax [limit])` | is within / intersects the box |
+| `withinBoxGeom` / `intersectBoxGeom` | `(geom [limit])` | is within / intersects `geom`'s envelope |
+| `north` `south` `east` `west` | `(lat lon [limit])` | has an envelope beyond the point in that direction |
+| `northGeom` … `westGeom` | `(geom [limit])` | the same from `geom`'s envelope |
+
+The subject is the feature: `?f geo:hasDefaultGeometry ?g` or `?f geo:hasGeometry ?g`
+(the `featureLinks`) with `?g` holding a matching serialization. One solution per
+feature; under `GRAPH ?g` the graph of the serialization. With a `limit`, the nearest
+matches (to the box's centre for the box and cardinal functions), ties by subject. Every
+match is tested exactly. Without an index (off, building, failed) the answers are the
+same, computed by a scan. Errors: `400` (`spatial:<name>: …`) for a malformed argument
+list, a coordinate out of range, an unknown unit or a non-integer limit; `501` for a
+variable argument and in a build without the `geo` feature.
+
+**The spatial index.** Optional per dataset. It indexes the geometry literals of the
+configured predicates (`geo:asWKT`, `geo:asGeoJSON`, `geo:hasSerialization` by default)
+in a packed R-tree over the generation's base, plus an overlay of the rows committed
+since. Every snapshot sees exactly its own rows, so a query may use the index at any
+commit; an update's own uncommitted changes and past states (`?at=`) run without it.
+FILTERs with one of the relations (but the disjoint ones), `relate` with a pattern that
+needs an intersection, or `distance`/`metricDistance` compared with a constant, over the
+object of an indexed predicate and a constant geometry, search the index
+(`SpatialScan` in EXPLAIN); the `spatial:` functions do too (`SpatialPf`). Results are the
+same with and without it. The index lives in memory: it is built when the database is
+opened (queries run without it meanwhile), and again for each new generation (bulk loads,
+compaction).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/$/geo/{ds}` | `GeoStatus` (below), or `{ "enabled": false }` |
+| PUT | `/$/geo/{ds}` | Enable or reconfigure; the body is a `GeoConfig` (empty: defaults). `202` with the build `Task` (`kind: "geo-index"`); `400 invalid geo configuration: …`; `409 spatial index build already running` |
+| DELETE | `/$/geo/{ds}` | Disable (`204`); removes `geo.json` |
+| POST | `/$/geo/{ds}/rebuild` | Rebuild the current generation's base (`202` Task; `400 spatial index is not enabled`; `409` if a build runs) |
+
+```ts
+type GeoConfig = {
+  predicates?: string[];        // serialization predicates; default geo:asWKT, geo:asGeoJSON, geo:hasSerialization
+  featureLinks?: string[];      // default geo:hasDefaultGeometry, geo:hasGeometry
+  graphs?: { include?: "all" | string[]; exclude?: string[] };   // as for full-text search
+  distance?: "geodesic" | "haversine";   // default "geodesic"
+  maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
+  maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
+  wgs84?: boolean;              // not supported yet (true: 400)
+  queryRewrite?: boolean;       // not supported yet (true: 400)
+  formatVersion?: 1;
+};
+type GeoStatus = {
+  enabled: true;
+  state: "ready" | "building" | "failed" | "over-budget";
+  progress?: number; message?: string;
+  generation: string;           // the generation the base was built for
+  commit: number;               // the commit the status describes
+  rows: { base: number; overlay: number; tail: number };
+  literals: number;             // distinct parsed geometries
+  skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
+  crs: { [iri: string]: number };   // literals per CRS, unknown ones included
+  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  config: GeoConfig; formatVersion: 1;
+  lastBuild?: { at: string; ms: number; rows: number };
+};
+```
+
+`over-budget`: the index would need more than `serve --geo-mb` (4096 MiB); queries run
+without it. `failed`: a build or a commit's update of the index failed (the write itself
+never fails because of the index); queries run without it until a rebuild or a
+compaction. The configuration lives in the database directory (`geo.json`; `sparkles
+check` validates it, clones copy it, backups include it). CLI:
+`sparkles geo-index --loc DB [--predicate IRI…] [--feature-link IRI…] [--exclude-graph IRI…] [--distance geodesic|haversine] [--rebuild | --status | --disable]`,
+and `sparkles serve --geo NAME[=geo.json]`.
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
@@ -1885,12 +2034,19 @@ type PlanNode = {
   actualRows: number; timeMs: number;       // wall time incl. children
   cached: boolean;
   children: PlanNode[];
+  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, refined,
+                             // matched, treeNodesVisited, index ("ready", "building", …), fallback
+  warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```
 
 ## Explain
 
 `GET|POST /{ds}/explain?query=…` → `{ "algebra": string /* SSE */, "plan": PlanNode }` (plan not executed; `actualRows`=-1).
+The root `PlanNode` lists `warnings` when something in the query did not run the way it
+reads, with the same answer: `geo-not-pushed` (a spatial FILTER evaluated row by row, and
+why), `geo-index-building` (the spatial index is being built; plans without it run),
+`geo-not-built` (`geof:` functions in a build without the `geo` feature).
 
 ## Compression
 
@@ -2121,8 +2277,8 @@ the permission is `403` before any connection or file is opened, even under `SIL
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | any caller (`/$/format`: none under `--format-endpoint off`, signed-in callers under `authenticated`); listings show readable datasets only (server-wide tasks: `server-admin`); cancelling a task (DELETE) needs `admin` on its dataset |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read` (a backup of another dataset is `404`) |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin` (a restore also on its target name) |
 | `/$/repositories` | GET | any caller; the full list for `server-admin`, names and types for callers with `admin` on some dataset, else empty |

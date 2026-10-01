@@ -183,9 +183,118 @@ pub fn status_json(ds: &Dataset) -> J {
         .map_or(J::Null, |s| serde_json::to_value(s).unwrap())
 }
 
-/// Prometheus series of the spatial indexes (`sparkles_geo_*`).
+/// The work of a query's spatial operators, from their explain counters: candidates,
+/// exact tests and matches (`None` when the plan has no spatial operator).
+pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<[u64; 3]> {
+    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<[u64; 3]>) {
+        if let Some(c) = &p.counters
+            && c.contains_key("candidates")
+        {
+            let s = sum.get_or_insert([0; 3]);
+            for (x, k) in s.iter_mut().zip(["candidates", "refined", "matched"]) {
+                *x += c.get(k).and_then(J::as_u64).unwrap_or(0);
+            }
+        }
+        for child in &p.children {
+            walk(child, sum);
+        }
+    }
+    let mut sum = None;
+    walk(plan, &mut sum);
+    sum
+}
+
+/// Prometheus series of the spatial indexes: rows per part, the last build's duration,
+/// and the work of spatial operators (`sparkles_geo_*`).
 pub fn metrics(st: &AppState, out: &mut String) {
-    let _ = (st, out);
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    let label = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    // datasets past --metrics-max-datasets share the `$other` label
+    let mut rows: BTreeMap<String, [u64; 3]> = BTreeMap::new();
+    let mut build: BTreeMap<String, f64> = BTreeMap::new();
+    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    for ds in datasets {
+        let Some(s) = ds.store.geo_status() else {
+            continue;
+        };
+        let l = st.metrics.dataset_label(Some(&ds.name));
+        let r = rows.entry(l.clone()).or_default();
+        for (x, n) in r.iter_mut().zip([s.rows.base, s.rows.overlay, s.rows.tail]) {
+            *x += n;
+        }
+        if let Some(b) = &s.last_build {
+            let e = build.entry(l).or_default();
+            *e = e.max(b.ms / 1000.0);
+        }
+    }
+    let work: Vec<(String, [u64; 3])> = st
+        .metrics
+        .geo_work()
+        .into_iter()
+        .filter(|(l, w)| rows.contains_key(l) || w.iter().any(|&n| n > 0))
+        .collect();
+    if rows.is_empty() && work.is_empty() {
+        return;
+    }
+    family(
+        out,
+        "sparkles_geo_rows",
+        "gauge",
+        "Rows of the spatial index by part (base, overlay, tail).",
+    );
+    for (ds, r) in &rows {
+        for (part, n) in ["base", "overlay", "tail"].iter().zip(r) {
+            let _ = writeln!(
+                out,
+                "sparkles_geo_rows{{dataset=\"{}\",part=\"{part}\"}} {n}",
+                label(ds)
+            );
+        }
+    }
+    family(
+        out,
+        "sparkles_geo_build_seconds",
+        "gauge",
+        "Duration of the last build of the spatial index's base, in seconds.",
+    );
+    for (ds, s) in &build {
+        let _ = writeln!(
+            out,
+            "sparkles_geo_build_seconds{{dataset=\"{}\"}} {s:.3}",
+            label(ds)
+        );
+    }
+    for (i, (name, help)) in [
+        (
+            "sparkles_geo_candidates_total",
+            "Index candidates of spatial operators (rows whose envelope matched).",
+        ),
+        (
+            "sparkles_geo_refined_total",
+            "Exact geometry tests run by spatial operators.",
+        ),
+        (
+            "sparkles_geo_matches_total",
+            "Rows that passed the exact test of spatial operators.",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        family(out, name, "counter", help);
+        for (ds, w) in &work {
+            let _ = writeln!(out, "{name}{{dataset=\"{}\"}} {}", label(ds), w[i]);
+        }
+    }
 }
 
 /// `serve --geo NAME[=geo.json]`
@@ -241,10 +350,12 @@ pub fn geo_index(loc: &std::path::Path, opts: StoreOptions, a: IndexArgs) -> Res
         eprintln!("spatial index disabled");
         return Ok(());
     }
+    // the index is built in memory when the store opens: report it once built
+    let current = store.wait_geo();
     if a.status {
         println!(
             "{}",
-            match store.geo_status() {
+            match current {
                 Some(s) => serde_json::to_string_pretty(&s)?,
                 None => r#"{ "enabled": false }"#.to_string(),
             }
@@ -256,7 +367,7 @@ pub fn geo_index(loc: &std::path::Path, opts: StoreOptions, a: IndexArgs) -> Res
         || !a.feature_link.is_empty()
         || !a.exclude_graph.is_empty()
         || a.distance.is_some();
-    let s = match store.geo_status() {
+    let s = match current {
         Some(_) if !configured && a.rebuild => store.rebuild_geo()?,
         Some(s) if !configured => s,
         current => {
