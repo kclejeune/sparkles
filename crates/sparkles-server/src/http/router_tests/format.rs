@@ -29,7 +29,7 @@ async fn post_json(app: &Router, uri: &str, body: J) -> Resp {
 async fn formats_json_bodies() {
     let (_d, app) = fmt_server(|_| {});
     // the cursor counts UTF-16 code units: after the emoji (two units) is 11
-    let text = "SELECT ('😀' AS ?x)\nWHERE {}\n";
+    let text = "SELECT (\"😀\" AS ?x)\nWHERE {}\n";
     let r = post_json(
         &app,
         "/$/format",
