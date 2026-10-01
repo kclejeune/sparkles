@@ -1,0 +1,6 @@
+prefix foaf: <http://xmlns.com/foaf/0.1/>
+select distinct ?name ?mbox ?homepage ?nick from <http://example.org/people> from named <http://xmlns.com/foaf/0.1/extra>
+{
+  ?p foaf:name ?name .
+}
+order by desc(?name) ?mbox offset 20 limit 10

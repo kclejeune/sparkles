@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+construct {
+  ?p a ex:Contact .
+} from <http://example.org/g>
+where {
+  ?p ex:fullName ?n .
+} limit 5

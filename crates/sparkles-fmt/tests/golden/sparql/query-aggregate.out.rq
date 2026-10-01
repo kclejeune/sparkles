@@ -1,0 +1,9 @@
+PREFIX ex: <http://example.org/>
+
+SELECT ?type (COUNT(?item) AS ?n) (SAMPLE(?item) AS ?example)
+WHERE {
+  ?item a ?type .
+}
+GROUP BY ?type
+HAVING(COUNT(?item) > 5)
+ORDER BY ASC(?n) DESC(?type)

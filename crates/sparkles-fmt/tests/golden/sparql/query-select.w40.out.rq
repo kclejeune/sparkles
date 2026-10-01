@@ -1,0 +1,15 @@
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT DISTINCT
+  ?name
+  ?mbox
+  ?homepage
+  ?nick
+FROM <http://example.org/people>
+FROM NAMED foaf:extra
+WHERE {
+  ?p foaf:name ?name .
+}
+ORDER BY DESC(?name) ?mbox
+LIMIT 10
+OFFSET 20

@@ -3,7 +3,9 @@
 //! nodes had a blank line before them.
 //!
 //! Let `P` be the last significant token before a comment and `N` the first after it.
-//! - Comments before the first significant token are the file **header**.
+//! - Comments before the first significant token are the file **header**, except a
+//!   block ending with `# sparkles-fmt: ignore` right before the first node: it leads
+//!   that node, so a node sorted to the top keeps its pragma.
 //! - A comment on `P`'s line **trails** the outermost attachment node that ends at `P`;
 //!   a separator (`,` `;` `.` `&&` `||`) counts as part of the item before it.
 //! - The other comments form blocks, split at blank lines. Before a closing bracket (or
@@ -271,11 +273,30 @@ impl Comments {
             }
         }
         let Some(p) = p else {
-            // the file header
-            self.header.extend_from_slice(comments);
-            if !comments.is_empty() && breaks_before(n) >= 2 {
+            // the file header, except that a block ending with an ignore pragma right
+            // before the first node is that node's leading block (so a node sorted to
+            // the top with its pragma keeps it)
+            let mut header = comments;
+            if breaks_before(n) < 2
+                && let Some(&last) = comments.last()
+                && crate::pragma::is_ignore(tree.token_text(last))
+                && let Some(node) = shape.starting_at(n)
+            {
+                let start = comments
+                    .iter()
+                    .rposition(|&c| breaks_before(c) >= 2)
+                    .unwrap_or(0);
+                let block = &comments[start..];
+                if self.blank_comments.contains(&block[0]) {
+                    self.blank_tokens.insert(n);
+                }
+                self.leading.insert(node, block.to_vec());
+                self.ignored.insert(node);
+                header = &comments[..start];
+            } else if !comments.is_empty() && breaks_before(n) >= 2 {
                 self.blank_tokens.insert(n);
             }
+            self.header.extend_from_slice(header);
             return;
         };
         let mut rest = comments;
