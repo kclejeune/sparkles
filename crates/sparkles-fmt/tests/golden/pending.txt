@@ -5,4 +5,3 @@
 # variants) or `<language>/<name>.<variant>` (that variant), whitespace, and the reason.
 turtle/t1.conventional the T1 example under turtle-layout = "conventional" (before the conventional layout)
 turtle/t4.sort sections as sort barriers, sorted (before Turtle sorting)
-nquads/l1 the N-Quads example, default and sorted (before the line formats)
