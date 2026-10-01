@@ -271,6 +271,20 @@ run = '''
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:shex-write"]
+description = "Write-time ShEx validation: 1-triple INSERT DATA latency with validation off / warn / reject"
+depends = ["build"]
+usage = '''
+arg "[people]" default="10000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench-shex-write" help="data, databases and results/ (shex-write.md)"
+flag "--runs <n>" default="20" help="measured runs per configuration"
+flag "--warmup <n>" default="3" help="warm-up runs per configuration"
+flag "--delta <n>" default="10000" help="pending delta quads of the second round"
+'''
+run = '''
+WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh --lang shex "$usage_people" "$(realpath -m "$usage_workdir")"
+'''
+
 [tasks."bench:backup"]
 description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
 depends = ["build"]
