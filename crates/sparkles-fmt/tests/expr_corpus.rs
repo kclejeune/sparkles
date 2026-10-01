@@ -190,7 +190,8 @@ fn expression_spots(text: &str) -> Vec<usize> {
 
 /// One comment after each token in and before every expression of every positive W3C
 /// file, one at a time, under both operator positions: the output keeps the comment once
-/// and is a fixpoint. Slow; run with `--ignored` (in release mode).
+/// and is a fixpoint. Run with `--ignored` (in release mode); `SPARKLES_SWEEP_ALL=1` puts
+/// the comment after every token of every file instead.
 #[test]
 #[ignore]
 fn a_comment_anywhere_in_an_expression_is_kept_and_stable() {
@@ -198,7 +199,18 @@ fn a_comment_anywhere_in_an_expression_is_kept_and_stable() {
     let texts = corpus::positive_texts();
     let failures: Vec<String> = corpus::par_map(texts, |(name, text)| {
         let mut out = Vec::new();
-        for at in expression_spots(text) {
+        let spots = if std::env::var_os("SPARKLES_SWEEP_ALL").is_some() {
+            let mut v: Vec<usize> = lex(text, LexMode::Sparql)
+                .iter()
+                .filter(|t| !t.kind.is_trivia())
+                .map(|t| t.end())
+                .collect();
+            v.dedup();
+            v
+        } else {
+            expression_spots(text)
+        };
+        for at in spots {
             let injected = format!("{} {MARK}\n{}", &text[..at], &text[at..]);
             for position in [OperatorPosition::Leading, OperatorPosition::Trailing] {
                 let opts = Options {
