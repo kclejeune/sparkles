@@ -850,9 +850,19 @@ its own `Authorization` header, which Sparkles would then reject. `unixSocket` m
 server listen on a Unix socket that nginx proxies to, so trusted proxy headers can be
 limited to it (`proxy.trusted = ["unix"]`).
 
-The module has no backup options: pass `extraArgs = [ "--backup-config" "/etc/sparkles/backup.toml" ]`,
-and add an `fs` repository's directory to `systemd.services.sparkles.serviceConfig.ReadWritePaths`
-(the service sees the rest of the file system read-only).
+Backup repositories: `backup.configFile` passes `--backup-config` (like
+`auth.configFile` it stays out of the Nix store, and `systemctl reload sparkles`
+re-reads it), `backup.maxTasks` `--backup-max-tasks`, and `backup.fsRoots` lists the
+directories of `fs` repositories, which the module creates for the service user and
+makes writable (the service sees the rest of the file system read-only):
+
+```nix
+services.sparkles.backup = {
+  configFile = "/run/secrets/sparkles-backup.toml";  # [repositories.local] path = "/srv/backups/sparkles/local"
+  fsRoots = [ "/srv/backups/sparkles" ];             # also [api] fs_roots, for API registrations
+  maxTasks = 1;
+};
+```
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so for offline work (`sparkles load`, `compact`) stop the service first,

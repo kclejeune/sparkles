@@ -57,6 +57,10 @@ let
 
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
 
+  # directories of `fs` backup repositories (writable by the service)
+  fsRoots = map (r: lib.removeSuffix "/" (toString r)) cfg.backup.fsRoots;
+  dataDirSlash = "${lib.removeSuffix "/" (toString cfg.dataDir)}/";
+
   datasetArgs = lib.concatLists (
     lib.mapAttrsToList (
       name: ds:
@@ -94,6 +98,14 @@ let
   ++ lib.optionals (cfg.auth.configFile != null) [
     "--auth-config"
     cfg.auth.configFile
+  ]
+  ++ lib.optionals (cfg.backup.configFile != null) [
+    "--backup-config"
+    cfg.backup.configFile
+  ]
+  ++ lib.optionals (cfg.backup.maxTasks != null) [
+    "--backup-max-tasks"
+    (toString cfg.backup.maxTasks)
   ]
   ++ lib.optionals (cfg.unixSocket != null) [
     "--unix-socket"
@@ -147,6 +159,7 @@ let
       lib.attrValues persistent
     )) "${cfg.dataDir}/declarative"
     ++ lib.mapAttrsToList datasetPath persistent
+    ++ fsRoots
   );
 
   upstream =
@@ -206,8 +219,8 @@ in
       default = "/var/lib/sparkles";
       description = ''
         State directory: the dataset registry (`config.json`), databases created through
-        the admin API (`databases/`), declarative persistent datasets (`declarative/`)
-        and backups (`backups/`).
+        the admin API (`databases/`), declarative persistent datasets (`declarative/`),
+        N-Quads backups (`backups/`) and the state of backup repositories (`backup/`).
       '';
     };
 
@@ -319,6 +332,52 @@ in
         by the service user. `systemctl reload sparkles` re-reads it. Without it the
         server is open.
       '';
+    };
+
+    backup = {
+      configFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/etc/sparkles/backup.toml";
+        description = ''
+          Backup repositories, lifecycle policies, credential sources and the limits of
+          repositories registered through the API: the TOML file passed as
+          `--backup-config` (see `docs/API.md`, Backup repositories). It names credential
+          files and environment variables rather than holding secrets, but like
+          {option}`auth.configFile` it must not be in the Nix store: keep it readable by
+          the service user only (agenix, sops-nix, or an `environment.etc` entry with a
+          `mode`). `systemctl reload sparkles` re-reads it. `fs` repositories may not
+          lie in its directory or in {option}`dataDir`; list their directories in
+          {option}`backup.fsRoots`. Without it repositories can still be registered
+          through the API (`fs` ones only, in a directory the service may write to: one of
+          {option}`backup.fsRoots`).
+        '';
+      };
+
+      maxTasks = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 1;
+        description = ''
+          Backup, restore, verification and GC tasks running at once
+          (`--backup-max-tasks`; `null`: the server's default, 2). Up to 4 more per
+          slot wait queued.
+        '';
+      };
+
+      fsRoots = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "/srv/backups/sparkles" ];
+        description = ''
+          Directories that hold `fs` backup repositories, from {option}`backup.configFile`
+          or registered through the API: created (owned by {option}`user`, mode 0750) and
+          made writable for the service, which sees the rest of the file system
+          read-only. They must be absolute, outside {option}`dataDir`, and not under
+          `/tmp`, `/var/tmp` or a home directory. To hold API registrations to them, also
+          set `[api] fs_roots` in the config file.
+        '';
+      };
     };
 
     unixSocket = mkOption {
@@ -493,6 +552,29 @@ in
           ];
         message = "services.sparkles.loadDir must not be under /tmp or /var/tmp: the service has a private temporary directory.";
       }
+      {
+        assertion =
+          cfg.backup.configFile == null
+          || (lib.hasPrefix "/" cfg.backup.configFile && !lib.hasPrefix "/nix/store" cfg.backup.configFile);
+        message = "services.sparkles.backup.configFile must be an absolute path outside the Nix store.";
+      }
+      {
+        assertion = lib.all (
+          r:
+          lib.hasPrefix "/" r
+          && r != ""
+          && !lib.hasPrefix "${r}/" dataDirSlash
+          && !lib.hasPrefix dataDirSlash "${r}/"
+          && !lib.any (t: r == t || lib.hasPrefix "${t}/" r) [
+            "/tmp"
+            "/var/tmp"
+            "/home"
+            "/root"
+            "/run/user"
+          ]
+        ) fsRoots;
+        message = "services.sparkles.backup.fsRoots must be absolute directories outside dataDir, and not under /tmp, /var/tmp or a home directory.";
+      }
     ];
 
     users.users = lib.mkMerge [
@@ -551,10 +633,10 @@ in
         rateLimits != null
       ) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
-        # re-reads the rate-limit and auth configurations (without either, SIGHUP would
-        # stop the server)
+        # re-reads the rate-limit, auth and backup configurations (without any, SIGHUP
+        # would stop the server)
         ExecReload = mkIf (
-          rateLimits != null || cfg.auth.configFile != null
+          rateLimits != null || cfg.auth.configFile != null || cfg.backup.configFile != null
         ) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
         RuntimeDirectory = mkIf (
