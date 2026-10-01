@@ -800,35 +800,35 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
     let m = metrics(&s.app).await;
     for (series, v) in [
         (
-            r#"sparkles_validation_total{dataset="ds",status="passed"}"#,
+            r#"sparkles_validation_total{dataset="ds",language="shacl",status="passed"}"#,
             1.0,
         ),
         (
-            r#"sparkles_validation_total{dataset="ds",status="rejected"}"#,
+            r#"sparkles_validation_total{dataset="ds",language="shacl",status="rejected"}"#,
             1.0,
         ),
         (
-            r#"sparkles_validation_total{dataset="ds",status="skipped"}"#,
+            r#"sparkles_validation_total{dataset="ds",language="shacl",status="skipped"}"#,
             1.0,
         ),
         (
-            r#"sparkles_validation_total{dataset="ds",status="timeout"}"#,
+            r#"sparkles_validation_total{dataset="ds",language="shacl",status="timeout"}"#,
             0.0,
         ),
         (
-            r#"sparkles_validation_duration_seconds_count{dataset="ds",strategy="full"}"#,
+            r#"sparkles_validation_duration_seconds_count{dataset="ds",language="shacl",strategy="full"}"#,
             2.0,
         ),
         (
-            r#"sparkles_validation_duration_seconds_bucket{dataset="ds",strategy="full",le="+Inf"}"#,
+            r#"sparkles_validation_duration_seconds_bucket{dataset="ds",language="shacl",strategy="full",le="+Inf"}"#,
             2.0,
         ),
         (
-            r#"sparkles_validation_results_total{dataset="ds",severity="violation"}"#,
+            r#"sparkles_validation_results_total{dataset="ds",language="shacl",severity="violation"}"#,
             1.0,
         ),
         (
-            r#"sparkles_validation_results_total{dataset="ds",severity="warning"}"#,
+            r#"sparkles_validation_results_total{dataset="ds",language="shacl",severity="warning"}"#,
             0.0,
         ),
         // a rejection is not a plain client error
@@ -853,7 +853,7 @@ async fn validation_metrics_count_writes_by_status_and_severity() {
     assert_eq!(
         sample(
             &m,
-            r#"sparkles_validation_total{dataset="$other",status="rejected"}"#
+            r#"sparkles_validation_total{dataset="$other",language="shacl",status="rejected"}"#
         ),
         Some(1.0),
         "{m}"

@@ -84,9 +84,9 @@ JSON object per line.
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
 | `sparkles_result_cache_bytes`, `…_capacity_bytes`, `…_entries` | gauge | `dataset` |
 | `sparkles_result_cache_hits_total`, `…_misses_total` | counter | `dataset` |
-| `sparkles_validation_total` | counter | `dataset`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
-| `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `strategy` = `full` \| `incremental` |
-| `sparkles_validation_results_total` | counter (results found by validated writes) | `dataset`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
+| `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
+| `sparkles_validation_results_total` | counter (results found by validated writes; ShEx: nonconformant associations, as `violation`) | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
 | `sparkles_geo_rows` | gauge (rows of the spatial index) | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge (the last build of the index's base) | `dataset` |
 | `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter (rows found by the index, exact geometry tests, rows that passed them, and the candidates the index could not place, over the spatial operators of queries) | `dataset` |
@@ -1717,7 +1717,7 @@ configuration lives in the database directory (`validation.json`):
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ config, status }` (`status`: mode, shape count, the baseline of the last commit, counters, warnings) or `{ config: null }` |
+| GET | `/$/validation/{ds}` | `{ language, config, status }` (`language`: `shacl`; `status`: mode, shape count, the baseline of the last commit, counters, warnings) or `{ config: null }` |
 | PUT | `/$/validation/{ds}` | Set the configuration. The current data is validated under the writer lock; `reject` on data that does not pass is refused with `409` and the report. `400` for a bad configuration or shapes that do not parse |
 | DELETE | `/$/validation/{ds}` | Turn validation off (`204`) |
 
@@ -1726,7 +1726,7 @@ configuration lives in the database directory (`validation.json`):
 before any byte is written; a write that touches neither the data graph nor the shapes
 graphs is skipped. Responses carry
 `Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`,
-and receipts (`receipt=true`) include a `validation` object. A rejection is
+and receipts (`receipt=true`) include a `validation` object (with `"language": "shacl"`). A rejection is
 `422 Unprocessable Content`:
 
 ```json

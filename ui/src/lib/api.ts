@@ -9,7 +9,14 @@ export type DatasetType = 'persistent' | 'mem';
 export type DatasetInfo = {
   name: string;
   type: DatasetType;
-  endpoints: { query: string; update: string; gsp: string; upload: string; shacl?: string };
+  endpoints: {
+    query: string;
+    update: string;
+    gsp: string;
+    upload: string;
+    shacl?: string;
+    shex?: string;
+  };
   quads: number;
   reasoning: null | {
     profile: string;
@@ -914,6 +921,104 @@ export async function shaclRaw(
   opts: ShaclOptions = {},
 ): Promise<Blob> {
   const res = await shaclRequest(ds, shapes, accept, opts);
+  return res.blob();
+}
+
+// --- ShEx ---------------------------------------------------------------------
+
+/** Why a node does not conform to a shape (`appinfo.failures` of a ShEx result). */
+export type ShexFailure =
+  | { kind: 'nodeKind' | 'datatype' | 'facet' | 'valueSet'; value: Term; constraint: string }
+  | {
+      kind: 'cardinality';
+      predicate: string;
+      inverse: boolean;
+      min: number;
+      max: number | null;
+      count: number;
+    }
+  | { kind: 'closed' | 'extra'; predicate: string; value: Term }
+  | { kind: 'noMatch'; detail: string }
+  | { kind: 'reference'; shape: string; value: Term }
+  | { kind: 'not' | 'external'; shape: string }
+  | { kind: 'semAct'; extension: string; message: string };
+
+/** One association of the result map of `/{ds}/shex`. */
+export type ShexResult = {
+  node: Term;
+  shape: Term | { type: 'start' };
+  status: 'conformant' | 'nonconformant';
+  /** The first failure, in one line. */
+  reason?: string;
+  appinfo?: { failures: ShexFailure[]; prints?: string[] };
+};
+
+export type ShexReport = {
+  conforms: boolean;
+  counts: { conformant: number; nonconformant: number };
+  results: ShexResult[];
+  warnings: string[];
+  millis: number;
+};
+
+export type ShexOptions = {
+  /** `default`, `union` or a graph IRI. */
+  graph?: string;
+  /** Include materialized inferences (server default: yes, when present). */
+  reasoning?: boolean;
+  /** Report only nonconformant associations (the counts still cover all). */
+  onlyNonconformant?: boolean;
+  /** Base IRI of the schema's (and the shape map's) relative IRIs. */
+  base?: string;
+  signal?: AbortSignal;
+};
+
+/** Report formats of `/{ds}/shex` besides the JSON report. */
+export type ShexFormat = 'shapemap' | 'smap' | 'text';
+
+function shexRequest(
+  ds: string,
+  schema: string,
+  map: string,
+  format: 'json' | ShexFormat,
+  opts: ShexOptions,
+): Promise<Response> {
+  const p = new URLSearchParams();
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  if (opts.onlyNonconformant) p.set('results', 'nonconformant');
+  if (opts.base) p.set('base', opts.base);
+  if (format !== 'json') p.set('format', format);
+  const qs = p.toString();
+  return request(`/${enc(ds)}/shex${qs ? `?${qs}` : ''}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/plain' },
+    // the envelope: the schema is sniffed (ShExJ when it starts with `{`, else ShExC)
+    body: JSON.stringify({ schema, map }),
+    signal: opts.signal,
+  });
+}
+
+/** Validate a data graph against a ShEx schema (ShExC or ShExJ) and a compact shape map. */
+export async function shex(
+  ds: string,
+  schema: string,
+  map: string,
+  opts: ShexOptions = {},
+): Promise<ShexReport> {
+  const res = await shexRequest(ds, schema, map, 'json', opts);
+  return (await res.json()) as ShexReport;
+}
+
+/** Same validation, the result map in another format (e.g. `shapemap` JSON) for download. */
+export async function shexRaw(
+  ds: string,
+  schema: string,
+  map: string,
+  format: ShexFormat,
+  opts: ShexOptions = {},
+): Promise<Blob> {
+  const res = await shexRequest(ds, schema, map, format, opts);
   return res.blob();
 }
 

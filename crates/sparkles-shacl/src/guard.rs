@@ -14,31 +14,33 @@ use anyhow::{Context, Result, bail};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
+pub use sparkles::guard::config::{Baseline, CONFIG_FILE, Counters, DataGraphSel};
+use sparkles::guard::config::{INFERRED_GRAPH as INFERRED, sha256_hex, write_atomic};
 use sparkles::guard::{
-    Candidate, CommitGuard, GuardMode, GuardStatus, Severity, SeverityCounts, Strategy,
-    ValidationSummary, WriteOptions,
+    Candidate, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity, SeverityCounts,
+    Strategy, ValidationSummary, WriteOptions,
 };
 use sparkles::id::Id;
 use sparkles::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
 use sparkles::store::{Snapshot, Store};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The configuration file in a database directory.
-pub const CONFIG_FILE: &str = "validation.json";
 /// A shapes file copied into the database directory.
-pub const SHAPES_FILE: &str = "validation-shapes.ttl";
-/// The reasoner's graph of materialized inferences.
-const INFERRED: &str = "urn:x-sparkles:inferred";
+pub const SHAPES_FILE: &str = sparkles::guard::config::SHACL_SHAPES_FILE;
 
-/// Write-time validation of one dataset (`validation.json`, format 1).
+/// Write-time SHACL validation of one dataset (`validation.json`, format 1; or format 2
+/// with `"language": "shacl"`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValidationConfig {
     #[serde(default = "one")]
     pub format: u32,
+    /// format 2: `shacl` (format 1 files have none)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<GuardLanguage>,
     pub mode: GuardMode,
     pub shapes: ShapesSource,
     #[serde(default)]
@@ -91,25 +93,19 @@ pub struct ShapesSource {
     pub format: Option<String>,
 }
 
-/// The data graph: `"default"`, `"union"`, or a list of graph IRIs.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum DataGraphSel {
-    Named(String),
-    Graphs(Vec<String>),
-}
-
-impl Default for DataGraphSel {
-    fn default() -> Self {
-        DataGraphSel::Named("default".into())
-    }
-}
-
 impl ValidationConfig {
     /// Check the fields (not the shapes).
     pub fn check(&self) -> Result<()> {
-        if self.format != 1 {
+        if !(1..=2).contains(&self.format) {
             bail!("unknown validation.json format {}", self.format);
+        }
+        if let Some(l) = self.language
+            && l != GuardLanguage::Shacl
+        {
+            bail!(
+                "this is a configuration for write-time {} validation, not SHACL",
+                l.title()
+            );
         }
         if !(self.timeout_seconds.is_finite() && self.timeout_seconds > 0.0) {
             bail!("timeoutSeconds must be a positive number");
@@ -190,32 +186,10 @@ impl ValidationConfig {
     }
 }
 
-/// The validation state of the last committed head.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Baseline {
-    pub commit: u64,
-    /// no blocking results (`None`: unknown, e.g. after a bypassed write)
-    pub conforms: Option<bool>,
-    pub blocking: u64,
-    pub total: u64,
-    pub millis: u64,
-}
-
 struct Pending {
     seq: u64,
     shapes: Option<Arc<Shapes>>,
     baseline: Baseline,
-}
-
-/// Counters since the guard was installed.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct Counters {
-    pub passed: u64,
-    pub warned: u64,
-    pub rejected: u64,
-    pub skipped: u64,
-    pub bypassed: u64,
 }
 
 /// `GET /$/validation/{ds}` status.
@@ -398,6 +372,7 @@ fn summarize(
         .to_turtle()
     });
     ValidationSummary {
+        language: GuardLanguage::Shacl,
         status,
         mode: cfg.mode,
         strategy: Strategy::Full,
@@ -602,12 +577,7 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         store.set_guard(None);
         store.set_guard_required(false);
         if let Some(r) = &root {
-            for f in [CONFIG_FILE, SHAPES_FILE] {
-                match std::fs::remove_file(r.join(f)) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                    _ => {}
-                }
-            }
+            sparkles::guard::config::remove_files(r, &[])?;
         }
         drop(txn);
         return Ok(SetOutcome::Removed);
@@ -620,12 +590,10 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     if cfg.mode == GuardMode::Reject && summary.blocking > 0 {
         return Ok(SetOutcome::NotConforming(summary));
     }
-    cfg.updated = Some(sparkles::commit::rfc3339_ms(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64),
-    ));
+    cfg.updated = Some(sparkles::guard::config::now_rfc3339());
     if let Some(r) = &root {
+        // a ShEx configuration this one replaces leaves nothing behind
+        sparkles::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;
         if let Some(text) = cfg.shapes.inline.take() {
             write_atomic(&r.join(SHAPES_FILE), text.as_bytes())?;
             cfg.shapes.file = Some(SHAPES_FILE.into());
@@ -649,26 +617,4 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     store.set_guard_required(true);
     drop(txn);
     Ok(SetOutcome::Installed(guard, summary))
-}
-
-fn sha256_hex(b: &[u8]) -> String {
-    use sha2::Digest;
-    sha2::Sha256::digest(b)
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    std::fs::File::open(&dir)?.sync_all()?;
-    Ok(())
 }

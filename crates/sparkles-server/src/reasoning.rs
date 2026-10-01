@@ -257,21 +257,31 @@ pub fn start_reason(
 }
 
 /// The task error of a materialization rejected by write-time validation:
-/// `inferences rejected by SHACL validation: 2 blocking results (first: <shape> at <node>)`.
+/// `inferences rejected by SHACL validation: 2 blocking results (first: <shape> at <node>)`
+/// (ShEx: `… 2 nonconformant associations …`).
 #[cfg(feature = "reasoning")]
 pub fn rejection_text(e: &anyhow::Error) -> Option<String> {
     let Some(sparkles::Error::Rejected(r)) = e.downcast_ref::<sparkles::Error>() else {
         return None;
     };
     let s = &r.summary;
+    let (lang, what) = match s.language {
+        sparkles::guard::GuardLanguage::Shacl => ("SHACL", "blocking result"),
+        sparkles::guard::GuardLanguage::Shex => ("ShEx", "nonconformant association"),
+    };
     Some(match &s.shapes_error {
         Some(err) => {
             format!(
-                "inferences rejected by SHACL validation: the shapes graph cannot be read ({err})"
+                "inferences rejected by {lang} validation: the {} cannot be read ({err})",
+                if lang == "ShEx" {
+                    "schema"
+                } else {
+                    "shapes graph"
+                }
             )
         }
         None => format!(
-            "inferences rejected by SHACL validation: {} blocking result{}{}",
+            "inferences rejected by {lang} validation: {} {what}{}{}",
             s.blocking,
             if s.blocking == 1 { "" } else { "s" },
             crate::obs::first_result(s)

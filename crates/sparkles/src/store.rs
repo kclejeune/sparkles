@@ -2056,22 +2056,24 @@ impl Store {
         opts: &crate::guard::WriteOptions,
         head: u64,
     ) -> Result<Option<Arc<crate::guard::ValidationSummary>>> {
-        use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
+        use crate::guard::{GuardLanguage, GuardMode, GuardStatus, Severity, ValidationSummary};
         let g = self.guard();
         let observer = self.guard_observer.read().clone();
+        let language = g.as_ref().map_or(GuardLanguage::Shacl, |g| g.language());
         if opts.bypass_validation {
-            let summary = ValidationSummary::empty(
+            let mut summary = ValidationSummary::empty(
                 GuardStatus::Bypassed,
                 GuardMode::Off,
                 Severity::Violation,
             );
+            summary.language = language;
             if let Some(g) = &g {
                 g.bypassed();
             }
             if let Some(o) = &observer
                 && (g.is_some() || self.guard_required())
             {
-                o.observe(kind, Ok(&summary), std::time::Duration::ZERO);
+                o.observe(language, kind, Ok(&summary), std::time::Duration::ZERO);
             }
             tracing::warn!("a write bypassed write-time validation");
             return Ok(Some(Arc::new(summary)));
@@ -2079,7 +2081,7 @@ impl Store {
         let Some(g) = g else {
             if self.guard_required() && !self.opts.unvalidated_writes {
                 return Err(Error::GuardMissing(
-                    "dataset requires write-time SHACL validation; install the guard (sparkles_shacl::guard::ShaclGuard::install) or allow unvalidated writes".into(),
+                    "dataset requires write-time validation (validation.json); install its guard (sparkles_shacl::guard::install or sparkles_shex::guard::install) or allow unvalidated writes".into(),
                 ));
             }
             return Ok(None);
@@ -2094,7 +2096,7 @@ impl Store {
             opts,
         });
         if let Some(o) = &observer {
-            o.observe(kind, checked.as_ref(), t0.elapsed());
+            o.observe(language, kind, checked.as_ref(), t0.elapsed());
         }
         let summary = checked?;
         if summary.status == GuardStatus::Rejected {
@@ -2697,7 +2699,7 @@ impl Store {
         }
         // write-time validation stays configured; the clone judges its first write in full
         if let Some(root) = &self.root {
-            for f in ["validation.json", "validation-shapes.ttl"] {
+            for f in crate::guard::config::FILES {
                 match std::fs::read(root.join(f)) {
                     Ok(b) => write_atomic(&dir.join(f), &b)?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3361,7 +3363,7 @@ pub fn named(iri: &str) -> NamedNode {
 /// `off`). Only the mode is read: the store does not depend on the validator. A file that
 /// does not parse also requires a guard (fail closed).
 fn guard_required_by(root: &Path) -> bool {
-    match std::fs::read(root.join("validation.json")) {
+    match std::fs::read(root.join(crate::guard::config::CONFIG_FILE)) {
         Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)
             .map(|j| j.get("mode").and_then(|m| m.as_str()) != Some("off"))
             .unwrap_or(true),
