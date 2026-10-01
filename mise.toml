@@ -22,9 +22,22 @@ run = "pnpm install --frozen-lockfile"
 sources = ["package.json", "pnpm-lock.yaml"]
 outputs = ["node_modules/.modules.yaml"]
 
+[tasks."ui:wasm"]
+description = "Build the formatter for the browser into ui/src/lib/wasm (optional: the UI uses it when present, else POST /$/format; later UI builds keep it up to date)"
+# the wasm-bindgen CLI must be the version of the wasm-bindgen crate in Cargo.lock
+tools = { "github:wasm-bindgen/wasm-bindgen" = "0.2.129" }
+run = "scripts/build-fmt-wasm.sh"
+sources = ["crates/sparkles-fmt/src/**/*", "crates/sparkles-fmt/Cargo.toml", "crates/sparkles-fmt-wasm/**/*", "Cargo.lock", "rust-toolchain.toml", "scripts/build-fmt-wasm.sh"]
+outputs = ["ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm"]
+
+[tasks."ui:wasm:refresh"]
+description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
+hide = true
+run = "if [ -e ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm ]; then mise run ui:wasm; fi"
+
 [tasks."ui:build"]
 description = "Build the SvelteKit UI (embedded into the server binary)"
-depends = ["ui:install"]
+depends = ["ui:install", "ui:wasm:refresh"]
 dir = "ui"
 run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
@@ -128,6 +141,10 @@ flag "--strict" help="exit 1 when an output differs"
 '''
 run = 'scripts/fmt-jsonld-prettier.sh ${usage_strict:+--strict}'
 
+[tasks."fmt:wasm"]
+description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy"
+run = "cargo clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
+
 [tasks.lint]
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
@@ -157,8 +174,8 @@ description = "shexTest conformance (syntax, negative syntax and structure, repr
 run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, Rust and UI tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "test", "ui:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust and UI tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "fmt:wasm", "test", "ui:test", "licenses:check"]
 
 # -------------------------------------------------------------------------- build / run ----
 

@@ -1,3 +1,5 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# the formatter's browser build (crates/sparkles-fmt-wasm; `mise run fmt:wasm` in CI)
+targets = ["wasm32-unknown-unknown"]

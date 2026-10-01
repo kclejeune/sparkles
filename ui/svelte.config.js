@@ -10,10 +10,12 @@ const config = {
     adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html', strict: false }),
     paths: { base: '/ui', relative: false },
     alias: { $components: 'src/lib/components' },
-    // type-check the Playwright configuration too (tests/ is already included)
+    // type-check the Playwright configuration too (tests/ is already included), but not the
+    // generated bindings of the browser formatter (`mise run ui:wasm`)
     typescript: {
       config: (tsconfig) => {
         tsconfig.include.push('../playwright.config.ts', '../playwright.mock.config.ts');
+        tsconfig.exclude = [...(tsconfig.exclude ?? []), '../src/lib/wasm/**'];
       },
     },
   },
