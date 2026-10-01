@@ -18,8 +18,8 @@ things for <engine> under <query-name> in <answers.json>:
   Geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`) compare by their
   coordinates rounded to `GEO_DECIMALS` decimal places (default 6, about 0.1 m in
   degrees), whatever the spelling, the ring starts and directions, the direction of
-  lines and the order of collection members; Z and M values are ignored, and the
-  default CRS84 prefix is dropped.
+  lines, vertices in the middle of straight runs and the order of collection members;
+  Z and M values are ignored, and the default CRS84 prefix is dropped.
 
 Solutions are compared as multisets over variables sorted by name, since ORDER BY ties
 may be broken differently and engines list the result variables in different orders.
@@ -120,12 +120,41 @@ def _parse_wkt(text):
     return g
 
 
+def _straight(a, b, c):
+    """Whether b lies on the segment from a to c (a vertex that adds nothing)."""
+    cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    scale = max(abs(c[0] - a[0]), abs(c[1] - a[1]), 1e-300)
+    if abs(cross) > 10 ** -GEO_DECIMALS * scale:
+        return False
+    return min(a[0], c[0]) <= b[0] <= max(a[0], c[0]) and min(a[1], c[1]) <= b[1] <= max(a[1], c[1])
+
+
+def _simplify(pts, closed):
+    """Drop repeated vertices and vertices in the middle of a straight run."""
+    out = []
+    for p in pts:
+        if not out or out[-1] != p:
+            out.append(p)
+    changed = True
+    while changed and len(out) > (3 if closed else 2):
+        changed = False
+        n = len(out)
+        for i in range(n) if closed else range(1, n - 1):
+            if _straight(out[i - 1], out[i], out[(i + 1) % n]):
+                del out[i]
+                changed = True
+                break
+    return out
+
+
 def _ring(coords):
-    """A closed ring without its closing vertex, from its smallest vertex, in the
-    direction that gives the smaller sequence (equal rings compare equal)."""
+    """A closed ring without its closing vertex or vertices on straight runs, from its
+    smallest vertex, in the direction that gives the smaller sequence (equal rings
+    compare equal)."""
     pts = [tuple(c) for c in coords]
     if len(pts) > 1 and pts[0] == pts[-1]:
         pts = pts[:-1]
+    pts = _simplify(pts, True)
     if not pts:
         return ()
     k = pts.index(min(pts))
@@ -137,7 +166,7 @@ def _ring(coords):
 
 
 def _line(coords):
-    pts = tuple(tuple(c) for c in coords)
+    pts = tuple(_simplify([tuple(c) for c in coords], False))
     return min(pts, tuple(reversed(pts)))
 
 

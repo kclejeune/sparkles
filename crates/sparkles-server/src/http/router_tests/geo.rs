@@ -275,6 +275,7 @@ async fn metrics_report_the_index() {
         "sparkles_geo_candidates_total{dataset=\"ds\"} 0",
         "sparkles_geo_refined_total{dataset=\"ds\"} 0",
         "sparkles_geo_matches_total{dataset=\"ds\"} 0",
+        "sparkles_geo_rechecked_total{dataset=\"ds\"} 0",
     ] {
         assert!(m.contains(line), "{line}\n{m}");
     }
@@ -370,11 +371,11 @@ fn spatial_work_is_summed_over_the_plan() {
     let scan = |c: u64| {
         node(
             Some(serde_json::json!({
-                "candidates": c, "refined": c / 2, "matched": 1, "index": "ready"
+                "candidates": c, "refined": c / 2, "matched": 1, "rechecked": 1, "index": "ready"
             })),
             vec![],
         )
     };
     let plan = node(None, vec![scan(10), node(None, vec![scan(4)])]);
-    assert_eq!(crate::geo::plan_work(&plan), Some([14, 7, 2]));
+    assert_eq!(crate::geo::plan_work(&plan), Some([14, 7, 2, 2]));
 }

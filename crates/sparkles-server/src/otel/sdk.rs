@@ -986,6 +986,13 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
             |j, f| per_dataset(j, f, |d| d["geo"]["matches"].as_f64()),
         ),
         (
+            "sparkles.geo.rechecked",
+            "{row}",
+            "Candidates of spatial operators that the index could not place, tested whatever the search window.",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["geo"]["rechecked"].as_f64()),
+        ),
+        (
             "sparkles.ready",
             "1",
             "Whether the server is ready to serve requests (1) or not (0).",

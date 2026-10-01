@@ -183,15 +183,22 @@ pub fn status_json(ds: &Dataset) -> J {
         .map_or(J::Null, |s| serde_json::to_value(s).unwrap())
 }
 
+/// The explain counters of spatial operators that the metrics sum up.
+pub const WORK: [&str; 4] = ["candidates", "refined", "matched", "rechecked"];
+
+/// Sums of the [`WORK`] counters.
+pub type Work = [u64; WORK.len()];
+
 /// The work of a query's spatial operators, from their explain counters: candidates,
-/// exact tests and matches (`None` when the plan has no spatial operator).
-pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<[u64; 3]> {
-    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<[u64; 3]>) {
+/// exact tests, matches and candidates the index could not place (`None` when the plan
+/// has no spatial operator).
+pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<Work> {
+    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<Work>) {
         if let Some(c) = &p.counters
             && c.contains_key("candidates")
         {
-            let s = sum.get_or_insert([0; 3]);
-            for (x, k) in s.iter_mut().zip(["candidates", "refined", "matched"]) {
+            let s = sum.get_or_insert([0; WORK.len()]);
+            for (x, k) in s.iter_mut().zip(WORK) {
                 *x += c.get(k).and_then(J::as_u64).unwrap_or(0);
             }
         }
@@ -215,7 +222,7 @@ pub struct GeoSeries {
     /// the longest last build of the label's datasets
     pub build_seconds: Option<f64>,
     /// the spatial operators' candidates, exact tests and matches
-    pub work: [u64; 3],
+    pub work: Work,
 }
 
 /// The spatial index series by dataset label: datasets with the index, and labels whose
@@ -262,6 +269,7 @@ pub fn series_json(s: Option<&GeoSeries>) -> J {
             "candidates": s.work[0],
             "refined": s.work[1],
             "matches": s.work[2],
+            "rechecked": s.work[3],
         }),
     }
 }
@@ -325,6 +333,10 @@ pub fn metrics(st: &AppState, out: &mut String) {
         (
             "sparkles_geo_matches_total",
             "Rows that passed the exact test of spatial operators.",
+        ),
+        (
+            "sparkles_geo_rechecked_total",
+            "Candidates of spatial operators whose literal the index skipped (too long to index, or with no place in longitude and latitude), tested whatever the search window.",
         ),
     ]
     .into_iter()

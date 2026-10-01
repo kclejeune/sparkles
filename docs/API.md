@@ -89,7 +89,7 @@ JSON object per line.
 | `sparkles_validation_results_total` | counter (results found by validated writes) | `dataset`, `severity` = `violation` \| `warning` \| `info` |
 | `sparkles_geo_rows` | gauge (rows of the spatial index) | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge (the last build of the index's base) | `dataset` |
-| `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total` | counter (rows found by the index, exact geometry tests, rows that passed them, over the spatial operators of queries) | `dataset` |
+| `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter (rows found by the index, exact geometry tests, rows that passed them, and the candidates the index could not place, over the spatial operators of queries) | `dataset` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded: `dataset` is an existing dataset name (at most
@@ -138,7 +138,7 @@ type MetricsSnapshot = {
       enabled: boolean;
       rows: { base: number; overlay: number; tail: number };
       buildSeconds: number | null;
-      candidates: number; refined: number; matches: number;
+      candidates: number; refined: number; matches: number; rechecked: number;
     };
   }[];
 };
@@ -217,7 +217,7 @@ observable instruments read at collection time, so nothing is counted twice and
 `sparkles.block_cache.{size,capacity,hits,misses}`,
 `sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.geo.rows`
 (`dataset`, `part`), `sparkles.geo.build.duration`,
-`sparkles.geo.{candidates,refined,matches}`, `sparkles.ready`,
+`sparkles.geo.{candidates,refined,matches,rechecked}`, `sparkles.ready`,
 `process.uptime` and `process.memory.usage`.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
@@ -1536,9 +1536,22 @@ FILTERs with one of the relations (but the disjoint ones), `relate` with a patte
 needs an intersection, or `distance`/`metricDistance` compared with a constant, over the
 object of an indexed predicate and a constant geometry, search the index
 (`SpatialScan` in EXPLAIN); the `spatial:` functions do too (`SpatialPf`). Results are the
-same with and without it. The index lives in memory: it is built when the database is
-opened (queries run without it meanwhile), and again for each new generation (bulk loads,
-compaction).
+same with and without it: every candidate is tested exactly, and literals the index skips
+although a function could still match them are candidates of every search, whatever its
+window. Those are literals over `maxGeometryBytes` and literals in a built-in CRS whose
+envelope has no place in longitude and latitude. Malformed literals, literals over
+`maxVertices`, empty geometries and literals in an unknown CRS are never candidates: no
+relation or distance with a constant can hold for them (they are type errors or empty).
+A `spatial:` call with a constant subject reads that feature's links directly, index or
+not. The index lives in memory: it is built when the database is opened (queries run
+without it meanwhile), and again for each new generation (bulk loads, compaction).
+
+Each spatial operator in an executed plan reports `counters`: `candidates` (rows the index
+or the scan handed out), `rechecked` (those among them the index could not place),
+`refined` (exact tests run), `matched` (rows that passed), `treeNodesVisited`, `index`
+(`ready`; `building (37%)`, `failed`, `over-budget`, `off`, … when the plan ran without
+it; `feature-links` for a `spatial:` call with a constant subject) and `fallback` (the
+rows came from a scan instead of the index).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -2040,8 +2053,9 @@ type PlanNode = {
   actualRows: number; timeMs: number;       // wall time incl. children
   cached: boolean;
   children: PlanNode[];
-  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, refined,
-                             // matched, treeNodesVisited, index ("ready", "building", …), fallback
+  counters?: Record<string, number | string | boolean>;  // spatial operators: candidates, rechecked,
+                             // refined, matched, treeNodesVisited, index ("ready", "building (37%)",
+                             // "feature-links", …), fallback (see GeoSPARQL)
   warnings?: { code: string; message: string }[];       // root only: notes about the plan
 };
 ```

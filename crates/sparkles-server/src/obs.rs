@@ -194,7 +194,7 @@ pub struct RequestReport {
     pub validation: Option<&'static str>,
     pub validation_ms: Option<u64>,
     /// query: the work of its spatial operators (candidates, exact tests, matches)
-    pub geo_work: Option<[u64; 3]>,
+    pub geo_work: Option<crate::geo::Work>,
 }
 
 impl RequestReport {
@@ -580,7 +580,7 @@ pub struct DsMetrics {
     budget: [AtomicU64; BudgetKind::ALL.len()],
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
     /// candidates, exact tests and matches of spatial operators
-    geo_work: [AtomicU64; 3],
+    geo_work: [AtomicU64; crate::geo::WORK.len()],
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -702,7 +702,7 @@ impl Metrics {
     }
 
     /// The spatial operators' work per dataset label: candidates, exact tests, matches.
-    pub fn geo_work(&self) -> Vec<(String, [u64; 3])> {
+    pub fn geo_work(&self) -> Vec<(String, crate::geo::Work)> {
         self.snapshot()
             .into_iter()
             .map(|(k, m)| (k, m.geo_work.each_ref().map(|c| c.load(Ordering::Relaxed))))
