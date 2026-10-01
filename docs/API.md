@@ -1818,10 +1818,16 @@ overlap. Built with the `shex` cargo feature (on by default; `501` without it).
 JSON envelope carries both:
 
 * **Schema as the body.** `Content-Type: text/shex` (ShExC), `application/shex+json`, or
-  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object. Any
-  other content type is sniffed: ShExJ when the body starts with `{`, ShExC otherwise. The
-  shape map is `map=<compact shape map>`, or `node=<term>` with `shape=<label>`
-  (`START` when `shape` is absent). `base=<iri>` resolves relative IRIs of the schema.
+  `application/json` / `application/ld+json` when the body is a ShExJ `Schema` object;
+  ShExR (the schema as RDF in the ShEx vocabulary `http://www.w3.org/ns/shex#`) as
+  `text/turtle`, `application/n-triples`, `application/trig`, `application/n-quads` or
+  `application/rdf+xml` (the triples of every graph are read as one graph, and a Turtle or
+  TriG body's prefixes are the schema's). Any other content type (`text/plain`, a form
+  type) is sniffed: ShExJ when the body starts with `{`, ShExC otherwise.
+  `schema-format=shexc|shexj|shexr` names the syntax where the media type does not (ShExR
+  is then read in the RDF syntax of the media type, else as Turtle). The shape map is
+  `map=<compact shape map>`, or `node=<term>` with `shape=<label>` (`START` when `shape`
+  is absent). `base=<iri>` resolves relative IRIs of the schema.
 * **JSON envelope** (`Content-Type: application/json`, a body that is not a ShExJ schema):
 
   ```json
@@ -1833,7 +1839,8 @@ JSON envelope carries both:
     "base": "http://ex.org/schema" }
   ```
 
-  `schemaFormat` is `shexc` or `shexj` (default: sniffed); `map` is a compact shape map
+  `schemaFormat` is `shexc`, `shexj` or `shexr` (Turtle; default: sniffed as ShExC or
+  ShExJ); `map` is a compact shape map
   (a string) or a JSON shape map (an array); `externs` defines the schema's `EXTERNAL`
   shapes; `imports` gives the bodies of `IMPORT`ed IRIs. Only `schema` is required, and
   the shape map comes from the envelope or the query string, not both. Unknown keys are
@@ -1846,7 +1853,21 @@ literal or a blank node as Sparkles prints it in query results (`_:b1f`); `{FOCU
 `{FOCUS p _}`, `{s p FOCUS}` and `{_ p FOCUS}` select the nodes of the data graph with
 those arcs. The JSON syntax is an array of `{"node": …, "shape": …}` (the draft's
 `nodeSelector` and `shapeLabel` are accepted too). A node that is not in the data graph
-is validated with no arcs. `SPARQL """…"""` selectors are not supported yet (`400`).
+is validated with no arcs.
+
+`SPARQL """SELECT …"""` (any of the four string quotes) selects the bindings of `?focus`,
+or of the first projected variable, in the order of the solutions (unbound ones are
+skipped; values the store does not hold are validated with no arcs). It is an extension
+from other ShEx tools, not part of the ShapeMap draft. The query is checked when the map
+is parsed (`400` with `line` and `column` at the selector unless it is a SELECT query that
+projects a variable and has no `SERVICE`) and runs on the data graph: its default graph is
+the data graph (`graph`, with the inferences when `reasoning` includes them), and `FROM`,
+`FROM NAMED` and `GRAPH` see nothing else. It has no prefixes or base IRI but its own
+(neither the map's nor the schema's), the row and memory budgets of a query
+(`--max-rows`, `--query-memory-mb`; `507` past them), and the validation's
+`timeout`, which covers the selectors and the validation together. The selected nodes
+count, with the other associations, against the report's size, and are deduplicated with
+them per (node, shape).
 
 **Imports** (`IMPORT <iri>`) resolve from the envelope's `imports`, then `file:` IRIs under
 `--load-dir` (none without it), then http(s) IRIs through the `--outbound-*` policy of
@@ -1904,7 +1925,9 @@ Jena's report, `OK` or one `<n> @ <S> :: Focus = <n>, Status = nonconformant, Re
 line per association.
 
 **Errors.** `400` with `line` and `column` for a syntax error in the schema, the shape map,
-the externs or an inline import (also ShEx 2.2 syntax); `400` for a schema that cannot be
+the externs or an inline import (also ShEx 2.2 syntax); `400` without them for a ShExR
+schema whose graph is not a schema (no `sx:Schema` node, a missing `sx:predicate`, a value
+of the wrong kind: the message names the node); `400` for a schema that cannot be
 used (an undefined reference, a negated reference cycle, an invalid `&include`, an import
 that does not resolve or is not allowed, an `EXTERNAL` shape without a definition), a shape
 label the schema does not define, `START` without a start shape, and invalid parameters;
@@ -1915,14 +1938,20 @@ budget, or `"outbound-bytes"` when the imports exceed the request's outbound bud
 [Budgets](#budgets)).
 
 The CLI equivalent is `sparkles shex validate (--loc DB | --data FILE…) --schema FILE
-(--map FILE | --shape-map 'MAP' | --node TERM [--shape LABEL]) [--graph default|union|IRI]
+[--schema-format shexc|shexj|shexr] (--map FILE | --shape-map 'MAP' | --node TERM [--shape
+LABEL]) [--graph default|union|IRI]
 [--no-inferences] [--externs FILE] [--format text|json|shapemap|smap] [--only-nonconformant]
 [--timeout S] [--semact-trace] [--stats]`, with Jena's flag names as aliases (`val`, `v`;
 `--shapes`/`-s`, `--datafile`/`-d`, `--shapesMap`/`-m`, `--target`/`-n`). Imports resolve
 against the schema file's directory. It prints Jena's text report by default and exits
 with 0 when every association conforms, 1 when one does not (or on a timeout or budget
-error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--out
-shexc|shexj|text] [--base IRI]` prints schemas as ShExC, ShExJ or a structural dump.
+error) and 2 for usage, parse and schema errors. `sparkles shex parse FILE… [--in
+shexc|shexj|shexr] [--out shexc|shexj|shexr|text] [--base IRI]` prints schemas as ShExC,
+ShExJ, ShExR (Turtle) or a structural dump. Schema files are read by extension: ShExJ for
+`.json` and `.shexj`; ShExR for `.ttl`, `.nt`, `.nq`, `.trig`, `.rdf`, `.owl` and `.n3`
+(in that RDF syntax); ShExC or ShExJ (sniffed) otherwise; `--in`/`--schema-format` name
+the syntax of stdin (`-`) or of a file whose name does not say. SPARQL selectors on the
+command line have no row or memory budgets.
 
 ## Formatting
 

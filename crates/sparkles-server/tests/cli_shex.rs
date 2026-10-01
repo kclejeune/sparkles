@@ -383,3 +383,119 @@ fn parse_round_trips_a_suite_schema() {
         round_trip(d.path(), f);
     }
 }
+
+/// ShExC → ShExR (Turtle) → ShExJ is ShExC → ShExJ, through stdin and through a `.ttl`
+/// file read as ShExR by its extension.
+#[test]
+fn parse_writes_and_reads_shexr() {
+    let d = setup();
+    let dir = d.path();
+    std::fs::write(
+        dir.join("rich.shex"),
+        r#"PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        %ex:init{ go %}
+        ex:S EXTRA a CLOSED {
+          a [ex:T ex:U~ "x"@en 1] ;
+          ex:n xsd:string /^[A-Z]\/x/i MAXLENGTH 9 // ex:note "name"@en %ex:act{ 50\% %} ;
+          ( ex:p @ex:S * | ^ex:q [. - ex:x - ex:y~] {2,3} ) + ;
+          ex:age xsd:integer MININCLUSIVE 0 MAXEXCLUSIVE 150.5 ?
+        } // ex:label "S"
+        ex:V IRI AND NOT @ex:S
+        "#,
+    )
+    .unwrap();
+    for file in ["person.shex", "rich.shex"] {
+        let j = shex(dir, &["parse", file, "--out", "shexj"]);
+        assert_eq!(j.status.code(), Some(0), "{}", err(&j));
+        let j: serde_json::Value = serde_json::from_slice(&j.stdout).unwrap();
+        let r = shex(dir, &["parse", file, "--out", "shexr"]);
+        assert_eq!(r.status.code(), Some(0), "{}", err(&r));
+        let turtle = out(&r);
+        assert!(turtle.contains("a sx:Schema"), "{turtle}");
+        let j2 = shex_stdin(
+            dir,
+            &["parse", "-", "--in", "shexr", "--out", "shexj"],
+            &turtle,
+        );
+        assert_eq!(j2.status.code(), Some(0), "{}\n{turtle}", err(&j2));
+        let j2: serde_json::Value = serde_json::from_slice(&j2.stdout).unwrap();
+        assert_eq!(j, j2, "\n{turtle}");
+        let ttl = file.replace(".shex", ".ttl");
+        std::fs::write(dir.join(&ttl), &turtle).unwrap();
+        let j3 = shex(dir, &["parse", &ttl, "--out", "shexj"]);
+        assert_eq!(j3.status.code(), Some(0), "{}", err(&j3));
+        let j3: serde_json::Value = serde_json::from_slice(&j3.stdout).unwrap();
+        assert_eq!(j, j3);
+    }
+    // ShExR stdin without --in is not ShExR
+    let r = shex(dir, &["parse", "person.ttl", "--out", "shexr"]);
+    let o = shex_stdin(dir, &["parse", "-"], &out(&r));
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
+}
+
+#[test]
+fn validates_with_a_shexr_schema() {
+    let d = setup();
+    let dir = d.path();
+    let r = shex(dir, &["parse", "person.shex", "--out", "shexr"]);
+    std::fs::write(dir.join("person.ttl"), out(&r)).unwrap();
+    std::fs::write(dir.join("person.txt"), out(&r)).unwrap();
+    for args in [
+        &["-s", "person.ttl"][..],
+        &["-s", "person.txt", "--schema-format", "shexr"],
+    ] {
+        let mut a = vec!["validate"];
+        a.extend_from_slice(args);
+        a.extend(["-d", "data.ttl", "-n", "<http://ex.org/alice>"]);
+        let o = shex(dir, &a);
+        assert_eq!(o.status.code(), Some(0), "{args:?}: {}", err(&o));
+        a.pop();
+        a.push("<http://ex.org/carol>");
+        let o = shex(dir, &a);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+    }
+    // a ShExR error is not at a place in the text
+    std::fs::write(
+        dir.join("bad.ttl"),
+        "<http://ex.org/a> <http://ex.org/b> 1 .",
+    )
+    .unwrap();
+    let o = shex(
+        dir,
+        &[
+            "validate",
+            "-s",
+            "bad.ttl",
+            "-d",
+            "data.ttl",
+            "-n",
+            "<http://ex.org/a>",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(
+        err(&o).contains("bad.ttl: ShExR: no node has type sx:Schema"),
+        "{}",
+        err(&o)
+    );
+    // a SPARQL selector on the command line
+    let o = shex(
+        dir,
+        &[
+            "validate",
+            "-s",
+            "person.ttl",
+            "-d",
+            "data.ttl",
+            "--shape-map",
+            "SPARQL 'SELECT ?p { ?p a <http://xmlns.com/foaf/0.1/Person> } ORDER BY ?p'@START",
+            "--format",
+            "smap",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert_eq!(
+        out(&o),
+        "<http://ex.org/alice>@START\n<http://ex.org/bob>@START\n<http://ex.org/carol>@!START\n"
+    );
+}

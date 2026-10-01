@@ -566,3 +566,334 @@ async fn imports_share_the_outbound_request_budget() {
     assert_eq!(j["budget"], "outbound-bytes");
     assert_eq!(j["limit"], 1 << 20);
 }
+
+// ------------------------------------------------- ShExR and SPARQL selectors ----
+
+/// The data and schema of the acceptance examples.
+const B1_DATA: &str = r#"
+@prefix ex: <http://ex.org/> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+ex:alice a ex:Person ; foaf:name "Alice" ; foaf:age 30 ; foaf:knows ex:bob .
+ex:bob   a ex:Person ; foaf:name "Bob" ; foaf:knows ex:alice .
+ex:carol a ex:Person ; foaf:age 200 .
+ex:acme  a ex:Org ; foaf:name "ACME" ; ex:city "Paris" ; ex:mayor ex:bob .
+"#;
+
+const B1_SCHEMA: &str = "PREFIX ex: <http://ex.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> \
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+start = @ex:Person
+ex:Person EXTRA a { a [ex:Person] ; foaf:name xsd:string ; foaf:age xsd:integer MAXINCLUSIVE 150 ? ; foaf:knows @ex:Person * }
+ex:Org CLOSED { a [ex:Org] ; foaf:name . ; ex:city [\"Paris\" \"Kyoto\"] }";
+
+const B1_MAP: &str = "{FOCUS a ex:Person}@ex:Person,ex:acme@ex:Org";
+
+/// A report without its timing.
+fn report(r: &Resp) -> J {
+    let mut j = r.json();
+    j.as_object_mut().unwrap().remove("millis");
+    j
+}
+
+/// A report without the reasons (which use the schema's prefixes).
+fn without_reasons(mut j: J) -> J {
+    for x in j["results"].as_array_mut().unwrap() {
+        x.as_object_mut().unwrap().remove("reason");
+    }
+    j
+}
+
+/// (node, status) of a report's results, in order.
+fn verdicts(j: &J) -> Vec<(String, String)> {
+    j["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            (
+                x["node"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("http://ex.org/")
+                    .to_string(),
+                x["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn shexr_bodies() {
+    let (_dir, app) = server_with(B1_DATA, |_| {});
+    let q = format!("/ds/shex?map={}", enc(B1_MAP));
+    let b1 = send(&app, post(&q, B1_SCHEMA)).await;
+    assert_eq!(b1.status, StatusCode::OK, "{}", b1.text());
+    let expected = report(&b1);
+    assert_eq!(expected["counts"]["conformant"], 2);
+    assert_eq!(expected["counts"]["nonconformant"], 2);
+    let schema = sparkles_shex::Schema::parse_shexc(B1_SCHEMA, None).unwrap();
+    let turtle = schema.to_shexr_turtle();
+    let nt = sparkles_shex::shexr::to_text(&schema, RdfFormat::NTriples);
+    let xml = sparkles_shex::shexr::to_text(&schema, RdfFormat::RdfXml);
+    // the Turtle's prefixes are the schema's, for the shape map; N-Triples has none
+    let full = format!(
+        "/ds/shex?map={}",
+        enc("{FOCUS a <http://ex.org/Person>}@<http://ex.org/Person>,\
+             <http://ex.org/acme>@<http://ex.org/Org>")
+    );
+    for ct in [
+        "text/turtle",
+        "text/turtle; charset=utf-8",
+        "application/trig",
+    ] {
+        let r = send(&app, post_as(&q, ct, &turtle)).await;
+        assert_eq!(r.status, StatusCode::OK, "{ct}: {}", r.text());
+        assert_eq!(report(&r), expected, "{ct}");
+    }
+    for (ct, body) in [
+        ("application/n-triples", &nt),
+        ("application/n-quads", &nt),
+        ("application/rdf+xml", &xml),
+    ] {
+        let r = send(&app, post_as(&full, ct, body)).await;
+        assert_eq!(r.status, StatusCode::OK, "{ct}: {}", r.text());
+        assert_eq!(
+            without_reasons(report(&r)),
+            without_reasons(expected.clone()),
+            "{ct}"
+        );
+    }
+    let r = send(&app, post_as(&q, "application/n-triples", &nt)).await;
+    assert!(error_of(&r).contains("undefined prefix"), "{}", r.text());
+    // schema-format names the syntax of a body the media type does not
+    for (f, body) in [("shexr", turtle.as_str()), ("shexc", B1_SCHEMA)] {
+        let r = send(
+            &app,
+            post_as(&format!("{q}&schema-format={f}"), "text/plain", body),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{f}: {}", r.text());
+        assert_eq!(report(&r), expected, "{f}");
+    }
+    let r = send(
+        &app,
+        post_as(
+            &format!("{full}&schema-format=shexr"),
+            "application/n-triples",
+            &nt,
+        ),
+    )
+    .await;
+    assert_eq!(
+        without_reasons(report(&r)),
+        without_reasons(expected.clone())
+    );
+    // the envelope's schemaFormat
+    let env = json!({"schema": turtle, "schemaFormat": "shexr", "map": B1_MAP});
+    let r = send(
+        &app,
+        post_as("/ds/shex", "application/json", &env.to_string()),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(report(&r), expected);
+
+    // errors: an RDF syntax error has its place; a ShExR error has none
+    let r = send(
+        &app,
+        post_as(
+            &q,
+            "text/turtle",
+            "PREFIX sx: <http://www.w3.org/ns/shex#>\n[] a sx:Schema ;;",
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(r.json()["line"], 2, "{}", r.text());
+    let r = send(
+        &app,
+        post_as(
+            &q,
+            "text/turtle",
+            "<http://ex.org/a> <http://ex.org/b> <http://ex.org/c> .",
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let j = r.json();
+    assert!(j.get("line").is_none() && j.get("column").is_none(), "{j}");
+    assert_eq!(
+        j["error"],
+        "schema error: ShExR: no node has type sx:Schema"
+    );
+    let r = send(
+        &app,
+        post_as(&format!("{q}&schema-format=rdf"), "text/turtle", &turtle),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        error_of(&r).contains("unknown schema-format"),
+        "{}",
+        r.text()
+    );
+}
+
+#[test]
+fn schema_media_types() {
+    use super::enabled::schema_hint;
+    use sparkles_shex::SchemaFormat as F;
+    let turtle = Some(F::ShExR(RdfFormat::Turtle));
+    assert_eq!(schema_hint("text/shex", None), Some(F::ShExC));
+    for ct in [
+        "application/shex+json",
+        "application/json",
+        "application/ld+json",
+    ] {
+        assert_eq!(schema_hint(ct, None), Some(F::ShExJ), "{ct}");
+    }
+    assert_eq!(schema_hint("text/turtle", None), turtle);
+    assert_eq!(
+        schema_hint("application/n-triples", None),
+        Some(F::ShExR(RdfFormat::NTriples))
+    );
+    assert_eq!(
+        schema_hint("application/rdf+xml", None),
+        Some(F::ShExR(RdfFormat::RdfXml))
+    );
+    for ct in ["text/plain", "", "application/x-www-form-urlencoded"] {
+        assert_eq!(schema_hint(ct, None), None, "{ct}");
+    }
+    assert_eq!(schema_hint("text/plain", turtle), turtle);
+    assert_eq!(
+        schema_hint("application/n-triples", turtle),
+        Some(F::ShExR(RdfFormat::NTriples))
+    );
+    assert_eq!(schema_hint("text/turtle", Some(F::ShExC)), Some(F::ShExC));
+}
+
+#[tokio::test]
+async fn sparql_selectors() {
+    let (_dir, app) = server_with(B1_DATA, |_| {});
+    let b1 = send(
+        &app,
+        post(&format!("/ds/shex?map={}", enc(B1_MAP)), B1_SCHEMA),
+    )
+    .await;
+    let expected = report(&b1);
+    let v = |n: &str, s: &str| (n.to_string(), s.to_string());
+    assert_eq!(
+        verdicts(&expected),
+        [
+            v("alice", "conformant"),
+            v("bob", "conformant"),
+            v("carol", "nonconformant"),
+            v("acme", "nonconformant")
+        ]
+    );
+    // the query has no prefixes but its own
+    let map = r#"SPARQL """SELECT ?focus { ?focus a <http://ex.org/Person> }"""@ex:Person,ex:acme@ex:Org"#;
+    let r = send(&app, post(&format!("/ds/shex?map={}", enc(map)), B1_SCHEMA)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(report(&r), expected);
+    // ?focus, else the first projected variable
+    let map = "SPARQL 'PREFIX ex: <http://ex.org/> SELECT ?x ?y { ?x ex:mayor ?y }'@ex:Org";
+    let r = send(
+        &app,
+        post(&format!("/ds/shex?map={}&format=smap", enc(map)), B1_SCHEMA),
+    )
+    .await;
+    assert_eq!(r.text(), "<http://ex.org/acme>@!<http://ex.org/Org>\n");
+    // counted after the expansion: the nonconformant ones, and the counts of all
+    let map = "SPARQL 'SELECT ?s { ?s a ?c } ORDER BY ?s'@START";
+    let r = send(
+        &app,
+        post(
+            &format!("/ds/shex?map={}&results=nonconformant", enc(map)),
+            B1_SCHEMA,
+        ),
+    )
+    .await;
+    let j = r.json();
+    assert_eq!(j["counts"]["conformant"], 2, "{j}");
+    assert_eq!(j["counts"]["nonconformant"], 2, "{j}");
+    assert_eq!(
+        verdicts(&j),
+        [v("acme", "nonconformant"), v("carol", "nonconformant")]
+    );
+    // a JSON shape map in the envelope
+    let env = json!({"schema": B1_SCHEMA, "map": [
+        {"node": "SPARQL \"\"\"SELECT ?focus { ?focus a <http://ex.org/Person> }\"\"\"",
+         "shape": "http://ex.org/Person"},
+        {"node": "http://ex.org/acme", "shape": "http://ex.org/Org"}]});
+    let r = send(
+        &app,
+        post_as("/ds/shex", "application/json", &env.to_string()),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(report(&r), expected);
+
+    // checked when the map is parsed: not SELECT, SERVICE, a prefix of the map
+    for (map, needle) in [
+        (
+            "ex:alice@ex:Person,\nSPARQL 'ASK {}'@ex:Person",
+            "SELECT query",
+        ),
+        (
+            "SPARQL 'SELECT ?x { SERVICE <http://ex.org/sparql> { ?x ?p ?o } }'@ex:Person",
+            "SERVICE is not allowed",
+        ),
+        (
+            "SPARQL 'SELECT ?x { ?x a ex:Person }'@ex:Person",
+            "invalid SPARQL selector",
+        ),
+    ] {
+        let r = send(&app, post(&format!("/ds/shex?map={}", enc(map)), B1_SCHEMA)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{map}: {}", r.text());
+        let j = r.json();
+        assert!(error_of(&r).contains(needle), "{map}: {j}");
+        assert!(
+            j["line"].as_u64().is_some() && j["column"].as_u64().is_some(),
+            "{j}"
+        );
+    }
+    let map = "ex:alice@ex:Person,\nSPARQL 'ASK {}'@ex:Person";
+    let r = send(&app, post(&format!("/ds/shex?map={}", enc(map)), B1_SCHEMA)).await;
+    let j = r.json();
+    assert_eq!((&j["line"], &j["column"]), (&json!(2), &json!(1)), "{j}");
+}
+
+#[tokio::test]
+async fn sparql_selectors_have_the_query_budgets() {
+    // --max-query-rows
+    let (_dir, app) = server_with(B1_DATA, |st| st.limits.max_rows = 2);
+    let map = "SPARQL 'SELECT ?focus { ?focus a <http://ex.org/Person> }'@ex:Person";
+    let r = send(&app, post(&format!("/ds/shex?map={}", enc(map)), B1_SCHEMA)).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert!(r.json()["budget"].is_string(), "{}", r.text());
+    // the report's size counts the selected nodes
+    let (_dir, app) = server_with(B1_DATA, |st| st.limits.max_result_bytes = Some(60));
+    let r = send(&app, post(&format!("/ds/shex?map={}", enc(map)), B1_SCHEMA)).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "result-bytes");
+    // the validation's timeout covers the selector: a long chain's closure
+    let chain: String = (0..2000)
+        .map(|i| {
+            format!(
+                "<http://ex.org/n{i}> <http://ex.org/next> <http://ex.org/n{}> .\n",
+                i + 1
+            )
+        })
+        .collect();
+    let (_dir, app) = server_with(&chain, |_| {});
+    let map = "SPARQL 'SELECT ?focus { ?focus <http://ex.org/next>* ?o }'@<http://ex.org/S>";
+    let r = send(
+        &app,
+        post(
+            &format!("/ds/shex?map={}&timeout=0.001", enc(map)),
+            "<http://ex.org/S> { }",
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", r.text());
+}
