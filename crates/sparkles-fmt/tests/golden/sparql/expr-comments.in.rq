@@ -1,0 +1,15 @@
+PREFIX ex: <http://example.org/>
+SELECT ?s WHERE {
+  ?s ex:price ?price ; ex:currency ?currency .
+  FILTER(?price > 10 && # cheap ones are noise
+    ?currency != "GBP" # not sold there
+    || ?price < 0)
+  FILTER(
+    # the first operand
+    ?price != 7 &&
+    # the second operand
+    ?price != 13
+  )
+  BIND(concat(str(?s), # the subject
+    "-", str(?price)) AS ?key)
+}

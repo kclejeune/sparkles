@@ -1,0 +1,25 @@
+PREFIX ex: <http://example.org/>
+
+SELECT
+  ?type
+  (COUNT(DISTINCT ?item) AS ?n)
+  (GROUP_CONCAT(DISTINCT ?label; SEPARATOR = ", ") AS ?labels)
+  (SAMPLE(?item) AS ?example)
+  (COUNT(*) AS ?all)
+  (MAX(?n2) + 1 AS ?next)
+WHERE {
+  ?item a ?type ;
+    ex:label ?label ;
+    ex:n ?n2 .
+  FILTER(?type IN (ex:A, ex:B) && ?label NOT IN ())
+  FILTER REGEX(STR(?label), "^a", "i")
+  FILTER ex:check(?item, -1, +2.5)
+  FILTER NOT EXISTS {
+    ?item ex:hidden true .
+  }
+  FILTER(<<( ?item ex:p "x"@en )>> != TRIPLE(?item, ex:p, ?label) && !isTRIPLE(?label))
+  FILTER(!BOUND(?label) || sameTerm(?item, ?type) || hasLANG(?label))
+}
+GROUP BY ?type
+HAVING(COUNT(DISTINCT ?item) > 5 && AVG(?n2) * 2 >= 10)
+ORDER BY DESC(?n) ASC(STRLEN(?labels))

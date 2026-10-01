@@ -10,6 +10,7 @@
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
+  import { formatEditor } from '$lib/fmt-edit';
   import { LatestRun } from '$lib/supersede';
   import { load, save } from '$lib/storage';
   import GraphView from '$components/GraphView.svelte';
@@ -38,6 +39,7 @@
 
   const DEFAULT_QUERY = EXAMPLES[0].query;
   const STORE_KEY = 'sparkles.queryTabs';
+  const FORMAT_ON_RUN_KEY = 'sparkles.formatOnRun';
   const LIMITS = [1_000, 10_000, 100_000, 1_000_000];
 
   const saved = load<{
@@ -62,6 +64,11 @@
   let inferences = $state(saved.inferences !== false);
   let outcomes = $state<Record<string, Outcome>>({});
   let examplesOpen = $state(false);
+  let formatMenuOpen = $state(false);
+  let formatting = $state(false);
+  /** Format the query before each Run (per viewer, off by default). */
+  let formatOnRun = $state(load<boolean>(FORMAT_ON_RUN_KEY, false) === true);
+  $effect(() => save(FORMAT_ON_RUN_KEY, formatOnRun));
   let renaming = $state<string | null>(null);
   let editor: SparqlEditor | undefined = $state();
 
@@ -135,6 +142,41 @@
     return 'table';
   }
 
+  /**
+   * Format the editor's query through the server (the Format button and Shift+Alt+F).
+   * `quiet` (format on run) reports nothing: the run reports a syntax error itself.
+   */
+  async function formatQuery(quiet = false) {
+    const ed = editor;
+    if (!ed || formatting || !ed.snapshot().text.trim()) return;
+    formatting = true;
+    try {
+      await formatEditor(ed, (req) => api.format(req));
+      ed.showError(undefined);
+    } catch (e) {
+      if (quiet) return;
+      if (e instanceof api.ApiError && e.status === 400 && e.code === 'syntax') {
+        ed.showError(e.line, e.column);
+        toasts.push(
+          'error',
+          e.line != null
+            ? `Can't format: syntax error at line ${e.line}`
+            : "Can't format: syntax error",
+          e.message,
+        );
+      } else if (e instanceof api.ApiError && e.status === 422) {
+        toasts.push(
+          'error',
+          'The formatter could not format this query safely; it was left unchanged',
+        );
+      } else {
+        toasts.error('Formatting failed', e);
+      }
+    } finally {
+      formatting = false;
+    }
+  }
+
   // Latest Run/Explain per tab: a superseded execution must not touch the tab's outcome.
   const runs = new LatestRun();
   const claim = (tabId: string) => runs.claim(tabId);
@@ -153,6 +195,8 @@
     }
     // capture the tab and its text before awaiting: the user may switch tabs meanwhile
     const tab = active;
+    // format first when asked to; on any failure the query runs as written
+    if (formatOnRun && tabId === activeId) await formatQuery(true);
     const original = tab.query;
     const owns = claim(tabId);
     outcomes[tabId]?.controller?.abort();
@@ -480,6 +524,8 @@
     };
     const onDoc = (e: MouseEvent) => {
       if (examplesOpen && !(e.target as HTMLElement).closest('.examples')) examplesOpen = false;
+      if (formatMenuOpen && !(e.target as HTMLElement).closest('.format-group'))
+        formatMenuOpen = false;
     };
     window.addEventListener('keydown', onKey);
     document.addEventListener('mousedown', onDoc);
@@ -591,6 +637,33 @@
         {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
       </select>
     </label>
+    <div class="format-group">
+      <button
+        class="btn sm format"
+        onclick={() => formatQuery()}
+        disabled={!active.query.trim() || formatting}
+        title="Format (Shift+Alt+F)"
+      >
+        <Icon name="wand" size={14} /> Format
+      </button>
+      <button
+        class="btn sm format-more"
+        aria-label="Format options"
+        aria-haspopup="true"
+        aria-expanded={formatMenuOpen}
+        onclick={() => (formatMenuOpen = !formatMenuOpen)}
+      >
+        <Icon name="chevronDown" size={13} />
+      </button>
+      {#if formatMenuOpen}
+        <div class="menu format-menu">
+          <label class="menu-item check">
+            <input type="checkbox" bind:checked={formatOnRun} />
+            <span>Format on run</span>
+          </label>
+        </div>
+      {/if}
+    </div>
     <button
       class="btn sm"
       onclick={runExplain}
@@ -624,6 +697,7 @@
       value={active.query}
       onchange={setQuery}
       onrun={run}
+      onformat={() => void formatQuery()}
       {completion}
     />
   </div>
@@ -1140,6 +1214,29 @@
   .menu-item:hover,
   .menu-item:focus-visible {
     background: var(--hover);
+  }
+  .format-group {
+    position: relative;
+    display: flex;
+  }
+  .format-group .format {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .format-group .format-more {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: none;
+    padding: 0 4px;
+  }
+  .format-menu {
+    width: auto;
+    white-space: nowrap;
+  }
+  .menu-item.check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .editor-wrap {
     min-height: 0;
