@@ -591,7 +591,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
 
     /// An in-memory dataset holding the fixture in its base.
     fn fixture(o: StoreOptions) -> Dataset {
-        crate::geo::column::tests::install_test_parser();
         let ds = Dataset::from_store(Store::in_memory(o));
         ds.load_str(FIXTURE, RdfFormat::TriG).unwrap();
         ds
@@ -670,8 +669,9 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             (1, 1, 0, 1)
         );
         assert_eq!(s.crs.get("http://example.org/crs/mars"), Some(&1));
-        assert!(s.crs[crate::geo::crs::CRS84_IRI] >= 6);
-        assert_eq!(s.crs.values().sum::<u64>(), 8);
+        assert_eq!(s.crs[crate::geo::crs::CRS84_IRI], 6);
+        assert_eq!(s.crs["http://www.opengis.net/def/crs/EPSG/0/4326"], 1);
+        assert_eq!(s.crs.len(), 3);
         assert!(s.last_build.is_some() && s.memory.tree_bytes > 0);
         assert_eq!(s.memory.budget_bytes, 4 << 30);
         let j = serde_json::to_value(&s).unwrap();
@@ -917,7 +917,6 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
 
     #[test]
     fn reopen_replays_the_log_into_the_overlay() {
-        crate::geo::column::tests::install_test_parser();
         let dir = tempfile::tempdir().unwrap();
         {
             let ds = Dataset::open_with(dir.path(), opts()).unwrap();
@@ -990,6 +989,12 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             .unwrap();
             assert_eq!(seen.len(), 8);
             assert_eq!(seen.iter().collect::<BTreeSet<_>>().len(), 8);
+            // with a lower bound that tells points apart, the farthest row comes last
+            if crate::geo::ops::distance::lower_bound_m([2.0, 2.0], [30.0, 30.0, 30.0, 30.0]) > 0.0
+            {
+                let g3 = snap.lookup_iri(&format!("{EX}g3")).unwrap();
+                assert_eq!(seen.last(), Some(&g3));
+            }
             assert_eq!(st.fallback, snap.geo.is_none());
             // the sink stops the search
             let mut calls = 0;

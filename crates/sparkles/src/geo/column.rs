@@ -8,8 +8,8 @@
 
 use super::GeomRef;
 use super::config::GeoConfig;
-use super::crs::{CRS84, CRS84_IRI, CrsId, CrsRef};
-use super::geom::{Geom, GeomError};
+use super::crs::{CRS84, CRS84_IRI, CrsRef};
+use super::geom::GeomError;
 use super::vocab::{GEOJSON_LITERAL, WKT_LITERAL};
 use crate::id::{Id, KEY_SEP, Tag};
 use crate::store::Snapshot;
@@ -52,8 +52,7 @@ impl ColumnEntry {
 
     /// Estimated memory of the entry and its geometry.
     pub(crate) fn bytes(&self) -> u64 {
-        (std::mem::size_of::<ColumnEntry>() + std::mem::size_of::<Geom>() + 48) as u64
-            + 16 * u64::from(self.geom.vertices)
+        (std::mem::size_of::<ColumnEntry>() + self.geom.mem_size()) as u64
     }
 }
 
@@ -95,27 +94,9 @@ pub(crate) enum Slot {
 /// The IRI of a CRS, for the status.
 fn crs_iri(c: &CrsRef) -> Arc<str> {
     match c {
-        CrsRef::Known(id) => known_crs_iri(*id).into(),
         CrsRef::Unknown(iri) => iri.clone(),
+        CrsRef::Known(_) => c.iri().into(),
     }
-}
-
-fn known_crs_iri(id: CrsId) -> String {
-    if id == CRS84 {
-        CRS84_IRI.to_string()
-    } else {
-        format!("urn:x-sparkles:crs:{}", id.0)
-    }
-}
-
-/// Parse a geometry literal: [`super::parse::parse`], with a stand-in parser while
-/// tests run against a build whose parser is not written yet.
-fn parse_literal(lex: &str, dt: &str) -> Result<Geom, GeomError> {
-    #[cfg(test)]
-    if let Some(p) = tests::PARSER.get() {
-        return p(lex, dt);
-    }
-    super::parse::parse(lex, dt)
 }
 
 /// Classify the literal with vocabulary key `key` under the limits of `cfg`.
@@ -145,7 +126,7 @@ pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
         return Slot::Skipped(Skip::Malformed);
     };
     // the parser is not trusted with arbitrary input: a panic is a malformed literal
-    let parsed = std::panic::catch_unwind(|| parse_literal(lex, dt));
+    let parsed = std::panic::catch_unwind(|| super::parse::parse(lex, dt));
     let g = match parsed {
         Ok(Ok(g)) => g,
         _ => return Slot::Skipped(Skip::Malformed),
@@ -350,117 +331,8 @@ impl Column {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::geo::crs::CrsRef;
-    use georust::{Coord, Geometry, LineString, Point, Polygon};
-
-    type Parser = fn(&str, &str) -> Result<Geom, GeomError>;
-
-    /// The stand-in parser of tests (see [`parse_literal`]).
-    pub(crate) static PARSER: std::sync::OnceLock<Parser> = std::sync::OnceLock::new();
-
-    fn err(msg: &str) -> GeomError {
-        GeomError {
-            offset: None,
-            msg: msg.into(),
-        }
-    }
-
-    fn nums(s: &str) -> Result<Vec<Coord<f64>>, GeomError> {
-        s.split(',')
-            .map(|p| {
-                let v: Vec<f64> = p
-                    .split_whitespace()
-                    .map(|x| x.parse::<f64>().map_err(|_| err("number")))
-                    .collect::<Result<_, _>>()?;
-                match v[..] {
-                    [x, y] if x.is_finite() && y.is_finite() => Ok(Coord { x, y }),
-                    _ => Err(err("a position needs two numbers")),
-                }
-            })
-            .collect()
-    }
-
-    /// A small parser for the shapes tests use: `[<crs>] POINT(x y)`,
-    /// `POLYGON((…))`, `LINESTRING(…)`, the empty literal, and GeoJSON points. EPSG:4326
-    /// is read as latitude, longitude and placed in CRS84.
-    pub(crate) fn test_parse(lex: &str, dt: &str) -> Result<Geom, GeomError> {
-        let mut s = lex.trim();
-        let mut crs = CrsRef::Known(CRS84);
-        let mut swap = false;
-        if dt == GEOJSON_LITERAL {
-            let v: serde_json::Value = serde_json::from_str(s).map_err(|_| err("json"))?;
-            let c = v["coordinates"]
-                .as_array()
-                .ok_or_else(|| err("coordinates"))?;
-            let (x, y) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
-            return Ok(Geom::from_geometry(crs, Geometry::Point(Point::new(x, y))));
-        }
-        if let Some(rest) = s.strip_prefix('<') {
-            let (iri, rest) = rest.split_once('>').ok_or_else(|| err("crs"))?;
-            crs = match iri {
-                CRS84_IRI => CrsRef::Known(CRS84),
-                "http://www.opengis.net/def/crs/EPSG/0/4326" => {
-                    swap = true;
-                    CrsRef::Known(CRS84)
-                }
-                other => CrsRef::Unknown(other.into()),
-            };
-            s = rest.trim();
-        }
-        if s.is_empty() {
-            let mut g = Geom::from_geometry(
-                crs,
-                Geometry::GeometryCollection(georust::GeometryCollection(vec![])),
-            );
-            g.empty = true;
-            return Ok(g);
-        }
-        let open = s.find('(').ok_or_else(|| err("("))?;
-        let kind = s[..open].trim().to_ascii_uppercase();
-        let body = s[open..].trim();
-        let inner = |b: &str| -> Result<Vec<Coord<f64>>, GeomError> {
-            let b = b.trim();
-            let b = b
-                .strip_prefix('(')
-                .and_then(|b| b.strip_suffix(')'))
-                .ok_or_else(|| err("parentheses"))?;
-            let mut c = nums(b)?;
-            if swap {
-                for p in &mut c {
-                    std::mem::swap(&mut p.x, &mut p.y);
-                }
-            }
-            Ok(c)
-        };
-        let g = match kind.as_str() {
-            "POINT" => {
-                let c = inner(body)?;
-                if c.len() != 1 {
-                    return Err(err("a point has one position"));
-                }
-                Geometry::Point(Point(c[0]))
-            }
-            "LINESTRING" => Geometry::LineString(LineString(inner(body)?)),
-            "POLYGON" => {
-                let b = body
-                    .strip_prefix('(')
-                    .and_then(|b| b.strip_suffix(')'))
-                    .ok_or_else(|| err("parentheses"))?;
-                Geometry::Polygon(Polygon::new(LineString(inner(b)?), vec![]))
-            }
-            _ => return Err(err("unsupported in tests")),
-        };
-        Ok(Geom::from_geometry(crs, g))
-    }
-
-    /// Use [`test_parse`] when the real parser cannot read literals yet.
-    pub(crate) fn install_test_parser() {
-        if super::super::parse::parse("POINT(1 2)", WKT_LITERAL).is_err() {
-            let _ = PARSER.set(test_parse);
-        }
-    }
 
     fn key(lex: &str, dt: &str) -> Vec<u8> {
         let mut k = vec![b'"'];
@@ -473,7 +345,6 @@ pub(crate) mod tests {
 
     #[test]
     fn classify_literals() {
-        install_test_parser();
         let cfg = GeoConfig::default();
         let Slot::Geom(e) = classify(&key("POINT(1 2)", WKT_LITERAL), &cfg) else {
             panic!("a point is indexed");

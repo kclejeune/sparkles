@@ -257,8 +257,18 @@ fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<GeomRef> {
 /// The geometry column's parse of a stored literal, when the dataset's spatial index
 /// has one for `id`.
 fn from_column(ctx: &Ctx, id: Id) -> Option<GeomRef> {
-    let _ = (ctx, id);
-    None
+    if !matches!(id.tag(), crate::id::Tag::Vocab | crate::id::Tag::Delta) {
+        return None;
+    }
+    // a transaction's view keeps its base's column: its ids are those of the generation
+    let base = ctx.snap.geo.as_deref()?.base.as_ref()?;
+    if base.generation != ctx.snap.generation.uid {
+        return None;
+    }
+    match base.column.get(id.0)? {
+        super::column::Slot::Geom(e) => e.geom(&ctx.snap).ok(),
+        _ => None,
+    }
 }
 
 /// Argument `i` of a function call as a geometry: the generation's geometry column for
@@ -393,6 +403,56 @@ mod tests {
         assert!(geom_arg(&args, 5, &row, &ctx).is_err());
         assert!(geom_arg(&args, 6, &row, &ctx).is_err());
         assert_eq!(ctx.geo.len(), 4);
+    }
+
+    #[test]
+    fn stored_literals_come_from_the_column() {
+        const AS_WKT: &str = "<http://www.opengis.net/ont/geosparql#asWKT>";
+        let triple = |s: &str, lex: &str| {
+            format!("<http://example.org/{s}> {AS_WKT} \"{lex}\"^^<{WKT_LITERAL}> .")
+        };
+        let ds = crate::dataset::Dataset::memory();
+        ds.load_str(&triple("a", "POINT(1 2)"), crate::io::RdfFormat::NTriples)
+            .unwrap();
+        let literal = |lex: &str| {
+            oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+                lex,
+                oxrdf::NamedNode::new_unchecked(WKT_LITERAL),
+            ))
+        };
+        let table = Table::unit();
+        let row = Row {
+            table: &table,
+            i: 0,
+            map: &[],
+            dec: None,
+        };
+        let arg = |ctx: &Ctx, lex: &str| {
+            let id = ctx.snap.lookup_term(&literal(lex)).unwrap();
+            geom_arg(&[Expr::Const(id)], 0, &row, ctx).unwrap()
+        };
+        // without the index, a stored literal is parsed into the memo
+        let ctx = Ctx::new(ds.snapshot());
+        arg(&ctx, "POINT(1 2)");
+        assert_eq!(ctx.geo.len(), 1);
+        ds.store()
+            .enable_geo(crate::geo::GeoConfig::default())
+            .unwrap();
+        ds.update(&format!("INSERT DATA {{ {} }}", triple("b", "POINT(3 4)")))
+            .unwrap();
+        // with it, base and delta literals come from the column: the memo misses nothing
+        let ctx = Ctx::new(ds.snapshot());
+        let a = arg(&ctx, "POINT(1 2)");
+        let b = arg(&ctx, "POINT(3 4)");
+        assert_eq!(ctx.geo.len(), 0);
+        assert_eq!(b.g, georust::Point::new(3.0, 4.0).into());
+        let view = ctx.snap.geo.clone().unwrap();
+        let base = view.base.as_ref().unwrap();
+        let id = ctx.snap.lookup_term(&literal("POINT(1 2)")).unwrap();
+        let Some(crate::geo::column::Slot::Geom(e)) = base.column.get(id.0) else {
+            panic!("indexed");
+        };
+        assert!(Arc::ptr_eq(&a, &e.geom(&ctx.snap).unwrap()));
     }
 
     #[test]
