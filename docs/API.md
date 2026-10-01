@@ -1,8 +1,8 @@
 # Sparkles HTTP API
 
-The server speaks the **Fuseki** protocol surface (so existing Jena tooling —
-`rdfconnection`, `s-query`, YASGUI, etc. — works unchanged) plus a small set of
-`/$/…` extensions used by the web UI.
+The server speaks the Fuseki protocol, so existing Jena tooling (`rdfconnection`,
+`s-query`, YASGUI and others) works unchanged. A small set of `/$/…` extensions serves the
+web UI.
 
 All admin endpoints live under `/$/`. Dataset names match `[A-Za-z0-9_.-]+` and are
 addressed as `/{ds}`. JSON responses use `application/json`.
@@ -12,6 +12,8 @@ every route needs credentials or a grant to `anonymous`; see
 [Authentication and access control](#authentication-and-access-control).
 
 ## Server
+
+Design and rationale: [C01 Observability, readiness and budgets](specs/C01-observability-and-budgets.md).
 
 | Method | Path          | Description |
 |--------|---------------|-------------|
@@ -395,7 +397,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancel a task that accepts it (a queued task, a clone until it is in place, an N-Quads backup): `202` with the `Task`; it ends `cancelled`. `409 {code: "not-cancellable"}` for other tasks and finished ones. Needs `admin` on the task's dataset (`server-admin` for a server-wide task). |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drop the dataset's cached query results. `{ "cleared": number /* entries */, "bytes": number }` |
-| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }` — the dataset's prefixes plus well-known ones. |
+| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | After Fuseki's prefixes service. `?prefix=p` → `{ prefix, uri }` (`404` if unbound); `?uri=u` → `{ uri, prefixes: [...] }`; neither → `{ prefixes: {...} }` (stored ones only). |
 | POST/PUT | `/{ds}/prefixes`           | Bind `prefix` to `uri` (query, form or JSON body `{prefix, uri}`); `400` for an invalid name or IRI (names up to 256 bytes, IRIs up to 4096), or for a new prefix once the dataset has `--max-prefixes` (1000; replacing one is fine). Prefixes of loaded data are added up to the same limit. Prefixes are metadata: no commit is made. |
 | DELETE | `/{ds}/prefixes?prefix=p`    | Remove a binding (`204`, or `404` if unbound). |
@@ -461,6 +463,8 @@ Starting a task while 1000 already wait answers `503`. The task list keeps every
 and running task and the 200 most recent finished ones.
 
 ## Schema discovery
+
+Design and rationale: [C02 Schema discovery](specs/C02-schema-discovery.md).
 
 `GET /$/schema/{ds}` reports the classes and predicates of a dataset in two separate
 layers:
@@ -570,6 +574,8 @@ when the timeout or the entry cap is exceeded. In Rust, `sparkles::schema::disco
 
 ### Clone
 
+Design and rationale: [C06 Clone-to-sandbox](specs/C06-clone-to-sandbox.md).
+
 `POST /$/datasets/{ds}/clone` copies one consistent snapshot of `{ds}` into a new,
 independent persistent dataset, for trying updates, reasoning or loads without touching
 the original. Parameters come from the query string, a form body or a JSON body:
@@ -631,7 +637,7 @@ Content negotiation via `Accept` or the `format=` parameter (Fuseki style):
 
 Query parameters beyond the standard protocol:
 
-* `timeout=<seconds>` — query timeout (default 60 s, `sparkles serve --timeout`), capped
+* `timeout=<seconds>`: query timeout (default 60 s, `sparkles serve --timeout`), capped
   at `--max-timeout` (default 1800 s; `0`: no cap; never below `--timeout`). Updates,
   Graph Store `PUT`/`POST`/`DELETE` and uploads accept it too, under the same cap (never
   below `--update-timeout`; for a Graph Store write or an upload it starts once the body
@@ -639,15 +645,17 @@ Query parameters beyond the standard protocol:
   timed-out write changes nothing. A `408` names the timeout that applied in
   `timeoutSeconds`. A write whose client disconnects is cancelled (also while it waits for
   the dataset's writer lock) and commits nothing; a commit that already started completes.
-* `send=<n>` — cap on rows serialized (the UI uses this so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
-* `reasoning=true|false` — include materialized inferences (default `true` if present).
-* `nocache=true` — bypass the query result cache: nothing is read from or stored in it
+* `send=<n>`: cap on rows serialized (the UI uses it so a huge result does not hang the browser; `meta.totalRows` still reports the full count).
+* `reasoning=true|false`: include materialized inferences (default `true` if present).
+* `nocache=true`: bypass the query result cache: nothing is read from or stored in it
   (for benchmarking; `explain` accepts it too). The server-wide budget is set with
   `sparkles serve --result-cache-mb N` (default 512, `0` disables the cache); the cache is
   keyed by snapshot version, so updates invalidate it, and `POST /$/cache/clear/{ds}`
   empties it.
 
 ## Commits
+
+Design and rationale: [CI Durable commit identity](specs/CI-commit-identity.md).
 
 Every dataset has a **dataset id** (a UUID created with it) and a gap-free **commit
 sequence**. Each write that changes data (update, Graph Store PUT/POST/DELETE, upload,
@@ -699,6 +707,8 @@ type Commit = {
 lists commits without taking the database lock, so it works next to a running server.
 
 ## Point-in-time reads and snapshots
+
+Design and rationale: [F06 Named snapshots and point-in-time queries](specs/F06-snapshots-and-point-in-time.md).
 
 Every commit since the dataset's last compaction or bulk commit can be read, at no extra
 cost: its state is the current index generation plus a prefix of its write-ahead log.
@@ -773,6 +783,8 @@ database, so stop a server that holds it or use the HTTP API. In Rust:
 `Store::snapshot_at`, `create_snapshot`, `set_retention`, `history`.
 
 ## Backup repositories
+
+Design and rationale: [F05 Backup repositories](specs/F05-snapshot-repositories.md).
 
 *Extension* (the `backup` cargo feature of `sparkles-server`, on by default). A
 **repository** is a directory (`fs`: a local or mounted file system) or a bucket prefix
@@ -1167,8 +1179,8 @@ for create, delete, restore and verify, an **exclusive** one for GC's sweep. A h
 is rewritten every 5 minutes; one not rewritten for 30 minutes (by the storage server's
 clock, never this host's) is **stale**: ignored by others and removed by GC. An
 operation that meets a conflicting lock retries with backoff for up to 10 minutes, then
-fails with `409 repository-locked`. Read-only repositories take no locks. So several
-servers, and the CLI, can share a repository.
+fails with `409 repository-locked`. These leases let several servers, and the CLI, share
+a repository. Read-only repositories take no locks.
 
 GC marks the blobs every manifest references under a shared lock (backups continue),
 then takes the exclusive lock, lists the manifests again and deletes the unreferenced
@@ -1331,6 +1343,8 @@ that compress differently still deduplicate.
 
 ## Full-text search
 
+Design and rationale: [F03 Full-text search](specs/F03-full-text-search.md).
+
 Datasets can index their string and language-tagged literals for ranked (BM25) search,
 queried with Jena's `text:query` property function (`PREFIX text: <http://jena.apache.org/text#>`):
 
@@ -1404,6 +1418,8 @@ and `sparkles serve --text NAME[=config.json]`.
 
 ## Vector similarity
 
+Design and rationale: [F04 Vector similarity search](specs/F04-vector-search.md).
+
 Embeddings are ordinary literals of the datatype `<urn:x-sparkles:vector>`: a JSON array
 of 1–16384 finite numbers (`"[0.1, -0.2, 0.3]"^^spk:vector`, with
 `PREFIX spk: <urn:x-sparkles:>`), read as `f32`. Literals are stored and returned exactly
@@ -1444,6 +1460,8 @@ as written; one that does not parse is stored but never matched.
 
 ## GeoSPARQL
 
+Design and rationale: [G01 GeoSPARQL](specs/G01-geosparql.md).
+
 Built with the `geo` cargo feature (on in the server), Sparkles implements the GeoSPARQL
 1.1 functions over geometry literals, Jena's `spatial:` property functions, and a spatial
 index per dataset. Prefixes: `geo:` `<http://www.opengis.net/ont/geosparql#>`, `geof:`
@@ -1469,7 +1487,7 @@ SELECT ?f ?d WHERE {
 * Literals are stored as written: `"POINT(1 2)"` and `"Point (1.0 2.0)"` are different
   terms with equal geometries (`=` compares terms, `geof:sfEquals` geometries). A literal
   that does not parse is stored all the same; functions give a type error on it and the
-  index skips it. A malformed geometry **constant** in a query is a `400`
+  index skips it. A malformed geometry constant in a query is a `400`
   (`geo: malformed wktLiteral at offset N: …`).
 * **CRSs.** CRS84 (the default, longitude first), CRS84h, EPSG:4326 and EPSG:4979
   (latitude first, as the EPSG definition says; GeoSPARQL Req 16), the legacy
@@ -1560,7 +1578,7 @@ generation or a `DELETE /$/geo/{ds}`.
 `wgs84_pos:long` (`http://www.w3.org/2003/01/geo/wgs84_pos#`) in the same graph is also
 a point of the index (several of either: every combination, as in Jena). Values are
 numbers of any XSD numeric type, or strings holding one, within ±90° and ±180°; other
-pairs are no points. A point lives while both of its quads do. The `spatial:` functions
+pairs are not points. A point lives while both of its quads do. The `spatial:` functions
 find such a subject as a feature (no feature link needed), and the map view reports it;
 `geof:` FILTERs do not see the pairs (there is no geometry literal), so they are not
 pushed down for them either.
@@ -1845,6 +1863,8 @@ style.
 
 ## Reasoning status and diagnostics
 
+Design and rationale: [C08 Inference freshness and diagnostics](specs/C08-inference-freshness.md).
+
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
 A materialization records the commit it wrote (or, when it changed nothing, the head it
 read) and the dataset id. Any later commit makes the inferences **stale**, including
@@ -1886,7 +1906,7 @@ recomputation that holds the dataset's writer lock, so updates wait while it run
 **Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks from the
 OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3), each one SPARQL query
 over the default graph (plus the inferences when included). Those rules are sound, so
-every finding is a genuine inconsistency. Finding nothing does **not** establish OWL
+every finding is a genuine inconsistency. Finding nothing does not establish OWL
 consistency.
 
 | Param | Default | Meaning |
@@ -1947,7 +1967,9 @@ CLI: `sparkles infer --loc DB --status` prints the status; `sparkles infer --loc
 
 ## Write-time validation
 
-A dataset can validate **every write** against SHACL shapes or a ShEx schema before it
+Design and rationale: [C10 Write-time SHACL validation](specs/C10-write-time-validation.md); for the ShEx guard, [G02 ShEx](specs/G02-shex.md).
+
+A dataset can validate every write against SHACL shapes or a ShEx schema before it
 commits; it uses one language at a time. The configuration lives in the database
 directory (`validation.json`, format 2; SHACL configurations of older Sparkles versions,
 format 1 without `language`, are still read):
@@ -2105,6 +2127,8 @@ conform.
 
 ## ShEx validation
 
+Design and rationale: [G02 ShEx 2.1 validation](specs/G02-shex.md).
+
 `POST /{ds}/shex` validates nodes of a data graph against a ShEx 2.1 schema (Shape
 Expressions). Fuseki has no ShEx operation; the parameters follow `/{ds}/shacl` where they
 overlap. Built with the `shex` cargo feature (on by default; `501` without it).
@@ -2250,12 +2274,22 @@ command line have no row or memory budgets.
 
 ## Formatting
 
-`POST /$/format` formats a SPARQL query or update (Turtle, TriG, N-Triples, N-Quads and
-JSON-LD later) and answers the formatted text, in the style of `sparkles fmt` (see the
-README). It reads no dataset and no config file: the style options come with the request,
-and omitted ones take their defaults. The formatter checks its own output before answering:
-it must parse to the same SPARQL algebra as the input, keep every comment and format to
-itself; when a check fails, the request fails and nothing is returned.
+Design and rationale: [X02 Formatter](specs/X02-formatter.md).
+
+`POST /$/format` formats a SPARQL query or update, or a Turtle, TriG, N-Triples, N-Quads
+or JSON-LD document, and answers the formatted text, in the style of `sparkles fmt` (see
+[USAGE.md](USAGE.md#formatting)). It reads no dataset and no config file: the style
+options come with the request, and omitted ones take their defaults. The formatter checks
+its own output before answering: it must parse to the same SPARQL algebra, RDF dataset or
+JSON as the input, keep every comment and format to itself; when a check fails, the
+request fails and nothing is returned.
+
+The UI formats in the page instead when it is built with the formatter's WebAssembly
+module (`mise run ui:wasm`; the Nix packages always include it): the module takes this
+endpoint's JSON and answers with it, and the UI calls `POST /$/format` only as a fallback,
+when the build has no module or it fails to load or run. So `--format-endpoint
+authenticated` or `off` does not stop such a UI from formatting; it limits only the
+endpoint.
 
 **JSON body** (`Content-Type: application/json`, what the UI sends):
 
@@ -2274,10 +2308,12 @@ type FormatOptions = {
   compactIris?: boolean;         // default true: full IRI → prefixed name
   quoteStyle?: "double" | "preserve";           // default "double"
   operatorPosition?: "leading" | "trailing";    // default "leading": where a broken || or && chain puts its operator
-  // accepted for the formats to come; no effect on SPARQL
-  sort?: boolean; directiveStyle?: "sparql" | "turtle"; turtleLayout?: "diff" | "conventional";
-  // accepted, not implemented yet (a warning says so)
-  prunePrefixes?: boolean; alignValues?: boolean;
+  alignValues?: boolean;         // default false; SPARQL: pad multi-variable VALUES rows into columns
+  prunePrefixes?: boolean;       // default false; SPARQL, Turtle, TriG: drop prefix declarations nothing uses
+  directiveStyle?: "sparql" | "turtle";         // default "sparql"; Turtle, TriG: PREFIX and GRAPH, or @prefix
+  turtleLayout?: "diff" | "conventional";       // default "diff"; Turtle, TriG
+  sort?: boolean;                // default false; Turtle, TriG, JSON-LD terms, N-Triples, N-Quads
+  // a key that does not act on the language is accepted and has no effect
 };
 type FormatResult = {
   text: string;
@@ -2294,9 +2330,10 @@ curl -s localhost:3030/'$/format' -H 'Content-Type: application/json' \
   -d '{"text": "select * { ?s ?p ?o }", "cursorOffset": 9, "options": {"lineWidth": 80}}'
 ```
 
-Without `language`, the text's first keyword after the prologue decides (`SELECT`,
-`INSERT`, … is SPARQL). The cursor is kept next to the same token; a byte order mark is
-dropped.
+Without `language`, the text decides: its first significant token after comments and a
+`PREFIX`/`BASE`/`VERSION` prologue (`SELECT`, `INSERT`, … is SPARQL). N-Triples, which is
+also valid Turtle, needs `language` or its media type. The cursor is kept next to the same
+token; a byte order mark is dropped.
 
 **Raw body** (curl): the body is the document, and its media type names the language unless
 `language` is in the query string. The answer is `200` with the same media type, the
@@ -2306,7 +2343,7 @@ through CORS).
 | `Content-Type` | Language |
 |---|---|
 | `application/sparql-query`, `application/sparql-update` | `sparql` |
-| `text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`, `application/ld+json` | `turtle`, `trig`, `ntriples`, `nquads`, `jsonld` (`415` until they are implemented) |
+| `text/turtle`, `application/trig`, `application/n-triples`, `application/n-quads`, `application/ld+json` | `turtle`, `trig`, `ntriples`, `nquads`, `jsonld` |
 | `text/plain` | needs `?language=` |
 
 ```sh
@@ -2329,7 +2366,7 @@ over the query string's; both are checked.
 | `404` | `{error}` | `--format-endpoint off` |
 | `408` | `{error}` | the request took longer than `--format-timeout`, waiting for a slot included |
 | `413` | `{error}` | a body larger than `--format-max-mb` |
-| `415` | `{error}` | RDF/XML (`application/rdf+xml` or `language=rdfxml`: "RDF/XML formatting is not supported; convert to Turtle to format"), a language this build does not format yet ("turtle formatting is not available yet"), or another media type |
+| `415` | `{error}` | RDF/XML (`application/rdf+xml` or `language=rdfxml`: "RDF/XML formatting is not supported; convert to Turtle to format"), or another media type |
 | `422` | `{error, code}` | the formatter refused its own output: `unsafe-format` (`algebra differs`, `comment lost`), `unstable-format` (`not idempotent`), or `unsupported-syntax` (the reference parser accepts a construct the formatter cannot handle yet). Logged at `warn` with the SHA-256 of the input (never the text); please report |
 
 **Server settings and access.**
@@ -2346,8 +2383,8 @@ cookie sessions send the CSRF header as for every other `POST`. Rate limits coun
 
 ## `application/x-sparkles+json` (UI result format)
 
-Rich result format inspired by QLever's `qlever-json`, used by the UI for results
-rendering and query-plan visualization:
+A result format modelled on QLever's `qlever-json`. The UI uses it to render results and
+draw query plans:
 
 ```ts
 type SparklesResult = {
@@ -2395,6 +2432,8 @@ why), `geo-index-building` (the spatial index is being built; plans without it r
 `geo-not-built` (`geof:` functions in a build without the `geo` feature).
 
 ## Compression
+
+Design and rationale: [X01 Compression codecs](specs/X01-compression-codecs.md).
 
 **Responses** are compressed when the client sends `Accept-Encoding` with `zstd`, `br`,
 `gzip` or `deflate`, streamed bodies included. Bodies under 256 bytes and images are sent
@@ -2474,6 +2513,8 @@ a machine-readable `code` (see [Backup repositories](#backup-errors)).
 
 ### Budgets
 
+Design and rationale: [C01 Observability, readiness and budgets](specs/C01-observability-and-budgets.md).
+
 Queries run under per-request budgets (see `limits` in `/$/server`); exceeding one fails
 the request with `507 Insufficient Storage` and
 
@@ -2500,10 +2541,15 @@ the request with `507 Insufficient Storage` and
   node's neighbourhood to a shape (100,000) and the (node, shape) pairs of its typing
   (10,000,000, or `--query-memory-mb` at 64 bytes per pair if that is fewer). A
   validation past either fails; it never becomes a nonconformant result.
+* `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
+
+`limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
+includes `memPeakBytes`, and `meta.memory.peakBytes` in `application/x-sparkles+json` reports
+the peak estimate of a query.
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
-of up to 1 MiB is sent whole, with `Content-Length`, and an error (including this budget)
-gets its status code. A larger body is streamed in 64 KiB chunks as it is serialized, so
+of up to 1 MiB is sent whole, with `Content-Length`, and an error (including the
+`result-bytes` budget) gets its status code. A larger body is streamed in 64 KiB chunks as it is serialized, so
 server memory stays flat; an error after that point (e.g. the budget exceeded at 1.2 GiB)
 aborts the transfer, and the client sees a truncated response instead of a status code.
 A query result whose smallest encoding already exceeds the budget is refused with `507`
@@ -2514,17 +2560,14 @@ written to a temporary file as they arrive rather than held in memory. A large P
 (estimated above the bulk threshold) replaces its graphs in one index rebuild that parses
 the body as a stream; like every write it is atomic, so a parse error leaves the data as
 it was.
-* `rows` (`--max-rows`, default 200,000,000): the rows of any intermediate result.
-
-`limit` and `requested` are in bytes (rows for `rows`). The response of `/{ds}/update`
-includes `memPeakBytes`, and `meta.memory.peakBytes` in `application/x-sparkles+json` reports
-the peak estimate of a query.
 
 ## Authentication and access control
 
+Design and rationale: [C09 Authentication and dataset-level access control](specs/C09-dataset-access-control.md).
+
 `sparkles serve --auth-config FILE` turns authentication on. Without it there are no
 credentials and every request may do everything, as the local principal. With it the
-server **denies by default**: a caller may do only what a grant allows.
+server denies by default: a caller may do only what a grant allows.
 
 Without it the server listens on loopback only: `--host` defaults to `127.0.0.1`, and a
 non-loopback address is refused at startup unless `--allow-open-network` (or
@@ -2536,12 +2579,12 @@ Since any web page the operator opens can send requests to a local server, a ser
 without auth also refuses:
 
 - a `Host` (or HTTP/2 `:authority`) that is not an IP address, `localhost`,
-  `*.localhost`, `--host` or a `--public-host` name: **421** (a page that rebinds its
+  `*.localhost`, `--host` or a `--public-host` name: `421` (a page that rebinds its
   own DNS name to the server's address sends its own name);
 - unsafe requests, and requests needing `write`, `admin` or `server-admin`, that are
   cross-origin by the rules of [CSRF and CORS](#csrf-and-cors) (`Origin` other than the
-  request's own or a `--cors-origin`, or `Sec-Fetch-Site: cross-site`): **403**
-  `cross-origin request refused`.
+  request's own or a `--cors-origin`, or `Sec-Fetch-Site: cross-site`): `403
+  cross-origin request refused`.
 
 CORS headers are sent only for `--cors-origin` origins, without credentials. Requests
 without `Origin` or `Sec-Fetch-Site` (the CLI, curl, other servers) and the server's own
@@ -2553,7 +2596,7 @@ Each request resolves to one principal. The first applicable source wins:
 
 1. **`Authorization`**: `Bearer spk_…` (an API token), or `Basic` with a configured user
    and password, or with a token as the password (any user name; for Basic-only clients
-   such as Jena). Invalid credentials are **401**, never treated as anonymous.
+   such as Jena). Invalid credentials are `401`, never treated as anonymous.
 2. **The session cookie** of the web UI (`__Host-sparkles_session` over https,
    `sparkles_session` on http://localhost). A bad, expired or revoked cookie is ignored and
    cleared.
@@ -2587,7 +2630,7 @@ reads only files under it). Grants are a union of a principal's own
 grants and its roles'; there are no deny rules. `--read-only` still applies to everyone,
 after authorization. `federate` does not open every URL: `SERVICE` and `LOAD <http…>`
 also follow the server's outbound policy (public addresses only unless
-`--outbound-allow-private` or `--outbound-allow`; see the README, Outbound requests), and a
+`--outbound-allow-private` or `--outbound-allow`; see [Outbound requests](USAGE.md#outbound-requests-service-and-load)), and a
 refused destination answers `403` as well. The local `sparkles query` and `sparkles update`
 (no server, no permissions) allow loopback and private destinations by default and take
 `--outbound-block-private` for the strict policy.
@@ -2885,9 +2928,11 @@ logouts, minted and revoked tokens, device approvals, reloads) are logged at INF
 
 ## MCP server
 
+Design and rationale: [C11 MCP server](specs/C11-mcp-server.md).
+
 `sparkles mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
-(JSON-RPC 2.0, one message per line) on stdin/stdout. It is not an HTTP endpoint; this
-section documents it here because it exposes the same engine.
+(JSON-RPC 2.0, one message per line) on stdin/stdout. It is not an HTTP endpoint, but it
+exposes the same engine, so it is documented here.
 
 ```
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])

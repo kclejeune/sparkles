@@ -593,7 +593,8 @@ enum Cmd {
     /// on stdin/stdout): read-only tools for schema discovery and bounded queries
     #[cfg(feature = "mcp")]
     Mcp(mcp::McpArgs),
-    /// Format SPARQL queries and updates: print, check (--check, -l) or rewrite (--write)
+    /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
+    /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
     /// A language server for editors (stdio): formatting and syntax diagnostics for the

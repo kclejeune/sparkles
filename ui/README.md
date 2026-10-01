@@ -2,7 +2,7 @@
 
 SvelteKit 2 + Svelte 5 single-page app for the Sparkles RDF/SPARQL server.
 It is built as static files (`build/`) that the Rust server embeds and serves
-under **`/ui/`**, redirecting `/` → `/ui/`. Datasets live at the server root
+under `/ui/`, redirecting `/` → `/ui/`. Datasets live at the server root
 (`/{ds}/sparql`, `/$/…`), which is why the UI stays under its own prefix.
 
 The HTTP contract is [`docs/API.md`](../docs/API.md).
@@ -41,7 +41,7 @@ The mock (`mock/server.mjs`) loads a small FOAF-style organisation graph with
 an OWL ontology (`mock/data.mjs`) into a `foaf` dataset plus a tiny `scratch`
 dataset. It implements every endpoint in API.md: queries and updates are
 evaluated for real, uploads parse Turtle/N-Triples/N-Quads/TriG/RDF-XML,
-reasoning materializes a few RDFS/OWL rules into `urn:sparkles:inferred`, and
+reasoning materializes a few RDFS/OWL rules into `urn:x-sparkles:inferred`, and
 tasks progress over a couple of seconds. Writes are committed with receipts
 (the `foaf` history is seeded, with its oldest commits no longer retained).
 `text:query` and `spk:vectorSearch` calls are answered from the call alone (a
@@ -83,8 +83,8 @@ pnpm preview   # serves build/ at http://localhost:4173/ui/ with the same proxy
 
 ## Formatting in the browser
 
-Format (the query editor and the shapes editor) runs the formatter in the browser when the
-build has its WebAssembly module, and asks `POST /$/format` otherwise. The module is
+Format, in the query editor and the shapes editor, runs the formatter in the browser when
+the build has its WebAssembly module, and calls `POST /$/format` otherwise. The module is
 optional: `mise run ui:wasm` (from the repository root) builds `crates/sparkles-fmt-wasm`
 into `src/lib/wasm/` (git-ignored) with `scripts/build-fmt-wasm.sh`, which needs the
 `wasm32-unknown-unknown` target (`rust-toolchain.toml` lists it) and the wasm-bindgen CLI of
@@ -94,8 +94,8 @@ Nix `sparkles-ui` package always builds it in (`nix/fmt-wasm.nix`).
 
 `lib/fmt-wasm.ts` loads the module the first time something is formatted (a hashed asset
 under `/ui/_app/immutable/`, served compressed: about 250 KB with brotli). It takes the
-endpoint's JSON and answers with it, errors included, so the pages handle both the same way;
-a module that does not load or fails while running hands the request to the endpoint. The
+endpoint's JSON and answers with it, errors included, so the pages handle both the same way.
+A module that does not load, or fails while running, hands the request to the endpoint. The
 pages' Content Security Policy has `'wasm-unsafe-eval'` for it. `VITE_FMT_WASM=off` leaves
 the module out of a build or `vite dev` (the mock tests below set it, so the mock's stand-in
 formatter answers).
@@ -105,9 +105,9 @@ formatter answers).
 `tests/e2e` holds Playwright smoke tests of the UI against a real `sparkles serve`:
 `global-setup.ts` starts `../target/debug/sparkles` (or `$SPARKLES_BIN`) on a free port of
 127.0.0.1 with a temporary data directory and an auth configuration (user `alice` with a
-password, a static server-admin API token), loads a small dataset (`data.ts`: labels,
+password, a static server-admin API token). It loads a small dataset (`data.ts`: labels,
 comments for full-text search, `spk:vector` embeddings for Similar) in two commits, enables
-full-text search and signs `alice` in; the teardown stops the server and deletes the
+full-text search and signs `alice` in. The teardown stops the server and deletes the
 directory (`SPARKLES_E2E_KEEP=1` keeps it, with `server.log`). A debug binary reads `build/`
 from disk, so run `pnpm build` first. The tests cover signing in with a password and with a
 token minted on the tokens page, Bearer tokens on the SPARQL endpoint, the query page,
@@ -119,11 +119,11 @@ chromium` downloads one. `mise run ui:e2e` does all of this.
 
 On Linux the flake check `ui-e2e` (`nix/ui-e2e.nix`, part of `nix flake check`; alone:
 `nix build .#checks.x86_64-linux.ui-e2e -L`) runs the same tests hermetically in the build
-sandbox: `SPARKLES_BIN` is the flake's `sparkles` package, a release build that embeds the UI
-(so no `build/` is needed), the dependencies are the `sparkles-ui` package's pnpm store (the
-same hash, refreshed with it when the lockfile changes), and Chromium comes from nixpkgs'
-`playwright-driver` (with a fontconfig listing DejaVu, as the sandbox has no system fonts).
-With `CI` set, as there, a failed test is retried once and reported as
+sandbox. There, `SPARKLES_BIN` is the flake's `sparkles` package, a release build that embeds
+the UI (so no `build/` is needed). The dependencies are the `sparkles-ui` package's pnpm store
+(the same hash, refreshed with it when the lockfile changes), and Chromium comes from
+nixpkgs' `playwright-driver` (with a fontconfig listing DejaVu, as the sandbox has no system
+fonts). With `CI` set, as in the sandbox, a failed test is retried once and reported as
 flaky, and `test.only` fails the run.
 
 `tests/mock` tests pages whose server side is not built yet (the Backups area) against the

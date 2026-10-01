@@ -5,11 +5,11 @@ editor:
 
 - **As a formatter command.** Formatter plugins pipe the buffer through
   `sparkles fmt --stdin-filepath PATH`, which reads stdin and prints the formatted text.
-  The path is never opened: it only names the buffer, so the language comes from its
-  extension and the options from the `.sparklesfmt.toml` nearest to it, and a path
-  matched by the working directory's `.sparklesfmtignore` comes back unchanged. A syntax
-  error exits with status 2 and a `path:LINE:COL: error: …` line on stderr, and prints
-  nothing, so the buffer is left as it is.
+  The path is never opened. It only names the buffer: the language comes from its
+  extension, the options from the `.sparklesfmt.toml` nearest to it, and a path matched
+  by the working directory's `.sparklesfmtignore` comes back unchanged. On a syntax error
+  it prints nothing on stdout, writes a `path:LINE:COL: error: …` line to stderr and exits
+  with status 2, so the buffer is left as it is.
 - **As a language server.** `sparkles lsp` speaks the Language Server Protocol over
   stdin and stdout. It formats documents (`textDocument/formatting`, and
   `textDocument/rangeFormatting`, which formats the whole document) and publishes syntax
@@ -32,12 +32,12 @@ offers:
   - a syntax error (`syntax`) is an error at its position;
   - output the formatter refuses (`unsafe-format`, `unstable-format`: its safety checks
     failed, please report it) and a broken config file (`config`) are warnings;
-  - the formatter's warnings about a document it formats are shown at their own
-    position: `comment-moved` (a comment that sat where no element starts or ends,
-    printed before the enclosing element) as a warning, `undeclared-prefix` (a prefix
-    used but not declared in the document) as information, and any other kind as
-    information, at the start of the document when it has no position (such as
-    `option-not-implemented`, for a config key this build does not act on yet).
+  - the formatter's warnings about the document appear at their own position:
+    `comment-moved` (a comment that sat where no element starts or ends, printed before
+    the enclosing element) as a warning, and `undeclared-prefix` (a prefix used but not
+    declared in the document) and any other kind as information. A warning without a
+    position, such as `option-not-implemented` for a config key this build does not act
+    on yet, appears at the start of the document.
 
   Diagnostics are cleared when the problem is fixed and when the document is closed. A
   document with a syntax error is not formatted; formatting it returns no edit rather

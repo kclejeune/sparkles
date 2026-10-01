@@ -8,7 +8,7 @@
 
 **License:** Natural Earth is in the public domain
 (<https://www.naturalearthdata.com/about/terms-of-use/>). No permission or credit is
-needed; the map credits "Natural Earth" in its attribution all the same.
+needed, but the map still credits "Natural Earth" in its attribution.
 
 `scripts/basemap.mjs` writes the file from the three GeoJSON files: it keeps only the
 geometries (each feature's `k` is `land`, `coast` or `border`), rounds coordinates to

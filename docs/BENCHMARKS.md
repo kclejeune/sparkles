@@ -1,15 +1,32 @@
 # Benchmarks
 
-This document records how Sparkles compares with **Apache Jena (TDB2 + Fuseki)**,
-**QLever**, **Fluree** and **Oxigraph** as of 2026-09-30, and where it still loses. The Sparkles column
-was re-measured after the executor and allocator changes of that night (same machine,
-data and harness; the other engines' numbers are from the earlier run the same day).
-Oxigraph was added later that day, measured on its own with the same harness, machine
-and data.
-Reproduce it with
-`mise run bench [people] [workdir]` (or `scripts/bench.sh`). Add `--engines fluree` to
-re-measure one engine and merge its results into an existing run, or `--answers-only` to
-re-check every engine's answers without timing anything.
+This document records how Sparkles compares with Apache Jena (TDB2 + Fuseki), QLever,
+Fluree and Oxigraph as of 2026-09-30, and where it still loses. The Sparkles column was
+re-measured after the executor and allocator changes of that night (same machine, data
+and harness; the other engines' numbers are from the earlier run the same day). Oxigraph
+was added later that day, measured on its own with the same harness, machine and data.
+
+Reproduce the runs with `mise run bench [people] [workdir]` (or `scripts/bench.sh`). Add
+`--engines fluree` to re-measure one engine and merge its results into an existing run,
+or `--answers-only` to re-check every engine's answers without timing anything.
+
+## Summary
+
+| | 1.05M triples | 10.5M triples |
+|---|---|---|
+| Bulk load | **0.6 s** (Oxigraph 1.0, Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.7 s** (Oxigraph 9.0, QLever 9.1, Fluree 10.2, TDB2 42.6) |
+| Fastest of the five | 17 of 20 queries | 17 of 20 queries |
+| Loses to QLever | none | `minus` ≈ |
+| Loses to Fluree | `distinct-obj` 1.3×; `count-all`, `two-hop-count` ≈ | `distinct-obj` 2.2×, `contains` 1.7× |
+| vs. Fuseki | 2.0–25× faster; Fuseki errors on `foaf:knows*` | 1.8–580× faster |
+| vs. Oxigraph | 1.4–46× faster | 1.5–465× faster |
+| Update latency (1 triple, real insert) | 7.3 ms (**Fluree 6.5**, Oxigraph 11.2, QLever 11.8, Fuseki 41.7) | **5.4 ms** (Fluree 6.8, Oxigraph 10.7, QLever 15.8, Fuseki 38.6) |
+| Throughput, 16 clients | **912 q/s** (Fluree 497, QLever 408, Fuseki 53, Oxigraph 25) | **193 q/s** (QLever 57, Fluree 51, Fuseki 7, Oxigraph 2) |
+| Server memory | 440 MiB (**QLever 225**, Oxigraph 890, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 921 MiB (**QLever 362 MiB**, Oxigraph 2.3 GiB, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
+
+At 1.05M most queries take 5–30 ms and run-to-run noise is of the same order, so wins and
+losses within a few ms are ties. The details, and what the numbers do not cover, are
+under [Where Sparkles loses](#where-sparkles-loses).
 
 ## Setup
 
@@ -43,7 +60,7 @@ re-check every engine's answers without timing anything.
   * Queries: SPARQL protocol POST, TSV results, 2 warm-ups + 10 runs at 1M, 1 + 5 at 10M.
   * Times are mean ± σ in ms and include a few ms of `curl` process overhead.
   * Loads: 1 run each.
-  * **Answers are checked before timing.** Every engine's answer to every query is
+  * Answers are checked before timing. Every engine's answer to every query is
     fetched as SPARQL JSON and fingerprinted (`scripts/bench-answers.py`):
     * the row count;
     * the solution multiset by RDF term identity;
@@ -54,7 +71,7 @@ re-check every engine's answers without timing anything.
     An engine whose answer differs *in value* from the majority would be marked † and
     not ranked. None did in these runs. A ‡ marks equal values returned as different RDF
     terms. `export-500k` (LIMIT without ORDER BY) is checked by row count only.
-  * **Update latency:** a single-triple `INSERT DATA` into a named graph. An untimed
+  * Update latency: a single-triple `INSERT DATA` into a named graph. An untimed
     `DELETE DATA` runs before every timed request, so each one performs a real
     insertion, and an ASK before and after checks that the change is visible. Each
     engine uses its default durability:
@@ -64,8 +81,8 @@ re-check every engine's answers without timing anything.
     * Fluree uses its default commit path;
     * Oxigraph commits a RocksDB transaction with RocksDB's default write options (the
       WAL is written but not fsynced).
-  * **Throughput:** 160 `star-join` requests from 16 parallel clients.
-  * **Memory:** server RSS after the run.
+  * Throughput: 160 `star-join` requests from 16 parallel clients.
+  * Memory: server RSS after the run.
 * **Machine:** Intel Core Ultra X7 358H (16 threads), 30 GB RAM, NVMe, Linux 6.18. The
   OS page cache is warm, so these are not cold-start numbers.
 
@@ -148,7 +165,7 @@ others print fewer or more.
    was not re-run.
 
 Sparkles' RSS after the 10.5M run was 1608 MiB before those changes, mostly heap
-retained by glibc rather than live data. The server now links mimalloc, and returns
+retained by glibc rather than live data. The server now links mimalloc and returns
 free heap memory to the OS once it has been idle for a second (`--idle-release-ms`,
 default 1000). Scans also reserve their output from the exact index count instead of
 growing it. At 1.05M, RSS after the run grew from 229 to 364 MiB: mimalloc keeps more
@@ -164,8 +181,9 @@ once, then 3 × 160 concurrent `star-join` requests, and reads RSS 2 s after eac
 | glibc, reservation + idle release (`malloc_trim`) | 644 MiB | 838 MiB | 1439 MiB |
 | **mimalloc, reservation + idle release (default build)** | 765 MiB | 920 MiB | 1682 MiB |
 
-About 500 MiB of each figure is the decoded-block cache. The allocator comparison also
-changed latency. Sparkles-only 10.5M runs of the default build against the glibc build:
+About 500 MiB of each figure is the decoded-block cache. The allocator also changed
+latency. Sparkles-only 10.5M runs of the default build against the glibc build:
+
 * throughput 190 vs 144 q/s;
 * `star-join` 38 vs 72 ms, `optional-count` 33 vs 55 ms, `minus` 27 vs 42 ms,
   `two-hop-count` 65 vs 96 ms;
@@ -184,6 +202,7 @@ Peak RSS during the Sparkles bulk load: 1.9 GB.
 ## Where Sparkles loses
 
 Sparkles is the fastest of the five on 17 of 20 queries at both sizes. Head to head:
+
 * **vs. QLever:** it wins all 20 at 1.05M (median 2.9×) and 19 of 20 at 10.5M (median
   3.1×); `minus` at 10.5M is a tie (22.3 vs 22.0 ms).
 * **vs. Fluree:** it wins 17 of 20 at 1.05M and 18 of 20 at 10.5M (median 5.0×).
@@ -269,11 +288,12 @@ its server used 890 MiB and 2.3 GiB after the runs. Its update latency (11.2 and
   B+trees in place. Sparkles keeps updates in an in-memory delta: large batches trigger
   a full rebuild, and many small commits grow the delta until `compact`. Sustained
   mixed read/write workloads have not been measured.
-* **Text search against other engines, spatial queries, inference-time reasoning.**
+* **Text search and spatial queries against other engines, inference-time reasoning.**
   Sparkles' full-text index is measured on its own below; it was not compared with
-  Jena's `jena-text` or QLever's text joins. Sparkles has no spatial queries or
-  inference-time reasoning, so GeoSPARQL and backward-chaining workloads were not
-  benchmarked.
+  Jena's `jena-text` or QLever's text joins. GeoSPARQL workloads were not compared with
+  other engines either (the spatial index's commit cost and the GeoSPARQL Compliance
+  Benchmark are below). Sparkles has no inference-time reasoning, so backward-chaining
+  workloads were not benchmarked.
 * **Result-cache benefit.** All runs had caches off. With the cache on, repeated
   queries are mostly served from memory, which is not a fair comparison.
 
@@ -304,8 +324,8 @@ Sparkles alone, release build, 2026-09-30. HTTP times are `hyperfine` means over
 | | zstd-1 | 2,909,611 | 15.6 | 0.141 | 0.190 |
 
 zstd streams the export as fast as identity at a 13–14× smaller size; gzip doubles the
-wall time and triples the server CPU. zstd-1 came out slightly smaller
-than zstd-3 on both responses.
+wall time and triples the server CPU. zstd-1 came out slightly smaller than zstd-3 on
+both responses.
 
 `/$/backup` (N-Quads dump to a file, median of 3; the CLI `sparkles backup --threads 16`
 with zstd-3 takes the same 8.2 s, so the server's 4 threads are not the limit):
@@ -350,7 +370,7 @@ Single requests timed with `curl` (`time_total`), medians:
 The first read of a commit replays 100,000 WAL commits into a snapshot (0.55–0.65 s for
 other cold commits as well); later reads of it reuse the cached snapshot. After a server
 restart, the first read at the base of the sealed generation takes 89–93 ms (it opens
-that generation's files), and at base + 100,000 605 ms again.
+that generation's files), and the first at base + 100,000 takes 605 ms again.
 
 ### Backup repositories (10.5M triples)
 
@@ -375,9 +395,9 @@ Sparkles alone, one configuration at a time, same machine and harness
 (`scripts/bench.sh` with `ENGINES=sparkles SKIP_LOAD=1`, plus `hyperfine` and `oha`).
 Update times are end to end over HTTP (`curl`).
 
-The full-text index is committed lazily: a write stages its documents, and the next text
-query that needs them, a tick about once a second, or a batch of about 16,000 staged
-changes commits them. Measured against the build before that change, alternately, in one
+The full-text index is committed lazily: a write stages its documents, and they are
+committed by the next text query that needs them, by a tick about once a second, or once
+about 16,000 changes are staged. Measured against the build before that change, alternately, in one
 session:
 
 | | Text search off | Text search on, commit per write | Text search on, lazy commit |
