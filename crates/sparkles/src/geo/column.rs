@@ -76,8 +76,10 @@ pub(crate) enum Skip {
     Malformed,
     /// a CRS this build cannot place on the globe (the IRI, for the status)
     UnknownCrs(Arc<str>),
-    /// longer than `maxGeometryBytes` or with more than `maxVertices` vertices
+    /// longer than `maxGeometryBytes` (functions still evaluate it)
     TooLarge,
+    /// more than `maxVertices` vertices (functions refuse it too)
+    TooComplex,
     /// an empty geometry
     Empty,
 }
@@ -91,6 +93,24 @@ pub(crate) enum Slot {
     Other,
 }
 
+impl Slot {
+    /// A skipped literal that a `geof:` function could still find in a relation or
+    /// within a distance of a constant: one too long to index, or one in a built-in CRS
+    /// whose envelope has no place in longitude and latitude. Searches hand its rows
+    /// out as candidates whatever the window, so that a pushed filter answers as the
+    /// plain one does. The other skipped literals never pass such a test: a malformed
+    /// literal or one with too many vertices is a type error for the functions too, an
+    /// empty geometry intersects nothing and has no distance, and an unknown CRS has no
+    /// common CRS with a constant the index can place.
+    pub fn rechecked(&self) -> bool {
+        match self {
+            Slot::Skipped(Skip::TooLarge) => true,
+            Slot::Skipped(Skip::UnknownCrs(iri)) => super::crs::lookup(iri).is_some(),
+            _ => false,
+        }
+    }
+}
+
 /// The IRI of a CRS, for the status.
 fn crs_iri(c: &CrsRef) -> Arc<str> {
     match c {
@@ -101,6 +121,20 @@ fn crs_iri(c: &CrsRef) -> Arc<str> {
 
 /// Classify the literal with vocabulary key `key` under the limits of `cfg`.
 pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
+    classify_with(key, cfg, false)
+}
+
+/// The geometry of a [`Slot::rechecked`] literal, parsed as functions parse it (no
+/// length limit); an envelope off the globe becomes the whole world, so every window
+/// meets it.
+pub(crate) fn recheck(key: &[u8], cfg: &GeoConfig) -> Option<Arc<ColumnEntry>> {
+    match classify_with(key, cfg, true) {
+        Slot::Geom(e) => Some(e),
+        _ => None,
+    }
+}
+
+fn classify_with(key: &[u8], cfg: &GeoConfig, recheck: bool) -> Slot {
     if key.first() != Some(&b'"') {
         return Slot::Other;
     }
@@ -119,7 +153,7 @@ pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
         return Slot::Other;
     };
     let lex = &key[1..sep];
-    if lex.len() > cfg.max_geometry_bytes {
+    if lex.len() > cfg.max_geometry_bytes && !recheck {
         return Slot::Skipped(Skip::TooLarge);
     }
     let Ok(lex) = std::str::from_utf8(lex) else {
@@ -132,7 +166,7 @@ pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
         _ => return Slot::Skipped(Skip::Malformed),
     };
     if g.vertices > cfg.max_vertices {
-        return Slot::Skipped(Skip::TooLarge);
+        return Slot::Skipped(Skip::TooComplex);
     }
     if g.empty {
         return Slot::Skipped(Skip::Empty);
@@ -144,6 +178,10 @@ pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
         Some(b) if b.iter().all(|x| x.is_finite()) => {
             Slot::Geom(Arc::new(ColumnEntry::new(Arc::new(g), b)))
         }
+        _ if recheck => Slot::Geom(Arc::new(ColumnEntry::new(
+            Arc::new(g),
+            [-180.0, -90.0, 180.0, 90.0],
+        ))),
         _ => Slot::Skipped(Skip::UnknownCrs(crs_iri(&g.crs))),
     }
 }
@@ -170,7 +208,7 @@ impl Counts {
                 self.crs_seen(&e.geom.crs);
             }
             Slot::Skipped(Skip::Malformed) => self.malformed += 1,
-            Slot::Skipped(Skip::TooLarge) => self.too_large += 1,
+            Slot::Skipped(Skip::TooLarge | Skip::TooComplex) => self.too_large += 1,
             Slot::Skipped(Skip::Empty) => self.empty += 1,
             Slot::Skipped(Skip::UnknownCrs(iri)) => {
                 self.unknown_crs += 1;
@@ -377,18 +415,24 @@ mod tests {
             max_geometry_bytes: 4,
             ..GeoConfig::default()
         };
-        assert!(matches!(
-            classify(&key("POINT(1 2)", WKT_LITERAL), &small),
-            Slot::Skipped(Skip::TooLarge)
-        ));
+        let s = classify(&key("POINT(1 2)", WKT_LITERAL), &small);
+        assert!(matches!(s, Slot::Skipped(Skip::TooLarge)));
+        // still a candidate of searches, parsed without the length limit
+        assert!(s.rechecked());
+        let e = recheck(&key("POINT(1 2)", WKT_LITERAL), &small).unwrap();
+        assert_eq!(e.bbox84(), [1.0, 2.0, 1.0, 2.0]);
         let few = GeoConfig {
             max_vertices: 3,
             ..GeoConfig::default()
         };
-        assert!(matches!(
-            classify(&key("POLYGON((0 0, 1 0, 1 1, 0 0))", WKT_LITERAL), &few),
-            Slot::Skipped(Skip::TooLarge)
-        ));
+        let s = classify(&key("POLYGON((0 0, 1 0, 1 1, 0 0))", WKT_LITERAL), &few);
+        assert!(matches!(s, Slot::Skipped(Skip::TooComplex)));
+        assert!(!s.rechecked());
+        assert!(recheck(&key("POLYGON((0 0, 1 0, 1 1, 0 0))", WKT_LITERAL), &few).is_none());
+        // the other reasons are no candidates
+        for lex in ["POINT(1)", "", "<http://example.org/mars> POINT(1 1)"] {
+            assert!(!classify(&key(lex, WKT_LITERAL), &cfg).rechecked(), "{lex}");
+        }
     }
 
     #[test]
