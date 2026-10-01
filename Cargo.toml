@@ -66,6 +66,13 @@ ignore = "0.4"
 similar = "2"
 proptest = "1"
 toml = "1"
+# GeoSPARQL (feature `geo` of crates/sparkles); the `geo` crate is renamed so it does not
+# clash with the `sparkles::geo` module
+georust = { package = "geo", version = "0.33", default-features = false }
+wkt = "0.14"
+geojson = "1"
+geo-index = { version = "0.4", default-features = false }
+geographiclib-rs = "0.2"
 
 [profile.release]
 lto = "thin"

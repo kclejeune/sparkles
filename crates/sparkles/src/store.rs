@@ -11,6 +11,7 @@
 //!   `CURRENT` (TDB2 `Data-NNNN` compaction).
 
 mod backup;
+mod geo;
 pub use backup::{BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
@@ -51,6 +52,8 @@ pub struct Generation {
     _tmp: Option<tempfile::TempDir>,
     /// packed vectors of the base index, built on first search
     pub vectors: crate::vector::GenerationVectors,
+    /// the spatial index's geometry column and base tree for this generation
+    pub geo: crate::geo::GenerationGeo,
 }
 
 impl Generation {
@@ -66,6 +69,7 @@ impl Generation {
             dvocab,
             _tmp: None,
             vectors: Default::default(),
+            geo: Default::default(),
         }
     }
 
@@ -114,6 +118,7 @@ impl Generation {
             dvocab,
             _tmp: None,
             vectors: Default::default(),
+            geo: Default::default(),
         })
     }
 
@@ -167,6 +172,8 @@ pub struct Snapshot {
     pub commit: u64,
     /// full-text search state at this commit (datasets with full-text search)
     pub text: Option<Arc<crate::text::TextView>>,
+    /// the spatial index as of this commit (datasets with a spatial index)
+    pub geo: Option<Arc<crate::geo::GeoView>>,
     pub union_default_graph: bool,
     /// per-predicate statistics of the delta (computed lazily, once per snapshot)
     pub delta_stats:
@@ -607,6 +614,12 @@ pub struct StoreOptions {
     /// Prefixes per dataset (0: unlimited): [`Store::set_prefix`] refuses a new one
     /// past it, and the prefixes of loaded data stop being added.
     pub max_prefixes: usize,
+    /// Memory for the spatial index (geometry column and trees); a build that would
+    /// exceed it is refused and queries run without the index.
+    pub geo_budget_bytes: u64,
+    /// Largest sum of input vertices of one geometry operation (overlay, buffer, hull,
+    /// relate); larger ones are a type error.
+    pub geo_op_vertices: u64,
 }
 
 /// Default of [`StoreOptions::max_prefixes`].
@@ -633,6 +646,8 @@ impl Default for StoreOptions {
             min_free_disk_bytes: None,
             max_memory_bytes: None,
             max_prefixes: DEFAULT_MAX_PREFIXES,
+            geo_budget_bytes: 4 << 30,
+            geo_op_vertices: 2_000_000,
         }
     }
 }
@@ -677,6 +692,8 @@ pub struct Store {
     clock: Arc<Mutex<Option<Clock>>>,
     /// full-text index, when enabled for this dataset
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
+    /// spatial index, when enabled for this dataset
+    geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// write guard checked before every commit (write-time validation)
@@ -745,7 +762,7 @@ impl Store {
             exact: true,
             reconstructed: false,
         };
-        Store {
+        let store = Store {
             root: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 generation: gen_,
@@ -756,6 +773,7 @@ impl Store {
                 dvocab_len: 0,
                 commit: 0,
                 text: None,
+                geo: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
                 historical: false,
@@ -775,6 +793,7 @@ impl Store {
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
+            geo: Default::default(),
             history: None,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -782,7 +801,9 @@ impl Store {
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
-        }
+        };
+        store.open_geo();
+        store
     }
 
     /// Open (or create) a persistent store rooted at `root`.
@@ -958,6 +979,7 @@ impl Store {
                 dvocab_len,
                 commit: head.seq,
                 text: None,
+                geo: None,
                 union_default_graph: opts.union_default_graph,
                 delta_stats: Default::default(),
                 historical: false,
@@ -977,6 +999,7 @@ impl Store {
             catalog: Arc::new(Mutex::new(catalog)),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
+            geo: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -987,6 +1010,7 @@ impl Store {
         };
         store.collect_history(gen_no, head.seq);
         store.open_text(&wal_text)?;
+        store.open_geo();
         Ok(store)
     }
 
@@ -1244,6 +1268,7 @@ impl Store {
             dvocab_len,
             commit: seq,
             text: None,
+            geo: self.historical_geo(),
             union_default_graph: self.opts.union_default_graph,
             delta_stats: Default::default(),
             historical: true,
@@ -2312,6 +2337,7 @@ impl Store {
                         dvocab_len: gen_.dvocab.len(),
                         commit: w.head.seq,
                         text: None,
+                        geo: None,
                         union_default_graph: self.opts.union_default_graph,
                         delta_stats: Default::default(),
                         historical: false,
@@ -2389,6 +2415,7 @@ impl Store {
             } else {
                 snap.text.clone()
             },
+            geo: None,
             union_default_graph: self.opts.union_default_graph,
             delta_stats: Default::default(),
             historical: false,
@@ -2396,6 +2423,8 @@ impl Store {
         if bulk.is_some() {
             self.rebuild_text_locked(&mut new_snap, snap.text.clone());
         }
+        // a new generation needs its own spatial base (bulk commits and compactions)
+        self.rebuild_geo_locked(&mut new_snap, snap);
         self.current.store(Arc::new(new_snap));
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
@@ -2583,6 +2612,20 @@ impl Store {
         };
         if let Some(cfg) = text_cfg {
             write_atomic(&dir.join("text.json"), &cfg)?;
+        }
+        // so does the spatial index
+        let geo_cfg = match &self.root {
+            Some(root) => match std::fs::read(root.join(crate::geo::CONFIG_FILE)) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            },
+            None => self
+                .geo_status()
+                .map(|s| serde_json::to_vec_pretty(&s.config).unwrap()),
+        };
+        if let Some(cfg) = geo_cfg {
+            write_atomic(&dir.join(crate::geo::CONFIG_FILE), &cfg)?;
         }
         // write-time validation stays configured; the clone judges its first write in full
         if let Some(root) = &self.root {
@@ -2865,6 +2908,8 @@ impl WriteTxn<'_> {
             dvocab_len: self.base.generation.dvocab.len(),
             commit: self.base.commit,
             text: self.base.text.clone(),
+            // the index does not cover this transaction's changes: plans without it
+            geo: self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
             historical: false,
@@ -3208,11 +3253,13 @@ impl WriteTxn<'_> {
             dvocab_len: gen_.dvocab.len(),
             commit: c.seq,
             text: self.base.text.clone(),
+            geo: self.base.geo.clone(),
             union_default_graph: self.base.union_default_graph,
             delta_stats: Default::default(),
             historical: false,
         };
         self.store.maintain_text(&mut snap, &self.log);
+        self.store.maintain_geo(&mut snap, &self.log);
         self.store.current.store(Arc::new(snap));
         if validation.is_some() {
             self.store.guard_committed(c.seq);
@@ -3551,6 +3598,7 @@ pub(crate) fn replay_wal(
         dvocab_len: u64::MAX,
         commit: 0,
         text: None,
+        geo: None,
         union_default_graph: false,
         delta_stats: Default::default(),
         historical: false,

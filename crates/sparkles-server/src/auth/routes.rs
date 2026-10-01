@@ -58,6 +58,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/cache/clear/{ds}", &["POST"]),
     ("/$/text/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/text/{ds}/rebuild", &["POST"]),
+    ("/$/geo/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/geo/{ds}/rebuild", &["POST"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
@@ -182,6 +184,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/shacl" => Dataset(Read),
         "/$/reason/{ds}"
         | "/$/text/{ds}"
+        | "/$/geo/{ds}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
@@ -196,6 +199,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
+        | "/$/geo/{ds}"
+        | "/$/geo/{ds}/rebuild"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
         | "/$/backup/{ds}"
@@ -944,6 +949,22 @@ mod tests {
         assert_eq!(n(Method::DELETE, "/$/tasks/{id}"), Some(Need::Caller));
         // formatting reads no dataset
         assert_eq!(n(Method::POST, "/$/format"), Some(Need::Caller));
+    }
+
+    #[test]
+    fn geo_route_needs() {
+        let n = |m: Method, route: &str| need(route, &m, &"/x".parse().unwrap(), &h(&[]));
+        let read = Some(Need::Dataset(Level::Read));
+        let adm = Some(Need::Dataset(Level::Admin));
+        assert_eq!(n(Method::GET, "/$/geo/{ds}"), read);
+        assert_eq!(n(Method::PUT, "/$/geo/{ds}"), adm);
+        assert_eq!(n(Method::DELETE, "/$/geo/{ds}"), adm);
+        assert_eq!(n(Method::POST, "/$/geo/{ds}/rebuild"), adm);
+        let uri: Uri = "/$/geo/places/rebuild".parse().unwrap();
+        assert_eq!(
+            ds_of("/$/geo/{ds}/rebuild", &uri).as_deref(),
+            Some("places")
+        );
     }
 
     #[test]

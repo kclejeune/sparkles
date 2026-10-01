@@ -13,6 +13,7 @@ mod compress;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
+mod geo;
 mod http;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -382,6 +383,17 @@ enum Cmd {
         /// Enable full-text search for a dataset: NAME, or NAME=CONFIG.json
         #[arg(long)]
         text: Vec<String>,
+        /// Enable the spatial index (GeoSPARQL) for a dataset: NAME, or NAME=geo.json
+        #[arg(long)]
+        geo: Vec<String>,
+        /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
+        /// is refused and queries run without the index
+        #[arg(long, default_value_t = 4096)]
+        geo_mb: u64,
+        /// Largest sum of input vertices of one geometry operation (overlay, buffer,
+        /// hull, relate); larger ones are a type error
+        #[arg(long, default_value_t = 2_000_000)]
+        geo_op_vertices: u64,
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
@@ -584,6 +596,34 @@ enum Cmd {
         #[arg(long)]
         status: bool,
         /// turn full-text search off and delete the index
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
+    GeoIndex {
+        #[arg(long)]
+        loc: PathBuf,
+        /// index the geometry literals of these predicates (default: geo:asWKT,
+        /// geo:asGeoJSON, geo:hasSerialization)
+        #[arg(long)]
+        predicate: Vec<String>,
+        /// feature → geometry links of the spatial: functions (default:
+        /// geo:hasDefaultGeometry, geo:hasGeometry)
+        #[arg(long)]
+        feature_link: Vec<String>,
+        /// do not index these graphs (IRIs; urn:x-arq:DefaultGraph for the default graph)
+        #[arg(long)]
+        exclude_graph: Vec<String>,
+        /// distances on geographic coordinates: geodesic (default) or haversine
+        #[arg(long)]
+        distance: Option<String>,
+        /// rebuild even if the index is current
+        #[arg(long, conflicts_with_all = ["status", "disable"])]
+        rebuild: bool,
+        /// print the status as JSON and change nothing
+        #[arg(long, conflicts_with = "disable")]
+        status: bool,
+        /// turn the spatial index off
         #[arg(long)]
         disable: bool,
     },
@@ -1255,6 +1295,9 @@ fn run() -> Result<()> {
             load_dir,
             idle_release_ms,
             text,
+            geo,
+            geo_mb,
+            geo_op_vertices,
             schema_max_entries,
             no_access_log,
             no_metrics,
@@ -1325,6 +1368,8 @@ fn run() -> Result<()> {
             let mut opts = opts;
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
+            opts.geo_budget_bytes = geo_mb << 20;
+            opts.geo_op_vertices = geo_op_vertices;
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.cors_origins = cors_origin;
@@ -1464,6 +1509,9 @@ fn run() -> Result<()> {
             }
             for t in text {
                 enable_text_for(&st, &t)?;
+            }
+            for g in geo {
+                geo::enable_for(&st, &g)?;
             }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1746,6 +1794,28 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
+        Cmd::GeoIndex {
+            loc,
+            predicate,
+            feature_link,
+            exclude_graph,
+            distance,
+            rebuild,
+            status,
+            disable,
+        } => geo::geo_index(
+            &loc,
+            opts,
+            geo::IndexArgs {
+                predicate,
+                feature_link,
+                exclude_graph,
+                distance,
+                rebuild,
+                status,
+                disable,
+            },
+        ),
         Cmd::TextIndex {
             loc,
             predicate,

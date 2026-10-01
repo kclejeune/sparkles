@@ -242,6 +242,14 @@ fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     write_node(n, ctx, &mut s).then_some(s)
 }
 
+/// The spatial index's epoch and configuration hash as the snapshot sees them.
+fn geo_view_key(ctx: &Ctx) -> (u64, u64) {
+    ctx.snap
+        .geo
+        .as_ref()
+        .map_or((0, 0), |v| (v.epoch, v.config.hash()))
+}
+
 fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
     let names = |vs: &[VarId]| {
         vs.iter()
@@ -284,6 +292,26 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
                 t.scan.prefix, t.scan.graph, t.scan.eqs, t.pieces
             );
             t.filter.iter().chain(&t.range_filter).all(deterministic)
+        }
+        Kind::SpatialScan(sp) => {
+            // the constant geometries, tests and windows, and the index's epoch and
+            // configuration (a rebuild or reconfiguration changes the candidates' source)
+            let (epoch, config) = geo_view_key(ctx);
+            let _ = write!(
+                s,
+                "{:?}{:?}{:?}k{:x}e{epoch}h{config:x}",
+                sp.scan.prefix, sp.scan.graph, sp.scan.eqs, sp.key
+            );
+            sp.filter.iter().all(deterministic)
+        }
+        Kind::SpatialPf(sp) => {
+            let (epoch, config) = geo_view_key(ctx);
+            let _ = write!(
+                s,
+                "{:?}{:?}{:?}k{:x}e{epoch}h{config:x}",
+                sp.graph, sp.graph_var, sp.subject, sp.key
+            );
+            true
         }
         Kind::TextSearch(t) => {
             // the view's epoch changes with every rebuild of the index
