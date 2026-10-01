@@ -638,3 +638,102 @@ proptest! {
         }
     }
 }
+
+/// A ShExR schema is copied as ShExJ, with the Turtle's prefixes kept for the shape map,
+/// and the copy reinstalls.
+#[test]
+fn shexr_schemas_are_copied_as_shexj() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = loaded(&root);
+    upd(
+        &s,
+        "DELETE DATA { ex:carol foaf:age 200 } ; INSERT DATA { ex:carol foaf:name \"Carol\" }",
+    )
+    .unwrap();
+    let turtle = crate::Schema::parse_shexc(SCHEMA, None)
+        .unwrap()
+        .to_shexr_turtle();
+    assert!(turtle.contains("PREFIX ex: <http://ex.org/>"), "{turtle}");
+    let c = config(serde_json::json!({"language": "shex", "mode": "reject",
+        "schema": {"inline": turtle, "format": "shexr"}, "shapeMap": MAP}))
+    .unwrap();
+    // the map's ex: is the Turtle's
+    let (g, sum) = installed(set_config(&s, Some(c), &NoImports).unwrap());
+    assert!(sum.conforms && sum.total == 3, "{:?}", sum.results);
+    assert!(!exists(&root, SHEX_SCHEMA_SHEXC_FILE) && exists(&root, SHEX_SCHEMA_SHEXJ_FILE));
+    let j = stored_config(&root);
+    assert_eq!(j["schema"]["format"], "shexj");
+    assert_eq!(j["schema"]["prefixes"]["ex"], "http://ex.org/");
+    assert_eq!(
+        j["schema"]["prefixes"]["foaf"],
+        "http://xmlns.com/foaf/0.1/"
+    );
+    assert_eq!(j["schema"]["sha256"], sha256_hex(turtle.as_bytes()));
+    assert_eq!(g.status().shape_count, 2);
+    // the copy is the schema
+    let copy = std::fs::read_to_string(root.join(SHEX_SCHEMA_SHEXJ_FILE)).unwrap();
+    let from_c = crate::Schema::parse_shexc(SCHEMA, None).unwrap();
+    assert_eq!(
+        crate::Schema::from_shexj(&copy).unwrap().to_shexj(),
+        from_c.to_shexj()
+    );
+    drop(s);
+
+    let s = open(&root);
+    install(&s).unwrap().unwrap();
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:dave a ex:Person }"),
+        Err(Error::Rejected(_))
+    ));
+    upd(
+        &s,
+        "INSERT DATA { ex:dave a ex:Person ; foaf:name \"Dave\" }",
+    )
+    .unwrap();
+    // a ShExR text that is not a schema is refused, and nothing changes
+    let c = config(serde_json::json!({"language": "shex", "mode": "reject",
+        "schema": {"inline": "<http://ex.org/a> <http://ex.org/b> 1 .", "format": "shexr"},
+        "shapeMap": MAP}))
+    .unwrap();
+    let e = set_config(&s, Some(c), &NoImports).err().unwrap();
+    assert!(format!("{e:#}").contains("sx:Schema"), "{e:#}");
+    assert_eq!(stored_config(&root)["schema"]["format"], "shexj");
+}
+
+/// SPARQL selectors, which every validated write would run, are refused when the
+/// configuration is set (compact or JSON maps, whatever the query), and nothing is
+/// installed or written.
+#[test]
+fn sparql_selectors_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = loaded(&root);
+    let selector = "SPARQL '''SELECT ?focus { ?focus a <http://ex.org/Person> }'''";
+    for map in [
+        serde_json::json!(format!("{selector}@ex:Person")),
+        serde_json::json!(format!("ex:alice@ex:Person, {selector}@ex:Person")),
+        serde_json::json!([{"node": selector, "shape": "http://ex.org/Person"}]),
+    ] {
+        let c = config(serde_json::json!({"language": "shex", "mode": "warn",
+            "schema": {"inline": SCHEMA, "format": "shexc"}, "shapeMap": map}))
+        .unwrap();
+        let e = set_config(&s, Some(c), &NoImports).err().unwrap();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("SPARQL node selectors are not allowed in write-time validation"),
+            "{map}: {e}"
+        );
+    }
+    // a selector that is not a SELECT query is a syntax error of the map
+    let e = set_config(
+        &s,
+        Some(cfg("warn", SCHEMA, "SPARQL 'ASK {}'@ex:Person")),
+        &NoImports,
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{e:#}").starts_with("shapeMap: line 1"), "{e:#}");
+    assert!(s.guard().is_none() && !s.guard_required());
+    assert!(!exists(&root, CONFIG_FILE));
+}

@@ -1,0 +1,5 @@
+# RDF 1.2 triple terms
+
+<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> "c"@en )>> <http://example.org/g> .
+_:r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( _:x <http://example.org/b> <<( _:y <http://example.org/c> "d" )>> )>> _:g .
+<http://example.org/s> <http://example.org/p> "o" .

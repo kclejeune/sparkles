@@ -1553,9 +1553,20 @@ impl Checker<'_> {
             run.add(Issue::warning(format!("{problem}: rebuilt on open")).file(f.clone()));
         }
         let preds = p.config.as_ref().map_or(0, |c| c.predicates.len());
-        self.checks.push(run.done(format!(
-            "configured for {preds} predicates; built in memory when opened"
-        )));
+        let files = match (p.files.len(), p.damaged.is_empty()) {
+            (0, true) => "no index files yet: built when opened".to_string(),
+            (n, _) => format!(
+                "{n} index files ({} bytes) {}",
+                p.file_bytes,
+                if self.full {
+                    "with their checksums"
+                } else {
+                    "(headers and index sections)"
+                }
+            ),
+        };
+        self.checks
+            .push(run.done(format!("configured for {preds} predicates; {files}")));
     }
 
     // --------------------------------------------------------------- full-text ------

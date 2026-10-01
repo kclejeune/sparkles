@@ -285,8 +285,6 @@ fn walks_and_explicit_paths() {
     let skipped = [
         "w/d.ttl",
         "w/d.trig",
-        "w/d.nt",
-        "w/d.nq",
         "w/x.rdf",
         "w/x.owl",
         "w/d.ttl.gz",
@@ -315,10 +313,6 @@ fn walks_and_explicit_paths() {
         (
             "w/d.trig",
             "w/d.trig: error: trig formatting is not available yet",
-        ),
-        (
-            "w/d.nt",
-            "w/d.nt: error: ntriples formatting is not available yet",
         ),
         (
             "w/x.rdf",
@@ -479,51 +473,49 @@ fn stdin_and_stdin_filepath() {
     expect(dir, &["--stdin-filepath", "x.rq", "a.rq"], None, 2);
 }
 
-/// The `option-not-implemented` warning of `align-values = true` shows which options a
+/// A query whose `VALUES` rows `align-values = true` pads: formatted with the defaults,
+/// it passes `--check` without the key and fails with it, which shows which options a
 /// file got.
-const ALIGN: &str = "warning: align-values is not implemented yet and has no effect";
+const TABLE: &str = "SELECT * WHERE { VALUES (?a ?b) { (1 2) (333 4) } }\n";
 
 #[test]
 fn config_discovery() {
     let d = tempdir();
     let dir = d.path();
-    let pretty = formatted(QUERY);
+    let pretty = formatted(TABLE);
     for f in ["top.rq", "sub/mid.rq", "sub/deep/low.rq", "other/o.rq"] {
         write(dir, f, &pretty);
     }
     write(dir, ".sparklesfmt.toml", "align-values = true\n");
     // the nearest file wins and is not merged with the one above it
     write(dir, "sub/sparklesfmt.toml", "line-width = 80\n");
-    let o = expect(dir, &["--check", "sub/deep/low.rq"], None, 0);
-    assert!(!stderr(&o).contains(ALIGN), "{}", stderr(&o));
-    let o = expect(dir, &["--check", "top.rq", "other/o.rq"], None, 0);
-    // said once for the whole run
-    assert_eq!(stderr(&o).matches(ALIGN).count(), 1, "{}", stderr(&o));
+    expect(dir, &["--check", "sub/deep/low.rq"], None, 0);
+    let o = expect(dir, &["-l", "top.rq", "other/o.rq"], None, 1);
+    let out = stdout(&o);
+    let mut listed: Vec<&str> = out.lines().collect();
+    listed.sort();
+    assert_eq!(listed, ["other/o.rq", "top.rq"]);
     // from a subdirectory, the files above still apply
-    let o = expect(&dir.join("other"), &["--check", "o.rq"], None, 0);
-    assert!(stderr(&o).contains(ALIGN));
+    expect(&dir.join("other"), &["--check", "o.rq"], None, 1);
     // flags override the file
-    let o = expect(dir, &["--check", "--no-align-values", "top.rq"], None, 0);
-    assert!(!stderr(&o).contains(ALIGN));
+    expect(dir, &["--check", "--no-align-values", "top.rq"], None, 0);
     // --config: one file for every input, no discovery
     write(dir, "conf/style.toml", "align-values = true\n");
-    let o = expect(
+    expect(
         dir,
         &["--check", "--config", "conf/style.toml", "sub/mid.rq"],
         None,
-        0,
+        1,
     );
-    assert!(stderr(&o).contains(ALIGN));
     // --no-config: the defaults, even under a broken file
     write(dir, "sub/sparklesfmt.toml", "line-width = 1000\n");
     expect(dir, &["--check", "sub/mid.rq"], None, 2);
-    let o = expect(
+    expect(
         dir,
         &["--check", "--no-config", "sub/mid.rq", "top.rq"],
         None,
         0,
     );
-    assert!(!stderr(&o).contains(ALIGN));
     // a broken file fails the files under it, is reported once, and the others go on
     let o = expect(
         dir,
@@ -533,10 +525,9 @@ fn config_discovery() {
     );
     assert_eq!(
         stderr(&o),
-        format!(
-            "sub/sparklesfmt.toml: error: line-width: expected an integer from 40 to 400, got 1000\n{ALIGN}\n"
-        )
+        "sub/sparklesfmt.toml: error: line-width: expected an integer from 40 to 400, got 1000\n"
     );
+    assert_eq!(stdout(&o), "top.rq\n");
     // the dotfile wins over sparklesfmt.toml in one directory: its indent width applies (the
     // file, formatted with 2 spaces, now needs changes) instead of the broken file's error
     write(dir, "sub/.sparklesfmt.toml", "indent-width = 4\n");

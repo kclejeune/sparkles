@@ -1,0 +1,5 @@
+# header
+
+<http://example.org/a> <http://example.org/p> "a" .
+# sparkles-fmt: ignore
+<http://example.org/z>   <http://example.org/p>   "z" .

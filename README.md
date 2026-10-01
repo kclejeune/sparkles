@@ -38,7 +38,7 @@ interactive querying.
 | `crates/sparkles` | ids, vocabulary, permutation index, bulk builder, store (MVCC + WAL), SPARQL engine, RDF I/O | jena-core, jena-arq, jena-tdb2, jena-db, jena-querybuilder, jena-rdfconnection (in-process) |
 | `crates/sparkles-reasoner` | RDFS / OWL 2 RL / Jena rule syntax, semi-naive forward chaining into `urn:x-sparkles:inferred` | jena-core `reasoner` |
 | `crates/sparkles-shacl` | SHACL Core + SHACL-SPARQL validation over store snapshots | jena-shacl |
-| `crates/sparkles-shex` | ShEx 2.1 validation (ShExC, ShExJ, shape maps) over store snapshots | jena-shex |
+| `crates/sparkles-shex` | ShEx 2.1 validation (ShExC, ShExJ, ShExR, shape maps) over store snapshots | jena-shex |
 | `crates/sparkles-server` | axum HTTP server + `sparkles` CLI | jena-fuseki2, jena-cmds |
 | `crates/sparkles-backup` | backup repositories (file system or S3): incremental, deduplicated backups, restore, lifecycle policies | Fuseki `/$/backup` (N-Quads dumps only) |
 | `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes (`PATCHED.md`) | ARQ's JavaCC grammar |
@@ -64,7 +64,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | N-Quads backups (`/$/backup`) and dumps (zstd by default, or gzip, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
-| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums, the spatial index's `geo.json`; safe next to a running server | ✅ |
+| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums, the spatial index's `geo.json` and index files; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
 ### SPARQL (ARQ equivalent)
@@ -81,7 +81,10 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit (staged, committed by the next search or a 1 s tick), graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | GeoSPARQL 1.1 functions (`geo` cargo feature, on in the server): `geo:wktLiteral` and `geo:geoJSONLiteral` (Z/M layouts, EMPTY, byte offsets in parse errors), built-in CRSs (CRS84, CRS84h, EPSG:4326/4979 with their latitude-first axes, Web Mercator) and OGC/QUDT/EPSG units, the 24 topological relations and `relate` on DE-9IM, `distance` (geodesic on WGS 84 by default, haversine per dataset, Euclidean for projected CRSs), `buffer` (metric buffers through a local projection), `convexHull`, `envelope`, `boundary`, `centroid`, the four overlay operations, `area`/`length`/`perimeter` (geodesic) and the accessors; see [docs/API.md](docs/API.md#geosparql) | ✅ |
-| Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), rebuilt on open and by compaction, within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
+| Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
+| Spatial index files (`gen-NNNN/geo/`, checksummed, read in place): opening a database or re-enabling the same configuration parses no literal; damaged or foreign files are rebuilt; compactions and bulk loads parse only new literals; never in backups or clones | ✅ |
+| W3C Basic Geo (`wgs84_pos:lat`/`long` pairs, `geo.json` `"wgs84": true`) as indexed points for the `spatial:` functions and the map view | ✅ |
+| `GET /{ds}/geo?bbox=…`: the indexed geometries in a box as simplified CRS84 GeoJSON, for map views | ✅ |
 | Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | ✅ |
 | GeoSPARQL `boundingCircle`, `concaveHull`, `isSimple`; the six `geof:agg…` aggregates (GROUP BY, DISTINCT); Jena's 15 `spatialF:` filter functions; the 120 UTM zones (EPSG:326NN/327NN, Krüger's series); `POST /$/geo/convert` (literals as CRS84 GeoJSON for maps); Oxigraph's GeoSPARQL tests (37/44, the rest listed with reasons) and Jena-derived tests; see [docs/API.md](docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
@@ -102,7 +105,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | SHACL Core + SHACL-SPARQL validation (`sparkles-shacl`): W3C suite **98/98** Core, **20/20** SPARQL; parallel, index-backed | ✅ |
 | Write-time SHACL and ShEx validation: every commit's post-state is validated before anything is written (`reject` refuses with `422`, `warn` commits and reports), SHACL shapes from dataset graphs or a file, or a ShEx schema (imports resolved and copied into the database when set) with a query shape map expanded per write, `validation.json` format 2 (format 1 still read), relevance skip (graphs; for ShEx also predicates no shape reads), fail-closed without a guard (`/$/validation/{ds}`, `sparkles validation`, `--no-validate`); `sparkles_validation_*` metrics, `validation` / `validation_ms` access-log fields, the status in CLI summaries and `sparkles stats`; full validation per write (incremental validation is planned) | ✅ |
 | Fuseki `/{ds}/shacl` endpoint (`graph=default\|union\|<iri>`, report as Turtle / N-Triples / JSON-LD / JSON, validates data ∪ inferences) and `sparkles shacl` command | ✅ |
-| ShEx 2.1 validation (`sparkles-shex`; `shex` cargo feature, on by default): ShExC and ShExJ schemas with imports (inline, `--load-dir` files, http(s) through the outbound policy), `EXTERNAL` shapes, annotations and the Test semantic-action extension; compact and JSON shape maps with `{FOCUS p o}` selectors; recursion and negation by stratified greatest-fixed-point typing without deep stacks; parallel, index-backed; shexTest: 100% of the syntax, negative-syntax and negative-structure tests, **99.9%** of the validation tests from ShExC and from ShExJ (the 42 that test blank-node labels are skipped: the store does not keep them). `POST /{ds}/shex` (a Sparkles extension) with JSON, ShapeMap JSON, compact and text reports, and `sparkles shex validate\|parse` (Jena's flag names as aliases); see [docs/API.md](docs/API.md#shex-validation). Not yet: ShExR schemas, ShEx 2.2, SPARQL selectors, a UI | ✅ |
+| ShEx 2.1 validation (`sparkles-shex`; `shex` cargo feature, on by default): ShExC, ShExJ and ShExR (RDF in any syntax Sparkles reads: `text/turtle`, N-Triples, RDF/XML, TriG, N-Quads; `.ttl`, `.nt`, … files) schemas with imports (inline, `--load-dir` files, http(s) through the outbound policy), `EXTERNAL` shapes, annotations and the Test semantic-action extension; compact and JSON shape maps with `{FOCUS p o}` selectors and `SPARQL """SELECT …"""` selectors (run on the data graph with the query's row and memory budgets, no SERVICE); recursion and negation by stratified greatest-fixed-point typing without deep stacks; parallel, index-backed; shexTest: 100% of the syntax, negative-syntax, negative-structure and representation tests, 100% of the ShExR tests (each `.ttl` schema read as ShExJ, each `.shex` written as the `.ttl` graph), **99.9%** of the validation tests from ShExC, ShExJ and ShExR (the 42 that test blank-node labels are skipped, and one more is listed: the store does not keep them). `POST /{ds}/shex` (a Sparkles extension) with JSON, ShapeMap JSON, compact and text reports, and `sparkles shex validate\|parse` (Jena's flag names as aliases; `parse --out shexr` writes Turtle); see [docs/API.md](docs/API.md#shex-validation). Not yet: ShEx 2.2, a UI | ✅ |
 | Query result cache controls: `--result-cache-mb`, `nocache=true`, cache stats in `/$/stats`, `POST /$/cache/clear/{ds}` | ✅ |
 | Schema discovery (`GET /$/schema/{ds}`, `sparkles schema`, `sparkles::schema`): classes and predicates with exact per-graph counts (triples, distinct subjects/objects, object kinds, datatypes, languages, max objects per subject) kept apart from their RDFS/OWL declarations; subClassOf roots and cycles; cursor pagination bound to one snapshot; time and entry budgets that fail instead of truncating | ✅ |
 | MCP server for LLM agents (`sparkles mcp`, stdio; `mcp` cargo feature, on by default): list datasets, describe the schema, run bounded SPARQL (compact table or JSON, truncation announced with the exact total), explain with warnings, describe a resource, list commits, full-text and vector similarity search, SHACL and ShEx validation (counts and the first results, compactly); `atCommit` keeps several calls on one snapshot; engine budgets on every call, SERVICE off, no writes; MCP revisions `2026-07-28`, `2025-11-25` and `2025-06-18` | ✅ |
@@ -167,7 +170,7 @@ feature gaps are:
 |---|---|---|
 | Full-text search | jena-text (Lucene), `text:query` | `text:query` subset over string literals (Tantivy, BM25), updated in the commit path; no highlighting, per-language stemming or entity-style multi-field documents yet |
 | Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions with a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | the GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs, Jena's `spatial:` property functions, and a spatial index per dataset that FILTERs and property functions use; no `spatialF:` functions, query rewrite, geometry-type entailment, GML/KML literals or EPSG database yet (see `docs/AUDIT.md` §5) |
-| Shape languages | ShEx (jena-shex) | SHACL and ShEx 2.1 (ShExC, ShExJ); no ShExR (RDF) schemas or ShEx 2.2 |
+| Shape languages | ShEx (jena-shex) | SHACL and ShEx 2.1 (ShExC, ShExJ, ShExR, SPARQL selectors); no ShEx 2.2 |
 | Inference | on-the-fly `InfModel`, backward / hybrid rules (LP engine), OWL Micro/Mini/Full | forward materialization only (RDFS, OWL 2 RL subset, Jena forward rules); not maintained incrementally: after updates the inferences are reported stale and re-run on request or, opt-in, automatically (a full recomputation); inconsistency detection covers a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency checking |
 | Ontology API | jena-ontapi `OntModel` object API | ✗ none (triples / SPARQL only) |
 | SPARQL extensions | property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, full `afn:`/`fn:` library | ✗ none of the extensions; common `fn:`/`afn:`/`math:` functions only |
@@ -596,7 +599,7 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
-sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph,
+sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 ```
 
@@ -839,7 +842,7 @@ prints the same report as JSON. The exit status is **0** when everything is clea
 | `wal` | records are well formed; every commit record's checksum matches (a damaged final transaction is a warning: open truncates it); commit numbers continue from the generation's base commit; ids resolve |
 | `catalog` | `commits.bin` record checksums and continuity, its dataset id, and agreement with the WAL; a lagging catalog, or damage open can rebuild from the WAL, is a warning, lost history before the generation an error |
 | `text` | `text.json` parses; the index opens read-only, every committed segment file exists and matches its checksum; its commit against the WAL (behind is a warning: caught up or rebuilt on open) |
-| `geo` | `geo.json` parses and is a valid configuration (the index itself is built in memory when the database is opened) |
+| `geo` | `geo.json` parses and is a valid configuration; the current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`): header, footer, that they belong to this generation and configuration, index checksums, and in full mode the data checksums (a damaged file is a warning: rebuilt on open) |
 | `reasoning` | `reasoning.json` parses and names an existing commit |
 
 Errors are what `Store::open` refuses, what loses acknowledged data or history, or what
@@ -1073,7 +1076,7 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
-mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, validation
+mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
 ```
 
