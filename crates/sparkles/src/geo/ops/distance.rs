@@ -567,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn projected() {
+        // Euclidean in metres; the second geometry is transformed into the first's CRS
+        let wm = |s: &str| g(&format!("<http://www.opengis.net/def/crs/EPSG/0/3857> {s}"));
+        let d = distance_m(
+            &wm("POINT(0 0)"),
+            &wm("POINT(3 4)"),
+            DistanceModel::Geodesic,
+        );
+        assert_eq!(d.unwrap(), 5.0);
+        let d = distance_m(&wm("POINT(0 0)"), &g("POINT(1 0)"), DistanceModel::Geodesic);
+        assert!((d.unwrap() - 111_319.490_793_273_57).abs() < 1e-6);
+        let deg = Unit {
+            kind: UnitKind::Angle,
+            factor: 1f64.to_radians(),
+        };
+        assert!(
+            distance(
+                &wm("POINT(0 0)"),
+                &wm("POINT(3 4)"),
+                &deg,
+                DistanceModel::Geodesic
+            )
+            .is_err()
+        );
+        let d = distance_m(
+            &wm("LINESTRING(0 0, 10 0)"),
+            &wm("POINT(5 2)"),
+            DistanceModel::Geodesic,
+        );
+        assert_eq!(d.unwrap(), 2.0);
+    }
+
+    #[test]
     fn units_and_angles() {
         let unit = |kind, factor| Unit { kind, factor };
         let (a, b) = (g("POINT(0 0)"), g("POINT(1 0)"));
