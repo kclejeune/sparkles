@@ -1,0 +1,1 @@
+prefix-groups = [["rdf", "rdfs", "xsd", "owl"], [""]]

@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.org/>
+describe ?s <http://example.org/thing> <http://other.example/x>
+{
+  ?s a ex:C .
+}

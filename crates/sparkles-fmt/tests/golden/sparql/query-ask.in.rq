@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+ask where {
+  ?s ex:p ?o .
+}

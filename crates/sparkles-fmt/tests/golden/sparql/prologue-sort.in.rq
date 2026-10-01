@@ -1,0 +1,15 @@
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX : <http://example.org/>
+prefix ex: <http://example.org/ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+base <http://example.org/base/>
+PREFIX rel: <rel/>
+PREFIX abs: <http://a/>
+VERSION '1.2'
+SELECT *
+WHERE {
+  ?s ?p ?o .
+}

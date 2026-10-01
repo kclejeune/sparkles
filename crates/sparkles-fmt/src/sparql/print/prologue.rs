@@ -32,7 +32,8 @@ pub fn prologue(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             node: d,
             label,
             iri,
-            has_comments: cx.has_comments(d),
+            // a detached block stays at the start of the run, so it does not count
+            has_comments: !cx.comments.leading(d).is_empty() || !cx.comments.trailing(d).is_empty(),
             barrier_before: after_other || !cx.comments.detached_before(d).is_empty(),
             blank_before: cx.comments.blank_before(d),
         });

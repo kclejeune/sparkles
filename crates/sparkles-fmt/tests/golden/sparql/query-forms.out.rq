@@ -1,0 +1,10 @@
+PREFIX ex: <http://example.org/>
+
+CONSTRUCT {
+  ?p a ex:Contact .
+}
+FROM ex:g
+WHERE {
+  ?p ex:fullName ?n .
+}
+LIMIT 5

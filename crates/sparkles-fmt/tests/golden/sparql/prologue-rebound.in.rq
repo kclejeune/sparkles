@@ -1,0 +1,8 @@
+PREFIX ex: <http://example.org/a#>
+PREFIX b: <http://example.org/b#>
+PREFIX ex: <http://example.org/b#>
+PREFIX a: <http://example.org/a#>
+SELECT *
+WHERE {
+  ?s ex:p ?o .
+}
