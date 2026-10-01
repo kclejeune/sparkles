@@ -1,0 +1,8 @@
+VERSION "1.2"
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+ex:alice ex:claims << ex:bob ex:age 23 >> , <<( ex:carol ex:age 31 )>> .
+<< ex:alice ex:knows ex:bob ~ ex:r1 >> ex:since "2020"^^xsd:gYear .
+ex:alice ex:knows ex:bob ~ ex:r2 {| ex:source ex:hr ; ex:certainty 0.8 |} , ex:carol {| ex:source ex:web |} .
+ex:dave ex:says <<( ex:x ex:y <<( ex:a ex:b "c"@en--ltr )>> )>> .
