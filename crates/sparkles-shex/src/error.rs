@@ -54,10 +54,6 @@ pub(crate) fn parse_todo(what: &str) -> ParseError {
     ParseError::new(format!("{what}: {NOT_IMPLEMENTED}"), 1, 1)
 }
 
-pub(crate) fn schema_todo(what: &str) -> SchemaError {
-    SchemaError::new(format!("{what}: {NOT_IMPLEMENTED}"))
-}
-
 pub(crate) fn todo(what: &str) -> anyhow::Error {
     anyhow::anyhow!("{what}: {NOT_IMPLEMENTED}")
 }
