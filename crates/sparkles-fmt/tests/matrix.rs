@@ -2,9 +2,9 @@
 //! combination, not only the defaults.
 //!
 //! - every golden input under the SPARQL matrix: `type-shorthand` × `compact-iris` ×
-//!   `quote-style` × `operator-position` × `prefix-groups` (none, or
-//!   `[["rdf", "rdfs", "xsd", "owl"]]`) × line width (40, 100), 64 combinations. Keys
-//!   SPARQL ignores, and keys not implemented yet, join when they act on SPARQL;
+//!   `quote-style` × `operator-position` × `prune-prefixes` × `align-values` ×
+//!   `prefix-groups` (none, or `[["rdf", "rdfs", "xsd", "owl"]]`) × line width (40,
+//!   100), 256 combinations. Keys SPARQL ignores stay out;
 //! - the W3C corpus with every key flipped from its default;
 //! - with `SPARKLES_FMT_MATRIX=1`, the W3C corpus under the whole SPARQL matrix (slow).
 
@@ -17,7 +17,7 @@ use sparkles_fmt::{
 /// The SPARQL matrix, each combination with a label for failure messages.
 fn sparql_matrix() -> Vec<OptionSet> {
     let mut v = Vec::new();
-    for bits in 0u32..64 {
+    for bits in 0u32..256 {
         let bit = |n: u32| bits & (1 << n) != 0;
         let o = Options {
             type_shorthand: !bit(0),
@@ -34,18 +34,22 @@ fn sparql_matrix() -> Vec<OptionSet> {
             },
             prefix_groups: if bit(4) { w3c_groups() } else { Vec::new() },
             line_width: if bit(5) { 40 } else { 100 },
+            prune_prefixes: bit(6),
+            align_values: bit(7),
             ..Options::default()
         };
         options::validate(&o).expect("valid options");
         let label = format!(
             "type-shorthand={} compact-iris={} quote-style={:?} operator-position={:?} \
-             prefix-groups={:?} line-width={}",
+             prefix-groups={:?} line-width={} prune-prefixes={} align-values={}",
             o.type_shorthand,
             o.compact_iris,
             o.quote_style,
             o.operator_position,
             o.prefix_groups,
-            o.line_width
+            o.line_width,
+            o.prune_prefixes,
+            o.align_values
         );
         v.push((label, o));
     }
@@ -138,7 +142,7 @@ fn golden_inputs_under_the_matrix() {
     let docs = corpus::golden_inputs();
     assert!(!docs.is_empty(), "no golden inputs");
     let matrix = sparql_matrix();
-    assert_eq!(matrix.len(), 64);
+    assert_eq!(matrix.len(), 256);
     run("golden inputs under the SPARQL matrix", &docs, &matrix);
 }
 

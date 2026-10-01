@@ -29,6 +29,9 @@ pub struct Ctx<'a, 's> {
     pub comments: &'a Comments,
     /// the prefixes declared in the document, for IRI compaction and `rdf:type`
     pub scope: PrefixScope,
+    /// the prefix declarations nothing uses (`prune-prefixes`), worked out by the first
+    /// prologue that needs them
+    pub unused_prefixes: Option<std::collections::HashSet<NodeId>>,
 }
 
 /// Helpers for the node printers. Build each child's document once with [`Ctx::node`]
@@ -42,6 +45,7 @@ impl<'a, 's> Ctx<'a, 's> {
             opts,
             comments,
             scope: PrefixScope::from_tree(tree),
+            unused_prefixes: None,
         }
     }
 

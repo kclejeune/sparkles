@@ -9,8 +9,11 @@
 //! Rows whose literal the index skipped although a `geof:` function could still match
 //! it (too long to index; see [`Slot::rechecked`]) are candidates of every search,
 //! whatever the window, so a search never misses a row the plain filter would keep.
+//!
+//! With `"wgs84": true`, searching the `wgs84_pos:lat` predicate finds the W3C Basic Geo
+//! points (rows whose object is a point's id, see [`super::wgs84`]), indexed or scanned.
 
-use super::column::{ColumnEntry, Slot, classify, recheck};
+use super::column::{Column, ColumnEntry, Slot, classify, recheck};
 use super::config::GeoConfig;
 use super::geom::Geom;
 use super::index::{GeoBase, GeoView, Row, intersects};
@@ -350,10 +353,21 @@ pub(crate) fn indexed<'a>(
 ) -> Option<(&'a GeoView, &'a Arc<GeoBase>)> {
     let view = snap.geo.as_deref()?;
     let base = view.usable()?;
+    let lat = wgs84_lat(snap);
     preds
         .iter()
-        .all(|&p| view.predicate_slot(p).is_some())
+        .all(|&p| view.predicate_slot(p).is_some() || Some(p) == lat)
         .then_some((view, base))
+}
+
+/// The `wgs84_pos:lat` predicate when `snap`'s index (or its configuration) makes W3C
+/// Basic Geo points.
+pub(crate) fn wgs84_lat(snap: &Snapshot) -> Option<Id> {
+    let view = snap.geo.as_deref()?;
+    if !view.config.wgs84 {
+        return None;
+    }
+    super::wgs84::predicates(snap).map(|(lat, _)| lat)
 }
 
 /// The row checks of a search: predicate, graph, validity in the snapshot, duplicates.
@@ -367,6 +381,8 @@ pub(crate) struct Filter<'a> {
     /// overlay and tail quads handed out: a quad deleted and inserted again may have
     /// two rows until the overlay is rebuilt
     quads: FxHashSet<Row>,
+    /// the column of the snapshot's base (W3C Basic Geo pairs)
+    column: Option<&'a Column>,
 }
 
 impl<'a> Filter<'a> {
@@ -383,7 +399,19 @@ impl<'a> Filter<'a> {
             dedup,
             triples: FxHashSet::default(),
             quads: FxHashSet::default(),
+            column: snap
+                .geo
+                .as_deref()
+                .and_then(|v| v.base.as_deref())
+                .map(|b| &b.column),
         }
+    }
+
+    /// Whether both quads of the W3C Basic Geo point row `r` are in the snapshot.
+    fn pair_live(&self, r: &Row) -> bool {
+        self.column
+            .and_then(|c| c.pair(r.o))
+            .is_some_and(|p| p.live(self.snap, r))
     }
 
     #[inline]
@@ -406,6 +434,9 @@ impl<'a> Filter<'a> {
         if !self.wanted(r) {
             return false;
         }
+        if super::wgs84::is_pair(r.o) {
+            return self.pair_live(r);
+        }
         let del = &self.snap.delta.del[Perm::Pso.index()];
         del.is_empty() || !del.contains(&r.pso())
     }
@@ -418,7 +449,11 @@ impl<'a> Filter<'a> {
     /// [`Self::delta_row`] without the triple check (done at emission).
     pub(crate) fn delta_row_unseen(&mut self, r: &Row) -> bool {
         self.wanted(r)
-            && self.snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+            && if super::wgs84::is_pair(r.o) {
+                self.pair_live(r)
+            } else {
+                self.snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+            }
             && self.quads.insert(*r)
     }
 
@@ -600,7 +635,13 @@ fn scan_fallback(
     let mut out: Vec<Hit> = Vec::with_capacity(CHUNK);
     let mut n = 0usize;
     let mut err: Option<crate::error::Error> = None;
+    let lat = wgs84_lat(snap);
+    let mut points = Points::default();
     for &p in preds {
+        if Some(p) == lat {
+            points.scan(ctx, p, windows, graph, dedup, st, &mut out, sink)?;
+            continue;
+        }
         let mut row = |k: [u64; 4]| -> Result<()> {
             n += 1;
             if n.is_multiple_of(CHUNK) {
@@ -664,6 +705,91 @@ fn scan_fallback(
         sink(&out)?;
     }
     Ok(())
+}
+
+/// The W3C Basic Geo points a scan finds (without the index), numbered per search.
+#[derive(Default)]
+struct Points {
+    ids: FxHashMap<[u64; 4], u64>,
+    values: FxHashMap<u64, Option<f64>>,
+}
+
+impl Points {
+    /// Hand out (through `out`, flushed to `sink` in chunks) the points of the `lat`
+    /// predicate `lat` whose envelope meets one of `windows` (any, without windows).
+    #[allow(clippy::too_many_arguments)]
+    fn scan(
+        &mut self,
+        ctx: &Ctx,
+        lat: Id,
+        windows: Option<&[[f64; 4]]>,
+        graph: &GraphFilter,
+        dedup: bool,
+        st: &mut SearchStats,
+        out: &mut Vec<Hit>,
+        sink: &mut dyn FnMut(&[Hit]) -> Result<()>,
+    ) -> Result<()> {
+        let snap = &*ctx.snap;
+        let Some(view) = snap.geo.as_deref() else {
+            return Ok(());
+        };
+        let Some((_, long)) = super::wgs84::predicates(snap) else {
+            return Ok(());
+        };
+        let mut lats: Vec<[u64; 4]> = Vec::new();
+        snap.scan(Perm::Pso, &[lat.0], |c| {
+            match c {
+                Chunk::Block(b, s, e) => lats.extend((s..e).map(|i| b.key(i))),
+                Chunk::Row(k) => lats.push(k),
+            }
+            Ok(true)
+        })?;
+        let mut triples: FxHashSet<(u64, u64)> = FxHashSet::default();
+        for (n, k) in lats.into_iter().enumerate() {
+            if n % CHUNK == CHUNK - 1 {
+                ctx.check()?;
+            }
+            let (s, lat_o, g) = (k[1], k[2], k[3]);
+            if !graph.accepts(g) || !view.lookup.graph(Id(g), snap, &view.config) {
+                continue;
+            }
+            let Some(y) = self.value(snap, lat_o) else {
+                continue;
+            };
+            for long_o in super::wgs84::objects(snap, s, long.0, g)? {
+                let Some(e) = self
+                    .value(snap, long_o)
+                    .and_then(|x| super::wgs84::point(y, x))
+                else {
+                    continue;
+                };
+                if let Some(ws) = windows
+                    && !ws.iter().any(|w| intersects(&e.bbox(), w))
+                {
+                    continue;
+                }
+                let next = super::wgs84::pair_id(self.ids.len() as u64);
+                let o = *self.ids.entry([s, g, lat_o, long_o]).or_insert(next);
+                if dedup && !triples.insert((s, o)) {
+                    continue;
+                }
+                out.push(Hit::new(&Row { s, p: lat.0, o, g }, e));
+                if out.len() >= CHUNK {
+                    st.candidates += out.len() as u64;
+                    sink(out)?;
+                    out.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, snap: &Snapshot, o: u64) -> Option<f64> {
+        *self
+            .values
+            .entry(o)
+            .or_insert_with(|| super::wgs84::number(snap, Id(o)))
+    }
 }
 
 /// [`nearest`] by scanning the predicates: every row, sorted by its bound.

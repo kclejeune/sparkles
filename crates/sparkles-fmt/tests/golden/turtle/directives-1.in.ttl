@@ -1,0 +1,16 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+prefix owl: <http://www.w3.org/2002/07/owl#>
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+@prefix : <http://example.org/default#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@base <http://example.org/base/> .
+@prefix rel: <relative/> .
+
+:a rdfs:seeAlso <other> , rel:x .
+
+# a later block stays as written
+@prefix z: <http://z.example/> .
+@prefix a: <http://a.example/> .
+z:s a:p :o .

@@ -376,3 +376,65 @@ fn spatial_work_is_summed_over_the_plan() {
     let plan = node(None, vec![scan(10), node(None, vec![scan(4)])]);
     assert_eq!(crate::geo::plan_work(&plan), Some([14, 7, 2, 2]));
 }
+
+#[tokio::test]
+async fn features_in_a_box() {
+    let s = geo_server();
+    let ids = |v: &J| -> Vec<String> {
+        let mut v: Vec<String> = v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                let id = f["id"].as_str().unwrap();
+                id.rsplit('/').next().unwrap().to_string()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let all = "/ds/geo?bbox=-180,-90,180,90";
+    // without an index: the rows a scan finds
+    let r = send(&s.app, get(all)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.content_type, "application/geo+json");
+    let scanned = r.json();
+    assert_eq!(scanned["type"], "FeatureCollection");
+    assert_eq!(
+        ids(&scanned),
+        ["g1", "g2", "g3", "g4", "gA", "gB", "gC"].map(String::from)
+    );
+    run_task(&s, put("/$/geo/ds", "")).await;
+    let v = send(&s.app, get(all)).await.json();
+    assert_eq!(ids(&v), ids(&scanned));
+    assert_eq!(v["truncated"], false);
+    let g4 = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "http://example.org/g4")
+        .unwrap();
+    assert_eq!(g4["properties"]["graph"], "http://example.org/G1");
+    assert_eq!(g4["properties"]["feature"], "http://example.org/p4");
+    assert_eq!(g4["geometry"]["coordinates"], serde_json::json!([3, 3]));
+    let v = send(&s.app, get("/ds/geo?bbox=1,1,2.5,2.5&limit=1"))
+        .await
+        .json();
+    assert_eq!(v["features"].as_array().unwrap().len(), 1);
+    assert_eq!(v["truncated"], true);
+    let v = send(
+        &s.app,
+        get("/ds/geo?bbox=-180,-90,180,90&graph=http%3A%2F%2Fexample.org%2FG1"),
+    )
+    .await
+    .json();
+    assert_eq!(ids(&v), ["g4"]);
+    assert_eq!(
+        send(&s.app, get("/ds/geo?bbox=1,2,3")).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(&s.app, get("/nope/geo?bbox=0,0,1,1")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}

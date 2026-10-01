@@ -12,11 +12,14 @@
 //!   delta keeps `ins` disjoint from the base and `del` within it, the rows of S are
 //!   exactly `(base − del) ∪ (overlay ∪ tail) ∩ ins`.
 
-use super::column::{Column, ColumnEntry, Counts, Slot};
+use super::column::{Column, ColumnEntry, Counts, Reuse, Slot};
 use super::config::{
-    FORMAT_VERSION, GeoBuild, GeoConfig, GeoMemory, GeoRows, GeoSkipped, GeoStatus, IndexState,
+    FORMAT_VERSION, GeoBuild, GeoConfig, GeoFiles, GeoMemory, GeoRows, GeoSkipped, GeoStatus,
+    IndexState,
 };
+use super::persist::{self, FileKind, Identity, Mapped, Problem};
 use super::tree::PackedTree;
+use super::wgs84::{self, Pair};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{Key, Perm};
@@ -24,11 +27,14 @@ use crate::store::Snapshot;
 use crate::text::PredicateSet;
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::FxHashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// An indexed quad (raw ids).
+/// An indexed quad (raw ids). The layout is that of the rows in `rtree.spkg` (four
+/// little-endian `u64`), which are read in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(C)]
 pub(crate) struct Row {
     pub s: u64,
     pub p: u64,
@@ -60,8 +66,59 @@ pub(crate) struct TailRow {
     pub entry: Arc<ColumnEntry>,
 }
 
+/// Rows held in memory, or read in place from a mapped `rtree.spkg`.
+pub(crate) enum Rows {
+    Owned(Vec<Row>),
+    Mapped {
+        file: Arc<Mapped>,
+        /// byte offset in the file's data (a multiple of 8)
+        at: usize,
+        n: usize,
+    },
+}
+
+impl Rows {
+    /// The `n` rows at `at` of `file`'s data (`None`: out of bounds or misaligned).
+    fn mapped(file: Arc<Mapped>, at: usize, n: usize) -> Option<Rows> {
+        let len = n.checked_mul(std::mem::size_of::<Row>())?;
+        let b = file.data().get(at..at.checked_add(len)?)?;
+        if !persist::SUPPORTED || !(b.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Row>())
+        {
+            return None;
+        }
+        Some(Rows::Mapped { file, at, n })
+    }
+
+    /// Bytes held in memory.
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Rows::Owned(v) => (v.len() * std::mem::size_of::<Row>()) as u64,
+            Rows::Mapped { .. } => 0,
+        }
+    }
+}
+
+impl std::ops::Deref for Rows {
+    type Target = [Row];
+    fn deref(&self) -> &[Row] {
+        match self {
+            Rows::Owned(v) => v,
+            Rows::Mapped { file, at, n } => {
+                let b = &file.data()[*at..*at + n * std::mem::size_of::<Row>()];
+                // SAFETY: `Rows::mapped` checked that the bytes are in the mapping and
+                // aligned for `Row`, a `repr(C)` struct of four `u64` for which every bit
+                // pattern is valid; the files are little-endian, as this platform
+                // (`persist::SUPPORTED`), and the mapping lives as long as `file`.
+                unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<Row>(), *n) }
+            }
+        }
+    }
+}
+
 fn tree_bytes(t: &Option<PackedTree>) -> u64 {
-    t.as_ref().map_or(0, PackedTree::bytes)
+    t.as_ref()
+        .filter(|t| !t.is_mapped())
+        .map_or(0, PackedTree::bytes)
 }
 
 /// Whether the `f32` box `b` intersects the CRS84 window `w`.
@@ -185,7 +242,7 @@ pub(crate) struct GeoBase {
     pub generation: u64,
     pub generation_name: String,
     /// base rows in PSO order (the tree's items)
-    pub rows: Vec<Row>,
+    pub rows: Rows,
     /// base rows whose literal was skipped but may still match (see
     /// [`Slot::rechecked`]): candidates of every search
     pub skipped: Vec<Row>,
@@ -194,6 +251,12 @@ pub(crate) struct GeoBase {
     /// base rows per predicate slot
     pub slot_rows: Vec<u64>,
     pub built_ms: f64,
+    /// base rows that are W3C Basic Geo points
+    pub pair_rows: u64,
+    /// read from the generation's index files (not built in this process)
+    pub opened: bool,
+    /// the index files the base is read from (bytes)
+    pub files_bytes: u64,
 }
 
 impl GeoBase {
@@ -202,23 +265,199 @@ impl GeoBase {
         GeoBase {
             generation: snap.generation.uid,
             generation_name: snap.generation.name.clone(),
-            rows: Vec::new(),
+            rows: Rows::Owned(Vec::new()),
             skipped: Vec::new(),
             tree: None,
             column: Column::empty(),
             slot_rows: vec![0; cfg.predicates.len()],
             built_ms: 0.0,
+            pair_rows: 0,
+            opened: false,
+            files_bytes: 0,
         }
     }
 
-    /// Memory of rows, tree and column.
+    /// Memory of rows, tree and column (what is read from files in place excluded).
     pub fn bytes(&self) -> u64 {
         self.tree_bytes() + self.column.bytes()
     }
 
     fn tree_bytes(&self) -> u64 {
-        ((self.rows.len() + self.skipped.len()) * std::mem::size_of::<Row>()) as u64
+        self.rows.heap_bytes()
+            + (self.skipped.len() * std::mem::size_of::<Row>()) as u64
             + tree_bytes(&self.tree)
+    }
+
+    /// Write the base's files (`rtree.spkg`, `column.spkg`) into `dir` (a generation's
+    /// `geo/` directory) for `ident`, durably.
+    pub(crate) fn write_files(&self, dir: &Path, ident: &Identity) -> Result<()> {
+        std::fs::create_dir(dir).or_else(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => Ok(()),
+            _ => Err(e),
+        })?;
+        self.column.write(&dir.join(persist::COLUMN_FILE), ident)?;
+        let tree = self.tree.as_ref().map_or(&[][..], PackedTree::data);
+        let pairs = self.column.base_pairs();
+        let mut index = persist::index_prefix(ident);
+        for n in [
+            self.rows.len(),
+            self.skipped.len(),
+            self.slot_rows.len(),
+            tree.len(),
+            pairs.len(),
+        ] {
+            index.extend_from_slice(&(n as u64).to_le_bytes());
+        }
+        let row = |r: &Row| {
+            let mut b = [0u8; 32];
+            for (i, x) in [r.s, r.p, r.o, r.g].into_iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        persist::write_file(
+            &dir.join(persist::RTREE_FILE),
+            FileKind::Rtree,
+            ident,
+            self.rows.len() as u64,
+            &index,
+            |sink| {
+                let mut buf = Vec::with_capacity(32 * 4096);
+                for chunk in self.rows.chunks(4096).chain(self.skipped.chunks(4096)) {
+                    buf.clear();
+                    for r in chunk {
+                        buf.extend_from_slice(&row(r));
+                    }
+                    sink.put(&buf)?;
+                }
+                for n in &self.slot_rows {
+                    sink.put(&n.to_le_bytes())?;
+                }
+                sink.put(tree)?;
+                sink.align()?;
+                for (id, p) in &pairs {
+                    for x in [*id, p.lat_o, p.long_o, p.long_p, p.flags()] {
+                        sink.put(&x.to_le_bytes())?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        crate::store::sync_dir(dir)?;
+        if let Some(parent) = dir.parent() {
+            crate::store::sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
+    /// The base of `snap`'s generation read from the files in `dir` (built for `ident`);
+    /// with `verify`, every data checksum is checked too.
+    pub(crate) fn read_files(
+        dir: &Path,
+        ident: &Identity,
+        snap: &Snapshot,
+        cfg: &GeoConfig,
+        verify: bool,
+    ) -> std::result::Result<GeoBase, (&'static str, Problem)> {
+        let t0 = std::time::Instant::now();
+        let open = |k: FileKind| {
+            Mapped::open(&dir.join(k.file_name()), k, Some(ident), verify)
+                .map(Arc::new)
+                .map_err(|p| (k.file_name(), p))
+        };
+        let rt = open(FileKind::Rtree)?;
+        let col = open(FileKind::Column)?;
+        let bad = |m: &str| (persist::RTREE_FILE, Problem::Unusable(m.to_string()));
+        let count = |i: usize| usize::try_from(rt.u64_at(persist::INDEX_PREFIX + 8 * i)).ok();
+        let (Some(n), Some(m), Some(k), Some(t), Some(w)) =
+            (count(0), count(1), count(2), count(3), count(4))
+        else {
+            return Err(bad("damaged index section"));
+        };
+        if rt.index().len() != persist::pad8(persist::INDEX_PREFIX + 40)
+            || n as u64 != rt.header.rows
+            || k != cfg.predicates.len()
+        {
+            return Err(bad("damaged index section"));
+        }
+        let sections = (|| {
+            let skipped_at = n.checked_mul(32)?;
+            let slots_at = skipped_at.checked_add(m.checked_mul(32)?)?;
+            let tree_at = slots_at.checked_add(k.checked_mul(8)?)?;
+            let pairs_at = persist::pad8(tree_at.checked_add(t)?);
+            let end = pairs_at.checked_add(w.checked_mul(PAIR_BYTES)?)?;
+            (end == rt.data().len()).then_some((skipped_at, slots_at, tree_at, pairs_at))
+        })();
+        let Some((skipped_at, slots_at, tree_at, pairs_at)) = sections else {
+            return Err(bad("data sections have the wrong length"));
+        };
+        let rows = Rows::mapped(rt.clone(), 0, n).ok_or_else(|| bad("misaligned rows"))?;
+        let skipped: Vec<Row> = rt.data()[skipped_at..slots_at]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|b| {
+                let x = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+                Row {
+                    s: x(0),
+                    p: x(1),
+                    o: x(2),
+                    g: x(3),
+                }
+            })
+            .collect();
+        let slot_rows: Vec<u64> = rt.data()[slots_at..tree_at]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect();
+        let tree = match n {
+            0 if t == 0 => None,
+            0 => return Err(bad("a tree without rows")),
+            _ => Some(
+                PackedTree::mapped(rt.clone(), tree_at, t, n as u64)
+                    .ok_or_else(|| bad("damaged tree"))?,
+            ),
+        };
+        let mut pairs = Vec::with_capacity(w);
+        for b in rt.data()[pairs_at..].as_chunks::<PAIR_BYTES>().0 {
+            let x = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+            if !wgs84::is_pair(x(0)) || x(4) > 3 {
+                return Err(bad("damaged W3C Basic Geo pairs"));
+            }
+            let pair = Pair {
+                lat_o: x(1),
+                long_o: x(2),
+                long_p: x(3),
+                lat_base: x(4) & 1 != 0,
+                long_base: x(4) & 2 != 0,
+            };
+            pairs.push((x(0), pair, None));
+        }
+        let files_bytes = rt.len() + col.len();
+        let mut column =
+            Column::read(col).map_err(|m| (persist::COLUMN_FILE, Problem::Unusable(m)))?;
+        if pairs
+            .iter()
+            .any(|(id, _, _)| column.base_entry(*id).is_none())
+        {
+            return Err(bad("W3C Basic Geo pairs without their points"));
+        }
+        column.add_base_pairs(pairs);
+        Ok(GeoBase {
+            generation: snap.generation.uid,
+            generation_name: snap.generation.name.clone(),
+            rows,
+            skipped,
+            tree,
+            column,
+            slot_rows,
+            built_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            pair_rows: w as u64,
+            opened: true,
+            files_bytes,
+        })
     }
 }
 
@@ -244,14 +483,16 @@ fn over_budget(limit: u64, requested: u64) -> Error {
 }
 
 /// Build the base of `snap`'s generation: rows of the configured predicates in the
-/// generation's own index (not the delta), their literals parsed in parallel blocks,
-/// and the packed tree. Fails with [`Error::BudgetExceeded`] past the budget and
-/// [`Error::Cancelled`] when told to stop.
+/// generation's own index (not the delta), their literals parsed in parallel blocks
+/// (or taken from the previous generation's column, `reuse`), and the packed tree.
+/// Fails with [`Error::BudgetExceeded`] past the budget and [`Error::Cancelled`] when
+/// told to stop.
 pub(crate) fn build_base(
     snap: &Snapshot,
     cfg: &GeoConfig,
     lookup: &Lookup,
     ctl: &BuildCtl<'_>,
+    reuse: Option<&Reuse<'_>>,
 ) -> Result<GeoBase> {
     let t0 = std::time::Instant::now();
     set_progress(ctl.progress, 0.0);
@@ -304,7 +545,7 @@ pub(crate) fn build_base(
     let total = objs.len().max(1) as f32;
     let done = AtomicU64::new(0);
     let used = AtomicU64::new(rows.len() as u64 * row_bytes);
-    let column = Column::build(snap, &objs, cfg, &|k, bytes| {
+    let mut column = Column::build(snap, &objs, cfg, reuse, &|k, bytes| {
         if (ctl.cancel)() {
             return Err(Error::Cancelled);
         }
@@ -316,6 +557,12 @@ pub(crate) fn build_base(
         set_progress(ctl.progress, 0.1 + 0.8 * (d as f32 / total));
         Ok(())
     })?;
+    if cfg.wgs84 {
+        let (pair_rows, pairs) = base_pairs(snap, cfg, lookup, ctl)?;
+        base.pair_rows = pair_rows.len() as u64;
+        column.add_base_pairs(pairs);
+        rows.extend(pair_rows);
+    }
     let mut boxes: Vec<[f32; 4]> = Vec::with_capacity(rows.len());
     let mut skipped = Vec::new();
     rows.retain(|r| match column.base_entry(r.o) {
@@ -339,8 +586,8 @@ pub(crate) fn build_base(
         return Err(Error::Cancelled);
     }
     base.tree = PackedTree::pack(boxes.into_iter());
-    base.rows = rows;
-    base.rows.shrink_to_fit();
+    rows.shrink_to_fit();
+    base.rows = Rows::Owned(rows);
     base.skipped = skipped;
     base.column = column;
     let need = base.bytes();
@@ -350,6 +597,167 @@ pub(crate) fn build_base(
     base.built_ms = t0.elapsed().as_secs_f64() * 1000.0;
     set_progress(ctl.progress, 1.0);
     Ok(base)
+}
+
+/// Bytes of a W3C Basic Geo pair in `rtree.spkg`: id, `lat` and `long` objects, the
+/// `long` predicate, flags.
+const PAIR_BYTES: usize = 40;
+
+/// The W3C Basic Geo points of `snap`'s generation base: their rows (`lat` the
+/// predicate, the point's id the object) and pairs, numbered in row order.
+#[allow(clippy::type_complexity)]
+fn base_pairs(
+    snap: &Snapshot,
+    cfg: &GeoConfig,
+    lookup: &Lookup,
+    ctl: &BuildCtl<'_>,
+) -> Result<(Vec<Row>, Vec<(u64, Pair, Option<Arc<ColumnEntry>>)>)> {
+    let vocab = &snap.generation.vocab;
+    let (Ok(lat), Ok(long)) = (
+        vocab.find(&crate::id::iri_key(wgs84::LAT)),
+        vocab.find(&crate::id::iri_key(wgs84::LONG)),
+    ) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let (lat_p, long_p) = (Id::vocab(lat).0, Id::vocab(long).0);
+    let perm = snap.perm(Perm::Pso);
+    // `[s, g, o]` of a predicate's quads in scope, sorted
+    let read = |p: u64| -> Result<Vec<[u64; 3]>> {
+        let mut v = Vec::new();
+        perm.for_each_range(&snap.cache, &[p], |b, s, e| {
+            if (ctl.cancel)() {
+                return Err(Error::Cancelled);
+            }
+            for i in s..e {
+                let k = b.key(i);
+                if lookup.graph(Id(k[3]), snap, cfg) {
+                    v.push([k[1], k[3], k[2]]);
+                }
+            }
+            Ok(())
+        })?;
+        v.sort_unstable();
+        Ok(v)
+    };
+    let (lats, longs) = (read(lat_p)?, read(long_p)?);
+    // the values of the objects
+    let mut objs: Vec<u64> = lats.iter().chain(&longs).map(|x| x[2]).collect();
+    objs.sort_unstable();
+    objs.dedup();
+    let mut values: FxHashMap<u64, f64> = FxHashMap::default();
+    let payloads: Vec<u64> = objs
+        .iter()
+        .filter(|&&o| Id(o).tag() == Tag::Vocab)
+        .map(|&o| Id(o).payload())
+        .collect();
+    vocab.get_sorted(&payloads, |pl, key| {
+        if let Some(x) = wgs84::number_of_key(key) {
+            values.insert(Id::vocab(pl).0, x);
+        }
+    });
+    for &o in objs.iter().filter(|&&o| Id(o).tag() != Tag::Vocab) {
+        if let Some(x) = wgs84::number(snap, Id(o)) {
+            values.insert(o, x);
+        }
+    }
+    // the cross product of each subject's lats and longs in one graph
+    let mut rows = Vec::new();
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < lats.len() && j < longs.len() {
+        let (a, b) = ((lats[i][0], lats[i][1]), (longs[j][0], longs[j][1]));
+        if a != b {
+            if a < b {
+                i += 1;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        let ie = i + lats[i..].iter().take_while(|x| (x[0], x[1]) == a).count();
+        let je = j + longs[j..].iter().take_while(|x| (x[0], x[1]) == a).count();
+        for la in &lats[i..ie] {
+            for lo in &longs[j..je] {
+                let (Some(&y), Some(&x)) = (values.get(&la[2]), values.get(&lo[2])) else {
+                    continue;
+                };
+                let Some(e) = wgs84::point(y, x) else {
+                    continue;
+                };
+                let id = wgs84::pair_id(pairs.len() as u64);
+                rows.push(Row {
+                    s: a.0,
+                    p: lat_p,
+                    o: id,
+                    g: a.1,
+                });
+                let pair = Pair {
+                    lat_o: la[2],
+                    long_o: lo[2],
+                    long_p,
+                    lat_base: true,
+                    long_base: true,
+                };
+                pairs.push((id, pair, Some(e)));
+            }
+        }
+        (i, j) = (ie, je);
+    }
+    Ok((rows, pairs))
+}
+
+/// The point rows the quad `q` (`[s, p, o, g]`, a `lat` or `long` quad inserted since
+/// the base, visible in `snap`) makes with the other half of each pair visible there.
+pub(crate) fn pair_rows(
+    snap: &Snapshot,
+    column: &Column,
+    q: [u64; 4],
+    lat: u64,
+    long: u64,
+) -> Result<Vec<TailRow>> {
+    let is_lat = q[1] == lat;
+    let ins = &snap.delta.ins[Perm::Pso.index()];
+    let in_base = |p: u64, o: u64| !ins.contains(&[p, q[0], o, q[3]]);
+    let mut out = Vec::new();
+    for other in wgs84::objects(snap, q[0], if is_lat { long } else { lat }, q[3])? {
+        let (lat_o, long_o) = if is_lat { (q[2], other) } else { (other, q[2]) };
+        let made = column.commit_pair([q[0], q[3], lat_o, long_o], || {
+            let e = wgs84::point(
+                wgs84::number(snap, Id(lat_o))?,
+                wgs84::number(snap, Id(long_o))?,
+            )?;
+            let pair = Pair {
+                lat_o,
+                long_o,
+                long_p: long,
+                lat_base: in_base(lat, lat_o),
+                long_base: in_base(long, long_o),
+            };
+            Some((pair, e))
+        });
+        if let Some((id, entry)) = made {
+            out.push(TailRow {
+                row: Row {
+                    s: q[0],
+                    p: lat,
+                    o: id,
+                    g: q[3],
+                },
+                entry,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the overlay or tail row `r` is in `snap`: its quad inserted (a point: both
+/// of its quads visible).
+pub(crate) fn delta_row_live(snap: &Snapshot, column: &Column, r: &Row) -> bool {
+    if wgs84::is_pair(r.o) {
+        column.pair(r.o).is_some_and(|p| p.live(snap, r))
+    } else {
+        snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+    }
 }
 
 /// Rows inserted by commits, in a packed tree.
@@ -435,6 +843,21 @@ pub(crate) fn overlay_of(
                 Slot::Geom(entry) => rows.push(TailRow { row, entry }),
                 s if s.rechecked() => skipped.push(row),
                 _ => {}
+            }
+        }
+    }
+    // W3C Basic Geo points with an inserted quad
+    if cfg.wgs84
+        && let Some((lat, long)) = wgs84::predicates(snap)
+    {
+        for p in [lat.0, long.0] {
+            for k in ins.range([p, 0, 0, 0]..=[p, u64::MAX, u64::MAX, u64::MAX]) {
+                if lookup.graph(Id(k[3]), snap, cfg)
+                    && let Ok(r) =
+                        pair_rows(snap, &base.column, [k[1], k[0], k[2], k[3]], lat.0, long.0)
+                {
+                    rows.extend(r);
+                }
             }
         }
     }
@@ -740,6 +1163,15 @@ impl GeoIndex {
                 base: base.map_or(0, |b| b.rows.len() as u64),
                 overlay: view.map_or(0, |v| v.overlay.rows.len() as u64),
                 tail: view.map_or(0, |v| v.tail.len() as u64),
+                wgs84: base.map_or(0, |b| b.pair_rows)
+                    + view.map_or(0, |v| {
+                        v.overlay
+                            .rows
+                            .iter()
+                            .chain(v.tail.iter())
+                            .filter(|r| wgs84::is_pair(r.row.o))
+                            .count() as u64
+                    }),
             },
             literals,
             skipped: GeoSkipped {
@@ -755,19 +1187,44 @@ impl GeoIndex {
                 geometry_bytes: base.map_or(0, |b| b.column.bytes()),
                 overlay_bytes: view.map_or(0, |v| v.overlay_bytes()),
                 budget_bytes: self.budget,
+                mapped_bytes: base.map_or(0, |b| b.files_bytes),
             },
             config: (*self.config).clone(),
             format_version: FORMAT_VERSION,
             last_build: info.last_build.clone(),
+            files: base.filter(|b| b.files_bytes > 0).map(|b| GeoFiles {
+                bytes: b.files_bytes,
+                opened: b.opened,
+            }),
         }
     }
 }
 
 /// The spatial data of one generation. The base, its column and the overlay live in the
 /// views of the generation's snapshots (a reconfiguration replaces them for the same
-/// generation), so nothing is kept here yet.
+/// generation); what is kept here guards the generation's index files.
 #[derive(Default)]
-pub struct GenerationGeo {}
+pub struct GenerationGeo {
+    /// held while the files are written or removed; true once the generation is
+    /// replaced (its directory may be removed at any time then, so nothing writes
+    /// there any more)
+    files: Mutex<bool>,
+}
+
+impl GenerationGeo {
+    /// The generation is being replaced: wait for a running write of its files, and
+    /// let none start.
+    pub(crate) fn retire(&self) {
+        *self.files.lock() = true;
+    }
+
+    /// Run `f` (a write or removal of the generation's files) unless the generation was
+    /// replaced; no replacement completes meanwhile.
+    pub(crate) fn with_files<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let retired = self.files.lock();
+        (!*retired).then(f)
+    }
+}
 
 #[cfg(test)]
 mod tests {

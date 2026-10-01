@@ -1,0 +1,15 @@
+# fixture
+<http://example.org/c> <http://example.org/p> "3" .
+<http://example.org/a> <http://example.org/p> "1" .
+
+<http://example.org/b> <http://example.org/p> "2" .
+<http://example.org/a> <http://example.org/p> "1" .
+<http://example.org/a> <http://example.org/p> "1" . # a duplicate with a comment stays
+# leads b
+<http://example.org/b> <http://example.org/p> "2" .
+
+# --- second section: a sort barrier ---
+
+_:z <http://example.org/p> "z" .
+<http://example.org/z> <http://example.org/p> "z" .
+<http://example.org/Z> <http://example.org/p> "Z" .

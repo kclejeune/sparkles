@@ -7,13 +7,13 @@ editor:
   `sparkles fmt --stdin-filepath PATH`, which reads stdin and prints the formatted text.
   The path is never opened: it only names the buffer, so the language comes from its
   extension and the options from the `.sparklesfmt.toml` nearest to it, and a path
-  matched by the working directory's `.sparklesfmtignore` comes back unchanged. A syntax error exits with status
-  2 and a `path:LINE:COL: error: …` line on stderr, and prints nothing, so the buffer is
-  left as it is.
+  matched by the working directory's `.sparklesfmtignore` comes back unchanged. A syntax
+  error exits with status 2 and a `path:LINE:COL: error: …` line on stderr, and prints
+  nothing, so the buffer is left as it is.
 - **As a language server.** `sparkles lsp` speaks the Language Server Protocol over
   stdin and stdout. It formats documents (`textDocument/formatting`, and
   `textDocument/rangeFormatting`, which formats the whole document) and publishes syntax
-  errors as diagnostics while you type.
+  errors and the formatter's warnings as diagnostics while you type.
 
 Both need the `sparkles` binary on the `PATH` (built with the `fmt` feature, on by
 default).
@@ -27,11 +27,21 @@ offers:
   undo, folds and marks elsewhere survive. A document that is already formatted gets no
   edit. Range formatting formats the whole document and returns the same edit, because
   a formatted range depends on what lies around it.
-- **Diagnostics** on open and on every change: a syntax error is an error at its
-  position; output the formatter refuses (its safety checks failed: please report it) and
-  a broken config file are warnings. Diagnostics are cleared when the problem is fixed
-  and when the document is closed. A document with a syntax error is not formatted;
-  formatting it returns no edit rather than an error, since its diagnostic says why.
+- **Diagnostics** on open and on every change, with source `sparkles fmt` and the kind
+  as their code:
+  - a syntax error (`syntax`) is an error at its position;
+  - output the formatter refuses (`unsafe-format`, `unstable-format`: its safety checks
+    failed, please report it) and a broken config file (`config`) are warnings;
+  - the formatter's warnings about a document it formats are shown at their own
+    position: `comment-moved` (a comment that sat where no element starts or ends,
+    printed before the enclosing element) as a warning, `undeclared-prefix` (a prefix
+    used but not declared in the document) as information, and any other kind as
+    information, at the start of the document when it has no position (such as
+    `option-not-implemented`, for a config key this build does not act on yet).
+
+  Diagnostics are cleared when the problem is fixed and when the document is closed. A
+  document with a syntax error is not formatted; formatting it returns no edit rather
+  than an error, since its diagnostic says why. Warnings do not stop formatting.
 - **Options from `.sparklesfmt.toml` only**: the file nearest to the document, found
   the way `sparkles fmt` finds it, and read again on every request, so an edit to it
   applies at once. Documents that are not files (an unsaved buffer) use the defaults.

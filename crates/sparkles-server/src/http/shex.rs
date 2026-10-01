@@ -1,14 +1,20 @@
 //! `POST /{ds}/shex`: ShEx validation of a dataset's data graph. The schema is the body
-//! (`text/shex`, or ShExJ) with the shape map in the query string (`map`, or `node` with
-//! `shape`), or the body is a JSON envelope (`{schema, schemaFormat?, map, externs?,
-//! imports?, base?}`). The parameters `graph`, `reasoning`, `results`, `format`,
-//! `timeout` and `semact-trace` are those of `/{ds}/shacl` where they overlap; `base`
-//! resolves the schema's relative IRIs and `stats=true` adds the typing's counters to
-//! the JSON report.
+//! (`text/shex`, ShExJ, or ShExR in an RDF syntax: `text/turtle`, `application/n-triples`,
+//! `application/rdf+xml`, `application/trig`, `application/n-quads`) with the shape map
+//! in the query string (`map`, or `node` with `shape`), or the body is a JSON envelope
+//! (`{schema, schemaFormat?, map, externs?, imports?, base?}`). `schema-format=shexc|
+//! shexj|shexr` names the body's syntax where the media type does not (`text/plain` and
+//! form types are sniffed as ShExC or ShExJ; ShExR without an RDF media type is Turtle).
+//! The parameters `graph`, `reasoning`, `results`, `format`, `timeout` and
+//! `semact-trace` are those of `/{ds}/shacl` where they overlap; `base` resolves the
+//! schema's relative IRIs and `stats=true` adds the typing's counters to the JSON
+//! report.
 //!
 //! Imports resolve from the envelope's inline bodies, then `file:` IRIs under
 //! `--load-dir` (none without it), then http(s) through the server's outbound policy,
-//! with one request budget per validation.
+//! with one request budget per validation. `SPARQL` selectors of the shape map run on
+//! the data graph with the request's query budgets (`--max-query-rows`, the query memory
+//! budget) and never run SERVICE.
 
 #[cfg(feature = "shex")]
 pub(super) use enabled::shex;
@@ -25,12 +31,14 @@ pub(super) async fn shex() -> super::ApiResult {
 mod enabled {
     use super::super::{
         ApiError, ApiResult, INFERRED_GRAPH, Params, QueryBody, St, blocking, cancel_on_drop,
-        content_type, dataset, err, negotiate, timeout_param, with_commit, with_inferences,
+        content_type, dataset, err, negotiate, query_options, timeout_param, with_commit,
+        with_inferences,
     };
+    use crate::auth::Principal;
     use crate::shex_cmd::{ShexFormat, write_report};
     use crate::state::AppState;
     use crate::validation_common::{GraphParam, graph_exists};
-    use axum::extract::Path;
+    use axum::extract::{Extension, Path};
     use axum::http::{HeaderMap, StatusCode, Uri, header};
     use axum::response::IntoResponse;
     use serde_json::{Value as J, json};
@@ -61,6 +69,8 @@ mod enabled {
         pub shape: Option<String>,
         /// the base IRI of the schema (and of the shape map)
         pub base: Option<String>,
+        /// the syntax of a schema body (`schema-format`)
+        pub schema_format: Option<SchemaFormat>,
     }
 
     fn flag(params: &Params, name: &str) -> ApiResult<bool> {
@@ -122,7 +132,16 @@ mod enabled {
             oxrdf::NamedNode::new(b.as_str())
                 .map_err(|e| bad(format!("invalid base <{b}>: {e}")))?;
         }
+        let schema_format = match params.get("schema-format") {
+            None => None,
+            Some(f) => Some(SchemaFormat::from_name(f).ok_or_else(|| {
+                bad(format!(
+                    "unknown schema-format '{f}' (shexc, shexj or shexr)"
+                ))
+            })?),
+        };
         Ok(ShexParams {
+            schema_format,
             graph,
             use_inferred: params.get("reasoning").is_none_or(|v| v != "false"),
             only_nonconformant,
@@ -152,8 +171,15 @@ mod enabled {
         base: Option<String>,
     }
 
-    /// A 400 for a syntax error, with its line and column.
+    /// A 400 for a syntax error, with its line and column (none for a ShExR error that is
+    /// not at a place in the text).
     fn syntax(what: &str, e: &ParseError) -> ApiError {
+        if e.line == 0 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("{what} error: {}", e.message),
+            );
+        }
         ApiError(
             StatusCode::BAD_REQUEST,
             json!({
@@ -202,13 +228,14 @@ mod enabled {
             let env: Envelope = serde_json::from_str(text)
                 .map_err(|e| bad(&format!("invalid request envelope: {e}")))?;
             let base = env.base.or_else(|| p.base.clone());
-            let hint =
-                match &env.schema_format {
-                    Some(f) => Some(SchemaFormat::from_name(f).ok_or_else(|| {
-                        bad(&format!("unknown schemaFormat '{f}' (shexc or shexj)"))
-                    })?),
-                    None => None,
-                };
+            let hint = match &env.schema_format {
+                Some(f) => Some(SchemaFormat::from_name(f).ok_or_else(|| {
+                    bad(&format!(
+                        "unknown schemaFormat '{f}' (shexc, shexj or shexr)"
+                    ))
+                })?),
+                None => None,
+            };
             let schema = sparkles_shex::parse_schema(&env.schema, base.as_deref(), hint)
                 .map_err(|e| syntax("schema", &e))?;
             let externs = match &env.externs {
@@ -251,14 +278,7 @@ mod enabled {
                 base,
             });
         }
-        let hint = match ct {
-            "text/shex" => Some(SchemaFormat::ShExC),
-            "application/shex+json" | "application/json" | "application/ld+json" => {
-                Some(SchemaFormat::ShExJ)
-            }
-            // anything else (curl's default form type included): sniffed
-            _ => None,
-        };
+        let hint = schema_hint(ct, p.schema_format);
         let schema = sparkles_shex::parse_schema(text, p.base.as_deref(), hint)
             .map_err(|e| syntax("schema", &e))?;
         Ok(Request {
@@ -272,16 +292,44 @@ mod enabled {
 
     const NO_MAP: &str = "no shape map: give map, or node (with shape, or the schema's START)";
 
+    /// The syntax of a schema body: `schema-format`, else the media type (ShExC, ShExJ
+    /// for the JSON types, ShExR for the RDF syntaxes); `None` (sniffed) for the rest,
+    /// `text/plain` and curl's default form type included. ShExR keeps the body's RDF
+    /// syntax when the media type names one.
+    pub(crate) fn schema_hint(ct: &str, given: Option<SchemaFormat>) -> Option<SchemaFormat> {
+        let rdf = match ct {
+            "text/plain" | "application/json" | "application/ld+json" => None,
+            ct => sparkles::io::format_for_media_type(ct),
+        };
+        match given {
+            Some(SchemaFormat::ShExR(_)) => rdf.map(SchemaFormat::ShExR).or(given),
+            Some(f) => Some(f),
+            None => match ct {
+                "text/shex" => Some(SchemaFormat::ShExC),
+                "application/shex+json" | "application/json" | "application/ld+json" => {
+                    Some(SchemaFormat::ShExJ)
+                }
+                _ => rdf.map(SchemaFormat::ShExR),
+            },
+        }
+    }
+
     /// `POST /{ds}/shex`.
     pub(crate) async fn shex(
         axum::extract::State(st): St,
         Path(name): Path<String>,
+        Extension(principal): Extension<Principal>,
         uri: Uri,
         headers: HeaderMap,
         QueryBody(body): QueryBody,
     ) -> ApiResult {
         let ds = dataset(&st, &name)?;
-        let p = params(&st, &Params::from_query(&uri), &headers)?;
+        let query = Params::from_query(&uri);
+        let p = params(&st, &query, &headers)?;
+        // SPARQL selectors: the request's row and memory budgets (SERVICE is refused
+        // when the map is parsed, and the caller's permissions apply all the same)
+        let mut selector_query = query_options(&st, &ds, &query);
+        crate::auth::restrict(&mut selector_query, &principal);
         let ct = content_type(&headers);
         let has_inferred = ds.reasoning.read().is_some();
         // a client that disconnects stops the validation at its next check
@@ -364,6 +412,7 @@ mod enabled {
                 max_pairs: Some(max_pairs),
                 only_nonconformant: p.only_nonconformant,
                 semact_trace: p.semact_trace,
+                selector_query: Some(selector_query),
                 ..Default::default()
             };
             let t = std::time::Instant::now();
