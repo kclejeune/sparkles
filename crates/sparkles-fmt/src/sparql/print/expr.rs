@@ -404,6 +404,14 @@ mod tests {
         );
         assert_eq!(
             filter("regex(?a,'x' , \"i\")"),
+            "  FILTER REGEX(?a, \"x\", \"i\")"
+        );
+        let preserve = Options {
+            quote_style: QuoteStyle::Preserve,
+            ..Options::default()
+        };
+        assert_eq!(
+            filter_with("regex(?a,'x' , \"i\")", &preserve),
             "  FILTER REGEX(?a, 'x', \"i\")"
         );
         assert_eq!(
