@@ -88,7 +88,7 @@ impl Store {
             // the index files go with the index (a build still running writes none: its
             // index is retired)
             #[cfg(feature = "geo")]
-            if let Some(root) = &self.root
+            if let Some(root) = self.root.as_ref().filter(|_| self.opts.geo_files)
                 && let Some(gdir) = snap.generation.dir.as_ref().filter(|d| d.starts_with(root))
             {
                 snap.generation
@@ -309,6 +309,7 @@ impl Store {
                     &ctl,
                     files.as_ref(),
                     false,
+                    self.opts.geo_files,
                     reuse.as_ref(),
                 )
             }));
@@ -424,6 +425,7 @@ impl Store {
     /// closing.
     fn spawn_geo_build(&self, idx: Arc<GeoIndex>, epoch: u64, snap: Arc<Snapshot>, load: bool) {
         let files = self.geo_files(&snap, &idx.config);
+        let write = self.opts.geo_files;
         let current = Arc::downgrade(&self.current);
         let writer = Arc::downgrade(&self.writer);
         let uid = snap.generation.uid;
@@ -453,6 +455,7 @@ impl Store {
                         &ctl,
                         files.as_ref(),
                         load,
+                        write,
                         None,
                     )
                 }));
@@ -486,10 +489,11 @@ impl Store {
 }
 
 /// The base of `snap`'s generation: with `load`, read from the generation's index files
-/// (`files`) when they fit it (files that do not are removed); else built (taking what
-/// it can from `reuse`) and, with `files`, written there and read back, so the base is
-/// read in place like one opened later.
+/// (`files`) when they fit it (with `write`, files that do not are removed); else built
+/// (taking what it can from `reuse`) and, with `write`, written there and read back, so
+/// the base is read in place like one opened later.
 #[cfg(feature = "geo")]
+#[allow(clippy::too_many_arguments)]
 fn base_for(
     snap: &Snapshot,
     cfg: &GeoConfig,
@@ -497,6 +501,7 @@ fn base_for(
     ctl: &BuildCtl<'_>,
     files: Option<&(PathBuf, Identity)>,
     load: bool,
+    write: bool,
     reuse: Option<&Reuse<'_>>,
 ) -> Result<GeoBase> {
     if let (Some((dir, ident)), true) = (files, load) {
@@ -508,12 +513,14 @@ fn base_for(
                     "spatial index file {}: {p}; it is built again",
                     dir.join(f).display()
                 );
-                snap.generation.geo.with_files(|| persist::remove(dir));
+                if write {
+                    snap.generation.geo.with_files(|| persist::remove(dir));
+                }
             }
         }
     }
     let base = build_base(snap, cfg, lookup, ctl, reuse)?;
-    let Some((dir, ident)) = files else {
+    let (Some((dir, ident)), true) = (files, write) else {
         return Ok(base);
     };
     let written = snap.generation.geo.with_files(|| {

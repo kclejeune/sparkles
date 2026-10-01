@@ -411,3 +411,47 @@ fn in_memory_stores_write_nothing() {
     let s = ds.store().enable_geo(GeoConfig::default()).unwrap();
     assert!(s.files.is_none() && s.memory.mapped_bytes == 0);
 }
+
+#[test]
+fn read_only_stores_write_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = persistent(dir.path(), GeoConfig::default());
+    let expected = answers(&ds);
+    let gdir = geo_dir(&ds.snapshot());
+    drop(ds);
+    std::fs::remove_dir_all(&gdir).unwrap();
+    let ro = StoreOptions {
+        geo_files: false,
+        ..opts()
+    };
+    let open = |o: StoreOptions| {
+        let ds = Dataset::open_with(dir.path(), o).unwrap();
+        assert_eq!(ds.store().wait_geo().unwrap().state, "ready");
+        ds
+    };
+    // built in memory, nothing written: not at open, a rebuild, a compaction or a disable
+    let ds = open(ro.clone());
+    assert!(ds.store().geo_status().unwrap().files.is_none());
+    assert_eq!(answers(&ds), expected);
+    ds.store().rebuild_geo().unwrap();
+    ds.compact().unwrap();
+    assert!(!geo_dir(&ds.snapshot()).exists());
+    assert_eq!(answers(&ds), expected);
+    drop(ds);
+    // files written by a writable store are read, and damaged ones left alone
+    let ds = open(opts());
+    let gdir = geo_dir(&ds.snapshot());
+    drop(ds);
+    let ds = open(ro.clone());
+    assert!(ds.store().geo_status().unwrap().files.unwrap().opened);
+    drop(ds);
+    let rtree = gdir.join(persist::RTREE_FILE);
+    let mut b = std::fs::read(&rtree).unwrap();
+    b[70] ^= 1;
+    std::fs::write(&rtree, &b).unwrap();
+    let ds = open(ro);
+    assert!(ds.store().geo_status().unwrap().files.is_none());
+    assert_eq!(answers(&ds), expected);
+    ds.store().disable_geo().unwrap();
+    assert_eq!(std::fs::read(&rtree).unwrap(), b);
+}
