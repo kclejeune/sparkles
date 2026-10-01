@@ -21,7 +21,54 @@ pub struct ExistsSpec {
     pub graph: super::plan::ActiveGraph,
     /// variables of the pattern that may be substituted from the outer row
     pub vars: Vec<VarId>,
+    /// constants already substituted for some of `vars` where the EXISTS appears
+    /// (initial bindings, filter equalities, the row of an enclosing EXISTS): the outer
+    /// table no longer holds them as columns, but they are part of the outer solution
+    pub bound: Vec<(VarId, Id)>,
     pub memo: Mutex<FxHashMap<Vec<Id>, bool>>,
+}
+
+impl ExistsSpec {
+    pub fn new(
+        pattern: GraphPattern,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+    ) -> ExistsSpec {
+        ExistsSpec {
+            pattern,
+            graph,
+            vars,
+            bound,
+            memo: Mutex::new(FxHashMap::default()),
+        }
+    }
+
+    /// The same EXISTS with `v` substituted by `c` as well.
+    pub fn with_bound(&self, v: VarId, c: Id) -> ExistsSpec {
+        let mut bound = self.bound.clone();
+        bound.push((v, c));
+        ExistsSpec::new(
+            self.pattern.clone(),
+            self.graph.clone(),
+            self.vars.clone(),
+            bound,
+        )
+    }
+
+    /// The value of `v` in the outer solution of `row`: its column, else the constant
+    /// substituted for it (`UNDEF` if neither).
+    #[inline]
+    pub fn value(&self, row: &Row<'_>, v: VarId) -> Id {
+        let id = row.get(v);
+        if !id.is_undef() {
+            return id;
+        }
+        self.bound
+            .iter()
+            .find(|b| b.0 == v)
+            .map_or(Id::UNDEF, |b| b.1)
+    }
 }
 
 #[derive(Clone)]
@@ -505,7 +552,7 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         }
         Expr::Exists(spec) => {
-            let key: Vec<Id> = spec.vars.iter().map(|&v| row.get(v)).collect();
+            let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
             if let Some(&r) = spec.memo.lock().get(&key) {
                 return Ok(b(r));
             }

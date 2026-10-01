@@ -764,6 +764,38 @@ fn exists() {
     assert_eq!(strs(&r), ["bob", "carol"]);
 }
 
+/// A variable replaced by a constant before the EXISTS is evaluated (filter equality,
+/// initial binding, the row of an enclosing EXISTS) is no column of the outer table,
+/// but it is still bound in the outer solution that EXISTS substitutes.
+#[test]
+fn exists_sees_substituted_variables() {
+    let s = store();
+    let r = q(
+        &s,
+        "SELECT ?p WHERE { ?p foaf:name ?n FILTER(?p = ex:carol) FILTER NOT EXISTS { ?p foaf:knows ?x } }",
+    );
+    assert_eq!(strs(&r), ["carol"]);
+    let r = q(
+        &s,
+        "SELECT ?p WHERE { ?p foaf:knows ?q FILTER EXISTS { ?q foaf:name ?n FILTER NOT EXISTS { ?q foaf:knows ?z } } }",
+    );
+    assert_eq!(strs(&r), ["alice", "bob"]);
+    let opts = QueryOptions {
+        initial_bindings: vec![(
+            "p".into(),
+            Term::NamedNode(oxrdf::NamedNode::new_unchecked("http://ex.org/carol")),
+        )],
+        ..Default::default()
+    };
+    let r = query(
+        s.snapshot(),
+        "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?n WHERE { ?p foaf:name ?n FILTER NOT EXISTS { ?p foaf:knows ?x } }",
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(strs(&r), ["Carol"]);
+}
+
 #[test]
 fn property_paths() {
     let s = store();
