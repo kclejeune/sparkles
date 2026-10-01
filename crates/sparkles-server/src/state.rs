@@ -232,6 +232,48 @@ pub struct AppState {
     manage: Mutex<()>,
     /// background task slots (`serve --max-tasks`)
     pub task_queue: TaskQueue,
+    /// `POST /$/format` (`serve --format-*`)
+    #[cfg(feature = "fmt")]
+    pub format: FormatConf,
+}
+
+/// Who may use `POST /$/format` (`serve --format-endpoint`).
+#[cfg(feature = "fmt")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum FormatEndpoint {
+    /// every caller the server admits, anonymous ones included
+    #[default]
+    On,
+    /// every caller but the anonymous principal (401)
+    Authenticated,
+    /// nobody (404)
+    Off,
+}
+
+/// The format endpoint's settings and its slots.
+#[cfg(feature = "fmt")]
+#[derive(Clone, Debug)]
+pub struct FormatConf {
+    pub endpoint: FormatEndpoint,
+    /// the largest request body (`--format-max-mb`; `None`: unlimited)
+    pub max_bytes: Option<u64>,
+    /// how long a request may take, waiting for a slot included (`--format-timeout`)
+    pub timeout: std::time::Duration,
+    /// requests formatting at once (one per core); more wait until their deadline
+    pub permits: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(feature = "fmt")]
+impl Default for FormatConf {
+    fn default() -> FormatConf {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        FormatConf {
+            endpoint: FormatEndpoint::On,
+            max_bytes: Some(16 << 20),
+            timeout: std::time::Duration::from_secs(10),
+            permits: Arc::new(tokio::sync::Semaphore::new(cores)),
+        }
+    }
 }
 
 /// Reasoning status is kept inside the database directory (`reasoning.json`) so it
@@ -434,6 +476,8 @@ impl AppState {
             backup: None,
             manage: Mutex::new(()),
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
+            #[cfg(feature = "fmt")]
+            format: FormatConf::default(),
         };
         // clones that were being built when the server stopped are never registered
         for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
@@ -490,6 +534,8 @@ impl AppState {
             backup: None,
             manage: Mutex::new(()),
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
+            #[cfg(feature = "fmt")]
+            format: FormatConf::default(),
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),

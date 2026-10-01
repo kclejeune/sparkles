@@ -14,6 +14,7 @@ sparkles = { path = "crates/sparkles" }
 sparkles-reasoner = { path = "crates/sparkles-reasoner" }
 sparkles-shacl = { path = "crates/sparkles-shacl" }
 sparkles-backup = { path = "crates/sparkles-backup" }
+sparkles-fmt = { path = "crates/sparkles-fmt" }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
@@ -59,6 +60,12 @@ chrono-tz = "0.10"
 futures = "0.3"
 bytes = "1"
 async-trait = "0.1"
+# the formatter (crates/sparkles-fmt, `sparkles fmt`)
+unicode-width = "0.2"
+ignore = "0.4"
+similar = "2"
+proptest = "1"
+toml = "1"
 
 [profile.release]
 lto = "thin"

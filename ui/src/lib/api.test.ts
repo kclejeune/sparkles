@@ -57,6 +57,49 @@ describe('errors', () => {
   });
 });
 
+describe('format', () => {
+  it('posts the text, language and cursor and returns the result', async () => {
+    const result = {
+      text: 'ASK {}',
+      changed: false,
+      language: 'sparql',
+      cursorOffset: 3,
+      warnings: [],
+    };
+    const calls = stubFetch(() => jsonResponse(result));
+    const r = await api.format({ text: 'ASK {}', language: 'sparql', cursorOffset: 3 });
+    expect(r).toEqual(result);
+    expect(calls[0].url).toBe('/$/format');
+    expect(calls[0].init.method).toBe('POST');
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({
+      text: 'ASK {}',
+      language: 'sparql',
+      cursorOffset: 3,
+    });
+  });
+
+  it('throws syntax errors with their code and position', async () => {
+    stubFetch(() =>
+      jsonResponse(
+        {
+          error: 'SPARQL syntax error at line 1, column 11: expected …',
+          code: 'syntax',
+          language: 'sparql',
+          line: 1,
+          column: 11,
+          requestId: 'r1',
+        },
+        400,
+      ),
+    );
+    const e = await api.format({ text: 'select * {' }).catch((x) => x);
+    expect(e).toBeInstanceOf(api.ApiError);
+    expect(e.code).toBe('syntax');
+    expect(e.line).toBe(1);
+    expect(e.column).toBe(11);
+  });
+});
+
 describe('query', () => {
   it('encodes the dataset and options and strips ?-prefixed variable names', async () => {
     const calls = stubFetch(() =>

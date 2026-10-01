@@ -27,6 +27,7 @@
     value,
     onchange,
     onrun,
+    onformat,
     completion,
     placeholder = 'SELECT * WHERE { ?s ?p ?o } LIMIT 100',
   }: {
@@ -35,6 +36,8 @@
     value: string;
     onchange: (value: string) => void;
     onrun: () => void;
+    /** Format the document (Shift+Alt+F); not bound yet. */
+    onformat?: () => void;
     completion: CompletionData;
     placeholder?: string;
   } = $props();
@@ -193,6 +196,26 @@
 
   export function focus() {
     view?.focus();
+  }
+
+  /** The document and the cursor (UTF-16 code units, CodeMirror's unit), to format. */
+  export function snapshot(): { text: string; cursorOffset: number } {
+    return {
+      text: view?.state.doc.toString() ?? value,
+      cursorOffset: view?.state.selection.main.head ?? 0,
+    };
+  }
+
+  /**
+   * Replace the document with its formatted text as one undoable change, the cursor at
+   * `cursorOffset`.
+   *
+   * TODO: replace only the changed middle (common prefix and suffix trimmed); a no-op until
+   * the Format button lands.
+   */
+  export function replaceFormatted(text: string, cursorOffset: number | null) {
+    void text;
+    void cursorOffset;
   }
 
   export function forget(id: string) {

@@ -189,6 +189,10 @@ fn classifies_routes() {
     );
     assert_eq!(c(Some("/$/datasets"), Method::GET, "/$/datasets"), None);
     assert_eq!(
+        c(Some("/$/format"), Method::POST, "/$/format"),
+        Some(Class::Query)
+    );
+    assert_eq!(
         c(Some("/$/datasets"), Method::POST, "/$/datasets"),
         Some(Class::Admin)
     );

@@ -1,0 +1,24 @@
+[package]
+name = "sparkles-fmt"
+description = "Opinionated, comment-preserving formatter for SPARQL (and later the RDF syntaxes)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No server dependency, and no std-only dependency where it is cheap to avoid one, so the
+# library can later build for wasm32-unknown-unknown.
+[dependencies]
+spargebra.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+# the crate itself with the test-only fault switch, for tests/fault.rs
+sparkles-fmt = { path = ".", features = ["fault-injection"] }
+proptest.workspace = true
+toml.workspace = true
+
+[features]
+# Test only: with `SPARKLES_FMT_FAULT=drop-token` in the environment the printer drops one
+# token, which proves that the safety checks fire.
+fault-injection = []

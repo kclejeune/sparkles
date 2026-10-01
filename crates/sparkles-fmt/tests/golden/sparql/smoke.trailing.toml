@@ -1,0 +1,2 @@
+operator-position = "trailing"
+prefix-groups = [["rdf", "rdfs"], ["", "ex"]]

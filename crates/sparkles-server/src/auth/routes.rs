@@ -65,6 +65,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
+    // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
+    ("/$/format", &["POST"]),
     // backup repositories (feature `backup`)
     ("/$/repositories", &["GET", "POST"]),
     ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
@@ -156,6 +158,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/auth/device/{user_code}/deny"
         | "/$/auth/cli/authorize" => Interactive,
         "/$/server" | "/$/tasks" | "/$/tasks/{id}" => Caller,
+        // reads no dataset; `--format-endpoint authenticated|off` is the handler's
+        "/$/format" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
         "/$/datasets" if get => Caller,
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
@@ -938,6 +942,8 @@ mod tests {
         );
         // cancelling is checked by the handler
         assert_eq!(n(Method::DELETE, "/$/tasks/{id}"), Some(Need::Caller));
+        // formatting reads no dataset
+        assert_eq!(n(Method::POST, "/$/format"), Some(Need::Caller));
     }
 
     #[test]

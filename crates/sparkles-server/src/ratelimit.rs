@@ -119,8 +119,9 @@ pub fn classify(
         if admin == "ping" || admin == "metrics" || admin.starts_with("ready") {
             return None;
         }
-        // reads that run queries over a dataset
-        if admin.starts_with("schema/")
+        // reads that run queries over a dataset, and formatting (cheap, read-like work)
+        if admin == "format"
+            || admin.starts_with("schema/")
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
         {
