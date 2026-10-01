@@ -1,0 +1,187 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  SelectQuery
+    SelectClause
+      Kw(Select) "SELECT"
+      Star "*"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+          Dot "."
+        Optional
+          Kw(Optional) "OPTIONAL"
+          GroupGraphPattern
+            LBrace "{"
+            TriplesStmt
+              Var1 "?s"
+              PropertyListEntry
+                PnameLn "ex:q"
+                Object
+                  Var1 "?q"
+            RBrace "}"
+        Dot "."
+        Minus
+          Kw(Minus) "MINUS"
+          GroupGraphPattern
+            LBrace "{"
+            TriplesStmt
+              Var1 "?s"
+              PropertyListEntry
+                Kw(A) "a"
+                Object
+                  PnameLn "ex:Hidden"
+            RBrace "}"
+        Union
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              TriplesStmt
+                Var1 "?s"
+                PropertyListEntry
+                  PnameLn "ex:r"
+                  Object
+                    Integer "1"
+              RBrace "}"
+          Kw(Union) "UNION"
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              TriplesStmt
+                Var1 "?s"
+                PropertyListEntry
+                  PnameLn "ex:r"
+                  Object
+                    Integer "2"
+              RBrace "}"
+          Kw(Union) "UNION"
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              TriplesStmt
+                Var1 "?s"
+                PropertyListEntry
+                  PnameLn "ex:r"
+                  Object
+                    Integer "3"
+              RBrace "}"
+        Union
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              TriplesStmt
+                Var1 "?s"
+                PropertyListEntry
+                  PnameLn "ex:alone"
+                  Object
+                    Var1 "?x"
+              RBrace "}"
+        TriplesStmt
+          Var1 "?o"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?z"
+        GraphPattern
+          Kw(Graph) "GRAPH"
+          Var1 "?g"
+          GroupGraphPattern
+            LBrace "{"
+            TriplesStmt
+              Var1 "?z"
+              PropertyListEntry
+                PnameLn "ex:p"
+                Object
+                  Var1 "?w"
+            RBrace "}"
+        Service
+          Kw(Service) "SERVICE"
+          Kw(Silent) "SILENT"
+          IriRef "<http://example.org/sparql>"
+          GroupGraphPattern
+            LBrace "{"
+            TriplesStmt
+              Var1 "?w"
+              PropertyListEntry
+                PnameLn "ex:p"
+                Object
+                  Var1 "?v"
+            RBrace "}"
+        Service
+          Kw(Service) "SERVICE"
+          PnameLn "ex:endpoint"
+          GroupGraphPattern
+            LBrace "{"
+            RBrace "}"
+        Filter
+          Kw(Filter) "FILTER"
+          Opaque
+            LParen "("
+            Var1 "?o"
+            NotEq "!="
+            Var1 "?z"
+            RParen ")"
+        Filter
+          Kw(Filter) "FILTER"
+          Opaque
+            Word "regex"
+            LParen "("
+            Var1 "?v"
+            Comma ","
+            String2 "\"x\""
+            RParen ")"
+        Bind
+          Kw(Bind) "BIND"
+          LParen "("
+          Opaque
+            Var1 "?v"
+          Kw(As) "AS"
+          Var1 "?bound"
+          RParen ")"
+        InlineValues
+          Kw(Values) "VALUES"
+          Var1 "?s"
+          LBrace "{"
+          DataValue
+            PnameLn "ex:a"
+          RBrace "}"
+        Union
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              SubSelect
+                SelectClause
+                  Kw(Select) "SELECT"
+                  ProjectionItem
+                    Var1 "?s"
+                WhereClause
+                  Kw(Where) "WHERE"
+                  GroupGraphPattern
+                    LBrace "{"
+                    TriplesStmt
+                      Var1 "?s"
+                      PropertyListEntry
+                        PnameLn "ex:p"
+                        Object
+                          Var1 "?o"
+                    RBrace "}"
+                Limit
+                  Kw(Limit) "LIMIT"
+                  Integer "1"
+              RBrace "}"
+        Union
+          UnionBranch
+            GroupGraphPattern
+              LBrace "{"
+              RBrace "}"
+        RBrace "}"

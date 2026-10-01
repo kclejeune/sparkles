@@ -1,0 +1,25 @@
+QueryUnit
+  Prologue
+    VersionDecl
+      Kw(Version) "VERSION"
+      String2 "\"1.2\""
+    BaseDecl
+      Kw(Base) "BASE"
+      IriRef "<http://example.org/>"
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/ns#>"
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs ":"
+      IriRef "<http://example.org/default#>"
+    BaseDecl
+      Kw(Base) "base"
+      IriRef "<relative/>"
+  AskQuery
+    Kw(Ask) "ASK"
+    WhereClause
+      GroupGraphPattern
+        LBrace "{"
+        RBrace "}"
