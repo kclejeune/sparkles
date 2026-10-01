@@ -59,10 +59,13 @@ pub struct Optimizations {
     pub selective_columns: bool,
     /// spatial FILTERs on an indexed predicate's object search the spatial index
     pub spatial_pushdown: bool,
+    /// pure expressions over one variable (FILTER, BIND, ORDER BY keys, aggregate
+    /// arguments) are evaluated once per distinct value
+    pub expr_cache: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 9] = [
+    pub const NAMES: [&str; 10] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -72,6 +75,7 @@ impl Optimizations {
         "ordered_topk",
         "selective_columns",
         "spatial_pushdown",
+        "expr_cache",
     ];
 
     /// Everything on.
@@ -85,6 +89,7 @@ impl Optimizations {
         ordered_topk: true,
         selective_columns: true,
         spatial_pushdown: true,
+        expr_cache: true,
     };
 
     /// Everything off: the generic operators only.
@@ -98,6 +103,7 @@ impl Optimizations {
         ordered_topk: false,
         selective_columns: false,
         spatial_pushdown: false,
+        expr_cache: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -111,6 +117,7 @@ impl Optimizations {
             "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
             "spatial_pushdown" => &mut self.spatial_pushdown,
+            "expr_cache" => &mut self.expr_cache,
             _ => return None,
         })
     }

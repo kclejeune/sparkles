@@ -256,6 +256,10 @@ add regex-iri 'SELECT (COUNT(*) AS ?c) WHERE { ?s foaf:name ?o FILTER(REGEX(STR(
 add knows-reach 'SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/person/0> foaf:knows* ?x }'
 add distinct-join 'SELECT DISTINCT ?o WHERE { ?a foaf:knows ?b . ?b ex:worksFor ?o }'
 add lang-filter 'SELECT (COUNT(*) AS ?c) WHERE { ?d ex:title ?t FILTER(LANGMATCHES(LANG(?t), "en")) }'
+# expressions over values that repeat (years, ages): BIND, ORDER BY keys and aggregate arguments
+add expr-bind-group 'SELECT ?decade (COUNT(*) AS ?c) WHERE { ?d ex:year ?y BIND(FLOOR(?y / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade'
+add expr-order-key 'SELECT ?p ?a WHERE { ?p foaf:age ?a } ORDER BY DESC(ABS(?a - 50)) ?p LIMIT 10'
+add expr-agg-arg 'SELECT ?o (SUM(?a * 12) AS ?months) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } GROUP BY ?o ORDER BY DESC(?months) ?o LIMIT 10'
 
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"

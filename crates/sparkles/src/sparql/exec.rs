@@ -2,6 +2,7 @@
 
 use super::ctx::Ctx;
 use super::expr::{Expr, Row, Val, ebv, eval};
+use super::exprcache::Report as ExprReport;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
@@ -155,6 +156,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     // runtime detail for EXPLAIN (which variant of the operator ran)
     let mut note: Option<String> = None;
     let mut counters = None;
+    // expressions evaluated per distinct value
+    let mut expr_report = ExprReport::default();
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
@@ -288,15 +291,15 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             }
             out
         }
-        Kind::Filter(exprs) => {
+        Kind::Filter(es) => {
             let mut t = child(0, &mut infos)?;
-            apply_filter(ctx, &mut t, exprs)?;
+            expr_report = apply_filter(ctx, &mut t, es)?;
             t
         }
         Kind::Extend(v, e) => {
             let mut t = child(0, &mut infos)?;
             ctx.check_output(t.len(), 1)?;
-            let col = compute_column(ctx, &t, e)?;
+            let col = compute_column(ctx, &t, e, &mut expr_report)?;
             t.vars.push(*v);
             t.cols.push(col);
             t
@@ -310,7 +313,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         Kind::OrderBy { keys, limit } => {
             let t = child(0, &mut infos)?;
-            let (t, pre) = order_by(ctx, t, keys, *limit)?;
+            let (t, pre) = order_by(ctx, t, keys, *limit, &mut expr_report)?;
             if let Some(kept) = pre {
                 note = Some(format!("[numeric prefilter kept {kept} rows]"));
             }
@@ -332,7 +335,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::Slice { offset, limit } => child(0, &mut infos)?.slice(*offset, *limit),
         Kind::Group { keys, aggs } => {
             let t = child(0, &mut infos)?;
-            group(ctx, &t, keys, aggs)?
+            group(ctx, &t, keys, aggs, &mut expr_report)?
         }
         Kind::Path {
             spec,
@@ -390,6 +393,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
     } else {
         table.sorted = n.sorted.clone();
+    }
+    if let Some(x) = expr_report.note() {
+        note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+        counters = counters.or_else(|| expr_report.counters());
     }
     ctx.check()?;
     // the inputs are gone (or became the output): only the output is alive now
@@ -614,14 +621,14 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
 }
 
 /// Apply a row-preserving / row-reducing unary operator to its input.
-fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table) -> Result<Table> {
+fn apply_unary(ctx: &Ctx, n: &Node, mut t: Table, report: &mut ExprReport) -> Result<Table> {
     Ok(match &n.kind {
         Kind::Filter(exprs) => {
-            apply_filter(ctx, &mut t, exprs)?;
+            report.extend(apply_filter(ctx, &mut t, exprs)?);
             t
         }
         Kind::Extend(v, e) => {
-            let col = compute_column(ctx, &t, e)?;
+            let col = compute_column(ctx, &t, e, report)?;
             t.vars.push(*v);
             t.cols.push(col);
             t
@@ -664,9 +671,17 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
             let mut budget = want.max(64);
             loop {
                 let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
-                let out = apply_unary(ctx, n, input)?;
+                let mut report = ExprReport::default();
+                let out = apply_unary(ctx, n, input, &mut report)?;
                 if out.len() >= want || complete {
-                    return finish(out, vec![cinfo], complete);
+                    let r = finish(out, vec![cinfo], complete);
+                    return r.map(|(t, mut info, complete)| {
+                        if let Some(x) = report.note() {
+                            info.description = format!("{} {x}", info.description);
+                            info.counters = report.counters();
+                        }
+                        (t, info, complete)
+                    });
                 }
                 budget = budget.saturating_mul(8);
             }
@@ -1004,7 +1019,7 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
     if rest.len() > spec.k {
-        rest = order_by(ctx, rest, &keys, Some(spec.k))?.0;
+        rest = order_by(ctx, rest, &keys, Some(spec.k), &mut ExprReport::default())?.0;
     }
     let held = ctx.charge(rest.mem_bytes())?;
     let better = if spec.asc {
@@ -1026,7 +1041,7 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
         }
         cand.sorted.clear();
         cand.sort_by_vars(&spec.tie_order);
-        let (top, _) = order_by(ctx, cand, &keys, Some(spec.k))?;
+        let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
@@ -1606,23 +1621,31 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     Some(out)
 }
 
-fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<()> {
-    let t0 = Instant::now();
-    let keep = match distinct_filter_mask(ctx, t, exprs)? {
-        Some(keep) => {
-            tracing::debug!("filter evaluated per distinct value in {:?}", t0.elapsed());
-            keep
-        }
-        None => filter_mask(ctx, t, exprs)?,
-    };
+/// Keep the rows that pass every conjunct: conjuncts that are pure over one variable
+/// are tested once per distinct value (see [`super::exprcache`]), the others row by row
+/// on the rows that are left.
+fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<ExprReport> {
+    let mut report = ExprReport::default();
     let sorted = t.sorted.clone();
-    t.filter_rows(&keep);
+    match super::exprcache::filter(ctx, t, exprs, &mut report)? {
+        Some((keep, rest)) => {
+            t.filter_rows(&keep);
+            if !rest.is_empty() {
+                let keep = filter_mask(ctx, t, &rest)?;
+                t.filter_rows(&keep);
+            }
+        }
+        None => {
+            let keep = filter_mask(ctx, t, exprs)?;
+            t.filter_rows(&keep);
+        }
+    }
     t.sorted = sorted;
-    Ok(())
+    Ok(report)
 }
 
 /// Evaluate the filter row by row.
-fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
+pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!("decoded values in {:?}", t0.elapsed());
@@ -1643,119 +1666,20 @@ fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
     Ok(keep)
 }
 
-/// A deterministic filter that reads a single variable has the same outcome for every
-/// row holding the same id: evaluate it once per distinct id and look the outcome up per
-/// row, instead of decoding and testing every row. Values of a column often repeat
-/// (names, labels, categories), and a column sorted on the variable yields its distinct
-/// ids as runs without sorting.
-fn distinct_filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<bool>>> {
-    if t.len() < 4096
-        || !exprs.iter().any(super::expr::needs_values)
-        || !exprs.iter().all(super::cache::deterministic)
+/// BIND: the value of `e` on every row (unbound on an error), once per distinct input
+/// value when the expression is pure over one variable.
+fn compute_column(ctx: &Ctx, t: &Table, e: &Expr, report: &mut ExprReport) -> Result<Vec<Id>> {
+    if t.len() >= super::exprcache::MIN_ROWS
+        && super::exprcache::eligible(&[e]).is_ok()
+        && let Some(p) =
+            super::exprcache::per_value(ctx, t, &[e], false, report, |v| column_rows(ctx, v, e))?
     {
-        return Ok(None);
+        return Ok(p.rows(t.len()));
     }
-    let mut vars = Vec::new();
-    for e in exprs {
-        e.vars(&mut vars);
-    }
-    vars.sort_unstable();
-    vars.dedup();
-    let &[v] = vars.as_slice() else {
-        return Ok(None);
-    };
-    let Some(c) = t.col_of(v) else {
-        return Ok(None);
-    };
-    let col = &t.cols[c];
-    let runs = t.sorted.first() == Some(&v);
-    let mut uniq = col.clone();
-    if !runs {
-        uniq.par_sort_unstable();
-    }
-    uniq.dedup();
-    let (hit, uniq) = match super::keyfilter::KeyFilter::new(exprs, v) {
-        Some(kf) => (key_filter_mask(ctx, &kf, &uniq, v, exprs)?, uniq),
-        // the general evaluator gains nothing when (nearly) every value is different
-        None if uniq.len() > col.len() / 4 * 3 => return Ok(None),
-        None => {
-            let mut values = Table::new(vec![v]);
-            values.len = uniq.len();
-            values.cols[0] = uniq;
-            let hit = filter_mask(ctx, &values, exprs)?;
-            (hit, std::mem::take(&mut values.cols[0]))
-        }
-    };
-    ctx.check()?;
-    Ok(Some(if runs {
-        // `uniq` lists the runs in column order
-        let mut j = 0;
-        col.iter()
-            .map(|id| {
-                if *id != uniq[j] {
-                    j += 1;
-                }
-                hit[j]
-            })
-            .collect()
-    } else {
-        col.par_iter()
-            .map(|id| hit[uniq.binary_search(id).unwrap()])
-            .collect()
-    }))
+    column_rows(ctx, t, e)
 }
 
-/// Outcome of a key filter for sorted distinct ids: base-vocabulary terms are tested on
-/// their keys straight from the front-coded blocks (in parallel, each block visited once),
-/// update-added terms on their delta keys, and everything else (inline literals, blank
-/// nodes, unbound) by the general evaluator.
-fn key_filter_mask(
-    ctx: &Ctx,
-    kf: &super::keyfilter::KeyFilter,
-    uniq: &[Id],
-    v: VarId,
-    exprs: &[Expr],
-) -> Result<Vec<bool>> {
-    use crate::id::Tag;
-    let vocab = &ctx.snap.generation.vocab;
-    let mut hit = vec![false; uniq.len()];
-    // raw ids sort by tag first, so the vocabulary ids are one contiguous range
-    let lo = uniq.partition_point(|id| id.tag() < Tag::Vocab);
-    let hi = lo + uniq[lo..].partition_point(|id| id.tag() == Tag::Vocab);
-    ctx.check()?;
-    hit[lo..hi]
-        .par_chunks_mut(4096)
-        .zip(uniq[lo..hi].par_chunks(4096))
-        .for_each(|(h, ids)| {
-            let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
-            let mut j = 0;
-            vocab.get_sorted(&payloads, |p, k| {
-                while payloads[j] != p {
-                    j += 1;
-                }
-                h[j] = kf.test(k);
-            });
-        });
-    let mut rest = Table::new(vec![v]);
-    let mut rest_at = Vec::new();
-    for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {
-        match ctx.snap.key(*id) {
-            Some(k) => hit[i] = kf.test(&k),
-            None => {
-                rest.push_row(&[*id]);
-                rest_at.push(i);
-            }
-        }
-    }
-    if !rest_at.is_empty() {
-        for (i, h) in rest_at.into_iter().zip(filter_mask(ctx, &rest, exprs)?) {
-            hit[i] = h;
-        }
-    }
-    Ok(hit)
-}
-
-fn compute_column(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
     let dec = decode_for(ctx, t, &[e]);
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
@@ -1815,6 +1739,7 @@ fn order_by(
     mut t: Table,
     keys: &[(Expr, bool)],
     limit: Option<usize>,
+    report: &mut ExprReport,
 ) -> Result<(Table, Option<usize>)> {
     let mut prefiltered = None;
     if let Some(k) = limit
@@ -1827,7 +1752,7 @@ fn order_by(
         ctx.check_output(cand.len(), t.width())?;
         t = t.take_rows(&cand);
     }
-    Ok((order_by_rows(ctx, t, keys, limit)?, prefiltered))
+    Ok((order_by_rows(ctx, t, keys, limit, report)?, prefiltered))
 }
 
 fn order_by_rows(
@@ -1835,36 +1760,62 @@ fn order_by_rows(
     t: Table,
     keys: &[(Expr, bool)],
     limit: Option<usize>,
+    report: &mut ExprReport,
 ) -> Result<Table> {
-    let dec = decode_for(ctx, &t, &keys.iter().map(|(e, _)| e).collect::<Vec<_>>());
-    let map = t.var_map(ctx.nvars());
-    let key_vals: Vec<Vec<Option<Value>>> = keys
+    // each key's value per row (`None`: an error), per distinct input value where the
+    // key is pure over one variable
+    let key_rows = |t: &Table, e: &Expr, dec: Option<&super::expr::DecodedCols>| {
+        let map = t.var_map(ctx.nvars());
+        let f = |i: usize| {
+            eval(
+                e,
+                &Row {
+                    table: t,
+                    i,
+                    map: &map,
+                    dec,
+                },
+                ctx,
+            )
+            .ok()
+            .and_then(|v| match v {
+                Val::Id(id) => ctx.value(id),
+                Val::V(v) | Val::Dec(_, v) => Some(v),
+            })
+        };
+        map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
+    };
+    let mut cached: Vec<Option<super::exprcache::PerValue<Option<Value>>>> = Vec::new();
+    for (e, _) in keys {
+        cached.push(if t.len() >= super::exprcache::MIN_ROWS {
+            super::exprcache::per_value(ctx, &t, &[e], false, report, |v| {
+                key_rows(v, e, decode_for(ctx, v, &[e]).as_ref())
+            })?
+        } else {
+            None
+        });
+    }
+    let rest: Vec<&Expr> = keys
         .iter()
-        .map(|(e, _)| -> Result<Vec<Option<Value>>> {
-            let f = |i: usize| {
-                eval(
-                    e,
-                    &Row {
-                        table: &t,
-                        i,
-                        map: &map,
-                        dec: dec.as_ref(),
-                    },
-                    ctx,
-                )
-                .ok()
-                .and_then(|v| match v {
-                    Val::Id(id) => ctx.value(id),
-                    Val::V(v) | Val::Dec(_, v) => Some(v),
-                })
-            };
-            map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
+        .zip(&cached)
+        .filter(|(_, c)| c.is_none())
+        .map(|((e, _), _)| e)
+        .collect();
+    let dec = decode_for(ctx, &t, &rest);
+    let key_vals: Vec<super::exprcache::Column<Option<Value>>> = keys
+        .iter()
+        .zip(cached)
+        .map(|((e, _), c)| {
+            Ok(match c {
+                Some(p) => super::exprcache::Column::Values(p),
+                None => super::exprcache::Column::Rows(key_rows(&t, e, dec.as_ref())?),
+            })
         })
         .collect::<Result<_>>()?;
     ctx.check()?;
     let cmp = |a: &usize, b: &usize| {
         for (k, (_, asc)) in keys.iter().enumerate() {
-            let o = order_cmp(key_vals[k][*a].as_ref(), key_vals[k][*b].as_ref());
+            let o = order_cmp(key_vals[k].get(*a).as_ref(), key_vals[k].get(*b).as_ref());
             let o = if *asc { o } else { o.reverse() };
             if o != Ordering::Equal {
                 return o;
@@ -1914,7 +1865,13 @@ fn distinct(t: Table) -> Table {
 
 // ------------------------------------------------------------------ group ------
 
-fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<Table> {
+fn group(
+    ctx: &Ctx,
+    t: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    report: &mut ExprReport,
+) -> Result<Table> {
     if ctx.opt.incremental_group
         && let Some(out) = group_incremental(ctx, t, keys, aggs)?
     {
@@ -1948,12 +1905,37 @@ fn group(ctx: &Ctx, t: &Table, keys: &[VarId], aggs: &[(VarId, Agg)]) -> Result<
     vars.extend(aggs.iter().map(|(v, _)| *v));
     let mut out = Table::new(vars);
     let map = t.var_map(ctx.nvars());
+    // aggregate arguments that are pure over one variable, once per distinct value
+    let mut args = Vec::with_capacity(aggs.len());
+    for (_, agg) in aggs {
+        args.push(match &agg.expr {
+            Some(e)
+                if t.len() >= super::exprcache::MIN_ROWS
+                    && super::exprcache::eligible(&[e]).is_ok() =>
+            {
+                super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
+                    let map = v.var_map(ctx.nvars());
+                    let f = |i: usize| {
+                        let row = Row {
+                            table: v,
+                            i,
+                            map: &map,
+                            dec: None,
+                        };
+                        eval(e, &row, ctx).ok().map(|x| x.into_id(ctx))
+                    };
+                    map_rows(ctx, v.len(), v.len() > PAR_THRESHOLD && !e.has_exists(), f)
+                })?
+            }
+            _ => None,
+        });
+    }
     for key in order {
         ctx.check()?;
         let rows = &groups[&key];
         let mut row = key.clone();
-        for (_, agg) in aggs {
-            row.push(aggregate(ctx, t, &map, rows, agg));
+        for ((_, agg), arg) in aggs.iter().zip(&args) {
+            row.push(aggregate(ctx, t, &map, rows, agg, arg.as_ref()));
         }
         out.push_row(&row);
     }
@@ -2181,7 +2163,16 @@ fn group_incremental(
     Ok(Some(out))
 }
 
-fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Agg) -> Id {
+/// One aggregate of one group; `arg` holds the argument's value per row when it was
+/// evaluated per distinct value (`None` in it: an error).
+fn aggregate(
+    ctx: &Ctx,
+    t: &Table,
+    map: &[Option<usize>],
+    rows: &[u32],
+    agg: &Agg,
+    arg: Option<&super::exprcache::PerValue<Option<Id>>>,
+) -> Id {
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
@@ -2197,6 +2188,9 @@ fn aggregate(ctx: &Ctx, t: &Table, map: &[Option<usize>], rows: &[u32], agg: &Ag
     let mut vals: Vec<Result<Id, ()>> = rows
         .iter()
         .map(|&i| {
+            if let Some(a) = arg {
+                return a.get(i as usize).ok_or(());
+            }
             eval(
                 e,
                 &Row {

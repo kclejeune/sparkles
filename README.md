@@ -297,9 +297,17 @@ result cache, and the web UI.
   key bytes (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in
   parallel, with no per-term string allocation. Terms added by updates are tested on
   their delta keys; inline values (numbers, dates) fall back to the general evaluator.
-* **Per-distinct-value filters.** A deterministic filter over one variable is
-  evaluated once per distinct id, and rows look up the outcome. When the column is
-  sorted on the variable, the distinct ids are its runs.
+* **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND,
+  ORDER BY key or aggregate argument that reads one variable, and gives the same result
+  for the same term, is evaluated once per distinct id of that variable. Rows look up
+  the result, errors included. RAND, UUID, STRUUID, BNODE and EXISTS are evaluated per
+  row; NOW and the base IRI are fixed for the query. When the column is sorted on the
+  variable, the distinct ids are its runs. Otherwise a sample estimates how often values
+  repeat, and inputs where fewer than half of the rows repeat a value are evaluated row
+  by row. EXPLAIN notes `[expr cache: …]` with the distinct count, or why the operator
+  ran row by row, and reports `exprCacheHits` / `exprCacheMisses` / `exprCacheSkipped`.
+  A constant regular expression is compiled once per thread and reused with its match
+  cache.
 * **Numeric range scans.** A FILTER comparing a scan's sort column with numeric
   constants reads only the id ranges that can match. Inline integers, and inline
   decimals of one scale, sort by value within their id segment. So each segment's

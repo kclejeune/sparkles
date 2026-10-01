@@ -4,6 +4,7 @@ pub mod cache;
 pub mod ctx;
 pub mod exec;
 pub mod expr;
+mod exprcache;
 pub mod geopf;
 mod keyfilter;
 pub mod plan;
@@ -677,6 +678,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod exprcache_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]
