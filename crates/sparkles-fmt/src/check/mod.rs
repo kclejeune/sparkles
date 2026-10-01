@@ -143,17 +143,19 @@ mod fault {
     use crate::lex::TokenKind;
     use crate::tree::Tree;
 
-    /// With `SPARKLES_FMT_FAULT=drop-token`, drop the first variable, IRI or prefixed
-    /// name of the output.
+    /// With `SPARKLES_FMT_FAULT=drop-token`, drop the first variable, IRI, prefixed name
+    /// or string of the output.
     pub(super) fn inject(tree: &Tree<'_>, mut printed: Printed) -> Printed {
         if std::env::var("SPARKLES_FMT_FAULT").as_deref() != Ok("drop-token") {
             return printed;
         }
         let victim = printed.tok_out.iter().position(|&(id, ..)| {
-            matches!(
-                tree.token_kind(id),
-                TokenKind::Var1 | TokenKind::Var2 | TokenKind::IriRef | TokenKind::PnameLn
-            )
+            let kind = tree.token_kind(id);
+            kind.is_string()
+                || matches!(
+                    kind,
+                    TokenKind::Var1 | TokenKind::Var2 | TokenKind::IriRef | TokenKind::PnameLn
+                )
         });
         if let Some(i) = victim {
             let (_, start, len) = printed.tok_out.remove(i);

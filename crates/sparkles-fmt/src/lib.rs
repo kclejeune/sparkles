@@ -718,7 +718,7 @@ mod tests {
         );
         assert_eq!(Language::from_media_type("text/plain"), None);
         assert!(Language::Sparql.is_implemented());
-        assert!(!Language::Turtle.is_implemented());
+        assert!(Language::Turtle.is_implemented() && Language::TriG.is_implemented());
     }
 
     #[test]
