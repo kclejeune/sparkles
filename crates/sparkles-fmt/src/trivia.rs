@@ -7,7 +7,9 @@
 //!   block ending with `# sparkles-fmt: ignore` right before the first node: it leads
 //!   that node, so a node sorted to the top keeps its pragma.
 //! - A comment on `P`'s line **trails** the outermost attachment node that ends at `P`;
-//!   a separator (`,` `;` `.` `&&` `||`) counts as part of the item before it.
+//!   a separator (`,` `;` `.` `&&` `||`) counts as part of the item before it, on
+//!   either side of the comment. A comment after separators whose item has a trailing
+//!   comment already does not trail (both would end one printed line).
 //! - The other comments form blocks, split at blank lines. Before a closing bracket (or
 //!   the end of the input) they **dangle** in the innermost container that `N` closes.
 //!   Otherwise the last block, when no blank line follows it, **leads** the outermost
@@ -59,6 +61,8 @@ pub struct Comments {
     blank_tokens: HashSet<TokenId>,
     /// comments with a blank line right before them
     blank_comments: HashSet<TokenId>,
+    /// significant tokens a trailing comment follows
+    trailed: HashSet<TokenId>,
     ignored: HashSet<NodeId>,
     ignore_file: bool,
     /// displaced comments and the warning printing them gives
@@ -154,18 +158,23 @@ impl Shape<'_, '_> {
 
     /// The node a comment on `p`'s line trails, `n` being the token after the comment.
     /// A separator belongs to the item before it, on either side of the comment
-    /// (`?a, # c` and `?a # c` before `, ?b`).
+    /// (`?a, # c` and `?a # c` before `, ?b`): before a separator, the comment trails
+    /// the outermost node ending with the separator, as it does after it, since the
+    /// separator is printed before the comment (the last operand of a nested chain
+    /// would otherwise take it inside that chain, and the next time, printed after the
+    /// outer operator, it would trail the outer operand).
     fn trailing_owner(&self, p: TokenId, n: TokenId) -> Option<NodeId> {
         let separator = |t: TokenId| self.rules.is_separator(self.tree.token_kind(t));
-        self.ending_at(p)
+        let with_separator = match separator(n) {
+            true => self
+                .ending_at(n)
+                .filter(|&x| self.first(x).is_some_and(|f| f <= p)),
+            false => None,
+        };
+        with_separator
+            .or_else(|| self.ending_at(p))
             .or_else(|| match separator(p) {
                 true => self.ending_at(self.tree.prev_significant(p)?),
-                false => None,
-            })
-            .or_else(|| match separator(n) {
-                true => self
-                    .ending_at(n)
-                    .filter(|&x| self.first(x).is_some_and(|f| f <= p)),
                 false => None,
             })
     }
@@ -302,10 +311,12 @@ impl Comments {
         let mut rest = comments;
         if let Some((&c0, more)) = rest.split_first()
             && breaks_before(c0) == 0
+            && !self.line_taken(shape, p)
             && let Some(owner) = shape.trailing_owner(p, n)
             && !self.trailing.contains_key(&owner)
         {
             self.trailing.insert(owner, vec![c0]);
+            self.trailed.insert(p);
             rest = more;
         }
         let blank = match rest.first() {
@@ -362,6 +373,26 @@ impl Comments {
         if !blocks.is_empty() {
             self.detached.entry(node).or_default().extend(blocks);
         }
+    }
+
+    /// Whether a comment after `p` would print on the line of an earlier trailing
+    /// comment: `p` is a separator and a trailing comment follows it or the item before
+    /// it, with only separators in between (`?o # c` before `; # d`). A separator is
+    /// printed with the item before it, so both comments would end the same line, and
+    /// the second would go to a line of its own, where it no longer trails.
+    fn line_taken(&self, shape: &Shape<'_, '_>, p: TokenId) -> bool {
+        let separator = |t: TokenId| shape.rules.is_separator(shape.tree.token_kind(t));
+        let mut at = p;
+        while separator(at) {
+            let Some(prev) = shape.tree.prev_significant(at) else {
+                return false;
+            };
+            if self.trailed.contains(&prev) {
+                return true;
+            }
+            at = prev;
+        }
+        false
     }
 
     /// Comments where no attachment node starts or ends lead `node`, the nearest one
@@ -730,6 +761,32 @@ mod tests {
         let c = Comments::attach(&t, &RULES);
         assert_eq!(texts(&t, c.trailing(nth(4))), ["# c"]);
         assert_eq!(texts(&t, c.leading(nth(5))), ["# d"]);
+
+        // before a separator, the node ending with the separator takes it (the entry,
+        // not its object); a comment after the separator then leads the next entry
+        let src = "{ ?s ?p ?a # c\n ; # d\n ?q ?b }";
+        let t = tree(src, "(Q (G _ (S _ (E _ (O _) _) (E _ (O _))) _))");
+        let c = Comments::attach(&t, &RULES);
+        assert_eq!(texts(&t, c.trailing(nth(3))), ["# c"]);
+        assert!(c.trailing(nth(4)).is_empty());
+        assert_eq!(texts(&t, c.leading(nth(5))), ["# d"]);
+        // nor does a comment trail after separators when the item before them ends a
+        // line with a trailing comment already, whatever node it went to: both would
+        // end the same line
+        let src = "{ ?s ?p ?a # c\n ; ; # d\n ?q ?b }";
+        let t = tree(src, "(Q (G _ (S _ (E _ (O _) _ _) (E _ (O _))) _))");
+        let c = Comments::attach(&t, &RULES);
+        assert_eq!(texts(&t, c.trailing(nth(4))), ["# c"]);
+        assert!(c.trailing(nth(3)).is_empty());
+        assert_eq!(texts(&t, c.leading(nth(5))), ["# d"]);
+        // after the next item it trails again
+        let src = "{ ?s ?p ?a # c\n ; ?q ?b ; # d\n ?r ?e }";
+        let t = tree(
+            src,
+            "(Q (G _ (S _ (E _ (O _) _) (E _ (O _) _) (E _ (O _))) _))",
+        );
+        let c = Comments::attach(&t, &RULES);
+        assert_eq!(texts(&t, c.trailing(nth(5))), ["# d"]);
     }
 
     #[test]

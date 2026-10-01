@@ -8,7 +8,8 @@
 //!   ` .` the statement. A trailing or doubled `;` in the input is dropped.
 //! - An object list stays on the entry's line when it fits; otherwise the objects go one
 //!   per line two levels deeper than the entry, each but the last followed by `,`.
-//!   Several `[ … ]` objects hug instead: `], [`.
+//!   Several `[ … ]` objects hug instead: `], [`, unless a trailing comment ends one
+//!   before the last.
 //! - `[ … ]` and `{| … |}` stay inline only with a single entry with a single object
 //!   that fits; otherwise the bracket ends the owning line, the entries follow one level
 //!   deeper, and the closing bracket comes back to the owning line's indentation.
@@ -84,10 +85,14 @@ pub fn property_list_entry(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 /// several `[ … ]` objects hug (`], [`), and a single object follows the verb directly.
 fn object_list(cx: &mut Ctx<'_, '_>, objects: &[NodeId]) -> DocId {
     let leading = objects.iter().any(|&o| cx.has_leading(o));
+    // not when a comment ends an object before the last: it would end the line after
+    // the next `[`, inside that block
     let hug = objects.len() > 1
-        && objects.iter().all(|&o| {
+        && objects.iter().enumerate().all(|(i, &o)| {
             matches!(cx.children(o).first(), Some(&Element::Node(b))
-                if cx.tree.kind(b) == NodeKind::BNodePropertyList)
+                if cx.tree.kind(b) == NodeKind::BNodePropertyList
+                    && (i + 1 == objects.len()
+                        || !(has_trailing(cx, o) || has_trailing(cx, b))))
         });
     // a trailing comment of the last object goes after the list, so it does not break
     // it: printed after the entry's `;` or the statement's `.`, it would attach there
@@ -238,6 +243,14 @@ fn bracket(cx: &mut Ctx<'_, '_>, n: NodeId, kind: TokenKind) -> DocId {
     }
 }
 
+/// Whether `n` has a trailing comment still to print.
+fn has_trailing(cx: &Ctx<'_, '_>, n: NodeId) -> bool {
+    cx.comments
+        .trailing(n)
+        .iter()
+        .any(|&c| !cx.comments.copied(c))
+}
+
 /// Whether another entry follows `entry` in its list.
 fn has_later_entry(cx: &Ctx<'_, '_>, entry: NodeId) -> bool {
     let Some(parent) = cx.tree.parent(entry) else {
@@ -309,6 +322,12 @@ mod tests {
             stmt("?s ex:c 2, 3 # c\n ; ex:d 4"),
             "?s ex:c 2, 3 ; # c\n  ex:d 4 ."
         );
+        // a comment after the `;` too: the `;` joins the first comment's line, so the
+        // second leads the next entry
+        assert_eq!(
+            stmt("?s ex:c 2 # c\n ; # d\n ex:d 4"),
+            "?s ex:c 2 ; # c\n  # d\n  ex:d 4 ."
+        );
     }
 
     #[test]
@@ -347,6 +366,12 @@ mod tests {
         assert_eq!(
             stmt("?s ex:p [ ex:q 1 ; ex:r 2 ], [ ex:t 3 ]"),
             "?s ex:p [\n  ex:q 1 ;\n  ex:r 2\n], [ ex:t 3 ] ."
+        );
+        // a comment after a block before the last: one object per line, since the
+        // comment ends the line
+        assert_eq!(
+            stmt("?s ex:p [ ex:q 1 ; ex:r 2 ], # c\n [ ex:t 3 # d\n ]"),
+            "?s ex:p\n    [\n      ex:q 1 ;\n      ex:r 2\n    ], # c\n    [\n      ex:t 3 # d\n    ] ."
         );
         assert_eq!(stmt("[ ex:q 1 ]"), "[ ex:q 1 ] .");
         assert_eq!(stmt("( 1 ?x ) ex:p (2)"), "( 1 ?x ) ex:p ( 2 ) .");
