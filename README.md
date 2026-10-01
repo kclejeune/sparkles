@@ -741,7 +741,14 @@ mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
+mise run licenses     # regenerate THIRD_PARTY_LICENSES.md after a Cargo.lock change (licenses:check)
 ```
+
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) holds the license and NOTICE files of
+every crate the binary links (on Linux and macOS), each text once; crates that ship no
+license file get their license's standard text. `scripts/third-party-licenses.py`
+generates it from `cargo metadata`, so it only changes with `Cargo.lock`; ship it with
+binaries (the Nix packages install it as `share/doc/sparkles/THIRD_PARTY_LICENSES.md`).
 
 Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with
 [prek](https://github.com/j178/prek) (plain `pre-commit` reads the same file). On staged files
@@ -764,7 +771,8 @@ The flake (flake-parts + rust-overlay, using the toolchain from `rust-toolchain.
 provides:
 
 * **Packages:**
-  * `sparkles` (default): the binary with the UI embedded.
+  * `sparkles` (default): the binary with the UI embedded, and the third-party licenses
+    and notices in `share/doc/sparkles/`.
   * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
   * `sparkles-ui`: the static UI build.
 * **Other outputs:**

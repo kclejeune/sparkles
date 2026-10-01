@@ -151,6 +151,14 @@ description = "Release build of the server/CLI with the embedded UI"
 depends = ["ui:build"]
 run = "cargo build --release -p sparkles-server"
 
+[tasks.licenses]
+description = "Regenerate THIRD_PARTY_LICENSES.md (the license and NOTICE files of the crates the binary links) from Cargo.lock"
+run = "python3 scripts/third-party-licenses.py"
+
+[tasks."licenses:check"]
+description = "Check that THIRD_PARTY_LICENSES.md matches Cargo.lock"
+run = "python3 scripts/third-party-licenses.py --check"
+
 [tasks.serve]
 description = "Run the server (UI at http://localhost:3030/ui/); extra args go to `sparkles serve`"
 depends = ["build"]
