@@ -275,7 +275,12 @@ fn make_ctx(
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
 ) -> Ctx {
+    #[cfg(feature = "geo")]
+    let op_vertices = snap.geo_op_vertices;
     let mut ctx = Ctx::new(snap);
+    // the store's limit on one geometry operation
+    #[cfg(feature = "geo")]
+    ctx.geo.set_op_vertices(op_vertices);
     ctx.deadline = opts.timeout.map(|t| Instant::now() + t);
     if let Some(c) = &opts.cancel {
         ctx.cancel = c.clone();

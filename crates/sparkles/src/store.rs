@@ -175,6 +175,9 @@ pub struct Snapshot {
     /// the spatial index as of this commit (datasets with a spatial index)
     pub geo: Option<Arc<crate::geo::GeoView>>,
     pub union_default_graph: bool,
+    /// largest sum of input vertices of one geometry operation in queries on this
+    /// snapshot ([`StoreOptions::geo_op_vertices`])
+    pub geo_op_vertices: u64,
     /// per-predicate statistics of the delta (computed lazily, once per snapshot)
     pub delta_stats:
         Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
@@ -835,6 +838,7 @@ impl Store {
                 text: None,
                 geo: None,
                 union_default_graph: opts.union_default_graph,
+                geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
                 historical: false,
             })),
@@ -1041,6 +1045,7 @@ impl Store {
                 text: None,
                 geo: None,
                 union_default_graph: opts.union_default_graph,
+                geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
                 historical: false,
             })),
@@ -1330,6 +1335,7 @@ impl Store {
             text: None,
             geo: self.historical_geo(),
             union_default_graph: self.opts.union_default_graph,
+            geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
             historical: true,
         });
@@ -2399,6 +2405,7 @@ impl Store {
                         text: None,
                         geo: None,
                         union_default_graph: self.opts.union_default_graph,
+                        geo_op_vertices: self.opts.geo_op_vertices,
                         delta_stats: Default::default(),
                         historical: false,
                     })
@@ -2477,6 +2484,7 @@ impl Store {
             },
             geo: None,
             union_default_graph: self.opts.union_default_graph,
+            geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
             historical: false,
         };
@@ -2971,6 +2979,7 @@ impl WriteTxn<'_> {
             // the index does not cover this transaction's changes: plans without it
             geo: self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())),
             union_default_graph: self.base.union_default_graph,
+            geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
             historical: false,
         }
@@ -3315,6 +3324,7 @@ impl WriteTxn<'_> {
             text: self.base.text.clone(),
             geo: self.base.geo.clone(),
             union_default_graph: self.base.union_default_graph,
+            geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
             historical: false,
         };
@@ -3660,6 +3670,7 @@ pub(crate) fn replay_wal(
         text: None,
         geo: None,
         union_default_graph: false,
+        geo_op_vertices: StoreOptions::default().geo_op_vertices,
         delta_stats: Default::default(),
         historical: false,
     };
