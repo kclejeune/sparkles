@@ -26,7 +26,7 @@ ex:PersonShape a sh:NodeShape ;
 test('the shapes editor feeds Validate and offers Format', async ({ page }) => {
   await page.goto(`/ui/datasets/${DATASET}`);
   const panel = page.locator('section.panel').filter({
-    has: page.getByRole('heading', { name: 'Validate (SHACL)' }),
+    has: page.getByRole('heading', { name: 'Validate', exact: true }),
   });
   await expect(panel.getByRole('button', { name: 'Format', exact: true })).toHaveAttribute(
     'title',
