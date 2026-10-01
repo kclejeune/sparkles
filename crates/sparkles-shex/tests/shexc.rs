@@ -119,3 +119,37 @@ fn lexer_is_lossless() {
     }
     eprintln!("lexed {n} files losslessly");
 }
+
+/// The suite's schemas that import others (circular imports included) close with their
+/// imports read from files next to them, and those the validation tests use compile.
+#[test]
+fn imports_close() {
+    let Some(suite) = suite_dir() else {
+        eprintln!("shexTest suite not found (set SPARKLES_SHEX_TESTS); skipped");
+        return;
+    };
+    let manifest =
+        std::fs::read_to_string(suite.join("validation/manifest.ttl")).unwrap_or_default();
+    let mut n = 0;
+    let mut failures = Vec::new();
+    for f in shex_files(&suite.join("schemas")) {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let base = sparkles_shex::resolve::file_url(&f);
+        let schema = Schema::parse_shexc(&text, Some(&base)).unwrap();
+        if schema.imports.is_empty() {
+            continue;
+        }
+        n += 1;
+        let resolver = sparkles_shex::FileResolver::default();
+        if let Err(e) = sparkles_shex::resolve::close(&schema, &resolver) {
+            failures.push(format!("{}: {e}", name(&f)));
+        }
+        // (some imported schemas reference labels only their importers declare)
+        let used = manifest.contains(&format!("schemas/{}>", name(&f)));
+        if used && let Err(e) = sparkles_shex::compile(&schema, &resolver) {
+            failures.push(format!("{}: compile: {e}", name(&f)));
+        }
+    }
+    eprintln!("imports: {}/{n} schemas close", n - failures.len());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -124,6 +124,12 @@ impl Schema {
         shexj::from_shexj(json)
     }
 
+    /// Parse ShExJ, resolving relative IRIs against `base` (imports excepted: the
+    /// [`Resolver`] resolves those).
+    pub fn from_shexj_with_base(json: &str, base: Option<&str>) -> Result<Schema, ParseError> {
+        shexj::from_shexj_with_base(json, base)
+    }
+
     /// The ShExJ form, with the `@context` of ShEx 2.1.
     pub fn to_shexj(&self) -> serde_json::Value {
         shexj::to_shexj(self)
@@ -151,7 +157,7 @@ pub fn parse_schema(
     });
     match format {
         SchemaFormat::ShExC => Schema::parse_shexc(text, base),
-        SchemaFormat::ShExJ => Schema::from_shexj(text),
+        SchemaFormat::ShExJ => Schema::from_shexj_with_base(text, base),
     }
 }
 
@@ -245,7 +251,7 @@ impl From<Label> for ShapeLabel {
 }
 
 /// The node selector of a shape association.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeSelector {
     /// a node, whether or not it occurs in the data
     Term(Term),
