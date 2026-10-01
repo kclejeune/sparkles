@@ -62,8 +62,15 @@ impl Visitor<'_> {
                 inner, aggregates, ..
             } => {
                 for (_, a) in aggregates {
-                    if let AggregateExpression::FunctionCall { expr, .. } = a {
-                        self.expr(expr, false)?;
+                    if let AggregateExpression::FunctionCall { name, expr, .. } = a {
+                        // the GeoSPARQL aggregates take a geometry
+                        let geo = match name {
+                            spargebra::algebra::AggregateFunction::Custom(iri) => {
+                                self.geo_call(iri.as_str())
+                            }
+                            _ => false,
+                        };
+                        self.expr(expr, geo)?;
                     }
                 }
                 self.pattern(inner)
@@ -114,27 +121,30 @@ impl Visitor<'_> {
             E::Exists(p) => self.pattern(p),
             E::FunctionCall(f, args) => {
                 let geo = match f {
-                    spargebra::algebra::Function::Custom(iri) => {
-                        let iri = iri.as_str();
-                        iri.starts_with(super::vocab::GEOF)
-                            || iri.starts_with(super::vocab::SPATIALF)
-                    }
+                    spargebra::algebra::Function::Custom(iri) => self.geo_call(iri.as_str()),
                     _ => false,
                 };
-                if geo && !cfg!(feature = "geo") && !self.warned {
-                    self.warned = true;
-                    (self.warn)(PlanWarning {
-                        code: "geo-not-built",
-                        message: "geof:* needs cargo feature \"geo\": the calls are unknown \
-                                  functions (errors) in this build"
-                            .into(),
-                    });
-                }
                 args.iter().try_for_each(|x| self.expr(x, geo))
             }
             #[allow(unreachable_patterns)]
             _ => Ok(()),
         }
+    }
+
+    /// Whether `iri` is a GeoSPARQL (or Jena spatial) function or aggregate; the first
+    /// one in a build without the feature adds the warning.
+    fn geo_call(&mut self, iri: &str) -> bool {
+        let geo = iri.starts_with(super::vocab::GEOF) || iri.starts_with(super::vocab::SPATIALF);
+        if geo && !cfg!(feature = "geo") && !self.warned {
+            self.warned = true;
+            (self.warn)(PlanWarning {
+                code: "geo-not-built",
+                message: "geof:* needs cargo feature \"geo\": the calls are unknown \
+                          functions (errors) in this build"
+                    .into(),
+            });
+        }
+        geo
     }
 }
 

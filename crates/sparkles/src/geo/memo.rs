@@ -238,7 +238,7 @@ pub fn parse_value(v: &Value, max_vertices: u32) -> Option<GeomRef> {
 
 /// The geometry of a term id: the generation's geometry column for the stored
 /// literals it holds, else the memo.
-fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<GeomRef> {
+pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<GeomRef> {
     if id.is_undef() {
         return Err(TypeError);
     }
