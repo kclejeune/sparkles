@@ -165,6 +165,46 @@ async fn shex_max_results_and_snapshots() {
     assert_eq!(r["commit"], first);
 }
 
+/// A selector query has no prefixes but its own.
+#[cfg(feature = "shex")]
+const PERSONS: &str =
+    "SPARQL \"\"\"SELECT ?focus { ?focus a <http://ex.org/Person> }\"\"\"@ex:Person";
+
+#[cfg(feature = "shex")]
+#[tokio::test(flavor = "multi_thread")]
+async fn shex_sparql_selectors() {
+    let mut c = Client::start(people_server());
+    let r = c
+        .structured(
+            "validate_shex",
+            json!({"schema": SCHEMA, "shapeMap": format!("{PERSONS},ex:acme@ex:Org"), "onlyNonconformant": false}),
+        )
+        .await;
+    assert_eq!(r["counts"], json!({"conformant": 2, "nonconformant": 2}));
+    assert_eq!(
+        nodes(&r, "node"),
+        ["ex:alice", "ex:bob", "ex:carol", "ex:acme"]
+    );
+    // the selector runs under the server's row budget
+    let mut st = AppState::standalone(StoreOptions::default(), Duration::from_secs(60));
+    st.read_only = true;
+    st.limits.max_rows = 2;
+    let st = Arc::new(st);
+    load(&st.attach("ds", DbType::Mem, None).unwrap(), PEOPLE);
+    let mut c = Client::start(McpServer::new(st, McpConfig::default()));
+    let (t, e) = c
+        .error(
+            "validate_shex",
+            json!({"schema": SCHEMA, "shapeMap": PERSONS}),
+        )
+        .await;
+    assert_eq!(
+        e,
+        json!({"code": "budget-rows", "status": 507, "budget": "rows"})
+    );
+    assert!(t.contains("fewer focus nodes"), "{t}");
+}
+
 #[cfg(feature = "shex")]
 #[tokio::test(flavor = "multi_thread")]
 async fn shex_errors() {
@@ -183,20 +223,18 @@ async fn shex_errors() {
     assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
     assert!(t.contains("does not resolve imports"), "{t}");
     assert!(t.contains("<http://ex.org/common.shex>"), "{t}");
-    // SPARQL selectors are refused until the engine runs them
-    if !super::super::validate::SPARQL_SELECTORS {
-        let (t, e) = c
-            .error(
-                "validate_shex",
-                err(
-                    SCHEMA,
-                    "SPARQL \"\"\"SELECT ?focus { ?focus a ex:Person }\"\"\"@ex:Person",
-                ),
-            )
-            .await;
-        assert_eq!(e, json!({"code": "unsupported", "status": 501}));
-        assert!(t.contains("SPARQL node selectors"), "{t}");
-    }
+    // a SPARQL selector with SERVICE is refused when the map is parsed
+    let (t, e) = c
+        .error(
+            "validate_shex",
+            err(
+                SCHEMA,
+                "SPARQL \"\"\"SELECT ?focus { SERVICE <http://127.0.0.1:9/> { ?focus ?p ?o } }\"\"\"@ex:Person",
+            ),
+        )
+        .await;
+    assert_eq!(e, json!({"code": "syntax", "status": 400}));
+    assert!(t.contains("SERVICE is not allowed"), "{t}");
     // syntax errors name the line and column
     let (t, e) = c
         .error(

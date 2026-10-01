@@ -2,7 +2,7 @@
 //! `validate_shex` (a ShEx schema with a shape map). Both validate one snapshot of a
 //! dataset's data graph, as `/{ds}/shacl` and `/{ds}/shex` do, and answer counts plus
 //! the first `maxResults` results in compact terms. Neither writes, fetches imports or
-//! runs SERVICE.
+//! runs SERVICE (not in SHACL-SPARQL constraints, not in ShEx `SPARQL` selectors).
 
 use super::Outcome;
 use super::errors::{ErrorContext, ToolError, secs};
@@ -419,15 +419,10 @@ fn shex_result(r: &sparkles_shex::ShapeResult, terms: &mut Terms) -> Value {
     o
 }
 
-/// Whether the ShEx engine runs `SPARQL """…"""` node selectors. Until it does, the
-/// tool refuses them with its own message.
-#[cfg(feature = "shex")]
-pub(super) const SPARQL_SELECTORS: bool = false;
-
 #[cfg(feature = "shex")]
 impl Tools<'_> {
     pub(super) fn validate_shex(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        use sparkles_shex::{NodeSelector, ShapeMap};
+        use sparkles_shex::ShapeMap;
         let a: ShexArgs = parse(args)?;
         text_arg("schema", &a.schema, MAX_SCHEMA_CHARS)?;
         text_arg("shapeMap", &a.shape_map, MAX_MAP_CHARS)?;
@@ -462,19 +457,6 @@ impl Tools<'_> {
         }
         let map = ShapeMap::parse(&a.shape_map, &map_prefixes, compiled.base())
             .map_err(|e| syntax("shape map", &e))?;
-        if !SPARQL_SELECTORS
-            && map
-                .0
-                .iter()
-                .any(|x| matches!(x.node, NodeSelector::Sparql(_)))
-        {
-            return Err(ToolError::new(
-                "unsupported",
-                501,
-                "SPARQL node selectors are not supported by validate_shex yet",
-            )
-            .hint("select nodes with {FOCUS p o}, {FOCUS p _}, {_ p FOCUS} or list them"));
-        }
         // the result terms use the dataset's prefixes, then the schema's
         let mut result_prefixes = t.prefixes.clone();
         for (k, v) in compiled.prefixes() {
@@ -504,7 +486,8 @@ impl Tools<'_> {
             max_results: validation_common::max_results(limits),
             max_pairs: Some(max_pairs),
             only_nonconformant,
-            // selector queries: the call's budgets, never SERVICE
+            // SPARQL selectors: the call's row and memory budgets, never SERVICE (their
+            // queries take no prefixes but their own)
             selector_query: Some(sparkles::sparql::QueryOptions {
                 max_rows: Some(limits.max_rows),
                 max_memory_bytes: self.cfg().query_memory_bytes,
