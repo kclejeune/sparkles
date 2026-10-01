@@ -395,6 +395,19 @@ pub struct ResultMap {
     /// e.g. "2 semantic actions with extension <…> were not run"
     pub warnings: Vec<String>,
     pub millis: u64,
+    /// what the validation computed
+    pub stats: ValidationStats,
+}
+
+/// Counters of a validation's typing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValidationStats {
+    /// (node, shape) pairs discovered
+    pub pairs: usize,
+    /// pair evaluations, in discovery and refinement
+    pub evaluations: u64,
+    /// refinement waves of each stratum, lowest first
+    pub waves: Vec<usize>,
 }
 
 impl ResultMap {

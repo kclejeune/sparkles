@@ -128,6 +128,10 @@ fn main() -> anyhow::Result<()> {
             r.nonconformant,
             by_reason(&r)
         );
+        println!(
+            "  typing: {} pairs, {} evaluations, refinement waves per stratum {:?}",
+            r.stats.pairs, r.stats.evaluations, r.stats.waves
+        );
     }
 
     // single nodes against the non-recursive ex:Org shape
