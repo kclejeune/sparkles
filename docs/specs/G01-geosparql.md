@@ -1,14 +1,14 @@
 # G01: GeoSPARQL (OGC GeoSPARQL 1.1, Jena spatial extensions, spatial index)
 
-> **Status:** implemented in part (Phases 1 and 2; Phase 3 not built)
+> **Status:** Phases 1 and 2 are implemented. Phase 3 is not built.
 >
-> **Phases:** Phase 1 (geometry literals, CRSs and units, the `geof:` functions, the
-> spatial index with FILTER pushdown, Jena's `spatial:` property functions, server and CLI
-> surfaces); Phase 2 (spatial joins and k-NN, Query Rewrite, `spatial:equals`, RDFS
-> entailment and default geometries, the aggregates, hulls and `isSimple`, `spatialF:`,
-> UTM zones, persisted index files, W3C Basic Geo points, `GET /{ds}/geo`,
-> `POST /$/geo/convert`, the UI maps, Oxigraph's GeoSPARQL tests); Phase 3 (GML and KML,
-> other EPSG CRSs) not started.
+> **Phases:** Phase 1 covers geometry literals, CRSs and units, the `geof:` functions, the
+> spatial index with FILTER pushdown, Jena's `spatial:` property functions, and the server
+> and CLI surfaces. Phase 2 covers spatial joins and k-NN, Query Rewrite, `spatial:equals`,
+> RDFS entailment and default geometries, the aggregates, hulls and `isSimple`,
+> `spatialF:`, UTM zones, persisted index files, W3C Basic Geo points, `GET /{ds}/geo`,
+> `POST /$/geo/convert`, the UI maps and Oxigraph's GeoSPARQL tests. Phase 3 (GML and KML,
+> other EPSG CRSs) has not started.
 >
 > **User docs:** [API: GeoSPARQL](../API.md#geosparql) ·
 > [API: hulls, aggregates, `spatialF:`, UTM and conversion](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) ·
@@ -19,81 +19,90 @@
 > [Benchmarks: spatial index commit cost](../BENCHMARKS.md#spatial-index-commit-cost) ·
 > [Benchmarks: GeoSPARQL Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark)
 >
-> This is the design as written before implementation; the [Outcome](#outcome) section at the end
-> records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) section at
+> the end records how it landed.
 
-The design depends on the commit-identity work ([CI](CI-commit-identity.md), durable
-`seq`), the budgets of [C01](C01-observability-and-budgets.md), and the planner and
-executor as they stood at `e23a1f5`. It changes a README decision: "GeoSPARQL" leaves the
-"Out of scope for v1" row (README §Divergences, `docs/AUDIT.md` rows for jena-geosparql and
-`spargeo`) when Phase 1 lands.
+The design depends on the durable `seq` from the commit-identity work
+([CI](CI-commit-identity.md)), on the budgets of [C01](C01-observability-and-budgets.md),
+and on the planner and executor as they stood at `e23a1f5`. It changes one README
+decision. When Phase 1 lands, GeoSPARQL leaves the "Out of scope for v1" row in README
+§Divergences, along with the `docs/AUDIT.md` rows for jena-geosparql and `spargeo`.
 
 ## 1. Summary, goals, non-goals
 
-Sparkles gets GeoSPARQL: geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`), the
-`geof:` function library of GeoSPARQL 1.1 (topological relations of the Simple Features,
-Egenhofer and RCC8 families, `relate`, the non-topological and 1.1 measurement functions,
-later the aggregates), Jena's `spatial:` property functions and `spatialF:` filter
-functions, the Query Rewrite and RDFS Entailment extensions, and a spatial index that makes
-the common shapes fast:
+This spec adds GeoSPARQL to Sparkles. It covers:
+
+* the geometry literals `geo:wktLiteral` and `geo:geoJSONLiteral`;
+* the GeoSPARQL 1.1 `geof:` functions: the Simple Features, Egenhofer and RCC8 relations,
+  `relate`, the non-topological and 1.1 measurement functions, and later the aggregates;
+* Jena's `spatial:` property functions and `spatialF:` filter functions;
+* the Query Rewrite and RDFS Entailment extensions;
+* a spatial index for the common query shapes.
+
+The index speeds up these shapes:
 
 * a FILTER with a constant geometry (`sfWithin(?w, "POLYGON(…)")`, `distance(?w, C, u) < r`);
 * a Jena property function (`?f spatial:nearby (51.5 -0.12 5 uom:kilometre 10)`);
 * later, a spatial join between two variables (`FILTER(geof:sfContains(?region, ?point))`)
   and k-nearest-neighbour `ORDER BY geof:distance(…) LIMIT k`.
 
-Literals stay authoritative and are stored as ordinary vocabulary terms, never rewritten.
-Parsed geometries and the R-tree are derived data. The index follows the vector
-segment's model, a base structure per generation plus an overlay, but the overlay is
-maintained in the commit path the way [F03](F03-full-text-search.md) maintains its documents. That makes every
-snapshot, including historical `?at=` snapshots, see exactly its own geometries. The index
-is an optimization: a query gives the same answer with it, without it, and while it is
-building.
+Literals are the source of truth. They are stored as ordinary vocabulary terms and never
+rewritten. Parsed geometries and the R-tree are derived data. The index has the same
+shape as the vector segment: a base structure per generation plus an overlay. The overlay,
+however, is maintained in the commit path, the way [F03](F03-full-text-search.md) maintains
+its documents, so every snapshot sees exactly its own geometries. That includes historical
+`?at=` snapshots. The index is only an optimization. A query gives the same answer with
+it, without it, and while it is building.
 
 **Goals**
 
-* GeoSPARQL 1.1 conformance classes **Core**, **Topology Vocabulary** (all three relation
-  families), **Geometry Extension** (serialization WKT, then GeoJSON), **Geometry Topology
-  Extension** (WKT and GeoJSON; Simple Features, Egenhofer and RCC8), **RDFS Entailment
-  Extension** (WKT) and **Query Rewrite Extension** (WKT and GeoJSON; all three families).
-  The phase table follows. Sparkles states its conformance per class, as the standard
-  requires (GeoSPARQL 1.1 Annex A).
-* Jena compatibility where users see it: the `geo:`, `geof:`, `spatial:` and `spatialF:`
-  IRIs and argument forms. Existing Jena GeoSPARQL queries run unchanged, and answers agree
-  except where §11 lists a deliberate divergence (each of them is a Jena bug or a silent
-  approximation).
-* Correct geodesic measurement on geographic CRSs (WGS 84 ellipsoid, Karney's algorithms):
-  distance, area, length, metric buffer.
-* Snapshot-consistent, index-accelerated spatial selection with no staleness window and
-  no `503` while an index builds.
-* Pure Rust and permissive licenses only (MIT, Apache-2.0, BSD, CC0). No GEOS (LGPL), no
-  PROJ C build by default.
-* Admin surfaces (HTTP, CLI, UI) for the index, explain output, and a map view in the UI
-  that needs no external tile server.
+* Conformance to these GeoSPARQL 1.1 classes:
+  * **Core**;
+  * **Topology Vocabulary**, all three relation families;
+  * **Geometry Extension**, WKT first and then GeoJSON;
+  * **Geometry Topology Extension**, WKT and GeoJSON, with Simple Features, Egenhofer and
+    RCC8;
+  * **RDFS Entailment Extension**, WKT;
+  * **Query Rewrite Extension**, WKT and GeoJSON, all three families.
+
+  §1.1 shows which phase delivers each class. Sparkles states its conformance per class,
+  as GeoSPARQL 1.1 Annex A requires.
+* Jena compatibility in everything users see: the `geo:`, `geof:`, `spatial:` and
+  `spatialF:` IRIs and argument forms. Existing Jena GeoSPARQL queries run unchanged. Their
+  answers agree except where §11 lists a deliberate divergence. Each divergence fixes a
+  Jena bug or a silent approximation.
+* Correct geodesic distance, area, length and metric buffers on geographic CRSs, using
+  the WGS 84 ellipsoid and Karney's algorithms.
+* Spatial selection that uses the index and is consistent with the snapshot. There is no
+  staleness window, and no `503` while an index builds.
+* Pure Rust and permissive licenses only (MIT, Apache-2.0, BSD, CC0). The default build
+  has no GEOS (LGPL) and no PROJ C library.
+* Admin surfaces for the index in HTTP, the CLI and the UI; explain output; and a map view
+  in the UI that needs no external tile server.
 
 **Non-goals (all phases unless noted)**
 
-* DGGS literals (`geo:dggsLiteral`, `geof:asDGGS`), the Geometry Extension DGGS conformance
-  class.
-* 3D topology, M-aware computation. Z and M are parsed, kept and reported (`is3D`,
-  `isMeasured`, `minZ`/`maxZ`), and ignored by every computation, as GeoSPARQL 1.1 §10.2
+* DGGS literals (`geo:dggsLiteral`, `geof:asDGGS`) and the Geometry Extension DGGS
+  conformance class.
+* 3D topology and M-aware computation. Sparkles parses, keeps and reports Z and M (`is3D`,
+  `isMeasured`, `minZ`/`maxZ`), and every computation ignores them, as GeoSPARQL 1.1 §10.2
   prescribes.
 * Arbitrary EPSG CRSs in Phases 1–2. Phase 3 adds an optional pure-Rust transform backend
   (§4.2.4).
-* Raster data, routing, map tiles, a tile server.
-* Jena's spatial index file format, assembler vocabulary (`geosparql:GeosparqlDataset`) and
-  GeoSPARQL-Fuseki CLI options. Sparkles configures the index itself (§2.8).
+* Raster data, routing, map tiles and a tile server.
+* Jena's spatial index file format, its assembler vocabulary (`geosparql:GeosparqlDataset`)
+  and the GeoSPARQL-Fuseki CLI options. Sparkles configures the index its own way (§2.8).
 * QLever's `SERVICE spatialSearch:` syntax (§10; open question 14).
 
 ### 1.1 Conformance by phase
 
 | Conformance class (1.1, `http://www.opengis.net/spec/geosparql/1.x/conf/…`) | Phase 1 | Phase 2 | Phase 3 |
 |---|---|---|---|
-| Core (`/conf/core`) | ✅ (vocabulary only; nothing to compute) | | |
+| Core (`/conf/core`) | ✅ Vocabulary only. There is nothing to compute. | | |
 | Topology Vocabulary (`/conf/topology-vocab-extension`), sf / eh / rcc8 | ✅ | | |
-| Geometry Extension (`/conf/geometry-extension`), WKT | ✅ all functions except the aggregates, `boundingCircle`, `concaveHull`, `asGML`, `asKML` | ✅ complete | |
-| Geometry Extension, GeoJSON | ✅ same as WKT | ✅ | |
-| Geometry Extension, GML / KML | | | ✅ (GML 3.2 Simple Features profile; KML 2.2 geometry) |
+| Geometry Extension (`/conf/geometry-extension`), WKT | ✅ All functions except the aggregates, `boundingCircle`, `concaveHull`, `asGML` and `asKML`. | ✅ Complete. | |
+| Geometry Extension, GeoJSON | ✅ Same as WKT. | ✅ | |
+| Geometry Extension, GML / KML | | | ✅ GML 3.2 Simple Features profile and KML 2.2 geometry. |
 | Geometry Extension DGGS | ❌ | ❌ | ❌ |
 | Geometry Topology Extension, sf / eh / rcc8 × WKT / GeoJSON | ✅ | | GML, KML |
 | RDFS Entailment Extension, WKT | | ✅ | GML hierarchy |
@@ -109,14 +118,14 @@ k-NN, the UI map and persisted index files (§6).
 
 | Prefix | IRI | Used for |
 |---|---|---|
-| `geo:` | `http://www.opengis.net/ont/geosparql#` | datatypes, properties, the 24 topological properties (Query Rewrite) |
-| `geof:` | `http://www.opengis.net/def/function/geosparql/` | functions |
-| `sf:` | `http://www.opengis.net/ont/sf#` | geometry type IRIs (`geof:geometryType`, RDFS entailment) |
-| `uom:` | `http://www.opengis.net/def/uom/OGC/1.0/` | units (also QUDT, §4.3) |
-| `spatial:` | `http://jena.apache.org/spatial#` | Jena property functions |
-| `spatialF:` | `http://jena.apache.org/function/spatial#` | Jena filter functions |
+| `geo:` | `http://www.opengis.net/ont/geosparql#` | Datatypes, properties and the 24 topological properties (Query Rewrite). |
+| `geof:` | `http://www.opengis.net/def/function/geosparql/` | Functions. |
+| `sf:` | `http://www.opengis.net/ont/sf#` | Geometry type IRIs, used by `geof:geometryType` and RDFS entailment. |
+| `uom:` | `http://www.opengis.net/def/uom/OGC/1.0/` | Units. QUDT units also work (§4.3). |
+| `spatial:` | `http://jena.apache.org/spatial#` | Jena property functions. |
+| `spatialF:` | `http://jena.apache.org/function/spatial#` | Jena filter functions. |
 
-Sparkles adds no IRIs of its own for GeoSPARQL. Every term above belongs to OGC or Jena, so
+Sparkles defines no GeoSPARQL IRIs of its own. Every term above belongs to OGC or Jena, so
 queries are portable.
 
 ### 2.2 Data
@@ -136,222 +145,241 @@ ex:seine geo:hasGeometry [ geo:asGeoJSON
 
 * Geometry literals load through every path (bulk load, GSP, `INSERT DATA`, upload) and
   are stored byte for byte. `"POINT(1 2)"` and `"Point (1.0 2.0)"` are different RDF terms
-  with equal geometries. `=` and `sameTerm` stay term identity, and DISTINCT does not merge
-  them. Only the relation functions, such as `geof:sfEquals`, compare geometries.
-* A literal whose lexical form is not a valid geometry of its datatype is stored anyway
-  (RDF 1.2 §3.4.2: ill-typed literals are accepted). Functions raise a type error on it, the
-  index skips it, and index status counts it under `skipped.malformed`.
-* W3C Basic Geo (`wgs84_pos:lat` / `wgs84_pos:long` on one subject) is indexed as points
-  when the index's `wgs84` option is on (Phase 2; Jena indexes it by default when a graph
-  has no GeoSPARQL literals).
+  with equal geometries. `=` and `sameTerm` still compare terms, and DISTINCT does not merge
+  the two. Only the relation functions, such as `geof:sfEquals`, compare geometries.
+* A literal whose lexical form is not a valid geometry of its datatype is stored anyway,
+  because RDF 1.2 §3.4.2 accepts ill-typed literals. Functions raise a type error on it,
+  the index skips it, and the index status counts it under `skipped.malformed`.
+* With the index's `wgs84` option on, W3C Basic Geo pairs (`wgs84_pos:lat` and
+  `wgs84_pos:long` on one subject) are indexed as points. This is Phase 2. Jena indexes
+  these pairs by default when a graph has no GeoSPARQL literals.
 
 ### 2.3 Functions (`geof:`)
 
 Every function works in FILTER, BIND, SELECT expressions, ORDER BY and HAVING, with or
-without an index. Argument errors are SPARQL type errors: unbound in BIND, false in FILTER
-(SPARQL 1.1 §17.2, §17.6; GeoSPARQL 1.1 §10.9.1). "geom" means a `geo:wktLiteral` or
-`geo:geoJSONLiteral` (later `gmlLiteral` / `kmlLiteral`). A geometry result has the
-datatype and CRS of the first geometry argument (GeoSPARQL 1.1 §10.9.1). A function with
-no geometry argument returns WKT in CRS84.
+without an index. Argument errors are SPARQL type errors, so they leave the variable
+unbound in BIND and evaluate to false in FILTER (SPARQL 1.1 §17.2, §17.6; GeoSPARQL 1.1
+§10.9.1). In the table, "geom" means a `geo:wktLiteral` or `geo:geoJSONLiteral`, and later
+also a `gmlLiteral` or `kmlLiteral`. A geometry result takes the datatype and CRS of the
+first geometry argument (GeoSPARQL 1.1 §10.9.1). A function with no geometry argument
+returns WKT in CRS84.
 
 Geometric results are new literals in the canonical form of §4.1.5.
 
 | Function | Result | Phase | Semantics (§4 has the details) |
 |---|---|---|---|
-| `distance(g1, g2, unit)` | `xsd:double` | 1 | shortest distance. Geographic CRS: geodesic on WGS 84 (§4.4.2). Projected: Euclidean in CRS units, converted. `0` when the geometries intersect |
+| `distance(g1, g2, unit)` | `xsd:double` | 1 | The shortest distance. On a geographic CRS it is geodesic on WGS 84 (§4.4.2). On a projected CRS it is Euclidean in CRS units, then converted. `0` when the geometries intersect. |
 | `metricDistance(g1, g2)` | `xsd:double` | 1 | `distance(g1, g2, uom:metre)` |
-| `buffer(g, radius, unit)` | geom | 1 | radius ≥ 0, or < 0 for areal geometries. Linear unit on a geographic CRS: metric buffer through a local projection (§4.4.3). Angular unit on a geographic CRS: planar degrees (as in Jena) |
+| `buffer(g, radius, unit)` | geom | 1 | The radius is ≥ 0, or < 0 for areal geometries. A linear unit on a geographic CRS gives a metric buffer through a local projection (§4.4.3). An angular unit on a geographic CRS buffers in planar degrees, as Jena does. |
 | `metricBuffer(g, radius)` | geom | 1 | `buffer(g, radius, uom:metre)` |
-| `convexHull(g)` | geom | 1 | planar in the CRS of `g` |
-| `concaveHull(g, targetPercent?)` | geom | 2 | `geo` concave hull; parameters documented (§4.4.6) |
-| `boundingCircle(g)` | geom | 2 | smallest enclosing circle (Welzl), polygonized with 32 segments per quadrant |
-| `envelope(g)` | geom | 1 | axis-aligned bounding box as a `POLYGON`; a point gives the point, a degenerate box a `LINESTRING` (as in Jena/JTS) |
-| `boundary(g)` | geom | 1 | OGC boundary: points → empty, curves → endpoints (mod-2 rule), polygons → rings |
-| `intersection` / `union` / `difference` / `symDifference(g1, g2)` | geom | 1 | overlay (§4.4.5); `g2` transformed into the CRS of `g1` |
-| `centroid(g)` | geom (`POINT`) | 1 | planar centroid in the CRS of `g` (as in Jena; §4.4.4) |
-| `getSRID(g)` | `xsd:anyURI` | 1 | the CRS IRI as written (CRS84 when absent). Jena returns `xsd:string` (§11 q3) |
-| `transform(g, srs)` | geom | 1 | between the built-in CRSs (§4.2). Unknown or unsupported target: type error |
-| `asWKT(g)` / `asGeoJSON(g)` | `wktLiteral` / `geoJSONLiteral` | 1 | conversion. GeoJSON output is always CRS84 (RFC 7946; GeoSPARQL Req 26) |
+| `convexHull(g)` | geom | 1 | Planar, in the CRS of `g`. |
+| `concaveHull(g, targetPercent?)` | geom | 2 | The `geo` concave hull. §4.4.6 documents the parameters. |
+| `boundingCircle(g)` | geom | 2 | The smallest enclosing circle (Welzl), as a polygon with 32 segments per quadrant. |
+| `envelope(g)` | geom | 1 | The axis-aligned bounding box as a `POLYGON`. A point gives the point, and a degenerate box gives a `LINESTRING`, as in Jena and JTS. |
+| `boundary(g)` | geom | 1 | The OGC boundary. Points give an empty geometry, curves give their endpoints (mod-2 rule), and polygons give their rings. |
+| `intersection` / `union` / `difference` / `symDifference(g1, g2)` | geom | 1 | Overlay (§4.4.5). `g2` is transformed into the CRS of `g1`. |
+| `centroid(g)` | geom (`POINT`) | 1 | The planar centroid in the CRS of `g`, as in Jena (§4.4.4). |
+| `getSRID(g)` | `xsd:anyURI` | 1 | The CRS IRI as written, or CRS84 when there is none. Jena returns `xsd:string` (§11 q3). |
+| `transform(g, srs)` | geom | 1 | Converts between the built-in CRSs (§4.2). An unknown or unsupported target is a type error. |
+| `asWKT(g)` / `asGeoJSON(g)` | `wktLiteral` / `geoJSONLiteral` | 1 | Converts the serialization. GeoJSON output is always CRS84 (RFC 7946; GeoSPARQL Req 26). |
 | `asGML(g, profile)` / `asKML(g)` | | 3 | |
-| `area(g, unit)` / `metricArea(g)` | `xsd:double` | 1 | geodesic area on geographic CRSs (Karney), planar otherwise. `0` for non-areal geometries |
-| `length(g, unit)` / `metricLength(g)` | `xsd:double` | 1 | geodesic or planar length of curves; areas give their boundary length; points 0 (§11 q11) |
-| `perimeter(g, unit)` / `metricPerimeter(g)` | `xsd:double` | 1 | boundary length of areal geometries, `0` otherwise |
-| `dimension(g)` | `xsd:integer` | 1 | topological dimension: 0, 1 or 2 (empty geometries: below) |
+| `area(g, unit)` / `metricArea(g)` | `xsd:double` | 1 | Geodesic area on geographic CRSs (Karney), planar otherwise. `0` for non-areal geometries. |
+| `length(g, unit)` / `metricLength(g)` | `xsd:double` | 1 | The geodesic or planar length of curves. Areas give their boundary length and points give 0 (§11 q11). |
+| `perimeter(g, unit)` / `metricPerimeter(g)` | `xsd:double` | 1 | The boundary length of areal geometries, `0` otherwise. |
+| `dimension(g)` | `xsd:integer` | 1 | The topological dimension: 0, 1 or 2. Empty geometries are covered below the table. |
 | `coordinateDimension(g)` / `spatialDimension(g)` | `xsd:integer` | 1 | 2, 3 (XYZ or XYM) or 4 / 2 or 3 |
-| `is3D(g)` / `isMeasured(g)` / `isEmpty(g)` | `xsd:boolean` | 1 | from the literal's declared layout |
-| `isSimple(g)` | `xsd:boolean` | 2 | OGC simplicity (no self-intersection except ring closure); own implementation (§4.4.7) |
-| `geometryType(g)` | `xsd:anyURI` | 1 | `sf:Point`, `sf:LineString`, `sf:Polygon`, `sf:MultiPoint`, `sf:MultiLineString`, `sf:MultiPolygon`, `sf:GeometryCollection` (also `sf:LinearRing`, `sf:Triangle`, `sf:TIN`, `sf:PolyhedralSurface` when written so) |
-| `numGeometries(g)` / `geometryN(g, n)` | `xsd:integer` / geom | 1 | direct members; atomic geometries count 1 and `geometryN(g, 1)` is `g`; `n` is 1-based; out of range: type error |
-| `minX` `minY` `maxX` `maxY` (`g`) | `xsd:double` | 1 | in the literal's own axis order (for EPSG:4326, X is latitude; as in Jena) |
-| `minZ` / `maxZ(g)` | `xsd:double` | 1 | type error when `g` has no Z |
-| `relate(g1, g2, matrix)` | `xsd:boolean` | 1 | DE-9IM pattern match, `[012TF*]{9}` |
+| `is3D(g)` / `isMeasured(g)` / `isEmpty(g)` | `xsd:boolean` | 1 | Read from the literal's declared layout. |
+| `isSimple(g)` | `xsd:boolean` | 2 | OGC simplicity: no self-intersection except ring closure. Sparkles implements it itself (§4.4.7). |
+| `geometryType(g)` | `xsd:anyURI` | 1 | `sf:Point`, `sf:LineString`, `sf:Polygon`, `sf:MultiPoint`, `sf:MultiLineString`, `sf:MultiPolygon` or `sf:GeometryCollection`. `sf:LinearRing`, `sf:Triangle`, `sf:TIN` and `sf:PolyhedralSurface` when the literal uses those types. |
+| `numGeometries(g)` / `geometryN(g, n)` | `xsd:integer` / geom | 1 | Direct members only. An atomic geometry counts as 1, and `geometryN(g, 1)` is `g`. `n` is 1-based, and an out-of-range `n` is a type error. |
+| `minX` `minY` `maxX` `maxY` (`g`) | `xsd:double` | 1 | In the literal's own axis order, as in Jena. For EPSG:4326, X is latitude. |
+| `minZ` / `maxZ(g)` | `xsd:double` | 1 | A type error when `g` has no Z. |
+| `relate(g1, g2, matrix)` | `xsd:boolean` | 1 | Matches the DE-9IM matrix against a pattern `[012TF*]{9}`. |
 | 24 topological functions | `xsd:boolean` | 1 | §2.4 |
-| `aggBoundingBox`, `aggBoundingCircle`, `aggCentroid`, `aggConvexHull`, `aggUnion`, `aggConcaveHull(g, pct)` | geom | 2 | custom aggregates (§5.8) |
+| `aggBoundingBox`, `aggBoundingCircle`, `aggCentroid`, `aggConvexHull`, `aggUnion`, `aggConcaveHull(g, pct)` | geom | 2 | Custom aggregates (§5.8). |
 
-`geof:dimension` of an empty geometry: GeoSPARQL leaves it open and Oxigraph returns `-1`.
+GeoSPARQL leaves `geof:dimension` of an empty geometry open, and Oxigraph returns `-1`.
 Sparkles returns the declared dimension of the empty type (`POINT EMPTY` → 0,
-`POLYGON EMPTY` → 2) and `-1` for `GEOMETRYCOLLECTION EMPTY` and the empty literal `""`. It
-is never a type error.
+`POLYGON EMPTY` → 2). It returns `-1` for `GEOMETRYCOLLECTION EMPTY` and the empty literal
+`""`. It never raises a type error.
 
-Jena filter functions (`spatialF:`, Phase 2, identical argument forms): `convertLatLon(lat,
-lon)`, `convertLatLonBox(latMin, lonMin, latMax, lonMax)` (both return EPSG:4326 WKT),
-`equals(g1, g2)`, `nearby(g1, g2, radius, unit)` and `withinCircle` (distance `<` radius),
-`distance(g1, g2, unit)`, `greatCircle(lat1, lon1, lat2, lon2, unit)`, `greatCircleGeom(g1,
-g2, unit)`, `angle`, `angleDeg`, `azimuth`, `azimuthDeg`, `transform(g, datatype, srs)`,
-`transformDatatype`, `transformSRS`. Their unit argument may be an IRI, an `xsd:anyURI`
-literal or a string, as in Jena. `greatCircle*` follows the dataset's distance model (§4.4.2).
+Phase 2 adds Jena's `spatialF:` filter functions, with the same argument forms as Jena:
+
+* `convertLatLon(lat, lon)` and `convertLatLonBox(latMin, lonMin, latMax, lonMax)`, which
+  both return EPSG:4326 WKT;
+* `equals(g1, g2)`;
+* `nearby(g1, g2, radius, unit)` and `withinCircle`, which test distance `<` radius;
+* `distance(g1, g2, unit)`, `greatCircle(lat1, lon1, lat2, lon2, unit)` and
+  `greatCircleGeom(g1, g2, unit)`;
+* `angle`, `angleDeg`, `azimuth` and `azimuthDeg`;
+* `transform(g, datatype, srs)`, `transformDatatype` and `transformSRS`.
+
+As in Jena, a unit argument may be an IRI, an `xsd:anyURI` literal or a string.
+`greatCircle*` follows the dataset's distance model (§4.4.2).
 
 ### 2.4 Topological relations
 
 The relation functions take two geometries (`geof:sfIntersects(?a, ?b)`) and return
 `xsd:boolean`. `g2` is transformed into the CRS of `g1`. When the two have no common
 built-in CRS, the result is a type error. The DE-9IM matrix comes from `geo`'s `Relate`
-(planar, in the CRS of `g1`; for geographic CRSs, planar in longitude/latitude, as in Jena,
-QLever, Oxigraph and the standard's own computation model).
+and is planar in the CRS of `g1`. For a geographic CRS this means planar in longitude and
+latitude. Jena, QLever and Oxigraph do the same, and it is the standard's own computation
+model.
 
 | Function | Holds when | Note |
 |---|---|---|
-| `sfEquals`, `ehEquals` | `T*F**FFF*` (topological equality) | The tables print `TFFFTFFFT`, which is false for two equal points because a point has an empty boundary. Sparkles uses JTS/`geo` topological equality (§11 q5) |
-| `rcc8eq` | `TFFFTFFFT` | areas only |
-| `sfDisjoint`, `ehDisjoint` | `FF*FF****` | 1.1 Table 2 misprints `FF**FF****` |
-| `rcc8dc` | `FFTFFTTTT` | areas only |
-| `sfIntersects` | `T********` ∨ `*T*******` ∨ `***T*****` ∨ `****T****` | 1.1 Table 6 misprints the touches pattern |
-| `sfTouches`, `ehMeet` | `FT*******` ∨ `F**T*****` ∨ `F***T****` | false for point/point |
-| `rcc8ec` | `FFTFTTTTT` | areas only |
+| `sfEquals`, `ehEquals` | `T*F**FFF*` (topological equality) | The tables print `TFFFTFFFT`. That pattern is false for two equal points, because a point has an empty boundary. Sparkles uses the topological equality of JTS and `geo` (§11 q5). |
+| `rcc8eq` | `TFFFTFFFT` | Areas only. |
+| `sfDisjoint`, `ehDisjoint` | `FF*FF****` | 1.1 Table 2 misprints this as `FF**FF****`. |
+| `rcc8dc` | `FFTFFTTTT` | Areas only. |
+| `sfIntersects` | `T********` ∨ `*T*******` ∨ `***T*****` ∨ `****T****` | 1.1 Table 6 misprints the touches pattern. |
+| `sfTouches`, `ehMeet` | `FT*******` ∨ `F**T*****` ∨ `F***T****` | False for two points. |
+| `rcc8ec` | `FFTFTTTTT` | Areas only. |
 | `sfWithin` | `T*F**F***` | |
 | `sfContains` | `T*****FF*` | |
-| `sfOverlaps` | `T*T***T**` for A/A and P/P; `1*T***T**` for L/L | false when the dimensions differ |
+| `sfOverlaps` | `T*T***T**` for A/A and P/P; `1*T***T**` for L/L | False when the dimensions differ. |
 | `ehOverlap` | `T*T***T**` | |
-| `rcc8po` | `TTTTTTTTT` | areas only |
-| `sfCrosses` | `T*T***T**` for P/L, P/A, L/A; `0********` for L/L | the vocabulary tables say `0********`, the function tables `0*T***T**` for L/L; Sparkles follows the vocabulary tables and JTS. False for other dimension pairs |
+| `rcc8po` | `TTTTTTTTT` | Areas only. |
+| `sfCrosses` | `T*T***T**` for P/L, P/A, L/A; `0********` for L/L | For L/L the vocabulary tables say `0********` and the function tables say `0*T***T**`. Sparkles follows the vocabulary tables and JTS. False for other dimension pairs. |
 | `ehCovers` | `T*TFT*FF*` | |
 | `ehCoveredBy` | `TFF*TFT**` | |
 | `ehInside` | `TFF*FFT**` | |
 | `ehContains` | `T*TFF*FF*` | |
-| `rcc8tppi` / `rcc8tpp` / `rcc8ntpp` / `rcc8ntppi` | `TTTFTTFFT` / `TFFTTFTTT` / `TFFTFFTTT` / `TTTFFTFFT` | areas only |
+| `rcc8tppi` / `rcc8tpp` / `rcc8ntpp` / `rcc8ntppi` | `TTTFTTFFT` / `TFFTTFTTT` / `TFFTFFTTT` / `TTTFFTFFT` | Areas only. |
 
-* "Areas only": RCC8 relations are defined for regions (A/A). With any non-areal
+* **Areas only.** RCC8 relations are defined for regions (A/A). With any non-areal
   argument the result is `false`, as in Jena and GeoSPARQL 1.1 Table 5.
-* **Empty geometries.** DE-9IM applies: an empty geometry is disjoint from everything
-  (`sfDisjoint`, `ehDisjoint` true; `rcc8dc` false because an empty geometry is not a
-  region), and every other relation is false. Jena returns false for every relation,
-  disjoint included (§11 q4).
+* **Empty geometries.** DE-9IM applies, so an empty geometry is disjoint from everything.
+  `sfDisjoint` and `ehDisjoint` are true. `rcc8dc` is false, because an empty geometry is
+  not a region. Every other relation is false. Jena returns false for every relation,
+  including disjoint (§11 q4).
 * `relate(g1, g2, pattern)` matches the computed matrix against any 9-character pattern of
-  `T F * 0 1 2` (case-insensitive). Another length or character is a type error. It does not
-  short-circuit on empty geometries (the matrix of an empty geometry is all `F` except
-  `EE = 2`).
+  `T F * 0 1 2`, ignoring case. Any other length or character is a type error. `relate`
+  does not short-circuit on empty geometries. The matrix of an empty geometry is all `F`
+  except `EE = 2`.
 
 ### 2.5 Jena property functions (`spatial:`)
 
 A triple pattern whose predicate is one of these IRIs is a property function, not a data
-match (Phase 1; constant arguments only, as with `text:query` and `spk:vectorSearch`).
+match. Phase 1 supports constant arguments only, as with `text:query` and
+`spk:vectorSearch`.
 
 | Property function | Object list | Matches features whose geometry … |
 |---|---|---|
-| `spatial:nearby`, `spatial:withinCircle` | `(lat lon radius [unit [limit]])` | is at distance `<` radius of the EPSG:4326 point. Default unit `uom:kilometre` |
-| `spatial:nearbyGeom`, `spatial:withinCircleGeom` | `(geom radius [unit [limit]])` | is at distance `<` radius of `geom` |
-| `spatial:withinBox` | `(latMin lonMin latMax lonMax [limit])` | is within the box (`sfWithin`) |
-| `spatial:withinBoxGeom` | `(geom [limit])` | is within `geom`'s envelope |
-| `spatial:intersectBox` | `(latMin lonMin latMax lonMax [limit])` | intersects the box |
-| `spatial:intersectBoxGeom` | `(geom [limit])` | intersects `geom`'s envelope |
-| `spatial:north` `south` `east` `west` | `(lat lon [limit])` | has an envelope that intersects the half-plane strip beyond the point (Jena's definition: north = from the point's latitude to 90°, all longitudes; east/west = up to 180° of longitude from the point, wrapping at ±180°) |
-| `spatial:northGeom` … `westGeom` | `(geom [limit])` | as above, from `geom`'s envelope edge |
-| `spatial:equals` | subject and object are features or geometry literals | `sfEquals` (Phase 2, with Query Rewrite) |
+| `spatial:nearby`, `spatial:withinCircle` | `(lat lon radius [unit [limit]])` | Is closer than `radius` to the EPSG:4326 point. The default unit is `uom:kilometre`. |
+| `spatial:nearbyGeom`, `spatial:withinCircleGeom` | `(geom radius [unit [limit]])` | Is closer than `radius` to `geom`. |
+| `spatial:withinBox` | `(latMin lonMin latMax lonMax [limit])` | Is within the box (`sfWithin`). |
+| `spatial:withinBoxGeom` | `(geom [limit])` | Is within `geom`'s envelope. |
+| `spatial:intersectBox` | `(latMin lonMin latMax lonMax [limit])` | Intersects the box. |
+| `spatial:intersectBoxGeom` | `(geom [limit])` | Intersects `geom`'s envelope. |
+| `spatial:north` `south` `east` `west` | `(lat lon [limit])` | Has an envelope that intersects the strip beyond the point. Sparkles uses Jena's definition. North runs from the point's latitude to 90°, across all longitudes. East and west extend up to 180° of longitude from the point and wrap at ±180°. |
+| `spatial:northGeom` … `westGeom` | `(geom [limit])` | As above, measured from the edge of `geom`'s envelope. |
+| `spatial:equals` | Subject and object are features or geometry literals. | `sfEquals`. Phase 2, with Query Rewrite. |
 
-* **Subject.** A variable, IRI or blank-node label: the feature. `?f` binds features `F`
-  with `F p G` for a feature link `p` (default `geo:hasDefaultGeometry`,
-  `geo:hasGeometry`; configurable, §2.8), where `G` has an indexed serialization that
-  matches. With `wgs84` on, subjects of matching `lat`/`long` pairs also match. A constant
-  subject restricts the answer to that feature. Like Jena, stand-alone geometries
-  (not linked from a feature) are not answers of `spatial:` functions; the `geof:`
-  functions and Query Rewrite cover them.
-* **Output.** One solution per distinct matching feature (set semantics; Jena can repeat a
-  feature that has two matching geometries). Under `GRAPH ?g { … }`, `?g` binds the graph
-  of the serialization quad, and the feature link must be in the same graph.
-* **Limit.** `limit` > 0 keeps the `limit` matches nearest to the query geometry (for the
-  box and cardinal functions: nearest to its envelope centre), ties by subject id. Jena
-  applies the limit in index order. Sparkles' order is deterministic and the useful one.
-  `limit ≤ 0` or absent means all matches, subject to the row budget.
-* **Exact refinement.** Every match is tested exactly against the stated relation. Jena
-  skips the exact test for `withinBox`/`intersectBox` when the subject is unbound and
-  returns envelope hits (false positives for non-rectangular geometries; §11 q9). The
-  cardinal functions are envelope-based by definition.
-* **Without an index** (index off, building, or failed) the answer is the same; it is
-  computed by enumerating the feature links (§5.6.3). Jena raises "Dataset Context does not
-  contain SpatialIndex". Sparkles answers instead, within the query's time and row budgets.
-* **Errors** (`400`, prefix `spatial:<name>: `): an object that is not a list of the
-  expected shape; a non-numeric coordinate or radius; latitude outside ±90 or longitude
-  outside ±180; an unknown unit; a non-integer limit; a variable argument (Phase 3:
-  bound-from-left arguments).
+* **Subject.** The subject is the feature: a variable, an IRI or a blank-node label. `?f`
+  binds each feature `F` that has a triple `F p G`, where `p` is a feature link and `G`
+  has a matching indexed serialization. The feature links default to
+  `geo:hasDefaultGeometry` and `geo:hasGeometry` and are configurable (§2.8). With `wgs84`
+  on, the subjects of matching `lat`/`long` pairs also match. A constant subject restricts
+  the answer to that feature. As in Jena, `spatial:` functions do not return stand-alone
+  geometries that no feature links to. The `geof:` functions and Query Rewrite cover those.
+* **Output.** The result has one solution per distinct matching feature (set semantics).
+  Jena can repeat a feature that has two matching geometries. Under `GRAPH ?g { … }`, `?g`
+  binds the graph of the serialization quad, and the feature link must be in the same
+  graph.
+* **Limit.** A `limit` above 0 keeps the `limit` matches nearest to the query geometry.
+  For the box and cardinal functions, distance is measured to the centre of the query
+  envelope. Ties are broken by subject id. Jena applies the limit in index order.
+  Sparkles' order is deterministic and more useful. A `limit` of 0 or less, or no limit,
+  returns all matches, subject to the row budget.
+* **Exact refinement.** Every match is tested exactly against the stated relation. When
+  the subject is unbound, Jena skips the exact test for `withinBox` and `intersectBox` and
+  returns envelope hits. Those include false positives for non-rectangular geometries
+  (§11 q9). The cardinal functions are defined on envelopes, so they need no exact test.
+* **Without an index.** When the index is off, building or failed, the answer is the
+  same. Sparkles computes it by enumerating the feature links (§5.6.3), within the query's
+  time and row budgets. Jena raises "Dataset Context does not contain SpatialIndex".
+* **Errors.** These return `400` with the message prefix `spatial:<name>: `:
+  * an object that is not a list of the expected shape;
+  * a non-numeric coordinate or radius;
+  * a latitude outside ±90 or a longitude outside ±180;
+  * an unknown unit;
+  * a non-integer limit;
+  * a variable argument. Phase 3 allows arguments bound from the left.
 
 ### 2.6 Query Rewrite Extension (Phase 2)
 
 A triple pattern whose predicate is one of the 24 topological properties (`geo:sfWithin`,
-`geo:ehMeet`, `geo:rcc8po`, …) matches:
+`geo:ehMeet`, `geo:rcc8po`, …) matches two kinds of triple:
 
-* the asserted triples (an ordinary scan), and
-* the derived triples of GeoSPARQL 1.1 §13 (rules `geor:sfWithin` etc.). Subject and object
-  are spatial objects `so1`, `so2`. Each resolves to geometry literals:
-  * a **feature**: `so geo:hasDefaultGeometry ?g . ?g asX ?lit`;
-  * a **geometry**: `so asX ?lit`;
-  * a **literal** in subject or object position (a Jena extension): the literal itself.
+* the asserted triples, found by an ordinary scan;
+* the derived triples of GeoSPARQL 1.1 §13 (rules `geor:sfWithin` and so on). The subject
+  and object are spatial objects `so1` and `so2`. Each one resolves to geometry literals:
+  * a **feature** resolves through `so geo:hasDefaultGeometry ?g . ?g asX ?lit`;
+  * a **geometry** resolves through `so asX ?lit`;
+  * a **literal** in subject or object position is itself. This is a Jena extension.
 
-  Here `asX` ranges over the configured serialization predicates (default `geo:asWKT`,
-  `geo:asGeoJSON`, `geo:hasSerialization`). The derived triple `(so1, geo:R, so2)` holds
+  `asX` ranges over the configured serialization predicates, by default `geo:asWKT`,
+  `geo:asGeoJSON` and `geo:hasSerialization`. The derived triple `(so1, geo:R, so2)` holds
   when some pair of their literals satisfies `geof:R`.
 
-The answer is the set union (a triple that is both asserted and derived appears once), as
-the entailment regime defines it. A feature with several default geometries relates when
-any pair does (the 1.1 text allows several, and `:f1 geo:sfDisjoint :f1` can then be
-true). The four rule cases include geometry–geometry and feature–geometry pairs, so
-`?x geo:sfWithin ex:region` returns both the features and the geometries inside the region,
-and a feature relates to its own geometry (as in Jena; filter with `?x a geo:Feature` if
-needed).
+The answer is the set union of the two, as the entailment regime defines it, so a triple
+that is both asserted and derived appears once. A feature with several default geometries
+relates to another object when any pair of geometries does. The 1.1 text allows several
+default geometries, and then `:f1 geo:sfDisjoint :f1` can be true. The four rule cases
+include geometry–geometry and feature–geometry pairs. So `?x geo:sfWithin ex:region`
+returns both the features and the geometries inside the region, and a feature relates to
+its own geometry. Jena behaves the same way. Add `?x a geo:Feature` to keep only features.
 
 * Like the rules, rewrite uses `geo:hasDefaultGeometry`, not `geo:hasGeometry`. RDFS
-  entailment does not help data with only `hasGeometry` (`hasDefaultGeometry` ⊑
-  `hasGeometry`, not the reverse). Such data needs `sparkles infer --geo-default-geometry`
-  (Phase 2), which materializes `hasDefaultGeometry` for features with exactly one
-  geometry, like Jena's `applyDefaultGeometry`.
-* An unbound predicate (`ex:a ?p ex:b`) matches asserted triples only (1.1 §13.5 leaves it
-  open).
-* Rewrite is on by default (Jena's default). `geo.json` `queryRewrite: false` turns it
-  off per dataset, and `serve --no-geo-rewrite` for the server. *(As built, rewrite is off by default, decided by the maintainer:
-  `queryRewrite: true` turns it on per dataset; see the Outcome.)*
-* Evaluation strategies (§5.6.4): both ends constant, a test; one end constant, an index
-  window query; both variables, a spatial self-join (budgeted). Disjoint relations
-  (`sfDisjoint`, `ehDisjoint`, `rcc8dc`) cannot use the index and enumerate all pairs
-  within the row budget.
+  entailment does not help data that has only `hasGeometry`, because `hasDefaultGeometry`
+  ⊑ `hasGeometry` and not the reverse. Such data needs
+  `sparkles infer --geo-default-geometry` (Phase 2). It materializes `hasDefaultGeometry`
+  for features with exactly one geometry, like Jena's `applyDefaultGeometry`.
+* An unbound predicate (`ex:a ?p ex:b`) matches asserted triples only. 1.1 §13.5 leaves
+  this case open.
+* Rewrite is on by default, as in Jena. `queryRewrite: false` in `geo.json` turns it off
+  for one dataset, and `serve --no-geo-rewrite` turns it off for the server. *(As built,
+  the maintainer decided rewrite is off by default. `queryRewrite: true` turns it on per
+  dataset. See the Outcome.)*
+* §5.6.4 describes the evaluation strategies. With both ends constant, rewrite runs one
+  test. With one end constant, it runs an index window query. With both ends variables, it
+  runs a spatial self-join within the budgets. The disjoint relations (`sfDisjoint`,
+  `ehDisjoint`, `rcc8dc`) cannot use the index, so they enumerate all pairs within the row
+  budget.
 
 ### 2.7 RDFS Entailment Extension (Phase 2)
 
-Sparkles reasons by materialization (README decision), so the extension is the GeoSPARQL
-ontology plus the existing RDFS profile:
+Sparkles reasons by materialization (a README decision). The extension is therefore the
+GeoSPARQL ontology added to the existing RDFS profile:
 
 * `sparkles-reasoner` embeds the GeoSPARQL 1.1 ontology (`geo`) and the Simple Features
-  vocabulary (`sf`), published under the OGC Document License (permissive; attribution kept
-  in the file header and `THIRD_PARTY_LICENSES.md`).
-* `sparkles infer --profile rdfs --vocab geosparql` and `POST /$/reason/{ds}`
-  `{"profile":"rdfs","vocabularies":["geosparql"]}` add them to the TBox, so the
-  subclass/subproperty closure (`sf:Polygon ⊑ sf:Surface ⊑ sf:Geometry ⊑ geo:Geometry`,
-  `geo:asWKT ⊑ geo:hasSerialization`, `geo:hasDefaultGeometry ⊑ geo:hasGeometry`, …) lands
-  in `urn:x-sparkles:inferred`. The inferred graph is queried with `reasoning=true`, as for
-  every other profile. The vocabulary triples themselves are not copied into user graphs.
-* Optional rule `geometryTypes` (Phase 3): materialize `?g a sf:Polygon` etc. from the type
-  of `?g`'s serialization. The standard does not require it (Req 48 asks for the hierarchy,
-  not for typing from literals), but it is what users expect from `?g a sf:Polygon`.
+  vocabulary (`sf`). OGC publishes both under the OGC Document License, which is
+  permissive. The attribution is kept in the file header and in `THIRD_PARTY_LICENSES.md`.
+* `sparkles infer --profile rdfs --vocab geosparql`, or `POST /$/reason/{ds}` with
+  `{"profile":"rdfs","vocabularies":["geosparql"]}`, adds them to the TBox. The subclass and
+  subproperty closure then lands in `urn:x-sparkles:inferred`:
+  `sf:Polygon ⊑ sf:Surface ⊑ sf:Geometry ⊑ geo:Geometry`,
+  `geo:asWKT ⊑ geo:hasSerialization`, `geo:hasDefaultGeometry ⊑ geo:hasGeometry`, and so
+  on. Queries read the inferred graph
+  with `reasoning=true`, as for every other profile. The vocabulary triples are not copied
+  into user graphs.
+* An optional rule, `geometryTypes` (Phase 3), materializes `?g a sf:Polygon` and similar
+  triples from the type of `?g`'s serialization. The standard does not require it: Req 48
+  asks for the hierarchy, not for typing from literals. Users still expect
+  `?g a sf:Polygon` to work.
 
 ### 2.8 HTTP (`/$/` extensions, documented in `docs/API.md`)
 
 | Method | Path | Phase | Description |
 |---|---|---|---|
-| GET | `/$/geo/{ds}` | 1 | `GeoStatus`. `404` unknown dataset. Index off: `{ "enabled": false }` |
-| PUT | `/$/geo/{ds}` | 1 | body `GeoConfig`: enable or reconfigure, returns `{ status, task }` (task kind `geo-index`). `400` invalid config, `403` read-only |
-| DELETE | `/$/geo/{ds}` | 1 | disable; removes `geo.json` and derived files. `204` |
-| POST | `/$/geo/{ds}/rebuild` | 1 | rebuild the current generation's base. `Task`; `409` when one runs |
-| POST | `/$/datasets` | 1 | optional `geo: true \| GeoConfig` |
-| GET | `/{ds}/geo?bbox=minLon,minLat,maxLon,maxLat&graph=&predicate=&limit=&tolerance=` | 2 | GeoJSON `FeatureCollection` of indexed geometries in a CRS84 box, for the UI map: `id` = subject, `properties` = `{ subject, feature?, graph, predicate }`, geometries simplified (Douglas–Peucker, `tolerance` in degrees, default from bbox size / 1024) and capped at `limit` (default 5,000, max 50,000; `truncated: true` beyond) |
-| POST | `/$/geo/convert` | 2 | `{ literals: [{ value, datatype }] }` → CRS84 GeoJSON geometries or errors per item, for the UI to draw result columns |
+| GET | `/$/geo/{ds}` | 1 | Returns `GeoStatus`, or `{ "enabled": false }` when the index is off. `404` for an unknown dataset. |
+| PUT | `/$/geo/{ds}` | 1 | Enables or reconfigures the index from a `GeoConfig` body. Returns `{ status, task }` with task kind `geo-index`. `400` for an invalid config, `403` for a read-only dataset. |
+| DELETE | `/$/geo/{ds}` | 1 | Disables the index and removes `geo.json` and the derived files. Returns `204`. |
+| POST | `/$/geo/{ds}/rebuild` | 1 | Rebuilds the current generation's base and returns a `Task`. `409` when a rebuild is already running. |
+| POST | `/$/datasets` | 1 | Takes an optional `geo: true \| GeoConfig`. |
+| GET | `/{ds}/geo?bbox=minLon,minLat,maxLon,maxLat&graph=&predicate=&limit=&tolerance=` | 2 | Returns the indexed geometries in a CRS84 box as a GeoJSON `FeatureCollection`, for the UI map. Each feature's `id` is the subject and its `properties` are `{ subject, feature?, graph, predicate }`. Geometries are simplified with Douglas–Peucker. `tolerance` is in degrees and defaults to the bbox size / 1024. The result is capped at `limit` (default 5,000, max 50,000) and has `truncated: true` when it hits the cap. |
+| POST | `/$/geo/convert` | 2 | Converts `{ literals: [{ value, datatype }] }` to CRS84 GeoJSON geometries, with an error for each item that fails. The UI uses it to draw result columns. |
 
 ```ts
 type GeoConfig = {
@@ -380,9 +408,10 @@ type GeoStatus = {
 ```
 
 `DatasetInfo` gets `geo: null | { state, rows }` and `DatasetStats` gets
-`geo: GeoStatus | null`. Prometheus: `sparkles_geo_rows{dataset,part}`,
-`sparkles_geo_build_seconds`, `sparkles_geo_candidates_total` and
-`sparkles_geo_refined_total` (exact tests run), `sparkles_geo_matches_total`.
+`geo: GeoStatus | null`. The Prometheus metrics are `sparkles_geo_rows{dataset,part}`,
+`sparkles_geo_build_seconds`, `sparkles_geo_candidates_total`,
+`sparkles_geo_refined_total` (the number of exact tests run) and
+`sparkles_geo_matches_total`.
 
 ### 2.9 CLI
 
@@ -396,11 +425,12 @@ sparkles serve … --no-geo-rewrite                   # Phase 2
 sparkles infer --loc db --profile rdfs --vocab geosparql [--geo-default-geometry]   # Phase 2
 ```
 
-`load`, `update`, `query`, `infer`, `compact` and `clone` maintain or copy the index
-(`geo.json` is a meta file, copied by `clone` and backed up by [F05](F05-snapshot-repositories.md) like `text.json`;
-derived files are never backed up). `sparkles check` validates `geo.json` and, from Phase
-2, the persisted files' headers and checksums (§5.5). Built without the feature,
-`geo-index` exits 2 with `built without GeoSPARQL (cargo feature "geo")`.
+`load`, `update`, `query`, `infer`, `compact` and `clone` maintain or copy the index.
+`geo.json` is a meta file like `text.json`: `clone` copies it and
+[F05](F05-snapshot-repositories.md) backs it up. Derived files are never backed up.
+`sparkles check` validates `geo.json`, and from Phase 2 also the headers and checksums of
+the persisted files (§5.5). In a build without the feature, `geo-index` exits 2 with
+`built without GeoSPARQL (cargo feature "geo")`.
 
 ### 2.10 Rust API (`sparkles`, feature `geo`)
 
@@ -427,61 +457,70 @@ SPARQL stays the query interface. The query builder needs nothing new.
 
 ### 2.11 UI (SvelteKit, `ui/`, Phase 2)
 
-* **Map result view.** The results panel gets a "Map" tab next to Table / Graph / Plan
-  when a result column holds `wktLiteral` or `geoJSONLiteral` values. Geometries are drawn
-  with a popup per feature showing the row's other bindings (`TermView`). A row click in the
-  table highlights the geometry. Non-CRS84 literals are converted client-side for EPSG:4326
-  (axis swap) and EPSG:3857; anything else goes through `POST /$/geo/convert`, and literals
-  that cannot be drawn are listed under the map.
-* **Explorer.** A resource with a geometry (directly, or via a feature link) shows a small
-  map card. A "Nearby" action runs `spatial:nearbyGeom` with a radius picker and lists the
-  results.
-* **Dataset page.** A "Spatial index" panel like the full-text panel: state badge,
-  rows (base / overlay / tail), skipped counts, CRS histogram, memory against budget,
-  configured predicates and feature links, last build. Buttons: Rebuild, Configure,
-  Disable (tasks appear in `TaskList`).
-* **Query editor.** `geo:`, `geof:`, `uom:`, `spatial:` and `spatialF:` in the prefix
-  completions, and examples in `examples.ts` (point in polygon, nearby, distance ranking).
-* **Library.** MapLibre GL JS 6 (BSD-3-Clause), loaded with a dynamic `import()` only when
-  a map opens, so other pages do not pay for it. Leaflet 1.9 (BSD-2-Clause) is the fallback
-  if the bundle size is a problem (§11 q13).
-* **Basemap.** No external tile server by default: the OSM tile usage policy forbids
-  offline and bulk use and requires a unique User-Agent, and an air-gapped server must
-  work. The UI ships Natural Earth 1:110m land, coastline and country boundaries (public
-  domain) as a small vector style, precompressed by `ui/scripts/precompress.mjs`. An
-  operator may set `serve --map-style-url URL` (a MapLibre style JSON). The server's CSP
-  then allows that origin for `connect-src`/`img-src`; nothing external is contacted
-  otherwise. Attribution, when the style needs it, comes from the style.
-* **`api.ts`**: `geoStatus`, `geoConfigure`, `geoDisable`, `geoRebuild`, `geoBox`,
+* **Map result view.** When a result column holds `wktLiteral` or `geoJSONLiteral`
+  values, the results panel gets a "Map" tab next to Table, Graph and Plan. Each feature
+  on the map has a popup that shows the row's other bindings (`TermView`). Clicking a row
+  in the table highlights its geometry. The client converts EPSG:4326 (an axis swap) and
+  EPSG:3857 literals itself. Other non-CRS84 literals go through `POST /$/geo/convert`.
+  Literals that cannot be drawn are listed under the map.
+* **Explorer.** A resource with a geometry, directly or through a feature link, shows a
+  small map card. A "Nearby" action runs `spatial:nearbyGeom` with a radius picker and
+  lists the results.
+* **Dataset page.** A "Spatial index" panel, like the full-text panel, shows the state,
+  the rows (base, overlay, tail), the skipped counts, a CRS histogram, memory use against
+  the budget, the configured predicates and feature links, and the last build. Its
+  buttons are Rebuild, Configure and Disable, and the tasks they start appear in
+  `TaskList`.
+* **Query editor.** The prefix completions include `geo:`, `geof:`, `uom:`, `spatial:` and
+  `spatialF:`. `examples.ts` gets point-in-polygon, nearby and distance-ranking examples.
+* **Library.** The map uses MapLibre GL JS 6 (BSD-3-Clause). It is loaded with a dynamic
+  `import()` only when a map opens, so other pages do not pay for it. Leaflet 1.9
+  (BSD-2-Clause) is the fallback if the bundle is too large (§11 q13).
+* **Basemap.** The UI uses no external tile server by default. The OSM tile usage policy
+  forbids offline and bulk use and requires a unique User-Agent, and the map must work on
+  an air-gapped server. The UI ships Natural Earth 1:110m land, coastlines and country
+  boundaries (public domain) as a small vector style, precompressed by
+  `ui/scripts/precompress.mjs`. An operator can point `serve --map-style-url URL` at a
+  MapLibre style JSON. The server's CSP then allows that origin for `connect-src` and
+  `img-src`. Otherwise the UI contacts nothing external. When the style needs an
+  attribution, the style supplies it.
+* **`api.ts`** gets `geoStatus`, `geoConfigure`, `geoDisable`, `geoRebuild`, `geoBox` and
   `geoConvert`. `ui/mock/server.mjs` emulates `/$/geo/*` and `/{ds}/geo`.
 
 ## 3. Standards basis
 
-* **OGC GeoSPARQL 1.1** (OGC 22-047r1, 2024; ISO 19186-1): conformance classes (Annex A),
-  vocabulary (§§7–9), literals (§10.2–10.8: Req 14–17 WKT, 25–27 GeoJSON, 20–22 GML, 30–32
-  KML), functions (§10.9, Annex B), relation patterns (Tables 2, 5–8), RDFS Entailment
-  (§12, Req 47–49), Query Rewrite (§13, rules `geor:*`). **GeoSPARQL 1.0** (OGC 11-052r4)
-  where 1.1 changed things (for example, the WKT separator was spaces only, and
-  `hasDefaultGeometry` belonged to the Geometry Extension).
-* **OGC/ISO Simple Features** (OGC 06-103r4 / ISO 19125-1) and **ISO 13249-3**: WKT
-  grammar, geometry types, the boundary rule, DE-9IM (Clementini, Di Felice, van Oosterom
-  1993; Egenhofer & Franzosa 1991; Randell, Cui & Cohn 1992 for RCC8).
-* **RFC 7946** (GeoJSON): geometry objects, CRS84, no `crs` member, antimeridian guidance.
-* **OGC CRS registry** (`http://www.opengis.net/def/crs/…`), EPSG axis orders for 4326
-  (latitude, longitude) and CRS84 (longitude, latitude); OGC unit IRIs
-  (`http://www.opengis.net/def/uom/OGC/1.0/…`) and QUDT units, which 1.1 §10.3 recommends.
-* **Karney 2013**, "Algorithms for geodesics" (geodesic distance and area on the ellipsoid);
-  WGS 84 parameters `a = 6378137 m`, `f = 1/298.257223563`.
-* **SPARQL 1.1 Query**: §17.6 extension functions, §17.2 error semantics, §18 BGP and join
-  semantics, §11 aggregates (custom aggregate IRIs), §13 datasets and the active graph,
-  §4.2.3 collections (property-function arguments); SPARQL 1.1 Entailment Regimes (RDFS),
-  which 1.1 Req 47 names.
-* **RDF 1.2 Concepts** §3.4.2 (ill-typed literals) and §5 (datatypes).
-* **R-trees**: Guttman 1984; STR packing (Leutenegger, Lopez & Edgington 1997); Hilbert
-  packing (Kamel & Faloutsos 1993); best-first k-NN (Hjaltason & Samet 1999).
-* **Apache Jena GeoSPARQL** (documentation and `jena-geosparql` sources, Apache-2.0): the
-  `spatial:` and `spatialF:` vocabularies, argument forms, defaults and the behaviours §11
-  compares.
+* **OGC GeoSPARQL 1.1** (OGC 22-047r1, 2024; ISO 19186-1). The spec relies on:
+  * the conformance classes (Annex A);
+  * the vocabulary (§§7–9);
+  * the literals (§10.2–10.8): Req 14–17 for WKT, 25–27 for GeoJSON, 20–22 for GML and
+    30–32 for KML;
+  * the functions (§10.9, Annex B) and the relation patterns (Tables 2, 5–8);
+  * RDFS Entailment (§12, Req 47–49) and Query Rewrite (§13, rules `geor:*`).
+* **GeoSPARQL 1.0** (OGC 11-052r4), where 1.1 changed something. In 1.0, for example, the
+  WKT separator could only be spaces, and `hasDefaultGeometry` belonged to the Geometry
+  Extension.
+* **OGC/ISO Simple Features** (OGC 06-103r4 / ISO 19125-1) and **ISO 13249-3** for the WKT
+  grammar, the geometry types, the boundary rule and DE-9IM. DE-9IM comes from Clementini,
+  Di Felice and van Oosterom (1993) and Egenhofer and Franzosa (1991). RCC8 comes from
+  Randell, Cui and Cohn (1992).
+* **RFC 7946** (GeoJSON) for the geometry objects, CRS84, the removal of the `crs` member
+  and the antimeridian guidance.
+* **OGC CRS registry** (`http://www.opengis.net/def/crs/…`) and the EPSG axis orders:
+  latitude, longitude for 4326 and longitude, latitude for CRS84. Also the OGC unit IRIs
+  (`http://www.opengis.net/def/uom/OGC/1.0/…`) and the QUDT units that 1.1 §10.3
+  recommends.
+* **Karney 2013**, "Algorithms for geodesics", for geodesic distance and area on the
+  ellipsoid, with the WGS 84 parameters `a = 6378137 m` and `f = 1/298.257223563`.
+* **SPARQL 1.1 Query**: extension functions (§17.6), error semantics (§17.2), BGP and join
+  semantics (§18), custom aggregate IRIs (§11), datasets and the active graph (§13), and
+  collections for property-function arguments (§4.2.3). Also SPARQL 1.1 Entailment Regimes
+  (RDFS), which 1.1 Req 47 names.
+* **RDF 1.2 Concepts**: ill-typed literals (§3.4.2) and datatypes (§5).
+* **R-trees**: Guttman 1984, STR packing (Leutenegger, Lopez and Edgington 1997), Hilbert
+  packing (Kamel and Faloutsos 1993) and best-first k-NN (Hjaltason and Samet 1999).
+* **Apache Jena GeoSPARQL** (the documentation and the `jena-geosparql` sources,
+  Apache-2.0) for the `spatial:` and `spatialF:` vocabularies, their argument forms and
+  defaults, and the behaviours that §11 compares.
 
 ## 4. Semantics
 
@@ -496,77 +535,93 @@ geometry   := ISO 13249-3 / OGC 06-103r4 WKT, keywords case-insensitive,
               Z / M / ZM dimension markers, "EMPTY" at any level
 ```
 
-* The IRI must be absolute. It is matched against the CRS table (§4.2) after alias
-  normalization, and kept verbatim for `getSRID`.
-* Sparkles strips the `<IRI>` prefix itself and hands the rest to the `wkt` crate (0.14:
-  case-insensitive keywords, Z/M/ZM, `EMPTY`). Unlike Jena's hand-written splitter, any
-  whitespace (tabs, newlines, repeated spaces) separates ordinates.
-* Accepted types: `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT` (with or without inner
-  parentheses), `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION`. Also `LINEARRING`,
-  `TRIANGLE`, `TIN` and `POLYHEDRALSURFACE`, which are mapped to polygons and multipolygons
-  for computation, but `geometryType` reports the written type. `CIRCULARSTRING`,
-  `COMPOUNDCURVE`, `CURVEPOLYGON` and other curved types are ill-typed (`unsupported
-  geometry type`).
+* The IRI must be absolute. Sparkles normalizes aliases, looks the IRI up in the CRS
+  table (§4.2), and keeps it verbatim for `getSRID`.
+* Sparkles strips the `<IRI>` prefix itself and hands the rest to the `wkt` crate 0.14,
+  which handles case-insensitive keywords, Z/M/ZM and `EMPTY`. Jena splits ordinates with
+  hand-written code. In Sparkles any whitespace separates them, including tabs, newlines
+  and repeated spaces.
+* The accepted types are `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT` (with or without
+  inner parentheses), `MULTILINESTRING`, `MULTIPOLYGON` and `GEOMETRYCOLLECTION`.
+  `LINEARRING`, `TRIANGLE`, `TIN` and `POLYHEDRALSURFACE` are also accepted. Computation
+  treats them as polygons and multipolygons, but `geometryType` reports the written type.
+  `CIRCULARSTRING`, `COMPOUNDCURVE`, `CURVEPOLYGON` and the other curved types are
+  ill-typed (`unsupported geometry type`).
 * Ordinates are decimal or scientific numbers (`-1.5e3`), parsed as `f64`. NaN, infinities
   and hex are ill-typed.
-* A missing multi-geometry member (`MULTIPOINT((1 2),)`) and unbalanced parentheses are
-  ill-typed. Nesting deeper than 32 `GEOMETRYCOLLECTION` levels is ill-typed.
-* Structural validity is not checked at parse time beyond what the type needs. A
-  `LINESTRING` needs ≥ 2 points (or `EMPTY`); a polygon ring needs ≥ 4 points and must be
-  closed (first = last). Otherwise the literal is ill-typed. Self-intersecting polygons are
-  accepted (as in Jena); overlay and relate on them give `geo`'s results, and `isSimple`
-  reports them.
-* A mixed Z/non-Z coordinate layout inside one geometry is ill-typed.
+* A missing multi-geometry member (`MULTIPOINT((1 2),)`) and unbalanced parentheses make
+  the literal ill-typed. So does nesting deeper than 32 `GEOMETRYCOLLECTION` levels.
+* The parser checks only the structure each type needs. A `LINESTRING` needs at least 2
+  points, or `EMPTY`. A polygon ring needs at least 4 points and must be closed (first =
+  last). A literal that breaks these rules is ill-typed. Self-intersecting polygons are
+  accepted, as in Jena. Overlay and relate on them give `geo`'s results, and `isSimple`
+  reports them as not simple.
+* A geometry that mixes coordinates with and without Z is ill-typed.
 
 #### 4.1.2 `geo:geoJSONLiteral`
 
-* An RFC 7946 Geometry object (`Point`, `LineString`, `Polygon`, `MultiPoint`,
-  `MultiLineString`, `MultiPolygon`, `GeometryCollection`), parsed with `geojson` 1.0.
-  `Feature` and `FeatureCollection` are ill-typed (GeoSPARQL: "GeoJSON Geometry objects").
+* The literal is an RFC 7946 Geometry object (`Point`, `LineString`, `Polygon`,
+  `MultiPoint`, `MultiLineString`, `MultiPolygon` or `GeometryCollection`), parsed with
+  `geojson` 1.0. `Feature` and `FeatureCollection` are ill-typed, because GeoSPARQL
+  specifies "GeoJSON Geometry objects".
 * The empty literal `""` and `null` are empty geometries (Req 27).
-* Always CRS84 (Req 26). A `crs` member (pre-RFC 7946 GeoJSON) is ill-typed rather than
-  silently ignored.
-* Positions with 3 elements are XYZ; with 4 or more, or with 1, the literal is ill-typed
-  (GeoJSON has no M).
-* Ring orientation is not checked (RFC 7946 §3.1.6 says parsers should not reject it).
+* The CRS is always CRS84 (Req 26). A `crs` member, from pre-RFC 7946 GeoJSON, makes the
+  literal ill-typed. Sparkles does not silently ignore it.
+* A position with 3 elements is XYZ. A position with 1 element, or with 4 or more, makes
+  the literal ill-typed, since GeoJSON has no M.
+* Ring orientation is not checked. RFC 7946 §3.1.6 says parsers should not reject a ring
+  for its orientation.
 
 #### 4.1.3 Other datatypes
 
-`gmlLiteral` (GML 3.2 Simple Features profile 10-100r3 levels 0 and 1, plus `gml:Curve` /
-`gml:Surface` with linear segments only) and `kmlLiteral` (KML 2.2 `Point`, `LineString`,
-`LinearRing`, `Polygon`, `MultiGeometry`) come in Phase 3. Until then, values of those
-datatypes are ill-typed geometry arguments (type error) and are not indexed. They are
-reported once in `GeoStatus.skipped` as `unsupportedDatatype` (Phase 3 field).
+Phase 3 adds `gmlLiteral` and `kmlLiteral`. `gmlLiteral` covers levels 0 and 1 of the GML
+3.2 Simple Features profile (10-100r3), plus `gml:Curve` and `gml:Surface` with linear
+segments only. `kmlLiteral` covers the KML 2.2 `Point`, `LineString`, `LinearRing`,
+`Polygon` and `MultiGeometry`. Until then, values of these datatypes are ill-typed
+geometry arguments, so functions raise a type error on them, and the index skips them.
+The index reports them once in `GeoStatus.skipped` as `unsupportedDatatype`, a Phase 3
+field.
 
 #### 4.1.4 Empty geometries and dimensions
 
-`""`, `POINT EMPTY`, `GEOMETRYCOLLECTION EMPTY` and so on are empty geometries. `isEmpty`
-is true. They are never indexed (they occupy no space) and are counted in `skipped.empty`.
-Relations follow §2.4. `distance` involving an empty geometry is a type error (there is no
-closest point). Measures are 0, and constructive functions return an empty geometry
-of the result type (`intersection` of disjoint polygons → `POLYGON EMPTY`, in WKT, or
-GeoJSON `{"type":"GeometryCollection","geometries":[]}`). `envelope`, `centroid`,
-`boundary`, `convexHull` of an empty geometry → `GEOMETRYCOLLECTION EMPTY`. `minX` etc. of
-an empty geometry → type error.
+`""`, `POINT EMPTY`, `GEOMETRYCOLLECTION EMPTY` and so on are empty geometries, and
+`isEmpty` is true for them. They occupy no space, so they are never indexed. The index
+counts them in `skipped.empty`. Relations follow §2.4.
+
+* `distance` involving an empty geometry is a type error, because there is no closest
+  point.
+* Measures are 0.
+* Constructive functions return an empty geometry of the result type. The `intersection`
+  of two disjoint polygons is `POLYGON EMPTY` in WKT, or
+  `{"type":"GeometryCollection","geometries":[]}` in GeoJSON.
+* `envelope`, `centroid`, `boundary` and `convexHull` of an empty geometry return
+  `GEOMETRYCOLLECTION EMPTY`.
+* `minX` and the other bounds of an empty geometry are a type error.
 
 #### 4.1.5 Canonical output form
 
-Sparkles never rewrites stored literals. Literals it creates (function results) are
-canonical:
+Sparkles never rewrites stored literals. The literals it creates as function results are
+in canonical form:
 
-* WKT: `[<IRI> ]TYPE[ Z| M| ZM](…)`. The type is uppercase, there is no space before `(`,
-  `, ` separates points and one space separates ordinates. The CRS prefix is omitted for
-  CRS84 (as in Jena; Oxigraph always writes it). Numbers use Rust's shortest round-trip
-  `f64` formatting, with integral values written without `.0` (`POINT(2 48.8566)`), `-0`
-  written as `0`, and no exponent between 1e-6 and 1e21 (exponent forms such as `1e-7`
-  otherwise). Empty: `POINT EMPTY` etc.
-* GeoJSON: compact JSON, members in the order `type`, `coordinates` / `geometries`, the
-  same number formatting, no `bbox`, polygons in the input's ring orientation (RFC 7946
-  §3.1.6 recommends right-hand rings for output; Sparkles keeps the computed orientation
-  and `asGeoJSON` forces exterior rings counter-clockwise, as Jena's writer does).
-* Jena rounds transformed and constructed coordinates to 6 decimal places (`PRECISION_MODEL
-  1e6`). Sparkles does not, so results can differ in the 7th decimal or beyond. Value-based
-  comparison of results (`bench-answers.py`) must compare geometries with a tolerance.
+* **WKT** is `[<IRI> ]TYPE[ Z| M| ZM](…)`. The type is uppercase, there is no space before
+  `(`, `, ` separates points and one space separates ordinates. The CRS prefix is omitted
+  for CRS84, as Jena does. Oxigraph always writes it. Numbers use Rust's shortest
+  round-trip `f64` formatting, with these adjustments:
+  * integral values have no `.0` (`POINT(2 48.8566)`);
+  * `-0` is written as `0`;
+  * values between 1e-6 and 1e21 have no exponent, and other values use exponent forms
+    such as `1e-7`.
+
+  Empty geometries are written `POINT EMPTY` and so on.
+* **GeoJSON** is compact JSON with the members in the order `type`, then `coordinates` or
+  `geometries`. It uses the same number formatting and has no `bbox`. Polygons keep the
+  input's ring orientation. RFC 7946 §3.1.6 recommends right-hand rings for output.
+  Sparkles keeps the computed orientation, and `asGeoJSON` forces exterior rings
+  counter-clockwise, as Jena's writer does.
+* Jena rounds transformed and constructed coordinates to 6 decimal places
+  (`PRECISION_MODEL 1e6`). Sparkles does not, so results can differ from the 7th decimal
+  on. A value-based comparison of results (`bench-answers.py`) must compare geometries
+  with a tolerance.
 
 ### 4.2 Coordinate reference systems
 
@@ -575,243 +630,269 @@ canonical:
 | CRS IRI(s), after normalization | Kind | Axis order of the literal | Notes |
 |---|---|---|---|
 | `http://www.opengis.net/def/crs/OGC/1.3/CRS84` (the default) | geographic 2D | lon, lat | |
-| `http://www.opengis.net/def/crs/OGC/0/CRS84h` | geographic 3D | lon, lat, h | Z = ellipsoidal height |
-| `http://www.opengis.net/def/crs/EPSG/0/4326` | geographic 2D | **lat, lon** | Req 16: axes in the CRS's order |
+| `http://www.opengis.net/def/crs/OGC/0/CRS84h` | geographic 3D | lon, lat, h | Z is the ellipsoidal height. |
+| `http://www.opengis.net/def/crs/EPSG/0/4326` | geographic 2D | **lat, lon** | Req 16 puts the axes in the CRS's order. |
 | `http://www.opengis.net/def/crs/EPSG/0/4979` | geographic 3D | lat, lon, h | |
-| `http://www.opengis.net/def/crs/EPSG/4326` (no `/0/`; legacy GeoSPARQL 1.0 examples) | geographic 2D | lon, lat | Jena's alias of CRS84; kept for compatibility |
-| `http://www.opengis.net/def/crs/EPSG/0/3857` (and `…/900913`) | projected (Web Mercator, spherical) | x, y (metres) | closed-form forward/inverse |
-| `http://www.opengis.net/def/crs/EPSG/0/326NN`, `…/327NN` (UTM zones on WGS 84) | projected | E, N (metres) | Phase 2: transverse Mercator with Krüger's 6th-order series (Karney 2011) |
+| `http://www.opengis.net/def/crs/EPSG/4326` (no `/0/`, from legacy GeoSPARQL 1.0 examples) | geographic 2D | lon, lat | Jena treats it as an alias of CRS84. Sparkles keeps that for compatibility. |
+| `http://www.opengis.net/def/crs/EPSG/0/3857` (and `…/900913`) | projected (Web Mercator, spherical) | x, y (metres) | Closed-form forward and inverse projection. |
+| `http://www.opengis.net/def/crs/EPSG/0/326NN`, `…/327NN` (UTM zones on WGS 84) | projected | E, N (metres) | Phase 2. Transverse Mercator with Krüger's 6th-order series (Karney 2011). |
 
-Alias normalization: `https://www.opengis.net/…` → `http://…`;
-`urn:ogc:def:crs:OGC:1.3:CRS84`, `urn:ogc:def:crs:EPSG::4326` and the like → the
-`http://www.opengis.net/def/crs/…` form; `CRS:84` and `EPSG:4326` short forms. Aliases
-change only CRS lookup, never the stored term.
+Alias normalization maps these forms to the `http://www.opengis.net/def/crs/…` IRIs:
+
+* `https://www.opengis.net/…` to `http://…`;
+* `urn:ogc:def:crs:OGC:1.3:CRS84`, `urn:ogc:def:crs:EPSG::4326` and similar URNs;
+* the short forms `CRS:84` and `EPSG:4326`.
+
+Aliases affect only the CRS lookup. The stored term never changes.
 
 #### 4.2.2 Axis order and internal coordinates
 
-Internally every geometry is held as `(x, y)` = (east, north): (lon, lat) for geographic
-CRSs, (E, N) for projected ones. EPSG:4326/4979 literals are swapped on parse and swapped
-back when a result in that CRS is written. All computation, the index and GeoJSON use the
-internal order. `minX`/`maxX`/`minY`/`maxY` report the literal's own axes (§2.3). The
-documentation calls this out, since axis order is the most common GeoSPARQL mistake.
+Internally every geometry is held as `(x, y)` = (east, north). That is (lon, lat) for
+geographic CRSs and (E, N) for projected ones. EPSG:4326 and 4979 literals are swapped on
+parse, and swapped back when a result in that CRS is written. All computation, the index
+and GeoJSON use the internal order. `minX`, `maxX`, `minY` and `maxY` report the literal's
+own axes (§2.3). Axis order is the most common GeoSPARQL mistake, so the documentation
+calls it out.
 
 #### 4.2.3 Mixed CRSs and unknown CRSs
 
-* A binary function with arguments in different built-in CRSs transforms `g2` into
-  `g1`'s CRS (GeoSPARQL: calculations in the SRS of `geom1`). Transforms between built-in
-  geographic CRSs are axis swaps (WGS 84 throughout). Geographic ↔ projected uses the
-  projection formulas.
-* A literal with a CRS IRI that is not in the table is still a valid geometry:
-  `getSRID`, `geometryType`, `dimension`, `isEmpty`, `asWKT`, `numGeometries`/`geometryN`,
-  `min*`/`max*`, `envelope`, `convexHull`, `boundary`, `centroid` and planar relations and
-  overlay between two geometries of the same unknown CRS work in its native
-  coordinates. Metric functions (`metricDistance`, `metricArea`, …), unit conversions, and
-  any mix with another CRS are type errors. Such literals are not indexed
-  (`skipped.unknownCrs`, with the IRIs counted in `GeoStatus.crs`). Jena instead logs a
-  warning and treats the coordinates as CRS84 degrees, which silently gives wrong answers
-  (§10).
+* When a binary function gets arguments in two different built-in CRSs, it transforms
+  `g2` into the CRS of `g1`. GeoSPARQL says calculations happen in the SRS of `geom1`.
+  All the built-in geographic CRSs use WGS 84, so transforms between them are axis swaps.
+  Transforms between geographic and projected CRSs use the projection formulas.
+* A literal whose CRS IRI is not in the table is still a valid geometry. These functions
+  work on it in its native coordinates: `getSRID`, `geometryType`, `dimension`, `isEmpty`,
+  `asWKT`, `numGeometries`/`geometryN`, `min*`/`max*`, `envelope`, `convexHull`,
+  `boundary` and `centroid`. Planar relations and overlay also work between two
+  geometries in the same unknown CRS. Metric functions (`metricDistance`, `metricArea`,
+  …), unit conversions and any mix with another CRS are type errors. The index skips such
+  literals and counts them in `skipped.unknownCrs`, with their IRIs counted in
+  `GeoStatus.crs`. Jena instead logs a warning and treats the coordinates as CRS84
+  degrees, which silently gives wrong answers (§10).
 
 #### 4.2.4 Additional CRSs (Phase 3)
 
-An optional feature `geo-proj4` uses `proj4rs` (MIT/Apache-2.0, pure Rust, a proj4js
-port: tmerc, lcc, laea, aea, stere, merc, …). CRS definitions come from an operator-supplied
-file `crs.json` (`{ "<CRS IRI>": { "proj4": "+proj=…", "axis": "en" | "ne" } }`), so
-Sparkles ships no EPSG dataset. The EPSG terms of use (no distribution for profit, notice to
-recipients) are a licensing question for the maintainer (§11 q16), and
-`crs-definitions` (CC0, but EPSG-derived) is therefore not bundled by default. `proj`
-(MIT bindings to PROJ 9, MIT) stays rejected for the default build (§10) and could be a
-further opt-in feature.
+An optional feature, `geo-proj4`, uses `proj4rs`. It is a pure-Rust port of proj4js
+(MIT/Apache-2.0) and supports tmerc, lcc, laea, aea, stere, merc and other projections.
+The CRS definitions come from a `crs.json` file that the operator supplies
+(`{ "<CRS IRI>": { "proj4": "+proj=…", "axis": "en" | "ne" } }`), so Sparkles ships no
+EPSG dataset. The EPSG terms of use forbid distribution for profit and require a notice
+to recipients. Whether that is acceptable is a licensing question for the maintainer
+(§11 q16). For that reason `crs-definitions` (CC0, but derived from EPSG) is not bundled
+by default. `proj` (MIT bindings to PROJ 9, MIT) stays out of the default build
+(§10). It could become another opt-in feature.
 
 ### 4.3 Units
 
-Accepted unit IRIs (as an IRI, or an `xsd:anyURI` literal; `spatialF:` also accepts a
-string):
+A unit can be given as an IRI or as an `xsd:anyURI` literal. `spatialF:` functions also
+accept a string. These units are accepted:
 
 | Kind | OGC (`uom:` prefix) | QUDT (`http://qudt.org/vocab/unit/`) | EPSG URNs (`urn:ogc:def:uom:EPSG::`) |
 |---|---|---|---|
 | length | `metre`/`meter` (1), `kilometre`/`kilometer` (1000), `centimetre`/`centimeter`, `millimetre`/`millimeter`, `mile`/`statuteMile` (1609.344), `nauticalMile` (1852), `yard` (0.9144), `foot` (0.3048), `inch` (0.0254), `surveyFootUS` (1200/3937) | `M`, `KiloM`, `CentiM`, `MilliM`, `MI`, `MI_N`, `YD`, `FT`, `IN`, `FT_US` | 9001, 9036, 1033, 1025, 9093, 9030, 9096, 9002, 9003 |
 | angle | `radian`, `microRadian`, `degree`, `minute`, `second`, `grad` | `RAD`, `MicroRAD`, `DEG`, `ARCMIN`, `ARCSEC`, `GON` | 9101, 9109, 9102, 9103, 9104, 9105 |
-| area | `squareMetre`/`square_metre`/`square_meter`, `squareKilometre`/`square_kilometre`, `hectare`, `acre` (OGC-namespace forms as Oxigraph accepts them) | `M2`, `KiloM2`, `HA`, `AC`, `ARE`, `MI2`, `FT2`, `YD2` | — |
+| area | `squareMetre`/`square_metre`/`square_meter`, `squareKilometre`/`square_kilometre`, `hectare`, `acre` (the OGC-namespace forms that Oxigraph accepts) | `M2`, `KiloM2`, `HA`, `AC`, `ARE`, `MI2`, `FT2`, `YD2` | — |
 
-* An unknown unit IRI is a type error. Jena throws an `UnitsURIException`, which becomes an
-  expression error too.
-* **Linear units on a geographic CRS** are supported everywhere: distance and length are
-  geodesic metres converted to the unit; buffer uses §4.4.3. (Jena rejects metric
-  buffers on geographic data and requires degrees.)
-* **Angular units on a geographic CRS**: `distance` returns the great-circle central angle
-  (haversine on the geodetic coordinates) between the closest points; `buffer` buffers in
-  degrees planarly (Jena's behaviour).
-* **Angular units on a projected CRS**: type error.
-* Area functions accept area units only; a length unit there is a type error.
+* An unknown unit IRI is a type error. Jena throws an `UnitsURIException`, which also
+  becomes an expression error.
+* **Linear units on a geographic CRS** work everywhere. Distance and length are geodesic
+  metres converted to the unit, and buffer uses §4.4.3. Jena rejects metric buffers on
+  geographic data and requires degrees.
+* **Angular units on a geographic CRS.** `distance` returns the great-circle central angle
+  between the closest points, computed with haversine on the geodetic coordinates.
+  `buffer` buffers planarly in degrees, as Jena does.
+* **Angular units on a projected CRS** are a type error.
+* Area functions accept only area units. A length unit there is a type error.
 
 ### 4.4 Computation model
 
 #### 4.4.1 Engine, precision, robustness
 
-* Geometry algorithms come from `geo` 0.33 (MIT/Apache-2.0): `Relate` (full DE-9IM),
-  `indexed::PreparedGeometry` for repeated relates against one geometry, `BooleanOps` and
-  `unary_union` (over `i_overlay`), `Buffer` (since 0.31), `ConvexHull`, `ConcaveHull`,
-  `Centroid`, `BoundingRect`, `Simplify`, `GeodesicArea`, the metric-space `Distance` /
-  `Length` API with `Euclidean` and `Geodesic` (Karney, via `geographiclib-rs`, MIT).
-* Coordinates are `f64`. Predicates use `robust`'s adaptive-precision orientation tests (as
-  `geo` does), so relate results are exact for the input coordinates. Overlay and buffer
-  output coordinates are computed in floating point (no snapping to a precision grid).
-  Results can differ from JTS/GEOS in the last bits and in degenerate configurations. The
-  acceptance tests (§7) compare constructed geometries with `sfEquals` or with a
-  coordinate tolerance, never textually.
-* Relations on geographic CRSs are planar in (lon, lat). That is the standard's model and
-  what every surveyed engine does. Geometries crossing the antimeridian must be written with
-  longitudes beyond ±180 or split into a `MULTI*`, as RFC 7946 §3.1.9 recommends. Sparkles
-  does not unwrap them.
+* The geometry algorithms come from `geo` 0.33 (MIT/Apache-2.0):
+  * `Relate` (full DE-9IM), and `indexed::PreparedGeometry` for repeated relates against
+    one geometry;
+  * `BooleanOps` and `unary_union`, built on `i_overlay`;
+  * `Buffer` (available since 0.31), `ConvexHull`, `ConcaveHull`, `Centroid`,
+    `BoundingRect`, `Simplify` and `GeodesicArea`;
+  * the metric-space `Distance` and `Length` API with `Euclidean` and `Geodesic`. The
+    geodesic metric is Karney's, through `geographiclib-rs` (MIT).
+* Coordinates are `f64`. Like `geo`, the predicates use `robust`'s adaptive-precision
+  orientation tests, so relate results are exact for the input coordinates. Overlay and
+  buffer compute their output coordinates in floating point, without snapping to a
+  precision grid. Results can differ from JTS and GEOS in the last bits and in degenerate
+  configurations. The acceptance tests (§7) therefore compare constructed geometries with
+  `sfEquals` or with a coordinate tolerance, never as text.
+* Relations on geographic CRSs are planar in (lon, lat). That is the standard's model, and
+  every engine surveyed does the same. A geometry that crosses the antimeridian must use
+  longitudes beyond ±180 or be split into a `MULTI*`, as RFC 7946 §3.1.9 recommends.
+  Sparkles does not unwrap it.
 
 #### 4.4.2 Distance
 
-* **Projected or same unknown CRS**: Euclidean distance between the closest points
-  (`geo` `Euclidean`), in CRS units, converted to the requested unit.
-* **Geographic CRS, `distance: "geodesic"` (default)**:
-  * point–point: the WGS 84 geodesic (Karney; `geo::Geodesic`);
-  * otherwise: 0 if the geometries intersect. Otherwise both geometries are mapped to a
-    local azimuthal equidistant projection centred on the midpoint of the gap between
-    their envelopes (spherical AEQD, about 60 lines of our own code), the closest points are
-    found in that plane (`geo` `ClosestPoint`), mapped back, and measured with the geodesic.
-    The reported distance is always a true geodesic length between two points of the
-    geometries, so it is never below the true distance. The target, verified by tests
-    against GeographicLib on random pairs, is an overestimate under 0.1% for gaps up to
-    1,000 km and under 0.5% beyond.
-* **Geographic CRS, `distance: "haversine"`** (Jena compatibility): Jena's model. The
-  closest pair is found planarly in degrees (with antimeridian adjustment), and the
-  great-circle distance is computed with the haversine formula on a sphere of radius
-  6,371,008.7714 m.
-* The two models differ by up to 0.56% (1° of longitude on the equator: 111,319.491 m
-  geodesic, 111,195.080 m haversine). Open question 2 records the default.
-* **Lower bound for index pruning**: the haversine distance on a sphere of radius
-  `a(1 − e²)` = 6,335,439 m (the smallest meridional radius of curvature) never exceeds the
-  WGS 84 geodesic distance between the same geodetic coordinates. Both principal radii of
-  curvature are at least that radius everywhere, so every curve is at least as long on the
-  ellipsoid. The index uses this bound for radius windows and k-NN ordering (§5.7), so
-  geodesic answers are exact.
+* **Projected CRS, or two geometries in the same unknown CRS.** The distance is Euclidean
+  between the closest points (`geo` `Euclidean`), in CRS units, converted to the requested
+  unit.
+* **Geographic CRS with `distance: "geodesic"`, the default.**
+  * Between two points, the distance is the WGS 84 geodesic (Karney, `geo::Geodesic`).
+  * For other geometries, the distance is 0 if they intersect. Otherwise Sparkles maps
+    both geometries into a local azimuthal equidistant projection (spherical AEQD, about
+    60 lines of our own code). The projection is centred on the midpoint of the gap
+    between their envelopes. Sparkles finds the closest points in that plane (`geo`
+    `ClosestPoint`), maps them back and measures the geodesic between them.
+
+    The result is always a true geodesic length between two points of the geometries, so
+    it is never below the true distance. The target overestimate is under 0.1% for gaps
+    up to 1,000 km and under 0.5% beyond. Tests verify it against GeographicLib on random
+    pairs.
+* **Geographic CRS with `distance: "haversine"`.** This is Jena's model, for
+  compatibility. The closest pair is found planarly in degrees, with an antimeridian
+  adjustment. The great-circle distance is then computed with the haversine formula on a
+  sphere of radius 6,371,008.7714 m.
+* The two models differ by up to 0.56%. One degree of longitude on the equator is
+  111,319.491 m geodesic and 111,195.080 m haversine. Open question 2 records the default.
+* **Lower bound for index pruning.** Take a sphere of radius `a(1 − e²)` = 6,335,439 m, the
+  smallest meridional radius of curvature. The haversine distance on that sphere never
+  exceeds the WGS 84 geodesic distance between the same geodetic coordinates. Both
+  principal radii of curvature are at least that radius everywhere, so every curve is at
+  least as long on the ellipsoid. The index uses this bound for radius windows and k-NN
+  ordering (§5.7), so geodesic answers are exact.
 
 #### 4.4.3 Buffer
 
-* Projected CRS, or angular unit on a geographic CRS: planar `geo` `Buffer` in CRS units,
-  round joins and caps, 8 segments per quarter circle (JTS's and Jena's default). Negative
-  radii shrink areal geometries (empty when they vanish) and are a type error for points
-  and lines.
-* Linear unit on a geographic CRS (`metricBuffer`, `buffer(…, uom:metre)`):
-  1. project into a spherical AEQD centred on the geometry's envelope centre;
-  2. buffer planarly in metres;
-  3. project back.
-  The target, verified by tests against GeographicLib's direct solution, is a boundary
-  within 0.5% of the radius from the true geodesic offset for geometries whose extent plus
-  radius is under 1,000 km. Larger inputs are a type error with the message
-  `buffer: geometry too large for a metric buffer (extent + radius > 1000 km)`, rather
-  than a silently wrong shape. A buffer that would cover a pole is a type error.
+* **Projected CRS, or an angular unit on a geographic CRS.** Sparkles runs the planar
+  `geo` `Buffer` in CRS units, with round joins and caps and 8 segments per quarter circle
+  (the JTS and Jena default). A negative radius shrinks an areal geometry, giving an empty
+  geometry when it vanishes. For points and lines a negative radius is a type error.
+* **Linear unit on a geographic CRS** (`metricBuffer`, `buffer(…, uom:metre)`). Sparkles:
+  1. projects into a spherical AEQD centred on the geometry's envelope centre;
+  2. buffers planarly in metres;
+  3. projects back.
+
+  For geometries whose extent plus radius is under 1,000 km, the target is a boundary
+  within 0.5% of the radius from the true geodesic offset. Tests verify it against
+  GeographicLib's direct solution. Larger inputs are a type error with the message
+  `buffer: geometry too large for a metric buffer (extent + radius > 1000 km)`, so the
+  user never gets a silently wrong shape. A buffer that would cover a pole is also a type
+  error.
 
 #### 4.4.4 Area, length, perimeter, centroid
 
-* `area` / `metricArea`: geographic → `GeodesicArea::geodesic_area_unsigned` on the
-  ellipsoid (holes subtracted, multipolygon members summed; overlapping members are
-  `unary_union`ed first, as QLever does). Projected → planar `Area`. Non-areal → 0.
-* `length`: curves → geodesic (or planar) length; areal geometries → length of all rings;
-  collections → sum of members; points → 0. QLever uses only the exterior ring for
-  polygons (open question 11).
-* `perimeter`: areal → length of all rings; others → 0.
-* `centroid`: planar in the CRS of `g`, as in Jena and the standard's "calculations in the
-  SRS". For geographic data spanning more than a few degrees this is not the geodesic
-  centroid. `aggCentroid` (Phase 2) behaves the same way.
+* **`area` and `metricArea`.** On a geographic CRS, Sparkles uses
+  `GeodesicArea::geodesic_area_unsigned` on the ellipsoid. Holes are subtracted and
+  multipolygon members are summed. Overlapping members are merged with `unary_union`
+  first, as QLever does. On a projected CRS it uses the planar `Area`. Non-areal
+  geometries have area 0.
+* **`length`.** A curve gives its geodesic or planar length. An areal geometry gives the
+  length of all its rings, and a collection the sum of its members. A point gives 0.
+  QLever uses only the exterior ring of a polygon (open question 11).
+* **`perimeter`.** An areal geometry gives the length of all its rings. Other geometries
+  give 0.
+* **`centroid`.** The centroid is planar in the CRS of `g`, as in Jena and as the
+  standard's "calculations in the SRS" implies. For geographic data that spans more than a
+  few degrees, this is not the geodesic centroid. `aggCentroid` (Phase 2) behaves the same
+  way.
 
 #### 4.4.5 Overlay
 
-`intersection`, `union`, `difference` and `symDifference` use `geo` `BooleanOps` for
-areal ∘ areal. Other dimension pairs:
+`intersection`, `union`, `difference` and `symDifference` use `geo` `BooleanOps` when both
+geometries are areal. The other dimension pairs work as follows:
 
-* point ∘ anything: computed by point location (`CoordinatePosition`);
-* line ∘ area: `BooleanOps::clip` (inside or outside);
-* line ∘ line: intersection points/segments via `line_intersection` over a segment R-tree,
-  union by noding both lines;
-* collections: member-wise, then `unary_union`.
+* point with anything: point location (`CoordinatePosition`);
+* line with area: `BooleanOps::clip`, keeping the inside or the outside;
+* line with line: `line_intersection` over a segment R-tree finds the intersection points
+  and segments, and union nodes both lines;
+* collections: member by member, then `unary_union`.
 
-The result dimension follows OGC (`intersection` keeps the lowest-dimension parts that
-exist). Results that `geo` cannot produce for a pair are a type error
-(`intersection: unsupported for these geometry types`). The tests (§7) list which pairs
-are covered.
+The result dimension follows OGC, so `intersection` keeps the lowest-dimension parts that
+exist. A result that `geo` cannot produce for a pair is a type error
+(`intersection: unsupported for these geometry types`). The tests (§7) list the pairs
+that are covered.
 
 #### 4.4.6 Hulls and simplicity (Phase 2)
 
-* `concaveHull(g[, targetPercent])`: `geo` `ConcaveHull` (concaveman). The optional
-  second argument, a Sparkles-documented parameter as GeoSPARQL requires, maps
-  `targetPercent ∈ (0, 100]` to the concavity. The default is concavity 2.0 (`geo`'s
-  default).
-* `isSimple`: points always; multipoints when no two points are equal; curves when no two
-  segments intersect except consecutive ones at their shared vertex (and the closing vertex
-  of a ring); areal geometries when `Validation` reports no ring self-intersection.
-  Collections: all members simple. The check is our own sweep over a segment R-tree,
-  since `geo`'s `Validation` checks validity, not OGC simplicity.
+* **`concaveHull(g[, targetPercent])`** uses `geo` `ConcaveHull` (concaveman). GeoSPARQL
+  requires the implementation to document its parameters. Sparkles documents one optional
+  second argument, which maps `targetPercent ∈ (0, 100]` to the concavity. The default
+  concavity is 2.0, `geo`'s default.
+* **`isSimple`** is defined per geometry type:
+  * a point is always simple;
+  * a multipoint is simple when no two points are equal;
+  * a curve is simple when no two segments intersect, except consecutive segments at
+    their shared vertex and the closing vertex of a ring;
+  * an areal geometry is simple when `Validation` reports no ring self-intersection;
+  * a collection is simple when all its members are.
+
+  `geo`'s `Validation` checks validity, not OGC simplicity, so the check is our own sweep
+  over a segment R-tree.
 
 ### 4.5 Errors
 
-Function errors are SPARQL type errors (the expression is in error). Planner-level errors
-are `400` with `Error::Invalid`:
+Function errors are SPARQL type errors: the expression is in error. Planner-level errors
+are `400` with `Error::Invalid`.
 
 | Condition | Status | Message (prefix) |
 |---|---|---|
-| malformed geometry constant in a query (literal typed `geo:wktLiteral` that does not parse) | 400 | `geo: malformed wktLiteral at offset N: …`. A constant that can never evaluate is reported, not silently false. Ill-typed *data* never errors |
+| A malformed geometry constant in a query, such as a literal typed `geo:wktLiteral` that does not parse | 400 | `geo: malformed wktLiteral at offset N: …`. A constant that can never evaluate is reported instead of silently evaluating to false. Ill-typed *data* never raises an error. |
 | `spatial:` argument errors | 400 | §2.5 |
-| `spatial:` / rewrite with a variable argument (Phase 1) | 501 | `spatial:nearby: variable arguments are not supported yet` (`Error::Unsupported`) |
-| over budget (vertices, overlay, index memory) | 507 | §4.7 |
-| built without feature `geo`: `geof:` functions | — | unknown extension function: type error, as for any unknown IRI today, plus one warning per query in the plan (`geof:* needs cargo feature "geo"`) |
-| built without feature `geo`: `spatial:` property function | 501 | `built without GeoSPARQL (cargo feature "geo")` |
-| index admin while disabled | 400 | `spatial index is not enabled` |
-| rebuild already running | 409 | `spatial index build already running` |
+| `spatial:` or rewrite with a variable argument (Phase 1) | 501 | `spatial:nearby: variable arguments are not supported yet` (`Error::Unsupported`) |
+| Over budget (vertices, overlay, index memory) | 507 | §4.7 |
+| `geof:` functions in a build without the `geo` feature | — | They are unknown extension functions, so they raise a type error like any unknown IRI does today. The plan also gets one warning per query: `geof:* needs cargo feature "geo"`. |
+| `spatial:` property functions in a build without the `geo` feature | 501 | `built without GeoSPARQL (cargo feature "geo")` |
+| Index admin while the index is disabled | 400 | `spatial index is not enabled` |
+| A rebuild is already running | 409 | `spatial index build already running` |
 
 ### 4.6 Index semantics and consistency
 
 * **What is indexed.** A **row** is a visible quad `(s, p, o, g)` where:
   * `p` is a configured serialization predicate;
-  * `g` is in the graph scope (by default every graph, including `urn:x-sparkles:inferred`,
-    so `reasoning=false` excludes it through the graph filter as for text);
+  * `g` is in the graph scope. By default that is every graph, including
+    `urn:x-sparkles:inferred`, and `reasoning=false` excludes the inferred graph through
+    the graph filter, as for text;
   * `o` is a well-typed, non-empty geometry literal of a supported datatype in a built-in
     CRS, within `maxGeometryBytes` and `maxVertices`.
 
-  Each row carries the envelope of `o` in CRS84 (internal lon/lat), rounded outward to
-  `f32`. W3C Basic Geo rows (Phase 2) are `(s, wgs84:lat, ·, g)` with a point built from the
-  subject's `lat`/`long` pair in the same graph (a cross-product when there are several,
-  as in Jena).
-* **MVCC.** A spatial operator on snapshot S sees exactly S's rows: the generation base
-  minus `S.delta.del`, plus the overlay rows present in `S.delta.ins` (§5.3). There is no
-  staleness window and no `503`. Historical snapshots (`?at=`, [F06](F06-snapshots-and-point-in-time.md)) get the same guarantee:
-  their generation's base is built on demand within the budget.
-* **Exactness.** The index only produces candidates. Every answer is refined with the exact
-  predicate from §2.4/§4.4, so results with and without the index are identical. The
-  acceptance tests check this property on random data (§7, A20).
-* **Graph scope** follows [F03](F03-full-text-search.md)/[F04](F04-vector-search.md): the active graph becomes a filter on `g` before any
-  top-`k`. Under a merged default graph without a graph variable, rows with equal
-  `(s, o)` are one solution.
+  Each row carries the envelope of `o` in CRS84 (internal lon/lat order), rounded outward
+  to `f32`. W3C Basic Geo rows (Phase 2) have the form `(s, wgs84:lat, ·, g)`. Their point
+  is built from the subject's `lat`/`long` pair in the same graph. When a subject has
+  several pairs, Sparkles indexes the cross product, as Jena does.
+* **MVCC.** A spatial operator on snapshot S sees exactly S's rows. Those are the
+  generation's base rows minus `S.delta.del`, plus the overlay rows present in
+  `S.delta.ins` (§5.3). There is no staleness window and no `503`. Historical snapshots
+  (`?at=`, [F06](F06-snapshots-and-point-in-time.md)) get the same guarantee. Their
+  generation's base is built on demand, within the budget.
+* **Exactness.** The index only produces candidates. Every answer is refined with the
+  exact predicate from §2.4 or §4.4, so results with and without the index are identical.
+  The acceptance tests check this on random data (§7, A20).
+* **Graph scope** works as in [F03](F03-full-text-search.md) and
+  [F04](F04-vector-search.md). The active graph becomes a filter on `g`, applied before
+  any top-`k`. Under a merged default graph without a graph variable, rows with equal
+  `(s, o)` form one solution.
 
 ### 4.7 Limits and budgets
 
 | Setting | Default | Where | On excess |
 |---|---|---|---|
-| `maxGeometryBytes` | 16 MiB | `geo.json` | not indexed (`skipped.tooLarge`); functions still evaluate it if `maxVertices` allows |
-| `maxVertices` (per geometry) | 1,000,000 | `geo.json` | not indexed; functions: type error `geometry too complex (N vertices)` |
-| `maxOpVertices` (sum of input vertices of one overlay, buffer, hull or relate) | 2,000,000 | `StoreOptions` / `--geo-op-vertices` | type error `geometry operation too large` |
+| `maxGeometryBytes` | 16 MiB | `geo.json` | Not indexed (`skipped.tooLarge`). Functions still evaluate it if `maxVertices` allows. |
+| `maxVertices` (per geometry) | 1,000,000 | `geo.json` | Not indexed. Functions raise the type error `geometry too complex (N vertices)`. |
+| `maxOpVertices` (sum of input vertices of one overlay, buffer, hull or relate) | 2,000,000 | `StoreOptions` / `--geo-op-vertices` | Type error `geometry operation too large`. |
 | buffer output | ≤ 8 segments per quarter circle × input vertices | constant | |
-| WKT/GeoJSON nesting depth | 32 | constant | ill-typed |
-| geometry column + trees memory (`geo_budget_bytes`) | 4 GiB | `StoreOptions`, `--geo-mb` | build refused, state `over-budget`, queries use the non-index plans |
-| per-query geometry memo | 64 MiB, LRU | `Ctx` | evicts |
+| WKT/GeoJSON nesting depth | 32 | constant | Ill-typed. |
+| geometry column + trees memory (`geo_budget_bytes`) | 4 GiB | `StoreOptions`, `--geo-mb` | The build is refused and the state becomes `over-budget`. Queries use the non-index plans. |
+| per-query geometry memo | 64 MiB, LRU | `Ctx` | Evicts. |
 | `limit` of `spatial:` | unbounded (row budget) | | `ctx.check_rows` → `507` |
 | spatial join candidates (Phase 2) | `max_rows` | `Ctx` | `507` with `spatial join produced more than N candidate pairs` |
 
-* `geo` calls are not interruptible. Every operator calls `ctx.check()` every 256 exact
-  tests and every 4,096 candidate rows, and `maxOpVertices` bounds the cost of a single call
-  (relate on two polygons is O((n + m) log(n + m)) with `PreparedGeometry`; overlay and
-  buffer similar with larger constants). A query of 1,000 relates against a 1M-vertex
-  constant therefore stays responsive to timeouts.
-* Constructed literals (buffers, unions) go to the query-local vocabulary and are charged
-  to `ctx`'s memory budget by their byte size, so `SELECT (geof:buffer(?w, …) AS ?b)` over
-  a large table fails with `507`, not an OOM.
-* Index builds run on the rayon pool with `ctx`-like cancellation at store close, and
-  check the budget before allocating (F04's admission model).
+* `geo` calls cannot be interrupted. Every operator calls `ctx.check()` every 256 exact
+  tests and every 4,096 candidate rows, and `maxOpVertices` bounds the cost of a single
+  call. With `PreparedGeometry`, relate on two polygons is O((n + m) log(n + m)). Overlay
+  and buffer are similar, with larger constants. A query that runs 1,000 relates against
+  a 1M-vertex constant therefore still responds to timeouts.
+* Constructed literals, such as buffers and unions, go to the query-local vocabulary.
+  Their byte size is charged to `ctx`'s memory budget, so
+  `SELECT (geof:buffer(?w, …) AS ?b)` over a large table fails with `507` instead of
+  running out of memory.
+* Index builds run on the rayon pool. They can be cancelled at store close, much like a
+  `ctx`, and they check the budget before allocating, following F04's admission model.
 
 ## 5. Design
 
@@ -819,25 +900,25 @@ are `400` with `Error::Invalid`:
 
 | Where | Change |
 |---|---|
-| `crates/sparkles/Cargo.toml` | optional `geo = "0.33"` (default features off; `earcutr`/`spade` not needed), `wkt = "0.14"`, `geojson = "1"`, `geographiclib-rs = "0.2"` (already a `geo` dependency), `geo-index = "0.4"`; `[features] geo = ["dep:geo", "dep:wkt", "dep:geojson", "dep:geo-index"]` |
-| `crates/sparkles-server/Cargo.toml` | `geo = ["sparkles/geo"]`, added to `default` |
-| `sparkles/src/geo/mod.rs` (always compiled) | IRIs, `GeoConfig` (serde), `GeoStatus`, the `not_built()` error, CRS and unit tables (pure data, so the planner can recognize terms without the feature) |
-| `geo/geom.rs` (`cfg(feature="geo")`) | `Geom`, parsing (WKT front end + `wkt`, GeoJSON), writing (§4.1.5), axis handling |
-| `geo/crs.rs` | CRS table, alias normalization, transforms (axis swap, Web Mercator, AEQD, Phase 2 UTM) |
-| `geo/ops.rs` | functions of §2.3–2.4 over `Geom` (DE-9IM table, distance models, buffer, measures, overlay dispatch) |
-| `geo/column.rs` | the geometry column: id → parsed entry, per generation (§5.2) |
-| `geo/index.rs` | `GeoBase` (packed R-tree over base rows), `Overlay`, `GeoView`, build, status |
-| `geo/search.rs` | window, radius and k-NN search over base + overlay with refinement; join kernels (Phase 2) |
-| `sparql/geopf.rs` (always compiled) | recognition of `spatial:*` property functions and (Phase 2) topological triple patterns, decoding into calls (reuses `textpf::take_calls`) |
-| `sparql/plan.rs` | `Kind::SpatialScan`, `Kind::SpatialPf`, Phase 2 `Kind::SpatialJoin`, `Kind::SpatialRelate`, `Kind::SpatialKnn`; detection (§5.6); `Optimizations::spatial_pushdown` |
-| `sparql/exec.rs` | dispatch to `geo::search`; without the feature: `Error::Unsupported` |
-| `sparql/expr.rs` | `geof:` and `spatialF:` in `is_extension` / `extension()` through `geo::ops`, with id-aware geometry arguments (§5.8) |
-| `sparql/exec.rs` aggregates (Phase 2) | `AggregateFunction::Custom` for the six `geof:agg*` IRIs (today it returns unbound) |
-| `sparql/cache.rs` | spatial kinds are cacheable; key adds the spec and the `GeoView`'s `(generation uid, epoch)` (the snapshot version already pins the overlay) |
-| `store.rs` | `Generation.geo: geo::GenerationGeo`; `Snapshot.geo: Option<Arc<GeoView>>`; `Store.geo: ArcSwapOption<GeoIndex>`; hooks in `open`, `publish_log` (`maintain_geo`), `rebuild_locked` (§5.4–5.5) |
-| `check.rs`, `clone`, F05 meta files | `geo.json` |
-| `sparkles-reasoner` (Phase 2) | embedded `geo` + `sf` ontologies, `--vocab geosparql`, `--geo-default-geometry` |
-| server `http.rs`, `main.rs`, `state.rs`, `obs.rs` | §2.8–2.9 routes, CLI, metrics |
+| `crates/sparkles/Cargo.toml` | Optional dependencies: `geo = "0.33"` with default features off (`earcutr` and `spade` are not needed), `wkt = "0.14"`, `geojson = "1"`, `geographiclib-rs = "0.2"` (already a `geo` dependency) and `geo-index = "0.4"`. The feature is `[features] geo = ["dep:geo", "dep:wkt", "dep:geojson", "dep:geo-index"]`. |
+| `crates/sparkles-server/Cargo.toml` | `geo = ["sparkles/geo"]`, added to `default`. |
+| `sparkles/src/geo/mod.rs` (always compiled) | IRIs, `GeoConfig` (serde), `GeoStatus`, the `not_built()` error, and the CRS and unit tables. These are pure data, so the planner can recognize the terms without the feature. |
+| `geo/geom.rs` (`cfg(feature="geo")`) | `Geom`, parsing (a WKT front end over `wkt`, and GeoJSON), writing (§4.1.5) and axis handling. |
+| `geo/crs.rs` | The CRS table, alias normalization, and transforms: axis swap, Web Mercator, AEQD and, in Phase 2, UTM. |
+| `geo/ops.rs` | The functions of §2.3–2.4 over `Geom`: the DE-9IM table, the distance models, buffer, measures and overlay dispatch. |
+| `geo/column.rs` | The geometry column, which maps an id to a parsed entry, per generation (§5.2). |
+| `geo/index.rs` | `GeoBase` (a packed R-tree over the base rows), `Overlay`, `GeoView`, the build and the status. |
+| `geo/search.rs` | Window, radius and k-NN search over base and overlay, with refinement. Join kernels in Phase 2. |
+| `sparql/geopf.rs` (always compiled) | Recognizes `spatial:*` property functions and, in Phase 2, topological triple patterns, and decodes them into calls. Reuses `textpf::take_calls`. |
+| `sparql/plan.rs` | `Kind::SpatialScan` and `Kind::SpatialPf`, plus `Kind::SpatialJoin`, `Kind::SpatialRelate` and `Kind::SpatialKnn` in Phase 2. Detection (§5.6) and `Optimizations::spatial_pushdown`. |
+| `sparql/exec.rs` | Dispatches to `geo::search`. Without the feature it returns `Error::Unsupported`. |
+| `sparql/expr.rs` | Adds `geof:` and `spatialF:` to `is_extension` and `extension()` through `geo::ops`, with id-aware geometry arguments (§5.8). |
+| `sparql/exec.rs` aggregates (Phase 2) | `AggregateFunction::Custom` for the six `geof:agg*` IRIs. Today it returns unbound. |
+| `sparql/cache.rs` | Spatial kinds are cacheable. The key adds the spec and the `GeoView`'s `(generation uid, epoch)`. The snapshot version already pins the overlay. |
+| `store.rs` | `Generation.geo: geo::GenerationGeo`, `Snapshot.geo: Option<Arc<GeoView>>` and `Store.geo: ArcSwapOption<GeoIndex>`. Hooks in `open`, `publish_log` (`maintain_geo`) and `rebuild_locked` (§5.4–5.5). |
+| `check.rs`, `clone`, F05 meta files | `geo.json`. |
+| `sparkles-reasoner` (Phase 2) | The embedded `geo` and `sf` ontologies, `--vocab geosparql` and `--geo-default-geometry`. |
+| server `http.rs`, `main.rs`, `state.rs`, `obs.rs` | The routes, CLI and metrics of §2.8–2.9. |
 | `ui/` (Phase 2) | §2.11 |
 
 ### 5.2 Geometry representation and the geometry column
@@ -856,23 +937,25 @@ pub struct Geom {
 The **geometry column** (`GenerationGeo.column`) maps a literal id to
 `Arc<ColumnEntry { bbox84: [f64; 4], kind, flags, vertices: u32, geom: OnceLock<Arc<Geom>> }>`:
 
-* For **base literals** (`Tag::Vocab`), it is built with the base index (§5.3) from the
-  distinct object ids of the indexed predicates, parsed in parallel blocks
-  (`Vocab::get_sorted` key batches, rayon). Phase 1 keeps the parsed `Geom` in memory, so
-  refinement never re-parses text. Phase 2 persists the column (§5.5) as WKB-like records
-  that are decoded on demand (no text parsing on restart).
+* **Base literals** (`Tag::Vocab`) enter the column when the base index is built (§5.3).
+  The build takes the distinct object ids of the indexed predicates and parses them in
+  parallel blocks, using `Vocab::get_sorted` key batches on rayon. Phase 1 keeps the parsed
+  `Geom` in memory, so refinement never parses text again. Phase 2 persists the column
+  (§5.5) as WKB-like records that are decoded on demand, so a restart parses no text.
 * **Delta literals** (`Tag::Delta`) are parsed by the commit hook (§5.4) and inserted into
-  the same generation's column (a `FxHashMap` behind a `RwLock`; delta ids are stable within
-  a generation). They are never removed before the generation is dropped. Memory is bounded
-  by the budget, and an over-budget overlay asks for compaction in the status message.
-* **Other literals** (constants, computed values, non-indexed predicates, local vocab) go
-  through the per-query memo `Ctx.geo_memo: FxHashMap<Id, Arc<Geom>>` (64 MiB LRU), so BIND
-  over many rows parses each distinct literal once.
+  the same generation's column, an `FxHashMap` behind a `RwLock`. Delta ids are stable
+  within a generation, and these entries stay until the generation is dropped. The budget
+  bounds their memory. When the overlay goes over budget, the status message asks for a
+  compaction.
+* **Other literals** go through the per-query memo
+  `Ctx.geo_memo: FxHashMap<Id, Arc<Geom>>` (64 MiB, LRU). These are constants, computed
+  values, objects of non-indexed predicates and local vocabulary. A BIND over many rows therefore parses each distinct
+  literal once.
 
-Memory: a point entry is about 120 bytes (entry + `Geom`). A polygon is about
-`16 · vertices + 160` bytes. 1M points come to ≈ 120 MB, and 1M 50-vertex polygons to
-≈ 960 MB. Phase 2's persisted column moves this to mmapped pages (`16 · vertices + 48`
-bytes per entry on disk).
+A point entry takes about 120 bytes of memory, counting the entry and its `Geom`. A
+polygon takes about `16 · vertices + 160` bytes. 1M points come to ≈ 120 MB, and 1M
+50-vertex polygons to ≈ 960 MB. Phase 2's persisted column moves this to mmapped pages,
+at `16 · vertices + 48` bytes per entry on disk.
 
 ### 5.3 Index structures
 
@@ -895,191 +978,218 @@ pub struct GeoView {                                // on Snapshot (Arc), immuta
 }
 ```
 
-* The base is built from `Perm::Pso` with prefix `[p]` for each indexed predicate, over
-  the generation's base only (as `vector::GenerationVectors::predicate` does), keeping rows
-  whose object parses (§4.6). Boxes come from the column. The tree is a static packed
-  R-tree (Flatbush layout via `geo-index`): build O(n log n), 16-entry nodes, about
-  `n · 1.07 · (16 + 4)` bytes plus `rows`.
+* The base is built from `Perm::Pso` with prefix `[p]` for each indexed predicate. It
+  covers only the generation's base, as `vector::GenerationVectors::predicate` does, and
+  keeps the rows whose object parses (§4.6). The boxes come from the column. The tree is a
+  static packed R-tree in the Flatbush layout, from `geo-index`. It builds in O(n log n),
+  has 16-entry nodes, and takes about `n · 1.07 · (16 + 4)` bytes plus `rows`.
 * **Overlay** rows come only from transactions (§5.4). A row in `overlay` or `tail` is
-  valid for snapshot S iff its quad is in `S.delta.ins` (O(log n) `imbl` lookup on the PSO
-  set). A base row is valid iff its quad is not in `S.delta.del`. `store::apply` keeps
-  `ins` disjoint from base and `del ⊆ base`, so
+  valid for snapshot S iff its quad is in `S.delta.ins`, which is an O(log n) `imbl` lookup
+  on the PSO set. A base row is valid iff its quad is not in `S.delta.del`. `store::apply`
+  keeps `ins` disjoint from the base and `del ⊆ base`, so
   `rows(S) = (base − del) ∪ (overlay ∪ tail) ∩ ins` exactly.
-* Searches query `base.tree`, `overlay.tree` and scan `tail` linearly. Tails stay short
-  (§5.4), so the scan is cheap.
+* A search queries `base.tree` and `overlay.tree`, and scans `tail` linearly. Tails stay
+  short (§5.4), so the scan is cheap.
 
 ### 5.4 Commit path (`WriteTxn::publish_log` → `Store::maintain_geo`)
 
-After the WAL fsync and before the snapshot is published (where `maintain_text` runs):
+The hook runs after the WAL fsync and before the snapshot is published, at the same point
+as `maintain_text`:
 
-1. `touched` = logged quads whose predicate is indexed and whose graph is in scope (a
-   per-generation `FxHashMap<Id, bool>` predicate cache makes non-geo commits cost one
-   lookup per logged quad).
-2. For each inserted quad, look up or parse its object in the column (delta literals are
-   parsed here, once). Valid rows are pushed to a clone of the previous view's `tail`
-   (persistent vector, O(1) amortized, structurally shared with older snapshots). Deletes
-   need no work, since validity is checked against the snapshot.
-3. If `tail.len() > max(4096, overlay.rows / 8)`, rebuild the overlay tree from
-   `overlay.rows ∪ tail`, dropping rows not in the new snapshot's `delta.ins`, and start an
-   empty tail. This is amortized O(log n) per insert and bounded by the overlay size, which
-   compaction resets.
-4. Publish with `snap.geo = Some(new view)`.
+1. `touched` is the set of logged quads whose predicate is indexed and whose graph is in
+   scope. A per-generation `FxHashMap<Id, bool>` predicate cache makes a commit without
+   geometry cost one lookup per logged quad.
+2. For each inserted quad, the hook looks up its object in the column, or parses it.
+   Delta literals are parsed here, once. Valid rows are pushed to a clone of the previous
+   view's `tail`. The tail is a persistent vector, so a push is O(1) amortized and shares
+   structure with older snapshots. Deletes need no work, since validity is checked against
+   the snapshot.
+3. If `tail.len() > max(4096, overlay.rows / 8)`, the hook rebuilds the overlay tree from
+   `overlay.rows ∪ tail`, drops rows that are not in the new snapshot's `delta.ins`, and
+   starts an empty tail. This costs O(log n) per insert, amortized, and is bounded by the
+   overlay size, which compaction resets.
+4. The snapshot is published with `snap.geo = Some(new view)`.
 
-Parse failures never fail a write: an ill-typed literal is counted and skipped. A panic or
-error in the hook marks the index `failed` (logged). The snapshot then carries
-`geo: None`, and queries use the non-index plans (correct, slower) until `rebuild`, which
-re-derives everything from RDF. Commit latency target: no measurable change for commits
-without geometry quads, and under 1 ms extra for a commit inserting 1,000 points (§9).
+A parse failure never fails a write. The ill-typed literal is counted and skipped. A panic
+or error in the hook is logged and marks the index `failed`. The snapshot then carries
+`geo: None`, and queries use the non-index plans until `rebuild` re-derives everything
+from RDF. Those plans give correct answers, only slower. The commit latency target is no
+measurable change for commits without geometry quads, and under 1 ms extra for a commit
+that inserts 1,000 points (§9).
 
-The writer mutex serializes commits, so the column and the overlay need no further
-locking beyond the column's `RwLock` (readers only read entries that existed when their
-snapshot was published).
+The writer mutex serializes commits. The column and the overlay therefore need no locking
+beyond the column's `RwLock`. Readers only read entries that existed when their snapshot
+was published.
 
 ### 5.5 Generation switches, open, rebuild, persistence
 
-* **Compaction and bulk commits** (`rebuild_locked`): after the new generation is built,
-  and while the writer lock is still held, build its `GeoBase` and column (in parallel,
-  from the new generation's PSO) before the snapshot is published, with an empty overlay.
-  Compaction time grows by the build time (§9 measures it). Phase 2 reuses the previous
-  generation's parsed geometries by literal key (`vocab` keys are identical across
-  generations), so a compaction re-parses only new literals.
-* **Open**: with `geo.json` present, the store opens with the base unbuilt. A background
-  thread builds it. Until the `OnceCell` is filled, the planner treats the index as not
-  ready and uses non-index plans (correct answers; explain says `spatial index building
-  (37%)`). The overlay is reconstructed from the WAL replay's commits (the replayed log
-  passes through `maintain_geo` like a live commit).
-* **Rebuild / reconfigure**: build a new base for the current generation in the
-  background, then swap it in by republishing the current snapshot with a new `GeoView`
-  (`epoch + 1`). In Phase 1 rebuild holds the writer lock (as F03 Phase 1 does). The
-  overlay is rebuilt from the delta under the new configuration (a scan of `delta.ins` for
-  the indexed predicates).
-* **Persistence (Phase 2)**: `gen-NNNN/geo/` with `column.spkg` and `rtree.spkg`, written
-  by the build with `*.tmp` → fsync → rename → `sync_dir`, the F04 segment pattern. Header
-  (64 bytes): magic `SPKGEO\0\x01`, `u32 format_version = 1`, `u32 kind`, `u64 rows`,
-  `u64 config_hash` (FNV-1a of canonical `geo.json`), `u64 base_seq`, `u64 meta.quads`,
-  reserved. Footer: `u64 rows`, `u64 xxh/fnv(header ‖ index section)`, magic. Validity
-  on open needs a matching magic, version, `config_hash`, `base_seq`, row count and footer.
-  Anything else → delete and rebuild. The files are mmapped (`memmap2`). `geo-index` trees
-  are usable zero-copy from bytes. A read-only server never writes them (in-memory builds
-  only). Removing the generation directory removes them. `sparkles check` verifies headers
-  and footers (`--checksums` also the data sections).
+* **Compaction and bulk commits** (`rebuild_locked`). After the new generation is built,
+  and while the writer lock is still held, Sparkles builds the generation's `GeoBase` and
+  column in parallel from its PSO order. This happens before the snapshot is published,
+  and the new snapshot starts with an empty overlay. Compaction takes longer by the build
+  time, which §9 measures. Phase 2 reuses the previous generation's parsed geometries by
+  literal key, since `vocab` keys are identical across generations. A compaction then
+  parses only new literals.
+* **Open.** When `geo.json` is present, the store opens with the base unbuilt and a
+  background thread builds it. Until the `OnceCell` is filled, the planner treats the
+  index as not ready and uses non-index plans. The answers are still correct, and explain
+  says `spatial index building (37%)`. The overlay is rebuilt from the commits of the WAL
+  replay, since the replayed log passes through `maintain_geo` like a live commit.
+* **Rebuild and reconfigure.** Sparkles builds a new base for the current generation in
+  the background. It then swaps the base in by republishing the current snapshot with a
+  new `GeoView` (`epoch + 1`). In Phase 1 a rebuild holds the writer lock, as F03 Phase 1
+  does. The overlay is rebuilt from the delta under the new configuration, by scanning
+  `delta.ins` for the indexed predicates.
+* **Persistence (Phase 2).** The build writes `column.spkg` and `rtree.spkg` to
+  `gen-NNNN/geo/`. It follows the F04 segment pattern: write `*.tmp`, fsync, rename, then
+  `sync_dir`.
+  * The 64-byte header holds the magic `SPKGEO\0\x01`, `u32 format_version = 1`,
+    `u32 kind`, `u64 rows`, `u64 config_hash` (FNV-1a of the canonical `geo.json`),
+    `u64 base_seq`, `u64 meta.quads` and reserved bytes.
+  * The footer holds `u64 rows`, `u64 xxh/fnv(header ‖ index section)` and the magic.
+  * On open, a file is valid only if the magic, version, `config_hash`, `base_seq`, row
+    count and footer all match. Otherwise Sparkles deletes it and rebuilds.
+
+  The files are mmapped (`memmap2`), and `geo-index` trees work zero-copy from the bytes.
+  A read-only server never writes them and builds in memory only. Removing the generation
+  directory removes them. `sparkles check` verifies headers and footers, and with
+  `--checksums` also the data sections.
 * **In-memory stores** build in memory only.
-* **Config**: `<root>/geo.json` (`GeoConfig` + `"formatVersion": 1`, `write_atomic`).
+* **Config** lives in `<root>/geo.json`: the `GeoConfig` plus `"formatVersion": 1`,
+  written with `write_atomic`.
 
 ### 5.6 Planner
 
 #### 5.6.1 FILTER pushdown with a constant geometry (Phase 1)
 
-`scan_options(t)` gets the group's filters. For a triple `?x <p> ?w` where `p` is an
-indexed predicate, `?w` is a variable, the index is ready for the snapshot's generation and
-`ctx.opt.spatial_pushdown` is set, each filter conjunct over `?w` of one of these shapes
-yields a **`SpatialScan`** option:
+`scan_options(t)` receives the group's filters. Pushdown applies to a triple `?x <p> ?w`
+when all of these hold:
+
+* `p` is an indexed predicate;
+* `?w` is a variable;
+* the index is ready for the snapshot's generation;
+* `ctx.opt.spatial_pushdown` is set.
+
+Then each filter conjunct over `?w` with one of these shapes yields a **`SpatialScan`**
+option:
 
 | Conjunct (either argument order where symmetric) | Window | Exact test |
 |---|---|---|
-| `geof:sfIntersects` / `sfWithin` / `sfContains` / `sfOverlaps` / `sfCrosses` / `sfTouches` / `sfEquals`, `eh*` except `ehDisjoint`, `rcc8*` except `rcc8dc` (`?w`, C) | envelope of C | the relation |
-| `geof:relate(?w, C, "pattern")` where the pattern requires a non-empty intersection (one of II, IB, BI, BB is `T`/`0`/`1`/`2`) | envelope of C | relate |
-| `geof:distance(?w, C, u) < r`, `<= r`, `r > …`, `r >= …`; `geof:metricDistance`; `spatialF:nearby(?w, C, r, u)` / `withinCircle` | envelope of C expanded by `r` (degrees from §4.4.2's lower-bound sphere, latitude-aware, split at the antimeridian, full longitude range near poles) | the comparison |
-| `geof:sfIntersects(?w, geof:buffer(C, r, u))` and other relations whose constant argument is a constant expression | the constant is folded at plan time | the relation |
+| `geof:sfIntersects` / `sfWithin` / `sfContains` / `sfOverlaps` / `sfCrosses` / `sfTouches` / `sfEquals`, `eh*` except `ehDisjoint`, `rcc8*` except `rcc8dc` (`?w`, C) | The envelope of C. | The relation. |
+| `geof:relate(?w, C, "pattern")` where the pattern requires a non-empty intersection (one of II, IB, BI, BB is `T`/`0`/`1`/`2`) | The envelope of C. | `relate`. |
+| `geof:distance(?w, C, u) < r`, `<= r`, `r > …`, `r >= …`; `geof:metricDistance`; `spatialF:nearby(?w, C, r, u)` / `withinCircle` | The envelope of C expanded by `r`. The expansion is in degrees on §4.4.2's lower-bound sphere and depends on latitude. The window is split at the antimeridian and covers the full longitude range near the poles. | The comparison. |
+| `geof:sfIntersects(?w, geof:buffer(C, r, u))` and other relations whose constant argument is a constant expression | The constant is folded at plan time. | The relation. |
 
-`C` is a constant geometry literal (or a constant-folded expression). Several conjuncts
-intersect their windows. The pushed conjuncts move into the `SpatialSpec` and are
-evaluated by the operator against the column (with `PreparedGeometry` built once for `C`).
-Other conjuncts stay ordinary filters.
+`C` is a constant geometry literal or a constant-folded expression. When several
+conjuncts apply, their windows are intersected. The pushed conjuncts move into the
+`SpatialSpec`, and the operator evaluates them against the column, with one
+`PreparedGeometry` built for `C`. Other conjuncts stay ordinary filters.
 
-Cost model (the DP chooses between the plain scan and the spatial one by cost, as
-`push_range` does for numeric ranges):
+The DP planner picks the plain scan or the spatial scan by cost, as `push_range` does for
+numeric ranges. The cost model:
 
-* `est_window` = count of rows whose box intersects the window, computed from the tree's
-  upper levels: walk down to the level with ≥ 256 nodes and sum the subtree sizes of nodes
-  intersecting the window. This is an upper bound within one node per boundary, and takes
-  microseconds. Add the overlay rows likewise and the tail length.
-* `est` = `est_window` × selectivity of the exact test (`sfWithin`/`sfContains` of points
-  in a polygon: area(C) / area(box(C)), capped at 1; otherwise 0.5).
-* `cost` = `est_window` × (1 + `REFINE_COST(kind, vertices(C))`) + 4 × tree levels, where
+* `est_window` is the number of rows whose box intersects the window. It comes from the
+  tree's upper levels: walk down to the first level with at least 256 nodes and sum the
+  subtree sizes of the nodes that intersect the window. The result is an upper bound,
+  accurate to within one node per boundary, and takes microseconds. The overlay rows are
+  counted the same way, and the tail length is added.
+* `est` is `est_window` times the selectivity of the exact test. For `sfWithin` or
+  `sfContains` of points in a polygon, the selectivity is area(C) / area(box(C)), capped
+  at 1. Otherwise it is 0.5.
+* `cost` is `est_window` × (1 + `REFINE_COST(kind, vertices(C))`) + 4 × tree levels.
   `REFINE_COST` is 0.5 for a point-in-prepared-polygon test and grows with
-  `log2(vertices)` for polygon–polygon relates. The plain alternative costs
-  `rows(p) × (1 + REFINE_COST)`, because the filter then evaluates per row.
+  `log2(vertices)` for polygon–polygon relates. The plain scan costs
+  `rows(p) × (1 + REFINE_COST)`, because the filter then runs on every row.
 
 The `Node` description reads
 `SpatialScan ?x ?w ← <asWKT> sfWithin POLYGON(5 pts) [window ≈ 1,240 of 1.0M rows; base+overlay]`.
 
 #### 5.6.2 `spatial:` property functions (Phase 1)
 
-`collect()` takes `spatial:*` triples and their argument lists out of the BGP
-(`textpf::take_calls`, as for `spk:vectorSearch`) and pushes a `SpatialPf` leaf with
+`collect()` takes `spatial:*` triples and their argument lists out of the BGP with
+`textpf::take_calls`, as for `spk:vectorSearch`. It pushes a `SpatialPf` leaf with
 `SpatialPfSpec { func, query: Geom (or lat/lon converted with EPSG:4326), radius_m, limit,
-subject: PathEnd, graph: GraphFilter, graph_var, dedup }`. Estimate: `min(limit,
-est_window × FEATURE_FANOUT)`, with `FEATURE_FANOUT` from the predicate statistics of the
-feature links (distinct subjects per object).
+subject: PathEnd, graph: GraphFilter, graph_var, dedup }`. The row estimate is
+`min(limit, est_window × FEATURE_FANOUT)`. `FEATURE_FANOUT` is the number of distinct
+subjects per object, taken from the predicate statistics of the feature links.
 
 #### 5.6.3 Execution of `SpatialPf` and fallback
 
-1. Window search over base + overlay (or, when the index is not ready, a scan of each
-   indexed predicate with the window test on the column, or on parsed literals when the
-   column is not built either).
-2. Exact refinement per §2.5.
-3. Map geometry subjects to features: one `POS` lookup per distinct geometry subject per
-   feature-link predicate (`[link, geomSubject]` prefix), within the graph filter, with the
-   same-graph rule under `GRAPH ?g`.
-4. Deduplicate features. With `limit`, rank by exact distance to the query geometry (box
-   and cardinal functions: to its envelope centre) and keep the first `limit`, ties by
-   subject id.
+1. Search the window over base and overlay. When the index is not ready, scan each
+   indexed predicate instead and test the window against the column, or against parsed
+   literals when the column is not built either.
+2. Refine each match exactly, as §2.5 describes.
+3. Map geometry subjects to features. This takes one `POS` lookup with prefix
+   `[link, geomSubject]` per distinct geometry subject and feature-link predicate. The
+   lookup respects the graph filter, and under `GRAPH ?g` the same-graph rule.
+4. Deduplicate the features. With a `limit`, rank them by exact distance to the query
+   geometry and keep the first `limit`, breaking ties by subject id. For the box and
+   cardinal functions, the distance is to the centre of the query envelope.
 
 For `nearby` with a `limit` and a large radius, step 1 runs as a best-first k-NN traversal
-(§5.7) that stops once `limit` distinct features are proven, so `spatial:nearby (lat lon
-20000 uom:kilometre 10)` does not refine the whole dataset.
+(§5.7). The traversal stops once it has proven `limit` distinct features, so
+`spatial:nearby (lat lon 20000 uom:kilometre 10)` does not refine the whole dataset.
 
 #### 5.6.4 Phase 2 operators
 
-* **Spatial join.** In `plan_group`, a conjunct `geof:R(?a, ?b)` (non-disjoint R),
-  `geof:relate(?a, ?b, p)` with an intersection-requiring pattern, or
-  `geof:distance(?a, ?b, u) <(=) r` with constant `r`, where `?a` and `?b` are bound by
-  different join components, becomes a join edge: `join_order` treats the two components as
-  connected through a `SpatialJoin` node instead of a cross product plus filter. Each child
-  is either an indexed scan (the persistent index is probed directly; index nested-loop
-  join) or any subplan (its distinct geometry ids are boxed from the column or parsed, and
-  a packed tree is built over the smaller side). The algorithm is synchronous traversal of
-  the two trees (or probe of each outer box), then exact refinement with the relation, a
-  `PreparedGeometry` per outer geometry when its candidates exceed 8. Output rows are the
-  row-id pairs joined back to both children's tables. Cost:
-  `(n + m) · log(min(n, m)) + pairs × REFINE_COST`, and
-  `est = n · m · overlap_ratio`, where the overlap ratio is estimated from a 1,024-row
-  sample of each side (the two-level box count of §5.6.1 applied to the sample).
-* **Query Rewrite** (§2.6): `collect()` turns a topological-property triple into a
-  `SpatialRelate` item that expands into `Union(Scan(asserted), Derived)` with set
-  semantics (`Distinct` over the two branches' `(so1, so2)`). `Derived` resolves
-  `so → literal` with the four cases as a small UNION of scans (feature via
-  `hasDefaultGeometry` then `asX`, geometry via `asX`, or a constant literal), then uses the
-  spatial join (both sides variable), a `SpatialScan` (one side constant) or a single test
-  (both constant). Disjoint relations use a nested-loop join with the row budget.
-* **k-NN.** `ORDER BY ASC(geof:distance(?w, C, u)) LIMIT k` (or `metricDistance`, or a
-  variable bound by `BIND` to one of them) over a group whose only producer of `?w` is an
-  indexed scan, and whose other leaves join on that scan's subject (stars), becomes
-  `SpatialKnn`. It is a best-first traversal of
-  base/overlay trees by the lower bound of §4.4.2, emitting candidates in increasing lower
-  bound in batches of `2k`. Each batch is joined with the rest of the group, and the
-  traversal stops once `k` results whose exact distance is ≤ the next lower bound exist.
-  SPARQL sorts an expression error (unbound) first in ascending order, so the operator
-  first emits the scan's rows whose distance is an error: ill-typed, empty, unknown-CRS
-  and unsupported literals. The column records these as `skipped` row lists (base and
-  overlay) for exactly this purpose. A `FILTER(BOUND(?d))` or a distance bound in the group
-  removes them, and the documented query shape includes one. Other shapes keep the generic
-  sort.
+* **Spatial join.** In `plan_group`, some conjuncts become join edges when `?a` and `?b`
+  are bound by different join components:
+  * `geof:R(?a, ?b)` for a relation R that is not a disjoint relation;
+  * `geof:relate(?a, ?b, p)` with a pattern that requires an intersection;
+  * `geof:distance(?a, ?b, u) <(=) r` with a constant `r`.
+
+  `join_order` then connects the two components through a `SpatialJoin` node instead of a
+  cross product plus a filter. A child can be an indexed scan, in which case the join
+  probes the persistent index directly (an index nested-loop join). A child can also be
+  any subplan. Its distinct geometry ids are then boxed from the column or parsed, and a
+  packed tree is built over the smaller side.
+
+  The join traverses the two trees together, or probes with each outer box. It then
+  refines the pairs exactly with the relation, building a `PreparedGeometry` for an outer
+  geometry when it has more than 8 candidates. The output rows are the row-id pairs,
+  joined back to both children's tables. The cost is
+  `(n + m) · log(min(n, m)) + pairs × REFINE_COST`, and the estimate is
+  `est = n · m · overlap_ratio`. The overlap ratio is estimated from a 1,024-row sample of
+  each side, using the two-level box count of §5.6.1.
+* **Query Rewrite** (§2.6). `collect()` turns a topological-property triple into a
+  `SpatialRelate` item. The item expands into `Union(Scan(asserted), Derived)` with set
+  semantics, applying `Distinct` over the `(so1, so2)` pairs of the two branches.
+  `Derived` resolves each spatial object to literals with a small UNION of scans, one per
+  case: a feature through `hasDefaultGeometry` and then `asX`, a geometry through `asX`, or
+  a constant literal. It then runs a spatial join when both sides are variables, a
+  `SpatialScan` when one side is constant, or a single test when both are. Disjoint
+  relations use a nested-loop join within the row budget.
+* **k-NN.** `ORDER BY ASC(geof:distance(?w, C, u)) LIMIT k` becomes `SpatialKnn` when the
+  only producer of `?w` in the group is an indexed scan, and the group's other leaves join
+  on that scan's subject (a star). `metricDistance`, or a variable bound by `BIND` to
+  either function, works the same way.
+
+  The operator traverses the base and overlay trees best-first, ordered by the lower bound
+  of §4.4.2. It emits candidates in increasing lower-bound order, in batches of `2k`, and
+  joins each batch with the rest of the group. It stops once it has `k` results whose
+  exact distance is ≤ the next lower bound.
+
+  In ascending order, SPARQL sorts an expression error (unbound) first. The operator
+  therefore first emits the scan's rows whose distance is an error: ill-typed, empty,
+  unknown-CRS and unsupported literals. The column keeps these as `skipped` row lists, for
+  base and overlay, for exactly this purpose. A `FILTER(BOUND(?d))` or a distance bound in
+  the group removes them, and the documented query shape includes one. Other query shapes
+  use the generic sort.
 
 ### 5.7 Search kernels (`geo/search.rs`)
 
-* **Window**: `tree.search(box)` on base and overlay, tail scan; validity against the
-  snapshot (§5.3); the graph filter; dedup per `(s, o)` under merged default graphs; exact
-  test on the column entry (box test first, then the relation). It runs in parallel over
-  chunks of 4,096 candidates with `ctx.check()` between chunks, as the vector search does.
-* **Radius**: window = box expanded by `r` on the lower-bound sphere; the exact test is the
-  configured distance model.
-* **k-NN**: a priority queue over tree nodes keyed by the lower-bound distance from the
-  query to the node box (`geo-index` `neighbors_with_callbacks`, or our own traversal over
-  its node layout if its callback API cannot take a custom metric). Leaf entries are
-  refined in order. Ties by `(s, o, g)` raw id.
-* **Antimeridian**: windows that cross ±180° are split into two boxes. Data rows are
+* **Window.** The kernel runs `tree.search(box)` on base and overlay and scans the tail.
+  It checks each row's validity against the snapshot (§5.3) and applies the graph filter.
+  Under merged default graphs it deduplicates per `(s, o)`. The exact test runs on the
+  column entry, box test first and then the relation. Like the vector search, the kernel
+  runs in parallel over chunks of 4,096 candidates, with `ctx.check()` between chunks.
+* **Radius.** The window is the box expanded by `r` on the lower-bound sphere. The exact
+  test uses the configured distance model.
+* **k-NN.** A priority queue over tree nodes, keyed by the lower-bound distance from the
+  query to the node's box. It uses `geo-index`'s `neighbors_with_callbacks`, or our own
+  traversal over its node layout if the callback API cannot take a custom metric. Leaf
+  entries are refined in order. Ties are broken by the raw `(s, o, g)` ids.
+* **Antimeridian.** A window that crosses ±180° is split into two boxes. Data rows are
   indexed as written (§4.4.1).
 
 ### 5.8 Functions in `expr.rs`
@@ -1087,24 +1197,27 @@ For `nearby` with a `limit` and a large radius, step 1 runs as a best-first k-NN
 * `is_extension` accepts `geof:` and `spatialF:` when the feature is on.
 * `extension()` dispatches to `geo::ops`. Geometry arguments go through
   `geom_arg(args, i, row, ctx)`:
-  * when the argument expression is a variable, take its id: a base or delta id → the
-    generation column (no parsing when present); otherwise `ctx.geo_memo`;
-  * otherwise evaluate to a `Value::Other { lex, dt }` and parse through `ctx.geo_memo`,
-    keyed by a 64-bit hash of `(dt, lex)`.
-* Numeric results are `xsd:double` (inline when the low mantissa bits allow, else the local
-  vocabulary). Booleans are inline. Geometries are local-vocabulary literals.
-* Aggregates (Phase 2): `AggregateFunction::Custom(iri)` for `geof:aggBoundingBox`,
-  `aggBoundingCircle`, `aggCentroid` (centroid of the union of inputs, planar),
-  `aggConvexHull`, `aggUnion` (`unary_union`, with `maxOpVertices`), `aggConcaveHull`.
-  They take one geometry expression. `DISTINCT` is honoured, and ill-typed inputs make the
-  aggregate an error, as for the built-in numeric aggregates. Results are in the CRS of the
-  first input, and inputs in other CRSs are transformed.
-* Constant folding: calls whose arguments are all constants are evaluated once at plan
-  time (needed for §5.6.1 windows; the existing `Expr` constant path).
+  * When the argument expression is a variable, it takes the variable's id. A base or
+    delta id is read from the generation column, with no parsing if the entry exists.
+    Other ids go through `ctx.geo_memo`.
+  * Otherwise it evaluates the expression to a `Value::Other { lex, dt }` and parses it
+    through `ctx.geo_memo`, keyed by a 64-bit hash of `(dt, lex)`.
+* Numeric results are `xsd:double`. They are inline when the low mantissa bits allow, and
+  in the local vocabulary otherwise. Booleans are inline. Geometries are local-vocabulary
+  literals.
+* **Aggregates (Phase 2).** `AggregateFunction::Custom(iri)` covers
+  `geof:aggBoundingBox`, `aggBoundingCircle`, `aggCentroid`, `aggConvexHull`, `aggUnion`
+  and `aggConcaveHull`. `aggCentroid` is the planar centroid of the union of the inputs.
+  `aggUnion` uses `unary_union`, limited by `maxOpVertices`. Each aggregate takes one
+  geometry expression and honours `DISTINCT`. As with the built-in numeric aggregates, an
+  ill-typed input makes the aggregate an error. Results are in the CRS of the first
+  input, and inputs in other CRSs are transformed.
+* **Constant folding.** A call whose arguments are all constants is evaluated once, at
+  plan time, through the existing `Expr` constant path. The §5.6.1 windows need this.
 
 ### 5.9 Explain and profile
 
-Plan nodes (`describe`):
+The plan nodes (`describe`) read:
 
 * `SpatialScan` (Phase 1), as in §5.6.1;
 * `SpatialPf ?f ← spatial:nearby POINT(-0.12 51.5) r=5 km limit 10 [features via hasDefaultGeometry|hasGeometry]`;
@@ -1113,13 +1226,14 @@ Plan nodes (`describe`):
 
 Profiles (`x-sparkles+json` and the UI's Plan tab) add per-operator counters:
 `candidates`, `refined`, `matched`, `treeNodesVisited`, `index: ready | building (p%) |
-off | failed`, and `fallback: true` when a non-index path ran. When a query has a spatial
-filter that was not pushed down (wrong shape, variable radius, index off), explain adds a
-warning naming the reason (the MCP server's explain-with-warnings surfaces it too).
+off | failed`, and `fallback: true` when a non-index path ran. When a spatial filter was
+not pushed down, explain adds a warning with the reason, such as the wrong shape, a
+variable radius or the index being off. The MCP server's explain-with-warnings shows the
+same warning.
 
 ## 6. Phasing
 
-Estimates are in implementation days, on the same scale as F03/F04.
+Estimates are in implementation days, on the same scale as F03 and F04.
 
 ### Phase 1 (about 7 days)
 
@@ -1156,36 +1270,40 @@ Estimates are in implementation days, on the same scale as F03/F04.
 
 ### Phase 2 (about 8 days)
 
-* Spatial joins, distance-within joins, k-NN rewrite (3 days).
-* Query Rewrite Extension, `--geo-default-geometry`, RDFS Entailment Extension (ontology
-  bundle, `--vocab geosparql`) (1.5 days).
-* Aggregates (custom aggregate support in `exec.rs`), `boundingCircle`, `concaveHull`,
-  `isSimple`, `spatialF:` functions, `spatial:equals`, UTM zones, W3C Basic Geo rows
-  (1.5 days).
-* Persisted column and trees, reuse of parsed geometries across compaction, `check`
-  coverage (1 day).
-* UI: map tab, explorer card and Nearby, dataset panel, `/{ds}/geo`, `/$/geo/convert`, mock
-  endpoints (1.5 days).
-* Oxigraph test-suite import, Jena-derived test cases, benchmark scripts (§8, §9);
-  `docs/BENCHMARKS.md` section (0.5 day plus the run).
+* Spatial joins, distance-within joins and the k-NN rewrite (3 days).
+* The Query Rewrite Extension, `--geo-default-geometry`, and the RDFS Entailment Extension
+  with its ontology bundle and `--vocab geosparql` (1.5 days).
+* Aggregates, which need custom aggregate support in `exec.rs`; `boundingCircle`,
+  `concaveHull`, `isSimple`, the `spatialF:` functions, `spatial:equals`, UTM zones and W3C
+  Basic Geo rows (1.5 days).
+* The persisted column and trees, reuse of parsed geometries across compaction, and
+  `check` coverage (1 day).
+* The UI: the map tab, the explorer card and Nearby action, the dataset panel,
+  `/{ds}/geo`, `/$/geo/convert` and the mock endpoints (1.5 days).
+* Import of Oxigraph's test suite, Jena-derived test cases and benchmark scripts (§8,
+  §9), plus a `docs/BENCHMARKS.md` section (0.5 day plus the run).
 
 ### Phase 3 (later, on demand)
 
-* GML and KML literals and `asGML`/`asKML`; the GML entailment hierarchy (Req 49).
-* `geo-proj4` feature with an operator CRS registry (§4.2.4).
-* Variable and bound-from-left arguments for `spatial:` (like F04's `candidates:join`).
-* k-NN with arbitrary joins (batch-and-verify generalized), spatial join with S2-cell or
-  grid prefilters (QLever's cell-grid idea, ideas only), simplified inner/outer polygon
-  approximations for refinement (Bast et al. 2025).
-* `geometryTypes` materialization rule, `geo:hasMetricArea` etc. computed by rewrite.
-* A Sparkles answer to QLever's `SERVICE spatialSearch:` syntax, if users ask (§11 q14).
-* Running the GeoSPARQL Compliance Benchmark in CI, if the maintainer accepts the GPL-2.0
-  fetch (§8).
+* GML and KML literals, `asGML` and `asKML`, and the GML entailment hierarchy (Req 49).
+* The `geo-proj4` feature with an operator-supplied CRS registry (§4.2.4).
+* Variable arguments and arguments bound from the left for `spatial:`, like F04's
+  `candidates:join`.
+* k-NN with arbitrary joins, by generalizing batch-and-verify.
+* Spatial joins with S2-cell or grid prefilters. QLever's cell grid is the model, and only
+  the idea is borrowed.
+* Simplified inner and outer polygon approximations for refinement (Bast et al. 2025).
+* The `geometryTypes` materialization rule, and `geo:hasMetricArea` and similar
+  properties computed by rewrite.
+* Support for QLever's `SERVICE spatialSearch:` syntax, if users ask (§11 q14).
+* Running the GeoSPARQL Compliance Benchmark in CI, if the maintainer accepts fetching
+  GPL-2.0 code (§8).
 
 ## 7. Acceptance examples
 
-Fixture (`ds`, spatial index enabled with defaults). Prefixes `ex:`, `geo:`, `geof:`,
-`uom:`, `spatial:`, `spatialF:`, `sf:`. CRS84 unless stated.
+The fixture is the dataset `ds` with the spatial index enabled with defaults. The
+prefixes are `ex:`, `geo:`, `geof:`, `uom:`, `spatial:`, `spatialF:` and `sf:`. Literals
+are CRS84 unless stated.
 
 ```trig
 ex:A geo:hasDefaultGeometry ex:gA . ex:gA geo:asWKT "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))"^^geo:wktLiteral .
@@ -1234,194 +1352,208 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
 | A28 (P2) | RDFS: `infer --profile rdfs --vocab geosparql` with `ex:gA a sf:Polygon`; `SELECT ?g { ?g a geo:Geometry }` with `reasoning=true` | includes `ex:gA` |
 
 The values in this table were computed by hand from the rules of §2–§4, not by an
-implementation. Where they disagree with those rules, the rules win and the table gets
+implementation. Where a value disagrees with the rules, the rules win and the table gets
 fixed. Approximate distances ("≈") are asserted against GeographicLib reference values,
-not against these roundings.
+not against the rounded numbers shown here.
 
 ## 8. Conformance testing
 
-* **Sparkles' own tests** (§7) in `crates/sparkles/src/sparql/tests.rs` and a new
-  `geo/tests.rs` (parser edge cases, CRS/axis handling, DE-9IM table, distance models
-  against reference values, budgets).
-* **Oxigraph's GeoSPARQL test suite** (`testsuite/oxigraph-tests/geosparql/`, 44 cases
-  in W3C manifest form, MIT OR Apache-2.0): vendored under `testsuite/geosparql/oxigraph/`
-  with its license notice, run by the existing W3C-manifest harness. Expected deviations
-  (Oxigraph rejects EPSG:4326 and uses haversine, planar centroid etc.) are listed in an
-  `expected-failures.txt` with the reason per case.
-* **Jena's `jena-geosparql` unit tests** (Apache-2.0; ~1,360 JUnit methods): no harness
-  port. Their expected values for parsers, relations and the `spatial:` functions
-  (`NearbyPFTest`, `WithinBoxPFTest`, cardinal tests, `SpatialIndexTestData` cities) are
-  re-expressed as Sparkles SPARQL tests where they encode observable behaviour, with a
-  comment naming the Jena test, and Jena's `NOTICE` attribution added to
-  `THIRD_PARTY_LICENSES.md` if any test data is copied verbatim. Divergences of §11 are
-  asserted as Sparkles' behaviour with the Jena value in a comment.
-* **GeoSPARQL 1.1 specification examples** (Annex C, OGC Document License, permissive):
-  the example dataset and queries become a test fixture.
-* **OGC Compliance Benchmark** (Jovanovik et al., github.com/OpenLinkSoftware/
-  GeoSPARQLBenchmark): GeoSPARQL 1.0, 206 queries, 406 expected-result files, dataset in
-  RDF/XML, GML and GeoJSON. It is GPL-2.0-only, so it is neither vendored nor linked.
-  An opt-in developer script `scripts/geosparql-benchmark.sh` (Phase 2) clones it at a
-  pinned commit into `target/geosparql-benchmark/`, loads its dataset into a scratch
-  server, runs the queries over HTTP and prints the per-requirement score. It is a
-  development tool, like `shellcheck` (README, PROVENANCE), never shipped. It needs the
-  maintainer's approval (§11 q12). Target: every WKT requirement passing (GML parts fail
-  until Phase 3), above GeoSPARQL Fuseki 3.17's published 177/206. The benchmark compares
-  floating-point answers exactly; mismatches caused only by the distance model or the 6-
-  decimal rounding are reported separately.
-* **OGC `ets-geosparql11`** (Apache-2.0) is a TEAM Engine skeleton without tests as of
-  2026-09. Revisit when it has tests.
+* **Sparkles' own tests** (§7) live in `crates/sparkles/src/sparql/tests.rs` and a new
+  `geo/tests.rs`. They cover parser edge cases, CRS and axis handling, the DE-9IM table,
+  the distance models against reference values, and budgets.
+* **Oxigraph's GeoSPARQL test suite** (`testsuite/oxigraph-tests/geosparql/`) has 44 cases
+  in W3C manifest form, under MIT OR Apache-2.0. It is vendored under
+  `testsuite/geosparql/oxigraph/` with its license notice and runs in the existing
+  W3C-manifest harness. Some cases are expected to fail, because Oxigraph rejects
+  EPSG:4326, uses haversine, computes a planar centroid and so on. An
+  `expected-failures.txt` lists each one with its reason.
+* **Jena's `jena-geosparql` unit tests** (Apache-2.0, about 1,360 JUnit methods) are not
+  ported as a harness. Where a test encodes observable behaviour, its expected values are
+  rewritten as a Sparkles SPARQL test, with a comment that names the Jena test. This
+  covers the parsers, the relations and the `spatial:` functions (`NearbyPFTest`,
+  `WithinBoxPFTest`, the cardinal tests and the `SpatialIndexTestData` cities). If any test
+  data is copied verbatim, Jena's `NOTICE` attribution goes into
+  `THIRD_PARTY_LICENSES.md`. For the divergences in §11, the tests assert Sparkles'
+  behaviour and give the Jena value in a comment.
+* **The GeoSPARQL 1.1 specification examples** (Annex C, under the permissive OGC Document
+  License) become a test fixture, both the example dataset and the queries.
+* **The OGC Compliance Benchmark** (Jovanovik et al., github.com/OpenLinkSoftware/
+  GeoSPARQLBenchmark) targets GeoSPARQL 1.0. It has 206 queries, 406 expected-result files
+  and a dataset in RDF/XML, GML and GeoJSON. It is GPL-2.0-only, so Sparkles neither
+  vendors nor links it.
+
+  An opt-in developer script, `scripts/geosparql-benchmark.sh` (Phase 2), clones it at a
+  pinned commit into `target/geosparql-benchmark/`. The script loads the dataset into a
+  scratch server, runs the queries over HTTP and prints the score per requirement. Like
+  `shellcheck` (README, PROVENANCE), it is a development tool and never ships. It needs
+  the maintainer's approval (§11 q12).
+
+  The target is to pass every WKT requirement, beating GeoSPARQL Fuseki 3.17's published
+  177/206. The GML parts fail until Phase 3. The benchmark compares floating-point answers
+  exactly, so mismatches caused only by the distance model or by 6-decimal rounding are
+  reported separately.
+* **OGC `ets-geosparql11`** (Apache-2.0) is a TEAM Engine skeleton with no tests as of
+  2026-09. Revisit it when it has tests.
 
 ## 9. Performance targets and benchmark plan
 
-Machine and method as `docs/BENCHMARKS.md` (engines alone, warm page cache, hyperfine,
-answers fingerprinted before timing; geometries compared by value with a tolerance in
-`bench-answers.py`, which gains a WKT-aware comparison).
+The machine and method are those of `docs/BENCHMARKS.md`: each engine runs alone with a
+warm page cache, timings come from hyperfine, and answers are fingerprinted before
+timing. `bench-answers.py` gains a WKT-aware comparison that compares geometries by value
+with a tolerance.
 
-**Data**: `scripts/gen-geo.py N` (seeded):
+**Data.** `scripts/gen-geo.py N` generates a seeded dataset:
 
-* `N` point features clustered around 500 "cities" (log-normal populations; CRS84, 1% as
-  EPSG:4326 to exercise axis swapping);
-* `N/10` line features (random walks, 2–200 vertices);
-* `N/20` polygon features (star polygons, 4–500 vertices, 10% with holes, 5%
-  multipolygons);
-* a three-level administrative hierarchy of polygons tiling the world (40 "countries",
-  1,600 "states", 64,000 "counties"; 20–2,000 vertices, shared borders so touches/within
-  are exercised);
-* features with `hasDefaultGeometry`, 50% also with labels and types, so joins with
-  ordinary patterns are realistic; 10% W3C Basic Geo points.
+* `N` point features clustered around 500 "cities" with log-normal populations. They are
+  in CRS84, with 1% in EPSG:4326 to exercise axis swapping.
+* `N/10` line features, random walks with 2–200 vertices.
+* `N/20` polygon features, star polygons with 4–500 vertices. 10% have holes and 5% are
+  multipolygons.
+* A three-level administrative hierarchy of polygons that tiles the world: 40 "countries",
+  1,600 "states" and 64,000 "counties", with 20–2,000 vertices each. The borders are
+  shared, so touches and within get exercised.
+* Features linked with `hasDefaultGeometry`. Half of them also have labels and types, so
+  joins with ordinary patterns are realistic. 10% are W3C Basic Geo points.
 
-Sizes: N = 1M (≈ 9M triples) and N = 10M. A real-data check uses Natural Earth admin
-boundaries (public domain) plus a GeoNames- or OSM-derived point set built locally (ODbL
-data, never committed).
+The sizes are N = 1M (≈ 9M triples) and N = 10M. A real-data check uses Natural Earth
+admin boundaries (public domain) and a point set derived from GeoNames or OSM. The point
+set is ODbL data, so it is built locally and never committed.
 
-**Queries** (each also run on Jena GeoSPARQL Fuseki with its spatial index, on QLever
-where it has the feature, and on Oxigraph for functions without an index):
+**Queries.** Each query also runs on Jena GeoSPARQL Fuseki with its spatial index, on
+QLever where it has the feature, and on Oxigraph for the functions that need no index.
 
 | Id | Query | Target (N = 1M, 16 threads) |
 |---|---|---|
-| Q1 | points `sfWithin` a constant county polygon (≈ 1k results) | p50 ≤ 5 ms |
-| Q2 | points within 5 km of a constant point (`distance <`) | ≤ 3 ms |
+| Q1 | Points `sfWithin` a constant county polygon (≈ 1k results). | p50 ≤ 5 ms |
+| Q2 | Points within 5 km of a constant point (`distance <`). | ≤ 3 ms |
 | Q3 | `spatial:nearby (lat lon 50 uom:kilometre 10)` | ≤ 2 ms |
-| Q4 | `spatial:withinBox` over 1% of the world | ≤ 20 ms |
-| Q5 (P2) | count points per state (1M × 1,600 `sfContains` join) | ≤ 2 s |
-| Q6 (P2) | county–county `sfTouches` self-join (64k) | ≤ 5 s |
-| Q7 (P2) | k-NN 10 nearest points to a constant (`ORDER BY metricDistance LIMIT 10`) | ≤ 3 ms |
-| Q8 | `SUM(geof:metricArea(?w))` over 50k polygons | ≤ 300 ms |
-| Q9 | Q1 joined with labels and types (3-pattern star) | ≤ 10 ms |
-| Q10 | Q1 with the index disabled (scan + filter) | report only (the speedup) |
+| Q4 | `spatial:withinBox` over 1% of the world. | ≤ 20 ms |
+| Q5 (P2) | Count points per state, a 1M × 1,600 `sfContains` join. | ≤ 2 s |
+| Q6 (P2) | County–county `sfTouches` self-join (64k). | ≤ 5 s |
+| Q7 (P2) | The 10 nearest points to a constant (`ORDER BY metricDistance LIMIT 10`). | ≤ 3 ms |
+| Q8 | `SUM(geof:metricArea(?w))` over 50k polygons. | ≤ 300 ms |
+| Q9 | Q1 joined with labels and types (a 3-pattern star). | ≤ 10 ms |
+| Q10 | Q1 with the index disabled (scan and filter). | Report the speedup only. |
 
-**Writes and maintenance**:
+**Writes and maintenance.**
 
-* index build at enable: 1M points ≤ 1.5 s; 1M mixed features (above) ≤ 10 s;
-* peak build memory ≤ 2× the final index memory;
-* compaction time increase ≤ 1.5× the build time (Phase 2: ≤ 0.3× with parsed-geometry
-  reuse);
-* single-triple non-geo `INSERT DATA`: no regression beyond noise; a point insert: ≤ +1 ms
-  over a non-geo insert; 1,000-polygon insert: ≤ +20 ms;
-* open time with persisted files (Phase 2): ≤ 200 ms extra for 1M rows;
-* memory: ≤ 150 bytes per point row and ≤ `16 · vertices + 200` bytes per polygon row
-  (Phase 1, in memory); report RSS next to Jena's.
+* Index build when the index is enabled: ≤ 1.5 s for 1M points, ≤ 10 s for the 1M mixed
+  features above.
+* Peak build memory: ≤ 2× the final index memory.
+* Compaction: at most 1.5× the build time added, and at most 0.3× in Phase 2 with
+  parsed-geometry reuse.
+* A single-triple `INSERT DATA` without geometry shows no regression beyond noise. A
+  point insert costs ≤ +1 ms over a non-geo insert, and a 1,000-polygon insert ≤ +20 ms.
+* Open time with persisted files (Phase 2): ≤ 200 ms extra for 1M rows.
+* Memory in Phase 1, in memory: ≤ 150 bytes per point row and ≤ `16 · vertices + 200`
+  bytes per polygon row. Report RSS next to Jena's.
 
-Results go to a "GeoSPARQL" section of `docs/BENCHMARKS.md`, with the "Where Sparkles
-loses" list updated (QLever's libspatialjoin is likely faster on huge self-joins).
+Results go to a "GeoSPARQL" section of `docs/BENCHMARKS.md`. The "Where Sparkles loses"
+list gets updated too, since QLever's libspatialjoin is likely faster on huge self-joins.
 
 ## 10. Rejected alternatives
 
-* **GEOS through the `geos` crate**: `geos` is MIT, but libgeos is LGPL-2.1, and static
-  linking (the `static` feature) or shipping it conflicts with the permissive-only policy.
-  `geo` covers the needed algorithms.
-* **PROJ through `proj`/`proj-sys`** as the default CRS engine: the PROJ library is MIT,
-  but the build needs CMake, a C++ toolchain and SQLite (libtiff with the network feature),
-  and it ships the EPSG dataset under its own terms of use. Possible later as an opt-in
-  feature; `proj4rs` is the pure-Rust option (§4.2.4).
-* **QLever-style inline `GeoPoint` ids** (30-bit quantized lat/lng in the 60-bit payload,
-  z-order or lat-major): lossy (≈ 2 cm), drops the lexical form, and breaks Sparkles' exact
-  term identity (README decision on canonical inlining). It also needs a fifth-from-last
-  tag (4 of 16 left). A point literal costs one vocabulary entry plus a column entry.
-* **A geo-split vocabulary** (QLever's `.geometry` sub-vocabulary with `.geoinfo` records):
-  changes the vocabulary format and id layout. The per-generation geometry column gives
-  the same precomputation without touching the vocabulary.
-* **Canonicalizing geometry literals on load** (for example, always writing CRS84): breaks
-  term identity, and users' literals must round-trip.
-* **A spatial index maintained like F03** (one mutable structure, results filtered against
-  the snapshot, removed entries kept until a seal): an R-tree has no cheap segment model
-  comparable to Tantivy's. Base + overlay + persistent tail gives MVCC by construction.
-* **F04's per-query overlay** (no commit-path work; the delta is parsed and scanned per
-  query): every query after a write would re-parse the delta's geometries. Parsing once in
-  the commit path costs microseconds per inserted geometry.
-* **`rstar` (dynamic R*-tree) for the base**: slower to build than a packed tree and not
-  usable zero-copy from an mmapped file. Packed Hilbert/STR trees are what Flatbush, JTS's
-  `STRtree` and `geo-index` use for static data.
-* **Jena's feature-keyed, envelope-only index** (one STRtree per graph, items = feature
-  nodes): stand-alone geometries are invisible, `?g` cannot be reported, the exact test is
-  skipped for boxes, and the index is never updated incrementally. Sparkles keys by
-  serialization quad and maps to features at query time.
-* **Jena's silent CRS84 fallback for unknown CRSs**, its planar-degree-only buffer on
-  geographic data, envelope-only `withinBox` answers, and returning `false` for every
-  relation on empty geometries: wrong or surprising answers that GeoSPARQL does not require
-  (§11 lists each as a divergence with a default).
-* **Approximating distance in Web Mercator metres** (QLever's `geof:distance` path through
-  `webMercMeterDist`): scale error grows with latitude (×2 at 60°).
-* **S2 (`s2` 0.2, Apache-2.0)**: a partial port without polygons ("lines and polygons
-  aren't implemented yet"). Cell-based prefilters are a Phase 3 idea, not a dependency.
-* **QLever's `SERVICE spatialSearch:` as the primary interface**: it overloads SERVICE (as
-  F04 argued for vector search). The standard FILTER form plus planner rewrites covers the
-  same joins. A compatibility shim stays an open question.
-* **Vendoring the GeoSPARQL Compliance Benchmark**: GPL-2.0-only.
-* **OSM's tile servers as the default basemap**: the tile usage policy forbids offline and
-  bulk use, requires a unique User-Agent and Referer, and blocks without notice. Air-gapped
-  servers must render maps.
-* **A separate "geometry" literal datatype of Sparkles' own** (as F04 did for vectors): the
-  OGC datatypes exist and are what data uses.
+* **GEOS through the `geos` crate.** `geos` is MIT, but libgeos is LGPL-2.1. Linking it
+  statically (the `static` feature) or shipping it conflicts with the permissive-only
+  policy. `geo` covers the algorithms Sparkles needs.
+* **PROJ through `proj`/`proj-sys` as the default CRS engine.** The PROJ library is MIT,
+  but the build needs CMake, a C++ toolchain and SQLite, plus libtiff with the network
+  feature. PROJ also ships the EPSG dataset under its own terms of use. It could come
+  later as an opt-in feature. `proj4rs` is the pure-Rust option (§4.2.4).
+* **QLever-style inline `GeoPoint` ids.** QLever quantizes lat/lng to 30 bits each in the
+  60-bit payload, in z-order or lat-major order. That is lossy (≈ 2 cm) and drops the
+  lexical form, which breaks Sparkles' exact term identity (the README decision on
+  canonical inlining). It would also need a fifth-from-last tag, and only 4 of 16 are left.
+  In Sparkles a point literal costs one vocabulary entry plus a column entry.
+* **A geo-split vocabulary**, like QLever's `.geometry` sub-vocabulary with `.geoinfo`
+  records. It changes the vocabulary format and the id layout. The per-generation geometry
+  column gives the same precomputation without touching the vocabulary.
+* **Canonicalizing geometry literals on load**, for example always writing CRS84. That
+  breaks term identity, and users' literals must round-trip.
+* **A spatial index maintained like F03**, with one mutable structure, results filtered
+  against the snapshot and removed entries kept until a seal. An R-tree has no cheap
+  segment model like Tantivy's. Base, overlay and persistent tail give MVCC by
+  construction.
+* **F04's per-query overlay**, where the commit path does no work and each query parses and
+  scans the delta. Every query after a write would parse the delta's geometries again.
+  Parsing once in the commit path costs microseconds per inserted geometry.
+* **`rstar` (a dynamic R*-tree) for the base.** It builds more slowly than a packed tree
+  and cannot be used zero-copy from an mmapped file. Flatbush, JTS's `STRtree` and
+  `geo-index` all use packed Hilbert or STR trees for static data.
+* **Jena's feature-keyed, envelope-only index**, with one STRtree per graph whose items
+  are feature nodes. Stand-alone geometries are invisible to it, it cannot report `?g`, it
+  skips the exact test for boxes, and it is never updated incrementally. Sparkles keys the
+  index by serialization quad and maps to features at query time.
+* **Jena's behaviours that give wrong or surprising answers** that GeoSPARQL does not
+  require: the silent CRS84 fallback for unknown CRSs, the planar-degree-only buffer on
+  geographic data, envelope-only `withinBox` answers, and `false` for every relation on
+  empty geometries. §11 lists each one as a divergence with a default.
+* **Approximating distance in Web Mercator metres**, as QLever's `geof:distance` does
+  through `webMercMeterDist`. The scale error grows with latitude and reaches ×2 at 60°.
+* **S2 (`s2` 0.2, Apache-2.0).** It is a partial port without polygons ("lines and
+  polygons aren't implemented yet"). Cell-based prefilters are a Phase 3 idea, not a
+  dependency.
+* **QLever's `SERVICE spatialSearch:` as the primary interface.** It overloads SERVICE,
+  which F04 argued against for vector search. The standard FILTER form plus planner
+  rewrites covers the same joins. A compatibility shim stays an open question.
+* **Vendoring the GeoSPARQL Compliance Benchmark.** It is GPL-2.0-only.
+* **OSM's tile servers as the default basemap.** The tile usage policy forbids offline and
+  bulk use, requires a unique User-Agent and Referer, and blocks clients without notice.
+  Air-gapped servers must still render maps.
+* **A Sparkles-specific "geometry" literal datatype**, as F04 did for vectors. The OGC
+  datatypes already exist, and real data uses them.
 
 ## 11. Open questions (defaults chosen here)
 
 1. **Index opt-in.** The spatial index is enabled per dataset (`geo.json`), like text
-   search; functions always work. Alternative: enable automatically when a load finds
-   `geo:asWKT`/`geo:asGeoJSON` quads.
-2. **Distance model.** Default `geodesic` (WGS 84, Karney), with `haversine` (Jena's
-   R = 6,371,008.7714 m) as a per-dataset option. Jena-identical numbers would need
-   `haversine` as the default.
-3. **`getSRID` datatype.** `xsd:anyURI` (the standard) rather than Jena's `xsd:string`.
-4. **Empty geometries.** DE-9IM (empty is disjoint from everything) rather than Jena's
-   "always false".
+   search. The functions always work. The alternative is to enable the index
+   automatically when a load finds `geo:asWKT` or `geo:asGeoJSON` quads.
+2. **Distance model.** The default is `geodesic` (WGS 84, Karney). `haversine`, with
+   Jena's R = 6,371,008.7714 m, is a per-dataset option. Numbers identical to Jena's would
+   need `haversine` as the default.
+3. **`getSRID` datatype.** `xsd:anyURI`, as the standard says, rather than Jena's
+   `xsd:string`.
+4. **Empty geometries.** DE-9IM, where an empty geometry is disjoint from everything,
+   rather than Jena's "always false".
 5. **`sfEquals`/`ehEquals`.** Topological equality `T*F**FFF*`, so equal points are equal.
-   The literal table pattern `TFFFTFFFT` would make two equal points unequal.
-6. **Legacy `…/EPSG/4326` (no `/0/`).** Treated as CRS84 lon/lat (Jena's alias) rather
-   than as EPSG:4326 lat/lon.
-7. **Unknown CRSs.** Parsed, usable same-CRS and planar, not indexed, error for metric
-   functions. Jena falls back to CRS84 with a warning.
-8. **Units.** OGC, QUDT and EPSG URN units are all accepted. GeoSPARQL 1.1 recommends QUDT;
-   Jena accepts OGC and EPSG; QLever QUDT.
-9. **`withinBox` / `intersectBox`.** Exact tests always (Jena returns envelope hits when the
-   subject is unbound).
-10. **Feature links of `spatial:`.** `hasDefaultGeometry` and `hasGeometry` (Jena). Should
-    1.1's `hasCentroid` and `hasBoundingBox` (subproperties of `hasGeometry`) count too?
-    Default: no (they are not "the" geometry).
-11. **`length` of a polygon.** All ring lengths (= perimeter). QLever: exterior ring only.
-    Standard text: "the longest length from any one dimension", which is ambiguous.
-12. **GeoSPARQL Compliance Benchmark (GPL-2.0)**: allow the opt-in fetch-at-test-time
-    script, never vendored? Recommended yes.
-13. **Map library and basemap size.** MapLibre GL JS (lazy-loaded) with a bundled Natural
-    Earth 1:110m basemap (a few hundred KB precompressed) versus Leaflet (smaller,
-    canvas/SVG) and no basemap.
+   The pattern printed in the tables, `TFFFTFFFT`, would make two equal points unequal.
+6. **Legacy `…/EPSG/4326` (no `/0/`).** Treated as CRS84 lon/lat, as Jena's alias does,
+   rather than as EPSG:4326 lat/lon.
+7. **Unknown CRSs.** Such literals are parsed and usable with planar functions within the
+   same CRS. They are not indexed, and metric functions raise an error. Jena falls back to
+   CRS84 with a warning.
+8. **Units.** Sparkles accepts OGC, QUDT and EPSG URN units. GeoSPARQL 1.1 recommends
+   QUDT. Jena accepts OGC and EPSG, and QLever accepts QUDT.
+9. **`withinBox` / `intersectBox`.** Sparkles always runs the exact test. Jena returns
+   envelope hits when the subject is unbound.
+10. **Feature links of `spatial:`.** `hasDefaultGeometry` and `hasGeometry`, as in Jena.
+    Should 1.1's `hasCentroid` and `hasBoundingBox`, which are subproperties of
+    `hasGeometry`, count too? The default is no, because they are not "the" geometry.
+11. **`length` of a polygon.** The sum of all ring lengths, which equals the perimeter.
+    QLever uses the exterior ring only. The standard says "the longest length from any one
+    dimension", which is ambiguous.
+12. **GeoSPARQL Compliance Benchmark (GPL-2.0).** Should the opt-in script that fetches it
+    at test time be allowed, with the benchmark never vendored? The recommendation is yes.
+13. **Map library and basemap size.** MapLibre GL JS, loaded lazily, with a bundled
+    Natural Earth 1:110m basemap of a few hundred KB precompressed. The alternative is
+    Leaflet, which is smaller and draws with canvas or SVG, and no basemap.
 14. **QLever `SERVICE spatialSearch:` compatibility.** Not planned. Add a translation shim
     if QLever users ask.
-15. **Strict writes.** Accept ill-typed geometry literals and count them (RDF 1.2), with a
-    possible [C10](C10-write-time-validation.md)-style opt-in rejection later.
-16. **EPSG data.** For Phase 3, ship no EPSG-derived definitions (operator-supplied
-    `crs.json`) unless the maintainer accepts the EPSG terms (or `crs-definitions`'
-    CC0 label) for bundled UTM-style definitions. The built-in UTM zones are formulas with
-    zone parameters, not EPSG data.
-17. **Query Rewrite on by default.** As in Jena. It changes the answers of existing queries
-    that use `geo:sf*` as plain predicates on data with geometries (more rows, never fewer).
-    A dataset can turn it off.
-18. **Index scope includes `urn:x-sparkles:inferred`.** As for text (filtered by
-    `reasoning=false`).
-19. **Overlay tail threshold.** `max(4096, overlay/8)`; measure in Phase 1.
-20. **Phase 1 commit latency** of parsing large polygons in the commit path: a 1M-vertex
-    insert parses in about 100 ms. Acceptable, or defer parsing of literals above 64 KiB to
-    the first query?
+15. **Strict writes.** Accept ill-typed geometry literals and count them, as RDF 1.2
+    allows. An opt-in rejection like [C10](C10-write-time-validation.md) could come later.
+16. **EPSG data.** For Phase 3, ship no EPSG-derived definitions, and let the operator
+    supply `crs.json`. The exception would be bundled UTM-style definitions, if the
+    maintainer accepts the EPSG terms or the CC0 label of `crs-definitions`. The built-in
+    UTM zones are formulas with zone parameters, not EPSG data.
+17. **Query Rewrite on by default.** This matches Jena. It changes the answers of existing
+    queries that use `geo:sf*` as plain predicates on data with geometries. They get more
+    rows, never fewer. A dataset can turn rewrite off.
+18. **Index scope includes `urn:x-sparkles:inferred`.** As for text, and `reasoning=false`
+    filters it out.
+19. **Overlay tail threshold.** `max(4096, overlay/8)`. Measure it in Phase 1.
+20. **Phase 1 commit latency.** Large polygons are parsed in the commit path, and a
+    1M-vertex insert takes about 100 ms to parse. Is that acceptable, or should literals
+    above 64 KiB be parsed at the first query instead?
 
 ## 12. Sources
 
@@ -1447,15 +1579,15 @@ loses" list updated (QLever's libspatialjoin is likely faster on huge self-joins
     `third-party-licenses.py`).
 * **OGC GeoSPARQL 1.1**, OGC 22-047r1 (https://docs.ogc.org/is/22-047r1/22-047r1.html,
   2024-01-29), and its AsciiDoc source on the `geosparql-1.1` branch of
-  github.com/opengeospatial/ogc-geosparql (no repository license file; the ontologies at
-  http://www.opengis.net/ont/geosparql and …/ont/sf declare the OGC Document License,
-  https://www.ogc.org/license, permissive). **GeoSPARQL 1.0**, OGC 11-052r4
-  (https://docs.ogc.org/is/11-052r4/11-052r4.pdf).
-* **OGC definitions server** (unit IRIs that resolve: metre, degree, radian, unity) and
-  QUDT unit IRIs (http://qudt.org/vocab/unit/).
+  github.com/opengeospatial/ogc-geosparql. The repository has no license file. The
+  ontologies at http://www.opengis.net/ont/geosparql and …/ont/sf declare the permissive
+  OGC Document License (https://www.ogc.org/license).
+* **GeoSPARQL 1.0**, OGC 11-052r4 (https://docs.ogc.org/is/11-052r4/11-052r4.pdf).
+* **OGC definitions server**, where the unit IRIs for metre, degree, radian and unity
+  resolve, and the QUDT unit IRIs (http://qudt.org/vocab/unit/).
 * **RFC 7946** (GeoJSON). Simple Features (OGC 06-103r4 / ISO 19125-1) and ISO 13249-3 are
-  cited from the GeoSPARQL text and general knowledge; their WKT case rule was not
-  re-checked.
+  cited from the GeoSPARQL text and from general knowledge. Their rule on WKT keyword case
+  was not re-checked.
 * **Apache Jena** (Apache-2.0), github.com/apache/jena at
   `b1dcba53b5` (2026-09-28, 6.3.0-SNAPSHOT): `jena-geosparql` (`GeoSPARQLConfig`, `WKTReader`,
   `WKTWriter`, `GeometryWrapper`, `SRSInfo`, `UnitsOfMeasure`, `UnitsRegistry`,
@@ -1473,10 +1605,10 @@ loses" list updated (QLever's libspatialjoin is likely faster on huge self-joins
   `GeoVocabulary.{h,cpp}`, `GeoCellGrid.{h,cpp}`, `SpatialJoin*.{h,cpp}`,
   `spatialJoinAlgorithms/*`, `SpatialQuery.{h,cpp}`, `QueryRewriteUtils.cpp`,
   `SparqlQleverVisitor.cpp`, `UnitOfMeasurement.h`, `RuntimeParameters.h`, `CMakeLists.txt`,
-  tests. Documentation: https://docs.qlever.dev/geosparql/. Ideas only, no code: its
-  geometry dependency `ad-freiburg/spatialjoin` is reported as Apache-2.0 on GitHub, while
-  the license of the `pb_util` library it pulls in could not be verified (one survey
-  recalled GPL-3.0). Nothing from either is used.
+  tests. Documentation: https://docs.qlever.dev/geosparql/. Sparkles takes ideas from
+  QLever but no code. QLever's geometry dependency, `ad-freiburg/spatialjoin`, is listed as
+  Apache-2.0 on GitHub. The license of the `pb_util` library it pulls in could not be
+  verified, and one survey recalled GPL-3.0. Nothing from either library is used.
 * **Oxigraph `spargeo`** (MIT OR Apache-2.0), github.com/oxigraph/oxigraph at `e0f286b0` (2026-09-23):
   `lib/spargeo/src/{lib,parse,units,vocab}.rs`, `Cargo.toml`, `README.md`;
   `testsuite/oxigraph-tests/geosparql/`.
@@ -1489,38 +1621,45 @@ loses" list updated (QLever's libspatialjoin is likely faster on huge self-joins
   (Apache-2.0); `geos` 11.3.1 (MIT; binds LGPL-2.1 libgeos); `geozero` 0.15.1, `wkb` 0.9.2,
   `geo-traits` 0.3.0, `geoarrow` 0.9.0 (MIT OR Apache-2.0); `flatgeobuf` 6.0.1
   (BSD-2-Clause); `h3o` 0.11.0 (BSD-3-Clause); `static_aabb2d_index` 2.1.0 (MIT OR
-  Apache-2.0). `geo` capability facts from its CHANGES.md: `PreparedGeometry` 0.29
-  (moved to `geo::indexed` in 0.32), `Validation` 0.30, `Buffer` 0.31, `Covers` 0.32,
-  `MakeValid` 0.33; geodesic/haversine distance is Point–Point only.
+  Apache-2.0). `geo`'s CHANGES.md gives these capability facts: `PreparedGeometry` arrived
+  in 0.29 and moved to `geo::indexed` in 0.32, `Validation` in 0.30, `Buffer` in 0.31,
+  `Covers` in 0.32 and `MakeValid` in 0.33. Geodesic and haversine distance work between
+  points only.
 * **EPSG Dataset Terms of Use** (https://epsg.org/terms-of-use.html).
 * **Map libraries and data**: Leaflet (BSD-2-Clause, 1.9.4), MapLibre GL JS (BSD-3-Clause,
-  6.11.2), OpenLayers (BSD-2-Clause, 10.10.0); Natural Earth terms of use (public domain);
-  OSM Foundation tile usage policy (https://operations.osmfoundation.org/policies/tiles/).
-* **Test suites**: OGC `ets-geosparql11` (Apache-2.0, template only); GeoSPARQL Compliance
-  Benchmark (github.com/OpenLinkSoftware/GeoSPARQLBenchmark, GPL-2.0-only; README, LICENSE
-  and file layout only).
-* **Papers**: Jovanovik, Homburg, Spasić, "A GeoSPARQL Compliance Benchmark", ISPRS IJGI
-  10(7):487, 2021, doi:10.3390/ijgi10070487 (results table); Bast, Brosi, Kalmbach,
-  "Efficient Spatial Joins on Large Geometry Sets", SIGSPATIAL 2025,
-  doi:10.1145/3748636.3762757, and the 2024 SIGSPATIAL spatial-join paper (abstract only;
-  full text could not be fetched); Karney, "Algorithms for geodesics", J. Geodesy 87:43–55,
-  2013, doi:10.1007/s00190-012-0578-z; Karney, "Transverse Mercator with an accuracy of a
-  few nanometers", J. Geodesy 85:475–485, 2011 (cited from general knowledge); Leutenegger,
-  Lopez, Edgington, "STR", ICDE 1997, doi:10.1109/ICDE.1997.582015; Beckmann et al., "The
-  R*-tree", SIGMOD 1990; Guttman, "R-trees", SIGMOD 1984, Kamel & Faloutsos 1993 (Hilbert
-  packing) and Hjaltason & Samet 1999 (distance browsing), cited from general knowledge;
-  Egenhofer & Franzosa, IJGIS 5(2), 1991, doi:10.1080/02693799108927841; Randell, Cui,
-  Cohn, KR 1992; Clementini, Di Felice, van Oosterom, SSD 1993,
-  doi:10.1007/3-540-56869-7_16.
+  6.11.2) and OpenLayers (BSD-2-Clause, 10.10.0); the Natural Earth terms of use (public
+  domain); the OSM Foundation tile usage policy
+  (https://operations.osmfoundation.org/policies/tiles/).
+* **Test suites**: OGC `ets-geosparql11` (Apache-2.0), of which only a template exists.
+  The GeoSPARQL Compliance Benchmark (github.com/OpenLinkSoftware/GeoSPARQLBenchmark,
+  GPL-2.0-only), of which only the README, LICENSE and file layout were read.
+* **Papers**:
+  * Jovanovik, Homburg, Spasić, "A GeoSPARQL Compliance Benchmark", ISPRS IJGI 10(7):487,
+    2021, doi:10.3390/ijgi10070487, for its results table.
+  * Bast, Brosi, Kalmbach, "Efficient Spatial Joins on Large Geometry Sets", SIGSPATIAL
+    2025, doi:10.1145/3748636.3762757. Also the 2024 SIGSPATIAL spatial-join paper, of
+    which only the abstract was read, because the full text could not be fetched.
+  * Karney, "Algorithms for geodesics", J. Geodesy 87:43–55, 2013,
+    doi:10.1007/s00190-012-0578-z.
+  * Karney, "Transverse Mercator with an accuracy of a few nanometers", J. Geodesy
+    85:475–485, 2011, cited from general knowledge.
+  * Leutenegger, Lopez, Edgington, "STR", ICDE 1997, doi:10.1109/ICDE.1997.582015.
+  * Beckmann et al., "The R*-tree", SIGMOD 1990.
+  * Guttman, "R-trees", SIGMOD 1984; Kamel and Faloutsos 1993 (Hilbert packing); and
+    Hjaltason and Samet 1999 (distance browsing), all cited from general knowledge.
+  * Egenhofer and Franzosa, IJGIS 5(2), 1991, doi:10.1080/02693799108927841.
+  * Randell, Cui, Cohn, KR 1992.
+  * Clementini, Di Felice, van Oosterom, SSD 1993, doi:10.1007/3-540-56869-7_16.
 * **Not consulted**: Fluree. No Fluree repository, source, tests, documentation, website
-  or other material was opened or used for this spec. No GPL or LGPL source code was read
-  (the GeoSPARQL benchmark was looked at only for its license, size and layout; GEOS and
-  QLever's `pb_util` not at all).
+  or other material was opened or used for this spec. No GPL or LGPL source code was
+  read. The GeoSPARQL benchmark was looked at only for its license, size and layout, and
+  GEOS and QLever's `pb_util` were not looked at at all.
 
 ## 13. Provenance entry (for `PROVENANCE.md`)
 
-The entry as drafted with the spec, before implementation. The current entry, with the
-dependencies that actually shipped, is in [PROVENANCE.md](PROVENANCE.md#geosparql).
+This is the entry as drafted with the spec, before implementation.
+[PROVENANCE.md](PROVENANCE.md#geosparql) has the current entry, with the dependencies
+that actually shipped.
 
 ```markdown
 ## GeoSPARQL
@@ -1564,42 +1703,55 @@ dependencies that actually shipped, is in [PROVENANCE.md](PROVENANCE.md#geosparq
 
 ## Outcome
 
-**Delivered.** Phases 1 and 2 landed on 2026-10-01 (dependencies in
-[PROVENANCE.md](PROVENANCE.md#geosparql)); Phase 3 (GML/KML, a `proj4rs` CRS backend,
-variable `spatial:` arguments, cell prefilters) is not started.
+**Delivered.** Phases 1 and 2 landed on 2026-10-01.
+[PROVENANCE.md](PROVENANCE.md#geosparql) lists the dependencies. Phase 3 has not started.
+It covers GML and KML, a `proj4rs` CRS backend, variable `spatial:` arguments and cell
+prefilters.
 
-**Decided by the maintainer:** geodesic WGS 84 measures by default, haversine per dataset
-(§11 q2); the index opt-in per dataset (q1); no EPSG data shipped (q16); MapLibre with a
-bundled Natural Earth basemap (q13); the GPL-2.0 Compliance Benchmark only fetched at test
-time, behind `SPARKLES_ALLOW_GPL_BENCHMARK=1`, never vendored (q12). Against q17, Query
-Rewrite is off by default (`"queryRewrite": true` per dataset; `serve --no-geo-rewrite`
-remains a server-wide switch), so enabling an index never changes what an existing query
-means. After Phase 1: two empty geometries are never `sfEquals`; an empty geometry is
-only disjoint, matching Jena, whose filter functions return false whenever a side is empty.
+**Decided by the maintainer.**
+* Measures are geodesic on WGS 84 by default, with haversine as a per-dataset option
+  (§11 q2).
+* The index is opt-in per dataset (q1).
+* No EPSG data ships (q16).
+* The map uses MapLibre with a bundled Natural Earth basemap (q13).
+* The GPL-2.0 Compliance Benchmark is only fetched at test time, behind
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1`, and never vendored (q12).
+* Query Rewrite is off by default, against the default proposed in q17. A dataset turns it
+  on with `"queryRewrite": true`, and `serve --no-geo-rewrite` remains a server-wide
+  switch. Enabling an index therefore never changes what an existing query means.
+* After Phase 1, two empty geometries are never `sfEquals`, and an empty geometry is only
+  disjoint. This matches Jena, whose filter functions return false whenever a side is
+  empty.
 
 **Deviations.**
-* Sparkles' own WKT and GeoJSON readers and writers replace the `wkt` and `geojson` crates
-  (both dropped): errors need byte offsets, and GeoSPARQL literals use `LINEARRING`,
+* Sparkles has its own WKT and GeoJSON readers and writers, and the `wkt` and `geojson`
+  crates were dropped. Errors need byte offsets, and GeoSPARQL literals use `LINEARRING`,
   `TRIANGLE`, `TIN`, `POLYHEDRALSURFACE`, untagged 3D positions and a CRS IRI prefix.
   Constructed geometries are 2D.
-* Metric buffers project with an ellipsoidal, not spherical, AEQD (§4.4.3). A constructed
-  literal over the memory budget is a type error, not `507`.
+* Metric buffers project with an ellipsoidal AEQD, not a spherical one (§4.4.3). A
+  constructed literal over the memory budget is a type error, not `507`.
 * Index files are keyed by a hash of the settings that change what is indexed, not of the
-  whole `geo.json` (§5.5), so changing `distance` or `queryRewrite` keeps them. `?at=`
-  snapshots run without the index (by scanning) instead of building a base on demand (§4.6).
-* Chosen during implementation (open to revision): `concaveHull`'s percentage maps
-  linearly to the concavity and `aggConcaveHull` takes one argument (a SPARQL aggregate
-  takes one expression); `spatial:equals` is always available; the `--vocab geosparql`
-  axioms are written from the standard and land in the inferred graph; `GET /{ds}/geo`
-  scans when the index is not ready; `POST /$/geo/convert` is open to any caller.
+  whole `geo.json` (§5.5). Changing `distance` or `queryRewrite` therefore keeps them.
+  `?at=` snapshots run without the index, by scanning, instead of building a base on
+  demand (§4.6).
+* Some choices were made during implementation and are open to revision:
+  * `concaveHull`'s percentage maps linearly to the concavity.
+  * `aggConcaveHull` takes one argument, because a SPARQL aggregate takes one expression.
+  * `spatial:equals` is always available.
+  * The `--vocab geosparql` axioms are written from the standard and land in the inferred
+    graph.
+  * `GET /{ds}/geo` scans when the index is not ready.
+  * `POST /$/geo/convert` is open to any caller.
 
-**Conformance.** The §7 examples and seeded index-versus-plain-plan comparisons run as
-tests; W3C and SHACL results were unchanged. Oxigraph's GeoSPARQL suite: 37 of 44, the
-other 7 listed with reasons in `testsuite/geosparql/oxigraph/expected-failures.txt`. The
-[Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark) on the Phase 1
-build: 74 of 206, and 72 of the 77 WKT queries without entailment or rewrite (the misses:
-the two empty-equality queries, decided above, and three distance, metre-buffer and
-benchmark-error cases); it was not re-run after Phase 2.
+**Conformance.** The §7 examples and seeded comparisons of the index plan against the plain
+plan run as tests. The W3C and SHACL results did not change. Sparkles passes 37 of the 44
+cases in Oxigraph's GeoSPARQL suite. The other 7 are listed with reasons in
+`testsuite/geosparql/oxigraph/expected-failures.txt`. On the Phase 1 build, the
+[Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark) scored 74 of 206.
+That includes 72 of the 77 WKT queries that need no entailment or rewrite. Two of the five
+misses are the empty-equality queries decided above. The other three are a distance case,
+a metre-buffer case and a benchmark error. The benchmark was not re-run after Phase 2.
 
-**Performance.** No measurable commit latency from the index ([commit
-cost](../BENCHMARKS.md#spatial-index-commit-cost)); the §9 query targets are not yet measured.
+**Performance.** The index adds no measurable commit latency ([commit
+cost](../BENCHMARKS.md#spatial-index-commit-cost)). The §9 query targets have not been
+measured yet.

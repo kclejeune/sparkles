@@ -2,27 +2,30 @@
 
 > **Status:** implemented in part (Phases 1 and 2; Phase 3 in part)
 >
-> **Phases:** Phase 1 (the `sparkles-shex` crate: ShExC and ShExJ, imports, shape maps,
-> stratified typing, `POST /{ds}/shex`, `sparkles shex validate|parse`, the shexTest
-> harness, `bench:shex`); Phase 2 (write-time ShEx validation with `validation.json`
-> format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx switch,
-> `bench:shex-write`); from Phase 3, the MCP tools `validate_shacl` and `validate_shex`
-> and the interval matcher (which became the Phase 1 matcher).
+> **Phases:** Phase 1 is the `sparkles-shex` crate with ShExC and ShExJ, imports, shape
+> maps and stratified typing, plus `POST /{ds}/shex`, `sparkles shex validate|parse`, the
+> shexTest harness and `bench:shex`. Phase 2 is write-time ShEx validation with
+> `validation.json` format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx
+> switch and `bench:shex-write`. Two Phase 3 items are also built: the MCP tools
+> `validate_shacl` and `validate_shex`, and the interval matcher, which became the Phase 1
+> matcher.
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: MCP server](../API.md#mcp-server) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
-> This is the design as written before implementation; the [Outcome](#outcome) section at
+> This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
 
-This is a clean-room spec. It depends on the store snapshot API (`Snapshot::scan`,
-`count`, `lookup_term`, `term`), the SHACL validator's data-graph selection
-(`crates/sparkles-shacl/src/data.rs`), and, for Phase 2, the write guard
-(`crates/sparkles/src/guard.rs`, `CommitGuard`) of
-[C10](C10-write-time-validation.md). It closes the README gap
-"Shape languages | ShEx (jena-shex) | ✗ SHACL only" and removes ShEx from the
-[AUDIT §5](../AUDIT.md#5-explicit-non-goals-for-v1) non-goals.
+This is a clean-room spec. It depends on three parts of Sparkles:
+
+* the store snapshot API (`Snapshot::scan`, `count`, `lookup_term`, `term`);
+* the data-graph selection of the SHACL validator (`crates/sparkles-shacl/src/data.rs`);
+* for Phase 2, the write guard of [C10](C10-write-time-validation.md)
+  (`crates/sparkles/src/guard.rs`, `CommitGuard`).
+
+It closes the README gap "Shape languages | ShEx (jena-shex) | ✗ SHACL only" and removes
+ShEx from the non-goals in [AUDIT §5](../AUDIT.md#5-explicit-non-goals-for-v1).
 
 ## 1. Summary, goals, non-goals
 
@@ -54,8 +57,9 @@ stacks. The feature provides:
   matcher is polynomial for the common deterministic shapes, and the ambiguous cases run
   under an explicit work budget.
 * **Performance.** Within 2× of the SHACL benchmark on the same data (§9).
-* **Jena-compatible surface** where Jena has one: CLI command names and flags, compact
-  shape-map syntax, and a Jena-like text report.
+* **Jena compatibility.** Where Jena has an equivalent, Sparkles matches it. That covers
+  the CLI command names and flags, the compact shape-map syntax and a Jena-like text
+  report.
 
 **Non-goals**
 
@@ -66,10 +70,10 @@ stacks. The feature provides:
   JavaScript, SPARQL-generating or "Map" actions.
 * **Repair and suggestion features**, such as shexTest's `validation-contrib`.
 * **ShEx-to-SHACL translation** in either direction.
-* **ShExR** (schemas as RDF) is deferred to Phase 2. A ShEx RDF result vocabulary is
-  out of scope, because none is standardized.
-* **Incremental write-time validation.** Phase 3; until then the guard validates in
-  full, like C10 Phase 1.
+* **ShExR in Phase 1.** Schemas as RDF wait for Phase 2. A ShEx result vocabulary in RDF
+  is out of scope, because none is standardized.
+* **Incremental write-time validation.** This waits for Phase 3. Until then the guard
+  validates in full, like C10 Phase 1.
 
 ## 2. User-visible behavior
 
@@ -78,26 +82,26 @@ stacks. The feature provides:
 | Syntax | Media type (in / out) | Extension | Phase |
 |---|---|---|---|
 | ShExC (compact) | `text/shex` | `.shex` | 1 |
-| ShExJ (JSON-LD, context `http://www.w3.org/ns/shex.jsonld`) | `application/shex+json` (unregistered, Open question 9), or `application/json` / `application/ld+json` when the object has `"type": "Schema"` | `.json`, `.shexj` | 1 |
+| ShExJ (JSON-LD, context `http://www.w3.org/ns/shex.jsonld`) | `application/shex+json`, which is unregistered (Open question 9). Also `application/json` or `application/ld+json` when the object has `"type": "Schema"`. | `.json`, `.shexj` | 1 |
 | ShExR (RDF, ShEx vocabulary `http://www.w3.org/ns/shex#`) | any RDF syntax Sparkles reads | `.ttl` … | 2 |
 
 The ShEx 2.1 specification registers only `text/shex` (IANA section). Jena registers no
-`Lang` for ShEx, so there is nothing to be compatible with, and Sparkles picks the media
-types above.
+`Lang` for ShEx, so Sparkles has nothing to match and chooses the media types above.
 
-A schema is parsed into one AST, which mirrors ShExJ (§6.1). That makes ShExC → ShExJ →
-ShExC round trips lossless, including annotations and semantic actions (the comments
-are not kept). Schema text is UTF-8. Relative IRIs resolve against `BASE`, then against
-the schema's location (a file path, or the request's `base` parameter).
+Every syntax parses into one AST that mirrors ShExJ (§6.1). ShExC → ShExJ → ShExC round
+trips therefore keep everything, annotations and semantic actions included, except
+comments. Schema text is UTF-8. Relative IRIs resolve against `BASE` first, then against
+the schema's location: a file path, or the request's `base` parameter.
 
 ### 2.2 Shape maps
 
 A **shape association** pairs a node selector with a shape label. A **shape map** is a
-list of associations. The forms follow the ShapeMap draft (shex.io/shape-map, 2017):
+list of associations. Sparkles uses the forms of the 2017 ShapeMap draft
+(shex.io/shape-map):
 
 | Kind | Node selector | Use |
 |---|---|---|
-| query map (input) | an RDF term; `{FOCUS p o}`, `{FOCUS p _}`, `{s p FOCUS}` or `{_ p FOCUS}`; Phase 2: `SPARQL """SELECT ?focus …"""` (an extension, §4.7) | what to validate |
+| query map (input) | An RDF term, or one of the patterns `{FOCUS p o}`, `{FOCUS p _}`, `{s p FOCUS}` and `{_ p FOCUS}`. Phase 2 adds `SPARQL """SELECT ?focus …"""`, an extension (§4.7). | what to validate |
 | fixed map | an RDF term | the query map after expansion |
 | result map | an RDF term, plus `status` (`conformant` \| `nonconformant`), `reason`, `appinfo` | the answer |
 
@@ -110,8 +114,8 @@ The shape label is an IRI, a prefixed name, or `START` (`@START` or `@start`).
 * an optional trailing `.`;
 * `a` for `rdf:type`.
 
-Associations follow the prefixes and base given by the directives. When there are no
-directives, prefixed names use the schema's prefixes.
+Associations use the prefixes and base that the directives declare. Without directives,
+prefixed names use the schema's prefixes.
 
 ```
 PREFIX ex: <http://example.org/>
@@ -136,9 +140,9 @@ warning.
 
 ### 2.3 HTTP: `POST /{ds}/shex`
 
-Fuseki has no ShEx operation: `jena-fuseki2` neither mentions ShEx nor depends on
-`jena-shex`. This endpoint is therefore a Sparkles extension, modeled on Fuseki's
-`/{ds}/shacl` as implemented in `http.rs` `shacl()`.
+Fuseki has no ShEx operation. `jena-fuseki2` neither mentions ShEx nor depends on
+`jena-shex`, so this endpoint is a Sparkles extension. It is modeled on Fuseki's
+`/{ds}/shacl`, as Sparkles implements it in `shacl()` in `http.rs`.
 
 **Request.** Two equivalent forms:
 
@@ -170,9 +174,9 @@ Query parameters, the same as `/{ds}/shacl` where they overlap:
 
 **Responses.**
 
-* `200` whether or not the data conforms, with the report of §2.4 and
-  `Sparkles-Commit: <head>`. With inferences, it also carries the inference headers of
-  `/{ds}/shacl` (`with_inferences`).
+* `200` whether or not the data conforms. The body is the report of §2.4, and the
+  response carries `Sparkles-Commit: <head>`. When the data graph includes inferences,
+  the response also carries the inference headers of `/{ds}/shacl` (`with_inferences`).
 * `400`:
   * a syntax error in the schema, the shape map or the externs, with `line` and
     `column`;
@@ -183,15 +187,15 @@ Query parameters, the same as `/{ds}/shacl` where they overlap:
 * `404`: a `graph` that does not exist.
 * `408`: timeout.
 * `413`: the body exceeds `--max-query-body-mb`.
-* `507`, with `budget: "result-bytes"`: the report is larger than `--max-result-mb`,
-  using the same rule as `shacl::max_results`.
-* `507`, with `budget: "validation-work"`: a new `BudgetKind` for the partition and
-  typing budgets of §5.9.
+* `507` with `budget: "result-bytes"`: the report is larger than `--max-result-mb`. The
+  rule is the same as in `shacl::max_results`.
+* `507` with `budget: "validation-work"`: the partition or typing budget of §5.9 ran
+  out. This is a new `BudgetKind`.
 * `501`: the server was built without the `shex` feature.
 
-Validations run in the existing half-the-cores pool (`crate::shacl::pool()`, renamed
-`validation_pool()`). They stop at the next check when the client disconnects
-(`cancel_on_drop`).
+Validations run in the existing pool that uses half the cores. Its accessor
+`crate::shacl::pool()` is renamed `validation_pool()`. A validation stops at its next
+check when the client disconnects (`cancel_on_drop`).
 
 ### 2.4 Result format
 
@@ -233,8 +237,8 @@ Other formats:
   `{node, shape, status, reason?, appinfo?}`, with compact-syntax strings for `node` and
   `shape`. This is the interoperable form.
 * **`format=smap`** (`text/plain`). The compact result map, one association per line:
-  `<n>@<S>` for conformant and `<n>@!<S>` for nonconformant. The `@!` form is the
-  convention of other ShEx tools; the published draft grammar has no status syntax.
+  `<n>@<S>` for conformant and `<n>@!<S>` for nonconformant. Other ShEx tools use the
+  `@!` form. The published draft grammar has no syntax for the status.
 * **`format=text`.** Jena's text report:
   * `OK` when everything conforms;
   * otherwise one line per association,
@@ -246,15 +250,15 @@ Other formats:
 follow the store's id order, which is deterministic for a snapshot.
 
 **Mapping onto the SHACL report UI.** The SHACL results table has the columns Focus node,
-Path, Value, Constraint, Severity and Message. The ShEx table uses Node, Shape, Status (a
-badge like the severity badge: `nonconformant` styled as a violation) and Reason, and
-expands a row into its `appinfo.failures`. The guard (§2.7) carries the same result
-objects in `ValidationSummary.results`. Each nonconformant result counts as one
-`violation` in `by_severity`; ShEx has no severities.
+Path, Value, Constraint, Severity and Message. The ShEx table has Node, Shape, Status and
+Reason. Status is a badge like the severity badge, with `nonconformant` styled as a
+violation. Expanding a row shows its `appinfo.failures`. The guard (§2.7) carries the same
+result objects in `ValidationSummary.results`. ShEx has no severities, so each
+nonconformant result counts as one `violation` in `by_severity`.
 
 ### 2.5 CLI
 
-Jena's launcher is `shex <cmd>`:
+Jena's launcher is `shex <cmd>`, with these subcommands:
 
 * `validate`, `val`, `v`;
 * `parse`, `p`, `print`.
@@ -278,20 +282,22 @@ sparkles shex parse FILE… [--out shexc|shexj|text] [--base IRI]
 ```
 
 * `validate` aliases: `val`, `v`. Flag aliases: `--shapes`/`-s`, `--datafile`/`-d`,
-  `--shapesMap`/`-m`, `--target`/`-n`. A `.json` map file is a JSON map; anything else
-  is compact syntax.
+  `--shapesMap`/`-m`, `--target`/`-n`. A map file ending in `.json` is read as a JSON
+  map, and any other file as compact syntax.
 * `--node` without `--shape` validates against `START`. If the schema has no start
-  shape, the error is `"the schema has no start shape; give --shape"` (Jena's wording:
-  "Start node required for URI-validation").
-* **Exit status:** 0 when conformant, 1 when any association is nonconformant (as
-  `sparkles shacl` and Jena do), 2 for usage, parse or structure errors.
+  shape, the error is `"the schema has no start shape; give --shape"`. Jena says
+  "Start node required for URI-validation".
+* **Exit status.** 0 when everything conforms and 1 when any association is
+  nonconformant, as in `sparkles shacl` and Jena. Usage, parse and structure errors exit
+  2.
 * `parse`:
   * `--out shexc` (the default) pretty-prints ShExC;
   * `--out shexj` prints ShExJ;
   * `--out text` prints a structural dump, like Jena's default `text`.
 
-  Jena's `parse` cannot print JSON (`shex_parse` has no ShExJ writer). This command can.
-  Several files are concatenated with `# file` headers, as Jena does.
+  Jena's `parse` cannot print JSON, because `shex_parse` has no ShExJ writer. This
+  command can. Several files are printed one after another under `# file` headers, as in
+  Jena.
 * Imports in local files resolve against the schema file's directory (§4.2).
   `--data FILE…` loads the files into an in-memory store, like `sparkles shacl`.
 
@@ -346,9 +352,10 @@ listed in the README's Jena→Sparkles table.
 
 ### 2.7 Write-time validation with ShEx (Phase 2)
 
-The [C10](C10-write-time-validation.md) guard is reused. A dataset uses one language at a time (Open question 7).
-`validation.json` becomes format 2, which adds `language`. A format 1 file is
-`"language": "shacl"` and keeps working unchanged:
+Write-time validation reuses the [C10](C10-write-time-validation.md) guard. A dataset
+uses one language at a time (Open question 7). `validation.json` moves to format 2, which
+adds a `language` field. A format 1 file reads as `"language": "shacl"` and keeps working
+unchanged:
 
 ```json
 { "format": 2, "language": "shex", "mode": "reject",
@@ -360,20 +367,20 @@ The [C10](C10-write-time-validation.md) guard is reused. A dataset uses one lang
 
 | field | meaning |
 |---|---|
-| `schema` | Copied into `<db>/validation-schema.shex` (or `.json`) when the config is set. As in C10 §9, a referenced path could change without the data being revalidated. Imports are resolved at set time and inlined into the copied ShExJ, so a later write never fetches anything. ShExR schemas in named graphs (`{"graphs": [iri…]}`, read from the post-state like SHACL shapes graphs) come in Phase 3. |
+| `schema` | Copied into `<db>/validation-schema.shex` (or `.json`) when the config is set. The copy exists for the reason in C10 §9: a file at a referenced path could change without the data being revalidated. Imports are resolved at set time and inlined into the copied ShExJ, so a later write never fetches anything. Phase 3 adds ShExR schemas in named graphs (`{"graphs": [iri…]}`), read from the post-state like SHACL shapes graphs. |
 | `shapeMap` | A query map, re-expanded on every validated post-state, so new focus nodes are picked up. A fixed map is allowed but rarely useful. |
 | `threshold` | Not accepted: every nonconformant association blocks. |
 | others | As C10 §2.1. |
 
 Behavior:
 
-* **Semantics.** Validation of the post-state, the `reject`/`warn` decision, the enable
-  precondition (`409` when the head does not conform), bypass, timeouts and the skip for
-  writes that touch no validated graph are as in C10 §§4.1–4.6.
-* **Rejection.** `422`, with `validation.results` holding ShEx result objects (§2.4)
-  limited to nonconformant ones. `blocking` is the nonconformant count, and `total` is
-  the number of associations. There is no Turtle report: a request whose `Accept` lists
-  `text/turtle` still gets JSON. The header adds `lang=shex`:
+* **Semantics.** The guard behaves as in C10 §§4.1–4.6. That covers validation of the
+  post-state, the `reject`/`warn` decision, the enable precondition (`409` when the head
+  does not conform), bypass, timeouts, and skipping writes that touch no validated graph.
+* **Rejection.** A rejected write gets `422`. `validation.results` holds the
+  nonconformant ShEx result objects (§2.4). `blocking` is the nonconformant count, and
+  `total` is the number of associations. There is no Turtle report, so a request whose
+  `Accept` lists `text/turtle` still gets JSON. The header gains `lang=shex`:
   `Sparkles-Validation: status=rejected, mode=reject, strategy=full, lang=shex, blocking=3, …`.
 * **Fail closed.** The `GuardMissing` rule covers a binary built without `shex` that opens
   a ShEx-validated database.
@@ -384,8 +391,8 @@ Behavior:
 
 ### 2.8 UI
 
-Phase 2 changes the dataset page's *Validate (SHACL)* panel into *Validate* with a
-**SHACL | ShEx** switch. The ShEx side has:
+In Phase 2 the dataset page's *Validate (SHACL)* panel becomes *Validate*, with a
+SHACL | ShEx switch. The ShEx side has:
 
 * a schema text area, with a default example schema built from the dataset's top classes
   (`/$/schema/{ds}`);
@@ -393,10 +400,10 @@ Phase 2 changes the dataset page's *Validate (SHACL)* panel into *Validate* with
 * the same graph and inference controls;
 * *Validate* and *Download* buttons. Download fetches `format=shapemap` JSON.
 
-The results table follows §2.4: Node links to Explore, as the SHACL focus column does.
-The schema and map persist in `localStorage`, like `sparkles.shacl.{name}`. `api.ts` gains
-`shex()` / `shexRaw()` and the `ShexReport` type. The write-time validation panel, where
-the UI has one, shows the language.
+The results table follows §2.4. Its Node column links to Explore, as the SHACL focus
+column does. The schema and map persist in `localStorage`, like `sparkles.shacl.{name}`.
+`api.ts` gains `shex()`, `shexRaw()` and the `ShexReport` type. Where the UI has a
+write-time validation panel, it shows the language.
 
 ### 2.9 Routing, auth, limits, metrics
 
@@ -404,9 +411,10 @@ the UI has one, shows the language.
   * the route table gains `("/{ds}/shex", &["POST"])`;
   * `need()` maps it to `Dataset(Read)`, like `/{ds}/shacl`;
   * `/$/validation/{ds}` is unchanged.
-* `ratelimit.rs`: the query class, with `/{ds}/shacl`.
-* `obs.rs`: `Op::Shex` (`"shex"`). Requests are counted in `sparkles_requests_total`.
-  `sparkles_validation_*` gains a `language` label (`shacl` \| `shex`).
+* `ratelimit.rs` puts the route in the query class, with `/{ds}/shacl`.
+* `obs.rs` adds `Op::Shex` (`"shex"`), so requests are counted in
+  `sparkles_requests_total`. The `sparkles_validation_*` series gain a `language` label
+  (`shacl` \| `shex`).
 * `DatasetInfo.endpoints` gains `shex` when the feature is built.
 * The access log, timeouts, `--max-query-body-mb` and `--max-result-mb` apply as for
   `/{ds}/shacl`.
@@ -422,18 +430,21 @@ the UI has one, shows the language.
     (SCCs) of the dependency graph.
   * Each stratum's typing is the union of all correct typings that agree with the lower
     strata. That is a greatest fixed point per stratum, and §4.5 implements it.
-* **§5.3.2.** `satisfies` for NodeConstraint, Shape (membership in the typing),
+* **§5.3.2** defines `satisfies` for NodeConstraint, Shape (membership in the typing),
   ShapeOr/And/Not, ShapeExternal ("implementation-specific mechanisms") and references.
-* **§5.4 Node constraints.** Node kinds, datatypes (lexical validity), string facets on
-  the lexical form, IRI string or blank-node label (lengths in code points; `pattern`
-  as XPath `fn:matches` with flags), numeric facets on SPARQL numeric types with type
-  promotion, and value sets (§5.4.6: objectValue, Language, IriStem, IriStemRange,
-  LiteralStem, LiteralStemRange, LanguageStem, LanguageStemRange, and wildcard ranges
-  with exclusions; stems compare with `fn:starts-with`, language stems with RFC 4647
-  basic filtering).
-* **§5.5.2.** `matchesShape` via a partition of `neigh(G, n)` into *matched* and
-  *remainder*, and `matches` for EachOf, OneOf, TripleConstraint and cardinalities ("a
-  max of -1 is treated as unbounded"); EXTRA and CLOSED.
+* **§5.4 Node constraints.**
+  * Node kinds, and datatypes with lexical validity.
+  * String facets on the lexical form, the IRI string or the blank-node label. Lengths
+    are in code points, and `pattern` is XPath `fn:matches` with flags.
+  * Numeric facets on SPARQL numeric types, with type promotion.
+  * Value sets (§5.4.6): objectValue, Language, IriStem, IriStemRange, LiteralStem,
+    LiteralStemRange, LanguageStem, LanguageStemRange, and wildcard ranges with
+    exclusions. Stems compare with `fn:starts-with`, and language stems with RFC 4647
+    basic filtering.
+* **§5.5.2** defines `matchesShape` through a partition of `neigh(G, n)` into *matched*
+  and *remainder*. It also defines `matches` for EachOf, OneOf, TripleConstraint and
+  cardinalities ("a max of -1 is treated as unbounded"), and the meaning of EXTRA and
+  CLOSED.
 * **§5.6 Import.** Labels of imported schemas are in scope transitively. Circular and
   redundant imports collapse, and an import's `start` is ignored.
 * **§5.7 Requirements.**
@@ -460,12 +471,12 @@ the UI has one, shows the language.
 | # | 2.1 text | Sparkles follows | why |
 |---|---|---|---|
 | R1 | `matchables` = remainder ∩ **arcsOut** with a mentioned predicate. An unmatched incoming arc is then always allowed. | **Direction-symmetric.** An incoming arc in the remainder whose predicate appears in an *inverse* triple constraint is a matchable, so it must not match, and its predicate must be in `extra`. | shexTest `1inversedotRef1_fail` ("two incoming `<p1>` for a {1,1} inverse") and `1inversedotCard2_fail` require it. Open question 1. |
-| R2 | "minlength: v >= len", "maxlength: v <= len", "totaldigits: v is less than or equals the number of digits" | the intended direction: `len ≥ minlength`, `len ≤ maxlength`, `digits ≤ totaldigits` | The spec's own examples, and the suite. A known erratum. |
-| R3 | ShapeExternal: implementation-defined | an error when no definition is supplied (§4.6) | Jena treats EXTERNAL as always true, which silently accepts. Open question 2. |
+| R2 | "minlength: v >= len", "maxlength: v <= len", "totaldigits: v is less than or equals the number of digits" | the intended direction: `len ≥ minlength`, `len ≤ maxlength`, `digits ≤ totaldigits` | The spec's own examples and the suite use this direction. It is a known erratum. |
+| R3 | ShapeExternal: implementation-defined | an error when no definition is supplied (§4.6) | Jena treats EXTERNAL as always true, so it accepts data without saying so. Open question 2. |
 
 ### 3.3 Apache Jena `jena-shex` (Apache-2.0), and where Sparkles differs
 
-Jena's module (checkout `b1dcba53b5`) is the compatibility reference for the surface:
+Jena's module (checkout `b1dcba53b5`) is the compatibility reference for what users see:
 
 * the CLI (§2.5);
 * the compact shape-map syntax with BASE/PREFIX, optional commas and a trailing `.`;
@@ -473,8 +484,7 @@ Jena's module (checkout `b1dcba53b5`) is the compatibility reference for the sur
 * the text report;
 * the semantic-action plug-in model, in which unknown action IRIs are ignored.
 
-Sparkles deliberately differs from Jena in these places, because Jena does not follow the
-spec there:
+Sparkles differs from Jena on purpose where Jena does not follow the spec:
 
 | Jena behaviour (file) | Sparkles |
 |---|---|
@@ -500,14 +510,15 @@ These checks produce `SchemaError`, mapped to HTTP `400` and CLI exit 2:
 * **S2.** No shape label reaches itself through `ShapeAnd`/`ShapeOr`/`ShapeNot`/reference
   edges alone, that is, without passing through a `Shape` (§5.7.2). Likewise no triple
   expression includes itself (§5.7.3).
-* **S3.** An `&include` names a triple expression; a node constraint does not qualify.
-  This is negativeStructure `includeNonSimpleShape`.
-* **S4.** **Negation requirement** (§5.7.4). Build the label dependency graph: an edge
-  s1 → s2 for every reference from s1's expression to s2, marked negative when it is
-  under an odd number of `NOT`, or when it is a triple constraint's value reference
-  whose predicate is in the enclosing shape's `extra`. Compute SCCs (Tarjan). Any SCC
-  that contains a negative edge is an error. The error names the cycle, e.g.
-  `negated reference cycle: :S -[EXTRA :a]-> :S` (negativeStructure `Cycle2Extra`).
+* **S3.** An `&include` names a triple expression. A node constraint does not qualify
+  (negativeStructure `includeNonSimpleShape`).
+* **S4. Negation requirement** (§5.7.4). The label dependency graph has an edge s1 → s2
+  for every reference from s1's expression to s2. An edge is negative when it is under an
+  odd number of `NOT`, or when it is a triple constraint's value reference whose
+  predicate is in the enclosing shape's `extra`. Tarjan's algorithm computes the SCCs,
+  and an SCC that contains a negative edge is an error. The error names the cycle, for
+  example `negated reference cycle: :S -[EXTRA :a]-> :S` (negativeStructure
+  `Cycle2Extra`).
 * **S5.** Labels are unique across the schema and its imports. Overlapping labels are an
   error (§5.6).
 * **S6.** The 2.1 `STRICT` rules Jena applies are kept, because negativeSyntax tests
@@ -517,14 +528,14 @@ These checks produce `SchemaError`, mapped to HTTP `400` and CLI exit 2:
   * an unknown datatype with a numeric facet;
   * `MININCLUSIVE` and similar with a literal that is not numeric.
 
-The SCCs from S4 also give the **strata** used by §4.5. Each stratum is assigned bottom
-up (stratum(s2) < stratum(s1) for an edge across SCCs).
+The SCCs from S4 also give the **strata** that §4.5 uses. Strata are numbered bottom up:
+an edge s1 → s2 across SCCs has stratum(s2) < stratum(s1).
 
 ### 4.2 Imports
 
 * `IMPORT <iri>` is resolved by a `Resolver`, in this order:
-  1. inline bodies supplied with the request (`imports` in the JSON envelope; the test
-     harness);
+  1. inline bodies supplied with the request (`imports` in the JSON envelope), which the
+     test harness uses;
   2. **files**:
      * the CLI resolves the IRI as a path relative to the importing schema;
      * the server allows `file:` IRIs only under `--load-dir`, reusing `FileLoads`, the
@@ -532,8 +543,8 @@ up (stratum(s2) < stratum(s1) for an edge across SCCs).
   3. **http(s)**, through the server's `OutboundPolicy` (the `--outbound-*` flags, timeout
      and size limits of SPARQL `LOAD`). There is no network access in tests.
 
-  If the exact IRI does not resolve, `.shex` and then `.json` are appended. shexTest
-  imports name schemas without an extension.
+  If the exact IRI does not resolve, the resolver appends `.shex` and then `.json`,
+  because shexTest imports name schemas without an extension.
 * The import closure is followed transitively. Each IRI is fetched once, and cycles
   terminate. The `start` of imported schemas is ignored.
 * Overlapping labels are an error (S5). So is an imported schema with `startActs`. The
@@ -593,9 +604,9 @@ Node constraints are evaluated on store ids (§5.4):
    is ∅.
 2. **Matchables** (reading R1) are the remainder arcs (s, p, o) whose (p, direction)
    appears in some triple constraint of the expression. Every matchable has
-   `p ∈ S.extra`, and no matchable *matches* a triple constraint of the expression:
-   that is, its predicate and direction are equal and its value satisfies the
-   constraint's `valueExpr` under the typing m.
+   `p ∈ S.extra`, and no matchable *matches* a triple constraint of the expression. An
+   arc matches a triple constraint when the predicate and direction are the same and the
+   arc's value satisfies the constraint's `valueExpr` under the typing m.
 3. If `S.closed`, every remainder arc that is outgoing and not a matchable is forbidden.
    Incoming arcs are never constrained by `CLOSED`.
 
@@ -631,8 +642,8 @@ Node constraints are evaluated on store ids (§5.4):
   * Within one stratum every reference is positive, so `satisfies` is monotone in the
     stratum's own pairs. The stratum's typing is the **greatest fixed point**: every
     pair starts `true`, and pairs that fail are removed until nothing changes (§5.6).
-  * Pairs of lower strata are final before any pair that reads them is evaluated. This is
-    how `NOT` and EXTRA references are always evaluated against final values.
+  * Pairs of lower strata are final before any pair that reads them is evaluated, so
+    `NOT` and EXTRA references always read final values.
 * **Restriction.** Restricting to reachable pairs is exact: a pair's value depends only
   on the pairs it can reach through references.
 
@@ -640,13 +651,13 @@ Node constraints are evaluated on store ids (§5.4):
 
 * **Semantic actions** are parsed, kept in the AST and round-tripped. They are executed
   through a `SemActHandler` registry keyed by extension IRI:
-  * **`http://shex.io/extensions/Test/`** is built in and enabled by default. It is pure:
-    `fail("msg")` fails the expression it is attached to (or the validation, for start
-    actions), and `print(s|p|o|"lit")` appends to `appinfo.prints` when `semact-trace`
-    is set. Open question 3.
-  * **Any other extension IRI is ignored** (success). This matches Jena's plug-in
-    behaviour and the "implementation-dependent" wording of §5.8.1. The report carries
-    one warning per unknown IRI:
+  * **`http://shex.io/extensions/Test/`** is built in and enabled by default (Open
+    question 3). It has no side effects. `fail("msg")` fails the expression it is
+    attached to, or the whole validation for a start action. `print(s|p|o|"lit")`
+    appends to `appinfo.prints` when `semact-trace` is set.
+  * **Any other extension IRI is ignored**, and its actions count as successes. This
+    matches Jena's plug-in behaviour and the "implementation-dependent" wording of
+    §5.8.1. The report carries one warning per unknown IRI:
     `"N semantic actions with extension <iri> were not run"`.
   * Placement:
     * start actions (`startActs`) run once per validation;
@@ -672,12 +683,12 @@ Node constraints are evaluated on store ids (§5.4):
 * `{FOCUS p o}` selects the subjects of (?, p, o) with a `POS` prefix scan. `{FOCUS p _}`
   selects the distinct subjects of p (`PSO`). `{s p FOCUS}` and `{_ p FOCUS}` are
   symmetric (`SPO` / `POS`). All of these scans are restricted to the data graph.
-* `a` means `rdf:type`. There is no RDFS reasoning; with `reasoning=true`, materialized
+* `a` means `rdf:type`. There is no RDFS reasoning. With `reasoning=true`, materialized
   `rdf:type` inferences are part of the data graph.
 * **Phase 2:** `SPARQL """query"""` runs a SELECT on the same snapshot and data graph,
   with the request's query budgets. The focus nodes are the bindings of `?focus`, or of
-  the first projected variable. It is an extension from other ShEx tools, not part of the
-  ShapeMap draft.
+  the first projected variable. This selector comes from other ShEx tools and is not part
+  of the ShapeMap draft.
 * The fixed map is the union of the expansions, deduplicated per (node, label) and kept
   in first-seen order. Its size counts against `max_results`.
 
@@ -741,8 +752,8 @@ results for F's pairs; reasons for nonconformant ones (explain mode, §5.8)
   arcs.
 * **Node constraints** are compiled per snapshot (`NcPlan`):
   * kind and datatype become tag tests (§5.4);
-  * IRI and literal value sets become `FxHashSet<Id>` of resolved ids; values absent from
-    the store can never match and are dropped;
+  * IRI and literal value sets become `FxHashSet<Id>` of resolved ids. Values absent
+    from the store can never match, so they are dropped;
   * IRI stems become a base-vocabulary id range plus a string test for `Delta` ids
     (§5.4);
   * facets keep their parsed bounds.
@@ -812,7 +823,9 @@ covers almost every real schema.
 
 **Step 3: deterministic shapes.** `cand(a)` is still a singleton, so the bag
 `c: TcIdx → count` is fixed. Membership of c in the expression is decided by
-**bag derivatives** (Labra Gayo et al. 2015):
+**bag derivatives** (Labra Gayo et al. 2015). The implementation decides it with
+iteration-count intervals instead; see the
+[implementation note](#implementation-note-2026-10-01-matcher-algorithm) and the Outcome.
 
 * `∂_{tc}^k(e)` derives by symbol tc taken k times at once, so the cost does not grow
   with arc counts. For example `∂_a^k(a{m,n}) = a{max(m−k,0), n−k}`, and the derivative
@@ -826,9 +839,9 @@ covers almost every real schema.
 * The bag matches iff the final expression is nullable.
 
 Because the expression is single-occurrence and simplification drops ∅ branches, the
-derivative stays O(|e|) in size. A later optimization (Phase 3, measurement-gated) may
-use the interval algorithm of Staworko et al. (2015, Thm 5) for deterministic shapes.
-The derivative matcher stays the reference, and property tests compare the two.
+derivative stays O(|e|) in size. If measurements call for it, Phase 3 may add the
+interval algorithm of Staworko et al. (2015, Thm 5) for deterministic shapes. The
+derivative matcher stays the reference, and property tests compare the two.
 
 **Step 4: ambiguous shapes.** Some arcs have |cand(a)| ≥ 2, for example
 `ex:p [1] ; ex:p @<A> ; ex:p .`.
@@ -854,12 +867,12 @@ the actions. Only the Test extension can fail an action, so this matters for con
 tests only.
 
 **Group cardinality with OneOf.** `(a | b){2}` matches `{a, b}`, because its two
-iterations take different branches. The derivative handles this exactly; Jena's min-0
+iterations take different branches. The derivative handles this exactly. Jena's min-0
 shortcut does not (§3.3).
 
 ### 5.6 Typing: stratified worklist refinement
 
-Jena and rudof validate goal-directed and recursively. A call `check(n, S)` evaluates S
+Jena and rudof use goal-directed recursive validation. A call `check(n, S)` evaluates S
 at n and recurses into `check(v, S')` for each referenced value. A pair already in
 progress is assumed `true`. Sparkles does not do this, for two reasons:
 
@@ -885,8 +898,8 @@ Sparkles instead computes the greatest fixed point over an explicit graph of pai
    read as *unknown*, in Kleene three-valued logic: `NOT unknown = unknown`, and an
    unknown candidate is "maybe". If the result is definitely `false`, for example a
    failing node constraint or a cardinality that no assignment can satisfy, the pair is
-   final `false` and is **not expanded**. This prunes most of the graph when data are
-   locally invalid, and gives most of the early exit of goal-directed search.
+   final `false` and is **not expanded**. When data are locally invalid, this prunes most
+   of the graph and recovers most of the early exit of goal-directed search.
 4. **Storage.**
    * Pairs are interned in a sharded `FxHashMap<(Id, PairKind), PairIdx>`.
    * Edges are stored as forward adjacency in `Vec<u32>` slices, plus reverse edges for
@@ -942,7 +955,7 @@ deterministic too.
   vectors, derivative arenas) is reused within a chunk.
 * A single huge neighbourhood, such as one node with 1M `foaf:knows` arcs, is evaluated
   by one thread. Its candidate computation reads only the typing, so Phase 3 may split
-  Step 1 of §5.5 over chunks of arcs when |A| > 64k. This is measurement-gated.
+  Step 1 of §5.5 over chunks of arcs when |A| > 64k, if measurements call for it.
 
 ### 5.8 Reasons (explain mode)
 
@@ -963,9 +976,10 @@ deterministic too.
   between waves, as in the SHACL `Engine`.
 * `max_pairs` (default 10M, or `--query-memory-mb` ÷ 64 bytes per pair, whichever is
   smaller) bounds the typing graph. Exceeding it is the `validation-work` budget error.
-* `max_partitions` (default 100k distributions per pair evaluation, §5.5 Step 4).
-* `max_results`: as `shacl::max_results(&limits)`. It counts reported results, so with
-  `results=nonconformant` only the nonconformant ones count.
+* `max_partitions` bounds the distributions tested per pair evaluation (default 100k,
+  §5.5 Step 4).
+* `max_results` works as `shacl::max_results(&limits)` and counts reported results. With
+  `results=nonconformant`, only the nonconformant ones count.
 
 ## 6. Design sketch
 
@@ -997,7 +1011,7 @@ crates/sparkles-shex/
 
 * **Dependencies:** `sparkles`, `oxrdf`, `oxiri`, `oxilangtag`, `oxsdatatypes`, `rayon`,
   `rustc-hash`, `regex`, `serde`, `serde_json`, `anyhow`, `thiserror`, `tracing`,
-  `smallvec`. All are already in the workspace lock: no new third-party crates.
+  `smallvec`. All are already in the workspace lock, so no third-party crates are added.
 * **Parser.** A hand-written recursive-descent parser was chosen over `peg`, which is
   already in the tree through spargebra. It gives precise error positions and stays
   reusable by a future ShExC formatter ([X02](X02-formatter.md)). The ShExC grammar is LL(1) apart from a
@@ -1010,16 +1024,16 @@ crates/sparkles-shex/
 ShEx needs the same data-graph access and XSD checks, so they move to `sparkles`.
 `sparkles-shacl` re-exports them, so the SHACL code does not change:
 
-* `sparkles-shacl/src/data.rs`, the `GraphSel` part plus `objects`, `subjects`,
-  `out_edges`, `subjects_of` and `objects_of`, moves to
-  `sparkles::validation::DataGraph`. The SHACL-specific subclass cache stays in
+* The `GraphSel` part of `sparkles-shacl/src/data.rs` moves to
+  `sparkles::validation::DataGraph`, together with `objects`, `subjects`, `out_edges`,
+  `subjects_of` and `objects_of`. The SHACL-specific subclass cache stays in
   `sparkles-shacl`.
 * `sparkles-shacl/src/xsd.rs` moves to `sparkles::xsd`.
 * New snapshot helpers:
   * `Snapshot::term_kind(id)` and `Snapshot::iri_prefix_range(prefix)` (§5.4);
   * `sparkles::sparql::expr::lang_matches` becomes `pub`.
 * `sparkles-server/src/shacl.rs` keeps `DataGraph::parse`, `validate_options`,
-  `max_results` and `pool()`. Their ShEx twins reuse them through a small
+  `max_results` and `pool()`. The ShEx server code reuses them through a small
   `ValidationInputs` struct.
 
 ### 6.3 Server plumbing
@@ -1035,7 +1049,8 @@ ShEx needs the same data-graph access and XSD checks, so they move to `sparkles`
   The route goes next to `/{ds}/shacl`.
 * `main.rs` gains `Cmd::Shex { cmd: ShexCmd::Validate{…} | ShexCmd::Parse{…} }` with the
   aliases of §2.5. The module doc line becomes "`shex` ≈ jena `shex validate|parse`".
-* Also `routes.rs`, `ratelimit.rs`, `obs.rs` and the `DatasetInfo` endpoints (§2.9).
+* `routes.rs`, `ratelimit.rs`, `obs.rs` and the `DatasetInfo` endpoints change as §2.9
+  describes.
 * Docs:
   * `docs/API.md` gains a "ShEx validation" section next to "SHACL validation";
   * the README feature table gains a ShEx row, its "Shape languages" gap row changes, and
@@ -1052,16 +1067,16 @@ ShEx needs the same data-graph access and XSD checks, so they move to `sparkles`
   `sparkles::guard::config_language(root) -> Language` lets the server and CLI call
   either `sparkles_shacl::guard::install` or `sparkles_shex::guard::install`.
 * **Cached state.** The guard keeps the `CompiledSchema` and the parsed query map. The
-  per-snapshot `NcPlan` is rebuilt per write, which takes microseconds: it resolves
-  predicates and value-set ids.
+  per-snapshot `NcPlan` is rebuilt on every write. That takes microseconds, because it
+  only resolves predicates and value-set ids.
 
 ## 7. rudof: depend, reuse, or neither
 
 rudof (github.com/rudof-project/rudof, Jose Emilio Labra Gayo et al.) is the main Rust
-ShEx implementation. It is licensed MIT OR Apache-2.0 (workspace `Cargo.toml`, and
-`LICENSE-MIT` plus `LICENSE-APACHE`), and its latest version is 0.3.24 (2026-09-27). It
-is the most conformant implementation found. Measured during this spec's research
-(shexTest main `fc784a9`):
+ShEx implementation. It is licensed MIT OR Apache-2.0, as its workspace `Cargo.toml` and
+its `LICENSE-MIT` and `LICENSE-APACHE` files state. Its latest version is 0.3.24
+(2026-09-27). It is the most conformant implementation found. Measured against shexTest
+main `fc784a9` during this spec's research:
 
 * 1305/1309 validation tests pass with ShExC schemas, and 1183/1195 with ShExJ;
 * 421/444 representation tests pass;
@@ -1070,15 +1085,15 @@ is the most conformant implementation found. Measured during this spec's researc
 | Criterion | Finding |
 |---|---|
 | License | MIT OR Apache-2.0, compatible with Sparkles (Apache-2.0). Reading its code and using it in tests is allowed. |
-| Dependency weight | `shex_validation` + `shex_ast` resolve to 234 crates. On native targets, `rudof_rdf` unconditionally pulls in `oxigraph`, `tokio` "full" and `reqwest`/rustls (through `rudof_iri`), even with default features off. Sparkles' server already has tokio, but the library crates do not, and none needs a second RDF store. |
+| Dependency weight | `shex_validation` and `shex_ast` resolve to 234 crates. On native targets, `rudof_rdf` always pulls in `oxigraph`, `tokio` "full" and `reqwest`/rustls (through `rudof_iri`), even with default features off. The Sparkles server already uses tokio, but the library crates do not, and none of them needs a second RDF store. |
 | Fit with snapshots | The validator needs `S: NeighsRDF + QueryRDF` (`validator.rs:129`, `engine.rs:81`). It works on term types, so every arc would be decoded from ids into `oxrdf` terms, and the value-set and id-range fast paths of §5.4 would be lost. `QueryRDF` is needed because rudof resolves triple-pattern selectors through SPARQL. |
-| Robustness | `todo!()` panics remain in the engine (negative atoms, `engine.rs:121,136`) and in shape-map selector paths. A panic in a server request is unacceptable. The debug build overflowed an 8 MB stack on the suite (recursive descent). Semantic actions on EachOf/OneOf are dropped (`ast2ir.rs:532,562`). |
-| API stability | 0.x, with renames and merges every few months (`srdf`→`rudof_rdf`, `iri_s`→`rudof_iri`, `shex_compact` and `shapemap`→`shex_ast`, `validate_shapemap2`→`validate_shapemap`), and several releases a week. |
+| Robustness | `todo!()` panics remain in the engine (negative atoms, `engine.rs:121,136`) and in shape-map selector paths. A panic in a server request is unacceptable. The debug build's recursive descent overflowed an 8 MB stack on the suite. Semantic actions on EachOf/OneOf are dropped (`ast2ir.rs:532,562`). |
+| API stability | Still 0.x. Crates and functions are renamed or merged every few months (`srdf`→`rudof_rdf`, `iri_s`→`rudof_iri`, `shex_compact` and `shapemap`→`shex_ast`, `validate_shapemap2`→`validate_shapemap`), and there are several releases a week. |
 | Scope | It includes ShEx 2.2 `EXTENDS`/`ABSTRACT`, which Sparkles does not need yet. |
 
-**Recommendation:** depend on neither rudof's validator nor its parser.
-`shex_ast` alone still pulls in `rudof_rdf`. Implement `sparkles-shex` natively over
-store ids, and use rudof in two permitted, non-linked ways:
+**Recommendation:** depend on neither rudof's validator nor its parser, since `shex_ast`
+alone still pulls in `rudof_rdf`. Implement `sparkles-shex` natively over store ids. Use
+rudof in two permitted ways, neither of which links it:
 
 1. **Differential oracle (development only).** `scripts/shex-diff.sh` runs
    `rudof shex-validate` (a binary installed by the developer, never a Cargo dependency)
@@ -1087,7 +1102,7 @@ store ids, and use rudof in two permitted, non-linked ways:
 2. **Design reference.** Its published algorithm notes, such as the derivative-based RBE
    matcher and the grouping of values by eligible buckets, agree with the papers cited
    in §3.1. This spec's §5.5 is derived from those papers. If an implementer reads rudof
-   source while building the matcher, the provenance entry must say so; no code is
+   source while building the matcher, the provenance entry must say so. No code is
    copied.
 
 Revisit if rudof reaches 1.0 with an optional, store-agnostic core: no `oxigraph` or
@@ -1097,7 +1112,8 @@ Revisit if rudof reaches 1.0 with an optional, store-agnostic core: no `oxigraph
 
 **Suite location.** As with the SHACL suites, the suite comes from the Jena checkout's
 vendored copy (`jena-shex/src/test/files/spec`) or from `SPARKLES_SHEX_TESTS`. The copy
-is shexTest under the W3C Software and Document License (its README), and has:
+is shexTest, under the W3C Software and Document License according to its README. It
+has:
 
 * `syntax/` (425 `.shex`);
 * `negativeSyntax/` (99);
@@ -1115,19 +1131,20 @@ without a suite, as the SHACL suites are.
 
 | Group | Check |
 |---|---|
-| syntax | every `syntax/*.shex` (Jena layout) or `schemas/*.shex` parses; Jena's two ill-formed-surrogate exclusions are listed with reasons |
-| negativeSyntax | every file fails to parse |
-| negativeStructure | every file parses, and `compile` fails with a `SchemaError` (S1–S6) |
-| representation (`schemas/manifest.jsonld`) | ShExC → AST → ShExJ equals the `.json` file after normalization (key order, number forms, defaulted `min`/`max`; upstream 2.next `ShapeDecl` wrappers without `abstract` unwrapped); and ShExJ → ShExC → ShExJ is stable |
-| validation (`validation/manifest.ttl`) | per entry, the data is loaded into an in-memory store (`Store::in_memory`). The schema is run twice, once from ShExC and once from `.json`. Supported forms are `shape` + `focus`, `map` (JSON), `semActs`, `shapeExterns` and `extensionResults`. The result must match the test type, and the Test extension's prints must equal `mf:extensionResults`. |
+| syntax | Every `syntax/*.shex` (Jena layout) or `schemas/*.shex` parses. Jena's two exclusions for ill-formed surrogates are listed with reasons. |
+| negativeSyntax | Every file fails to parse. |
+| negativeStructure | Every file parses, and `compile` fails with a `SchemaError` (S1–S6). |
+| representation (`schemas/manifest.jsonld`) | ShExC → AST → ShExJ equals the `.json` file after normalizing key order, number forms and defaulted `min`/`max`. Upstream 2.next `ShapeDecl` wrappers without `abstract` are unwrapped. ShExJ → ShExC → ShExJ is stable. |
+| validation (`validation/manifest.ttl`) | For each entry, the data is loaded into an in-memory store (`Store::in_memory`). The schema is run twice, once from ShExC and once from `.json`. Supported forms are `shape` + `focus`, `map` (JSON), `semActs`, `shapeExterns` and `extensionResults`. The result must match the test type, and the Test extension's prints must equal `mf:extensionResults`. |
 
-**Told blank nodes** (`sht:ToldBNode`, `LexicalBNode`; Jena skips about 51 of these).
+**Told blank nodes.** These tests carry the traits `sht:ToldBNode` and `LexicalBNode`.
+Jena skips about 51 of them.
 
 * The harness parses the data with `oxttl` itself and inserts it through a `WriteTxn`.
   It keeps a map from each parsed label to the store blank node's id, and resolves
   `sht:focus _:label` through that map.
-* Requirement for the store: a transaction that inserts terms keeps a stable label → id
-  mapping for the duration of the test. If that is impossible, these tests go to the
+* This needs the store to keep a stable label → id mapping for the terms a transaction
+  inserts, for the duration of the test. If that is impossible, these tests go to the
   known-failures list with this reason.
 
 **Exclusions by trait**, not counted as failures:
@@ -1148,17 +1165,17 @@ reason. The run fails on unlisted failures and reports listed tests that pass.
 
 **Other tests:**
 
-* **Unit tests.** Every node-constraint facet against shexTest's facet tables. The
-  `facets.ods` and `facet-tests.ods` sheets are the reference; they are not parsed.
-* **Matcher property tests** (proptest, already in the workspace). Random
-  single-occurrence expressions and bags are checked by the derivative matcher against a
-  brute-force partition enumerator, which takes ≤ 8 arcs. Random ambiguous shapes are
-  checked against the same oracle.
-* **Typing property tests.** Random recursive schemas (positive and stratified negative
-  references) on random graphs of ≤ 30 nodes, with refinement checked against a naive
-  greatest-fixed-point computation over all pairs.
-* **Server tests** in `http/shex_tests.rs`, following `validation_tests.rs`: formats,
-  errors, budgets, auth.
+* **Unit tests** cover every node-constraint facet, using shexTest's facet tables. The
+  `facets.ods` and `facet-tests.ods` sheets are the reference, but they are not parsed.
+* **Matcher property tests** use proptest, which is already in the workspace. They run
+  the derivative matcher on random single-occurrence expressions and bags, and compare it
+  with a brute-force partition enumerator that takes ≤ 8 arcs. Random ambiguous shapes
+  are checked against the same oracle.
+* **Typing property tests** run random recursive schemas, with positive and stratified
+  negative references, on random graphs of ≤ 30 nodes. They check refinement against a
+  naive greatest-fixed-point computation over all pairs.
+* **Server tests** in `http/shex_tests.rs` follow `validation_tests.rs` and cover
+  formats, errors, budgets and auth.
 
 ## 9. Performance targets and benchmark
 
@@ -1173,7 +1190,7 @@ reason. The run fails on unlisted failures and reports listed tests that pass.
 * result counts by reason kind.
 
 `--compare-rudof` (§7) and `--compare-jena FILE` (Jena's text report) are optional
-equivalence checks. The ShEx counterpart of the SHACL bench shapes:
+equivalence checks. These are the SHACL bench shapes written in ShEx:
 
 ```shex
 PREFIX ex: <http://example.org/>
@@ -1242,8 +1259,9 @@ exercises §5.6.2 at scale.
 | memory | ≤ 64 bytes per discovered pair, plus the edge vectors | §5.9 |
 
 The results go into `docs/BENCHMARKS.md` next to the SHACL row. Phase 2 adds
-`bench:shex-write` (reusing `bench:shacl-write` with `--lang shex`), whose target is the
-same as [C10 §6.1](C10-write-time-validation.md): `reject` latency ≤ standalone validation + 10 ms.
+`bench:shex-write`, which reuses `bench:shacl-write` with `--lang shex`. Its target is the
+one in [C10 §6.1](C10-write-time-validation.md): `reject` latency ≤ standalone
+validation + 10 ms.
 
 ## 10. Phasing
 
@@ -1279,8 +1297,9 @@ Estimates are one engineer's working days.
 
 **Phase 3 (about 6–8 days; each item independent)**
 
-* **Incremental guard validation.** [C10 §6.2](C10-write-time-validation.md) specialized to ShEx: each triple constraint
-  is one hop. For a change (s, p, o), the affected pairs are s for outgoing p and o for
+* **Incremental guard validation.** This is [C10 §6.2](C10-write-time-validation.md)
+  specialized to ShEx, where each triple constraint is one hop. For a change (s, p, o),
+  the affected pairs are s for outgoing p and o for
   inverse p in the shapes that mention p. These propagate up the reverse pair-dependency
   edges and are unioned with the selector delta. `CLOSED` reads `*`. The F1–F8 fallbacks
   carry over. 3 days.
@@ -1328,15 +1347,15 @@ carol's `appinfo.failures` contains
 `{kind:"closed", predicate:"http://ex.org/mayor"}`. The response carries
 `Sparkles-Commit`.
 
-**B2: recursion is a greatest fixed point.** alice and bob know each other: (alice,
-Person) and (bob, Person) are mutually dependent and both conformant. After
+**B2: recursion is a greatest fixed point.** alice and bob know each other, so (alice,
+Person) and (bob, Person) depend on each other. Both are conformant. After
 `INSERT DATA { ex:bob foaf:age "old" }`:
 
 * bob is nonconformant (`datatype`);
 * alice is nonconformant with `{kind:"reference", shape:"ex:Person", value: ex:bob}`.
 
-A unit test checks that `foaf:knows` chains of 200k nodes validate without stack growth
-(run in a thread with a 256 KB stack).
+A unit test checks that `foaf:knows` chains of 200k nodes validate without stack growth.
+It runs in a thread with a 256 KB stack.
 
 **B3: negation stratification.** A schema `ex:S { ex:a NOT @ex:S }` gets `400` with
 `"negated reference cycle: ex:S -[NOT]-> ex:S"`. `ex:S EXTRA ex:a { ex:a @ex:S }` gets
@@ -1346,7 +1365,7 @@ A unit test checks that `foaf:knows` chains of 200k nodes validate without stack
 conforming and one nonconforming person is conformant: the nonconforming arc is an
 allowed EXTRA arc. Without `EXTRA` it is nonconformant
 (`{kind:"extra", predicate:"…knows"}`). With two conforming arcs it is nonconformant in
-both cases (cardinality: the matching arc may not be left in the remainder).
+both cases. The cause is cardinality: a matching arc may not be left in the remainder.
 
 **B5: inverse (R1).** `ex:Child { ^ex:parentOf @ex:Person {1,2} }`. A node with three
 incoming `ex:parentOf` arcs from conforming persons is nonconformant (`cardinality`,
@@ -1398,7 +1417,7 @@ report as B1.
 **B12: auth and routing.**
 
 * With `--auth-config` and a token holding only `read` on `ds`, `POST /ds/shex` gets
-  `200`; without access it gets `404` (hidden dataset).
+  `200`. Without access it gets `404`, because the dataset is hidden.
 * `/$/metrics` counts `sparkles_requests_total{op="shex"}`.
 * `GET /$/datasets/ds` lists `endpoints.shex`.
 
@@ -1412,9 +1431,9 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 
 ## 12. Rejected alternatives
 
-* **Depend on rudof.** See §7: 234 crates, including a second RDF store and network
-  stacks; 0.x churn; term-level store access; `todo!()` panics; stack overflow on deep
-  recursion.
+* **Depend on rudof.** §7 has the details. It pulls in 234 crates, including a second RDF
+  store and network stacks. Its 0.x API changes often, it reads the store by term rather
+  than by id, it has `todo!()` panics, and it overflows the stack on deep recursion.
 * **Vendor rudof's parser crate only.** `shex_ast` is entangled with `rudof_rdf`,
   `prefixmap` and `rudof_iri`, so it pulls in most of the same dependency tree.
 * **Port Jena's `jena-shex` structure.** Its full cartesian product over assignments and
@@ -1437,13 +1456,14 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 * **Executing other semantic actions** (JavaScript, SPARQL generation, the Map
   extension). They are a security risk on a server, and transformation is out of scope.
 * **An RDF report** (an `sh:ValidationReport` lookalike or ShExV). No standard
-  vocabulary exists, and a SHACL-shaped report would misstate ShEx semantics. JSON forms
-  only.
-* **ShExC text in a named graph as a literal** for the guard. Use a copied file
-  (Phase 2) or a ShExR graph (Phase 3).
+  vocabulary exists, and a SHACL-shaped report would misstate ShEx semantics. Reports are
+  JSON only.
+* **ShExC text in a named graph as a literal** for the guard. The guard uses a copied
+  file (Phase 2) or a ShExR graph (Phase 3) instead.
 * **Running SHACL and ShEx guards together in Phase 2.** It needs a guard chain and a
   combined `validation.json`. It is deferred (Open question 7).
-* **`peg` grammar for ShExC.** Weaker error positions, and not reusable by a formatter.
+* **`peg` grammar for ShExC.** It gives weaker error positions and is not reusable by a
+  formatter.
 * **Treating budget overruns as `nonconformant`.** That would turn resource limits into
   false verdicts, and in `reject` mode into false rejections.
 
@@ -1453,8 +1473,9 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
    remainder arcs, while shexTest requires incoming arcs with inverse-constraint
    predicates to be matched. Default: follow the suite, and apply `EXTRA` to such
    incoming arcs as well.
-2. **`EXTERNAL` without definitions.** Error (default), or Jena's always-true?
-   Default: error; `--externs-default true|false` can be added later if users need it.
+2. **`EXTERNAL` without definitions.** Should it be an error, or always true as in Jena?
+   Default: error. A `--externs-default true|false` flag can be added later if users need
+   it.
 3. **Test semantic actions on by default?** They are pure, and `fail` changes results.
    Default: on. Unknown extensions are ignored with a warning, as in Jena.
 4. **Facet erratum (R2).** Follow the intent and the suite. Default: yes.
@@ -1466,14 +1487,14 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
    policy, as for LOAD (private addresses already blocked).
 7. **One guard language per dataset.** A guard chain (SHACL and ShEx on one dataset) is
    deferred. Default: one language.
-8. **Budget defaults.** `max_partitions` 100k per pair evaluation; `max_pairs` 10M or the
-   memory budget ÷ 64. Default: as stated, revisited after `bench:shex`.
+8. **Budget defaults.** `max_partitions` is 100k per pair evaluation. `max_pairs` is 10M
+   or the memory budget ÷ 64. Default: as stated, revisited after `bench:shex`.
 9. **ShExJ media type.** Accept the unregistered `application/shex+json` plus sniffed
    `application/json` / `application/ld+json`? Default: yes. Responses that return ShExJ
    (`parse --out shexj`) use `application/json`.
 10. **`shex` feature on by default.** It adds no new dependencies. Default: on.
-11. **ShEx 2.2 (`EXTENDS`, `ABSTRACT`).** rudof has it; Jena does not; the spec is a CG
-    draft. Default: not before Phase 3, and only on request.
+11. **ShEx 2.2 (`EXTENDS`, `ABSTRACT`).** rudof has it and Jena does not. The spec is a
+    CG draft. Default: not before Phase 3, and only on request.
 12. **`SPARQL """…"""` selectors.** A non-standard extension. Default: Phase 2, run with
     the request's query budgets.
 13. **Results for absent nodes.** A fixed-map node that is not in the data has an empty
@@ -1500,9 +1521,9 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 * **Existing specs:** [C10](C10-write-time-validation.md) (structure, guard semantics)
   and [PROVENANCE.md](PROVENANCE.md). No other design documents were read.
 * **Shape Expressions Language 2.1**, Final Community Group Report, 8 October 2019,
-  http://shex.io/shex-semantics/ (fetched): §§2.5, 5.2–5.9, the IANA section. W3C
-  Community Final Specification Agreement; reports under the W3C Software and Document
-  License.
+  http://shex.io/shex-semantics/ (fetched): §§2.5, 5.2–5.9, the IANA section. It is
+  under the W3C Community Final Specification Agreement, and the reports are under the
+  W3C Software and Document License.
 * **ShEx editor's draft "2.next"**, https://shexspec.github.io/spec/ (consulted for 2.2
   scope only).
 * **ShapeMap Structure and Language**, Draft Community Group Report, 13 July 2017,
@@ -1512,7 +1533,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 * **shexTest**, https://github.com/shexSpec/shexTest (main `fc784a9`, tags up to v2.1.0;
   W3C Software and Document License, `W3C-20150513`). It is also used through the copy
   vendored in Apache Jena (`jena-shex/src/test/files/spec`, same license per its README).
-  Manifests, traits and counts were inspected; the `doc/ShExJ.jsg` and
+  Manifests, traits and counts were inspected. The `doc/ShExJ.jsg` and
   `ShExJ-context.jsonld` files were consulted for ShExJ.
 * **Apache Jena `jena-shex` and `jena-cmds`** (Apache-2.0), checkout `b1dcba53b5`
   (2026-09-28). Read for behaviour and CLI surface:
@@ -1529,7 +1550,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
   crates 0.3.24; **MIT OR Apache-2.0**). Licenses, crate structure, dependency tree
   (built in a scratch consumer crate), trait signatures, documented algorithm and the
   shexTest pass rates were inspected and measured. It is not a dependency. Its
-  `feasibility-model.md` credits a port of an Apache Jena fork (fhircat/jena); that
+  `feasibility-model.md` credits a port of an Apache Jena fork (fhircat/jena). That
   fork was not consulted.
 * **Papers** (citations verified; content per the published PDFs and abstracts):
   * S. Staworko, I. Boneva, J. E. Labra Gayo, S. Hym, E. G. Prud'hommeaux, H. Solbrig,
@@ -1557,7 +1578,7 @@ gets `409`, because carol does not conform. After carol is fixed, it gets `200`.
 
 ## Appendix: provenance entry (for [PROVENANCE.md](PROVENANCE.md))
 
-As drafted with the spec, before implementation; the published entry in
+This is the entry as drafted with the spec, before implementation. The published entry in
 [PROVENANCE.md](PROVENANCE.md) records the implementation.
 
 ```markdown
@@ -1596,60 +1617,76 @@ As drafted with the spec, before implementation; the published entry in
 
 ## Implementation note (2026-10-01): matcher algorithm
 
-The Phase-1 matcher does not use regular-bag-expression derivatives (∂^k). It computes, per
-sub-expression, the interval of iteration counts a count vector can be split into (EachOf:
-intersection over parts; OneOf: sum over branches; then the group's own `{m,n}`), and the
-vector matches when the root's interval contains 1. This is exact for any expression and
-linear in its size regardless of counts (the interval method §5 had deferred to Phase 3).
-It is checked by property tests against a brute-force enumerator that follows §4.4's
-partition definition literally (≤ 8 arcs, nested groups, random cardinalities, EXTRA,
-ambiguous predicates). Class distributions, the `max_partitions` budget and semantic-action
-enumeration are as specified.
+The Phase 1 matcher does not use regular-bag-expression derivatives (∂^k). For each
+sub-expression it computes the interval of iteration counts that a count vector can be
+split into. An EachOf takes the intersection over its parts and a OneOf the sum over its
+branches, and then the group's own `{m,n}` applies. The vector matches when the root's
+interval contains 1. This is the interval method that §5 had deferred to Phase 3. It is
+exact for any expression, and linear in the expression's size whatever the counts.
+
+Property tests check it against a brute-force enumerator that follows the partition
+definition of §4.4 literally. The tests cover up to 8 arcs, nested groups, random
+cardinalities, EXTRA and ambiguous predicates. Class distributions, the `max_partitions`
+budget and semantic-action enumeration are as specified.
 
 ## Outcome
 
-**Delivered.** Spec written 2026-09-30; Phases 1 and 2 landed on 2026-10-01, as designed
-in §2–§6 (crate, endpoint, CLI, harness, `bench:shex`, the rudof differential script; then
-the format 2 guard with the predicate relevance skip, ShExR, SPARQL selectors, the UI
-switch, `bench:shex-write`). The MCP tools `validate_shacl` and `validate_shex` were taken
-early from Phase 3. No new third-party crates were added.
+**Delivered.** The spec was written on 2026-09-30. Phases 1 and 2 landed on 2026-10-01 as
+designed in §2–§6. Phase 1 brought the crate, the endpoint, the CLI, the harness,
+`bench:shex` and the rudof differential script. Phase 2 brought the format 2 guard with the
+predicate relevance skip, ShExR, SPARQL selectors, the UI switch and `bench:shex-write`.
+The MCP tools `validate_shacl` and `validate_shex` were taken early from Phase 3. No new
+third-party crates were added.
 
 **Deviations from the spec.**
 * **Matcher.** The interval method replaced bag derivatives as the only matcher (see the
-  implementation note above): it is exact for every expression, since each triple
-  constraint occurs once after `&include` expansion, and linear in the expression's size
-  whatever the counts, where derivatives copy group bodies. It was approved during
-  implementation; the brute-force partition enumerator stays the property-test oracle.
-* **Told blank nodes.** The store does not keep blank-node labels, so the harness skips
-  the `LexicalBNode` validation tests (counted) and lists one more in `known-failures.txt`.
-* **`validation.json` is always written as format 2**, SHACL configurations too, with
-  `"language"`; format 1 files are still read. Decided by the maintainer: it is a
-  Sparkles-internal file, and only older Sparkles binaries are affected.
-* Node-constraint annotations and semantic actions stay rejected (ShExJ 2.1 has no slot for
-  them). An exhausted outbound budget while fetching imports answers `507`, not `400`.
-  Imports are capped at 64 schemas and 16 MiB per validation.
+  implementation note above). It is exact for every expression, because each triple
+  constraint occurs once after `&include` expansion. Its cost is linear in the
+  expression's size whatever the counts, while derivatives copy group bodies. The change
+  was approved during implementation. The brute-force partition enumerator stays the
+  property-test oracle.
+* **Told blank nodes.** The store does not keep blank-node labels. The harness therefore
+  skips the `LexicalBNode` validation tests, counting them, and lists one more test in
+  `known-failures.txt`.
+* **`validation.json` is always written as format 2**, with `"language"`, for SHACL
+  configurations too. Format 1 files are still read. The maintainer decided this because
+  the file is internal to Sparkles and only older Sparkles binaries are affected.
+* Node-constraint annotations and semantic actions stay rejected, because ShExJ 2.1 has
+  no slot for them. An exhausted outbound budget while fetching imports answers `507`,
+  not `400`. Imports are capped at 64 schemas and 16 MiB per validation.
 
-**Decided by the maintainer:** the `sparkles_validation_*` series gain a `language` label
-(SHACL series become `language="shacl"`); SPARQL selectors are refused in the write-time
-guard (`400` when the configuration is set) and allowed on demand; server flags for the
-import limits and CLI `--outbound-*` flags for imports are deferred.
-**Chosen during implementation** (open to revision): the SHACL `Sparkles-Validation`
-header is unchanged and ShEx adds `lang=shex`; summaries and `GET /$/validation/{ds}` gain
-an additive `language` field; the stored schema is the text as given when it has no
-imports, otherwise the closed schema as ShExJ with its base and prefixes; the PUT body
-takes no inline imports or externs (`EXTERNAL` is a `400`); an empty shape map is refused;
-SPARQL selectors do not inherit the map's or schema's prefixes; `--schema`/`--shape-map`
-imply `--lang shex`; the MCP tools are on by default (read-only, `maxResults` 20, imports
-refused); the UI gets no write-time validation panel in this phase.
+**Decided by the maintainer.**
+* The `sparkles_validation_*` series gain a `language` label. The SHACL series become
+  `language="shacl"`.
+* SPARQL selectors are refused in the write-time guard (`400` when the configuration is
+  set) and allowed on demand.
+* Server flags for the import limits, and CLI `--outbound-*` flags for imports, are
+  deferred.
 
-**Conformance at landing** ([FEATURES.md](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) and `known-failures.txt`): 100 % of the syntax,
-negative-syntax, negative-structure, representation and ShExR tests; 99.9 % of the
-validation tests from ShExC, ShExJ and ShExR (42 blank-node-label tests skipped, one more
-listed). SHACL stayed at 98/98 + 20/20 through the shared-code moves.
+**Chosen during implementation** (open to revision).
+* The SHACL `Sparkles-Validation` header is unchanged, and ShEx adds `lang=shex`.
+* Summaries and `GET /$/validation/{ds}` gain an additive `language` field.
+* The stored schema is the text as given when it has no imports. Otherwise it is the
+  closed schema as ShExJ, with its base and prefixes.
+* The PUT body takes no inline imports or externs, so `EXTERNAL` is a `400`.
+* An empty shape map is refused.
+* SPARQL selectors do not inherit the prefixes of the map or the schema.
+* `--schema` and `--shape-map` imply `--lang shex`.
+* The MCP tools are on by default. They are read-only, use `maxResults` 20 and refuse
+  imports.
+* The UI gets no write-time validation panel in this phase.
 
-**Performance.** `mise run bench:shex` and `bench:shex-write` exist; no ShEx numbers are
-published in [BENCHMARKS.md](../BENCHMARKS.md) yet, so the §9 targets are unverified.
+**Conformance at landing.** Sparkles passes 100 % of the syntax, negative-syntax,
+negative-structure, representation and ShExR tests. It passes 99.9 % of the validation
+tests from ShExC, ShExJ and ShExR: 42 blank-node-label tests are skipped, and one more is
+listed in `known-failures.txt`.
+[FEATURES.md](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) has the
+current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
+
+**Performance.** `mise run bench:shex` and `bench:shex-write` exist, but
+[BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers yet, so the §9 targets are
+unverified.
 
 **Deferred or rejected.** Incremental guard validation, ShExR schemas in named graphs for
 the guard, SHACL and ShEx guards on one dataset, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are
-not built; the guard validates the full post-state on every relevant write.
+not built. The guard validates the full post-state on every relevant write.

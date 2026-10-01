@@ -1,21 +1,21 @@
 # Provenance of adopted designs and dependencies
 
-The clean-room provenance record of Sparkles. One entry per feature or dependency: where
-the design came from, what was adopted (version and license), and what was rejected. No
-entry uses Fluree source, tests or design documents: Fluree was not consulted for any
-feature. Each feature's spec in this directory (see the [index](README.md)) gives the
-full design and, in its Outcome section, how the implementation landed.
+This is the clean-room provenance record of Sparkles. Each entry covers one feature or
+dependency. It says where the design came from, what was adopted, with version and
+license, and what was rejected. No entry uses Fluree source, tests or design documents,
+and Fluree was not consulted for any feature. Each feature's spec in this directory (see
+the [index](README.md)) gives the full design, and its Outcome section describes how the
+implementation landed.
 
 ## Allocator (server and CLI binaries)
 
-- **Adopted:** `mimalloc` 0.1.52 (MIT), with `libmimalloc-sys` 0.1.49 (MIT, `extended`
-  feature for `mi_collect`), which bundles Microsoft mimalloc 3.3.2 (MIT). It is a
-  default-on feature of `sparkles-server`; the `sparkles` library stays
-  allocator-neutral.
-- **Design source:** our own measurements of allocator memory retention, the mimalloc
-  option documentation and source
-  (`src/options.c`: `purge_delay`, `purge_decommits`), and glibc `mallopt(3)` and
-  `malloc_trim(3)`.
+- **Adopted:** `mimalloc` 0.1.52 (MIT), with `libmimalloc-sys` 0.1.49 (MIT). The
+  `extended` feature of `libmimalloc-sys` provides `mi_collect`. The crate bundles
+  Microsoft mimalloc 3.3.2 (MIT). The allocator is a default-on feature of
+  `sparkles-server`. The `sparkles` library stays allocator-neutral.
+- **Design source:** our own measurements of allocator memory retention; the mimalloc
+  option documentation and source (`src/options.c`: `purge_delay`, `purge_decommits`);
+  and glibc `mallopt(3)` and `malloc_trim(3)`.
 - **Rejected:**
   - glibc `mallopt` fixed thresholds: slower throughput.
   - `tikv-jemallocator` 0.7 (MIT/Apache-2.0): slower, and needs `make`.
@@ -28,9 +28,9 @@ full design and, in its Outcome section, how the implementation landed.
   Protocol and Graph Store Protocol, and RFCs 3339, 9562, 9110, 6648 and 9651. Fluree was
   not consulted.
 - **Implementation:** from the spec plus Sparkles code only.
-  - **Dependencies:** `uuid` 1.x (Apache-2.0/MIT, already a dependency; its `serde`
-    feature is now enabled) and the CRC-32 from `flate2` (MIT/Apache-2.0, already a
-    dependency).
+  - **Dependencies:** `uuid` 1.x (Apache-2.0/MIT), with its `serde` feature now
+    enabled, and the CRC-32 from `flate2` (MIT/Apache-2.0). Both were already
+    dependencies.
 - **Rejected** (spec §8):
   - `Snapshot::version` as the id;
   - content hashes as the primary id;
@@ -43,13 +43,17 @@ full design and, in its Outcome section, how the implementation landed.
 ## Full-text search
 
 - **Spec:** [`F03-full-text-search.md`](F03-full-text-search.md), written independently
-  from the Sparkles code, Apache Jena's text-query documentation and `jena-text` sources
-  (Apache-2.0, syntax compatibility only), the Tantivy docs, spargebra's parser source,
-  the SPARQL 1.1 Query §4.2.3 collections syntax, BCP 47 and RFC 4647. Fluree was not
-  consulted.
+  from:
+  - the Sparkles code;
+  - Apache Jena's text-query documentation and `jena-text` sources (Apache-2.0), for
+    syntax compatibility only;
+  - the Tantivy docs and spargebra's parser source;
+  - the SPARQL 1.1 Query §4.2.3 collections syntax, BCP 47 and RFC 4647.
+
+  Fluree was not consulted.
 - **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`
-  and `lz4-compression`, which avoids zstd's C code. It is behind the optional `text`
-  feature of `sparkles`, which the server enables by default.
+  and `lz4-compression`. That set avoids zstd's C code. Tantivy is behind the optional
+  `text` feature of `sparkles`, which the server enables by default.
 - **Rejected** (spec §8):
   - a home-grown inverted index;
   - one document per subject;
@@ -69,20 +73,27 @@ full design and, in its Outcome section, how the implementation landed.
   docs.rs / crates.io pages for the ANN candidates, and the Sparkles code. Fluree was not
   consulted.
 - **Implementation:** Phase 1 (exact search), from the spec and Sparkles code only.
-  No new dependencies: the kernel is our own 8-lane loop, and rayon is already used.
-- **Deferred:** HNSW (USearch 2.26 Apache-2.0 recommended by the spec, hnsw_rs as the
-  pure-Rust alternative).
-- **Rejected** (spec §8): canonicalizing vector literals on load; a new id tag for
-  vectors; `rdf:JSON`.
+  There are no new dependencies. The kernel is our own 8-lane loop, and rayon was
+  already in use.
+- **Deferred:** HNSW. The spec recommends USearch 2.26 (Apache-2.0), with hnsw_rs as the
+  pure-Rust alternative.
+- **Rejected** (spec §8):
+  - canonicalizing vector literals on load;
+  - a new id tag for vectors;
+  - `rdf:JSON`.
 
 ## Named snapshots and point-in-time reads
 
 - **Spec:** [`F06-snapshots-and-point-in-time.md`](F06-snapshots-and-point-in-time.md),
-  written on 2026-09-30 independently from the Sparkles code, [CI](CI-commit-identity.md),
-  RFC 7089 (Memento), RFC 9110, and the W3C SPARQL 1.1 Protocol and Graph Store Protocol
-  (all fetched), plus RFCs 3339, 8246, 6648 and 9651 and Jena's RDF Patch format
-  (Apache-2.0, open question only), cited from general knowledge. Fluree was not
-  consulted.
+  written on 2026-09-30 independently from:
+  - the Sparkles code and [CI](CI-commit-identity.md);
+  - RFC 7089 (Memento), RFC 9110, and the W3C SPARQL 1.1 Protocol and Graph Store
+    Protocol, all fetched;
+  - RFCs 3339, 8246, 6648 and 9651, cited from general knowledge;
+  - Jena's RDF Patch format (Apache-2.0), cited from general knowledge for an open
+    question only.
+
+  Fluree was not consulted.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30).
   - **Dependencies:** `httpdate` 1.0.3 (MIT OR Apache-2.0), new in the server.
 - **Rejected** (spec §8):
@@ -131,9 +142,10 @@ full design and, in its Outcome section, how the implementation landed.
     - `sha2` and `reqwest` (already dependencies), and clap's `env` feature;
     - tests only: `aws-lc-rs` 1 as a dev-dependency, to sign the mock OIDC provider's
       tokens.
-  - **Not adopted:** `openidconnect` 4.0.1 (MIT) and `cookie`, which the spec named. The
-    OIDC relying party (discovery, code flow with PKCE, claim checks), HMAC-SHA-256 and
-    cookie handling are our own code over `jsonwebtoken`, `reqwest` and `sha2`.
+  - **Not adopted:** `openidconnect` 4.0.1 (MIT) and `cookie`, which the spec named.
+    Our own code over `jsonwebtoken`, `reqwest` and `sha2` implements the OIDC relying
+    party (discovery, code flow with PKCE, claim checks), HMAC-SHA-256 and cookie
+    handling.
 - **Rejected** (spec §14):
   - authentication only in the reverse proxy;
   - a JS auth server (better-auth) or SvelteKit SSR for OIDC;
@@ -150,15 +162,19 @@ full design and, in its Outcome section, how the implementation landed.
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on
-  2026-09-30 independently from the Sparkles code and specs (CI, C08, C06, C01), W3C
-  SHACL, SHACL 1.2 Core (Working Draft), SPARQL 1.1 Update and Protocol, and Apache Jena's
-  SHACL documentation (Apache-2.0), all fetched; plus RFC 9110, RFC 9651 and four papers
-  on integrity checking and view maintenance (Nicolas 1982; Blakeley, Larson and Tompa
-  1986; Gupta and Mumick 1995; Corman, Reutter and Savković 2018), cited from general
-  knowledge. Fluree and TopBraid documentation were not consulted.
-- **Implementation:** from the spec plus Sparkles code only (2026-09-30). No new
-  third-party dependencies: `sparkles-shacl` now also uses `serde`, `serde_json`,
-  `parking_lot`, `sha2` and `tempfile`, all already in the workspace.
+  2026-09-30 independently from:
+  - the Sparkles code and specs (CI, C08, C06, C01);
+  - W3C SHACL, SHACL 1.2 Core (Working Draft), SPARQL 1.1 Update and Protocol, and
+    Apache Jena's SHACL documentation (Apache-2.0), all fetched;
+  - RFC 9110 and RFC 9651, cited from general knowledge;
+  - four papers on integrity checking and view maintenance, cited from general
+    knowledge: Nicolas 1982; Blakeley, Larson and Tompa 1986; Gupta and Mumick 1995;
+    Corman, Reutter and Savković 2018.
+
+  Fluree and TopBraid documentation were not consulted.
+- **Implementation:** from the spec plus Sparkles code only (2026-09-30). There are no
+  new third-party dependencies. `sparkles-shacl` now uses `serde`, `serde_json`,
+  `parking_lot`, `sha2` and `tempfile`, which were all already in the workspace.
 - **Rejected** (spec §9):
   - validating after commit and reverting with a compensating commit;
   - validating only the request's data;
@@ -176,20 +192,25 @@ full design and, in its Outcome section, how the implementation landed.
 ## MCP server
 
 - **Spec:** [`C11-mcp-server.md`](C11-mcp-server.md), written on 2026-09-30
-  independently from the MCP specification, revision `2026-07-28` (fetched from
-  modelcontextprotocol.io: versioning, changelog, base protocol, stdio and streamable HTTP
-  transports, tools, resources, prompts, pagination, caching, cancellation, authorization
-  and the schema), the rmcp 3.5.0 crates.io record, docs.rs pages, READMEs and `LICENSE`,
-  JSON-RPC 2.0 and SPARQL 1.1 (cited from working knowledge), and the Sparkles code and
-  specs C01, C02 and C06. Fluree was not consulted, including any Fluree MCP server or "memory" feature
-  material.
+  independently from:
+  - the MCP specification, revision `2026-07-28`, fetched from modelcontextprotocol.io.
+    The parts read were versioning, the changelog, the base protocol, the stdio and
+    streamable HTTP transports, tools, resources, prompts, pagination, caching,
+    cancellation, authorization and the schema;
+  - the rmcp 3.5.0 crates.io record, its docs.rs pages, READMEs and `LICENSE`;
+  - JSON-RPC 2.0 and SPARQL 1.1, cited from working knowledge;
+  - the Sparkles code and specs C01, C02 and C06.
+
+  Fluree was not consulted, including any material on a Fluree MCP server or "memory"
+  feature.
 - **Implementation:** from the spec plus Sparkles code only (2026-09-30), behind the
   default-on `mcp` feature of `sparkles-server`.
   - **Dependencies:** `rmcp` 3.5.0 (Apache-2.0), the official Rust SDK
-    (github.com/modelcontextprotocol/rust-sdk), pinned `~3.5` with default features off
-    and only `server` and `transport-io`, so no tool macros. Its dependencies are MIT,
-    Apache-2.0 or both, including `schemars` 1.2.2 (MIT). The published crate carries no
-    `LICENSE` file; the text is in the upstream repository.
+    (github.com/modelcontextprotocol/rust-sdk). It is pinned to `~3.5` with default
+    features off and only `server` and `transport-io` on, so there are no tool macros.
+    Its dependencies are MIT, Apache-2.0 or both, including `schemars` 1.2.2 (MIT). The
+    published crate carries no `LICENSE` file. The license text is in the upstream
+    repository.
 - **Rejected** (spec §9):
   - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
   - rmcp `#[tool]` macros with `schemars`-derived schemas;
@@ -204,23 +225,27 @@ full design and, in its Outcome section, how the implementation landed.
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
-  2026-09-30 independently as internal engineering, from the codec formats' own
-  specifications (RFC 8878 zstd, RFC 7932 Brotli, RFC 1952 gzip, the LZ4 frame format),
-  RFC 9110 content codings, the docs of `zstd`, `ruzstd`, `brotli`, `flate2`, `lz4_flex`,
-  tower-http 0.7, rust-embed 8 and Tantivy 0.26, and the Sparkles code. It is not derived from any other database
-  product. It has no explicit "Fluree was not consulted" line, and Fluree is not among
-  its sources.
+  2026-09-30 independently as internal engineering. Its sources are:
+  - the codec formats' own specifications: RFC 8878 (zstd), RFC 7932 (Brotli), RFC 1952
+    (gzip) and the LZ4 frame format;
+  - RFC 9110 content codings;
+  - the docs of `zstd`, `ruzstd`, `brotli`, `flate2`, `lz4_flex`, tower-http 0.7,
+    rust-embed 8 and Tantivy 0.26;
+  - the Sparkles code.
+
+  It does not derive from any other database product. It has no explicit "Fluree was not
+  consulted" line, and Fluree is not among its sources.
 - **Implementation:** Phase 1, from the spec plus Sparkles code only (2026-09-30).
   - **Dependencies:**
-    - `zstd` 0.14.0 (BSD-3-Clause), with `zstd-safe` 8.0.0 and `zstd-sys`
-      2.1.0+zstd.1.5.7 (BSD-3-Clause; a C build of libzstd 1.5.7) and the `zstdmt`
-      feature. It is behind the `zstd` feature of `sparkles`: off in the library, on in
-      the server. The spec's table says MIT/Apache-2.0; the crate's `Cargo.toml` says
-      BSD-3-Clause (0.13 was MIT).
+    - `zstd` 0.14.0 (BSD-3-Clause), with `zstd-safe` 8.0.0, `zstd-sys`
+      2.1.0+zstd.1.5.7 (BSD-3-Clause) and the `zstdmt` feature. `zstd-sys` is a C build
+      of libzstd 1.5.7. The crate is behind the `zstd` feature of `sparkles`, which is
+      off in the library and on in the server. The spec's table says MIT/Apache-2.0, but
+      the crate's `Cargo.toml` says BSD-3-Clause. Version 0.13 was MIT.
     - `brotli` 8.0.4 (BSD-3-Clause AND MIT), pure Rust, with `brotli-decompressor` 5.0.3
-      (BSD-3-Clause/MIT) and `alloc-no-stdlib` 2.0.4 and `alloc-stdlib` 0.2.4
-      (BSD-3-Clause). It is behind the `brotli` feature, likewise off in the library and
-      on in the server.
+      (BSD-3-Clause/MIT), `alloc-no-stdlib` 2.0.4 and `alloc-stdlib` 0.2.4
+      (BSD-3-Clause). It is behind the `brotli` feature, which is also off in the
+      library and on in the server.
     - tower-http 0.7.1 (MIT) `decompression-full`, which adds `async-compression` 0.4.49
       and `compression-codecs` 0.4.44 (MIT OR Apache-2.0) over the same codec crates.
     - Tantivy's `zstd-compression` feature, which uses `zstd` 0.13.3 (MIT, `zstd-safe`
@@ -230,11 +255,12 @@ full design and, in its Outcome section, how the implementation landed.
     - The UI's precompression step (`ui/scripts/precompress.mjs`) uses Node's built-in
       zlib only.
   - **Not adopted:** `ruzstd` (MIT) and the `zstd-decode-pure` feature (spec §3).
-- **Deferred:** Phase 2 storage codecs (index blocks, vocabulary, spill files), gated on
-  measurements; Phase 3 repository blobs with F05.
-- **Rejected** (spec §1 non-goals; there is no rejected-alternatives section):
-  compressing the WAL, `delta.vocab` or `commits.bin`; in-memory compressed caches;
-  compressed network protocols other than HTTP `Content-Encoding`.
+- **Deferred:** Phase 2 storage codecs for index blocks, vocabulary and spill files,
+  which wait on measurements. Phase 3 repository blobs, together with F05.
+- **Rejected** (spec §1 non-goals, since the spec has no rejected-alternatives section):
+  - compressing the WAL, `delta.vocab` or `commits.bin`;
+  - in-memory compressed caches;
+  - compressed network protocols other than HTTP `Content-Encoding`.
 
 ## Backup repositories
 
@@ -242,90 +268,104 @@ full design and, in its Outcome section, how the implementation landed.
   2026-09-30 independently from:
   - the Sparkles code and specs (CI and F06 in full; C09 §§3–4, 7, 9);
   - Elasticsearch and Kibana public user documentation on snapshot and restore, as
-    evidence of desired behaviour only (both are source-available under non-permissive
-    licenses; no source code was read);
-  - the `object_store` 0.14.2 docs (MIT/Apache-2.0), the AWS S3 User Guide (conditional
-    writes, consistency), restic's design references (BSD-2-Clause; ideas only) and the
-    `croner` 4.0.0 docs (MIT), all fetched;
+    evidence of desired behaviour only. Both products are source-available under
+    non-permissive licenses, and no source code was read;
+  - the `object_store` 0.14.2 docs (MIT/Apache-2.0), the AWS S3 User Guide on
+    conditional writes and consistency, restic's design references (BSD-2-Clause, ideas
+    only) and the `croner` 4.0.0 docs (MIT), all fetched;
   - `chrono-tz`, `lz4_flex`, `age`, BLAKE3, S3 limits, the borg chunker (BSD-3-Clause),
     `s3s-fs`, the MinIO license, RFCs 9110, 3339 and 9562 and the IANA time zone
     database, cited from general knowledge.
 
   Fluree was not consulted.
 - **Implementation:** done (2026-09-30/10-01), from the spec, the implementation plan
-  (which overrides the spec where they differ) and the Sparkles code only:
-  - the `sparkles-backup` crate (repository engine, policies as pure functions);
+  and the Sparkles code only. Where the plan and the spec differ, the plan wins. The
+  implementation consists of:
+  - the `sparkles-backup` crate, with the repository engine and policies as pure
+    functions;
   - the engine's capture, lease, `reidentify` and `restoredFrom` support in `sparkles`;
-  - the server's `backup` module (registry, task slots, HTTP routes, in-place restore and
-    startup recovery, policy scheduler, metrics) behind the default-on `backup` feature
-    of `sparkles-server`;
+  - the server's `backup` module, behind the default-on `backup` feature of
+    `sparkles-server`. It holds the registry, task slots, HTTP routes, in-place restore
+    and startup recovery, the policy scheduler and metrics;
   - the `sparkles repo` / `sparkles backup` commands, the UI's Backups page,
     `docs/API.md` ("Backup repositories") and `scripts/backup-bench.sh`.
 
-  Phase 1 as delivered is spec Phase 1 plus policies, GC and the full UI, as the
-  maintainer decided.
-  - **Dependencies** (versions from `Cargo.lock`, licenses from each crate's
-    `Cargo.toml` and checked against its shipped license files):
-    - `object_store` 0.14.2 (`MIT/Apache-2.0`), `default-features = false`, features
-      `tokio`, `fs` and `aws` (the crate features `fs` and `s3` of `sparkles-backup`,
-      both default); `gcp` and `azure` stay behind the off-by-default `gcs` and `azure`
-      features. It reuses the workspace's reqwest 0.13, hyper 1 and aws-lc-rs/rustls.
-      Note: the published crate ships only the Apache-2.0 text (`LICENSE.txt`) and the
-      ASF `NOTICE.txt`; distributing a binary under the Apache-2.0 option means carrying
-      that NOTICE ("Apache Arrow Object Store, Copyright 2020-2026 The Apache Software
-      Foundation"). Not a blocker.
+  As the maintainer decided, the delivered Phase 1 is the spec's Phase 1 plus policies,
+  GC and the full UI.
+  - **Dependencies.** Versions come from `Cargo.lock`. Licenses come from each crate's
+    `Cargo.toml` and were checked against its shipped license files.
+    - `object_store` 0.14.2 (`MIT/Apache-2.0`), with `default-features = false` and the
+      features `tokio`, `fs` and `aws`. These map to the crate features `fs` and `s3` of
+      `sparkles-backup`, both on by default. `gcp` and `azure` stay behind the
+      off-by-default `gcs` and `azure` features. The crate reuses the workspace's
+      reqwest 0.13, hyper 1 and aws-lc-rs/rustls. The published crate ships only the
+      Apache-2.0 text (`LICENSE.txt`) and the ASF `NOTICE.txt`. A binary distributed
+      under the Apache-2.0 option must carry that NOTICE ("Apache Arrow Object Store,
+      Copyright 2020-2026 The Apache Software Foundation"). This is not a blocker.
     - `croner` 4.0.0 (MIT; `LICENSE.md`), with `derive_builder` 0.20.2 (MIT OR
-      Apache-2.0; `darling` 0.20.11, MIT, a build-time proc macro) and `strum` 0.27.2 /
-      `strum_macros` 0.27.2 (MIT). Builds with chrono 0.4.45, so the planned fallback
-      parser was not needed.
-    - `chrono-tz` 0.10.4 (MIT OR Apache-2.0; the bundled IANA tz data is public domain),
-      with `phf` / `phf_shared` 0.12.1 (MIT) and `siphasher` 1.0.4 (MIT OR Apache-2.0).
-      No `chrono-tz-build` step (the 0.10 tables are pre-generated).
-    - New through `object_store`: `crc-fast` 1.10.0 (MIT OR Apache-2.0; pure Rust, no
-      build script) with `digest` 0.10.7 and `crypto-common` 0.1.7 (MIT OR Apache-2.0),
-      `generic-array` 0.14.7 (MIT) and `spin` 0.10.1 (MIT); `humantime` 2.4.0 (MIT OR
-      Apache-2.0); `itertools` 0.15.0 (MIT OR Apache-2.0; a second version next to
-      0.14.0); `nix` 0.31.3 (MIT); `quick-xml` 0.41.0 (MIT; next to 0.37.5);
-      `wasm-streams` 0.5.0 (MIT OR Apache-2.0; wasm targets only, never built here).
+      Apache-2.0), `strum` 0.27.2 and `strum_macros` 0.27.2 (MIT). `derive_builder` uses
+      `darling` 0.20.11 (MIT), a build-time proc macro. `croner` builds with chrono
+      0.4.45, so the planned fallback parser was not needed.
+    - `chrono-tz` 0.10.4 (MIT OR Apache-2.0), with `phf` / `phf_shared` 0.12.1 (MIT) and
+      `siphasher` 1.0.4 (MIT OR Apache-2.0). The bundled IANA tz data is public domain.
+      There is no `chrono-tz-build` step, because the 0.10 tables are pre-generated.
+    - New through `object_store`:
+      - `crc-fast` 1.10.0 (MIT OR Apache-2.0), pure Rust with no build script, with
+        `digest` 0.10.7 and `crypto-common` 0.1.7 (MIT OR Apache-2.0), `generic-array`
+        0.14.7 (MIT) and `spin` 0.10.1 (MIT);
+      - `humantime` 2.4.0 (MIT OR Apache-2.0);
+      - `itertools` 0.15.0 (MIT OR Apache-2.0), a second version next to 0.14.0;
+      - `nix` 0.31.3 (MIT);
+      - `quick-xml` 0.41.0 (MIT), next to 0.37.5;
+      - `wasm-streams` 0.5.0 (MIT OR Apache-2.0), for wasm targets only and never built
+        here.
     - Reused, already in the workspace: `sha2`, `lz4_flex`, `futures`, `bytes`,
       `async-trait`, `percent-encoding`, `tokio`, `uuid`, `chrono`, `serde_json`, `toml`.
-    - Nothing non-permissive: every new crate is MIT, Apache-2.0 or both. MinIO
-      (AGPL-3.0) remains an external test process only (the S3 tests run only with
-      `SPARKLES_TEST_S3_ENDPOINT`); `age` (Phase 3 encryption) is not a dependency yet.
-  - **Deviations from the spec** (decisions of the plan and of the implementation):
-    - Leases are keyed by generation, not by commit (`Lease { generation, label }`;
-      history GC keeps a leased generation unconditionally, shown as `backup:<name>`):
-      after a compaction the new generation's base covers the captured commit, so a
-      lease by commit would not have kept the old generation.
-    - `validation.json` and `validation-shapes.ttl` are backed up as meta files (the
-      spec's file list omitted them; clones copy them too), and the restore path grammar
-      accepts them.
-    - Repositories registered through the API are restricted beyond the spec: S3
-      credentials only by name (`{"source": "named", "name": …}`, resolved from the
-      config file's `[credentials.<name>]` tables), never `env`, `file` or `default`
-      chosen by the caller; S3 endpoints (and every address their host resolves to)
-      under the server's outbound policy, with connections pinned to the checked
-      addresses through a custom DNS resolver; `fs` paths under `[api] fs_roots` when
-      set and outside the directories of the server's config files; `gcs`/`azure`
-      from the config file only. Endpoint URLs refuse userinfo, queries and fragments.
-    - Blob header byte 5 is the codec (0 raw, 1 LZ4, 2 zstd reserved) and byte 6 the
-      encryption (0 none); still format 1.
-    - In-place restores answer requests for the dataset `503 dataset-restoring` with
-      `Retry-After: 5` from a router layer (the spec's check in `dataset()` could not
-      guarantee "never 404"); server-wide tasks have `dataset: ""` and are listed for
-      `server-admin` only; `verified` comes from a server-local `<data>/backup/verify.json`;
-      `Repository.lastGc` from `gc/last.json`; `<data>/sparkles-server.lock` makes one
-      server per data directory and guards `sparkles backup restore --data`.
-    - Schedules: croner in naive local time with Sparkles' own DST mapping (skipped
-      times run after the gap, repeated ones once); `every <duration>` is epoch-aligned
-      in UTC.
-    - At most 4 tasks wait per `--backup-max-tasks` slot (`503 too-many-tasks` beyond).
-    - Not as specified (yet): `507 insufficient-storage` is defined but no restore
-      checks free space; `sparkles_backup_object_requests_total` counts only the
-      successful requests that verification and GC reports carry (`result="ok"`), not
-      every request with `ok|error`; in-memory datasets answer
-      `501 backup-unsupported`; `sparkles backup policy run` (offline) is refused
-      (Phase 2).
+    - Nothing is non-permissive. Every new crate is MIT, Apache-2.0 or both. MinIO
+      (AGPL-3.0) is only an external test process, and the S3 tests run only with
+      `SPARKLES_TEST_S3_ENDPOINT`. `age`, for Phase 3 encryption, is not a dependency
+      yet.
+  - **Deviations from the spec.** The plan and the implementation made these decisions:
+    - Leases are keyed by generation, not by commit (`Lease { generation, label }`).
+      After a compaction, the new generation's base covers the captured commit, so a
+      lease by commit would not have kept the old generation. History GC keeps a leased
+      generation unconditionally and shows it as `backup:<name>`.
+    - `validation.json` and `validation-shapes.ttl` are backed up as meta files, and the
+      restore path grammar accepts them. The spec's file list omitted them, and clones
+      copy them as well.
+    - Repositories registered through the API are restricted beyond the spec:
+      - S3 credentials are named only (`{"source": "named", "name": …}`) and resolved
+        from the config file's `[credentials.<name>]` tables. The caller can never
+        choose `env`, `file` or `default`.
+      - S3 endpoints, and every address their host resolves to, are under the server's
+        outbound policy. A custom DNS resolver pins connections to the checked
+        addresses.
+      - `fs` paths must lie under `[api] fs_roots` when it is set, and outside the
+        directories of the server's config files.
+      - `gcs` and `azure` repositories come from the config file only.
+      - Endpoint URLs refuse userinfo, queries and fragments.
+    - Blob header byte 5 is the codec (0 raw, 1 LZ4, 2 zstd reserved), and byte 6 is
+      the encryption (0 none). The format is still 1.
+    - During an in-place restore, a router layer answers requests for the dataset with
+      `503 dataset-restoring` and `Retry-After: 5`. The spec's check in `dataset()`
+      could not guarantee "never 404".
+    - Server-wide tasks have `dataset: ""` and are listed for `server-admin` only.
+    - `verified` comes from a server-local `<data>/backup/verify.json`, and
+      `Repository.lastGc` from `gc/last.json`.
+    - `<data>/sparkles-server.lock` allows one server per data directory and guards
+      `sparkles backup restore --data`.
+    - Schedules use croner in naive local time with a DST mapping written for Sparkles.
+      Skipped times run after the gap, and repeated times run once. `every <duration>`
+      is aligned to the epoch in UTC.
+    - At most 4 tasks wait per `--backup-max-tasks` slot. Beyond that, requests get
+      `503 too-many-tasks`.
+    - Some parts are not built as specified:
+      - `507 insufficient-storage` is defined, but no restore checks free space.
+      - `sparkles_backup_object_requests_total` counts only the successful requests
+        that verification and GC reports carry (`result="ok"`), not every request with
+        `ok|error`.
+      - In-memory datasets answer `501 backup-unsupported`.
+      - `sparkles backup policy run` (offline) is refused until Phase 2.
 - **Rejected** (spec §8):
   - N-Quads dumps as the backup format;
   - a tar of the database directory per backup;
@@ -346,7 +386,7 @@ full design and, in its Outcome section, how the implementation landed.
 ## Formatter
 
 - **Spec:** [`X02-formatter.md`](X02-formatter.md), written on 2026-09-30 independently
-  as internal engineering, from:
+  as internal engineering. Its sources are:
   - the W3C and IETF specifications: SPARQL 1.1 and 1.2 Query, SPARQL 1.1 Update and
     Results JSON, RDF 1.1 and 1.2 Turtle, TriG, N-Triples, N-Quads and Concepts,
     RDFC-1.0, JSON-LD 1.1, RFC 8259 and BCP 47;
@@ -358,11 +398,11 @@ full design and, in its Outcome section, how the implementation landed.
     RDF 1.2 constructs only);
   - the Sparkles code, spargebra 0.4.7, oxttl 0.2.4 and oxrdf 0.3.4.
 
-  No code was read or copied from any GPL or LGPL project. It has no explicit "Fluree was
-  not consulted" line, and Fluree is not among its sources.
-- **Implementation** (slice 1, 2026-09-30: SPARQL queries and updates, `sparkles fmt`,
-  `POST /$/format`, the UI's Format button): from the spec, the slice plan and the
-  Sparkles code only. Fluree was not consulted.
+  No code was read or copied from any GPL or LGPL project. The spec has no explicit
+  "Fluree was not consulted" line, and Fluree is not among its sources.
+- **Implementation, slice 1** (2026-09-30): SPARQL queries and updates, `sparkles fmt`,
+  `POST /$/format` and the UI's Format button. It was built from the spec, the slice plan
+  and the Sparkles code only. Fluree was not consulted.
   - **Design sources:**
     - Philip Wadler, "A prettier printer" (1998/2003), for the document algebra (text,
       line, group, nest) and the fits-then-break rule;
@@ -370,9 +410,10 @@ full design and, in its Outcome section, how the implementation landed.
       `group`, `indent`, `line`/`softline`/`hardline`, `ifBreak` with a group id,
       `lineSuffix`, `breakParent`, `cursorOffset`, `--check`/`--list-different`/`--write`
       and their exit codes, ignore files and `prettier-ignore`;
-    - rust-analyzer's syntax-tree approach from its public architecture and design docs
-      (MIT OR Apache-2.0): a lossless token stream, a hand-written recursive-descent
-      parser with markers (`start`/`complete`/`precede`), trivia kept by token adjacency;
+    - rust-analyzer's syntax-tree approach, from its public architecture and design docs
+      (MIT OR Apache-2.0). It uses a lossless token stream and a hand-written
+      recursive-descent parser with markers (`start`/`complete`/`precede`), and keeps
+      trivia by token adjacency;
     - the W3C SPARQL 1.1 and 1.2 grammars (EBNF, terminals, keyword spellings), with
       spargebra 0.4.7 (MIT OR Apache-2.0, already a dependency) as the reference parser and
       the source of the algebra the safety check compares.
@@ -382,20 +423,21 @@ full design and, in its Outcome section, how the implementation landed.
       (`sparkles-fmt`);
     - `ignore` 0.4.33 (Unlicense OR MIT): directory walks with gitignore rules and
       `.sparklesfmtignore` (server, feature `fmt`);
-    - `similar` 2.7.0 (Apache-2.0): `--diff` unified diffs (server, feature `fmt`; the spec
-      named 3, the lock had 2);
+    - `similar` 2.7.0 (Apache-2.0): `--diff` unified diffs (server, feature `fmt`). The
+      spec named version 3, but the lock had 2;
     - `proptest` 1.11.0 (MIT OR Apache-2.0): property tests, dev only (`sparkles-fmt`);
     - `toml` 1.1.6 (MIT OR Apache-2.0, already an optional dependency for auth and backup):
       `.sparklesfmt.toml`, now also enabled by feature `fmt`;
     - reused: `thiserror` 2.0.21 (MIT OR Apache-2.0), `rayon` and `tempfile` (parallel
       files and atomic `--write`), `sha2` (the input hash in refusal logs).
-  - **Test-only switch:** feature `fault-injection` of `sparkles-fmt`, enabled only through
-    dev-dependencies (its own tests and `sparkles-server`'s); with
-    `SPARKLES_FMT_FAULT=drop-token` the printer drops a token so the tests can show that
-    the CLI and the endpoint refuse such output.
-- **Later slices** (2026-10-01: Turtle, TriG, N-Triples, N-Quads and JSON-LD,
-  `sparkles lsp`, the optional WebAssembly build for the UI, streaming Turtle and TriG):
-  from the spec, the plan for the remaining slices and the Sparkles code only.
+  - **Test-only switch:** the `fault-injection` feature of `sparkles-fmt`. Only
+    dev-dependencies enable it, in its own tests and in `sparkles-server`'s. With
+    `SPARKLES_FMT_FAULT=drop-token`, the printer drops a token, so the tests can show
+    that the CLI and the endpoint refuse such output.
+- **Later slices** (2026-10-01): Turtle, TriG, N-Triples, N-Quads and JSON-LD,
+  `sparkles lsp`, the optional WebAssembly build for the UI, and streaming Turtle and
+  TriG. They were built from the spec, the plan for the remaining slices and the
+  Sparkles code only.
   - **New dependencies** (all permissive; versions from `Cargo.lock`):
     - `json-event-parser` 0.2.3 (MIT OR Apache-2.0, from the Oxigraph developers): the JSON
       tokenizer of the JSON-LD formatter (`sparkles-fmt`);
@@ -416,12 +458,13 @@ full design and, in its Outcome section, how the implementation landed.
 
 ## Patched spargebra (vendored)
 
-- **Adopted:** `spargebra` 0.4.7 (MIT OR Apache-2.0, per its `Cargo.toml`; copyright the
-  Oxigraph developers) from crates.io, copied to `vendor/spargebra` and used through
-  `[patch.crates-io]` in the workspace `Cargo.toml` (2026-09-30).
-- **Changes** (`vendor/spargebra/PATCHED.md`), written against 0.4.7's rust-peg grammar
-  from the W3C SPARQL 1.1 and 1.2 Query grammars and the W3C test suite, not ported from
-  upstream:
+- **Adopted:** `spargebra` 0.4.7 from crates.io (2026-09-30). Its `Cargo.toml` gives the
+  license as MIT OR Apache-2.0, and the copyright belongs to the Oxigraph developers. The
+  crate is copied to `vendor/spargebra` and used through `[patch.crates-io]` in the
+  workspace `Cargo.toml`.
+- **Changes** (`vendor/spargebra/PATCHED.md`): written against 0.4.7's rust-peg grammar
+  from the W3C SPARQL 1.1 and 1.2 Query grammars and the W3C test suite. None were
+  ported from upstream.
   - left-associative `+ -` and `* /`;
   - case-insensitive `true` / `false`;
   - longest match for `<` against `IRIREF`;
@@ -429,83 +472,101 @@ full design and, in its Outcome section, how the implementation landed.
   - SELECT expressions see earlier aliases;
   - no nested aggregates;
   - triple-term subjects restricted per the SPARQL 1.2 grammar rules [123] and [138].
-- **Notes:** like the published crate, the copy has no `LICENSE` files; the license is
-  the `Cargo.toml` field. The copy is dropped once a spargebra release has these fixes.
+- **Notes:** like the published crate, the copy has no `LICENSE` files. The license is
+  the `Cargo.toml` field. The copy will be dropped once a spargebra release has these
+  fixes.
 - **Rejected:** waiting for an upstream release, and porting the rewritten parser of
   Oxigraph's development version.
 
 ## GeoSPARQL
 
-- **Spec:** [`G01-geosparql.md`](G01-geosparql.md), from the OGC GeoSPARQL 1.1 standard
-  (OGC document license), Apache Jena's `jena-geosparql` (Apache-2.0; read for behaviour,
-  the `spatial:` and `spatialF:` surface and its divergences, no code copied), Oxigraph's
-  `spargeo` (Apache-2.0/MIT, read), QLever's spatial support (Apache-2.0, read) and the
-  Sparkles code. Fluree was not consulted.
-- **Implementation** (Phase 1, 2026-10-01): the `geo` feature of `sparkles` (on in the
-  server), built on `geo` 0.33.1 (default features off, renamed `georust`), `geo-index`
-  0.4.0 (both MIT OR Apache-2.0; `wkt` and `geojson` were tried and dropped) and
-  `geographiclib-rs` 0.2.7 (MIT; a port of Karney's GeographicLib). New transitive crates (`i_overlay`, `robust`, `rstar`, `geo-traits`,
-  `geo-types`, `float_next_after`, `heapless`, `accurate`, …) are all MIT and/or
-  Apache-2.0, with no `earcutr` or `spade`; `THIRD_PARTY_LICENSES.md` lists them.
+- **Spec:** [`G01-geosparql.md`](G01-geosparql.md). Its sources are:
+  - the OGC GeoSPARQL 1.1 standard (OGC document license);
+  - Apache Jena's `jena-geosparql` (Apache-2.0), read for behaviour, the `spatial:` and
+    `spatialF:` surface and its divergences. No code was copied;
+  - Oxigraph's `spargeo` (Apache-2.0/MIT) and QLever's spatial support (Apache-2.0),
+    both read;
+  - the Sparkles code.
+
+  Fluree was not consulted.
+- **Implementation, Phase 1** (2026-10-01): the `geo` feature of `sparkles`, which is on
+  in the server. It is built on three crates:
+  - `geo` 0.33.1 (MIT OR Apache-2.0), with default features off, renamed `georust`;
+  - `geo-index` 0.4.0 (MIT OR Apache-2.0);
+  - `geographiclib-rs` 0.2.7 (MIT), a port of Karney's GeographicLib.
+
+  `wkt` and `geojson` were tried and dropped. The new transitive crates (`i_overlay`,
+  `robust`, `rstar`, `geo-traits`, `geo-types`, `float_next_after`, `heapless`,
+  `accurate`, …) are all MIT and/or Apache-2.0, and there is no `earcutr` or `spade`.
+  `THIRD_PARTY_LICENSES.md` lists them.
   - The WKT and GeoJSON readers and writers are hand-written from the GeoSPARQL 1.1 and
-    Simple Features grammars and RFC 7946 (the `wkt` crate gives no error offsets and has no
-    TRIANGLE/TIN). The CRS and unit tables come from the OGC, EPSG and QUDT registries.
-  - Topology through DE-9IM (`geo`'s relate); geodesic distance, area and buffers through
-    GeographicLib (Karney 2013); GeographicLib's published values are test oracles.
-  - The spatial index (packed R-tree base, overlay and tail) and the planner/executor are
-    written from the spec and the Sparkles store and planner code.
-  - **Test data and tools:** the GPL-2.0 GeoSPARQL Compliance Benchmark is never vendored:
-    `scripts/geosparql-benchmark.sh` fetches it at test time into `target/` (pinned commit
-    879e0746) only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`; its README and file names (not its
-    code) were consulted to write the runner.
+    Simple Features grammars and RFC 7946. The `wkt` crate gives no error offsets and
+    has no TRIANGLE/TIN. The CRS and unit tables come from the OGC, EPSG and QUDT
+    registries.
+  - Topology uses DE-9IM (`geo`'s relate). Geodesic distance, area and buffers use
+    GeographicLib (Karney 2013), and GeographicLib's published values serve as test
+    oracles.
+  - The spatial index (packed R-tree base, overlay and tail) and the planner and
+    executor are written from the spec and the Sparkles store and planner code.
+  - **Test data and tools:** the GeoSPARQL Compliance Benchmark is GPL-2.0 and is never
+    vendored. `scripts/geosparql-benchmark.sh` fetches it at test time into `target/`
+    at pinned commit 879e0746, and only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Its README
+    and file names were consulted to write the runner. Its code was not.
 - **Phase 2** (2026-10-01): spatial joins, nearest neighbours, query rewrite, hulls and
-  aggregates, conversion and the UI's maps, from the spec, the Phase 2 plan and the
+  aggregates, conversion and the UI's maps. Built from the spec, the Phase 2 plan and the
   Sparkles code. Fluree was not consulted.
   - **UI dependencies:** `maplibre-gl` 6.11.2 (BSD-3-Clause) and its `@maplibre/*` packages
     (ISC, MIT, MIT OR Apache-2.0), listed in `THIRD_PARTY_LICENSES-UI.md`.
   - **Data:** the bundled basemap is Natural Earth 1:110m, release 5.1.2 (public domain),
     reduced by `scripts/basemap.mjs` (`ui/src/lib/basemap/README.md`).
-  - The GeoSPARQL vocabulary axioms behind `--vocab geosparql` are written by hand from the
-    standard; no OGC files are vendored.
+  - The GeoSPARQL vocabulary axioms behind `--vocab geosparql` are written by hand from
+    the standard. No OGC files are vendored.
 
 ## ShEx validation
 
-- **Spec:** [`G02-shex.md`](G02-shex.md), written on 2026-09-30 independently from the Sparkles
-  code and spec C10; the ShEx 2.1 Final Community Group Report and the ShapeMap draft
-  (shex.io; W3C Software and Document License; the shape-map repository is MIT), both
-  fetched; the shexTest suite (W3C Software and Document License), upstream and as
-  vendored in Apache Jena; Apache Jena's `jena-shex`, `jena-cmds` and `jena-fuseki2`
-  sources (Apache-2.0), read for behaviour and CLI surface, no code copied; rudof 0.3.24
-  (MIT OR Apache-2.0), inspected for licensing, dependency weight, API and conformance,
-  not used as a dependency; and papers by Staworko et al. (ICDT 2015), Boneva, Labra Gayo
-  and Prud'hommeaux (ISWC 2017) and Labra Gayo et al. (2015, RBE derivatives). Fluree
-  was not consulted.
-- **Implementation** (Phase 1, 2026-10-01): from the spec, the plan and the Sparkles
+- **Spec:** [`G02-shex.md`](G02-shex.md), written on 2026-09-30 independently from:
+  - the Sparkles code and spec C10;
+  - the ShEx 2.1 Final Community Group Report and the ShapeMap draft from shex.io, both
+    fetched. Both are under the W3C Software and Document License, and the shape-map
+    repository is MIT;
+  - the shexTest suite (W3C Software and Document License), upstream and as vendored in
+    Apache Jena;
+  - Apache Jena's `jena-shex`, `jena-cmds` and `jena-fuseki2` sources (Apache-2.0), read
+    for behaviour and CLI surface. No code was copied;
+  - rudof 0.3.24 (MIT OR Apache-2.0), inspected for licensing, dependency weight, API
+    and conformance. It is not a dependency;
+  - papers by Staworko et al. (ICDT 2015), Boneva, Labra Gayo and Prud'hommeaux (ISWC
+    2017) and Labra Gayo et al. (2015, RBE derivatives).
+
+  Fluree was not consulted.
+- **Implementation, Phase 1** (2026-10-01): from the spec, the plan and the Sparkles
   code. Fluree was not consulted.
-  - The conformance harness (`crates/sparkles-shex/tests/shextest.rs`) reads the shexTest
-    manifests itself (oxttl for Turtle, serde_json for JSON-LD); Jena's
-    `ShexTests.java` and `ShexValidationTest.java` (Apache-2.0) were read for how the
-    suite is run (base IRIs, the start-focus and map forms, extension results, its
-    exclusions), no code copied.
+  - The conformance harness (`crates/sparkles-shex/tests/shextest.rs`) reads the
+    shexTest manifests itself, with oxttl for Turtle and serde_json for JSON-LD. Jena's
+    `ShexTests.java` and `ShexValidationTest.java` (Apache-2.0) were read to learn how
+    the suite is run: base IRIs, the start-focus and map forms, extension results and
+    its exclusions. No code was copied.
   - The server endpoint (`http/shex.rs`) and `sparkles shex` (`shex_cmd.rs`) follow the
     `/{ds}/shacl` handler and `sparkles shacl` in the Sparkles code.
-  - The ShExC lexer and parser (`shexc/`) are hand-written from the ShEx 2.1 grammar;
-    the suite's ShExJ files were the reference for the parsed form. No parser generator.
+  - The ShExC lexer and parser (`shexc/`) are hand-written from the ShEx 2.1 grammar,
+    without a parser generator. The suite's ShExJ files were the reference for the
+    parsed form.
   - The ShExJ reader (`shexj.rs`) follows the ShExJ section of the ShEx 2.1 report.
   - Schema checks and compilation follow the report's well-formedness and stratification
     rules (Boneva et al. 2017 for stratified negation).
-  - The matcher decides a neighbourhood partition by iteration-count intervals per group
-    rather than RBE derivatives; the brute-force partition enumerator in its tests reads
-    the report's partition definition literally. Typing is a per-stratum greatest fixed
-    point (Staworko et al. 2015; Boneva et al. 2017).
-  - Node constraints reuse `sparkles::xsd` for lexical forms and value comparison; facet
-    semantics follow the report and its errata.
-  - Shape maps follow the ShapeMap draft; Jena's compact-map extensions (BASE/PREFIX,
-    optional commas, trailing `.`) were taken from reading `jena-shex`, no code copied.
-  - Imports and EXTERNAL resolution follow the report; http(s) imports go through
+  - The matcher decides a neighbourhood partition by iteration-count intervals per
+    group, not by RBE derivatives. The brute-force partition enumerator in its tests
+    follows the report's partition definition literally. Typing is a per-stratum
+    greatest fixed point (Staworko et al. 2015; Boneva et al. 2017).
+  - Node constraints reuse `sparkles::xsd` for lexical forms and value comparison.
+    Facet semantics follow the report and its errata.
+  - Shape maps follow the ShapeMap draft. Jena's compact-map extensions (BASE/PREFIX,
+    optional commas, trailing `.`) were learned from reading `jena-shex`. No code was
+    copied.
+  - Imports and EXTERNAL resolution follow the report. http(s) imports go through
     `sparkles::outbound`.
-  - **Dependencies:** none new; `sparkles-shex` uses workspace crates only (`smallvec` and
-    `oxilangtag` were already in the lock).
+  - **Dependencies:** none new. `sparkles-shex` uses workspace crates only, and
+    `smallvec` and `oxilangtag` were already in the lock.
   - **Test data:** shexTest is read from the Jena checkout or `SPARKLES_SHEX_TESTS`,
     not vendored.
   - **Development-only:** the rudof CLI as a differential oracle (`bench:shex
@@ -515,8 +576,9 @@ full design and, in its Outcome section, how the implementation landed.
   - porting Jena's partition-enumeration validator;
   - goal-directed recursive validation with hypothesis stacks;
   - translating ShEx to SHACL or SPARQL;
-  - RBE derivatives as the matcher (the spec preferred them; the interval method was
-    adopted in implementation because it is exact and linear, checked by an oracle);
+  - RBE derivatives as the matcher. The spec preferred them, but the implementation
+    adopted the interval method because it is exact and linear, and an oracle checks
+    it;
   - ShEx 2.2 in Phase 1;
   - executing semantic actions other than the Test extension;
   - an RDF report format;
@@ -533,8 +595,8 @@ full design and, in its Outcome section, how the implementation landed.
     (`ui/pnpm-lock.yaml`), with its `@oxfmt/binding-*` 0.71.0 platform packages (MIT) and
     `tinypool` 2.2.0 (MIT);
   - `shfmt` 3.14.1 (BSD-3-Clause, mvdan/sh), pinned in `mise.toml`;
-  - `shellcheck` 0.11.0 (GPL-3.0), pinned in `mise.toml`. It is a development tool only:
-    it is run on the shell scripts and is never linked, bundled or shipped.
+  - `shellcheck` 0.11.0 (GPL-3.0), pinned in `mise.toml`. It is a development tool only.
+    It runs on the shell scripts and is never linked, bundled or shipped;
   - `nixfmt` (MPL-2.0), the flake's formatter, pinned by `flake.lock`.
 - **Design source:** the tools' own documentation.
 - **Replaced:** Prettier and `prettier-plugin-svelte` (MIT), removed from the UI.

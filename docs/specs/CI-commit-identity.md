@@ -1,80 +1,85 @@
 # CI: Durable commit identity and commit receipts
 
-> **Status:** implemented in part (Phases 1 and 2; Phase 3 not built)
+> **Status:** Phases 1 and 2 are implemented. Phase 3 is not built.
 >
-> **Phases:** Phase 1 (dataset ids, commit sequence, WAL commit records, catalog, receipts,
-> headers, `/$/commits`, `sparkles log`); Phase 2 (UI history and receipts, headers on
-> explain and SHACL, `meta.commit`, `id`/`head`/`modified` on datasets, `sparkles log --at`,
-> the in-memory ring); Phase 3 (change digest, `ETag`, commit messages) not built.
+> **Phases:** Phase 1 added dataset ids, the commit sequence, WAL commit records, the
+> catalog, receipts, headers, `/$/commits` and `sparkles log`. Phase 2 added the UI history
+> and receipts, headers on explain and SHACL, `meta.commit`, `id`/`head`/`modified` on
+> datasets, `sparkles log --at` and the in-memory ring. Phase 3 (change digest, `ETag`,
+> commit messages) is not built.
 >
 > **User docs:** [API: Commits](../API.md#commits) · [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
-> This is the design as written before implementation; the [Outcome](#outcome) section at the end
-> records how it landed.
+> This is the design as written before implementation. The [Outcome](#outcome) section at
+> the end records how it landed.
 
-This is a clean-room spec. It is the prerequisite for full-text and vector search
+This is a clean-room spec. Several later features build on it: full-text and vector search
 watermarks ([F03](F03-full-text-search.md), [F04](F04-vector-search.md)), point-in-time
 queries (`?at=commit:<n>`, [F06](F06-snapshots-and-point-in-time.md)), change events and
 remote storage ([F05](F05-snapshot-repositories.md)).
 
 ## 1. Summary, goals, non-goals
 
-Sparkles has in-process snapshot versions (`Snapshot::version`, reset on every restart and
-bumped by compaction), a per-generation WAL (`gen-NNNN/wal.log`) and immutable generations
-switched through `CURRENT`. Nothing identifies a *data state* durably. This feature adds:
+Sparkles has in-process snapshot versions (`Snapshot::version`), which reset on every
+restart and are incremented by compaction. It also has a WAL per generation (`gen-NNNN/wal.log`) and
+immutable generations switched through `CURRENT`. None of these identifies a *data state*
+durably. This feature adds four things:
 
-* a **dataset id**: a UUID created with the database and stored in it;
-* a **commit sequence number** (`seq`): a gap-free, strictly increasing `u64` per dataset.
-  Every committed write that changes data gets the next `seq`. `seq` survives restart,
-  WAL replay, compaction and bulk-write generations. Commit `0` is the root. It is created
-  with the database, or when an existing database is first opened by a version with this
-  feature;
-* a **commit record** per `seq`: server timestamp, parent, effective quad counts, dataset
-  size after the commit, operation kind, generation and flags;
-* **receipts** from every write API (library, SPARQL Update, GSP, upload, CLI), a
-  `Sparkles-Commit` response header on writes *and* reads, a **commit catalog** listable
-  over HTTP (`GET /$/commits/{ds}`) and CLI (`sparkles log`), and UI surfaces.
+* A **dataset id**. This is a UUID created with the database and stored in it.
+* A **commit sequence number** (`seq`). This is a gap-free, strictly increasing `u64` per
+  dataset. Every committed write that changes data gets the next `seq`. The `seq` survives
+  restart, WAL replay, compaction and bulk-write generations. Commit `0` is the root. It is
+  created with the database, or when a version with this feature first opens an existing
+  database.
+* A **commit record** for each `seq`. It holds the server timestamp, the parent, the
+  effective quad counts, the dataset size after the commit, the operation kind, the
+  generation and some flags.
+* **Receipts** and a **commit catalog**. Every write API (library, SPARQL Update, GSP,
+  upload, CLI) returns a receipt. Writes *and* reads carry a `Sparkles-Commit` response
+  header. The catalog can be listed over HTTP (`GET /$/commits/{ds}`), from the CLI
+  (`sparkles log`) and in the UI.
 
-Goals: crash-safe (a `seq` is durable exactly when its data is), deterministic replay (a
-reopened store reproduces the same `seq`, timestamp and counts), and near-zero overhead
-(no extra fsync on the WAL path). The default HTTP responses stay Fuseki-compatible.
+The feature has three goals. It must be crash-safe: a `seq` is durable exactly when its
+data is. Replay must be deterministic: a reopened store reproduces the same `seq`,
+timestamp and counts. The overhead must be close to zero, with no extra fsync on the WAL
+path. The default HTTP responses stay Fuseki-compatible.
 
-Non-goals (later features): keeping old *data* for time travel (only commit *metadata* is
-retained here), `?at=` query selectors, branches/forks, signed or content-addressed
-commits, commit messages/authors, replication.
+Several things are left to later features. This feature keeps only commit *metadata*, not
+old *data* for time travel. It has no `?at=` query selectors, branches or forks, signed or
+content-addressed commits, commit messages or authors, or replication.
 
 ## 2. User-visible behavior
 
 ### 2.1 Identifiers
 
-* **Dataset id**: a UUID (RFC 9562, version 4), lowercase hyphenated text,
-  e.g. `3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa`. It names a *lineage* of commits. A new
+* **Dataset id.** A UUID (RFC 9562, version 4) written as lowercase hyphenated text, for
+  example `3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa`. It names a *lineage* of commits. A new
   database gets a new id. So does a dataset re-created under the same name, and a dump
-  reloaded into a new directory. Copying the directory byte-for-byte keeps the id (see
+  reloaded into a new directory. A byte-for-byte copy of the directory keeps the id (see
   Open questions).
-* **Commit id**: the decimal `seq`, scoped by the dataset id. A commit is fully
-  identified by the pair (dataset id, seq). The textual reference form is
-  `commit:<seq>` (e.g. `commit:42`). It is reserved for the future `?at=commit:42` selector
-  and is accepted by `sparkles log --at`/`GET /$/commits/{ds}/{ref}` as a synonym for
-  `42`.
-* **Parent**: `seq − 1`. The root commit (`seq 0`) has parent `null`. History is linear
-  within a dataset id.
-* **Timestamp**: server wall clock, RFC 3339 in UTC with millisecond precision and `Z`
-  (`2026-09-30T14:03:11.482Z`). It is clamped to be non-decreasing:
-  `ts(n) = max(now, ts(n−1))`. That makes a later `?at=time:` selector a well-defined
-  binary search.
+* **Commit id.** The decimal `seq`, scoped by the dataset id. The pair (dataset id, seq)
+  identifies a commit fully. The textual reference form is `commit:<seq>`, for example
+  `commit:42`. It is reserved for the future `?at=commit:42` selector. `sparkles log --at`
+  and `GET /$/commits/{ds}/{ref}` accept it as a synonym for `42`.
+* **Parent.** The parent is `seq − 1`. The root commit (`seq 0`) has parent `null`. History
+  is linear within a dataset id.
+* **Timestamp.** The server's wall clock, in RFC 3339 UTC with millisecond precision and a
+  `Z` suffix (`2026-09-30T14:03:11.482Z`). It is clamped so it never decreases:
+  `ts(n) = max(now, ts(n−1))`. A later `?at=time:` selector can then use a binary search.
 
 ### 2.2 What creates a commit
 
-A commit is created **iff** a write transaction has a non-zero *net* effect or staged a
-bulk batch. Examples of a net-zero transaction: `INSERT DATA` of quads already present,
-`DELETE DATA` of absent quads, or an insert and a delete of the same quad in one request.
-A net-zero transaction creates no commit. Its receipt says `"committed": false` and
-carries the unchanged head. Compaction creates no commit: data is unchanged, the head
-keeps its `seq`, and only the snapshot `version` and generation change. Prefix changes
-(`prefixes.json`) are not data and create no commit.
+A write transaction creates a commit **iff** it has a non-zero *net* effect or staged a
+bulk batch. `INSERT DATA` of quads already present is net-zero. So is `DELETE DATA` of
+absent quads, and so is an insert and a delete of the same quad in one request. A net-zero
+transaction creates no commit. Its receipt says `"committed": false` and carries the
+unchanged head.
 
-Operation kinds (JSON name / on-disk code):
+Compaction creates no commit. The data is unchanged and the head keeps its `seq`. Only the
+snapshot `version` and the generation change. Prefix changes (`prefixes.json`) are not
+data and create no commit either.
+
+Each commit has an operation kind, with a JSON name and an on-disk code:
 
 | kind | code | produced by |
 |---|---|---|
@@ -93,40 +98,39 @@ Operation kinds (JSON name / on-disk code):
 
 ### 2.3 Counts
 
-* `inserted` / `deleted` are **net effective** changes relative to the parent commit. A
-  quad is counted once. Re-inserting a present quad or deleting an absent one counts 0.
-  An insert and a delete of the same quad in one transaction count 0 each. Invariant:
-  `quads(n) = quads(n−1) + inserted − deleted`.
+* `inserted` and `deleted` are the **net effective** changes relative to the parent
+  commit. Each quad counts once. Re-inserting a present quad or deleting an absent one
+  counts 0. An insert and a delete of the same quad in one transaction count 0 each. The
+  invariant is `quads(n) = quads(n−1) + inserted − deleted`.
 * `exact` is `true` for every transaction on the WAL path and for bulk loads that only
-  insert. It is `false` for a bulk-path commit that also deleted quads (GSP `PUT` of a
-  large graph, a large `reason` run after deletes). There a quad deleted earlier in the
-  same transaction and re-added by the bulk batch counts as both deleted and inserted. The
-  invariant above still holds.
-* The existing `UpdateStats.inserted/deleted` keep their current meaning: the sum of
-  per-operation effective changes. These can differ from the receipt counts for
-  multi-operation requests.
+  insert. It is `false` for a bulk-path commit that also deleted quads, such as a GSP `PUT`
+  of a large graph or a large `reason` run after deletes. In that case, a quad deleted
+  earlier in the transaction and re-added by the bulk batch counts as both deleted and
+  inserted. The invariant still holds.
+* The existing `UpdateStats.inserted/deleted` keep their meaning: the sum of the effective
+  changes of each operation. For requests with several operations they can differ from
+  the receipt counts.
 
 ### 2.4 HTTP
 
-**Headers.** These appear on every successful response of the write endpoints (`/{ds}/update`,
-GSP `PUT/POST/DELETE`, `/{ds}/upload`, and the same operations dispatched through
-`/{ds}`) and of the read endpoints (`/{ds}/sparql|query`, `/{ds}` queries, GSP `GET/HEAD`
-on `/{ds}/data|get`, `/{ds}/explain`, `/{ds}/shacl`):
+**Headers.** Every successful response from a write or read endpoint carries two headers.
+The write endpoints are `/{ds}/update`, GSP `PUT/POST/DELETE`, `/{ds}/upload`, and the
+same operations sent to `/{ds}`. The read endpoints are `/{ds}/sparql|query`, queries on
+`/{ds}`, GSP `GET/HEAD` on `/{ds}/data|get`, `/{ds}/explain` and `/{ds}/shacl`.
 
 ```
 Sparkles-Commit: 42
 Sparkles-Dataset-Id: 3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa
 ```
 
-On reads the value is the `seq` of the snapshot the request was evaluated against. On
-writes it is the new commit, or the unchanged head when `committed` is false.
-`Sparkles-Commit` is a valid RFC 9651 Integer. Both headers are added to CORS
-`Access-Control-Expose-Headers`.
+On a read, the value is the `seq` of the snapshot the request ran against. On a write, it
+is the new commit, or the unchanged head when `committed` is false. `Sparkles-Commit` is a
+valid RFC 9651 Integer. Both headers are listed in CORS `Access-Control-Expose-Headers`.
 
 **Receipt negotiation.** The body of a successful write is unchanged unless the client asks
-for a receipt. A client asks with `Accept: application/x-sparkles+json` (the existing
-Sparkles media type) or `receipt=true` in the query string or form. The receipt is a
-**superset** of today's body, so code that reads `inserted` or `count` keeps working:
+for a receipt. To ask, a client sends `Accept: application/x-sparkles+json`, the existing
+Sparkles media type, or puts `receipt=true` in the query string or form. The receipt is a
+**superset** of today's body, so code that reads `inserted` or `count` keeps working.
 
 | endpoint | default status / body (unchanged) | with receipt |
 |---|---|---|
@@ -135,7 +139,7 @@ Sparkles media type) or `receipt=true` in the query string or form. The receipt 
 | GSP `POST`, `/upload` | `201` / `200` `{count,tripleCount,quadCount}` | same status, same + receipt members |
 | GSP `DELETE` | `204`, no body | `200`, receipt members only |
 
-Receipt members (`Content-Type: application/x-sparkles+json`):
+The receipt members look like this (`Content-Type: application/x-sparkles+json`):
 
 ```json
 {
@@ -152,27 +156,28 @@ Receipt members (`Content-Type: application/x-sparkles+json`):
 }
 ```
 
-The Sparkles JSON query-result format (`application/x-sparkles+json`) also gains
-`meta.commit` (the seq) and `meta.datasetId`.
+The Sparkles JSON query-result format (`application/x-sparkles+json`) gains
+`meta.commit`, which holds the seq, and `meta.datasetId`.
 
 **Commit catalog.**
 
-* `GET /$/commits/{ds}?limit=&before=&after=`. By default it lists the newest commits
-  first. `before=<seq>` pages backwards (exclusive). `after=<seq>` lists in *ascending*
-  order starting after `seq`, which suits index consumers that follow the log. `limit`
-  defaults to 50 and is clamped to 1000.
+* `GET /$/commits/{ds}?limit=&before=&after=` lists the newest commits first by default.
+  `before=<seq>` pages backwards and excludes `seq`. `after=<seq>` lists in *ascending*
+  order, starting after `seq`. That order suits index consumers that follow the log.
+  `limit` defaults to 50 and is clamped to 1000.
   ```json
   { "dataset": "ds", "datasetId": "…", "head": 42, "firstRetained": 0,
     "complete": true,
     "commits": [ {commit}, … ],
     "next": "/$/commits/ds?before=40&limit=2" }
   ```
-  `next` is `null` on the last page. `complete` is `false` while the catalog lags the WAL
-  after a catalog write error (§4.3).
-* `GET /$/commits/{ds}/{ref}`, where `ref` is `42`, `commit:42` or `head`. It returns
-  `{ "dataset", "datasetId", "commit": {commit} }`.
-* `GET /$/datasets[/{ds}]` and `GET /$/server` dataset entries gain `"id"`, `"head"` (seq)
-  and `"modified"` (head timestamp). `GET /$/stats/{ds}` gains `"commit"`.
+  `next` is `null` on the last page. `complete` is `false` while the catalog lags behind
+  the WAL after a catalog write error (§4.3).
+* `GET /$/commits/{ds}/{ref}` returns `{ "dataset", "datasetId", "commit": {commit} }`.
+  `ref` is `42`, `commit:42` or `head`.
+* The dataset entries of `GET /$/datasets[/{ds}]` and `GET /$/server` gain `"id"`,
+  `"head"` and `"modified"`. `head` is the head seq and `modified` its timestamp.
+  `GET /$/stats/{ds}` gains `"commit"`.
 
 All of these work on read-only servers.
 
@@ -184,7 +189,7 @@ sparkles log --loc DB --at commit:42        # one commit
 ```
 
 `log` reads `dataset.json` and `commits.bin` **without taking the database lock**, so it
-works next to a running server. Text output:
+works next to a running server. The text output looks like this:
 
 ```
 dataset 3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa  head 2
@@ -194,10 +199,10 @@ dataset 3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa  head 2
    0  2026-09-30T14:04:59.800Z  create            0         0        0  gen-0001
 ```
 
-`--format json` prints the §2.4 list document without `next`. Inexact counts are shown
-with a trailing `~`. The write commands print the commit: `sparkles update` prints
-`inserted 3 · deleted 1 · commit 42 · 1.20 ms` (or `no change · head 41`). `load`,
-`infer` and `compact` print `commit N` (compact prints `head N (unchanged)`).
+`--format json` prints the §2.4 list document without `next`. Inexact counts get a
+trailing `~`. The write commands print the commit. `sparkles update` prints
+`inserted 3 · deleted 1 · commit 42 · 1.20 ms`, or `no change · head 41`. `load` and
+`infer` print `commit N`, and `compact` prints `head N (unchanged)`.
 
 ### 2.6 Rust library API
 
@@ -242,71 +247,75 @@ impl Dataset {
 // sparql::update::update_as(store, text, opts, kind) — update() == update_as(.., Update).
 ```
 
-`Store::load`/`replace` and the `Dataset::load_*` methods keep their `u64` return types as
-thin wrappers.
+`Store::load`/`replace` and the `Dataset::load_*` methods become thin wrappers and keep
+their `u64` return types.
 
 ### 2.7 UI (SvelteKit, `ui/`)
 
-* **Dataset page** (`routes/datasets/[name]`): the header `<dl>` gains *Commit* (`42`, with
-  relative time and the absolute RFC 3339 time as tooltip) and *Dataset id* (with a copy
-  button). A new **History** panel lists the latest 20 commits in a table: seq, time,
-  kind badge, `+inserted` / `−deleted` (with `~` and a tooltip when inexact), quads after,
-  generation. A generation change between rows is marked as a thin divider labelled
-  "compacted into gen-0008" or "rebuilt (bulk)". An *Older* button follows `next`. The
-  panel refreshes after uploads, reasoning tasks, compaction and updates run from the
-  query page (the same `app.refreshDatasets()` path). It shows an "incomplete catalog"
-  warning when `complete` is false.
-* **Query page** (`routes/query`): `api.update` sends
+* **Dataset page** (`routes/datasets/[name]`). The header `<dl>` gains *Commit* and
+  *Dataset id*. *Commit* shows `42` with the relative time, and the absolute RFC 3339 time
+  as a tooltip. *Dataset id* has a copy button.
+
+  A new **History** panel lists the latest 20 commits in a table. The columns are seq,
+  time, a kind badge, `+inserted` / `−deleted`, the quads after the commit, and the
+  generation. Inexact counts get a `~` and a tooltip. A thin divider between rows marks a
+  generation change, labelled "compacted into gen-0008" or "rebuilt (bulk)". An *Older*
+  button follows `next`. The panel refreshes after uploads, reasoning tasks, compaction,
+  and updates run from the query page, through the same `app.refreshDatasets()` path.
+  When `complete` is false it shows an "incomplete catalog" warning.
+* **Query page** (`routes/query`). `api.update` sends
   `Accept: application/x-sparkles+json, application/json;q=0.9`. The update outcome and
-  toast read "+3 / −1 quads · commit 42", or "No change · head 41" when `committed` is
+  the toast read "+3 / −1 quads · commit 42", or "No change · head 41" when `committed` is
   false. The commit links to the dataset's History panel. Query results show "at commit
-  42" next to the timing, taken from the header or `meta.commit`. Against a Fuseki
-  server (no header) this is omitted.
-* **Upload panel**: after an upload, show "Loaded N quads · commit 42".
-* **Datasets list** (`routes/datasets`): a *Modified* column (head timestamp, relative).
-* `lib/api.ts`: `commits(ds, {before, after, limit})`, `commit(ds, ref)`, a `Receipt` type,
-  and `UpdateResult` extended with the optional receipt members.
+  42" next to the timing, taken from the header or `meta.commit`. A Fuseki server sends no
+  header, so the note is left out there.
+* **Upload panel.** After an upload, the panel shows "Loaded N quads · commit 42".
+* **Datasets list** (`routes/datasets`). A *Modified* column shows the head timestamp as a
+  relative time.
+* **`lib/api.ts`.** It gains `commits(ds, {before, after, limit})`, `commit(ds, ref)` and a
+  `Receipt` type. `UpdateResult` gains the optional receipt members.
 
 ## 3. Standards basis
 
-* **SPARQL 1.1 Protocol §2.2.4**: a successful update SHOULD use 2XX. "The response body
-  of a successful update request is implementation defined. Implementations may use HTTP
-  content negotiation to provide both human-readable and machine-processable
-  information". That permits a receipt behind conneg.
-* **SPARQL 1.1 Graph Store HTTP Protocol**: `PUT` that creates content → `201`, else `200`
-  or `204`; `DELETE` → `200`/`204`. Receipt bodies ride on `200` for `DELETE` only when
-  requested.
-* **Fuseki behavior** (from the local Jena checkout): `SPARQL_Update` answers a
-  `application/sparql-update` body with `204 No Content`. A form update gets a
-  `200` "Update succeeded" page (HTML, text, or `{"statusCode":200,"message":…}` by
-  `Accept`). GSP and upload return `ServletOps.uploadResponse`: `201` if the target was
-  absent, else `200`, with body `{count, tripleCount, quadCount}`. Sparkles already
-  returns `200` + JSON stats for updates, and every Fuseki/Jena client accepts any 2XX.
-  Keeping today's defaults and adding only headers therefore stays compatible (see Open
-  questions for byte-exact Fuseki status codes).
-* **RFC 3339** timestamps; **RFC 9562** UUIDs; **RFC 9110** (status codes, header field
-  semantics); **RFC 6648** (no `X-` prefix for new headers); **RFC 9651** (header value is
-  an Integer item).
-* **RFC 7089 (Memento)** is noted as the model for the future `?at=time:` /
-  `Accept-Datetime` work. It is out of scope here but motivates non-decreasing timestamps.
+* **SPARQL 1.1 Protocol §2.2.4.** A successful update SHOULD use 2XX. The spec says: "The
+  response body of a successful update request is implementation defined. Implementations
+  may use HTTP content negotiation to provide both human-readable and machine-processable
+  information". That permits a receipt behind content negotiation.
+* **SPARQL 1.1 Graph Store HTTP Protocol.** A `PUT` that creates content answers `201`,
+  otherwise `200` or `204`. A `DELETE` answers `200` or `204`. A `DELETE` returns a receipt
+  body, with `200`, only when the client asks for one.
+* **Fuseki behavior**, read from the local Jena checkout. `SPARQL_Update` answers an
+  `application/sparql-update` body with `204 No Content`. A form update gets a `200`
+  "Update succeeded" page. Depending on `Accept`, the page is HTML, text, or
+  `{"statusCode":200,"message":…}`. GSP and upload return `ServletOps.uploadResponse`:
+  `201` if the target was absent, otherwise `200`, with the body
+  `{count, tripleCount, quadCount}`. Sparkles already returns `200` with JSON stats for
+  updates, and every Fuseki or Jena client accepts any 2XX. Keeping today's defaults and
+  adding only headers therefore stays compatible. Open questions covers byte-exact Fuseki
+  status codes.
+* **RFCs.** Timestamps follow RFC 3339 and UUIDs follow RFC 9562. RFC 9110 defines the
+  status codes and header field semantics. RFC 6648 says new headers take no `X-` prefix.
+  Under RFC 9651 the header value is an Integer item.
+* **RFC 7089 (Memento)** is the model for the future `?at=time:` and `Accept-Datetime`
+  work. That work is out of scope here, but it is the reason timestamps never decrease.
 
 ## 4. Semantics
 
 ### 4.1 Admission and consistency
 
-* `seq` is assigned under the single writer mutex, at commit time, as `head + 1`. Aborted
-  transactions (error, timeout, cancel, parse error) consume nothing, and the next commit
-  reuses the same `seq`.
-* A commit is **acknowledged** (receipt returned, snapshot published) only after it is
-  durable: WAL fsync on the delta path, or the `CURRENT` switch on the bulk path.
-  Unacknowledged commits lost to a crash may have their `seq` reused. No client ever saw
-  them.
-* Readers see `snapshot.commit` of the snapshot they loaded. Because publication follows
-  durability, a client that got receipt `n` sees `Sparkles-Commit ≥ n` on every later
-  request to the same server (read-your-writes).
-* In-memory datasets (`--mem`, `Dataset::memory()`) have commit ids too. The dataset id is
-  random per instance, and the catalog is an in-memory ring of the last 65 536 commits
-  (`firstRetained` advances). Nothing is durable.
+* The writer assigns `seq = head + 1` at commit time, under the single writer mutex. An
+  aborted transaction consumes nothing, whether it failed on an error, a timeout, a cancel
+  or a parse error. The next commit reuses the same `seq`.
+* A commit is **acknowledged**, meaning its receipt is returned and its snapshot
+  published, only after it is durable. On the delta path that is the WAL fsync. On the
+  bulk path it is the `CURRENT` switch. A crash can lose unacknowledged commits, and their
+  `seq` may then be reused. No client ever saw them.
+* Readers see the `snapshot.commit` of the snapshot they loaded. Publication follows
+  durability, so a client that got receipt `n` sees `Sparkles-Commit ≥ n` on every later
+  request to the same server. This gives read-your-writes.
+* In-memory datasets (`--mem`, `Dataset::memory()`) have commit ids too. Each instance
+  gets a random dataset id. The catalog is an in-memory ring of the last 65,536 commits,
+  and `firstRetained` advances as it wraps. Nothing is durable.
 
 ### 4.2 Errors
 
@@ -322,75 +331,82 @@ thin wrappers.
 
 ### 4.3 Failure handling
 
-* **Writer poisoning.** Any I/O error *after the first WAL byte of a commit is written*
-  poisons the writer: a failed `write_all`/`flush`/`sync_data`. So does any error after a
-  bulk `CURRENT` switch. The store's `WriterState.poisoned` is set. All later write
-  transactions fail with a new `Error::Poisoned` (HTTP 503), and reads continue. Without
-  this, a failed fsync followed by another commit could leave two WAL commit records with
-  the same `seq`. Reopening the store replays whatever is durable.
-* **Catalog lag.** The catalog is appended *after* the commit is durable and before the
-  snapshot is published. An append error does not fail the commit (it is already durable)
-  and does not poison. The record is kept in `Catalog::pending`, `complete` becomes
-  `false`, the error is logged, and every later commit retries the pending appends first.
-  Rebuilds refuse to switch `CURRENT` until the catalog is complete and fsynced (§5.4).
-  Otherwise the old WAL, the only other copy, would be deleted.
+* **Writer poisoning.** An I/O error *after the first WAL byte of a commit is written*
+  poisons the writer. This covers a failed `write_all`, `flush` or `sync_data`, and any
+  error after a bulk `CURRENT` switch. The store sets `WriterState.poisoned`. Every later
+  write transaction fails with a new `Error::Poisoned` (HTTP 503), and reads continue.
+  Without poisoning, a failed fsync followed by another commit could leave two WAL commit
+  records with the same `seq`. Reopening the store replays whatever is durable.
+* **Catalog lag.** The catalog record is appended *after* the commit is durable and before
+  the snapshot is published. An append error neither fails the commit, which is already
+  durable, nor poisons the writer. The store keeps the record in `Catalog::pending`, sets
+  `complete` to `false` and logs the error. Every later commit retries the pending appends
+  first. A rebuild refuses to switch `CURRENT` until the catalog is complete and fsynced
+  (§5.4). After the switch the old WAL, the only other copy, is deleted.
 
 ### 4.4 Limits and configuration
 
-* Catalog: 64 bytes per commit, kept forever (10 M commits ≈ 640 MB). No pruning in this
-  feature. `firstRetained` exists for recovery (§5.5), in-memory rings and future pruning.
-* No new CLI flags for `serve`. `StoreOptions` gains `memory_commit_ring: usize`
-  (default 65 536). There is also a hidden test hook,
-  `Store::set_clock(Arc<dyn Fn() -> i64 + Send + Sync>)`.
-* Overhead per WAL commit: one 64-byte buffered `write` to `commits.bin` (no fsync). CRC
-  over the transaction's WAL bytes. Two `OrdSet` lookups per effective insert/delete for
-  net counting.
+* The catalog takes 64 bytes per commit and keeps every commit, so 10 M commits take about
+  640 MB. This feature does no pruning. `firstRetained` exists for recovery (§5.5), for
+  in-memory rings and for future pruning.
+* `serve` gets no new CLI flags. `StoreOptions` gains `memory_commit_ring: usize`, which
+  defaults to 65,536. A hidden test hook,
+  `Store::set_clock(Arc<dyn Fn() -> i64 + Send + Sync>)`, replaces the clock.
+* Each WAL commit costs one buffered 64-byte `write` to `commits.bin`, with no fsync, and
+  a CRC over the transaction's WAL bytes. Net counting adds two `OrdSet` lookups per
+  effective insert or delete.
 
 ## 5. Design sketch
 
 ### 5.1 New and changed modules
 
-* `crates/sparkles/src/commit.rs` (new): `CommitKind` (u8 codes, JSON names),
-  `CommitInfo`, `Receipt`, `CommitPage`, RFC 3339 millisecond formatting (extends
-  `builder::now_rfc3339`), `DatasetFile` (`dataset.json`), `GenCommitFile`
-  (`gen-NNNN/commit.json`), `Catalog` (binary file, in-memory ring variant).
-* `store.rs`: `Store` gains `dataset_id`, `catalog: Mutex<Catalog>` (appends happen under
-  the writer mutex, and reads use a separate `pread` handle so listing never blocks
-  writers). `WriterState` gains `head: CommitInfo`, `poisoned: bool`. `Snapshot` gains
-  `commit: u64`. `WriteTxn` gains `kind`, `net_ins: u64`, `net_del: u64`. The WAL commit
-  record changes (§5.3). Replay, `rebuild_locked`, `publish_log` and `open` change as below.
-* `sparql/update.rs`: `update_as(.., kind)`. `UpdateStats.commit`.
-* `dataset.rs`: API of §2.6.
-* `sparkles-reasoner`: `materialize` uses `write_as(Reason)`, `clear` uses
+* **`crates/sparkles/src/commit.rs`** is new. It holds `CommitKind` with its u8 codes and
+  JSON names, `CommitInfo`, `Receipt` and `CommitPage`. It formats RFC 3339 timestamps
+  with milliseconds, extending `builder::now_rfc3339`. It also holds `DatasetFile` for
+  `dataset.json`, `GenCommitFile` for `gen-NNNN/commit.json`, and `Catalog`, which has a
+  binary-file variant and an in-memory ring variant.
+* **`store.rs`.** `Store` gains `dataset_id` and `catalog: Mutex<Catalog>`. Appends happen
+  under the writer mutex. Reads use a separate `pread` handle, so listing never blocks
+  writers. `WriterState` gains `head: CommitInfo` and `poisoned: bool`. `Snapshot` gains
+  `commit: u64`. `WriteTxn` gains `kind`, `net_ins: u64` and `net_del: u64`. The WAL commit
+  record changes as described in §5.3. Replay, `rebuild_locked`, `publish_log` and `open`
+  change as described below.
+* **`sparql/update.rs`** gains `update_as(.., kind)` and `UpdateStats.commit`.
+* **`dataset.rs`** gains the API of §2.6.
+* **`sparkles-reasoner`.** `materialize` uses `write_as(Reason)` and `clear` uses
   `write_as(ReasonClear)`.
-* `sparkles-server/http.rs`: headers, receipt negotiation, `/$/commits` routes, CORS
-  expose list. Every read handler takes the snapshot once and uses its `commit` for the
-  header (`query_endpoint` today calls `ds.store.snapshot()` inside `sparql::query`; pass
-  the captured snapshot instead). `main.rs`: `Log` subcommand and the printed commits.
-* `ui/`: §2.7.
+* **`sparkles-server/http.rs`** gains the headers, receipt negotiation, the `/$/commits`
+  routes and the CORS expose list. Every read handler takes the snapshot once and uses its
+  `commit` for the header. Today `query_endpoint` calls `ds.store.snapshot()` inside
+  `sparql::query`. It should pass the captured snapshot instead. **`main.rs`** gains the
+  `Log` subcommand and prints commits.
+* **`ui/`** changes as described in §2.7.
 
 ### 5.2 Net counting (exact on the WAL path)
 
-`WriteTxn::insert` and `delete` already log only effective changes (`contains` checks the
-view). For an effective change of quad `q` with key `k`, the transaction computes
+`WriteTxn::insert` and `delete` already log only effective changes, because `contains`
+checks the view. For an effective change of quad `q` with key `k`, the transaction
+computes the following. `in_base` is already computed at that point.
+
 `present_at_start = base.delta.ins[SPO].contains(k) || (in_base(q) && !base.delta.del[SPO].contains(k))`
-(`in_base` is already computed there). Then:
+
+Then:
 
 * insert: `present_at_start ? net_del -= 1 : net_ins += 1`
 * delete: `present_at_start ? net_ins -= 1 : net_del += 1`
 
-(The delete case above is swapped; the implementation uses
-`present_at_start ? net_del += 1 : net_ins -= 1`. See [Outcome](#outcome).)
+The delete case above is swapped. The implementation uses
+`present_at_start ? net_del += 1 : net_ins -= 1` (see [Outcome](#outcome)).
 
-`commit()` with `net_ins == net_del == 0` and an empty bulk batch creates no commit. It
-writes no WAL bytes and publishes nothing. The terms it interned stay in the append-only
-delta vocabulary, as they do for aborted transactions today. Replay recomputes the same
-numbers per transaction, using the replayed delta so far as "start".
+When `net_ins == net_del == 0` and the bulk batch is empty, `commit()` creates no commit.
+It writes no WAL bytes and publishes nothing. The terms it interned stay in the
+append-only delta vocabulary, as they do today for aborted transactions. Replay recomputes
+the same numbers for each transaction, with the delta replayed so far as the "start".
 
 ### 5.3 WAL commit record, version 2
 
 Records stay 33 bytes. Data records (`1` insert, `2` delete) are unchanged. The commit
-record (`op = 3`) uses its 24 spare bytes, which are always zero today:
+record (`op = 3`) puts its 24 spare bytes to use. Today they are always zero.
 
 | bytes | field |
 |---|---|
@@ -403,19 +419,19 @@ record (`op = 3`) uses its 24 spare bytes, which are always zero today:
 | 27..29 | reserved, zero |
 | 29..33 | CRC-32 (IEEE, `flate2::Crc`) over this transaction's data records followed by bytes 0..29 of this record |
 
-Replay (in `Store::open`) groups records into transactions as today and checks each
+Replay in `Store::open` groups records into transactions as it does today, and checks each
 commit record:
 
-* CRC mismatch or truncated transaction **in the last transaction**: torn tail. Truncate
-  to the previous commit as today.
-* CRC mismatch **before** the last transaction: `Error::Corrupt`. Silently dropping
-  acknowledged commits would reuse their ids.
-* version 2: `seq` must equal the previous seq + 1. The first one must equal the
-  generation's `base_seq + 1`. Anything else is `Error::Corrupt`.
-* version 0 (legacy): see §5.6.
+* A CRC mismatch or a truncated transaction **in the last transaction** is a torn tail.
+  Replay truncates to the previous commit, as today.
+* A CRC mismatch **before** the last transaction is `Error::Corrupt`. Dropping
+  acknowledged commits silently would reuse their ids.
+* In a version 2 record, `seq` must equal the previous seq + 1. The first one must equal
+  the generation's `base_seq + 1`. Anything else is `Error::Corrupt`.
+* Version 0 records are legacy records, handled as in §5.6.
 
-The id, timestamp and kind live inside the record that already defines durability. So a
-commit id is durable exactly when its WAL entry is, and replay reproduces it
+The id, timestamp and kind live inside the record that already defines durability. A
+commit id is therefore durable exactly when its WAL entry is, and replay reproduces it
 byte-for-byte.
 
 ### 5.4 Generations: `gen-NNNN/commit.json` (format 1)
@@ -429,32 +445,34 @@ Each generation records the commit its base index holds:
               "generation": "gen-0004", "bulk": true, "exact": true } }
 ```
 
-`origin` is `create`, `baseline`, `bulk` (the rebuild *is* commit `baseSeq`) or
-`compaction` (`commit` is a copy of the head record, whose `generation` names the
-generation where it was made). `rebuild_locked` changes:
+`origin` is one of four values. `create` and `baseline` mark a root commit. `bulk` means
+the rebuild *is* commit `baseSeq`. `compaction` means `commit` is a copy of the head
+record, whose `generation` names the generation where that commit was made.
+`rebuild_locked` changes in four steps:
 
-1. Before building: if the catalog is incomplete, flush `pending`. Then fsync
-   `commits.bin`. On failure, abort (nothing switched, no seq consumed).
-2. Bulk commit (`WriteTxn::commit` with a bulk batch, `load` into an empty or large store):
-   `seq = head + 1`, timestamp clamped. `inserted = meta.quads − start.len() + net_del`,
-   where `start` is the committed snapshot the transaction began from, and
-   `deleted = net_del`.
+1. Before building, it flushes `pending` if the catalog is incomplete, then fsyncs
+   `commits.bin`. If either fails, it aborts. Nothing is switched and no seq is consumed.
+2. A bulk commit is `WriteTxn::commit` with a bulk batch, or a `load` into an empty or
+   large store. It gets `seq = head + 1` and a clamped timestamp. `start` is the committed
+   snapshot the transaction began from, and the counts are
+   `inserted = meta.quads − start.len() + net_del` and `deleted = net_del`.
    `exact = (net_del == 0)`. Compaction keeps `seq = head`.
-3. After `Builder::finish`, `write_synced(dir/commit.json)`, then the existing
-   `sync_dir(dir)`, `sync_dir(root)`, `write_atomic(CURRENT)`. **The `CURRENT` switch is
-   the commit point**, as today. The new generation's WAL starts empty. Its first commit
-   will carry `baseSeq + 1`.
-4. After the switch: append the catalog record (bulk only) and publish a snapshot with
-   `commit = seq`. Errors here poison the writer (§4.3). This covers the existing
-   `add_prefixes(...)?` between the switch and `current.store`.
+3. After `Builder::finish`, it calls `write_synced(dir/commit.json)`, then the existing
+   `sync_dir(dir)`, `sync_dir(root)` and `write_atomic(CURRENT)`. **The `CURRENT` switch
+   is the commit point**, as today. The new generation's WAL starts empty, and its first
+   commit will carry `baseSeq + 1`.
+4. After the switch, it appends the catalog record (bulk only) and publishes a snapshot
+   with `commit = seq`. Errors in this step poison the writer (§4.3). That includes the
+   existing `add_prefixes(...)?` between the switch and `current.store`.
 
-`Store::open` reads `commit.json` of the `CURRENT` generation and sets
-`head = baseSeq`, then replays the WAL.
+`Store::open` reads the `commit.json` of the `CURRENT` generation, sets `head = baseSeq`,
+and then replays the WAL.
 
 ### 5.5 Catalog: `<root>/commits.bin` (format 1)
 
-Fixed-size little-endian records, so commit `s` is at offset `64 + (s − first_seq)·64`.
-That gives O(1) lookups and paging, and later a binary search on timestamps.
+The catalog holds fixed-size little-endian records, so commit `s` is at offset
+`64 + (s − first_seq)·64`. Lookups and paging are O(1), and a later binary search on
+timestamps is possible.
 
 Header (64 bytes): `0..8` magic `SPKCMTS\0` · `8..12` format `1` · `12..16` record size
 `64` · `16..32` dataset UUID bytes · `32..40` `first_seq` · `40..60` zero · `60..64`
@@ -464,76 +482,93 @@ Record (64 bytes): `0..8` seq · `8..16` timestamp_ms · `16..24` inserted · `2
 deleted · `32..40` quads · `40..44` generation number · `44` kind · `45` flags (bit0 exact,
 bit1 bulk, bit2 reconstructed) · `46..60` zero · `60..64` CRC-32 of 0..60.
 
-It is appended with `write_all` + `flush`, with no fsync per commit (the WAL or
-`commit.json` is the durable source). It is fsynced before every `CURRENT` switch and on
-`Drop` of the store. **Repair on open**, after WAL replay has established `head`:
+Records are appended with `write_all` and `flush`, with no fsync per commit. The WAL or
+`commit.json` is the durable source. The file is fsynced before every `CURRENT` switch and
+when the store is dropped.
 
-* Drop trailing records that are partial, fail their CRC, or have `seq > head`, with a
-  warning. Any of these means lost page-cache writes or a hand-edited directory.
-* If `last < baseSeq`, append from `commit.json`. That record is always present. If
-  `last < baseSeq − 1`, the history between is unrecoverable. This only happens if the
-  file was deleted or corrupted. Start a new catalog at `first_seq = baseSeq` and rename
-  the old file to `commits.bin.corrupt-<ts>`. `firstRetained` then reports the gap.
-* Append the replayed WAL commits with `seq > last`. Their counts come from §5.2.
-* Header dataset UUID ≠ `dataset.json`: `Error::Corrupt`.
+**Repair on open** runs after WAL replay has established `head`:
 
-`sparkles log` (lockless) reads only complete records with valid CRCs, up to the last one.
+* Trailing records that are partial, fail their CRC, or have `seq > head` are dropped with
+  a warning. Any of these means lost page-cache writes or a hand-edited directory.
+* If `last < baseSeq`, the record from `commit.json` is appended. That record is always
+  present. If `last < baseSeq − 1`, the history in between is lost, which happens only if
+  the file was deleted or corrupted. In that case a new catalog starts at
+  `first_seq = baseSeq`, the old file is renamed to `commits.bin.corrupt-<ts>`, and
+  `firstRetained` reports the gap.
+* The replayed WAL commits with `seq > last` are appended, with counts from §5.2.
+* If the dataset UUID in the header differs from `dataset.json`, open fails with
+  `Error::Corrupt`.
+
+`sparkles log` takes no lock. It reads only complete records with valid CRCs, up to the
+last one.
 
 ### 5.6 Dataset file, creation, migration
 
 `<root>/dataset.json` (format 1):
 `{ "format": 1, "id": "3f1c…", "created": "2026-09-30T14:04:59.800Z", "origin": "create" | "baseline" }`.
 
-* **New database** (`CURRENT` absent): write `dataset.json` (reusing it if present from
-  an interrupted create). Build `gen-0001`, then `gen-0001/commit.json` (`baseSeq 0`,
-  kind `create`, quads 0). Write `commits.bin` with record 0. Write `CURRENT` last.
-* **Pre-existing database** (`CURRENT` present, no `dataset.json`): open and replay as
-  today, treating version-0 commit records as legacy. Then write the baseline root commit:
-  `seq 0`, kind `baseline`, `inserted = quads` (everything present), `deleted 0`,
-  timestamp = now. Write it to `gen-NNNN/commit.json` (`baseSeq 0`, origin `baseline`),
-  then `commits.bin`, then `dataset.json` last. The presence of `dataset.json` marks the
-  migration complete, so an interrupted migration is redone. Legacy records
-  *before* the first version-2 record are folded into `baseSeq` (commit 0).
-* **Legacy records after a version-2 record** (an older binary appended to an upgraded
-  database): each gets `seq = prev + 1`, kind `unknown`, timestamp = the parent's
-  timestamp, and flag `reconstructed`. This is deterministic, so every replay assigns the
-  same ids. Downgrading remains unsupported, but it does not corrupt anything.
+* **New database** (`CURRENT` absent). Write `dataset.json`, or reuse it if an
+  interrupted create left one. Build `gen-0001`, then write `gen-0001/commit.json` with
+  `baseSeq 0`, kind `create` and quads 0. Write `commits.bin` with record 0. Write
+  `CURRENT` last.
+* **Pre-existing database** (`CURRENT` present, no `dataset.json`). Open and replay as
+  today, treating version-0 commit records as legacy. Then write the baseline root commit.
+  It has `seq 0`, kind `baseline`, `inserted = quads` (everything present), `deleted 0`
+  and the current time as its timestamp. Write it to `gen-NNNN/commit.json` (`baseSeq 0`,
+  origin `baseline`), then to `commits.bin`, and write `dataset.json` last. Once
+  `dataset.json` exists the migration is complete, so an interrupted migration is redone.
+  Legacy records *before* the first version-2 record are folded into `baseSeq`
+  (commit 0).
+* **Legacy records after a version-2 record.** These appear when an older binary appends
+  to an upgraded database. Each gets `seq = prev + 1`, kind `unknown`, the parent's
+  timestamp and the `reconstructed` flag. The rule is deterministic, so every replay
+  assigns the same ids. Downgrading is still unsupported, but it corrupts nothing.
 
 ### 5.7 Server plumbing
 
 * `update_endpoint` passes `CommitKind::Update`. `gsp` uses `replace_as(.., GspPut)`,
   `load_as(.., GspPost)` and `update_as("CLEAR …", .., GspDelete)`. `upload` uses
-  `load_as(.., Upload)`. GSP/upload `count` stays "new quads" (= `receipt.commit.inserted`
-  when committed, else 0). It no longer needs the racy `snapshot().len()` before/after
-  subtraction.
-* `fn receipt_wanted(params, headers) -> bool`: `receipt=true`, or an `Accept` that
-  explicitly lists `application/x-sparkles+json` (`*/*` does not count).
-* Headers are set by one helper, `commit_headers(ds_id, seq)`. `CorsLayer` gets
+  `load_as(.., Upload)`. The GSP and upload `count` still means "new quads". It equals
+  `receipt.commit.inserted` when the write committed, and 0 otherwise. The racy
+  subtraction of `snapshot().len()` before and after the write is no longer needed.
+* `fn receipt_wanted(params, headers) -> bool` returns true for `receipt=true`, or for an
+  `Accept` that lists `application/x-sparkles+json` explicitly. `*/*` does not count.
+* One helper, `commit_headers(ds_id, seq)`, sets the headers. `CorsLayer` gets
   `.expose_headers([SPARKLES_COMMIT, SPARKLES_DATASET_ID])`.
-* New routes: `/$/commits/{ds}` and `/$/commits/{ds}/{ref}` (GET only).
+* There are two new routes, `/$/commits/{ds}` and `/$/commits/{ds}/{ref}`, both GET only.
 
 ## 6. Phasing
 
-**Phase 1 (MVP, ~1 day)**: `commit.rs` types. `dataset.json` + root commit (create and
-baseline migration). WAL commit record v2 with seq, timestamp, kind and CRC, plus replay
-checks. Net counting. `gen/commit.json` on rebuild/compaction. `Snapshot.commit`,
-`head_commit`, `dataset_id`. `commits.bin` append + repair on open. Writer poisoning.
-`CommitKind` plumbing through update/GSP/upload/load/reasoner. `Sparkles-Commit` /
-`Sparkles-Dataset-Id` on write and query responses. Receipt negotiation.
-`GET /$/commits/{ds}` (`limit`, `before`, `after`) and `/{ref}`. `sparkles log`. Tests
-from §7 A1–A12.
+**Phase 1 (MVP, ~1 day)** contains:
 
-**Phase 2**: UI (§2.7). Headers on `explain`/`shacl`/GSP `HEAD`. `meta.commit` in
-Sparkles JSON. `/$/datasets` `id/head/modified`. In-memory ring bound. `sparkles log --at`.
+* the `commit.rs` types;
+* `dataset.json` and the root commit, for both create and the baseline migration;
+* WAL commit record v2 with seq, timestamp, kind and CRC, and the replay checks;
+* net counting;
+* `gen/commit.json` on rebuild and compaction;
+* `Snapshot.commit`, `head_commit` and `dataset_id`;
+* appending to `commits.bin` and repairing it on open;
+* writer poisoning;
+* `CommitKind` passed through update, GSP, upload, load and the reasoner;
+* `Sparkles-Commit` and `Sparkles-Dataset-Id` on write and query responses;
+* receipt negotiation;
+* `GET /$/commits/{ds}` (with `limit`, `before` and `after`) and `/{ref}`;
+* `sparkles log`;
+* the tests of §7 A1–A12.
 
-**Phase 3**: optional per-commit **change digest** (§9, off by default).
-`ETag: W/"<datasetId>:<seq>"` + `If-None-Match` on GSP `GET`. A commit annotations
-side-file (client message via a `Sparkles-Commit-Message` request header).
+**Phase 2** adds the UI (§2.7) and the headers on `explain`, `shacl` and GSP `HEAD`. It
+also adds `meta.commit` in Sparkles JSON, `id`, `head` and `modified` on `/$/datasets`,
+the bound on the in-memory ring, and `sparkles log --at`.
 
-**Later (separate specs)**: retained generations and `?at=commit:N|time:…`
-([F06](F06-snapshots-and-point-in-time.md)). Search indexes that record their `seq`
-watermark ([F03](F03-full-text-search.md), [F04](F04-vector-search.md)). Change feed `GET /$/commits/{ds}?after=`
-long-poll. Catalog pruning.
+**Phase 3** adds an optional per-commit **change digest** (§9), off by default. It also
+adds `ETag: W/"<datasetId>:<seq>"` and `If-None-Match` on GSP `GET`, and a side-file of
+commit annotations. Clients send a message in a `Sparkles-Commit-Message` request header.
+
+**Later work** has its own specs. Retained generations and `?at=commit:N|time:…` belong to
+[F06](F06-snapshots-and-point-in-time.md). Search indexes that record their `seq`
+watermark belong to [F03](F03-full-text-search.md) and [F04](F04-vector-search.md). A
+long-poll change feed on `GET /$/commits/{ds}?after=` and catalog pruning are also later
+work.
 
 ## 7. Acceptance examples
 
@@ -622,67 +657,69 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
 
 ## 8. Rejected alternatives
 
-* **Using `Snapshot::version` as the commit id**: it is in-process, resets on restart, and
-  compaction bumps it without changing data.
-* **Random/UUID commit ids or content hashes as the primary id**: they are not ordered.
-  Watermarks, paging and `?at=` all need `a < b` comparisons and O(1) lookup. A digest can
-  be added as an attribute (Phase 3).
-* **A separate WAL record type for commit metadata**: an older binary stops at the unknown
-  opcode and *truncates* the WAL on open, losing data on a downgrade. The spare bytes of
-  the existing commit record are ignored by old binaries.
-* **fsyncing the catalog on every commit**: it doubles the fsyncs per write. The catalog is
-  derivable from the WAL and `commit.json`. It only has to be durable before a
+* **`Snapshot::version` as the commit id.** It lives in one process and resets on restart,
+  and compaction increments it without changing data.
+* **Random or UUID commit ids, or content hashes, as the primary id.** They are not
+  ordered. Watermarks, paging and `?at=` all need `a < b` comparisons and O(1) lookup. A
+  digest can be added as an attribute in Phase 3.
+* **A separate WAL record type for commit metadata.** An older binary stops at the unknown
+  opcode and *truncates* the WAL on open, so a downgrade would lose data. Old binaries
+  ignore the spare bytes of the existing commit record.
+* **An fsync of the catalog on every commit.** It doubles the fsyncs per write. The catalog
+  can be rebuilt from the WAL and `commit.json`. It only has to be durable before a
   generation's WAL is discarded.
-* **A JSON-lines catalog**: it needs a scan or a side index for paging and seq lookup.
-  Fixed records are simpler and faster. `sparkles log --format json` covers human
-  inspection.
-* **Counting raw WAL records as inserted/deleted**: it double-counts
-  insert-then-delete within one transaction. Diffing delta sets at commit costs more than
-  the O(1) bookkeeping of §5.2.
-* **A commit for compaction**: two ids would name identical content, and search
-  watermarks would re-index for nothing. Generation changes stay visible through the
-  `generation` field.
-* **Empty commits for no-op writes**: they add catalog noise and break "each commit
-  changed something". The receipt returns the head instead.
-* **Changing default update responses to Fuseki's exact `204`/HTML page**: that would
-  break existing Sparkles clients (the UI parses the JSON). The receipt is opt-in instead
+* **A JSON-lines catalog.** Paging and seq lookup would need a scan or a side index. Fixed
+  records are simpler and faster, and `sparkles log --format json` covers inspection by
+  people.
+* **Counting raw WAL records as inserted and deleted.** That double-counts an insert
+  followed by a delete in one transaction. Diffing the delta sets at commit costs more
+  than the O(1) bookkeeping of §5.2.
+* **A commit for compaction.** Two ids would name identical content, and search watermarks
+  would re-index for nothing. The `generation` field still shows generation changes.
+* **Empty commits for no-op writes.** They add noise to the catalog and break the rule that
+  each commit changed something. The receipt returns the head instead.
+* **Fuseki's exact `204` or HTML page as the default update response.** That would break
+  existing Sparkles clients, because the UI parses the JSON. The receipt is opt-in instead
   (see Open questions).
-* **Putting the commit in `ETag` only**: ETag has cache-validation semantics per
-  representation (RFC 9110 §8.8.3), and a query result also depends on parameters and
-  non-deterministic functions. It is a Phase 3 addition for GSP `GET`, not the carrier.
-* **An `X-Sparkles-Commit` header name**: RFC 6648 deprecates the `X-` prefix.
-* **Adding the base seq to `CURRENT`**: older binaries read `CURRENT` verbatim as a
-  directory name. `gen-NNNN/commit.json` is invisible to them.
+* **The commit in `ETag` only.** An ETag has cache-validation semantics for each
+  representation (RFC 9110 §8.8.3). A query result also depends on parameters and
+  non-deterministic functions. ETag is a Phase 3 addition for GSP `GET`, not the main
+  carrier.
+* **An `X-Sparkles-Commit` header name.** RFC 6648 deprecates the `X-` prefix.
+* **The base seq in `CURRENT`.** Older binaries read `CURRENT` verbatim as a directory
+  name. They never see `gen-NNNN/commit.json`.
 
 ## 9. Open questions
 
-1. **Directory copies share an id.** Should `Store::open` detect a copy (e.g. record the
-   absolute path or inode in `dataset.json`) and mint a new id? Clone-to-sandbox
-   ([C06](C06-clone-to-sandbox.md))
-   should mint a new id and record `"forkedFrom": {"id", "seq"}`. Default: copies keep the
-   id.
-2. **Fuseki-exact defaults.** Should `Accept: */*` / no `Accept` update requests get
-   `204` (like Fuseki) instead of today's `200` JSON? Also, GSP `POST` currently always
-   returns `201` and `PUT` always `200`. Fuseki uses `201` iff the target was absent. That
-   is worth aligning in a separate fix. Default: unchanged.
-3. **Change digest (Phase 3).** Proposed, not canonical RDF. `digest(n) = SHA-256(
+1. **Directory copies share an id.** Should `Store::open` detect a copy and mint a new id?
+   It could record the absolute path or inode in `dataset.json`, for example.
+   Clone-to-sandbox ([C06](C06-clone-to-sandbox.md)) should mint a new id and record
+   `"forkedFrom": {"id", "seq"}`. Default: copies keep the id.
+2. **Fuseki-exact defaults.** Should update requests with `Accept: */*` or no `Accept` get
+   `204`, as in Fuseki, instead of today's `200` JSON? Separately, GSP `POST` currently
+   always returns `201` and `PUT` always `200`, while Fuseki returns `201` iff the target
+   was absent. That is worth aligning in a separate fix. Default: unchanged.
+3. **Change digest (Phase 3).** This is a proposal, and it is not canonical RDF:
+   `digest(n) = SHA-256(
    "sparkles-commit-digest-v1\n" ‖ datasetId ‖ "\n" ‖ seq ‖ "\n" ‖ hex(digest(n−1)) ‖ "\n"
    ‖ timestamp ‖ "\n" ‖ kind ‖ "\n" ‖ sorted lines "-" + L(q) for deleted q ‖ sorted lines
    "+" + L(q) for inserted q)`. `L(q)` is the quad in canonical N-Quads form (RDF 1.2
-   N-Quads §3) with blank nodes written as their store-internal labels (`bnode_for(id)`).
-   Lines are sorted by UTF-8 bytes, and `digest(−1)` is 32 zero bytes. Blank-node labels
-   are store-internal, so equal digests across different databases mean nothing. It is
-   not an RDF Dataset Canonicalization (RDFC-1.0) hash. Bulk commits would need the change
-   set materialized, and whether they get `digest = null` or pay the cost is open. Default:
-   not implemented.
-4. **Timestamp source**: wall clock with a non-decreasing clamp. A large backwards clock
-   jump freezes timestamps until the wall clock catches up. Should the server warn?
-5. **Catalog pruning** by age or count once point-in-time retention exists. Default:
-   keep everything.
-6. **Commit messages/authors**: need variable-length storage (annotation side-file keyed
-   by seq). Deferred to Phase 3 so the fixed record stays 64 bytes.
-7. **UUID version**: v4 (random, already enabled in the workspace `uuid`). v7 would embed
-   creation time. Default: v4, with the creation time in `dataset.json`.
+   N-Quads §3), with blank nodes written as their store-internal labels (`bnode_for(id)`).
+   Lines are sorted by UTF-8 bytes, and `digest(−1)` is 32 zero bytes. Because blank-node
+   labels are internal to the store, equal digests from different databases mean nothing.
+   It is not an RDF Dataset Canonicalization (RDFC-1.0) hash. Bulk commits would need
+   their change set materialized. It is open whether they get `digest = null` or pay that
+   cost. Default: not implemented.
+4. **Timestamp source.** The wall clock, clamped so it never decreases. A large backwards
+   jump of the clock freezes timestamps until the wall clock catches up. Should the server
+   warn?
+5. **Catalog pruning** by age or count, once point-in-time retention exists. Default: keep
+   everything.
+6. **Commit messages and authors** need variable-length storage, such as an annotation
+   side-file keyed by seq. They are deferred to Phase 3 so the fixed record stays 64
+   bytes.
+7. **UUID version.** v4 is random and already enabled in the workspace `uuid` crate. v7
+   would embed the creation time. Default: v4, with the creation time in `dataset.json`.
 
 ## 10. Sources
 
@@ -713,50 +750,56 @@ while `sparkles serve` holds the lock → succeeds and lists seqs 1, 0.
 * Cited from general knowledge, not fetched: RFC 3339, RFC 9562 (UUID), RFC 9110 (HTTP
   semantics, ETag), RFC 6648 (`X-` prefix), RFC 9651 (Structured Field Values), RFC 7089
   (Memento), W3C RDF Dataset Canonicalization (RDFC-1.0).
-* **Not consulted**: Fluree, in any form (code, docs, tests, site, talks). Also not read:
-  the project's earlier implementation review and feature plan.
+* **Not consulted**: Fluree in any form, including its code, docs, tests, site and talks.
+  The project's earlier implementation review and feature plan were not read either.
 
 ## Outcome
 
-**Delivered.** Phase 1 landed on 2026-09-30 as `0374949` (engine: dataset ids, WAL commit
-record version 2, net counting, `gen-NNNN/commit.json`, `commits.bin` with repair on open,
-writer poisoning) and `f128404` (server and CLI: headers, receipt negotiation,
-`/$/commits` routes, `sparkles log`). Phase 2 followed the same day: the UI's commit
-history panel and write receipts (`9b8cacb`), and commit headers on SHACL validation
-(`cb598c8`); `id`, `head` and `modified` on dataset entries, `meta.commit` in the Sparkles
-JSON format, `sparkles log --at` and the in-memory ring (`StoreOptions::memory_commit_ring`,
-65,536) are all in place. The receipts became the base that the later features build on:
-search watermarks ([F03](F03-full-text-search.md)), `?at=` reads and named snapshots
-([F06](F06-snapshots-and-point-in-time.md)), clones that record `forkedFrom`
-([C06](C06-clone-to-sandbox.md)), backups and restores ([F05](F05-snapshot-repositories.md))
-and write-time validation summaries ([C10](C10-write-time-validation.md)).
+**Delivered.** Phase 1 landed on 2026-09-30 in two commits. `0374949` changed the engine.
+It added dataset ids, WAL commit record version 2, net counting, `gen-NNNN/commit.json`,
+`commits.bin` with repair on open, and writer poisoning. `f128404` changed the server and
+CLI. It added the headers, receipt negotiation, the `/$/commits` routes and
+`sparkles log`.
+
+Phase 2 followed the same day. `9b8cacb` added the UI's commit history panel and write
+receipts, and `cb598c8` added commit headers on SHACL validation. Dataset entries have
+`id`, `head` and `modified`. The Sparkles JSON format has `meta.commit`.
+`sparkles log --at` works, and in-memory datasets keep a ring of 65,536 commits
+(`StoreOptions::memory_commit_ring`).
+
+Later features build on the receipts. Search watermarks ([F03](F03-full-text-search.md)),
+`?at=` reads and named snapshots ([F06](F06-snapshots-and-point-in-time.md)), clones that
+record `forkedFrom` ([C06](C06-clone-to-sandbox.md)), backups and restores
+([F05](F05-snapshot-repositories.md)) and write-time validation summaries
+([C10](C10-write-time-validation.md)) all use them.
 
 **Deviations from the spec.**
 
-- §5.2 swapped the delete case. The implementation counts deleting a quad present at
-  the start of the transaction as `net_del += 1`, and deleting one the same transaction
-  added as `net_ins -= 1`.
-- The catalog is kept in memory (a ring of 64-byte records) rather than read with
-  `pread`; a million commits take about 64 MiB. Reading from the file remains the option
-  if histories grow long.
+- §5.2 swapped the delete case. The implementation counts deleting a quad that was present
+  at the start of the transaction as `net_del += 1`. Deleting a quad that the same
+  transaction added counts as `net_ins -= 1`.
+- The catalog is kept in memory as a ring of 64-byte records, not read with `pread`. A
+  million commits take about 64 MiB. If histories grow long, reading from the file is
+  still an option.
 - Legacy WAL records are folded into the base only when the generation's base is a
-  baseline commit (or during the upgrade itself); otherwise they are reconstructed with
+  baseline commit, or during the upgrade itself. Otherwise they are reconstructed with
   kind `unknown`, as §5.6 describes for records after a version-2 record.
-- Graph Store PUT still reports the parsed count as `count`, as before (the spec said "new
-  quads"). POST and upload report the commit's net inserted count, which equals the old
+- Graph Store PUT still reports the parsed count as `count`, as before. The spec said "new
+  quads". POST and upload report the commit's net inserted count, which equals the old
   number.
 - `sparkles log` lists 20 commits unless `--limit` says otherwise.
 
-**Open questions.** Directory copies still share an id (question 1), but clones and
-restores into a new lineage mint a new id and record `forkedFrom`. Default response bodies
-stay as they were (question 2). The non-decreasing clock clamp and v4 UUIDs are as
-proposed; the catalog is not pruned.
+**Open questions.** Directory copies still share an id (question 1). Clones, and restores
+into a new lineage, mint a new id and record `forkedFrom`. Default response bodies are
+unchanged (question 2). The non-decreasing clock clamp and v4 UUIDs are as proposed. The
+catalog is not pruned.
 
 **Tests at landing.** `crates/sparkles/tests/commits.rs` covers the root commit, net
 counting, restart and replay, a lost catalog tail, a torn WAL tail, compaction and bulk
-commits, migration, the monotone clock and the library API; router tests cover receipts,
+commits, migration, the monotone clock and the library API. Router tests cover receipts,
 headers, the catalog routes, paging and errors. The W3C SPARQL results did not change.
 
-**Not built.** Phase 3: the per-commit change digest, `ETag`/`If-None-Match` on Graph
-Store GET, and commit messages through a `Sparkles-Commit-Message` header. Catalog pruning
-and the long-poll change feed remain later work.
+**Not built.** Phase 3 is not built: the per-commit change digest, `ETag` and
+`If-None-Match` on Graph Store GET, and commit messages through a
+`Sparkles-Commit-Message` header. Catalog pruning and the long-poll change feed remain
+later work.

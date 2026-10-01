@@ -1,11 +1,11 @@
 # Usage
 
-The operator's guide to the `sparkles` binary: running the server, the command-line tools,
-the formatter, backups, outbound requests, integrity checks, the MCP server, embedding the
-library and deploying on NixOS. The HTTP API is specified in [API.md](API.md); building
-from source and testing are in [DEVELOPMENT.md](DEVELOPMENT.md).
+This guide covers operating the `sparkles` binary: running the server, the command-line
+tools, the formatter, backups, outbound requests, integrity checks, the MCP server,
+embedding the library and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
+[DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
-Sparkles is experimental: the on-disk format, HTTP API and CLI may change between commits
+Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
 
 * [Running the server](#running-the-server)
@@ -28,52 +28,56 @@ sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 ```
 
 The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
-allocator (the default `mimalloc` cargo feature of `sparkles-server`; the `sparkles`
-library leaves the choice to its embedder). Once no request has been active for
-`--idle-release-ms` (default 1000 ms), `sparkles serve` hands free heap memory back to
-the OS. Built with `--no-default-features --features reasoning,shacl` it uses the
-system allocator and `malloc_trim` instead.
+allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
+by default. The `sparkles` library leaves the choice of allocator to its embedder. Once
+no request has been active for `--idle-release-ms` (default 1000 ms), `sparkles serve`
+hands free heap memory back to the OS. A build with
+`--no-default-features --features reasoning,shacl` uses the system allocator and
+`malloc_trim` instead.
 
 ### Network exposure
 
-`serve` listens on `127.0.0.1` by default. It refuses to start on a non-loopback `--host`
-(such as `0.0.0.0`) without `--auth-config`, because without authentication every caller
+`serve` listens on `127.0.0.1` by default. It refuses to start on a non-loopback `--host`,
+such as `0.0.0.0`, without `--auth-config`, because without authentication every caller
 may read, write and administer every dataset. `--allow-open-network` (or
 `SPARKLES_ALLOW_OPEN_NETWORK=1`) serves it open anyway and logs a warning. A network
 listener without request rate limits (`query`, `update` or `admin`) also logs a warning,
-with or without auth. An authenticating reverse proxy in front does not make an open
-backend safe: bind the backend to loopback or a Unix socket (`--unix-socket`), or
-firewall it, so that nothing can bypass the proxy.
+with or without auth.
 
-A server without `--auth-config` also guards against the web pages its operator opens:
+An authenticating reverse proxy in front does not make an open backend safe. Bind the
+backend to loopback or a Unix socket (`--unix-socket`), or firewall it, so that nothing
+can bypass the proxy.
 
-* it answers only requests whose `Host` is an IP address, `localhost` (or
-  `*.localhost`), `--host` or a `--public-host` name; anything else gets `421`, which
-  stops a page that rebinds its own DNS name to the server;
-* it refuses unsafe requests and anything that writes or administers from another site
-  (`403 cross-origin request refused`, by `Origin` and `Sec-Fetch-Site`);
-* it sends no CORS headers unless `--cors-origin` names an origin.
+A server without `--auth-config` also guards against web pages that its operator opens:
 
-The UI served by the server itself, the CLI and other non-browser clients are
-unaffected. Behind a reverse proxy, pass the name the proxy is reached by with
-`--public-host` (the NixOS module does this for its nginx virtual host).
+* It answers only requests whose `Host` is an IP address, `localhost` or `*.localhost`,
+  `--host`, or a `--public-host` name. Anything else gets `421`. This stops a page that
+  rebinds its own DNS name to the server.
+* It refuses unsafe requests, and anything that writes or administers, when they come
+  from another site. It decides by `Origin` and `Sec-Fetch-Site`, and answers
+  `403 cross-origin request refused`.
+* It sends no CORS headers unless `--cors-origin` names an origin.
+
+These checks do not affect the UI that the server itself serves, the CLI, or other
+non-browser clients. Behind a reverse proxy, pass the name that clients use to reach the
+proxy with `--public-host`. The NixOS module does this for its nginx virtual host.
 
 Every response carries `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
-The UI's pages have a Content Security Policy that allows scripts only from the UI
-itself (its inline start-up scripts by hash) and no framing. Their `script-src` also has
-`'wasm-unsafe-eval'` so the page can compile the formatter's WebAssembly module; that
-permits WebAssembly compilation only, not JavaScript's `eval`. API responses have
-`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
+The UI's pages have a Content Security Policy that forbids framing and allows scripts
+only from the UI itself, with its inline start-up scripts allowed by hash. Their
+`script-src` also has `'wasm-unsafe-eval'` so the page can compile the formatter's
+WebAssembly module. That permits WebAssembly compilation only, not JavaScript's `eval`.
+API responses have `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
 
 ### Endpoints and operations
 
-Fuseki-style endpoints for a dataset `ds`: `/ds/sparql`, `/ds/update`, `/ds/data` (GSP),
-`/ds/upload`, plus `/$/datasets`, `/$/stats/ds`, `/$/compact/ds`, `/$/backup/ds`, `/$/tasks`
-(see [API.md](API.md)). `--mem NAME` adds an in-memory dataset; `--loc NAME=PATH` serves an
-existing database.
+A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/data`
+(GSP) and `/ds/upload`. The server also has `/$/datasets`, `/$/stats/ds`,
+`/$/compact/ds`, `/$/backup/ds` and `/$/tasks` (see [API.md](API.md)). `--mem NAME` adds
+an in-memory dataset, and `--loc NAME=PATH` serves an existing database.
 
-Operations: `/$/ping` is the liveness check and `/$/ready` the readiness check (`503`
-once shutdown starts on SIGINT or SIGTERM); `/$/metrics` serves Prometheus metrics.
+`/$/ping` is the liveness check and `/$/ready` the readiness check. `/$/ready` returns
+`503` once shutdown starts on SIGINT or SIGTERM. `/$/metrics` serves Prometheus metrics.
 Every response carries an `X-Request-Id`, and each request is logged once under the
 `sparkles::access` target.
 
@@ -81,71 +85,71 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host ADDR` | `127.0.0.1` | listen address; a non-loopback address needs `--auth-config` or `--allow-open-network` |
-| `--allow-open-network` | off | serve without `--auth-config` on a non-loopback address (also `SPARKLES_ALLOW_OPEN_NETWORK=1`); logged as a warning |
-| `--public-host NAME` | | a host name clients reach the server by, such as a reverse proxy's (repeatable); without `--auth-config`, names other than IP addresses, `localhost` and `--host` are refused with `421`, and with it so are requests carrying trusted proxy headers from loopback or the Unix socket |
-| `--cors-origin ORIGIN` | none | a browser origin (`https://yasgui.example`) whose pages may call the API cross-origin, without credentials (repeatable; with `--auth-config`, added to `cors.origins`); without auth such a page may do everything the server allows |
-| `--timeout S` | `60` | default query timeout in seconds (`timeout=` per request) |
-| `--update-timeout S` | `0` | default SPARQL update timeout in seconds (`0`: none; `timeout=` per request); a timed-out update changes nothing |
-| `--max-timeout S` | `1800` | largest `timeout=` a query or update may ask for (`0`: unlimited; never below `--timeout` / `--update-timeout`) |
-| `--query-memory-mb N` | `8192` | budget for the estimated memory of a query's intermediate results (`0`: unlimited) |
-| `--max-result-mb N` | `1024` | budget for the body of a SPARQL query response (`0`: unlimited) |
-| `--max-export-mb N` | `0` | budget for the body of a Graph Store GET, i.e. a graph or whole-dataset export (`0`: unlimited) |
-| `--max-rows N` | `200000000` | rows of any intermediate result |
-| `--max-query-body-mb N` | `16` | largest SPARQL query body (also explain and `/shacl` shapes); `413` past it (`0`: unlimited) |
-| `--max-update-body-mb N` | `256` | largest SPARQL update body; bulk data goes through the Graph Store or `/upload` (`0`: unlimited) |
-| `--max-admin-body-mb N` | `16` | largest `/$/…` or prefix-change body (`0`: unlimited); `/$/auth/*` bodies are capped at 64 KiB |
-| `--max-upload-mb N` | `4096` | largest Graph Store write or upload body, streamed to a temporary file and counted after HTTP decompression (`0`: unlimited) |
-| `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free, and to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) once the data directory's would (`0`: no check) |
-| `--max-mem-dataset-mb N` | `4096` | largest in-memory dataset; a commit that would grow one past it fails with `507` (`0`: unlimited) |
-| `--max-tasks N` | `4` | background tasks (compaction, clones, reasoning, full-text and spatial index builds, N-Quads backups) running at once; more wait `queued` (`0`: no limit) |
-| `--backup-config FILE` | | backup repositories, policies, credential sources and the limits of repositories registered through the API (TOML, also `$SPARKLES_BACKUP_CONFIG`; re-read on SIGHUP; read-only through the API) |
-| `--backup-max-tasks N` | `2` | backup, restore, verify and GC tasks running at once; more wait `queued` |
-| `--format-endpoint on\|authenticated\|off` | `on` | who may use `POST /$/format` (see [API.md](API.md#formatting)): every caller the server admits, every caller but the anonymous principal (`401`), or nobody (`404`); a UI built with the formatter's WebAssembly module formats in the page and needs the endpoint only as a fallback |
-| `--format-max-mb N` | `16` | largest `POST /$/format` body (`0`: unlimited) |
-| `--format-timeout S` | `10` | seconds a `POST /$/format` request may take, waiting for a free slot (one per core) included; `408` past it |
-| `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
-| `--text NAME[=FILE]` | | enable full-text search for a dataset (with a `text.json`-shaped configuration file) |
-| `--geo NAME[=FILE]` | | enable the spatial index for a dataset (with a `geo.json`-shaped configuration file); the build runs before the server starts listening |
-| `--geo-mb N` | `4096` | memory for each dataset's spatial index (geometry column and trees); a build that would exceed it is refused, the status says `over-budget`, and queries run without the index |
-| `--geo-op-vertices N` | `2000000` | largest sum of input vertices of one geometry operation (overlay, buffer, hull, relate); larger ones are a type error |
-| `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
-| `--no-access-log` | | no per-request log lines |
-| `--no-metrics` | | `/$/metrics` answers `404` and no request metrics are kept |
-| `--metrics-max-datasets N` | `100` | datasets with their own metric labels (the rest share `$other`) |
-| `--otel` | off | export traces and metrics over OTLP (also enabled by `OTEL_EXPORTER_OTLP_ENDPOINT`; the standard `OTEL_*` variables apply, see [API.md](API.md), OpenTelemetry) |
-| `--otel-logs` | off | export log events over OTLP too |
-| `--otel-query-text` | off | record query text (`db.query.text`) and plan operator descriptions in spans; they may hold data |
-| `--otel-plan-spans` | off | one span per executed plan operator |
-| `--rate-limit SPEC` | off (`preauth=30/min,burst=60` with `--auth-config`) | limit a request class per client, e.g. `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5`; `preauth=…` limits authentication failures per address before credentials are checked (repeatable; see [API.md](API.md), Rate limiting) |
-| `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP; `--rate-limit` applies on top |
-| `--rate-limit-trusted-proxy CIDR` | | proxy whose `X-Forwarded-For` names the client (repeatable; `unix`: the `--unix-socket`); limits by address need a peer address clients cannot choose, so list only proxies that overwrite or append to the header |
-| `--rate-limit-trusted-proxy-header H` | `x-forwarded-for` | the one header trusted proxies name the client in: `x-forwarded-for` or `forwarded` (RFC 7239); the other is ignored |
-| `--no-service` | | refuse `SERVICE` for everyone |
-| `--outbound-allow-private` | off | let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)) |
-| `--outbound-block-private` | | refuse those addresses: already the default of `serve` and `mcp`, an opt-in for the local `query` and `update` (which allow them by default) |
-| `--outbound-allow HOST_OR_CIDR` | | contact only these destinations (repeatable) |
-| `--outbound-timeout S` | `60` | total time of one outbound request, until the end of its response |
-| `--outbound-max-mb N` | `256` | largest outbound response, decompressed |
-| `--outbound-request-max-mb N` | 4 × `--outbound-max-mb` (`1024`) | bytes all the SERVICE calls and LOADs of one query or update may receive (`507` past it) |
-| `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | time all the SERVICE calls and LOADs of one query or update may take, summed |
-| `--load-dir DIR` | | let `LOAD <file:…>` read the regular files under `DIR` (symbolic links resolved, nothing outside it); without it the server refuses file loads |
-| `--max-prefixes N` | `1000` | prefixes per dataset (global flag; `0`: unlimited); a new one past it is refused with `400`, and loaded data stops adding its prefixes |
+| `--host ADDR` | `127.0.0.1` | Listen address. A non-loopback address needs `--auth-config` or `--allow-open-network`. |
+| `--allow-open-network` | off | Serve without `--auth-config` on a non-loopback address, and log a warning. Also `SPARKLES_ALLOW_OPEN_NETWORK=1`. |
+| `--public-host NAME` | | A host name that clients use to reach the server, such as a reverse proxy's. Repeatable. Without `--auth-config`, names other than IP addresses, `localhost` and `--host` are refused with `421`. With `--auth-config`, the same applies to requests that carry trusted proxy headers from loopback or the Unix socket. |
+| `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
+| `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
+| `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
+| `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
+| `--query-memory-mb N` | `8192` | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
+| `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
+| `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
+| `--max-rows N` | `200000000` | Rows in any intermediate result. |
+| `--max-query-body-mb N` | `16` | Largest SPARQL query body, which also covers explain and `/shacl` shapes; `0` means unlimited. A larger body gets `413`. |
+| `--max-update-body-mb N` | `256` | Largest SPARQL update body; `0` means unlimited. Bulk data goes through the Graph Store or `/upload`. |
+| `--max-admin-body-mb N` | `16` | Largest `/$/…` or prefix-change body; `0` means unlimited. `/$/auth/*` bodies are capped at 64 KiB. |
+| `--max-upload-mb N` | `4096` | Largest Graph Store write or upload body; `0` means unlimited. The body is streamed to a temporary file and counted after HTTP decompression. |
+| `--min-free-disk-mb N` | `1024` | Free disk space to keep; `0` turns the check off. The server refuses with `507` to spool a request body when the temporary directory's file system would keep less. It refuses to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) when the data directory's file system would keep less. |
+| `--max-mem-dataset-mb N` | `4096` | Largest in-memory dataset; `0` means unlimited. A commit that would grow one past it fails with `507`. |
+| `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text and spatial index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
+| `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
+| `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
+| `--format-endpoint on\|authenticated\|off` | `on` | Who may use `POST /$/format` (see [API.md](API.md#formatting)). `on` admits every caller the server admits, `authenticated` every caller but the anonymous principal (`401`), and `off` nobody (`404`). A UI built with the formatter's WebAssembly module formats in the page and needs the endpoint only as a fallback. |
+| `--format-max-mb N` | `16` | Largest `POST /$/format` body; `0` means unlimited. |
+| `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
+| `--vector-memory-mb N` | `4096` | Memory for the packed vectors of `spk:vectorSearch`, per index generation. |
+| `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
+| `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
+| `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
+| `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
+| `--log-format text\|json` | `text` | Log format on stderr. A global flag. `RUST_LOG` filters as usual. |
+| `--no-access-log` | | No per-request log lines. |
+| `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
+| `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
+| `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
+| `--otel-logs` | off | Export log events over OTLP as well. |
+| `--otel-query-text` | off | Record query text (`db.query.text`) and plan operator descriptions in spans. These may hold data. |
+| `--otel-plan-spans` | off | One span per executed plan operator. |
+| `--rate-limit SPEC` | off (`preauth=30/min,burst=60` with `--auth-config`) | Limit a request class per client, for example `query=100/s,burst=200,concurrency=64` or `auth=10/min,burst=5`. `preauth=…` limits authentication failures per address before credentials are checked. Repeatable; see [API.md](API.md), Rate limiting. |
+| `--rate-limit-config FILE` | | JSON rate-limit configuration, re-read on SIGHUP. `--rate-limit` applies on top. |
+| `--rate-limit-trusted-proxy CIDR` | | A proxy whose `X-Forwarded-For` names the client. Repeatable; `unix` means the `--unix-socket`. Limits by address need a peer address that clients cannot choose, so list only proxies that overwrite or append to the header. |
+| `--rate-limit-trusted-proxy-header H` | `x-forwarded-for` | The one header in which trusted proxies name the client: `x-forwarded-for` or `forwarded` (RFC 7239). The other is ignored. |
+| `--no-service` | | Refuse `SERVICE` for everyone. |
+| `--outbound-allow-private` | off | Let `SERVICE` and `LOAD <http…>` reach loopback, private, shared (CGNAT) and unique-local addresses (see [Outbound requests](#outbound-requests-service-and-load)). |
+| `--outbound-block-private` | | Refuse those addresses. This is already the default for `serve` and `mcp`. The local `query` and `update` allow them by default, so for those commands it is an opt-in. |
+| `--outbound-allow HOST_OR_CIDR` | | Contact only these destinations. Repeatable. |
+| `--outbound-timeout S` | `60` | Total time of one outbound request, until the end of its response. |
+| `--outbound-max-mb N` | `256` | Largest outbound response, after decompression. |
+| `--outbound-request-max-mb N` | 4 × `--outbound-max-mb` (`1024`) | Bytes that all the SERVICE calls and LOADs of one query or update may receive together. Past it, the request gets `507`. |
+| `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
+| `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
+| `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
 
-`sparkles serve --help` lists the rest (`--read-only`, `--result-cache-mb`,
-`--auto-reason`, `--auth-config`, `--unix-socket`, `--map-style-url`, compression and
-schema limits, …).
+`sparkles serve --help` lists the other options, including `--read-only`,
+`--result-cache-mb`, `--auto-reason`, `--auth-config`, `--unix-socket`,
+`--map-style-url`, and the compression and schema limits.
 
-Over-budget requests fail with `507` and a JSON body naming the budget (`outbound-bytes` for
-the outbound total). A query or write stops as soon as its client disconnects, and a write
-then commits nothing. `sparkles query --memory-mb N` applies the memory budget on the
-command line (unlimited by default).
+A request over budget fails with `507` and a JSON body that names the budget. The
+outbound total is named `outbound-bytes`. A query or write stops as soon as its client
+disconnects, and a write then commits nothing. `sparkles query --memory-mb N` applies the
+memory budget on the command line, where there is no limit by default.
 
 ## Command-line tools
 
-The Jena `tdb2.*` / `arq` equivalents work on a database directory directly. A running
-server locks the databases it holds; use the HTTP API, or `--server` where a command
-takes it:
+The equivalents of Jena's `tdb2.*` and `arq` tools work on a database directory
+directly. A running server locks the databases it holds, so use the HTTP API instead, or
+`--server` where a command takes it:
 
 ```sh
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
@@ -169,26 +173,35 @@ sparkles geo-index  --loc db                  # spatial index: --predicate, --fe
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 ```
 
-`sparkles geo-index` enables the spatial index when it is off (with the defaults or the
-given options), builds it and prints its status to stderr. When the index is already
-enabled, opening the database starts the build, and the command reports the status after
-it. It exits 2 when the binary was built without the `geo` feature.
+`sparkles geo-index` enables the spatial index if it is off, with the defaults or the
+given options. It then builds the index and prints its status to stderr. When the index
+is already enabled, opening the database starts the build, and the command reports the
+status after it. The command exits 2 when the binary was built without the `geo`
+feature.
 
-The other commands: `schema`, `shacl`, `shex validate|parse`, `validation` (write-time
-validation), `snapshot` (named snapshots and history retention), `repo` and
-`backup create|list|show|restore|verify|delete|policy` ([below](#backup-repositories)),
-`auth` (password hashes, tokens, `auth login` for remote `query` / `update` /
-`load --server`), `mcp` ([below](#mcp-server-llm-agents)), `fmt` and `lsp`
-([below](#formatting)). `sparkles help COMMAND` describes each.
+The other commands are:
+
+* `schema`, `shacl` and `shex validate|parse`;
+* `validation`, for write-time validation;
+* `snapshot`, for named snapshots and history retention;
+* `repo` and `backup create|list|show|restore|verify|delete|policy`
+  ([below](#backup-repositories));
+* `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
+  `load --server`;
+* `mcp` ([below](#mcp-server-llm-agents));
+* `fmt` and `lsp` ([below](#formatting)).
+
+`sparkles help COMMAND` describes each one.
 
 ## Formatting
 
 `sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle
 (`.ttl`, `.turtle`), TriG (`.trig`), N-Triples (`.nt`), N-Quads (`.nq`) and JSON-LD
-(`.jsonld`) with Prettier's modes and exit codes: 0 when everything is formatted (or was
-written), 1 when `--check` or `-l` found a file that would change, 2 on any error (a
-syntax error, a refused output, an unreadable file, a bad option). It processes every
-file, so one run reports every problem, and formats files in parallel (`--threads N`).
+(`.jsonld`). It follows Prettier's modes and exit codes. It exits 0 when everything is
+formatted or was written, and 1 when `--check` or `-l` found a file that would change.
+It exits 2 on any error: a syntax error, a refused output, an unreadable file or a bad
+option. It processes every file, so one run reports every problem, and it formats files
+in parallel (`--threads N`).
 
 ```sh
 sparkles fmt q.rq                    # print the formatted query (stdin to stdout without a path)
@@ -200,20 +213,22 @@ sparkles fmt --sort data.nq          # N-Triples / N-Quads sorted (external sort
 sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
 ```
 
-- **Files.** Directories are walked recursively for the extensions above, with
-  `.gitignore`, `.git/info/exclude` and the global gitignore applied (hidden files
-  included; never `.git`, `node_modules` or `target`). A file named on the command line is
-  formatted whatever its extension: `--language` names its language, else the extension
-  does; with an unknown extension the content decides (it never reads as N-Triples,
-  since N-Triples is valid Turtle too). Walks skip `.n3`, `.shc` and `.json` files, which
-  need `--language` when named; RDF/XML and compressed files are refused.
-- **Ignore file.** `.sparklesfmtignore` in the current directory (gitignore syntax), or
-  `--ignore-path FILE` (repeatable). It applies to walks and to named files, which it
-  skips silently; an ignored `--stdin-filepath` passes stdin through unchanged.
-- **Config.** `.sparklesfmt.toml` (or `sparklesfmt.toml`), found by walking up from each
-  file's directory; the nearest one wins and files are not merged. Flags override it;
-  `--config FILE` uses one file for every input and `--no-config` the defaults. An unknown
-  key or a bad value is an error naming the key and the file.
+- **Files.** Directories are walked recursively for the extensions above. The walk
+  applies `.gitignore`, `.git/info/exclude` and the global gitignore. It includes hidden
+  files but never enters `.git`, `node_modules` or `target`. A file named on the command
+  line is formatted whatever its extension. `--language` names its language; otherwise
+  the extension does. With an unknown extension, the content decides, and it is never
+  detected as N-Triples, because N-Triples is also valid Turtle. Walks skip `.n3`, `.shc`
+  and `.json` files, which need `--language` when named. RDF/XML and compressed files are
+  refused.
+- **Ignore file.** `.sparklesfmtignore` in the current directory, in gitignore syntax, or
+  `--ignore-path FILE` (repeatable). It applies to walks and to named files. A named file
+  that it matches is skipped silently. An ignored `--stdin-filepath` passes stdin through
+  unchanged.
+- **Config.** `.sparklesfmt.toml` or `sparklesfmt.toml`, found by walking up from each
+  file's directory. The nearest one wins, and files are not merged. Flags override it.
+  `--config FILE` uses one file for every input, and `--no-config` uses the defaults. An
+  unknown key or a bad value is an error that names the key and the file.
 
   ```toml
   line-width = 100               # 40..=400
@@ -231,41 +246,45 @@ sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
   ```
 
   Every key has a flag of the same name (`--no-type-shorthand`, `--quote-style preserve`, …).
-- **Messages.** Errors read `path:LINE:COL: error: …` (1-based lines and columns, in
-  characters); a refused output reads `path: error: formatter refused its own output
-  (algebra differs); input left unchanged; please report`.
-- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`;
-  sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix). A larger file is an error, with two
+- **Messages.** Errors read `path:LINE:COL: error: …`, with 1-based lines and columns
+  counted in characters. A refused output reads
+  `path: error: formatter refused its own output (algebra differs); input left unchanged; please report`.
+- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`).
+  Sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix. A larger file is an error, with two
   exceptions:
-  - N-Triples and N-Quads always stream: a file or stdin of any size is formatted in one
-    pass in bounded memory (`--diff` formats them in memory).
+  - N-Triples and N-Quads always stream. A file or stdin of any size is formatted in one
+    pass in bounded memory. With `--diff`, they are formatted in memory.
   - Turtle and TriG over `--max-bytes` stream statement by statement unless sorted.
-    `--max-bytes` then bounds the largest statement; with `prune-prefixes` the input is
+    `--max-bytes` then bounds the largest statement. With `prune-prefixes`, the input is
     read twice, and stdin is kept in a temporary file.
 
   Sorting N-Triples and N-Quads spills sorted runs to the temporary directory past
-  `--sort-memory` (default `1GiB`); `--canonicalize` holds at most
+  `--sort-memory` (default `1GiB`). `--canonicalize` holds at most
   `--max-canonicalize-quads` quads (default 20,000,000).
 
-`sparkles lsp` serves the same formatting, with syntax errors and the formatter's warnings
-as diagnostics, to editors over the Language Server Protocol; [editors.md](editors.md) has
-the setups. `POST /$/format` is the HTTP form ([API.md](API.md#formatting)), and the UI
-formats in the page when it is built with the formatter's WebAssembly module.
+`sparkles lsp` serves the same formatting to editors over the Language Server Protocol,
+with syntax errors and the formatter's warnings as diagnostics. [editors.md](editors.md)
+has the editor setups. `POST /$/format` is the HTTP form ([API.md](API.md#formatting)).
+The UI formats in the page when it is built with the formatter's WebAssembly module.
 
 ## Backup repositories
 
-Backup repositories (see [API.md](API.md#backup-repositories)) work offline
-too, on a stopped database; a server's own datasets are backed up through its HTTP API or
-UI, or by its policies. `--repo` takes a name from the backup config file
-(`--backup-config FILE`, `$SPARKLES_BACKUP_CONFIG`, default
-`$XDG_CONFIG_HOME/sparkles/backup.toml`) or a URL: `file:///srv/backups/r`,
-`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true`, or `memory://`.
-Credentials never go in URLs; they come from the environment or a credentials file.
-Only `repo add` and `backup create` initialize an empty location; the other commands
+Backup repositories (see [API.md](API.md#backup-repositories)) also work offline, on a
+stopped database. A server's own datasets are backed up through its HTTP API or UI, or by
+its policies.
+
+`--repo` takes either a name from the backup config file or a URL. The config file is
+`--backup-config FILE` or `$SPARKLES_BACKUP_CONFIG`, and defaults to
+`$XDG_CONFIG_HOME/sparkles/backup.toml`. A URL is `file:///srv/backups/r`,
+`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true` or `memory://`.
+Credentials never go in URLs. They come from the environment or a credentials file.
+
+Only `repo add` and `backup create` initialize an empty location. The other commands
 attach to an existing repository. Manifests are cached in
-`$XDG_CACHE_HOME/sparkles/backup/`, progress goes to stderr, Ctrl-C cancels (twice:
-quits), and the commands that print a result take `--format json` (or `--json`). Exit
-codes: 0 ok, 1 errors, 2 warnings only (orphaned blobs in `repo verify`).
+`$XDG_CACHE_HOME/sparkles/backup/`, and progress goes to stderr. Ctrl-C cancels, and a
+second Ctrl-C quits. The commands that print a result take `--format json` (or
+`--json`). The exit code is 0 on success, 1 on errors, and 2 on warnings only, such as
+orphaned blobs in `repo verify`.
 
 ```sh
 sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
@@ -291,24 +310,25 @@ sparkles backup policy list | show P | history P # policies of the config file (
 sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin [--count 5]
 ```
 
-`restore --identity auto|new|keep` picks the dataset id (`auto` keeps it unless a dataset
-of the target data directory has it) and `--check quick|full|none` the integrity check
-before the restored database is published. `sparkles serve` holds a lock on
-`<data>/sparkles-server.lock` (one server per data directory), and `restore --data`
-refuses while a server holds it.
+`restore --identity auto|new|keep` picks the dataset id. `auto` keeps the id unless a
+dataset in the target data directory already has it. `--check quick|full|none` picks the
+integrity check that runs before the restored database is published. `sparkles serve`
+holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
+directory, and `restore --data` refuses while a server holds it.
 
-A server (`sparkles serve --backup-config FILE`) serves the file's repositories and
-policies read-only through its API. It also takes repositories registered through its
-API and UI (`POST /$/repositories`), under the operator's limits from that file:
+A server started with `sparkles serve --backup-config FILE` serves the file's
+repositories and policies through its API, read-only. It also accepts repositories
+registered through its API and UI (`POST /$/repositories`), within the operator's limits
+from that file:
 
-* their credentials only name a source defined there, never environment variables, files
-  or the instance's default chain of the caller's choosing;
-* their S3 endpoints go through the [outbound policy](#outbound-requests-service-and-load)
-  (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or `--outbound-allow-private`),
-  never through a proxy of the environment (`HTTPS_PROXY`; the config file's repositories
-  and the CLI's use it);
-* `fs` repositories stay out of the data directory and the config files' directories,
-  and under `[api] fs_roots` when it is set:
+* Their credentials can only name a source defined in the file. The caller cannot choose
+  environment variables, files or the instance's default chain.
+* Their S3 endpoints go through the [outbound policy](#outbound-requests-service-and-load),
+  so a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
+  `--outbound-allow-private`. They never go through a proxy from the environment
+  (`HTTPS_PROXY`). The config file's repositories and the CLI's do use that proxy.
+* `fs` repositories must stay out of the data directory and the config files'
+  directories. When `[api] fs_roots` is set, they must lie under it:
 
 ```toml
 [credentials.minio]              # named by {"source": "named", "name": "minio"}
@@ -320,83 +340,88 @@ secret_access_key_var = "MINIO_SECRET_KEY"
 fs_roots = ["/srv/backups"]
 ```
 
-To register an S3 repository through the API, define its credential source in the
-file first (by hand, or with `sparkles repo add … --credentials-name minio --credentials
-…` on the same file), start the server with it (or send it SIGHUP), then
-`POST /$/repositories` with `"credentials": {"source": "named", "name": "minio"}`.
+To register an S3 repository through the API, first define its credential source in the
+file. Write it by hand, or run
+`sparkles repo add … --credentials-name minio --credentials …` on the same file. Start the
+server with the file, or send it SIGHUP. Then `POST /$/repositories` with
+`"credentials": {"source": "named", "name": "minio"}`.
 
 ## Outbound requests (SERVICE and LOAD)
 
 `SERVICE <url>` and `LOAD <http…>` make the server open connections, so they follow a
-network policy (with authentication on, they also need the `federate` permission). The
-local `sparkles query` and `sparkles update` follow it too, with a different default
-(below):
+network policy. With authentication on, they also need the `federate` permission. The
+local `sparkles query` and `sparkles update` follow the same policy with a different
+default, described below. The policy works as follows:
 
-* only `http` and `https` URLs;
-* the host is resolved once and the connection goes to exactly the addresses that were
-  checked, so DNS rebinding cannot swap in another address; if any address a name
-  resolves to is refused, the name is refused;
-* by default only public addresses are contacted. Refused: loopback (`127.0.0.0/8`,
-  `::1`), private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64.0.0/10`),
-  link-local (`169.254.0.0/16` with the `169.254.169.254` metadata service, `fe80::/10`),
-  unique-local (`fc00::/7`), multicast, broadcast, unspecified, documentation,
-  benchmarking and reserved ranges, and the IPv4-mapped, IPv4-compatible, NAT64 and 6to4
-  IPv6 forms of those;
-* every redirect hop is checked the same way (at most 5 hops);
-* a 10 s connect timeout, a total timeout (`--outbound-timeout`, default 60 s, and never
-  past the query's own timeout), and a response ceiling counted as the body streams in and,
-  for a compressed `LOAD`, after decompression (`--outbound-max-mb`, default 256);
-* one budget for all the SERVICE calls and LOADs of a query or update, so that many
-  requests cannot add up to more than a few large ones: the bytes they receive
-  (`--outbound-request-max-mb`, by default 4 × `--outbound-max-mb`; a compressed `LOAD`
-  counts its decompressed bytes) and the time they take, summed
-  (`--outbound-request-timeout`, by default 4 × `--outbound-timeout`). Past the bytes the
-  request fails with `507` (`"budget": "outbound-bytes"`) and an update commits nothing;
-  past the time the next call gets only what is left and then fails like a timeout;
-* a `LOAD` is parsed as its response streams in, not buffered first.
+* Only `http` and `https` URLs are allowed.
+* The host is resolved once, and the connection goes to exactly the addresses that were
+  checked, so DNS rebinding cannot swap in another address. If any address that a name
+  resolves to is refused, the name is refused.
+* By default, only public addresses are contacted. The policy refuses loopback
+  (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`), shared
+  (`100.64.0.0/10`), link-local (`169.254.0.0/16`, which holds the `169.254.169.254`
+  metadata service, and `fe80::/10`), unique-local (`fc00::/7`), multicast, broadcast,
+  unspecified, documentation, benchmarking and reserved ranges. It also refuses the
+  IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms of those.
+* Every redirect hop is checked the same way, for at most 5 hops.
+* Each request has a 10 s connect timeout and a total timeout (`--outbound-timeout`,
+  default 60 s) that never runs past the query's own timeout. Its response has a ceiling
+  (`--outbound-max-mb`, default 256), counted as the body streams in and, for a
+  compressed `LOAD`, after decompression.
+* One budget covers all the SERVICE calls and LOADs of a query or update, so that many
+  requests cannot add up to more than a few large ones. It limits the bytes they receive
+  (`--outbound-request-max-mb`, by default 4 × `--outbound-max-mb`), and a compressed
+  `LOAD` counts its decompressed bytes. It also limits the time they take, summed
+  (`--outbound-request-timeout`, by default 4 × `--outbound-timeout`). Past the byte
+  limit, the request fails with `507` (`"budget": "outbound-bytes"`) and an update
+  commits nothing. Past the time limit, the next call gets only the time that is left and
+  then fails like a timeout.
+* A `LOAD` is parsed as its response streams in. It is not buffered first.
 
 A refused destination fails with `403` before any connection is made. `SILENT` hides
-neither that nor a spent budget; it hides failures of the remote side, such as timeouts.
-Proxy environment variables (`HTTP_PROXY`, …) are ignored for these requests.
+neither that refusal nor a spent budget. It hides failures of the remote side, such as
+timeouts. Proxy environment variables (`HTTP_PROXY`, …) are ignored for these requests.
 
-Error messages name the URL and its host, but neither what the host resolved to nor the
-connection's own error: a refused name answers `… is refused by the outbound policy`, a
-failed connection `cannot connect`. The server logs the details (target
-`sparkles::outbound`: the resolved address and its kind, the OS error), so an operator can
-tell why while a caller cannot map internal names to addresses.
+Error messages name the URL and its host. They do not say what the host resolved to, and
+they do not include the connection's own error. A refused name answers
+`… is refused by the outbound policy`, and a failed connection answers `cannot connect`.
+The server logs the details under the target `sparkles::outbound`: the resolved address,
+its kind and the OS error. An operator can see why a request failed, but a caller cannot
+use the errors to map internal names to addresses.
 
-`--outbound-allow-private` opens loopback, private, shared and unique-local addresses, for
-example a local Fuseki during development:
+`--outbound-allow-private` opens loopback, private, shared and unique-local addresses,
+for example to reach a local Fuseki during development:
 
 ```sh
 sparkles serve --data ./data --outbound-allow-private
 # SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }
 ```
 
-Link-local addresses, the metadata service among them, stay refused. In production,
-prefer an allowlist: with `--outbound-allow` (repeatable) only the listed destinations are
-contacted. An entry is one of:
+Link-local addresses, including the metadata service, stay refused. In production,
+prefer an allowlist. With `--outbound-allow` (repeatable), only the listed destinations
+are contacted. An entry is one of:
 
-* a host name (`--outbound-allow sparql.example.org`), or `*.example.org` for the
-  subdomains of a name: contacted at public addresses (private ones too with
-  `--outbound-allow-private`);
-* an address or CIDR network (`--outbound-allow 10.20.0.0/16`): any address in it,
-  private and link-local ones included.
+* A host name (`--outbound-allow sparql.example.org`), or `*.example.org` for the
+  subdomains of a name. The name is contacted at public addresses, and at private ones
+  too with `--outbound-allow-private`.
+* An address or CIDR network (`--outbound-allow 10.20.0.0/16`). Any address in it is
+  contacted, including private and link-local ones.
 
-A name vouches for the name, not for its addresses: to reach a name that resolves to a
-private or link-local address, list that address or network as well (`--outbound-allow
-fuseki.internal --outbound-allow 10.20.0.0/16`), so a hijacked or mistyped DNS record
-never opens the metadata service. `sparkles mcp` takes the same flags. Library users set
-`QueryOptions::outbound` (`sparkles::outbound::OutboundPolicy`, same defaults); the
-default refusal of non-public addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
+Listing a name vouches for the name, not for the addresses it resolves to. To reach a
+name that resolves to a private or link-local address, list that address or network as
+well (`--outbound-allow fuseki.internal --outbound-allow 10.20.0.0/16`). A hijacked or
+mistyped DNS record then cannot open the metadata service. `sparkles mcp` takes the same
+flags. Library users set `QueryOptions::outbound`
+(`sparkles::outbound::OutboundPolicy`), which has the same defaults. The default refusal
+of non-public addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
 
 **Local commands.** `sparkles query` and `sparkles update` without `--server` run on the
-operator's own machine, so they allow loopback, private, shared and unique-local
-destinations by default, as `--outbound-allow-private` does for a server: a SERVICE call
-to a local Fuseki or a `LOAD` from an intranet host needs no flag. Link-local addresses (the
-metadata service) stay refused. They take the same `--outbound-*` flags;
-`--outbound-block-private` restores the strict default of `serve` and `mcp`, e.g. for a
-query from an untrusted source:
+operator's own machine. They therefore allow loopback, private, shared and unique-local
+destinations by default, as `--outbound-allow-private` does for a server. A SERVICE call
+to a local Fuseki or a `LOAD` from an intranet host needs no flag. Link-local addresses,
+including the metadata service, stay refused. The local commands take the same
+`--outbound-*` flags. `--outbound-block-private` restores the strict default of `serve`
+and `mcp`, for example for a query from an untrusted source:
 
 ```sh
 sparkles query --data local.ttl 'SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }'
@@ -406,52 +431,54 @@ sparkles query --data local.ttl --outbound-block-private --query untrusted.rq
 With `--server`, the request runs on that server under its own policy, and these flags
 do not apply.
 
-**Local files.** `LOAD <file:…>` over HTTP needs `server-admin` (with authentication on)
-and `serve --load-dir DIR`: the file must be a regular file under `DIR` once `..` and
-symbolic links are resolved (a link inside `DIR` may point elsewhere inside it). Without
-the flag the server refuses file loads (`403`); `DIR` may not hold the data directory.
-The local `sparkles update` reads any file its user can. Library users set
-`QueryOptions::file_loads` (`FileLoads::Anywhere` by default, `FileLoads::under(dir)`, or
-`FileLoads::Disabled`).
+**Local files.** `LOAD <file:…>` over HTTP needs `serve --load-dir DIR`, and
+`server-admin` when authentication is on. The file must be a regular file under `DIR`
+once `..` and symbolic links are resolved. A link inside `DIR` may point elsewhere inside
+it. Without the flag, the server refuses file loads with `403`. `DIR` may not hold the
+data directory. The local `sparkles update` reads any file its user can read. Library
+users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
+`FileLoads::under(dir)` or `FileLoads::Disabled`.
 
 ## Checking a database
 
-`sparkles check --loc db` verifies a database directory without modifying it: it takes
+`sparkles check --loc db` verifies a database directory without modifying it. It takes
 no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
-run next to a server that holds the database (`--data DIR` checks every database of a
-server data directory). Each check prints one line, `ok`, `warning` or `error`, with the
-file, offset, block, row, commit or id of every problem below it; `--format json`
-prints the same report as JSON. The exit status is 0 when everything is clean, 1 when
-any check found an error, and 2 when there are warnings only.
+run next to a server that holds the database. `--data DIR` checks every database in a
+server's data directory. Each check prints one line, `ok`, `warning` or `error`, and
+lists the file, offset, block, row, commit or id of every problem below it.
+`--format json` prints the same report as JSON. The exit status is 0 when everything is
+clean, 1 when any check found an error, and 2 when there are warnings only.
 
 | Check | What it verifies |
 |---|---|
-| `layout` | `CURRENT` names an existing generation; `dataset.json`, the generation's `commit.json` (same dataset id) and `prefixes.json` parse; leftovers of interrupted work (`*.tmp`, `text.new`/`text.old`, old or unfinished `gen-NNNN`, a set-aside catalog) are warnings |
-| `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count |
-| `vocabulary` | the front-coded vocabulary decodes, its keys strictly increase, its size matches `meta.json`, and every vocabulary id in the permutations is below it |
-| `delta-vocabulary` | the update vocabulary is well formed and holds no duplicate (a torn tail is a warning) |
-| `perm.spo` … `perm.gspo` | block metadata is contiguous and sorted and fits the file; the row count matches `meta.json`; every block decodes to its row count, its first and last keys match the metadata, keys strictly increase within and across blocks, and every id is valid for its position |
-| `permutations` | the 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads |
-| `wal` | records are well formed; every commit record's checksum matches (a damaged final transaction is a warning: open truncates it); commit numbers continue from the generation's base commit; ids resolve |
-| `catalog` | `commits.bin` record checksums and continuity, its dataset id, and agreement with the WAL; a lagging catalog, or damage open can rebuild from the WAL, is a warning, lost history before the generation an error |
-| `text` | `text.json` parses; the index opens read-only, every committed segment file exists and matches its checksum; its commit against the WAL (behind is a warning: caught up or rebuilt on open) |
-| `geo` | `geo.json` parses and is a valid configuration; the current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`): header, footer, that they belong to this generation and configuration, index checksums, and in full mode the data checksums (a damaged file is a warning: rebuilt on open) |
-| `reasoning` | `reasoning.json` parses and names an existing commit |
+| `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
+| `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count. |
+| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. |
+| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. A torn tail is a warning. |
+| `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
+| `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. Commit numbers continue from the generation's base commit, and ids resolve. |
+| `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
+| `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
+| `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
+| `reasoning` | `reasoning.json` parses and names an existing commit. |
 
-Errors are what `Store::open` refuses, what loses acknowledged data or history, or what
-queries would read wrongly; warnings are states open handles by itself. A server writing
-meanwhile can cause transient warnings (an in-flight transaction looks like a torn
-tail), never errors. `--quick` reads metadata only: block metadata instead of every
-block, the first key of each vocabulary block, segment files' presence instead of
-their checksums. On the 10.5M-quad benchmark database a full check takes about 0.3 s
-and a quick one 20 ms (16 cores, warm page cache). The same check is a library call:
+Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
+that queries would read wrongly. Warnings are states that open handles by itself. A
+server that writes during the check can cause transient warnings, because an in-flight
+transaction looks like a torn tail, but never errors.
+
+`--quick` reads metadata only. It reads block metadata instead of every block, the first
+key of each vocabulary block, and whether segment files exist instead of their
+checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
+quick one 20 ms (16 cores, warm page cache). The same check is a library call:
 `sparkles::check::check(root, &CheckOptions::default())` returns a serializable
 `CheckReport`.
 
 ## MCP server (LLM agents)
 
-`sparkles mcp` serves databases, or RDF files loaded into memory, to an MCP host
-(Claude Desktop, Claude Code, IDE agents, …) over stdin/stdout:
+`sparkles mcp` serves databases, or RDF files loaded into memory, over stdin/stdout to
+an MCP host such as Claude Desktop, Claude Code or an IDE agent:
 
 ```sh
 sparkles mcp --loc /data/books                 # a database directory (name: books)
@@ -459,8 +486,9 @@ sparkles mcp --loc books=/data/books --loc films=/data/films
 sparkles mcp --data a.ttl b.nt --name demo     # files, in one in-memory dataset
 ```
 
-Host configuration (`claude_desktop_config.json`, or a project's `.mcp.json` for Claude
-Code; `claude mcp add sparkles -- sparkles mcp --loc /data/books` does the same):
+Configure the host in `claude_desktop_config.json`, or in a project's `.mcp.json` for
+Claude Code. For Claude Code, `claude mcp add sparkles -- sparkles mcp --loc /data/books`
+does the same:
 
 ```json
 {
@@ -470,33 +498,40 @@ Code; `claude mcp add sparkles -- sparkles mcp --loc /data/books` does the same)
 }
 ```
 
-The tools are read-only: `list_datasets`, `describe_schema`, `sparql_query`,
-`explain_query`, `describe_resource`, `list_commits`, `search_text` (BM25 over a
-full-text index; `--text` indexes `--data` files), `similar_entities` (exact search
-over stored `spk:vector` embeddings; it never computes them), and `validate_shacl` and
-`validate_shex` (a shapes graph, or a ShEx schema with a shape map, checked against a
-snapshot: counts and the first 20 results with node, shape and reason; no imports).
-Schemas are in [API.md](API.md#mcp-server). Results are sized for a model's context:
-query rows come back as a compact table with the dataset's prefixes (100 rows / 64 KiB by
-default), every truncation is announced with the exact total and how to continue, and
-data values are escaped so they cannot pass for table structure or status lines. Every
-result names the commit it read; passing it back as `atCommit` keeps a multi-call
-exploration on one snapshot (the server holds the last 4 commits read per dataset for 10
-minutes).
+The tools are read-only:
 
-Every call runs under the query timeout (30 s by default, `--timeout` is the maximum),
-a memory budget (`--query-memory-mb`, default 2048) and the intermediate-row cap, at
-most `--max-concurrent` (4) at a time. SERVICE is off unless `--allow-service`, because
-a prompt-injected model could otherwise send data to any URL; when allowed, it follows
-the [outbound policy](#outbound-requests-service-and-load). `--disable-tool NAME`
-removes a tool. A database held by a running `sparkles serve` is refused (the lock).
-Only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
+* `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
+  `describe_resource` and `list_commits`.
+* `search_text` runs BM25 search over a full-text index. `--text` indexes `--data` files.
+* `similar_entities` runs exact search over stored `spk:vector` embeddings. It never
+  computes embeddings.
+* `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
+  shape map, against a snapshot. They return counts and the first 20 results with node,
+  shape and reason. They do not follow imports.
+
+[API.md](API.md#mcp-server) has the tool schemas. Results are sized for a model's
+context. Query rows come back as a compact table with the dataset's prefixes, up to 100
+rows or 64 KiB by default. Every truncation is announced with the exact total and how to
+continue. Data values are escaped so they cannot pass for table structure or status
+lines. Every result names the commit it read. Passing that commit back as `atCommit`
+keeps a multi-call exploration on one snapshot. The server holds the last 4 commits read
+per dataset for 10 minutes.
+
+Every call runs under the query timeout, a memory budget (`--query-memory-mb`, default
+2048) and the intermediate-row cap. The timeout is 30 s by default, and `--timeout` is
+the maximum. At most `--max-concurrent` calls (4) run at a time. SERVICE is off unless
+`--allow-service` is given, because a prompt-injected model could otherwise send data to
+any URL. When allowed, SERVICE follows the
+[outbound policy](#outbound-requests-service-and-load). `--disable-tool NAME` removes a
+tool. A database held by a running `sparkles serve` is refused, because the server holds
+its lock. The MCP server supports only stdio. Logs go to stderr, and stdout carries
+JSON-RPC only.
 
 ## Embedding the library
 
 `crates/sparkles` is a plain Rust library. The CLI (everything except `serve`) and the
 server are built on it, so anything they do can be done in-process. A database
-directory is locked while open (`sparkles.lock`, like TDB2's `tdb.lock`).
+directory is locked while it is open, with `sparkles.lock`, like TDB2's `tdb.lock`.
 
 ```rust
 use sparkles::{Dataset, io::RdfFormat};
@@ -550,16 +585,16 @@ ds.dump(std::io::stdout(), RdfFormat::TriG)?;
 | `ShaclValidator` | `sparkles_shacl::validate` (crate `sparkles-shacl`) |
 | `ShexValidator` | `sparkles_shex::validate` (crate `sparkles-shex`) |
 
-Lower-level access (ids, snapshots, raw index scans, the bulk `Builder`) is available
-through `Dataset::store()` and the `store` / `index` / `builder` modules. `mise run doc`
-builds the API documentation of the library crates.
+`Dataset::store()` and the `store`, `index` and `builder` modules give lower-level
+access: ids, snapshots, raw index scans and the bulk `Builder`. `mise run doc` builds
+the API documentation of the library crates.
 
 ## Deploying on NixOS
 
-The flake's `nixosModules.default` provides `services.sparkles`, which runs the server as
-a hardened systemd service (the packages and other flake outputs are in
-[DEVELOPMENT.md](DEVELOPMENT.md#nix)). Its state lives in `/var/lib/sparkles` (the
-dataset registry, databases created from the UI or admin API, and backups). It can put an
+The flake's `nixosModules.default` provides `services.sparkles`, which runs the server
+as a hardened systemd service. [DEVELOPMENT.md](DEVELOPMENT.md#nix) lists the packages
+and other flake outputs. The service keeps its state in `/var/lib/sparkles`: the dataset
+registry, databases created from the UI or admin API, and backups. The module can put an
 nginx virtual host in front of the server, which you then extend through the usual
 `services.nginx.virtualHosts.<name>` options:
 
@@ -603,8 +638,8 @@ nginx virtual host in front of the server, which you then extend through the usu
 ```
 
 The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
-`openFirewall`). Another `listenAddress` needs `auth.configFile` or
-`allowOpenNetwork = true` (an assertion checks it). The nginx location sets:
+`openFirewall`). Any other `listenAddress` needs `auth.configFile` or
+`allowOpenNetwork = true`, and an assertion checks this. The nginx location sets:
 
 * `client_max_body_size` to `nginx.clientMaxBodySize` (default 4g), for bulk uploads;
 * proxy timeouts to `queryTimeout + 30` seconds;
@@ -612,26 +647,28 @@ The server listens on `127.0.0.1:3030` by default (`listenAddress`, `port`,
 * `X-Forwarded-For` to the client's address (`$remote_addr`, replacing whatever the
   client sent), and `Forwarded` to nothing.
 
-The server always trusts nginx for `X-Forwarded-For` (`--rate-limit-trusted-proxy` for
-127.0.0.1 and ::1, or `unix` with `unixSocket`), whether or not `rateLimits` is set, so
-failed logins and rate limits count each client rather than nginx. Behind another proxy
-or CDN, set up nginx's realip module so that `$remote_addr` is the client.
+The server always trusts nginx for `X-Forwarded-For`, whether or not `rateLimits` is
+set. It passes `--rate-limit-trusted-proxy` for 127.0.0.1 and ::1, or `unix` with
+`unixSocket`. Failed logins and rate limits therefore count each client rather than
+nginx. Behind another proxy or CDN, set up nginx's realip module so that `$remote_addr`
+is the client.
 
-`loadDir` passes `--load-dir`: `LOAD <file:…>` over HTTP may read from that directory
-only (the service gets it read-only; it must not contain `dataDir` or lie under `/tmp`).
+`loadDir` passes `--load-dir`, so `LOAD <file:…>` over HTTP may read from that
+directory only. The service gets the directory read-only. It must not contain `dataDir`
+or lie under `/tmp`.
 
-With `auth.configFile` the service starts with `--auth-config` and `systemctl reload
-sparkles` re-reads it (SIGHUP). Keep the file out of the Nix store (agenix, sops-nix),
-owned by the `sparkles` user. Do not also set nginx `basicAuthFile`: nginx would forward
-its own `Authorization` header, which Sparkles would then reject. `unixSocket` makes the
-server listen on a Unix socket that nginx proxies to, so trusted proxy headers can be
-limited to it (`proxy.trusted = ["unix"]`).
+With `auth.configFile`, the service starts with `--auth-config`, and
+`systemctl reload sparkles` re-reads the file (SIGHUP). Keep the file out of the Nix
+store (agenix, sops-nix), owned by the `sparkles` user. Do not also set nginx
+`basicAuthFile`. nginx would forward its own `Authorization` header, which Sparkles
+would then reject. `unixSocket` makes the server listen on a Unix socket that nginx
+proxies to, so trusted proxy headers can be limited to it (`proxy.trusted = ["unix"]`).
 
-Backup repositories: `backup.configFile` passes `--backup-config` (like
-`auth.configFile` it stays out of the Nix store, and `systemctl reload sparkles`
-re-reads it), `backup.maxTasks` passes `--backup-max-tasks`, and `backup.fsRoots` lists the
-directories of `fs` repositories, which the module creates for the service user and
-makes writable (the service sees the rest of the file system read-only):
+For backup repositories, `backup.configFile` passes `--backup-config`. Like
+`auth.configFile`, it stays out of the Nix store, and `systemctl reload sparkles`
+re-reads it. `backup.maxTasks` passes `--backup-max-tasks`. `backup.fsRoots` lists the
+directories of `fs` repositories. The module creates them for the service user and makes
+them writable, while the service sees the rest of the file system read-only:
 
 ```nix
 services.sparkles.backup = {
@@ -642,5 +679,5 @@ services.sparkles.backup = {
 ```
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
-its databases, so for offline work (`sparkles load`, `compact`) stop the service first,
-or use the HTTP API.
+its databases, so stop the service before offline work such as `sparkles load` or
+`compact`, or use the HTTP API instead.

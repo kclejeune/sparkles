@@ -2,17 +2,17 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Phase 1 (all of it: Basic users, API tokens, OIDC sign-in for the UI,
-> trusted proxy headers, CLI logins, remote `query`/`update`/`load`, the UI pages);
-> Phase 2 in part (rate limiting of failed logins, a Content Security Policy for the UI);
-> Phase 3 (graph-level ACLs) not built.
+> **Phases:** Phase 1 is complete: Basic users, API tokens, OIDC sign-in for the UI,
+> trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
+> Phase 2 is built in part: rate limiting of failed logins and a Content Security Policy
+> for the UI. Phase 3, graph-level ACLs, is not built.
 >
 > **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation; the [Outcome](#outcome) section at the end
 > records how it landed.
 
-Written as a clean-room spec; it was a must-have. Scope:
+This spec was written clean-room, for a must-have feature. It covers:
 
 - `crates/sparkles-server`: HTTP, state, observability, CLI (including a minimal remote
   client);
@@ -23,24 +23,25 @@ Written as a clean-room spec; it was a must-have. Scope:
 
 ## 1. Summary
 
-**Before this feature.** The server has no authentication. Any client that reaches the
-port can query, update, delete datasets, read metrics, make the server fetch URLs
+**Before this feature**, the server has no authentication. Any client that reaches the
+port can query and update data, delete datasets, read metrics, make the server fetch URLs
 (`SERVICE`, `LOAD <http…>`) and load local files (`LOAD <file:…>`). The README and the
-NixOS module recommend nginx `basicAuthFile`: one shared password, all or nothing. The
-CLI works only on local database directories.
+NixOS module recommend nginx `basicAuthFile`, which gives one shared password with all or
+nothing behind it. The CLI works only on local database directories.
 
-**This spec adds**, behind an opt-in `serve --auth-config FILE`:
+
+**This spec adds** the following, behind an opt-in `serve --auth-config FILE`:
 
 | Mechanism | For | Credential |
 |---|---|---|
-| Config users | scripts, small teams | HTTP Basic; argon2id hashes in the config |
-| API tokens | CLI, scripts, CI | `Authorization: Bearer spk_…`. Stored hashed. Scoped, expiring and revocable. Minted through the API, the UI or the CLI; static tokens can also be listed in the config |
-| OIDC login | the browser UI | Authorization code + PKCE with the operator's IdP, implemented natively in Rust. A server-side session behind a signed `HttpOnly` `SameSite=Lax` cookie |
-| Trusted headers | forward-auth proxies (oauth2-proxy, Authelia, Tailscale serve, Cloudflare Access) | `Remote-User`/`X-Forwarded-User` and similar headers, only from configured proxy CIDRs or the Unix socket |
-| CLI login | `sparkles auth login --server URL` | A browser loopback redirect or RFC 8628 device code. It yields an API token, stored in `~/.config/sparkles/credentials.toml` (0600) |
-| Anonymous | public datasets | none; the config holds its grants |
+| Config users | scripts, small teams | HTTP Basic, with argon2id hashes in the config. |
+| API tokens | CLI, scripts, CI | `Authorization: Bearer spk_…`. Tokens are stored hashed, scoped, expiring and revocable. They are minted through the API, the UI or the CLI, and static tokens can be listed in the config. |
+| OIDC login | the browser UI | The authorization code flow with PKCE against the operator's IdP, implemented natively in Rust. The browser gets a server-side session behind a signed `HttpOnly` `SameSite=Lax` cookie. |
+| Trusted headers | forward-auth proxies (oauth2-proxy, Authelia, Tailscale serve, Cloudflare Access) | `Remote-User`/`X-Forwarded-User` and similar headers, accepted only from configured proxy CIDRs or the Unix socket. |
+| CLI login | `sparkles auth login --server URL` | A browser loopback redirect or an RFC 8628 device code. Either one yields an API token, stored in `~/.config/sparkles/credentials.toml` (0600). |
+| Anonymous | public datasets | None. The config holds its grants. |
 
-On top of these, one permission model:
+One permission model covers all of them:
 
 - per-dataset levels `read` < `write` < `admin`;
 - server permissions `metrics`, `federate` and `server-admin`;
@@ -49,20 +50,20 @@ On top of these, one permission model:
 A single fail-closed authorization middleware enforces it. It hides datasets the caller
 cannot read (404, never 403) and filters every listing.
 
-**Without `--auth-config` nothing changes**: no credentials, same CORS, same routes, same
-benchmark numbers. `/$/auth/config` says `{"enabled": false}`, and the other `/$/auth/*`
-routes answer 404.
+**Without `--auth-config`, nothing changes.** No credentials are needed, and CORS, the
+routes and the benchmark numbers stay the same. `/$/auth/config` says
+`{"enabled": false}`, and the other `/$/auth/*` routes answer 404.
 
 ### 1.1 Threat model
 
-Deployment: one Sparkles process serving several users or teams. It sits behind a
-TLS-terminating proxy or on a private network (tailnet, VPN).
+The model deployment is one Sparkles process serving several users or teams. It sits
+behind a TLS-terminating proxy or on a private network such as a tailnet or VPN.
 
 | Adversary | Can | Must not be able to |
 |---|---|---|
-| Unauthenticated network client | reach the port | read or change any dataset not granted to `anonymous`; learn which datasets exist; read metrics; make the server fetch URLs or files; forge proxy identity headers |
-| Authenticated user | use their grants | read, change or see other datasets; escalate (create datasets, clone into foreign names, mint tokens broader or longer-lived than themselves); use outbound HTTP or local files without a grant |
-| Malicious web page in the user's browser | send cross-origin requests with ambient credentials (session cookie, proxy cookie, cached Basic) | read responses; trigger writes (CSRF); log the user into another account (login CSRF) |
+| Unauthenticated network client | reach the port | Read or change any dataset not granted to `anonymous`, learn which datasets exist, read metrics, make the server fetch URLs or files, or forge proxy identity headers. |
+| Authenticated user | use their grants | Read, change or see other datasets. Escalate by creating datasets, cloning into foreign names, or minting tokens broader or longer-lived than themselves. Use outbound HTTP or local files without a grant. |
+| Malicious web page in the user's browser | send cross-origin requests with ambient credentials: the session cookie, a proxy cookie or cached Basic credentials | Read responses, trigger writes (CSRF), or log the user into another account (login CSRF). |
 | Local process on the CLI user's machine | connect to 127.0.0.1 ports | obtain the token from the loopback flow without the PKCE verifier |
 | Someone who sees a device-code prompt | guess or observe a user code | approve it without an authenticated UI session |
 | Reader of logs, metrics or `<data>/auth/*.json` | read them | recover passwords, tokens, session ids or `Authorization` headers |
@@ -79,7 +80,7 @@ Out of scope:
 
 **Goals**
 
-- No auth by default, unchanged behavior for local use.
+- Auth is off by default, and local use behaves as before.
 - With auth, **deny by default**.
 - A dataset's existence leaks only to principals with at least `read` on it.
 - Every route has an explicit required permission in one table. A router test fails
@@ -94,14 +95,14 @@ Out of scope:
 
 **Non-goals (Phase 1)**
 
-- Graph- or triple-level ACLs (Phase 3; §12.3 explains why they are hard).
+- Graph- or triple-level ACLs (Phase 3). §12.3 explains why they are hard.
 - IdP-issued JWT access tokens on the API (Phase 2). In Phase 1, OIDC logs in the
-  *browser*; programs use Sparkles API tokens.
-- Users managed through the API (config users are file-managed; external identities come
-  from the IdP or proxy).
+  *browser*, and programs use Sparkles API tokens.
+- Managing users through the API. Config users are managed in the file, and external
+  identities come from the IdP or proxy.
 - Native TLS.
-- Per-IP rate limiting (Phase 2; Phase 1 bounds the cost of failed logins and caps
-  pending grants instead).
+- Per-IP rate limiting (Phase 2). Phase 1 instead bounds the cost of failed logins and
+  caps pending grants.
 - Per-principal query budgets.
 - Endpoint-level permissions.
 - A JavaScript auth server or SSR. **The UI stays static files embedded in the binary.**
@@ -112,8 +113,8 @@ Out of scope:
 
 | Kind | Log name | Source |
 |---|---|---|
-| `local` | none (not logged) | auth disabled: all permissions |
-| `anonymous` | `anonymous` | nothing else applied |
+| `local` | none (not logged) | Auth is disabled. The principal has all permissions. |
+| `anonymous` | `anonymous` | No other source applied. |
 | `user` | `user:{name}` | Basic, or a UI password login (session) |
 | `token` | `token:{id}` | Bearer, Basic with a token as the password, or a UI token login (session) |
 | `oidc` | `oidc:{name}` | a UI OIDC login (session) |
@@ -158,38 +159,39 @@ CLI logins (§6.3, §6.4).
 
 ### 2.3 API tokens
 
-**Format.** `spk_` followed by 43 base64url characters (32 bytes from the OS RNG), 47
-characters in all. The prefix makes leaked tokens easy to recognize and lets secret
-scanners find them. Each token also has a public **id**, `tok_` followed by 12 lowercase
-base32 characters, used in URLs, logs and the UI.
+**Format.** A token is `spk_` followed by 43 base64url characters (32 bytes from the OS
+RNG), 47 characters in all. The prefix makes leaked tokens easy to recognize and lets
+secret scanners find them. Each token also has a public **id**, `tok_` followed by 12
+lowercase base32 characters, which URLs, logs and the UI use.
 
-**At rest: SHA-256, not argon2id.**
+**At rest, tokens are hashed with SHA-256, not argon2id.**
 
 - The store keeps `sha256:<hex>` of the whole token string. The token is shown once, at
   mint time.
-- Slow hashes (argon2id, the OWASP password-storage guidance) protect *low-entropy human
-  passwords* against offline guessing. A 256-bit random token cannot be guessed offline
-  whatever the hash.
-- argon2id on every API request would cost about 20 ms of CPU and 19 MiB of memory,
-  which would be both a throughput limit and a DoS lever.
-- Lookup is `HashMap<[u8; 32], TokenRef>` keyed by digest. Lookup timing can only reveal
-  bits of the digest of attacker-chosen input, which is useless without a preimage.
-- Tokens are always generated by Sparkles, so their entropy is guaranteed. Tokens
-  supplied by users are never accepted for hashing.
+- Slow hashes like argon2id protect *low-entropy human passwords* against offline
+  guessing (OWASP password-storage guidance). A 256-bit random token cannot be guessed
+  offline, whatever the hash.
+- Running argon2id on every API request would cost about 20 ms of CPU and 19 MiB of
+  memory. That would cap throughput and give attackers a DoS lever.
+- Lookup uses a `HashMap<[u8; 32], TokenRef>` keyed by digest. Its timing can reveal
+  only bits of the digest of attacker-chosen input, which are useless without a
+  preimage.
+- Sparkles always generates the tokens, so their entropy is guaranteed. Tokens supplied
+  by users are never accepted for hashing.
 
-**Two sources, one lookup:**
+Tokens come from two sources and share one lookup:
 
 | | Static tokens | Minted tokens |
 |---|---|---|
 | Defined in | `[[tokens]]` in the config file | the token store `<data>/auth/tokens.json` |
-| Created by | `sparkles auth gen-token`, then an edit and SIGHUP | `POST /$/auth/tokens`, the UI tokens page, or the CLI login and `token create` |
+| Created by | `sparkles auth gen-token`, then a config edit and SIGHUP | `POST /$/auth/tokens`, the UI tokens page, or the CLI login and `token create` |
 | Id | `cfg-{name}` | `tok_…` |
 | Owner | none (a machine identity) | the minting identity (§2.3.1) |
-| Expiry | optional | required; default `tokens_policy.default_ttl` (30d), at most `tokens_policy.max_ttl` (90d) |
+| Expiry | optional | Required. Defaults to `tokens_policy.default_ttl` (30d), and is at most `tokens_policy.max_ttl` (90d). |
 | Revoked by | editing the config and SIGHUP | `DELETE /$/auth/tokens/{id}`, the UI, or `sparkles auth token revoke` / `auth logout` |
 
-Minted token record (`tokens.json`, format 1, written with `write_file_atomic`, mode
-0600, in a 0700 directory):
+A minted token's record in `tokens.json` (format 1) looks like this. The file is written
+with `write_file_atomic`, mode 0600, in a 0700 directory:
 
 ```json
 { "id": "tok_3k9x2m4q7p1z", "name": "laptop (sparkles CLI)", "hash": "sha256:…",
@@ -222,8 +224,8 @@ eff(owner) = grants of that identity under the *current* policy:
 - **A token never exceeds its minter, now or later.** Removing a user's grant, a role
   mapping or an admission rule shrinks every token they minted at the next request.
 - **Chains.** A token minted by a token records `parent`, and its expiry must be ≤ the
-  parent's. When the parent is revoked or expires, the child is invalid (the lookup of
-  the parent fails). Chains are limited to 4 levels.
+  parent's. When the parent is revoked or expires, the child becomes invalid, because
+  the lookup of the parent fails. Chains are limited to 4 levels.
 - **Static tokens** have no owner. `eff` is their own grants: their `datasets`, `server`
   and `roles`.
 - The groups of an oidc or proxy owner are those recorded at mint. They cannot be
@@ -232,66 +234,69 @@ eff(owner) = grants of that identity under the *current* policy:
 
 ### 2.4 OIDC login for the UI (native)
 
-The server is an OIDC **relying party** using the authorization code flow with PKCE
-(OpenID Connect Core §3.1, RFC 7636 `S256`), and discovery (OpenID Connect Discovery,
-falling back to RFC 8414 metadata).
+The server is an OIDC **relying party**. It uses the authorization code flow with PKCE
+(OpenID Connect Core §3.1, RFC 7636 `S256`) and discovery (OpenID Connect Discovery, with
+RFC 8414 metadata as the fallback).
 
-**Crate.** `openidconnect` 4.x (MIT), with `default-features = false`. A 30-line
-`AsyncHttpClient` adapter over the workspace `reqwest` 0.13 avoids a second reqwest.
-The adapter **does not follow redirects** (the crate's SSRF advice) and uses a 10 s
-timeout. Custom `AdditionalClaims`
-(`#[serde(flatten)] HashMap<String, serde_json::Value>`) exposes arbitrary claims such as
+**Crate.** The server uses `openidconnect` 4.x (MIT) with `default-features = false`. A
+30-line `AsyncHttpClient` adapter over the workspace `reqwest` 0.13 avoids a second
+reqwest. Following the crate's SSRF advice, the adapter **does not follow redirects**,
+and it uses a 10 s timeout. Custom `AdditionalClaims`
+(`#[serde(flatten)] HashMap<String, serde_json::Value>`) expose arbitrary claims such as
 `groups`.
 
-Flow:
+The flow has three steps:
 
 1. **Start.** The UI's "Sign in with {display_name}" navigates to
    `GET /$/auth/oidc/login?return_to=/ui/datasets`.
-   - `return_to` must start with `/ui/` and not with `//`; otherwise it becomes `/ui/`
-     (no open redirect).
+   - `return_to` must start with `/ui/` and not with `//`. Any other value becomes
+     `/ui/`, so there is no open redirect.
    - The server creates `state`, `nonce` and a PKCE verifier (32 random bytes each). It
-     keeps `pending[state] = {nonce, verifier, return_to, created}` in memory (TTL 10 min,
-     at most 10 000 entries, oldest evicted).
+     keeps `pending[state] = {nonce, verifier, return_to, created}` in memory for 10
+     minutes, with at most 10 000 entries and the oldest evicted first.
    - It sets the login cookie `__Host-sparkles_oidc=<state>` (signed, `HttpOnly`,
      `Secure`, `SameSite=Lax`, `Path=/`, `Max-Age=600`).
    - It answers 302 to the IdP's `authorization_endpoint`, with `response_type=code`,
      the configured `scopes`, `code_challenge_method=S256` and
      `redirect_uri = {public_url}/$/auth/oidc/callback`.
 2. **Callback.** `GET /$/auth/oidc/callback?code&state`:
-   - the `state` query value must equal the signed login cookie *and* be pending; it is
-     removed in the same step (one-time). A mismatch → `error=state` (this is the
-     login-CSRF defense);
+   - the `state` query value must equal the signed login cookie *and* be pending. It is
+     removed in the same step, so it works only once. A mismatch gives `error=state`.
+     This is the login-CSRF defense;
    - IdP `error=…` → `error=idp`;
    - exchange the code with the verifier (`client_secret_basic` when
      `client_secret_file` is set, otherwise a public client);
    - verify the ID token: the JWS signature with a JWKS key, `alg` on the allow-list
      (default `RS256`, `ES256`), `iss`, `aud` containing `client_id`, `exp`/`iat` with
      60 s leeway, and `nonce`;
-   - read the name from `name_claim` (default `email`; `preferred_username` and `sub`
-     are allowed). Read groups from `groups_claim`; if that is absent from the ID token
-     and a `userinfo_endpoint` exists, call UserInfo once (OIDC Core §5.3);
-   - check admission (§2.7). Not admitted → `error=not_allowed` and no session;
+   - read the name from `name_claim`, which defaults to `email` and may also be
+     `preferred_username` or `sub`. Read groups from `groups_claim`. If the ID token
+     lacks that claim and a `userinfo_endpoint` exists, call UserInfo once (OIDC Core
+     §5.3);
+   - check admission (§2.7). An identity that is not admitted gets `error=not_allowed`
+     and no session;
    - create a session (§2.6), clear the login cookie, and redirect **303** to `return_to`.
 
    All errors redirect 303 to `/ui/login?error=<code>`, so the server renders no HTML.
 3. **Logout.** `POST /$/auth/logout` (CSRF-checked) deletes the session and clears the
    cookie. It answers `{"redirect": url | null}`:
    - when the IdP advertises `end_session_endpoint` (RP-Initiated Logout 1.0), the URL is
-     that endpoint with `id_token_hint` (kept in memory for the session; omitted after a
-     restart, with `client_id` sent instead) and
-     `post_logout_redirect_uri={public_url}/ui/`;
+     that endpoint with `id_token_hint` and `post_logout_redirect_uri={public_url}/ui/`.
+     The ID token is kept in memory for the session. After a restart it is gone, and
+     `client_id` is sent instead;
    - for proxy principals, it is `proxy.logout_url`.
 
 **Discovery and keys.**
 
 - Discovery runs at startup. When the IdP is down, the server still starts, logs a WARN,
-  and retries lazily on the next login (30 s backoff). Until then, login answers
+  and retries on the next login, with a 30 s backoff. Until then, login answers
   `error=idp_unavailable`.
-- JWKS is re-fetched on an unknown `kid` (at most once per 5 min) and hourly.
+- JWKS is re-fetched hourly, and on an unknown `kid` at most once per 5 min.
 - The metadata `issuer` must equal the configured one exactly.
 
 `[server] public_url` is **required** with `[oidc]`. It fixes the redirect URI, the
-cookie attributes and the own-origin for CSRF checks, so they do not depend on `Host`.
+cookie attributes and the server's own origin for CSRF checks, so none of them depend on
+`Host`.
 
 ### 2.5 Trusted-header auth (forward-auth proxies)
 
@@ -307,58 +312,60 @@ name_from = "user"           # or "email": which header names the principal
 logout_url = "https://auth.example.org/logout"
 ```
 
-Presets (names from each product's documentation, cited from working knowledge; verify
-when implementing):
+The presets take their header names from each product's documentation. They were cited
+from working knowledge and need checking during implementation:
 
 | Preset | User | Email | Groups |
 |---|---|---|---|
 | `oauth2-proxy` | `X-Forwarded-User` | `X-Forwarded-Email` | `X-Forwarded-Groups` |
 | `authelia` | `Remote-User` | `Remote-Email` | `Remote-Groups` |
 | `tailscale` (`tailscale serve`) | `Tailscale-User-Login` | `Tailscale-User-Login` | none |
-| `cloudflare-access` | `Cf-Access-Authenticated-User-Email` | the same | none (groups need Access's JWT; Phase 2) |
+| `cloudflare-access` | `Cf-Access-Authenticated-User-Email` | the same | None. Groups need Access's JWT (Phase 2). |
 
 **Rules**
 
-- **Trust.** Headers are honored only when the peer address (via
-  `into_make_service_with_connect_info`) is inside a `trusted` CIDR, or when the
-  connection arrived on `serve --unix-socket PATH` and `trusted` contains `"unix"`.
-- **Untrusted peers.** Identity headers from any other peer are ignored (the request
-  proceeds as if they were absent), counted in
-  `sparkles_auth_untrusted_proxy_headers_total`, and logged at WARN once a minute.
+- **Trust.** Headers are honored only when the peer address, taken from
+  `into_make_service_with_connect_info`, is inside a `trusted` CIDR. They are also
+  honored when the connection arrived on `serve --unix-socket PATH` and `trusted`
+  contains `"unix"`.
+- **Untrusted peers.** Identity headers from any other peer are ignored, and the request
+  proceeds as if they were absent. They are counted in
+  `sparkles_auth_untrusted_proxy_headers_total` and logged at WARN once a minute.
 - **Precedence.** An `Authorization` header wins over proxy headers, so CLI tokens work
-  through the proxy. A valid session cookie also wins.
-- **Validation.** The user header must be 1–256 bytes of visible ASCII, else ignored.
-  Groups are split on `groups_separator` and trimmed.
-- **Admission and roles** follow §2.7. Proxy principals are ambient: CSRF rules apply
-  (§5.3).
-- **Hard errors at startup:** `trusted` contains `0.0.0.0/0` or `::/0`; a CIDR does not
-  parse; `[proxy]` has no user header.
+  through the proxy. A valid session cookie wins over them as well.
+- **Validation.** The user header must be 1–256 bytes of visible ASCII; otherwise it is
+  ignored. Groups are split on `groups_separator` and trimmed.
+- **Admission and roles** follow §2.7. Proxy principals are ambient, so the CSRF rules
+  apply (§5.3).
+- **Hard errors at startup.** The server refuses to start when `trusted` contains
+  `0.0.0.0/0` or `::/0`, when a CIDR does not parse, or when `[proxy]` has no user
+  header.
 - **Spoofing WARNs at startup.** Header spoofing is the whole risk of this mechanism.
-  - `[proxy]` with the server listening on TCP at a **non-loopback** address:
+  - When `[proxy]` is set and the server listens on TCP at a **non-loopback** address:
     "trusted-header auth is enabled and the server listens on 0.0.0.0:3030. Any host in
     `trusted` can impersonate any user; make sure only the proxy can reach this port".
-  - Any `trusted` range wider than a single host (for example `10.0.0.0/8`): "every host
-    in 10.0.0.0/8 can set Remote-User".
+  - When a `trusted` range is wider than a single host (for example `10.0.0.0/8`):
+    "every host in 10.0.0.0/8 can set Remote-User".
   - `docs/API.md` states:
     - the proxy must **overwrite or strip** client-supplied identity headers on every
       route, including routes it exempts from auth;
     - the Unix socket (`--unix-socket`, mode 0660) is the safest transport;
     - `tailscale serve` connects from 127.0.0.1 through tailscaled.
-- **Routes the proxy must let through unauthenticated** so the CLI can log in:
-  `/$/auth/config`, `/$/auth/device`, `/$/auth/token`, and requests that carry
-  `Authorization: Bearer spk_…`. Otherwise CLI clients use a separate proxy route that
-  skips forward auth.
+- **Routes the proxy must let through unauthenticated.** For the CLI to log in, the
+  proxy must pass `/$/auth/config`, `/$/auth/device`, `/$/auth/token`, and requests that
+  carry `Authorization: Bearer spk_…`. Otherwise CLI clients need a separate proxy route
+  that skips forward auth.
 
 ### 2.6 Sessions
 
 **Store.** `<data>/auth/sessions.json` (0600) holds `sha256(session_id) → record`. The
 store is written atomically on login and logout. Expired records are pruned at startup
-and hourly, and there are at most 10 000 sessions (oldest evicted).
+and hourly. The store holds at most 10 000 sessions and evicts the oldest.
 
-**Why a file.** Deploys and restarts should not log everyone out. Hashing the ids means
-a leaked file grants nothing. The write rate (logins) is tiny. In-memory only was
-rejected for the restarts; a signed stateless cookie was rejected because it cannot be
-revoked.
+**Why a file.** Deploys and restarts should not log everyone out. Because the ids are
+hashed, a leaked file grants nothing. The write rate, one write per login, is tiny. A
+store kept only in memory was rejected because restarts would log everyone out. A signed
+stateless cookie was rejected because it cannot be revoked.
 
 Record:
 
@@ -369,28 +376,29 @@ Record:
 ```
 
 A session's permissions are recomputed at each request from its identity, as for token
-owners (§2.3.1). A session from a token login stores `tokenId`: it dies with the token,
-and `expires ≤` the token's expiry.
+owners (§2.3.1). A session from a token login stores `tokenId`. It dies with the token,
+and its `expires` is no later than the token's expiry.
 
 **Cookie.**
 
 - Name: `__Host-sparkles_session`. The `__Host-` prefix requires `Secure`, `Path=/` and
   no `Domain`. When `public_url` is `http://localhost…` or `http://127.0.0.1…`, the
   cookie is `sparkles_session` without `Secure`, for development.
-- Attributes: `HttpOnly`, `SameSite=Lax`, `Max-Age = session.ttl` (default 12h,
-  absolute, not sliding).
+- Attributes: `HttpOnly`, `SameSite=Lax` and `Max-Age = session.ttl`. The TTL defaults
+  to 12h and is absolute, not sliding.
 - Value: 32 random bytes (base64url), **signed** with the `cookie` crate's `SignedJar`
-  (HMAC-SHA256; `cookie` 0.18, MIT/Apache-2.0, feature `signed`). The signature rejects
-  garbage cheaply and makes the key rotatable: replacing the key file logs everyone out.
-- Why `Lax` and not `Strict`: `Strict` would drop the cookie when the user follows a
-  link to the UI from elsewhere. CSRF is handled by §5.3.
+  (HMAC-SHA256). The crate is `cookie` 0.18 (MIT/Apache-2.0) with feature `signed`. The
+  signature rejects garbage cheaply and makes the key rotatable. Replacing the key file
+  logs everyone out.
+- `Lax` is used instead of `Strict` because `Strict` would drop the cookie when the user
+  follows a link to the UI from elsewhere. §5.3 handles CSRF.
 
 **Key.** The session key is 64 random bytes (base64) read from `session.key_file`. The
 default is `<data>/auth/session.key`, created with mode 0600 on first start. Subkeys are
 derived with HMAC-SHA256: `k_cookie = HMAC(key, "cookie")`, `k_csrf = HMAC(key,
 "csrf")`.
 
-**Other UI logins** with the same session mechanism, so the UI never holds secrets in
+**Other UI logins** use the same session mechanism, so the UI never holds secrets in
 JavaScript:
 
 - `POST /$/auth/login` with `{"user": "bob", "password": "…"}` or `{"token": "spk_…"}`
@@ -416,18 +424,21 @@ default_roles  = []                 # roles every admitted identity gets
 - **Admission.** When both lists are empty, everyone the IdP or proxy authenticates is
   admitted. Otherwise the name must be in `allowed_users` or one of its groups in
   `allowed_groups`.
-- **Not admitted.** OIDC → no session, `error=not_allowed`. Proxy → 403
-  `{"error":"user not allowed"}` on every route except the public ones.
+- **Not admitted.** An OIDC login creates no session and ends with
+  `error=not_allowed`. A proxy principal gets 403 `{"error":"user not allowed"}` on
+  every route except the public ones.
 - **Grants** = `default_roles` ∪ `group_roles[g]` for each group ∪ `user_roles[name]`.
-  An admitted identity with no roles can log in but sees nothing (deny by default).
-- **WARN** when both admission lists are empty while `default_roles` is not: "every
-  account at the IdP gets …".
+  An admitted identity with no roles can log in but sees nothing, because access is
+  denied by default.
+- **WARN.** The server warns when both admission lists are empty but `default_roles` is
+  not: "every account at the IdP gets …".
 
 ### 2.8 Anonymous
 
-`[anonymous]` holds grants. By default it has none: an anonymous caller can reach only
-the Public and Caller routes of §3.4 and sees no datasets. Typical use is
-`datasets = { public = "read" }`.
+`[anonymous]` holds the anonymous principal's grants. By default it has none, so an
+anonymous caller can reach only the Public and Caller routes of §3.4 and sees no
+datasets. A typical setting is `datasets = { public = "read" }`.
+
 
 ## 3. Permission model
 
@@ -439,21 +450,22 @@ the Public and Caller routes of §3.4 and sees no datasets. Typical use is
 | `write` | `read`, plus SPARQL Update, GSP PUT/POST/DELETE, upload |
 | `admin` | `write`, plus compact, backup, reason and unreason, text enable/disable/rebuild, result-cache clear, clone (source side), delete |
 
-The levels are hierarchical. A write-only level would be meaningless: `DELETE WHERE` and
-`INSERT … WHERE` read data, and their counts reveal it. Solid WAC's modes informed this:
-`Control` becomes `admin`, and `Append` is dropped (§14).
+The levels are hierarchical. A write-only level would be meaningless, because
+`DELETE WHERE` and `INSERT … WHERE` read data and their counts reveal it. The levels draw
+on Solid WAC's modes: `Control` becomes `admin`, and `Append` is dropped (§14).
 
 ### 3.2 Server permissions
 
 | Permission | Allows |
 |---|---|
-| `metrics` | `/$/metrics` (text and JSON); the full dataset list in `/$/ready` |
+| `metrics` | `/$/metrics` (text and JSON), and the full dataset list in `/$/ready` |
 | `federate` | outbound HTTP from queries and updates: `SERVICE`, `LOAD <http(s)…>` |
 | `server-admin` | `admin` on every dataset, plus `metrics`, `federate`, `POST /$/datasets`, all tasks, all tokens (list and revoke), `LOAD <file:…>` |
 
 - `--no-service` still disables SERVICE for everyone.
-- `--read-only` is checked **after** authorization, for everyone (403
-  `server is read-only`). It does not block auth state writes (sessions, tokens).
+- `--read-only` applies to everyone and is checked **after** authorization (403
+  `server is read-only`). It does not block writes of auth state such as sessions and
+  tokens.
 
 ### 3.3 Grants and evaluation
 
@@ -461,7 +473,7 @@ Grantees are users, static tokens, roles and anonymous. Each has:
 
 - `datasets: { pattern → level }`;
 - `server: [permission]`;
-- `roles: [role]`, for users and static tokens (roles do not nest).
+- `roles: [role]`, for users and static tokens. Roles do not nest.
 
 Effective grants are the union over the grantee and its roles:
 
@@ -472,28 +484,28 @@ level(p, N) = Admin                                   if server-admin ∈ server
 
 Tokens intersect this with their owner or parent (§2.3.1).
 
-- **`glob`.** `*` matches any run (possibly empty) of dataset-name characters, and every
-  other character matches itself. Matching is case-sensitive; `"*"` matches all
-  datasets.
+- **`glob`.** `*` matches any run of dataset-name characters, including an empty one,
+  and every other character matches itself. Matching is case-sensitive, and `"*"`
+  matches all datasets.
 - **No deny rules.** Grants are monotonic, so entry order never matters.
-- **By name.** Grants are by dataset name, not id (as Fuseki's `allowedUsers`). A
-  dataset recreated under the same name gets the same grants (open question 4).
-- **Existence-independent.** `level(p, N)` never depends on whether `N` exists, which
-  §5.1 relies on.
+- **By name.** Grants follow the dataset name, not its id, as Fuseki's `allowedUsers`
+  does. A dataset recreated under the same name gets the same grants (open question 4).
+- **Existence-independent.** `level(p, N)` never depends on whether `N` exists. §5.1
+  relies on this.
 
 **Create and clone.**
 
 - `POST /$/datasets` needs `server-admin`.
 - `POST /$/datasets/{ds}/clone?name=NEW` needs `admin` on `ds` **and**
   `level(p, NEW) == Admin`. Otherwise it is 403
-  `no admin access to the target name /NEW`. That leaks nothing (the caller typed the
-  name), and the 409 existence check runs only after the target check passes.
+  `no admin access to the target name /NEW`. That leaks nothing, because the caller
+  typed the name, and the 409 existence check runs only after the target check passes.
 
 ### 3.4 Route table
 
-`Need` values:
+The `Need` values are:
 
-- `Public`: no check; invalid `Authorization` is still 401.
+- `Public`: no check, although an invalid `Authorization` header still gets 401.
 - `Caller`: anyone, anonymous included.
 - `Authed`: any principal except anonymous.
 - `Interactive`: a session or proxy principal (§2.1).
@@ -543,7 +555,7 @@ Tokens intersect this with their owner or parent (§2.3.1).
 | `/$/auth/tokens` | GET | Authed | own tokens; `?all=true` needs `server-admin` |
 | `/$/auth/tokens` | POST | Authed | minting rules (§6.1) |
 | `/$/auth/tokens/{id}` | DELETE | Authed | own, `self`, or any with `server-admin` |
-| `/$/auth/tokens` | DELETE | S(server-admin) | `?owner=oidc:alice@…`: revoke all of an owner's tokens |
+| `/$/auth/tokens` | DELETE | S(server-admin) | `?owner=oidc:alice@…` revokes all of an owner's tokens |
 | `/$/auth/device` | POST | Public | RFC 8628 device authorization (§6.3) |
 | `/$/auth/device/{user_code}` | GET | Interactive | grant details for the approval page |
 | `/$/auth/device/{user_code}/approve`, `…/deny` | POST | Interactive | |
@@ -552,17 +564,19 @@ Tokens intersect this with their owner or parent (§2.3.1).
 | any other matched route | any | S(server-admin) | fail closed |
 | unmatched path | any | none | the router's 404 |
 
-**`/{ds}` classification** (the inputs of `obs::route_op`):
+**`/{ds}` classification.** The need for `/{ds}` depends on the same inputs that
+`obs::route_op` uses:
 
 - `update=` in the query string, or `application/sparql-update` → W;
 - `query=`, or `application/sparql-query` → R;
 - GET, HEAD or OPTIONS → R;
-- POST `application/x-www-form-urlencoded` → R in the middleware, and `dataset_root`
-  **re-checks W** after parsing the body, before delegating to the update handler;
+- POST `application/x-www-form-urlencoded` → R in the middleware. `dataset_root`
+  **re-checks W** after parsing the body, before it delegates to the update handler;
 - any other POST, PUT or DELETE → W.
 
-**Protocol fix riding along.** The SPARQL 1.1 Protocol allows updates only via POST, so
-`GET /{ds}?update=…` answers 405 `use POST for SPARQL Update`, with auth on or off.
+**A protocol fix comes with this change.** The SPARQL 1.1 Protocol allows updates only
+via POST, so `GET /{ds}?update=…` answers 405 `use POST for SPARQL Update`, whether auth
+is on or off.
 
 ### 3.5 Outbound requests and local files
 
@@ -570,14 +584,14 @@ Tokens intersect this with their owner or parent (§2.3.1).
 |---|---|---|
 | `SERVICE <http(s)…>` | allowed unless `--no-service` | needs `federate` |
 | `LOAD <http(s)…>` | allowed | needs `federate` |
-| `LOAD <file:…>` | allowed (today; open question 7) | needs `server-admin` |
+| `LOAD <file:…>` | allowed today (open question 7) | needs `server-admin` |
 
-- `QueryOptions` gains `allow_remote_load` and `allow_file_load` (default `true`);
+- `QueryOptions` gains `allow_remote_load` and `allow_file_load` (default `true`), and
   `update.rs::load` checks them.
-- Handlers set `allow_service = st.allow_service && p.has(Federate)`, and the load flags
-  in the same way.
-- A refusal is a new `Error::NotPermitted(String)`, mapped to **403** and raised before
-  any connection or file open:
+- Handlers set `allow_service = st.allow_service && p.has(Federate)`, and set the load
+  flags the same way.
+- A refusal is a new `Error::NotPermitted(String)`. It maps to **403** and is raised
+  before any connection is made or file opened:
   - `SERVICE requires the federate permission`;
   - `LOAD <http…> requires the federate permission`;
   - `LOAD <file:…> requires server-admin`.
@@ -587,7 +601,8 @@ Tokens intersect this with their owner or parent (§2.3.1).
 
 ### 4.1 File format and example
 
-TOML, parsed with `serde` and `toml` (MIT/Apache-2.0) using `deny_unknown_fields`.
+The file is TOML, parsed with `serde` and `toml` (MIT/Apache-2.0) using
+`deny_unknown_fields`.
 
 ```toml
 # /etc/sparkles/auth.toml. Mode 0600/0640, owned by the service user; never in /nix/store.
@@ -650,7 +665,7 @@ origins = ["https://yasgui.example.org"]  # default: none (same-origin only)
 
 Durations are `<n>s|m|h|d`.
 
-**Validation** (startup and reload; errors carry the line and column):
+**Validation** runs at startup and on reload. Errors carry the line and column.
 
 - `version` must be `1`.
 - Names:
@@ -658,20 +673,20 @@ Durations are `<n>s|m|h|d`.
   - unique within each kind;
   - every referenced role exists.
 - Passwords must be `$argon2id$`. Token hashes must be `sha256:` plus 64 lowercase hex
-  characters, unique.
-- Levels and server permissions come from §3; `"*"` in `server` is allowed only on
+  characters, and must be unique.
+- Levels and server permissions come from §3. `"*"` in `server` is allowed only on
   minted scopes.
 - Patterns are dataset names that may contain `*`.
 - `[oidc]` requires `server.public_url` over `https`, except for localhost.
 - `max_ttl` ≥ `default_ttl`.
 - CORS origins must be `scheme://host[:port]`, and not `*`.
 - `[proxy]` rules are in §2.5.
-- **WARNs:**
+- The server logs a WARN when:
   - the file is readable by group or others;
   - argon2 parameters are below the OWASP minimum;
   - a grantee has no grants;
   - `anonymous` holds more than `read`;
-  - the proxy and external admission warnings of §2.5 and §2.7.
+  - a proxy or external admission warning of §2.5 or §2.7 applies.
 
 ### 4.2 Files under `<data>/auth/` (directory 0700, files 0600)
 
@@ -682,14 +697,15 @@ Durations are `<n>s|m|h|d`.
 | `sessions.json` | session records (hashed ids) | on login, logout and prune |
 
 All are written with `state::write_file_atomic`. A corrupt `tokens.json` or
-`sessions.json` stops startup with the path in the error; nothing is silently reset.
+`sessions.json` stops startup, and the error names the path. Nothing is reset silently.
 
 ### 4.3 Reload
 
-- **SIGHUP** re-reads `--auth-config`. If the new file validates, the policy is swapped
-  atomically (`ArcSwap<Policy>`), the password cache is cleared and OIDC discovery is
-  redone if `[oidc]` changed. Otherwise the old policy stays, an ERROR is logged, and
-  `sparkles_auth_reloads_total{result="error"}` is incremented.
+- **SIGHUP** re-reads `--auth-config`. If the new file validates, the server swaps the
+  policy atomically (`ArcSwap<Policy>`) and clears the password cache. It also redoes
+  OIDC discovery if `[oidc]` changed. If the file does not validate, the old policy
+  stays, an ERROR is logged, and `sparkles_auth_reloads_total{result="error"}` is
+  incremented.
 - In-flight requests keep their policy.
 - Sessions and minted tokens survive a reload, and their permissions follow the new
   policy at the next request.
@@ -701,15 +717,15 @@ All are written with `state::write_file_atomic`. A corrupt `tokens.json` or
 - `services.sparkles.auth.configFile` (`nullOr path`). It is passed as `--auth-config`.
   An assertion rejects paths under `/nix/store`. Use agenix or sops-nix secrets owned by
   the service user.
-- `ExecReload = "kill -HUP $MAINPID"` when set.
+- When the option is set, the module adds `ExecReload = "kill -HUP $MAINPID"`.
 - `services.sparkles.unixSocket` (`nullOr path`). It adds `--unix-socket`, and the nginx
   `upstream` then uses `unix:` so proxy headers can be trusted with `trusted = ["unix"]`.
   The socket is mode 0660, group `sparkles`, and nginx is added to that group.
-- `nginx.virtualHost` description: drop "the server itself has no authentication". Say
-  that nginx `basicAuthFile` and Sparkles auth must not both be enabled: nginx forwards
-  its own `Authorization`, which Sparkles would then reject.
-- The VM test gains an auth case: a token-protected dataset, 401 without the token, 200
-  with it.
+- The `nginx.virtualHost` description drops "the server itself has no authentication".
+  It says instead that nginx `basicAuthFile` and Sparkles auth must not both be enabled,
+  because nginx forwards its own `Authorization` header, which Sparkles would reject.
+- The VM test gains an auth case: a token-protected dataset answers 401 without the
+  token and 200 with it.
 
 ## 5. HTTP behavior
 
@@ -725,8 +741,8 @@ For each request whose route matched:
      `authentication busy` with `Retry-After: 1`.
    - A non-admitted proxy identity → 403 `user not allowed`.
 3. **CSRF gates** (§5.3). They can refuse with 403.
-4. **Need** from the route table (§3.4), with `N = {ds}` (`obs::ds_param`,
-   percent-decoded).
+4. **Need.** Look up the route's need in the route table (§3.4), with `N = {ds}` taken
+   from `obs::ds_param` and percent-decoded.
 5. **Dataset needs.** With `lvl = level(p, N)`:
 
    | `lvl` | Principal | Dataset exists | Response |
@@ -739,20 +755,21 @@ For each request whose route matched:
    | ≥ need | any | either | pass |
 
    The first two rows are existence-independent. The 404 body is byte-identical to the
-   handler's (`http::dataset()`); `delete_dataset`'s `"no such dataset"` changes to
-   match. A 403 happens only where `lvl ≥ read`, so the caller may already know the
-   dataset exists.
+   one the handler sends (`http::dataset()`), and `delete_dataset`'s
+   `"no such dataset"` changes to match. A 403 happens only when `lvl ≥ read`, and such
+   a caller may already know that the dataset exists.
 6. **Other needs.**
-   - `S(x)`: anonymous → 401; authenticated without `x` → 403, for example
-     `metrics permission required`.
-   - `Authed`: anonymous → 401.
-   - `Interactive`: anonymous → 401; a Bearer or Basic principal → 403
-     `this action requires signing in to the web UI`.
+   - `S(x)`: 401 for anonymous, and 403 for an authenticated principal without `x`, for
+     example `metrics permission required`.
+   - `Authed`: 401 for anonymous.
+   - `Interactive`: 401 for anonymous, and 403
+     `this action requires signing in to the web UI` for a Bearer or Basic principal.
 7. **Pass.** Insert `Extension<Principal>` into the request, record `principal` and
    `auth` on the request span, and put an `AuthReport` in the response extensions for
    `obs`.
 
-With auth disabled, the middleware only inserts `Principal::local()`: one `Arc` clone.
+With auth disabled, the middleware only inserts `Principal::local()`, which costs one
+`Arc` clone.
 
 **Layer order**, from outermost to innermost:
 
@@ -762,27 +779,28 @@ alloc → observe → trace → cors → auth → compression → body limit →
 
 CORS preflights are answered before authentication. 401 and 403 responses still carry
 CORS headers and `X-Request-Id`. `axum::serve` switches to
-`into_make_service_with_connect_info::<Peer>()`: implement `Connected` for `Peer` over
-both `TcpListener` and `UnixListener`, which both implement axum 0.8's `serve::Listener`.
+`into_make_service_with_connect_info::<Peer>()`. `Peer` implements `Connected` over both
+`TcpListener` and `UnixListener`, which both implement axum 0.8's `serve::Listener`.
 
 ### 5.2 401, challenges and 403 bodies
 
 All auth errors use the existing `{"error": …}` JSON.
 
-- **401 without credentials** (RFC 6750 §3.1: no `error` attribute when the request had
-  no credentials):
-  `WWW-Authenticate: Bearer realm="sparkles"` plus
-  `WWW-Authenticate: Basic realm="sparkles", charset="UTF-8"`, and
-  `{"error":"authentication required"}`.
-- **401 with bad credentials:** `Bearer realm="sparkles", error="invalid_token",
-  error_description="invalid credentials"` plus the Basic challenge, and
-  `{"error":"invalid credentials"}`. The message is the same for an unknown user, a
-  wrong password and an unknown token. `token expired` is the one distinct description.
+- **401 without credentials.** The response carries
+  `WWW-Authenticate: Bearer realm="sparkles"` and
+  `WWW-Authenticate: Basic realm="sparkles", charset="UTF-8"`, with the body
+  `{"error":"authentication required"}`. The Bearer challenge has no `error` attribute,
+  because the request had no credentials (RFC 6750 §3.1).
+- **401 with bad credentials.** The challenges are `Bearer realm="sparkles",
+  error="invalid_token", error_description="invalid credentials"` and the Basic
+  challenge, and the body is `{"error":"invalid credentials"}`. The message is the same
+  for an unknown user, a wrong password and an unknown token. `token expired` is the one
+  distinct description.
 - **Basic challenge suppression.** The `Basic` challenge is omitted when
-  `Sec-Fetch-Mode` is `cors`, `same-origin` or `no-cors` (a script fetch), and whenever
-  the server is configured without `[[users]]`. This stops the browser's native login
-  dialog from covering the UI and caching ambient credentials. Navigations and
-  non-browser clients still get it.
+  `Sec-Fetch-Mode` is `cors`, `same-origin` or `no-cors`, which marks a script fetch. It
+  is also omitted whenever the server is configured without `[[users]]`. This stops the
+  browser's native login dialog from covering the UI and caching ambient credentials.
+  Navigations and non-browser clients still get the challenge.
 - **403** for a Bearer caller also carries `WWW-Authenticate: Bearer realm="sparkles",
   error="insufficient_scope"` (RFC 6750 §3.1).
 
@@ -794,30 +812,32 @@ These gates apply only with auth enabled.
   and to any request whose need is W, A or `S(server-admin)`. The request is refused
   with 403 `cross-origin request refused` when:
   - `Sec-Fetch-Site: cross-site` is present, or
-  - `Origin` is present and is neither the server's own origin (`server.public_url`, or
-    the scheme and `Host` of the request when that is unset) nor in `cors.origins`.
+  - `Origin` is present, is not the server's own origin, and is not in `cors.origins`.
+    The server's own origin is `server.public_url`, or the request's scheme and `Host`
+    when that is unset.
 
   Requests without `Origin` (curl, the CLI, Jena) pass. This is OWASP's "verify origin
   with standard headers". It also protects `POST /$/auth/login` against login CSRF and
   guards Basic credentials cached by a browser.
-- **(b) Synchronizer token for ambient principals** (session or proxy) on non-safe
-  methods: the `X-Sparkles-CSRF` header must equal
-  `base64url(HMAC-SHA256(k_csrf, principal-binding))`, compared in constant time.
+- **(b) Synchronizer token.** For ambient principals (session or proxy) on non-safe
+  methods, the `X-Sparkles-CSRF` header must equal
+  `base64url(HMAC-SHA256(k_csrf, principal-binding))`. The comparison runs in constant
+  time.
   - The binding is the raw session id for sessions, and `"proxy:" + name` for proxy
     principals.
   - `/$/whoami` returns this value as `csrfToken`.
-  - Missing or wrong → 403 `CSRF token missing or invalid`.
+  - A missing or wrong token gets 403 `CSRF token missing or invalid`.
   - A custom header cannot be sent cross-origin without a CORS preflight, which §5.4
     refuses. The HMAC binding also defeats a cross-site page that guesses the header
     name.
-- The CLI grant endpoints (`/$/auth/device`, `/$/auth/token`) are not ambient-sensitive:
-  they identify the client by the device code or PKCE verifier, never by cookies.
+- The CLI grant endpoints (`/$/auth/device`, `/$/auth/token`) are not ambient-sensitive.
+  They identify the client by the device code or the PKCE verifier, never by cookies.
 
 ### 5.4 CORS
 
 | | Auth disabled | Auth enabled |
 |---|---|---|
-| Origins | unchanged by this spec (see [Outcome](#outcome)) | `cors.origins` only; none by default |
+| Origins | unchanged by this spec (see [Outcome](#outcome)) | `cors.origins` only, none by default |
 | `Access-Control-Allow-Credentials` | unchanged by this spec | never sent |
 | Request headers | mirrored | `authorization`, `content-type`, `accept`, `x-request-id` (not `x-sparkles-csrf`) |
 | Methods | mirrored | GET, HEAD, POST, PUT, DELETE, OPTIONS |
@@ -830,10 +850,10 @@ using the session cookie or cached Basic credentials. The embedded UI is same-or
 ### 5.5 Filtered listings and `GET /$/whoami`
 
 - `GET /$/datasets` and `/$/server`'s `datasets` list only readable datasets. Each
-  `DatasetInfo` gains `access: "read" | "write" | "admin"`; it is absent when auth is
-  disabled, and the UI then assumes `admin`.
+  `DatasetInfo` gains `access: "read" | "write" | "admin"`. The field is absent when
+  auth is disabled, and the UI then assumes `admin`.
 - `/$/server` gains `"auth": {"enabled": bool}`.
-- `/$/tasks` is filtered, and `/$/ready`'s `datasets` too unless the caller has
+- `/$/tasks` is filtered. So is `/$/ready`'s `datasets`, unless the caller has
   `metrics`.
 - `/$/whoami` returns 401 only for invalid `Authorization`:
 
@@ -850,8 +870,9 @@ using the session cookie or cached Basic credentials. The embedded UI is same-or
   "logout": true }
 ```
 
-- `datasets` lists **existing** datasets with their effective level; patterns are never
+- `datasets` lists **existing** datasets with their effective level. Patterns are never
   revealed.
+
 - `method` is `none`, `basic`, `bearer`, `session` or `proxy`.
 - `csrfToken` is present only for ambient principals.
 - `logout` is true for session principals, and for proxy principals with `logout_url`.
@@ -898,30 +919,32 @@ Responses:
   - `name` is 1–80 characters;
   - `expiresIn` ≤ `max_ttl`, and ≤ the minter's expiry when the minter is a token or a
     session;
-  - scope entries must be valid levels and patterns; an empty scope is allowed but
+  - scope entries must be valid levels and patterns. An empty scope is allowed but
     useless.
 
   Scopes need not be subsets of the minter's permissions, because §2.3.1 intersects
   them at use. The UI offers only subsets for clarity.
-- 400 for bad input; 403 for a static token that tries to mint (static tokens are
-  machine identities with no owner to bind to).
-- Records `owner` (for a session or proxy minter: its identity and groups; for a user:
-  `{kind: "user", name}`), and `parent` when minted by a token.
+- 400 for bad input. 403 for a static token that tries to mint, because static tokens
+  are machine identities with no owner to bind to.
+- The record stores `owner`, and `parent` when a token minted it. For a session or proxy
+  minter, `owner` is its identity and groups. For a user, it is
+  `{kind: "user", name}`.
 
 `GET /$/auth/tokens` returns
 `{"tokens": [{id, name, scope, created, expires, lastUsed, via, client, owner}]}`.
 
-- It lists tokens with the caller's owner; a token caller sees tokens of its own owner.
-- `?all=true` (server-admin) lists every token plus static tokens (`cfg-…`, with
-  `static: true`).
+- It lists the tokens owned by the caller's identity. A token caller sees the tokens of
+  its own owner.
+- With `?all=true`, a server-admin sees every token, plus the static tokens (`cfg-…`,
+  marked `static: true`).
 - It never returns hashes.
 
 `DELETE /$/auth/tokens/{id}` → 204.
 
 - `{id}` may be `self`, meaning the token in use.
-- Allowed for the owner's principals (a session, or tokens with the same owner) and for
-  `server-admin`. Otherwise 404 (hiding).
-- Static tokens → 403 `static tokens are revoked in the auth config`.
+- The owner's principals may revoke a token: a session, or tokens with the same owner.
+  So may `server-admin`. Anyone else gets 404, which hides the token.
+- Revoking a static token gets 403 `static tokens are revoked in the auth config`.
 - Revocation takes effect at the next request.
 
 `DELETE /$/auth/tokens?owner=oidc:alice@example.org` (server-admin) →
@@ -929,8 +952,8 @@ Responses:
 
 ### 6.2 Token endpoint
 
-`POST /$/auth/token` takes an `application/x-www-form-urlencoded` body (JSON is accepted
-too). This is the OAuth token endpoint shape of RFC 6749 §4.1.3 and RFC 8628 §3.4.
+`POST /$/auth/token` takes an `application/x-www-form-urlencoded` or JSON body. This is
+the OAuth token endpoint shape of RFC 6749 §4.1.3 and RFC 8628 §3.4.
 
 | `grant_type` | Parameters | Grant |
 |---|---|---|
@@ -948,9 +971,10 @@ too). This is the OAuth token endpoint shape of RFC 6749 §4.1.3 and RFC 8628 §
 
 ### 6.3 Device flow (RFC 8628)
 
-This follows the flow of nimbus, the maintainer's earlier project (`cli-auth.ts`,
-`cli/device`): 600 s expiry, 5 s interval, an unambiguous alphabet, one-time retrieval
-and scope-bounded approval.
+This follows the device flow of nimbus, the maintainer's earlier project (`cli-auth.ts`,
+`cli/device`). Grants expire after 600 s and the poll interval is 5 s. User codes use an
+unambiguous alphabet, the token can be retrieved once, and the approver's own access
+bounds the scope.
 
 1. **Start.** `POST /$/auth/device` with optional form fields `label` and `hostname`
    (each at most 80 characters) → 200:
@@ -965,30 +989,33 @@ and scope-bounded approval.
    - The user code is 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no 0, O, 1
      or I), formatted `XXXX-XXXX`. Input is case- and dash-insensitive.
    - `verification_uri` uses `public_url`, or the request's scheme and `Host`.
-   - Grants live in memory (lost on restart; the CLI then gets `expired_token`). At most
-     1 000 are pending; beyond that the answer is 503 `too many pending logins`.
+   - Grants live in memory. A restart loses them, and the CLI then gets
+     `expired_token`. At most 1 000 grants can be pending. Beyond that, the answer is
+     503 `too many pending logins`.
 2. **Poll.** `POST /$/auth/token` with the device `grant_type` returns
    `authorization_pending` until the grant is decided.
    - Polling faster than `interval` returns `slow_down`, and the grant's interval grows
      by 5 s (RFC 8628 §3.5).
-   - Approved → the token, **once**; the grant is then deleted and a second poll gets
-     `expired_token`.
-   - Denied → `access_denied`. Past expiry → `expired_token`.
-3. **Approval page.** `/ui/cli/device?code=…` requires an interactive principal: the UI
-   redirects to `/ui/login?return_to=…` first.
+   - After approval, a poll returns the token **once**. The grant is then deleted, and a
+     second poll gets `expired_token`.
+   - A denied grant returns `access_denied`, and an expired one `expired_token`.
+3. **Approval page.** `/ui/cli/device?code=…` requires an interactive principal, so the
+   UI redirects to `/ui/login?return_to=…` first.
    - The page calls `GET /$/auth/device/{user_code}`, which returns
      `{userCode, label, hostname, expiresIn, status}` or 404 for unknown or expired
      codes.
-   - It shows the requesting client and a scope form: preset "All my access" (the
-     default), or per-dataset levels among the user's own datasets, plus the expiry
-     (default `default_ttl`).
-   - **Approve** → `POST …/approve` with `{name, datasets, server, expiresIn}` mints the
-     token (`via: "cli-device"`, `client: {label, hostname}`), owned by the approver, and
-     stores the plaintext token in the grant until it is retrieved or expires.
-   - **Deny** → `POST …/deny`.
+   - It shows the requesting client and a scope form. The scope is either the preset
+     "All my access", which is the default, or per-dataset levels among the user's own
+     datasets. The form also sets the expiry, which defaults to `default_ttl`.
+   - **Approve** sends `POST …/approve` with `{name, datasets, server, expiresIn}`. The
+     server mints the token (`via: "cli-device"`, `client: {label, hostname}`), owned by
+     the approver, and keeps the plaintext token in the grant until it is retrieved or
+     expires.
+   - **Deny** sends `POST …/deny`.
 4. **Guessing defense** (RFC 8628 §5.1).
    - Approval needs a logged-in interactive user, and the code alone grants nothing.
-   - Each session may fail at most 20 user-code lookups per 10 min; after that, 429.
+   - Each session may fail at most 20 user-code lookups per 10 min, and gets 429 after
+     that.
    - The code space is 32⁸ ≈ 1.1·10¹², and at most 1 000 codes are pending.
 
 ### 6.4 Browser loopback flow (RFC 8252 §7.3 with PKCE)
@@ -1000,32 +1027,32 @@ one-time **code** instead, which is useless without the PKCE verifier held by th
    and a PKCE verifier (32 random bytes, base64url), with
    `challenge = base64url(SHA-256(verifier))`. It opens
    `{server}/ui/cli/authorize?port=P&state=S&code_challenge=C&code_challenge_method=S256&label=sparkles%20CLI&hostname=H`.
-2. **Approval page.** `/ui/cli/authorize` (interactive; login first if needed) shows the
-   same client and scope form as the device page.
-   - **Approve** → `POST /$/auth/cli/authorize` with
+2. **Approval page.** `/ui/cli/authorize` requires an interactive principal, so the user
+   logs in first if needed. It shows the same client and scope form as the device page.
+   - **Approve** sends `POST /$/auth/cli/authorize` with
      `{port, state, codeChallenge, name, datasets, server, expiresIn, label, hostname}`.
      - The server validates `port` (1024–65535) and the challenge (43 base64url
        characters).
-     - It mints the token (`via: "cli-loopback"`), keeps it under a one-time code (32
-       random bytes, TTL 120 s) bound to `(challenge, port)`.
+     - It mints the token (`via: "cli-loopback"`) and keeps it under a one-time code
+       bound to `(challenge, port)`. The code is 32 random bytes and lives for 120 s.
      - It answers
        `{"redirect": "http://127.0.0.1:P/callback?code=…&state=S"}`, and the page
        navigates there.
-     - The host is fixed to `127.0.0.1`; only the port comes from the caller, so there is
-       no open redirect.
-   - **Deny** → the page navigates to
+     - The host is fixed to `127.0.0.1`. Only the port comes from the caller, so there
+       is no open redirect.
+   - **Deny** makes the page navigate to
      `http://127.0.0.1:P/callback?error=access_denied&state=S` without calling the
      server.
 3. **CLI callback.** The CLI's listener accepts `GET /callback` only with the matching
-   `state`, and answers a small UTF-8 page (with a `<meta charset>`, as nimbus notes)
-   saying "Sparkles CLI is authorized; you can close this tab".
+   `state`. It answers with a small UTF-8 page saying "Sparkles CLI is authorized; you
+   can close this tab". As nimbus notes, the page needs a `<meta charset>`.
 4. **Exchange.** The CLI calls `POST /$/auth/token` with `grant_type=authorization_code`,
    `code`, `code_verifier` and `redirect_uri=http://127.0.0.1:P/callback`.
    - The server checks `S256(verifier) == challenge` and the port, then removes the
      code.
-   - A wrong verifier also consumes the code, so it cannot be retried; the answer is
+   - A wrong verifier also consumes the code, so it cannot be retried. The answer is
      `invalid_grant`.
-5. **Timeout.** The CLI gives up after 10 minutes (`browser authorization timed out`).
+5. **Timeout.** The CLI gives up after 10 minutes with `browser authorization timed out`.
 
 ## 7. CLI
 
@@ -1059,42 +1086,44 @@ sparkles auth token revoke ID [--server URL]
 1. Normalize the URL (scheme, lowercase host, port, no trailing slash). Plain `http` is
    refused for non-loopback hosts unless `--insecure-http` is given, because tokens are
    bearer secrets.
-2. `GET /$/auth/config`.
-   - `enabled: false` → print `URL does not require authentication` and exit 0 without
-     saving.
-   - `--token` → validate it with `GET /$/whoami` and store it.
+2. Call `GET /$/auth/config`.
+   - With `enabled: false`, print `URL does not require authentication` and exit 0
+     without saving.
+   - With `--token`, validate the token with `GET /$/whoami` and store it.
 3. Otherwise pick the flow as nimbus does.
-   - `--web` / `--device` force a flow.
-   - Without a flag, use the browser when the session looks graphical: no
-     `SSH_CONNECTION`/`SSH_TTY`; macOS and Windows always; elsewhere `DISPLAY` or
-     `WAYLAND_DISPLAY` set.
-   - Open the browser via `$BROWSER`, else `open`, `xdg-open` or
+   - `--web` and `--device` force a flow.
+   - Without a flag, use the browser when the session looks graphical. That requires
+     that neither `SSH_CONNECTION` nor `SSH_TTY` is set. On macOS and Windows that is
+     enough. Elsewhere `DISPLAY` or `WAYLAND_DISPLAY` must also be set.
+   - Open the browser with `$BROWSER`, or else `open`, `xdg-open` or
      `rundll32 url.dll,FileProtocolHandler`.
-   - If the browser flow cannot start (no `cli.authorizeUrl`, bind or launch failure)
-     and `--web` was not given, print the reason and fall back to the device flow.
-   - Device output:
+   - The browser flow cannot start when `cli.authorizeUrl` is missing or the bind or
+     launch fails. If `--web` was not given, print the reason and fall back to the
+     device flow.
+   - The device flow prints:
      `To authorize this device, visit:\n\n    {verification_uri_complete}\n\nand confirm the code {user_code}`.
 4. On success, `GET /$/whoami` with the token, save it, and print
    `Logged in to https://sparql.example.org as oidc:alice@example.org (token tok_…,
    expires 2026-10-30)`.
 
-**`logout`**: `DELETE /$/auth/tokens/self`, then remove the local entry. If the server
-is unreachable or answers 401, remove it anyway and print a warning.
+**`logout`** calls `DELETE /$/auth/tokens/self` and then removes the local entry. If the
+server is unreachable or answers 401, it removes the entry anyway and prints a warning.
 
-**`status`**: for each saved server (or the given one), print the server, whether it is
-the default, and `GET /$/whoami` as principal, token id, expiry and dataset levels, or
+**`status`** reports on each saved server, or on the given one. It prints the server and
+whether it is the default. From `GET /$/whoami` it prints the principal, token id,
+expiry and dataset levels, or else
 `token invalid or expired: run sparkles auth login --server URL`.
 
-**`token create|list|revoke`**: call §6.1 with the saved token.
+**`token create|list|revoke`** call the §6.1 API with the saved token.
 
-- `create` prints the new token once on stdout, and id and expiry on stderr.
+- `create` prints the new token once on stdout, and its id and expiry on stderr.
 - `list` prints a table `ID NAME SCOPE EXPIRES LAST USED`.
 - Minting from a CLI token works through the chain rules (§2.3.1).
 
 ### 7.3 Credentials file
 
-`$XDG_CONFIG_HOME/sparkles/credentials.toml` (default
-`~/.config/sparkles/credentials.toml`).
+Credentials live in `$XDG_CONFIG_HOME/sparkles/credentials.toml`, by default
+`~/.config/sparkles/credentials.toml`.
 
 ```toml
 default_server = "https://sparql.example.org"
@@ -1107,28 +1136,30 @@ expires = "2026-10-30T12:00:00Z"
 ```
 
 - The directory is created with mode 0700.
-- The file is written atomically: a temporary file created with mode 0600 (`OpenOptions`
-  plus `mode(0o600)` before any byte is written), then renamed.
+- The file is written atomically. The CLI creates a temporary file with mode 0600, set
+  through `OpenOptions` and `mode(0o600)` before any byte is written, and then renames
+  it.
 - On read, a file readable by group or others produces a warning with the `chmod 600`
   fix.
 - The first login sets `default_server`, and `--set-default` overrides it.
-- **Token resolution** for remote commands: `SPARKLES_TOKEN` env, then the entry for the
-  normalized server URL, then no token (anonymous).
+- **Token resolution.** Remote commands use `SPARKLES_TOKEN` from the environment, then
+  the entry for the normalized server URL, and otherwise no token (anonymous).
 
 ### 7.4 Minimal remote client
 
-The CLI has no remote mode today. Add `--server URL` (clap `env = "SPARKLES_SERVER"`;
-enable clap's `env` feature) and `--dataset NAME` to three commands. `--server` conflicts
-with `--loc` and `--data`, and `--dataset` is required with it.
+The CLI has no remote mode today. Three commands gain `--server URL` and
+`--dataset NAME`. `--server` also reads `SPARKLES_SERVER` (clap `env`, which needs clap's
+`env` feature). It conflicts with `--loc` and `--data`, and `--dataset` is required with
+it.
 
 | Command | Request |
 |---|---|
-| `sparkles query --server URL --dataset DS [--results F] [--timeout S] [TEXT \| --query FILE]` | `POST /{ds}/sparql` with `Content-Type: application/sparql-query` and an `Accept` derived from `--results` (`text` → `text/tab-separated-values, text/turtle;q=0.9`; `json`, `xml`, `csv`, `tsv`, `sparkles`, `ttl`, `nt`, `nq`, `trig`, `jsonld`, `rdfxml` map to their media types). The body is streamed to stdout unchanged. `--explain` → `/{ds}/explain` |
-| `sparkles update --server URL --dataset DS [TEXT \| --update FILE]` | `POST /{ds}/update` with `application/sparql-update`; prints the stats JSON |
-| `sparkles load --server URL --dataset DS [--graph IRI] FILES…` | per file, `POST /{ds}/data?default` (or `?graph=IRI`), streamed from disk, with the content type from the extension. A `.gz` file is decompressed client-side while streaming. Prints `loaded N quads from FILE` |
+| `sparkles query --server URL --dataset DS [--results F] [--timeout S] [TEXT \| --query FILE]` | `POST /{ds}/sparql` with `Content-Type: application/sparql-query`. `Accept` comes from `--results`: `text` asks for `text/tab-separated-values, text/turtle;q=0.9`, and `json`, `xml`, `csv`, `tsv`, `sparkles`, `ttl`, `nt`, `nq`, `trig`, `jsonld` and `rdfxml` map to their media types. The body is streamed to stdout unchanged. `--explain` uses `/{ds}/explain`. |
+| `sparkles update --server URL --dataset DS [TEXT \| --update FILE]` | `POST /{ds}/update` with `application/sparql-update`. Prints the stats JSON. |
+| `sparkles load --server URL --dataset DS [--graph IRI] FILES…` | One `POST /{ds}/data?default` (or `?graph=IRI`) per file, streamed from disk, with the content type from the extension. A `.gz` file is decompressed client-side while streaming. Prints `loaded N quads from FILE`. |
 
-- **HTTP client:** the workspace `reqwest` 0.13 blocking client (rustls), added to the
-  server crate.
+- **HTTP client.** The server crate adds the workspace `reqwest` 0.13 blocking client
+  (rustls).
 - **Exit status** is 0 or 1. On a non-2xx response, print the server's `error` field.
 - **401** prints `not logged in to URL (run: sparkles auth login --server URL)`.
 - **404** prints `no such dataset: /ds (or no access)`.
@@ -1136,30 +1167,30 @@ with `--loc` and `--data`, and `--dataset` is required with it.
 ## 8. UI
 
 The UI stays a static SvelteKit build embedded in the binary. Every auth flow that
-needs a server-side step lives in the Rust server. The UI holds **no secrets**: it
-authenticates with the `HttpOnly` session cookie, or not at all (proxy principals), and
-keeps only the non-secret `csrfToken` in memory.
+needs a server-side step lives in the Rust server. The UI holds **no secrets**. It
+authenticates with the `HttpOnly` session cookie, or not at all for proxy principals,
+and keeps only the non-secret `csrfToken` in memory.
 
-**Startup.** The layout loads `/$/auth/config` and `/$/whoami` into an `auth` store. When
-auth is enabled, the principal is anonymous, and anonymous has no datasets, it redirects
-to `/ui/login?return_to=<current path>`. Any 401 from a data call redirects the same way
-(for example, an expired session).
+**Startup.** The layout loads `/$/auth/config` and `/$/whoami` into an `auth` store. It
+redirects to `/ui/login?return_to=<current path>` when auth is enabled, the principal is
+anonymous, and anonymous has no datasets. Any 401 from a data call, for example after a
+session expires, redirects the same way.
 
-**`/ui/login`**:
+**`/ui/login`** shows:
 
-- a button "Sign in with {displayName}", shown with `oidc`; it navigates to
+- a "Sign in with {displayName}" button when `oidc` is listed. It navigates to
   `/$/auth/oidc/login?return_to=…`;
-- an "API token" field, shown with `token`;
-- a user and password form, shown with `password`.
+- an "API token" field when `token` is listed;
+- a user and password form when `password` is listed.
 
-The forms `POST /$/auth/login` and then navigate to `return_to`, validated as starting
-with `/ui/`. `?error=` codes (`state`, `idp`, `idp_unavailable`, `not_allowed`) show a
-plain message, for example "Your account is not allowed to use this server". Proxy
+The forms post to `/$/auth/login` and then navigate to `return_to`, which must start with
+`/ui/`. The `?error=` codes (`state`, `idp`, `idp_unavailable`, `not_allowed`) show a
+plain message, such as "Your account is not allowed to use this server". Proxy
 principals never see this page.
 
-**Requests.** `api.ts` `request()` adds `X-Sparkles-CSRF: <csrfToken>` on non-GET/HEAD
-requests, and the upload XHR sets it too. Cookies go with requests by default
-(same-origin fetch and XHR).
+**Requests.** `api.ts` `request()` adds `X-Sparkles-CSRF: <csrfToken>` to requests other
+than GET and HEAD, and the upload XHR sets the same header. Same-origin fetch and XHR
+requests send cookies by default.
 
 **Sidebar user block** (`+layout.svelte`):
 
@@ -1177,16 +1208,17 @@ requests, and the upload XHR sets it too. Cookies go with requests by default
     and text index configuration unless `admin`;
   - **Upload** unless `write`;
   - the server page's metrics panels unless `metrics`.
-- **Disabled, with the tooltip "Requires write access to /ds":** the query page's Update
-  mode.
+- **Disabled:** the query page's Update mode, with the tooltip "Requires write access to
+  /ds".
 - Lists and the switcher show only filtered datasets.
-- `readOnly` gating is kept. The server always enforces; the UI only hides.
+- `readOnly` gating is kept. The server always enforces access, and the UI only hides
+  controls.
 
 **`/ui/tokens`** (API tokens):
 
 - a table of own tokens: name, id, scope summary, created, expires, last used, and a
   **Revoke** button;
-- a server-admin toggle for "All tokens", including static ones, read-only;
+- for a server-admin, an "All tokens" toggle that also lists static tokens, read-only;
 - **New token**:
   - a name;
   - an expiry (7, 30 or 90 days, capped at `max_ttl`);
@@ -1196,9 +1228,10 @@ requests, and the upload XHR sets it too. Cookies go with requests by default
 
   On create, a dialog shows the token once, with **Copy** and "You won't see it again".
 
-**`/ui/cli/device`**: a code input, pre-filled from `?code=`, then the §6.3 approval
-view. **`/ui/cli/authorize`**: the §6.4 approval view. Both show the client label and
-hostname, the scope form and Approve/Deny, and on approval "Return to your terminal".
+**`/ui/cli/device`** has a code input, pre-filled from `?code=`, followed by the §6.3
+approval view. **`/ui/cli/authorize`** shows the §6.4 approval view. Both show the
+client label and hostname, the scope form and Approve/Deny, and after approval "Return to
+your terminal".
 
 **Mock server.** `ui/mock/` gains an auth mode for UI tests.
 
@@ -1206,19 +1239,20 @@ hostname, the scope form and Approve/Deny, and on approval "Return to your termi
 
 **Access log.** `sparkles::access` events gain:
 
-- `principal`: for example `oidc:alice@example.org` or `token:tok_3k9x2m4q7p1z`; absent
-  when auth is disabled;
+- `principal`, such as `oidc:alice@example.org` or `token:tok_3k9x2m4q7p1z`. It is
+  absent when auth is disabled;
 - `auth`: `none`, `basic`, `bearer`, `session` or `proxy`.
 
-Both are also span fields (declared `Empty` in `observe`'s span, recorded by the auth
-layer), so every event of the request carries them. Failed logins log `principal=-` and
-`auth_error=invalid|expired|malformed|busy`, and never the attempted user name.
+Both are also span fields. They are declared `Empty` in `observe`'s span and recorded by
+the auth layer, so every event of the request carries them. Failed logins log
+`principal=-` and `auth_error=invalid|expired|malformed|busy`, and never the attempted
+user name.
 
 **Never logged:** `Authorization` and `Cookie` headers, passwords, tokens, token or
 session hashes, PHC strings, session ids, CSRF tokens, OIDC codes, verifiers, device
 codes, ID tokens.
 
-**Audit events** at INFO, target `sparkles::audit`:
+**Audit events** are logged at INFO with target `sparkles::audit`:
 
 - `login`: method, principal, result;
 - `logout`;
@@ -1231,7 +1265,7 @@ codes, ID tokens.
 hidden-dataset 404s from the auth layer. Clients see identical 404s, while operators can
 tell them apart. The UI's `Outcome` type gains `'denied'`.
 
-**Metrics** use closed label sets; there is no principal label.
+**Metrics** use closed label sets, with no principal label.
 
 | Name | Type | Labels |
 |---|---|---|
@@ -1249,11 +1283,11 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 
 ### 10.1 Hashing, comparison, randomness
 
-- **Passwords.** argon2id `m=19456 KiB, t=2, p=1`, 16-byte salt, via the RustCrypto
-  `argon2` crate (MIT/Apache-2.0; PHC `PasswordHasher`/`PasswordVerifier`, whose output
-  comparison is constant-time).
-- **Tokens, session ids, device codes, loopback codes.** SHA-256 (`sha2`), stored or
-  looked up by digest.
+- **Passwords** use argon2id with `m=19456 KiB, t=2, p=1` and a 16-byte salt, through
+  the RustCrypto `argon2` crate (MIT/Apache-2.0). Its PHC
+  `PasswordHasher`/`PasswordVerifier` compare output in constant time.
+- **Tokens, session ids, device codes and loopback codes** are hashed with SHA-256
+  (`sha2`) and stored or looked up by digest.
 - **Direct comparisons** of secret-derived values (CSRF token, PKCE challenge, login
   state) use `subtle::ConstantTimeEq` (`subtle` 2.6, BSD-3, already in `Cargo.lock`).
 - **Randomness.** All secrets come from the OS RNG (`rand::rngs::OsRng`, or `getrandom`).
@@ -1262,16 +1296,17 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 
 ### 10.2 Bounding login cost (Phase 1) and rate limiting (Phase 2)
 
-- **Password cache.** Key: `HMAC-SHA256(k_proc, user ‖ 0x00 ‖ password)`, with `k_proc`
-  random per process. At most 10 000 entries, TTL 5 min, cleared on reload.
+- **Password cache.** The cache key is `HMAC-SHA256(k_proc, user ‖ 0x00 ‖ password)`,
+  where `k_proc` is random per process. The cache holds at most 10 000 entries, each for
+  5 min, and is cleared on reload.
 - **Semaphore.** At most `max(1, cores / 2)` argon2 verifications run concurrently, in
   `spawn_blocking`. A request that waits more than 5 s gets 503.
 - **Caps.** At most 1 000 pending device grants, 10 000 pending OIDC logins, 10 000
   sessions, and 20 failed user-code lookups per session per 10 min.
-- **Phase 2: per-IP failure buckets.** 10 failures per minute, burst 20, then 429 with
-  `Retry-After`. The client IP comes from `Peer`, plus `X-Forwarded-For` only from
-  `proxy.trusted` peers. A global budget is not used: it would let one attacker lock
-  everyone out.
+- **Phase 2: per-IP failure buckets.** Each IP may fail 10 times per minute, with a
+  burst of 20, and then gets 429 with `Retry-After`. The client IP comes from `Peer`, and
+  from `X-Forwarded-For` only when the peer is in `proxy.trusted`. A global budget is not
+  used, because it would let one attacker lock everyone out.
 
 ### 10.3 Never logging secrets
 
@@ -1284,17 +1319,17 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 ### 10.4 TLS
 
 - **Phase 1.**
-  - Basic, Bearer and session cookies are bearer secrets; TLS is terminated by a proxy,
-    or the server runs on a private network.
-  - With `--auth-config` and a non-loopback TCP listener, the server logs a startup WARN
-    ("credentials are accepted over plain HTTP on 0.0.0.0:3030; terminate TLS in front
-    of the server").
+  - Basic credentials, Bearer tokens and session cookies are bearer secrets. A proxy
+    terminates TLS, or the server runs on a private network.
+  - With `--auth-config` and a non-loopback TCP listener, the server logs a startup
+    WARN: "credentials are accepted over plain HTTP on 0.0.0.0:3030; terminate TLS in
+    front of the server".
   - `[oidc]` requires an `https` `public_url` (except for localhost), which also makes
     the cookie `__Host-` and `Secure`.
   - The CLI refuses plain `http` to non-loopback hosts without `--insecure-http`.
   - The default `--host 0.0.0.0` is unchanged (open question 8).
-- **Phase 2.** Native TLS with `--tls-cert` and `--tls-key` (rustls via `tokio-rustls`;
-  rustls is already in the tree), reloaded on SIGHUP.
+- **Phase 2** adds native TLS with `--tls-cert` and `--tls-key`, reloaded on SIGHUP. It
+  uses rustls through `tokio-rustls`, and rustls is already in the tree.
 
 ### 10.5 Other hardening in this spec
 
@@ -1303,7 +1338,8 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 - The OIDC HTTP client does not follow redirects.
 - `return_to` is validated as a `/ui/` path.
 - The loopback redirect host is fixed to `127.0.0.1`.
-- `Cache-Control: no-store` on `/$/whoami`, `/$/auth/*` and authenticated `/$/*` JSON.
+- Send `Cache-Control: no-store` on `/$/whoami`, `/$/auth/*` and authenticated `/$/*`
+  JSON.
 
 ## 11. Design sketch
 
@@ -1347,8 +1383,8 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
   - the filtered handlers, the `dataset_root` re-check and the 405 for update over GET;
   - the clone target check;
   - `federate` and load flags in `query_options` and `update_endpoint`;
-  - `whoami`; the `/$/auth/*` routes;
-  - `dataset_info(ds, access)`; the normalized 404;
+  - `whoami` and the `/$/auth/*` routes;
+  - `dataset_info(ds, access)` and the normalized 404;
   - `Error::NotPermitted` → 403.
 - **`obs.rs`:**
   - `ds_param` becomes `pub(crate)`;
@@ -1359,8 +1395,8 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
 - **`crates/sparkles`:** `QueryOptions { allow_remote_load, allow_file_load }` and
   `Error::NotPermitted`.
 
-**Dependencies** of `sparkles-server`, all MIT/Apache-2.0 unless noted; record them in
-[PROVENANCE](PROVENANCE.md):
+**Dependencies.** `sparkles-server` gains the following, all MIT/Apache-2.0 unless noted.
+Record them in [PROVENANCE](PROVENANCE.md).
 
 - new crates:
   - `argon2` 0.5/0.6;
@@ -1393,11 +1429,12 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
   - `auth hash`, `auth gen-token`, `auth check`;
   - unit tests.
 - **Day 2: the middleware.**
-  - the route table with its coverage test; 401/403/404; challenges;
+  - the route table with its coverage test, the 401/403/404 responses and the
+    challenges;
   - Origin check, CORS, filtered listings, `whoami`, `auth/config`;
   - `federate`/LOAD gating, the update-over-GET fix, the clone target check;
   - `Peer`, `--unix-socket`, trusted headers with admission and roles;
-  - obs fields, metrics, audit; SIGHUP reload.
+  - obs fields, metrics and audit events, and SIGHUP reload.
 - **Day 3: stores and flows.**
   - the token store and API (mint, list, revoke, chains, effective permissions);
   - the session store, key, signed cookie and CSRF synchronizer;
@@ -1405,7 +1442,7 @@ tell them apart. The UI's `Outcome` type gains `'denied'`.
   - OIDC (discovery, PKCE, callback, admission, RP logout);
   - device and loopback grants, and `/$/auth/token`.
 - **Day 4: CLI.**
-  - the credentials file; `auth login` (web, device, fallback);
+  - the credentials file, and `auth login` (web, device, fallback);
   - `auth logout`, `auth status`, `auth token create|list|revoke`;
   - remote `query`, `update` and `load`.
 - **Day 5: UI and docs.**
@@ -1425,20 +1462,20 @@ If time runs short, the order to cut from the end is:
 
 - IdP JWT access tokens on the API (§12.4) and Cloudflare Access JWT verification
   (`Cf-Access-Jwt-Assertion`) instead of the plain header.
-- Per-IP rate limiting (§10.2); native TLS (§10.4).
-- A strict `Content-Security-Policy` for `/ui/` (hash the inline theme script in
-  `app.html`).
-- Sliding sessions with idle timeout; OIDC back-channel logout.
+- Per-IP rate limiting (§10.2) and native TLS (§10.4).
+- A strict `Content-Security-Policy` for `/ui/`, which needs a hash of the inline theme
+  script in `app.html`.
+- Sliding sessions with an idle timeout, and OIDC back-channel logout.
 - Audit events for dataset admin operations.
 - Endpoint-level restrictions, if requested.
 
 ### 12.3 Phase 3: graph-level ACLs
 
-Fuseki's `fuseki-access` shows the shape: per user, a list of visible graphs, with
-special names for the default graph. By its documentation it applies only to read-only
-datasets. Sparkles would add visible-graph sets per grant, with writes still requiring
-dataset `write`. The work is in the engine, because many fast paths assume the whole
-dataset is visible:
+Fuseki's `fuseki-access` shows the shape. Each user gets a list of visible graphs, with
+special names for the default graph. According to its documentation, it applies only to
+read-only datasets. Sparkles would add visible-graph sets per grant, and writes would
+still require dataset `write`. The work is in the engine, because many fast paths assume
+the whole dataset is visible:
 
 - **Scans and paths.** Every scan must be restricted to allowed graph ids:
   - `GRAPH ?g` enumeration;
@@ -1446,7 +1483,8 @@ dataset is visible:
   - property paths over a union, which must filter each hop, not the result;
   - blank-node graph names.
 
-  The home is a `GraphFilter` in `Ctx`, applied in the scan operators.
+  The natural place for this is a `GraphFilter` in `Ctx`, applied in the scan
+  operators.
 - **Result cache** (`sparql/cache.rs`). It is keyed by query and snapshot version, so the
   key needs a visible-graph-set fingerprint, or caching must be off for filtered
   principals. Otherwise one user's cached rows serve another.
@@ -1456,11 +1494,11 @@ dataset is visible:
   - The same statistics drive planner estimates visible in `/explain`.
   - `/$/stats` and `/$/schema` read them directly.
 - **Search indexes.**
-  - Full text: one Tantivy index per dataset. Top-k then filtering returns too few rows,
-    and BM25 IDF leaks term statistics of hidden graphs. [F03](F03-full-text-search.md)
-    rejected post-filtering, so the filter goes inside the collector, and scores still
-    carry corpus-wide IDF.
-  - Vector segments span graphs: filter before top-k.
+  - Full text: each dataset has one Tantivy index. Filtering after top-k returns too few
+    rows, and BM25 IDF leaks term statistics of hidden graphs.
+    [F03](F03-full-text-search.md) rejected post-filtering, so the filter goes inside the
+    collector, and scores still carry corpus-wide IDF.
+  - Vector segments span graphs, so the filter must run before top-k.
 - **Inferences.** `urn:x-sparkles:inferred` is materialized from all graphs, so derived
   triples can expose hidden facts. Hide it unless every source graph is visible, or
   materialize per graph.
@@ -1474,14 +1512,14 @@ engine through `QueryOptions`.
 
 ### 12.4 Phase 2 design note: IdP JWTs on the API
 
-`Authorization: Bearer <JWT>`, where a value with two `.` separators is a JWT and one
-with the `spk_` prefix is a Sparkles token.
+API clients would send `Authorization: Bearer <JWT>`. A value with two `.` separators is
+a JWT, and one with the `spk_` prefix is a Sparkles token.
 
-- Validation follows RFC 7519 §7.2 with the `[oidc]` issuer's JWKS: `alg` allow-list,
-  `iss`, `aud = api_audience`, `exp`/`nbf` with 60 s leeway.
+- Validation follows RFC 7519 §7.2 with the `[oidc]` issuer's JWKS. It checks the `alg`
+  allow-list, `iss`, `aud = api_audience`, and `exp`/`nbf` with 60 s leeway.
 - The principal is `oidc:{name_claim}`, mapped through `[external]`.
-- Crate: `jsonwebtoken` (MIT; recent majors need an explicit crypto-backend feature), or
-  `openidconnect`'s verifier types.
+- The crate would be `jsonwebtoken` (MIT), whose recent majors need an explicit
+  crypto-backend feature, or `openidconnect`'s verifier types.
 
 ## 13. Acceptance examples
 
@@ -1636,9 +1674,10 @@ through the step named `x`, and `csrf(x)` its whoami `csrfToken`.
 
 ### OIDC and sessions
 
-A mock IdP runs in-process in the tests (axum): discovery, a JWKS with a fixed RS256
-test key, an `/authorize` that immediately redirects with a code, a `/token` that signs
-an ID token with the requested nonce and configurable claims, and `end_session_endpoint`.
+The tests run a mock IdP in-process (axum). It serves discovery, a JWKS with a fixed
+RS256 test key, an `/authorize` that immediately redirects with a code, a `/token` that
+signs an ID token with the requested nonce and configurable claims, and
+`end_session_endpoint`.
 
 - **A25. Login redirect.** `GET /$/auth/oidc/login?return_to=/ui/datasets` → 302 to the
   mock `/authorize`, with `code_challenge_method=S256`, a 43-character `code_challenge`,
@@ -1709,8 +1748,8 @@ an ID token with the requested nonce and configurable claims, and `end_session_e
 
 ### CLI end to end
 
-Run against a real listener on 127.0.0.1 with `HOME` and `XDG_CONFIG_HOME` in a
-temporary directory.
+These tests run against a real listener on 127.0.0.1, with `HOME` and
+`XDG_CONFIG_HOME` in a temporary directory.
 
 - **A34. `auth login --device`.** A helper thread reads the printed user code and
   approves it with an alice session. The command exits 0 and prints
@@ -1775,12 +1814,12 @@ temporary directory.
 
 ## 14. Rejected alternatives
 
-- **Auth only in the proxy.** It cannot filter `/$/datasets`, hide datasets, or tell a
-  read from a write on `/{ds}` (the operation is in the body). Trusted headers keep
-  proxy SSO while Sparkles authorizes.
+- **Auth only in the proxy.** A proxy cannot filter `/$/datasets`, hide datasets, or
+  tell a read from a write on `/{ds}`, where the operation is in the body. Trusted
+  headers keep proxy SSO while Sparkles authorizes.
 - **A JS auth server (better-auth) or SvelteKit SSR for OIDC.** It would be a second
   process and runtime, and the UI would no longer be static files in the binary. The
-  maintainer ruled it out; the Rust relying party is about one day of work with
+  maintainer ruled it out. The Rust relying party is about one day of work with
   `openidconnect`.
 - **Tokens or passwords in `sessionStorage` or `localStorage` for the UI.** XSS could
   read them, and the Basic variant stores a password-equivalent. `HttpOnly` cookies with
@@ -1811,18 +1850,18 @@ temporary directory.
 1. Should `DELETE /$/datasets/{ds}` need `server-admin` rather than dataset `admin`?
 2. Should a pattern `admin` grant allow `POST /$/datasets` for matching names
    (self-service namespaces)? Currently only clone creates there.
-3. Pepper for password hashes, from a separate key file?
+3. Should password hashes use a pepper from a separate key file?
 4. Should grants bind to dataset ids as well as names, so that a recreated dataset does
    not inherit access?
 5. Should authenticated principals get `federate` by default, for compatibility?
    Currently no.
 6. Should `/$/server` require an authenticated principal, hiding the version from
    anonymous callers?
-7. With auth disabled, should `LOAD <file:>` stay allowed? (Perhaps a
-   `--allow-file-load` flag that defaults to off on non-loopback hosts.)
+7. With auth disabled, should `LOAD <file:>` stay allowed? One option is an
+   `--allow-file-load` flag that defaults to off on non-loopback hosts.
 8. Should the CLI default `--host` become `127.0.0.1`?
-9. Should device grants persist across restarts? Currently they are in memory only;
-   they expire within 10 min anyway.
+9. Should device grants persist across restarts? Currently they live only in memory,
+   and they expire within 10 min anyway.
 10. Should oidc and proxy token owners' groups refresh on each UI login, updating their
     tokens' recorded groups? That would be friendlier, but changes token permissions
     retroactively.
@@ -1838,12 +1877,12 @@ temporary directory.
   - `state.rs`: `AppState`, `valid_name`, registry, `write_file_atomic`, tasks.
   - `obs.rs`: `observe`, `MakeSpan`, `route_op`, `ds_param`, `Outcome`, metrics,
     readiness.
-  - `main.rs`: `serve` flags; the `query`, `update` and `load` definitions (local only);
-    `axum::serve`.
-  - `ui.rs`; `crates/sparkles-server/Cargo.toml`, `Cargo.toml`, `Cargo.lock`.
+  - `main.rs`: the `serve` flags, the `query`, `update` and `load` definitions (local
+    only), and `axum::serve`.
+  - `ui.rs`, `crates/sparkles-server/Cargo.toml`, `Cargo.toml` and `Cargo.lock`.
   - `crates/sparkles/src/sparql/exec.rs` (`service`), `sparql/update.rs` (`load`,
     including `file://`), `vector.rs`.
-  - `nix/module.nix`; `docs/API.md`; `README.md` (auth rows).
+  - `nix/module.nix`, `docs/API.md`, and the auth rows of `README.md`.
   - `ui/src/lib/api.ts` (`request`, `ready`, the `upload` XHR),
     `ui/src/lib/storage.ts`, `ui/src/routes/**` (`readOnly` gating).
   - the specs [C01](C01-observability-and-budgets.md), [C06](C06-clone-to-sandbox.md),
@@ -1903,43 +1942,49 @@ temporary directory.
   Cited from working knowledge: `cookie` (signed jar), `subtle`, `zeroize`, `hmac`,
   `sha2`, `toml`, `rpassword`, `ipnet`, `jsonwebtoken`, `arc-swap`, clap `env`.
 - **Forward-auth header names** (oauth2-proxy, Authelia, Tailscale serve, Cloudflare
-  Access): cited from working knowledge of each product's public documentation; verify
-  when implementing.
+  Access): cited from working knowledge of each product's public documentation, to be
+  verified when implementing.
 - **Not consulted:** anything from Fluree (source, documentation, policy or design
   documents, website, blog or talks). No Fluree checkout was opened or searched. No
   project planning notes other than the specs listed above were read.
 
 ## Outcome
 
-**Delivered.** Phase 1 landed on 2026-09-30 in five steps: the authorization middleware
-and route table (`e404c18`), tokens, sessions, OIDC, trusted headers and CLI grants
-(`f43dfb3`), the CLI (`45aa952`), the UI (`a9216e5`), and docs and the NixOS module
-(`255f4a2`); merged as `acd6da3`. It sits behind the default-on `auth` feature of
-`sparkles-server`; without `--auth-config` the auth layer only inserts the local
+**Delivered.** Phase 1 landed on 2026-09-30 in five steps:
+- the authorization middleware and route table (`e404c18`);
+- tokens, sessions, OIDC, trusted headers and CLI grants (`f43dfb3`);
+- the CLI (`45aa952`);
+- the UI (`a9216e5`);
+- docs and the NixOS module (`255f4a2`).
+
+The steps were merged as `acd6da3`. Auth sits behind the default-on `auth` feature of
+`sparkles-server`. Without `--auth-config`, the auth layer only inserts the local
 principal.
 
 **Deviations from the spec.**
 
-- `openidconnect` and `cookie` were not adopted. The relying party (discovery, code flow
-  with PKCE, claim checks), HMAC-SHA-256 and cookie signing are Sparkles code over
-  `jsonwebtoken` (ID-token signatures only, `aws_lc_rs` backend), `reqwest` and `sha2`.
-  Only asymmetric algorithms can be configured (RS, PS, ES and EdDSA families), and the
-  ID token's `azp` is checked as well. `ipnet` is a plain dependency.
-- `QueryOptions` got `forbid_service`, `forbid_remote_load` and `forbid_file_load`
-  (refusals with `Error::NotPermitted`), plus `file_loads` (which files may be read at
-  all) and `outbound` (which destinations may be reached), instead of the two
-  `allow_*_load` flags of §3.5.
+- `openidconnect` and `cookie` were not adopted. Sparkles implements the relying party
+  itself (discovery, the code flow with PKCE and the claim checks), along with
+  HMAC-SHA-256 and cookie signing. That code builds on `reqwest`, `sha2` and
+  `jsonwebtoken`, which checks ID-token signatures only and uses the `aws_lc_rs`
+  backend. Only asymmetric algorithms can be configured (the RS, PS, ES and EdDSA
+  families), and the ID token's `azp` is checked as well. `ipnet` is a plain dependency.
+- Instead of the two `allow_*_load` flags of §3.5, `QueryOptions` got `forbid_service`,
+  `forbid_remote_load` and `forbid_file_load`, which refuse with `Error::NotPermitted`.
+  It also got `file_loads`, which sets the files that may be read at all, and
+  `outbound`, which sets the destinations that may be reached.
 - Beyond §10.2, the auth layer gained limits of its own, documented in
   [API: Authentication](../API.md#authentication-and-access-control):
-  - at most 50 sessions per owner (a full store evicts from the owner holding the most);
+  - at most 50 sessions per owner, where a full store evicts from the owner holding the
+    most;
   - per-owner token quotas (`max_active_per_owner`, `mint_rate`);
   - device logins and unknown user codes limited per client network and per owner;
   - password checks shared fairly between client networks;
   - a 64 KiB body cap on `/$/auth/*`.
-- Failed-login limiting (planned for Phase 2) arrived as the `preauth` stage of the
-  shared rate limiter, on by default with auth; signed-in callers are rate-limited per
-  owner ([API: Rate limiting](../API.md#rate-limiting)). The UI's pages got a hash-based
-  Content Security Policy.
+- Failed-login limiting, planned for Phase 2, arrived as the `preauth` stage of the
+  shared rate limiter. It is on by default with auth, and signed-in callers are
+  rate-limited per owner ([API: Rate limiting](../API.md#rate-limiting)). The UI's pages
+  got a hash-based Content Security Policy.
 
 **Decided by the maintainer.**
 
@@ -1947,19 +1992,22 @@ principal.
   address without `--auth-config` unless `--allow-open-network` is given.
 - Open question 7: `LOAD <file:…>` needs `serve --load-dir` and reads only under it, with
   or without auth.
-- `federate` does not open every URL: `SERVICE` and `LOAD <http…>` also follow the
-  server's outbound policy (public addresses only unless allowed).
+- `federate` does not open every URL. `SERVICE` and `LOAD <http…>` also follow the
+  server's outbound policy, which allows only public addresses unless others are
+  allowed.
 
-Without `--auth-config` the server also refuses cross-site writes and unknown `Host`
+Without `--auth-config`, the server also refuses cross-site writes and unknown `Host`
 names, and sends CORS headers only for `--cors-origin` origins (see the
-[divergences table](../COMPARISON.md#divergences-from-jena--qlever-decisions)); this
-replaced the "unchanged" auth-disabled column of §5.4. Anonymous callers get no version or limits from `/$/server`.
+[divergences table](../COMPARISON.md#divergences-from-jena--qlever-decisions)). This
+replaced the "unchanged" auth-disabled column of §5.4. Anonymous callers get no version
+or limits from `/$/server`.
 
-**Tests at landing.** The acceptance examples are router tests
-(`crates/sparkles-server/src/http/router_tests/auth/`: permissions, tokens, sessions,
-OIDC against an in-process mock provider, proxy headers, CLI grants, limits), CLI tests,
-and a Playwright test signing in with a local user and an API token. The NixOS VM test
-gained an authentication node later (`b149524`).
+**Tests at landing.** The acceptance examples became router tests, CLI tests, and a
+Playwright test that signs in with a local user and an API token. The router tests live
+in `crates/sparkles-server/src/http/router_tests/auth/` and cover permissions, tokens,
+sessions, OIDC against an in-process mock provider, proxy headers, CLI grants and
+limits. The NixOS VM test gained an authentication node later (`b149524`).
+
 
 **Not built.** Native TLS, IdP JWT access tokens on the API and Cloudflare Access JWTs,
 sliding sessions and back-channel logout, endpoint-level permissions, and graph-level ACLs
