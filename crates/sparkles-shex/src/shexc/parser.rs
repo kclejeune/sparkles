@@ -6,6 +6,10 @@
 //! text was given with; without either a relative IRI stays relative), escapes in
 //! strings, IRIs, regular expressions and semantic-action code are decoded, and each
 //! node constraint goes through [`check_facets`].
+//!
+//! A known limitation: the 2.1 grammar lets annotations and semantic actions follow a
+//! node constraint in a declaration (`<S> LITERAL %ex:a{ … %}`), but ShExJ 2.1 has no
+//! place for them, so the parser rejects them rather than drop them.
 
 use super::lexer::{Token, TokenKind, is_local_escape, lex, uchar};
 use crate::ast::*;

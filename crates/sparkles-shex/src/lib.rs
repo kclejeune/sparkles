@@ -251,7 +251,7 @@ impl From<Label> for ShapeLabel {
 }
 
 /// The node selector of a shape association.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeSelector {
     /// a node, whether or not it occurs in the data
     Term(Term),
