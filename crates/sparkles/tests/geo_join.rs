@@ -668,3 +668,31 @@ fn the_candidate_budget_is_the_row_limit() {
         other => panic!("{:?}", other.map(|r| r.table.len())),
     }
 }
+
+/// A reopened database reads its index from files; W3C Basic Geo points (indexed under
+/// `wgs84_pos:lat`) are not geometry literals and stay out of joins and orders over
+/// `geo:asWKT`.
+#[test]
+fn a_reopened_index_with_basic_geo_points_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut data = random_data(5, 120, true);
+    data.push_str(
+        "@prefix wgs: <http://www.w3.org/2003/01/geo/wgs84_pos#> .\n\
+         ex:here wgs:lat 1.5 ; wgs:long 2.5 .\n",
+    );
+    {
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        load(&s, &data);
+        s.compact().unwrap();
+        s.enable_geo(GeoConfig {
+            wgs84: true,
+            ..GeoConfig::default()
+        })
+        .unwrap();
+    }
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert_eq!(s.wait_geo().unwrap().state, "ready");
+    let snap = s.snapshot();
+    joins_agree(&snap);
+    knn_agrees(&snap, 5);
+}
