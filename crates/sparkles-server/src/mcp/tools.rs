@@ -47,6 +47,10 @@ pub fn run(
         #[cfg(feature = "text")]
         "search_text" => t.search_text(args),
         "similar_entities" => t.similar_entities(args),
+        #[cfg(feature = "shacl")]
+        "validate_shacl" => t.validate_shacl(args),
+        #[cfg(feature = "shex")]
+        "validate_shex" => t.validate_shex(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }
