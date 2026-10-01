@@ -202,6 +202,7 @@ mod tests {
                 "1 semantic action with extension <http://ex.org/js> was not run".into(),
             ],
             millis: 7,
+            ..Default::default()
         }
     }
 
