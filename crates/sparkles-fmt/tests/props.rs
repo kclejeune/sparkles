@@ -283,6 +283,32 @@ proptest! {
     }
 }
 
+/// Cases the comment injection found: two comments that would end the same line.
+#[test]
+fn comments_that_would_share_a_line() {
+    let cases = [
+        // after an object, and after the `;` that follows it
+        "PREFIX : <http://e/>\nSELECT * {\n  ?s :p ?o # c0\n ; # c1\n :q ?y .\n}\n",
+        // after an operand of a nested chain, and after the operator that follows it
+        "SELECT * {\n  FILTER(?a > 1 && ?b != \"x\" # c0\n || # c1\n ?a < 0)\n}\n",
+        // after a `[ … ]` object before the last, and inside the next one
+        "PREFIX : <http://e/>\nCONSTRUCT {\n  ?p :m [ :a 1 ; :b 2 ], # c0\n [ :c 3 # c1\n ] .\n} WHERE {}\n",
+        "PREFIX : <http://e/>\nCONSTRUCT {\n  ?p :m [ :a 1 ; :b 2 ] # c0\n , [ # c1\n :c 3 ] .\n} WHERE {}\n",
+    ];
+    for text in cases {
+        for position in [OperatorPosition::Leading, OperatorPosition::Trailing] {
+            let opts = Options {
+                operator_position: position,
+                ..Options::default()
+            };
+            let out = fixpoint(text, &opts).unwrap_or_else(|e| panic!("{text}{position:?}: {e}"));
+            for c in ["# c0", "# c1"] {
+                assert_eq!(out.matches(c).count(), 1, "{c} in\n{out}");
+            }
+        }
+    }
+}
+
 #[test]
 fn injection_and_respacing_keep_the_meaning() {
     // the helpers themselves: markers land between tokens, re-spacing keeps the tokens

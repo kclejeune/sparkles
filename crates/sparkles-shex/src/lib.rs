@@ -124,6 +124,12 @@ impl Schema {
         shexj::from_shexj(json)
     }
 
+    /// Parse ShExJ, resolving relative IRIs against `base` (imports excepted: the
+    /// [`Resolver`] resolves those).
+    pub fn from_shexj_with_base(json: &str, base: Option<&str>) -> Result<Schema, ParseError> {
+        shexj::from_shexj_with_base(json, base)
+    }
+
     /// The ShExJ form, with the `@context` of ShEx 2.1.
     pub fn to_shexj(&self) -> serde_json::Value {
         shexj::to_shexj(self)
@@ -151,7 +157,7 @@ pub fn parse_schema(
     });
     match format {
         SchemaFormat::ShExC => Schema::parse_shexc(text, base),
-        SchemaFormat::ShExJ => Schema::from_shexj(text),
+        SchemaFormat::ShExJ => Schema::from_shexj_with_base(text, base),
     }
 }
 
@@ -395,6 +401,19 @@ pub struct ResultMap {
     /// e.g. "2 semantic actions with extension <…> were not run"
     pub warnings: Vec<String>,
     pub millis: u64,
+    /// what the validation computed
+    pub stats: ValidationStats,
+}
+
+/// Counters of a validation's typing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValidationStats {
+    /// (node, shape) pairs discovered
+    pub pairs: usize,
+    /// pair evaluations, in discovery and refinement
+    pub evaluations: u64,
+    /// refinement waves of each stratum, lowest first
+    pub waves: Vec<usize>,
 }
 
 impl ResultMap {

@@ -265,13 +265,19 @@ fn start_and_map_labels() {
     let k = c.ir().start.unwrap();
     assert_ne!(k, kind(&c, "S"));
     assert_eq!(c.ir().pairs[k.index()].stratum, 1);
-    // an EXTERNAL shape nothing references compiles
+    // an EXTERNAL shape nothing references compiles; a shape map cannot name it
     let s = schema(vec![("E", ShapeExpr::External)]);
     let c = compiled(&s);
     assert!(matches!(
         c.ir().ses[c.ir().pairs[kind(&c, "E").index()].se.index()],
         Se::External
     ));
+    assert_eq!(
+        shape_label(&c, &ShapeLabel::Iri(format!("{EX}E")))
+            .unwrap_err()
+            .message,
+        "external shape ex:E has no definition"
+    );
 }
 
 #[test]

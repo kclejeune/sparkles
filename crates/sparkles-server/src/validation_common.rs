@@ -2,8 +2,8 @@
 //! Fuseki's `graph=default|union|<iri>` parameter with or without the materialized
 //! inferences, the result limit, and the thread pool validations run in.
 
-// (all of it is used by SHACL; ShEx uses it once its endpoint is wired in)
-#![cfg_attr(not(feature = "shacl"), allow(dead_code))]
+// (used by the SHACL and ShEx endpoints and commands)
+#![cfg_attr(not(any(feature = "shacl", feature = "shex")), allow(dead_code))]
 
 use anyhow::{Context, Result};
 use sparkles::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
