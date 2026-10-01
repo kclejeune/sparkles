@@ -8,7 +8,6 @@
 //! dimension: the lower one for an intersection, the first geometry's for a
 //! difference, the higher one otherwise.
 
-use super::construct::empty_of;
 use super::measure::polygons;
 use super::{OpError, guarded, in_crs, made};
 use crate::geo::geom::{Geom, GeomType};
@@ -55,8 +54,8 @@ pub fn overlay(a: &Geom, b: &Geom, op: Overlay) -> Result<Geom, OpError> {
     };
     Ok(match out.assemble() {
         Some(g) => made(a, g),
-        None => empty_of(
-            a,
+        None => Geom::empty(
+            a.crs.clone(),
             match empty_dim {
                 0 => GeomType::Point,
                 1 => GeomType::LineString,
@@ -319,13 +318,10 @@ fn merge(segs: Vec<Line<f64>>) -> Vec<LineString<f64>> {
 mod tests {
     use super::*;
     use crate::geo::Relation;
-    use crate::geo::crs::{CRS84, CrsRef};
     use crate::geo::ops::relate::relation;
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     fn check(a: &str, b: &str, op: Overlay, want: &str) {
@@ -452,10 +448,7 @@ mod tests {
 
     #[test]
     fn crs_and_empties() {
-        let mars = Geom::from_geometry(
-            CrsRef::Unknown("http://example.org/crs/mars".into()),
-            Geometry::try_from_wkt_str(GA).unwrap(),
-        );
+        let mars = crate::geo::ops::wkt(&format!("<http://example.org/crs/mars> {}", GA));
         assert!(overlay(&mars, &g(GB), Intersection).is_err());
         assert!(overlay(&mars, &mars, Intersection).is_ok());
         check(GA, "POLYGON EMPTY", Union, GA);

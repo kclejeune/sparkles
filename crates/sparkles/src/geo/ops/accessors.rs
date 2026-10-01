@@ -1,49 +1,24 @@
 //! Accessors of a geometry (`geof:dimension`, `geometryType`, `numGeometries`,
 //! `geometryN`, `minX` … `maxZ`, …).
 
-use super::{OpError, lat_first, made, type_error};
-use crate::geo::geom::{Geom, GeomType, Layout};
+use super::{OpError, made, type_error};
+use crate::geo::geom::{Geom, GeomType};
 use crate::geo::vocab::SF;
-use georust::{BoundingRect, Geometry};
+use georust::Geometry;
 
 /// `geof:coordinateDimension`: 2, 3 (XYZ or XYM) or 4.
 pub fn coordinate_dimension(g: &Geom) -> i64 {
-    match g.layout {
-        Layout::Xy => 2,
-        Layout::Xyz | Layout::Xym => 3,
-        Layout::Xyzm => 4,
-    }
+    g.layout.ordinates() as i64
 }
 
 /// `geof:spatialDimension`: 2, or 3 with Z.
 pub fn spatial_dimension(g: &Geom) -> i64 {
-    if is_3d(g) { 3 } else { 2 }
-}
-
-pub fn is_3d(g: &Geom) -> bool {
-    matches!(g.layout, Layout::Xyz | Layout::Xyzm)
-}
-
-pub fn is_measured(g: &Geom) -> bool {
-    matches!(g.layout, Layout::Xym | Layout::Xyzm)
+    if g.layout.has_z() { 3 } else { 2 }
 }
 
 /// `geof:geometryType`: the `sf:` IRI of the type as written.
 pub fn geometry_type(g: &Geom) -> String {
-    let local = match g.declared {
-        GeomType::Point => "Point",
-        GeomType::LineString => "LineString",
-        GeomType::Polygon => "Polygon",
-        GeomType::MultiPoint => "MultiPoint",
-        GeomType::MultiLineString => "MultiLineString",
-        GeomType::MultiPolygon => "MultiPolygon",
-        GeomType::GeometryCollection => "GeometryCollection",
-        GeomType::LinearRing => "LinearRing",
-        GeomType::Triangle => "Triangle",
-        GeomType::Tin => "TIN",
-        GeomType::PolyhedralSurface => "PolyhedralSurface",
-    };
-    format!("{SF}{local}")
+    format!("{SF}{}", g.declared.sf_name())
 }
 
 /// Whether the type is a collection of members (rather than one atomic geometry).
@@ -93,12 +68,10 @@ pub fn geometry_n(g: &Geom, n: i64) -> Result<Geom, OpError> {
     let i = usize::try_from(n - 1).map_err(|_| out_of_range())?;
     let m = members(&g.g).into_iter().nth(i).ok_or_else(out_of_range)?;
     let mut out = made(g, m);
-    if matches!(g.declared, GeomType::Tin | GeomType::PolyhedralSurface) {
-        out.declared = if g.declared == GeomType::Tin {
-            GeomType::Triangle
-        } else {
-            GeomType::Polygon
-        };
+    match g.declared {
+        GeomType::Tin => out.declared = GeomType::Triangle,
+        GeomType::PolyhedralSurface => out.declared = GeomType::Polygon,
+        _ => {}
     }
     Ok(out)
 }
@@ -115,17 +88,9 @@ pub enum Bound {
 /// `geof:minX` … `maxY`, in the literal's own axis order (for a latitude-first CRS, X is
 /// the latitude). Empty: a type error.
 pub fn bound(g: &Geom, b: Bound) -> Result<f64, OpError> {
-    let r = (!g.empty)
-        .then(|| g.g.bounding_rect())
-        .flatten()
+    let [x0, y0, x1, y1] = g
+        .bbox_own_axes()
         .ok_or_else(|| type_error("an empty geometry has no coordinates"))?;
-    let (min, max) = (r.min(), r.max());
-    // internal (east, north) → the literal's axes
-    let (x0, y0, x1, y1) = if lat_first(&g.crs) {
-        (min.y, min.x, max.y, max.x)
-    } else {
-        (min.x, min.y, max.x, max.y)
-    };
     Ok(match b {
         Bound::MinX => x0,
         Bound::MinY => y0,
@@ -144,12 +109,9 @@ pub fn z_bound(g: &Geom, max: bool) -> Result<f64, OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::crs::{CRS84, CrsRef};
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     #[test]
@@ -171,6 +133,22 @@ mod tests {
         assert_eq!(num_geometries(&g("GEOMETRYCOLLECTION EMPTY")), 0);
         assert!(z_bound(&ga, false).is_err());
         assert_eq!((coordinate_dimension(&ga), spatial_dimension(&ga)), (2, 2));
-        assert!(!is_3d(&ga) && !is_measured(&ga));
+        let z = g("LINESTRING Z (0 0 5, 1 1 7)");
+        assert_eq!((coordinate_dimension(&z), spatial_dimension(&z)), (3, 3));
+        assert_eq!((z_bound(&z, false), z_bound(&z, true)), (Ok(5.0), Ok(7.0)));
+        let m = g("POINT ZM (1 2 3 4)");
+        assert_eq!((coordinate_dimension(&m), spatial_dimension(&m)), (4, 3));
+    }
+
+    #[test]
+    fn own_axis_order() {
+        // EPSG:4326 writes latitude first: x is the latitude
+        let p = g("<http://www.opengis.net/def/crs/EPSG/0/4326> POINT(2 12)");
+        assert_eq!(bound(&p, Bound::MinX).unwrap(), 2.0);
+        assert_eq!(bound(&p, Bound::MaxY).unwrap(), 12.0);
+        let tin = g("TIN (((0 0, 1 0, 0 1, 0 0)), ((1 0, 1 1, 0 1, 1 0)))");
+        assert_eq!(geometry_type(&tin), format!("{SF}TIN"));
+        assert_eq!(num_geometries(&tin), 2);
+        assert_eq!(geometry_n(&tin, 2).unwrap().declared, GeomType::Triangle);
     }
 }

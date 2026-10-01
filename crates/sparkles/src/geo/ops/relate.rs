@@ -221,13 +221,10 @@ fn holds(im: &IntersectionMatrix, r: Relation, da: i8, db: i8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::crs::{CRS84, CrsRef};
     use std::sync::Arc;
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     fn rel(a: &str, b: &str, r: &str) -> bool {
@@ -390,14 +387,10 @@ mod tests {
 
     #[test]
     fn unknown_crs() {
-        let mars = |s: &str| {
-            let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-            Geom::from_geometry(
-                CrsRef::Unknown("http://example.org/crs/mars".into()),
-                geometry,
-            )
-        };
-        let (m, p) = (mars("POINT(1 1)"), g("POINT(1 1)"));
+        let (m, p) = (
+            g("<http://example.org/crs/mars> POINT(1 1)"),
+            g("POINT(1 1)"),
+        );
         assert!(relation(&m, &m, Relation::SfEquals).unwrap());
         assert!(relation(&m, &p, Relation::SfEquals).is_err());
         assert!(relation(&p, &m, Relation::SfIntersects).is_err());

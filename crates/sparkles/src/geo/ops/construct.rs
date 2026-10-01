@@ -38,10 +38,7 @@ pub fn buffer(g: &Geom, radius: f64, u: &Unit) -> Result<Geom, OpError> {
         ));
     }
     if g.empty {
-        return Ok(made(
-            g,
-            Geometry::Polygon(Polygon::new(LineString(vec![]), vec![])),
-        ));
+        return Ok(Geom::empty(g.crs.clone(), GeomType::Polygon));
     }
     match (u.kind, geographic) {
         (UnitKind::Length, true) => metric_buffer(g, radius * u.factor),
@@ -70,10 +67,7 @@ fn planar_buffer(g: &Geom, d: f64) -> Result<Geom, OpError> {
 /// in the plane, project back.
 fn metric_buffer(g: &Geom, r: f64) -> Result<Geom, OpError> {
     let Some(rect) = g.g.bounding_rect() else {
-        return Ok(made(
-            g,
-            Geometry::Polygon(Polygon::new(LineString(vec![]), vec![])),
-        ));
+        return Ok(Geom::empty(g.crs.clone(), GeomType::Polygon));
     };
     let c = rect.center();
     let proj = Aeqd::ellipsoid(c.x, c.y);
@@ -113,7 +107,7 @@ fn polygonal(mut m: MultiPolygon<f64>) -> Geometry<f64> {
 }
 
 fn empty_collection(g: &Geom) -> Geom {
-    made(g, Geometry::GeometryCollection(GeometryCollection(vec![])))
+    Geom::empty(g.crs.clone(), GeomType::GeometryCollection)
 }
 
 /// `geof:convexHull`: planar in the CRS of `g`; a point or a segment when the hull is
@@ -235,26 +229,6 @@ pub fn centroid(g: &Geom) -> Result<Geom, OpError> {
     }
 }
 
-/// The empty geometry of a type, in the CRS of `like`.
-pub fn empty_of(like: &Geom, t: GeomType) -> Geom {
-    use Geometry as G;
-    let g = match t {
-        GeomType::Point | GeomType::MultiPoint => G::MultiPoint(MultiPoint(vec![])),
-        GeomType::LineString | GeomType::LinearRing => G::LineString(LineString(vec![])),
-        GeomType::MultiLineString => G::MultiLineString(MultiLineString(vec![])),
-        GeomType::Polygon | GeomType::Triangle => {
-            G::Polygon(Polygon::new(LineString(vec![]), vec![]))
-        }
-        GeomType::MultiPolygon | GeomType::Tin | GeomType::PolyhedralSurface => {
-            G::MultiPolygon(MultiPolygon(vec![]))
-        }
-        GeomType::GeometryCollection => G::GeometryCollection(GeometryCollection(vec![])),
-    };
-    let mut out = made(like, g);
-    out.declared = t;
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,11 +236,9 @@ mod tests {
     use crate::geo::ops::measure::area_m2;
     use crate::geo::ops::relate::relation;
     use crate::geo::{DistanceModel, Relation};
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     fn same(a: &Geom, b: &str) -> bool {
@@ -374,10 +346,7 @@ mod tests {
         assert!(buffer(&g("POINT(0 0)"), 1_000_001.0, &METRE).is_err());
         assert!(buffer(&g("LINESTRING(0 0, 18 0)"), 1000.0, &METRE).is_err());
         assert!(buffer(&g("POINT(0 89.9)"), 20_000.0, &METRE).is_err());
-        let mars = Geom::from_geometry(
-            CrsRef::Unknown("http://example.org/crs/mars".into()),
-            Geometry::Point(Point::new(1.0, 1.0)),
-        );
+        let mars = g("<http://example.org/crs/mars> POINT(1 1)");
         assert!(buffer(&mars, 1.0, &DEGREE).is_err());
         assert!(buffer(&g("POINT EMPTY"), 1.0, &METRE).unwrap().empty);
     }

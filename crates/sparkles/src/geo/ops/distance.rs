@@ -526,14 +526,11 @@ fn nearest_to(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::crs::{CRS84, CrsRef};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     fn metres(a: &str, b: &str, m: DistanceModel) -> f64 {
@@ -590,10 +587,7 @@ mod tests {
 
     #[test]
     fn errors() {
-        let mars = Geom::from_geometry(
-            CrsRef::Unknown("http://example.org/crs/mars".into()),
-            Geometry::<f64>::try_from_wkt_str("POINT(1 1)").unwrap(),
-        );
+        let mars = g("<http://example.org/crs/mars> POINT(1 1)");
         assert!(distance_m(&mars, &mars, DistanceModel::Geodesic).is_err());
         assert!(distance_m(&mars, &g("POINT(1 1)"), DistanceModel::Geodesic).is_err());
         assert!(distance_m(&g("POINT(1 1)"), &mars, DistanceModel::Geodesic).is_err());

@@ -5,7 +5,7 @@
 //! operation over `maxOpVertices`. A geometry result has the datatype and CRS of the
 //! first geometry argument; its literal is charged to the query's memory budget.
 
-use super::crs::{CRS84, CrsRef};
+use super::crs::{self, CrsRef};
 use super::geom::Geom;
 use super::ops::accessors::{self, Bound};
 use super::ops::overlay::{Overlay, overlay};
@@ -63,8 +63,8 @@ pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalRe
         "dimension" => f.accessor(|g| integer(i64::from(g.dim()))),
         "coordinateDimension" => f.accessor(|g| integer(accessors::coordinate_dimension(g))),
         "spatialDimension" => f.accessor(|g| integer(accessors::spatial_dimension(g))),
-        "is3D" => f.accessor(|g| boolean(accessors::is_3d(g))),
-        "isMeasured" => f.accessor(|g| boolean(accessors::is_measured(g))),
+        "is3D" => f.accessor(|g| boolean(g.layout.has_z())),
+        "isMeasured" => f.accessor(|g| boolean(g.layout.has_m())),
         "isEmpty" => f.accessor(|g| boolean(g.empty)),
         "geometryType" => f.accessor(|g| any_uri(accessors::geometry_type(g))),
         "numGeometries" => f.accessor(|g| integer(accessors::num_geometries(g))),
@@ -142,14 +142,15 @@ impl Call<'_, '_> {
     /// Refuse inputs larger than one operation may take.
     fn sized(&self, gs: &[&GeomRef]) -> EvalResult<()> {
         let gs: Vec<&Geom> = gs.iter().map(|g| &***g).collect();
-        ops::check_vertices(ops::DEFAULT_OP_VERTICES, &gs).map_err(op)
+        memo::check_op_vertices(self.ctx, &gs)
     }
 
     /// A constructed geometry as a literal of datatype `dt`, charged to the query.
     fn geometry(&self, g: &Geom, dt: &'static str) -> EvalResult<Val> {
         let lex = if dt == GEOJSON_LITERAL {
-            let g = ops::transform(g, &CrsRef::Known(CRS84)).map_err(op)?;
-            write::to_geojson(&g)
+            // GeoJSON is CRS84: the writer transforms built-in CRSs, others have none
+            g.crs.known().ok_or(TypeError)?;
+            write::to_geojson(g)
         } else {
             write::to_wkt(g)
         };
@@ -224,13 +225,13 @@ impl Call<'_, '_> {
 
     fn get_srid(&self) -> EvalResult<Val> {
         self.arity(1)?;
-        any_uri(ops::crs_iri(&self.geom(0)?.crs).to_owned())
+        any_uri(self.geom(0)?.crs_iri().to_owned())
     }
 
     fn transform(&self) -> EvalResult<Val> {
         self.arity(2)?;
         let g = self.geom(0)?;
-        let to = ops::known_crs(&self.iri(1)?).map_err(op)?;
+        let to = CrsRef::Known(crs::lookup(&self.iri(1)?).ok_or(TypeError)?);
         let out = ops::transform(&g, &to).map_err(op)?;
         self.geometry(&out, self.datatype(0))
     }
@@ -303,4 +304,293 @@ fn any_uri(iri: String) -> EvalResult<Val> {
         lex: iri.into(),
         dt: XSD_ANY_URI.into(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::io::{RdfFormat, Source};
+    use crate::sparql::{QueryOptions, query};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::Term;
+
+    const FIXTURE: &str = r#"
+@prefix ex: <http://example.org/> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+ex:gA geo:asWKT "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))"^^geo:wktLiteral .
+ex:gB geo:asWKT "POLYGON((5 5, 15 5, 15 15, 5 15, 5 5))"^^geo:wktLiteral .
+ex:gC geo:asWKT "POLYGON((10 0, 20 0, 20 10, 10 10, 10 0))"^^geo:wktLiteral .
+ex:g1 geo:asWKT "POINT(2 2)"^^geo:wktLiteral .
+ex:g2 geo:asWKT "<http://www.opengis.net/def/crs/EPSG/0/4326> POINT(2 12)"^^geo:wktLiteral .
+ex:g3 geo:asGeoJSON "{\"type\":\"Point\",\"coordinates\":[30,30]}"^^geo:geoJSONLiteral .
+ex:gX geo:asWKT "POINT(1)"^^geo:wktLiteral .
+ex:gE geo:asWKT ""^^geo:wktLiteral .
+ex:gM geo:asWKT "<http://example.org/crs/mars> POINT(1 1)"^^geo:wktLiteral .
+"#;
+
+    const PREFIXES: &str = "PREFIX ex: <http://example.org/>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+PREFIX uom: <http://www.opengis.net/def/uom/OGC/1.0/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+";
+
+    fn store() -> Store {
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            FIXTURE.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s
+    }
+
+    /// `expr` evaluated with `?a`, `?b`, `?c`, `?p1`, `?p2`, `?p3`, `?x`, `?e`, `?m`
+    /// bound to the stored literals of `ex:gA`, `ex:gB`, `ex:gC`, `ex:g1`, `ex:g2`,
+    /// `ex:g3`, `ex:gX`, `ex:gE`, `ex:gM`.
+    fn eval(s: &Store, expr: &str) -> Option<Term> {
+        let mut pattern = String::new();
+        for (v, g) in [
+            ("a", "gA"),
+            ("b", "gB"),
+            ("c", "gC"),
+            ("p1", "g1"),
+            ("p2", "g2"),
+            ("p3", "g3"),
+            ("x", "gX"),
+            ("e", "gE"),
+            ("m", "gM"),
+        ] {
+            let used = expr
+                .match_indices(&format!("?{v}"))
+                .any(|(i, m)| !expr[i + m.len()..].starts_with(|c: char| c.is_alphanumeric()));
+            if used {
+                let p = if v == "p3" {
+                    "geo:asGeoJSON"
+                } else {
+                    "geo:asWKT"
+                };
+                pattern.push_str(&format!("ex:{g} {p} ?{v} . "));
+            }
+        }
+        let text = format!("{PREFIXES}SELECT ?r {{ {pattern} BIND({expr} AS ?r) }}");
+        let r = query(s.snapshot(), &text, &QueryOptions::default())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let mut rows = r.rows();
+        assert_eq!(rows.len(), 1, "{text}");
+        rows.pop().unwrap().pop().unwrap()
+    }
+
+    fn lit(s: &Store, expr: &str) -> (String, String) {
+        match eval(s, expr) {
+            Some(Term::Literal(l)) => (l.value().to_string(), l.datatype().as_str().to_string()),
+            other => panic!("{expr}: {other:?}"),
+        }
+    }
+
+    fn num(s: &Store, expr: &str) -> f64 {
+        let (v, dt) = lit(s, expr);
+        assert!(
+            dt.ends_with("#double") || dt.ends_with("#integer"),
+            "{expr}: {dt}"
+        );
+        v.parse().unwrap()
+    }
+
+    fn truth(s: &Store, expr: &str) -> bool {
+        match lit(s, expr) {
+            (v, dt) if dt.ends_with("#boolean") => v == "true",
+            other => panic!("{expr}: {other:?}"),
+        }
+    }
+
+    const ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
+    const WKT: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+    #[test]
+    fn relations() {
+        let s = store();
+        for e in [
+            "geof:sfTouches(?a, ?c)",
+            "geof:sfIntersects(?a, ?c)",
+            "geof:sfOverlaps(?a, ?b)",
+            "geof:sfContains(?a, \"POINT(2 2)\"^^geo:wktLiteral)",
+            "geof:rcc8ec(?a, ?c)",
+            "geof:rcc8po(?a, ?b)",
+            "geof:ehCovers(?a, \"LINESTRING(0 1, 5 1)\"^^geo:wktLiteral)",
+            "geof:sfEquals(\"POINT(1 1)\"^^geo:wktLiteral, \"Point (1.0 1.0)\"^^geo:wktLiteral)",
+            // EPSG:4326 POINT(2 12) is longitude 12, latitude 2: within C
+            "geof:sfWithin(?p2, ?c)",
+            "geof:relate(?a, ?b, \"212101212\")",
+            "geof:sfEquals(?m, ?m)",
+            "geof:sfDisjoint(?e, ?a)",
+        ] {
+            assert!(truth(&s, e), "{e}");
+        }
+        for e in [
+            "geof:ehCovers(?a, \"LINESTRING(1 1, 5 1)\"^^geo:wktLiteral)",
+            "geof:sfOverlaps(?a, ?c)",
+            "geof:rcc8ec(?a, \"POINT(10 5)\"^^geo:wktLiteral)",
+            "geof:sfEquals(\"POINT(1 1)\"^^geo:wktLiteral, \"POINT(1 2)\"^^geo:wktLiteral)",
+            "geof:sfWithin(?p2, ?a)",
+            "geof:sfIntersects(?e, ?a)",
+        ] {
+            assert!(!truth(&s, e), "{e}");
+        }
+    }
+
+    #[test]
+    fn distances() {
+        let s = store();
+        let p = |a: &str, b: &str| {
+            format!("\"POINT({a})\"^^geo:wktLiteral, \"POINT({b})\"^^geo:wktLiteral")
+        };
+        let d = num(&s, &format!("geof:metricDistance({})", p("0 0", "1 0")));
+        assert!((d - 111_319.490_793_273_57).abs() < 1e-6, "{d}");
+        for unit in [
+            "uom:kilometre",
+            "<http://qudt.org/vocab/unit/KiloM>",
+            "\"http://www.opengis.net/def/uom/OGC/1.0/kilometre\"^^xsd:anyURI",
+        ] {
+            let d = num(&s, &format!("geof:distance({}, {unit})", p("0 0", "1 0")));
+            assert!((d - 111.319_490_793_273_57).abs() < 1e-9, "{unit}: {d}");
+        }
+        let d = num(
+            &s,
+            &format!("geof:distance({}, uom:degree)", p("0 0", "1 0")),
+        );
+        assert!((d - 1.0).abs() < 1e-9, "{d}");
+        let d = num(
+            &s,
+            "geof:distance(?a, \"POINT(12 5)\"^^geo:wktLiteral, uom:metre)",
+        );
+        assert!((d - 221_800.0).abs() / 221_800.0 < 0.001, "{d}");
+        assert_eq!(num(&s, "geof:metricDistance(?a, ?p1)"), 0.0);
+    }
+
+    #[test]
+    fn crs_and_accessors() {
+        let s = store();
+        let epsg = "http://www.opengis.net/def/crs/EPSG/0/4326";
+        assert_eq!(lit(&s, "geof:getSRID(?p2)"), (epsg.into(), ANY_URI.into()));
+        assert_eq!(
+            lit(&s, "geof:getSRID(?p1)"),
+            (crate::geo::crs::CRS84_IRI.into(), ANY_URI.into())
+        );
+        assert_eq!(lit(&s, "geof:getSRID(?m)").0, "http://example.org/crs/mars");
+        assert_eq!(
+            lit(
+                &s,
+                "geof:transform(?p2, <http://www.opengis.net/def/crs/OGC/1.3/CRS84>)"
+            ),
+            ("POINT(12 2)".into(), WKT.into())
+        );
+        assert_eq!(
+            lit(&s, "geof:asWKT(?p2)"),
+            (format!("<{epsg}> POINT(2 12)"), WKT.into())
+        );
+        assert_eq!(
+            lit(&s, "geof:asGeoJSON(?p2)").0,
+            r#"{"type":"Point","coordinates":[12,2]}"#
+        );
+        assert_eq!(lit(&s, "geof:asWKT(?p3)").0, "POINT(30 30)");
+        assert_eq!(num(&s, "geof:minX(?p2)"), 2.0);
+        assert_eq!(num(&s, "geof:maxY(?a)"), 10.0);
+        let mp = "\"MULTIPOINT((1 1),(2 2))\"^^geo:wktLiteral";
+        assert_eq!(num(&s, &format!("geof:numGeometries({mp})")), 2.0);
+        assert_eq!(lit(&s, &format!("geof:geometryN({mp}, 2)")).0, "POINT(2 2)");
+        assert_eq!(
+            lit(&s, "geof:geometryType(?a)"),
+            (
+                "http://www.opengis.net/ont/sf#Polygon".into(),
+                ANY_URI.into()
+            )
+        );
+        assert_eq!(num(&s, "geof:dimension(?a)"), 2.0);
+        assert!(truth(&s, "geof:isEmpty(?e)"));
+        assert_eq!(num(&s, "geof:dimension(?e)"), -1.0);
+        assert!(!truth(&s, "geof:is3D(?a)"));
+        assert_eq!(num(&s, "geof:coordinateDimension(?a)"), 2.0);
+    }
+
+    #[test]
+    fn constructions_and_measures() {
+        let s = store();
+        let equal = |expr: &str, want: &str| {
+            let e = format!("geof:sfEquals({expr}, \"{want}\"^^geo:wktLiteral)");
+            assert!(truth(&s, &e), "{e}");
+        };
+        equal(
+            "geof:intersection(?a, ?b)",
+            "POLYGON((5 5,10 5,10 10,5 10,5 5))",
+        );
+        equal("geof:union(?a, ?c)", "POLYGON((0 0,20 0,20 10,0 10,0 0))");
+        equal(
+            "geof:envelope(\"LINESTRING(0 0, 2 1)\"^^geo:wktLiteral)",
+            "POLYGON((0 0,2 0,2 1,0 1,0 0))",
+        );
+        equal(
+            "geof:convexHull(\"MULTIPOINT((0 0),(2 0),(1 1),(1 0.5))\"^^geo:wktLiteral)",
+            "POLYGON((0 0,2 0,1 1,0 0))",
+        );
+        equal("geof:centroid(?a)", "POINT(5 5)");
+        assert_eq!(lit(&s, "geof:boundary(?p1)").0, "GEOMETRYCOLLECTION EMPTY");
+        assert_eq!(
+            lit(
+                &s,
+                "geof:intersection(?a, \"POINT(50 50)\"^^geo:wktLiteral)"
+            )
+            .0,
+            "POINT EMPTY"
+        );
+        let square = "\"POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))\"^^geo:wktLiteral";
+        let a = num(&s, &format!("geof:metricArea({square})"));
+        assert!((a - 12_308_778_361.469).abs() / a < 1e-6, "{a}");
+        let km2 = num(
+            &s,
+            &format!("geof:area({square}, <http://qudt.org/vocab/unit/KiloM2>)"),
+        );
+        assert!((km2 - 12_308.778).abs() < 0.01, "{km2}");
+        let l = num(
+            &s,
+            "geof:metricLength(\"LINESTRING(0 0, 1 0)\"^^geo:wktLiteral)",
+        );
+        assert!((l - 111_319.490_793_273_57).abs() < 1e-6);
+        assert_eq!(
+            num(&s, "geof:metricArea(\"POINT(0 0)\"^^geo:wktLiteral)"),
+            0.0
+        );
+        let disc = num(
+            &s,
+            "geof:metricArea(geof:metricBuffer(\"POINT(0 0)\"^^geo:wktLiteral, 1000))",
+        );
+        let circle = std::f64::consts::PI * 1e6;
+        assert!(disc > circle * 0.993 && disc < circle * 1.001, "{disc}");
+        // a GeoJSON argument gives a GeoJSON result
+        let (_, dt) = lit(&s, "geof:envelope(?p3)");
+        assert_eq!(dt, crate::geo::vocab::GEOJSON_LITERAL);
+    }
+
+    #[test]
+    fn type_errors() {
+        let s = store();
+        for e in [
+            "geof:sfIntersects(?x, ?a)",
+            "geof:sfIntersects(?m, ?a)",
+            "geof:distance(?a, ?b, <http://www.opengis.net/def/uom/OGC/1.0/parsec>)",
+            "geof:area(?a, uom:metre)",
+            "geof:geometryN(?a, 2)",
+            "geof:minZ(?a)",
+            "geof:relate(?a, ?b, \"TT\")",
+            "geof:metricDistance(?m, ?m)",
+            "geof:metricDistance(?e, ?a)",
+            "geof:minX(?e)",
+            "geof:sfIntersects(?a)",
+            "geof:buffer(?p1, -1, uom:metre)",
+            "geof:asGeoJSON(?m)",
+            "geof:transform(?a, <http://example.org/crs/mars>)",
+        ] {
+            assert_eq!(eval(&s, e), None, "{e}");
+        }
+    }
 }

@@ -191,12 +191,9 @@ fn sphere_ring_area(r: &LineString<f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::crs::{CRS84, CrsRef};
-    use wkt::TryFromWkt;
 
     fn g(s: &str) -> Geom {
-        let geometry = Geometry::<f64>::try_from_wkt_str(s).unwrap();
-        Geom::from_geometry(CrsRef::Known(CRS84), geometry)
+        crate::geo::ops::wkt(s)
     }
 
     const GEO: DistanceModel = DistanceModel::Geodesic;
@@ -271,10 +268,7 @@ mod tests {
             factor: 1.0,
         };
         assert!(length(&g(SQUARE), &m2, GEO).is_err());
-        let mars = Geom::from_geometry(
-            CrsRef::Unknown("http://example.org/crs/mars".into()),
-            Geometry::try_from_wkt_str(SQUARE).unwrap(),
-        );
+        let mars = crate::geo::ops::wkt(&format!("<http://example.org/crs/mars> {}", SQUARE));
         assert!(area_m2(&mars, GEO).is_err());
     }
 }
