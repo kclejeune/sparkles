@@ -1,0 +1,11 @@
+{
+  "knows": {"@id": "http://example.org/bob"},
+  "@graph": [{"@id": "http://example.org/g1", "name": "in the graph"}],
+  "name": "Alice",
+  "@reverse": {"parent": {"@id": "http://example.org/carol"}},
+  "@type": ["Person", "Agent"],
+  "@id": "http://example.org/alice",
+  "@included": [{"name": "included", "@id": "http://example.org/inc"}],
+  "@index": "people",
+  "@context": {"@vocab": "http://example.org/vocab#", "knows": {"@type": "@id"}}
+}
