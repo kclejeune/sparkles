@@ -29,7 +29,7 @@ async fn post_json(app: &Router, uri: &str, body: J) -> Resp {
 async fn formats_json_bodies() {
     let (_d, app) = fmt_server(|_| {});
     // the cursor counts UTF-16 code units: after the emoji (two units) is 11
-    let text = "SELECT ('😀' AS ?x) {}\n";
+    let text = "SELECT ('😀' AS ?x)\nWHERE {}\n";
     let r = post_json(
         &app,
         "/$/format",
@@ -242,6 +242,76 @@ async fn body_limit_and_endpoint_switch() {
     let (_d, app) = fmt_server(|st| st.format.endpoint = FormatEndpoint::Authenticated);
     let r = post_json(&app, "/$/format", json!({ "text": "ASK {}" })).await;
     assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_cursor_counts_utf16_units_both_ways() {
+    let (_d, app) = fmt_server(|_| {});
+    // astral characters (two UTF-16 units each) before the cursor, in a document that
+    // changes (formatting drops the byte order mark, one unit)
+    let text = "\u{feff}SELECT ('😀𝔸' AS ?x) {}";
+    let before = "\u{feff}SELECT ('😀𝔸";
+    let units = before.encode_utf16().count();
+    let r = post_json(
+        &app,
+        "/$/format",
+        json!({ "text": text, "cursorOffset": units }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["changed"], true);
+    // still right after the same characters in the output
+    let out = j["text"].as_str().unwrap();
+    let end = out.find("𝔸").unwrap() + "𝔸".len();
+    assert_eq!(j["cursorOffset"], out[..end].encode_utf16().count(), "{j}");
+    // past the end, by one unit
+    let r = post_json(
+        &app,
+        "/$/format",
+        json!({ "text": text, "cursorOffset": text.encode_utf16().count() + 1 }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn default_body_limit_and_deadline() {
+    // the default limit is 16 MiB
+    let (_d, app) = fmt_server(|_| {});
+    let big = format!("ASK {{}} # {}", "x".repeat(17 << 20));
+    let r = post_as(&app, "/$/format", "application/sparql-query", &big).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        r.json()["error"],
+        "request body exceeds 16.0 MiB (--format-max-mb)"
+    );
+    // a deadline that has passed
+    let (_d, app) = fmt_server(|st| st.format.timeout = Duration::ZERO);
+    let r = post_json(&app, "/$/format", json!({ "text": "ASK {}" })).await;
+    assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", r.text());
+    assert!(r.json()["requestId"].is_string());
+}
+
+#[tokio::test]
+async fn long_syntax_errors_are_cut() {
+    let (_d, app) = fmt_server(|_| {});
+    let r = post_json(
+        &app,
+        "/$/format",
+        json!({ "text": "SELECT * {\n  FILTER(?o > )\n}", "language": "sparql" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let j = r.json();
+    let error = j["error"].as_str().unwrap();
+    assert!(error.starts_with("SPARQL syntax error at line "), "{j}");
+    assert!(error.ends_with(", …") && !error.contains('\n'), "{j}");
+    let detail = j["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("expected one of ") && !error.contains(detail),
+        "{j}"
+    );
 }
 
 #[tokio::test]

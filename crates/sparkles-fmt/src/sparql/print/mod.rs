@@ -14,24 +14,37 @@ pub mod values;
 
 use crate::doc::{DocArena, DocId, GroupId, Printed};
 use crate::lex::TokenKind;
+use crate::normalize::{self, PrefixScope};
 use crate::sparql::keywords::Kw;
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId, Tree};
 use crate::trivia::{self, CommentRules, Comments};
-use crate::{FormatError, Options};
+use crate::{FormatError, Options, QuoteStyle};
 
-/// What every node printer works with.
+/// What every node printer works with. Build it with [`Ctx::new`].
 pub struct Ctx<'a, 's> {
     pub tree: &'a Tree<'s>,
     pub arena: DocArena<'a>,
     pub opts: &'a Options,
     pub comments: &'a Comments,
+    /// the prefixes declared in the document, for IRI compaction and `rdf:type`
+    pub scope: PrefixScope,
 }
 
 /// Helpers for the node printers. Build each child's document once with [`Ctx::node`]
 /// (which adds its comments) and reuse the `DocId` when it appears in two branches of an
 /// `if_break`.
-impl Ctx<'_, '_> {
+impl<'a, 's> Ctx<'a, 's> {
+    pub fn new(tree: &'a Tree<'s>, comments: &'a Comments, opts: &'a Options) -> Ctx<'a, 's> {
+        Ctx {
+            tree,
+            arena: DocArena::new(&tree.tokens),
+            opts,
+            comments,
+            scope: PrefixScope::from_tree(tree),
+        }
+    }
+
     // ------------------------------------------------------------------ nodes ------
 
     /// Node `n`'s document, with its comments.
@@ -67,11 +80,11 @@ impl Ctx<'_, '_> {
         doc
     }
 
-    /// A child element: a node with [`Ctx::node`], a token with [`Ctx::kw`].
+    /// A child element: a node with [`Ctx::node`], a token with [`Ctx::term`].
     pub fn element(&mut self, e: Element) -> DocId {
         match e {
             Element::Node(c) => self.node(c),
-            Element::Token(t) => self.kw(t),
+            Element::Token(t) => self.term(t),
         }
     }
 
@@ -107,6 +120,60 @@ impl Ctx<'_, '_> {
             TokenKind::Kw(k) => self.tok_as(t, k.canonical()),
             _ => self.tok(t),
         }
+    }
+
+    /// A token with every normalization that depends on the token alone: a keyword in
+    /// the grammar's spelling, a full IRI as a prefixed name when a prefix in scope covers
+    /// it (`compact-iris`), a single-quoted string in double quotes (`quote-style`).
+    /// Variables keep their sigil; language tags and everything else stay as written.
+    /// Not for the IRI of a `PREFIX` or `BASE` (use [`Ctx::kw`]).
+    pub fn term(&mut self, t: TokenId) -> DocId {
+        let text = self.tree.token_text(t);
+        let kind = self.tree.token_kind(t);
+        let printed = match kind {
+            TokenKind::Kw(k) => Some(k.canonical().to_string()),
+            TokenKind::IriRef if self.opts.compact_iris => {
+                normalize::compact_iri(text, &self.scope, t)
+            }
+            TokenKind::String1 | TokenKind::StringLong1
+                if self.opts.quote_style == QuoteStyle::Double =>
+            {
+                normalize::requote(text, kind)
+            }
+            _ => None,
+        };
+        match printed {
+            Some(p) => self.tok_as(t, p),
+            None => self.tok(t),
+        }
+    }
+
+    /// A verb token: `a` for `rdf:type` (`type-shorthand`), else [`Ctx::term`]. Only for a
+    /// simple verb, never inside a longer path or in subject or object position.
+    pub fn verb(&mut self, t: TokenId) -> DocId {
+        if self.opts.type_shorthand && normalize::is_rdf_type(self.tree, t, &self.scope) {
+            return self.tok_as(t, "a");
+        }
+        self.term(t)
+    }
+
+    /// A typed literal `lexical ^^ datatype` as its numeric or boolean shorthand when its
+    /// lexical form is that token (`"1"^^xsd:integer` → `1`): the string token printed
+    /// as the shorthand, and the caller prints neither `^^` nor the datatype. `None`
+    /// when the literal stays as written.
+    pub fn literal_shorthand(&mut self, lexical: TokenId, datatype: TokenId) -> Option<DocId> {
+        let dt_text = self.tree.token_text(datatype);
+        let dt: String = match self.tree.token_kind(datatype) {
+            TokenKind::IriRef => dt_text.to_string(),
+            TokenKind::PnameLn => {
+                let (label, local) = dt_text.split_once(':')?;
+                format!("{}{local}", self.scope.resolve(label, datatype)?)
+            }
+            _ => return None,
+        };
+        let lexical_text = self.tree.token_text(lexical);
+        let short = normalize::literal_shorthand(lexical_text, &dt)?.to_string();
+        Some(self.tok_as(lexical, short))
     }
 
     // ------------------------------------------------------------- documents ------
@@ -361,12 +428,7 @@ impl Ctx<'_, '_> {
 
 /// Print a whole tree.
 pub fn print(tree: &Tree<'_>, comments: &Comments, opts: &Options) -> Result<Printed, FormatError> {
-    let mut cx = Ctx {
-        tree,
-        arena: DocArena::new(&tree.tokens),
-        opts,
-        comments,
-    };
+    let mut cx = Ctx::new(tree, comments, opts);
     let root = node(&mut cx, tree.root());
     crate::doc::print(
         &cx.arena,
@@ -585,12 +647,7 @@ mod tests {
         let t = tree(src, shape);
         let comments = Comments::attach(&t, &RULES);
         let opts = Options::default();
-        let mut cx = Ctx {
-            tree: &t,
-            arena: DocArena::new(&t.tokens),
-            opts: &opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&t, &comments, &opts);
         let g = NodeId(1);
         let items: Vec<(NodeId, DocId)> = cx
             .child_nodes(g)
@@ -643,12 +700,7 @@ mod tests {
         let t = tree(src, "(Q (G _ (S _ (E _ (O _ _) (O _ _) (O _))) _))");
         let comments = Comments::attach(&t, &RULES);
         let opts = Options::default();
-        let mut cx = Ctx {
-            tree: &t,
-            arena: DocArena::new(&t.tokens),
-            opts: &opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&t, &comments, &opts);
         // objects, their commas inside them, through `delimited` (a group that broke
         // because of the trailing comment)
         let entry = NodeId(3);
@@ -667,12 +719,8 @@ mod tests {
         let p = crate::doc::print(&cx.arena, list, t.src, 100, 2, None).unwrap();
         assert_eq!(p.text, "(\n  ?a,\n  ?b, # c\n  ?d\n)");
 
-        let mut cx = Ctx {
-            tree: &t,
-            arena: DocArena::new(&t.tokens),
-            opts: &opts,
-            comments: &Comments::default(),
-        };
+        let none = Comments::default();
+        let mut cx = Ctx::new(&t, &none, &opts);
         let objects: Vec<DocId> = cx
             .child_nodes(entry)
             .into_iter()
@@ -725,12 +773,7 @@ mod tests {
         };
         let comments = Comments::default();
         let opts = Options::default();
-        let mut cx = Ctx {
-            tree: &t,
-            arena: DocArena::new(&t.tokens),
-            opts: &opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&t, &comments, &opts);
         let a = cx.kw(TokenId(0));
         let b = cx.kw(TokenId(2));
         let both = cx.spaced([a, b]);

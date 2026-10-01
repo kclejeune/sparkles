@@ -361,10 +361,21 @@ fn format_error(e: &FormatError, job: &Job) -> ApiError {
             column,
             ..
         } => {
-            let mut body =
-                super::syntax_error_body(&format!("error at {line}:{column}: {message}"));
-            body["code"] = "syntax".into();
-            body["language"] = job.language.name().into();
+            // the head of the parser's message; the whole of it in `detail`
+            let short = crate::fmt::report::short_message(message);
+            let mut body = json!({
+                "error": format!(
+                    "{} syntax error at line {line}, column {column}: {short}",
+                    job.language.display_name()
+                ),
+                "line": line,
+                "column": column,
+                "code": "syntax",
+                "language": job.language.name(),
+            });
+            if short != message.trim() {
+                body["detail"] = message.as_str().into();
+            }
             ApiError(StatusCode::BAD_REQUEST, body)
         }
         FormatError::Unsupported { .. } | FormatError::Unsafe { .. } => {
