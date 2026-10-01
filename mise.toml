@@ -121,16 +121,18 @@ run = "cargo fmt --all --check"
 
 [tasks.lint]
 description = "Clippy (warnings are errors) + svelte-check"
-depends = ["ui:check"]
+# ui:build first: the server embeds ui/build, which a concurrent UI build rewrites
+depends = ["ui:check", "ui:build"]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
-depends = ["ui:check"]
+depends = ["ui:check", "ui:build"]
 run = "cargo check --workspace --all-targets"
 
 [tasks.test]
 description = "All Rust tests (unit, W3C SPARQL + SHACL suites when the Jena checkout is present, doctests)"
+depends = ["ui:build"]
 run = "cargo test --workspace"
 
 [tasks."test:w3c"]

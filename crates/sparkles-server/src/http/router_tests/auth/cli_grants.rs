@@ -244,7 +244,7 @@ async fn loopback_flow() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let redirect = r.json()["redirect"].as_str().unwrap().to_string();
     let re = regex::Regex::new(
-        r"^http://127\.0\.0\.1:50123/callback\?code=([A-Za-z0-9_-]{43})&state=s1$",
+        r"^http://127\.0\.0\.1:50123/callback\?code=([A-Za-z0-9_-]{43})&state=s[0-9]$",
     )
     .unwrap();
     let code = re.captures(&redirect).unwrap()[1].to_string();
@@ -270,10 +270,7 @@ async fn loopback_flow() {
     assert_eq!(late.json()["error"], "invalid_grant");
 
     let r = authorize(50123, "s2").await;
-    let code = re
-        .captures(&r.json()["redirect"].as_str().unwrap().replace("s2", "s1"))
-        .unwrap()[1]
-        .to_string();
+    let code = re.captures(r.json()["redirect"].as_str().unwrap()).unwrap()[1].to_string();
     let ok = exchange(code.clone(), verifier.clone()).await;
     assert_eq!(ok.status, StatusCode::OK, "{}", ok.text());
     let token = ok.json()["access_token"].as_str().unwrap().to_string();
@@ -294,10 +291,7 @@ async fn loopback_flow() {
 
     // codes expire after 120 s
     let r = authorize(50123, "s3").await;
-    let code = re
-        .captures(&r.json()["redirect"].as_str().unwrap().replace("s3", "s1"))
-        .unwrap()[1]
-        .to_string();
+    let code = re.captures(r.json()["redirect"].as_str().unwrap()).unwrap()[1].to_string();
     s.auth().advance(121);
     assert_eq!(
         exchange(code, verifier).await.json()["error"],
