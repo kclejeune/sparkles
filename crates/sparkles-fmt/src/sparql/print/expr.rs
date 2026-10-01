@@ -14,7 +14,7 @@ use crate::doc::DocId;
 use crate::lex::TokenKind;
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId};
-use crate::{OperatorPosition, QuoteStyle};
+use crate::{OperatorPosition, QuoteStyle, trivia};
 
 /// `OrChain`: one group, broken one operand per line.
 pub fn or_chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
@@ -30,49 +30,48 @@ pub fn and_chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 /// one level deeper. The operator starts the continuation line (`leading`) or ends the
 /// line before it (`trailing`).
 ///
-/// The chain prints its operands' comments itself, because in the leading position an
-/// operand's leading comments go before the operator that starts its line, and its
-/// trailing comment after the operand, where the operator no longer is.
+/// The chain prints its operands' comments itself rather than through [`node`]: in the
+/// leading position an operand's own-line comments go before the operator that starts
+/// its line, and its trailing comment (one after the operator, too) goes after the
+/// operand, which now ends the line.
 fn chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let leading = cx.opts.operator_position == OperatorPosition::Leading;
-    let operands: Vec<NodeId> = cx.tree.child_nodes(n).collect();
     let mut first = Vec::new();
     let mut rest = Vec::new();
     let mut prev_op: Option<TokenId> = None;
-    for (i, &o) in operands.iter().enumerate() {
+    for (i, o) in cx.child_nodes(n).into_iter().enumerate() {
         let (body, op) = operand(cx, o);
         let out = if i == 0 {
             &mut first
         } else {
-            rest.push(cx.arena.line());
+            rest.push(cx.line());
             &mut rest
         };
-        for c in operand_leading(cx, o) {
-            out.push(c);
-            out.push(cx.arena.hard_line());
-        }
+        out.extend(operand_leading(cx, o));
         if leading {
             if let Some(op) = prev_op {
-                out.push(cx.arena.token(op, None));
-                out.push(cx.arena.text(" "));
+                out.push(cx.tok(op));
+                out.push(cx.space());
             }
             out.push(body);
         } else {
             out.push(body);
             if let Some(op) = op {
-                out.push(cx.arena.text(" "));
-                out.push(cx.arena.token(op, None));
+                out.push(cx.space());
+                out.push(cx.tok(op));
             }
         }
         for c in cx.comments.trailing(o).to_vec() {
-            out.push(trailing_comment(cx, c));
+            if !cx.comments.copied(c) {
+                out.push(trivia::trailing_comment(&mut cx.arena, cx.comments, c));
+            }
         }
         prev_op = op;
     }
-    let rest = cx.arena.concat(rest);
-    first.push(cx.arena.indent(rest));
-    let doc = cx.arena.concat(first);
-    cx.arena.group(doc).0
+    let rest = cx.concat(rest);
+    first.push(cx.indent(rest));
+    let doc = cx.concat(first);
+    cx.group(doc)
 }
 
 /// A chain operand's expression (verbatim under an ignore pragma), and the operator
@@ -80,7 +79,7 @@ fn chain(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 fn operand(cx: &mut Ctx<'_, '_>, o: NodeId) -> (DocId, Option<TokenId>) {
     let mut body = None;
     let mut op = None;
-    for &e in cx.tree.children(o) {
+    for e in cx.children(o) {
         match e {
             Element::Token(t)
                 if matches!(cx.tree.token_kind(t), TokenKind::OrOr | TokenKind::AndAnd) =>
@@ -88,52 +87,42 @@ fn operand(cx: &mut Ctx<'_, '_>, o: NodeId) -> (DocId, Option<TokenId>) {
                 op = Some(t);
             }
             e if body.is_none() => {
-                body = Some(if cx.comments.ignored(o) {
-                    match e {
-                        Element::Node(c) => cx.verbatim(c),
-                        Element::Token(t) => cx.arena.token(t, None),
-                    }
-                } else {
-                    element(cx, e)
+                body = Some(match e {
+                    Element::Node(c) if cx.comments.ignored(o) => cx.verbatim(c),
+                    Element::Token(t) if cx.comments.ignored(o) => cx.tok(t),
+                    e => element(cx, e),
                 });
             }
             _ => {}
         }
     }
-    let body = body.unwrap_or_else(|| cx.arena.nil());
+    let body = body.unwrap_or_else(|| cx.nil());
     (body, op)
 }
 
-/// The comments on their own lines before a chain operand: its detached blocks, then
-/// its leading block.
+/// The comments on their own lines before a chain operand, each line ending with a line
+/// break: its detached blocks (a blank line after each), then its leading block.
 fn operand_leading(cx: &mut Ctx<'_, '_>, o: NodeId) -> Vec<DocId> {
-    let mut v: Vec<TokenId> = cx
-        .comments
-        .detached_before(o)
-        .iter()
-        .flatten()
-        .copied()
-        .collect();
-    v.extend_from_slice(cx.comments.leading(o));
-    v.into_iter().map(|c| comment(cx, c)).collect()
-}
-
-/// A comment token, without trailing whitespace.
-fn comment(cx: &mut Ctx<'_, '_>, c: TokenId) -> DocId {
-    let text = cx.tree.token_text(c);
-    let trimmed = text.trim_end();
-    let printed = (trimmed.len() != text.len()).then(|| trimmed.into());
-    cx.arena.token(c, printed)
-}
-
-/// ` # comment` at the end of the line, which then cannot be joined with the next.
-fn trailing_comment(cx: &mut Ctx<'_, '_>, c: TokenId) -> DocId {
-    let space = cx.arena.text(" ");
-    let c = comment(cx, c);
-    let both = cx.arena.concat([space, c]);
-    let suffix = cx.arena.line_suffix(both);
-    let brk = cx.arena.break_parent();
-    cx.arena.concat([suffix, brk])
+    let live = |cs: &[TokenId]| -> Vec<TokenId> {
+        cs.iter()
+            .copied()
+            .filter(|&c| !cx.comments.copied(c))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for block in cx.comments.detached_before(o).to_vec() {
+        let block = live(&block);
+        if !block.is_empty() {
+            out.push(trivia::comment_lines(&mut cx.arena, cx.comments, &block));
+            out.push(cx.empty_line());
+        }
+    }
+    let lead = live(cx.comments.leading(o));
+    if !lead.is_empty() {
+        out.push(trivia::comment_lines(&mut cx.arena, cx.comments, &lead));
+        out.push(cx.hard_line());
+    }
+    out
 }
 
 /// `ChainOperand` outside a chain's own layout: the operand and the operator after it.
@@ -141,9 +130,8 @@ pub fn chain_operand(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let (body, op) = operand(cx, n);
     match op {
         Some(op) => {
-            let space = cx.arena.text(" ");
-            let op = cx.arena.token(op, None);
-            cx.arena.concat([body, space, op])
+            let op = cx.tok(op);
+            cx.spaced([body, op])
         }
         None => body,
     }
@@ -158,21 +146,21 @@ pub fn binary(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 /// A `Binary`, whose first token is a signed number standing for the operator and the
 /// operand (`signed_first`) when it is the right side of `a +1 * 2`.
 fn binary_doc(cx: &mut Ctx<'_, '_>, n: NodeId, signed_first: bool) -> DocId {
-    let children = cx.tree.children(n).to_vec();
+    let children = cx.children(n);
     let fused_rhs = children.len() == 2;
-    let mut parts = Vec::with_capacity(children.len() * 2);
-    for (i, &e) in children.iter().enumerate() {
-        if i > 0 {
-            parts.push(cx.arena.text(" "));
-        }
-        let signed = (i == 0 && signed_first) || (i == 1 && fused_rhs);
-        parts.push(if signed {
-            signed_operand(cx, e)
-        } else {
-            element(cx, e)
-        });
-    }
-    cx.arena.concat(parts)
+    let docs: Vec<DocId> = children
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| {
+            let signed = (i == 0 && signed_first) || (i == 1 && fused_rhs);
+            if signed {
+                signed_operand(cx, e)
+            } else {
+                element(cx, e)
+            }
+        })
+        .collect();
+    cx.spaced(docs)
 }
 
 /// The right operand of `a +1`: `+ 1`, or `+ 1 * 2` when the number starts operations.
@@ -183,11 +171,11 @@ fn signed_operand(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
         {
             let text = cx.tree.token_text(t);
             let printed = format!("{} {}", &text[..1], &text[1..]);
-            cx.arena.token(t, Some(printed.into()))
+            cx.tok_as(t, printed)
         }
         Element::Node(m) if cx.tree.kind(m) == NodeKind::Binary => {
             let doc = binary_doc(cx, m, true);
-            crate::trivia::wrap(&mut cx.arena, cx.comments, m, doc)
+            trivia::wrap(&mut cx.arena, cx.comments, m, doc)
         }
         e => element(cx, e),
     }
@@ -197,9 +185,8 @@ fn signed_operand(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
 /// that a sign stays apart from an unsigned number, which it would otherwise join
 /// (`- 1` is not the token `-1`).
 pub fn unary(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    let children = cx.tree.children(n).to_vec();
     let mut parts = Vec::with_capacity(3);
-    for (i, &e) in children.iter().enumerate() {
+    for (i, e) in cx.children(n).into_iter().enumerate() {
         if i == 1 {
             let joins = first_token(cx, e).is_some_and(|t| {
                 matches!(
@@ -208,17 +195,17 @@ pub fn unary(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
                 )
             });
             if joins {
-                parts.push(cx.arena.text(" "));
+                parts.push(cx.space());
             }
         }
         parts.push(element(cx, e));
     }
-    cx.arena.concat(parts)
+    cx.concat(parts)
 }
 
 /// `Bracketed`: `(expr)`, or broken as `(`, the expression one level deeper, `)`.
 pub fn bracketed(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    let children = cx.tree.children(n).to_vec();
+    let children = cx.children(n);
     let (open, close) = match (children.first(), children.last()) {
         (Some(&Element::Token(o)), Some(&Element::Token(c))) if children.len() >= 2 => (o, c),
         _ => return cx.verbatim(n),
@@ -227,54 +214,21 @@ pub fn bracketed(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
         .iter()
         .map(|&e| element(cx, e))
         .collect();
-    brackets(cx, n, open, inner, close)
-}
-
-/// `(`, the items separated by lines, the container's dangling comments, `)`: one
-/// group, broken one item per line one level deeper.
-fn brackets(
-    cx: &mut Ctx<'_, '_>,
-    n: NodeId,
-    open: TokenId,
-    items: Vec<DocId>,
-    close: TokenId,
-) -> DocId {
-    let mut inner = vec![cx.arena.soft_line()];
-    for (i, item) in items.into_iter().enumerate() {
-        if i > 0 {
-            inner.push(cx.arena.line());
-        }
-        inner.push(item);
-    }
-    for c in cx.comments.dangling(n).to_vec() {
-        inner.push(cx.arena.hard_line());
-        inner.push(comment(cx, c));
-    }
-    let inner = cx.arena.concat(inner);
-    let open = cx.arena.token(open, None);
-    let inner = cx.arena.indent(inner);
-    let soft = cx.arena.soft_line();
-    let close = cx.arena.token(close, None);
-    let doc = cx.arena.concat([open, inner, soft, close]);
-    cx.arena.group(doc).0
+    let open = cx.tok(open);
+    let close = cx.tok(close);
+    cx.delimited(n, open, &inner, close, false)
 }
 
 /// `Call`: the name directly before its arguments: `STR(?x)`, `ex:fn(?a, ?b)`.
 pub fn call(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    let parts: Vec<DocId> = cx
-        .tree
-        .children(n)
-        .to_vec()
-        .into_iter()
-        .map(|e| element(cx, e))
-        .collect();
-    cx.arena.concat(parts)
+    let parts: Vec<DocId> = cx.children(n).into_iter().map(|e| element(cx, e)).collect();
+    cx.concat(parts)
 }
 
 /// `ArgList`: `()`, or `(a, b)` broken one argument per line. `DISTINCT` goes before the
 /// first argument, and `GROUP_CONCAT`'s `SEPARATOR = "…"` after the last.
 pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    let children = cx.tree.children(n).to_vec();
+    let children = cx.children(n);
     let (open, close) = match (children.first(), children.last()) {
         (Some(&Element::Token(o)), Some(&Element::Token(c))) if children.len() >= 2 => (o, c),
         (Some(&Element::Token(t)), _) if children.len() == 1 => return term_token(cx, t),
@@ -291,23 +245,20 @@ pub fn arg_list(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
             }
             Element::Token(t) => {
                 let doc = term_token(cx, t);
+                let space = cx.space();
                 match items.last_mut() {
                     // `SEPARATOR = "…"` after the last argument
-                    Some(item) => {
-                        let space = cx.arena.text(" ");
-                        item.extend([space, doc]);
-                    }
+                    Some(item) => item.extend([space, doc]),
                     // `DISTINCT`
-                    None => {
-                        let space = cx.arena.text(" ");
-                        before_first.extend([doc, space]);
-                    }
+                    None => before_first.extend([doc, space]),
                 }
             }
         }
     }
-    let items = items.into_iter().map(|i| cx.arena.concat(i)).collect();
-    brackets(cx, n, open, items, close)
+    let items: Vec<DocId> = items.into_iter().map(|i| cx.concat(i)).collect();
+    let open = cx.tok(open);
+    let close = cx.tok(close);
+    cx.delimited(n, open, &items, close, false)
 }
 
 /// `Arg`: the expression and the `,` or `;` after it.
@@ -337,15 +288,8 @@ pub fn not_exists(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
 
 /// The children separated by single spaces.
 fn spaced(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    let children = cx.tree.children(n).to_vec();
-    let mut parts = Vec::with_capacity(children.len() * 2);
-    for (i, &e) in children.iter().enumerate() {
-        if i > 0 {
-            parts.push(cx.arena.text(" "));
-        }
-        parts.push(element(cx, e));
-    }
-    cx.arena.concat(parts)
+    let docs: Vec<DocId> = cx.children(n).into_iter().map(|e| element(cx, e)).collect();
+    cx.spaced(docs)
 }
 
 /// The first significant token of a child.
@@ -370,16 +314,17 @@ fn element(cx: &mut Ctx<'_, '_>, e: Element) -> DocId {
 /// else as written.
 pub fn term_token(cx: &mut Ctx<'_, '_>, t: TokenId) -> DocId {
     let kind = cx.tree.token_kind(t);
-    let text = cx.tree.token_text(t);
-    let printed: Option<Box<str>> = match kind {
-        TokenKind::Kw(k) => (text != k.canonical()).then(|| k.canonical().into()),
-        TokenKind::Nil => (text != "()").then(|| "()".into()),
+    match kind {
+        TokenKind::Kw(_) => cx.kw(t),
+        TokenKind::Nil => cx.tok_as(t, "()"),
         k if k.is_string() && cx.opts.quote_style == QuoteStyle::Double => {
-            crate::normalize::requote(text, k).map(Into::into)
+            match crate::normalize::requote(cx.tree.token_text(t), k) {
+                Some(s) => cx.tok_as(t, s),
+                None => cx.tok(t),
+            }
         }
-        _ => None,
-    };
-    cx.arena.token(t, printed)
+        _ => cx.tok(t),
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +442,209 @@ mod tests {
             "  FILTER NOT EXISTS {?s ?p ?o}"
         );
         assert_eq!(filter("(exists{} || ?a)"), "  FILTER(EXISTS {} || ?a)");
+    }
+
+    fn opts(width: u16, position: OperatorPosition) -> Options {
+        Options {
+            line_width: width,
+            operator_position: position,
+            ..Options::default()
+        }
+    }
+
+    const LONG: &str = "(?price > \"10\"^^<http://www.w3.org/2001/XMLSchema#decimal> && ?price < 1000 && contains(lcase(str(?s)), \"sale\") && ?currency != \"GBP\")";
+
+    #[test]
+    fn a_long_chain_breaks_with_leading_operators() {
+        assert_eq!(
+            filter(LONG),
+            "  FILTER(
+    ?price > \"10\"^^<http://www.w3.org/2001/XMLSchema#decimal>
+      && ?price < 1000
+      && CONTAINS(LCASE(STR(?s)), \"sale\")
+      && ?currency != \"GBP\"
+  )"
+        );
+    }
+
+    #[test]
+    fn a_long_chain_breaks_with_trailing_operators() {
+        assert_eq!(
+            filter_with(LONG, &opts(100, OperatorPosition::Trailing)),
+            "  FILTER(
+    ?price > \"10\"^^<http://www.w3.org/2001/XMLSchema#decimal> &&
+      ?price < 1000 &&
+      CONTAINS(LCASE(STR(?s)), \"sale\") &&
+      ?currency != \"GBP\"
+  )"
+        );
+    }
+
+    #[test]
+    fn short_chains_break_only_when_they_do_not_fit() {
+        let src = "(?price > 10 && ?currency != \"GBP\")";
+        assert_eq!(
+            filter_with(src, &opts(43, OperatorPosition::Leading)),
+            "  FILTER(?price > 10 && ?currency != \"GBP\")"
+        );
+        assert_eq!(
+            filter_with(src, &opts(30, OperatorPosition::Leading)),
+            "  FILTER(
+    ?price > 10
+      && ?currency != \"GBP\"
+  )"
+        );
+        assert_eq!(
+            filter_with(src, &opts(30, OperatorPosition::Trailing)),
+            "  FILTER(
+    ?price > 10 &&
+      ?currency != \"GBP\"
+  )"
+        );
+    }
+
+    #[test]
+    fn nested_chains_go_one_level_deeper() {
+        assert_eq!(
+            filter_with("(?a || (?b && ?c))", &opts(12, OperatorPosition::Leading)),
+            "  FILTER(
+    ?a
+      || (
+        ?b
+          && ?c
+      )
+  )"
+        );
+        assert_eq!(
+            filter_with("(?a || (?b && ?c))", &opts(12, OperatorPosition::Trailing)),
+            "  FILTER(
+    ?a ||
+      (
+        ?b &&
+          ?c
+      )
+  )"
+        );
+        // an && chain is an operand of the || chain without brackets
+        assert_eq!(
+            filter_with(
+                "(?a || ?bb && ?cc || ?d)",
+                &opts(20, OperatorPosition::Leading)
+            ),
+            "  FILTER(
+    ?a
+      || ?bb && ?cc
+      || ?d
+  )"
+        );
+        assert_eq!(
+            filter_with(
+                "(?aaaa || ?bbbb && ?cccc)",
+                &opts(16, OperatorPosition::Leading)
+            ),
+            "  FILTER(
+    ?aaaa
+      || ?bbbb
+        && ?cccc
+  )"
+        );
+    }
+
+    #[test]
+    fn argument_lists_and_in_lists_break_one_item_per_line() {
+        assert_eq!(
+            filter_with(
+                "concat(?aaaa, ?bbbb, \"cccc\")",
+                &opts(20, OperatorPosition::Leading)
+            ),
+            "  FILTER CONCAT(
+    ?aaaa,
+    ?bbbb,
+    \"cccc\"
+  )"
+        );
+        assert_eq!(
+            filter_with(
+                "(?x not in (?aaaa, ?bbbb))",
+                &opts(24, OperatorPosition::Leading)
+            ),
+            "  FILTER(
+    ?x NOT IN (
+      ?aaaa,
+      ?bbbb
+    )
+  )"
+        );
+        assert_eq!(
+            filter_with(
+                "(group_concat(distinct ?label; separator=\", \") != \"\")",
+                &opts(40, OperatorPosition::Leading)
+            ),
+            "  FILTER(
+    GROUP_CONCAT(
+      DISTINCT ?label; SEPARATOR = \", \"
+    ) != \"\"
+  )"
+        );
+    }
+
+    #[test]
+    fn comments_after_operators() {
+        for src in ["(?a && # c\n ?b)", "(?a # c\n && ?b)"] {
+            assert_eq!(
+                filter(src),
+                "  FILTER(
+    ?a # c
+      && ?b
+  )",
+                "{src:?}"
+            );
+            assert_eq!(
+                filter_with(src, &opts(100, OperatorPosition::Trailing)),
+                "  FILTER(
+    ?a && # c
+      ?b
+  )",
+                "{src:?}"
+            );
+        }
+        // an own-line comment before an operand goes before its operator
+        let src = "(?a &&\n # c\n ?b || ?d)";
+        assert_eq!(
+            filter(src),
+            "  FILTER(
+    ?a
+      # c
+      && ?b
+      || ?d
+  )"
+        );
+        assert_eq!(
+            filter_with(src, &opts(100, OperatorPosition::Trailing)),
+            "  FILTER(
+    ?a &&
+      # c
+      ?b ||
+      ?d
+  )"
+        );
+    }
+
+    #[test]
+    fn comments_in_argument_lists() {
+        assert_eq!(
+            filter("concat(?a, # c\n ?b)"),
+            "  FILTER CONCAT(
+    ?a, # c
+    ?b
+  )"
+        );
+        assert_eq!(
+            filter("(?a\n # dangling\n)"),
+            "  FILTER(
+    ?a
+    # dangling
+  )"
+        );
     }
 }
