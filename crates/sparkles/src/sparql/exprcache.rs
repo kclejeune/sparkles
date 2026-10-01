@@ -176,6 +176,12 @@ impl<T> PerValue<T> {
         }
     }
 
+    /// The index into `vals` of a row's result.
+    #[inline]
+    pub fn index(&self, row: usize) -> usize {
+        self.slot.as_ref().map_or(0, |s| s[row] as usize)
+    }
+
     /// The per-row results.
     pub fn rows(&self, n: usize) -> Vec<T>
     where

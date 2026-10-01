@@ -243,6 +243,10 @@ ran.
   in those ranges (`IndexRangeScan` in EXPLAIN).
 * **Numeric top-k.** `ORDER BY ?v LIMIT k` over numbers ranks cheap rounded keys first.
   Exact values are computed only for rows that can still reach the first k.
+* **First-key top-k** (`topk_first_key`). `ORDER BY k1 k2 … LIMIT k` finds the k-th
+  row by the first key alone and drops every row whose first key is worse, since at
+  least k rows precede it. The later keys (often IRIs or strings to decode) are
+  evaluated only for the rows left (`[first-key prefilter kept N rows]`).
 * **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (and OFFSET) over a single triple
   pattern, with FILTERs over it, reads the pattern in the order of `?v` and stops once
   the first k rows are proven (`IndexTopK` in EXPLAIN). The scan is re-targeted to a

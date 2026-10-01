@@ -329,9 +329,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::OrderBy { keys, limit } => {
             let t = child(0, &mut infos)?;
             let (t, pre) = order_by(ctx, t, keys, *limit, &mut expr_report)?;
-            if let Some(kept) = pre {
-                note = Some(format!("[numeric prefilter kept {kept} rows]"));
-            }
+            note = pre;
             t
         }
         Kind::Project(vars) => child(0, &mut infos)?.project(vars),
@@ -1874,19 +1872,137 @@ fn order_by(
     keys: &[(Expr, bool)],
     limit: Option<usize>,
     report: &mut ExprReport,
-) -> Result<(Table, Option<usize>)> {
-    let mut prefiltered = None;
+) -> Result<(Table, Option<String>)> {
+    let mut notes = Vec::new();
     if let Some(k) = limit
         && ctx.opt.topk_prefilter
         && let Some(cand) = topk_candidates(ctx, &t, keys, k)
         && cand.len() < t.len()
     {
         // the candidates keep their relative order, so ties break as in the full sort
-        prefiltered = Some(cand.len());
+        notes.push(format!("[numeric prefilter kept {} rows]", cand.len()));
         ctx.check_output(cand.len(), t.width())?;
         t = t.take_rows(&cand);
     }
-    Ok((order_by_rows(ctx, t, keys, limit, report)?, prefiltered))
+    if let Some(k) = limit
+        && ctx.opt.topk_first_key
+        && keys.len() > 1
+        && k > 0
+        && k.saturating_mul(8) <= t.len()
+        && let Some(cand) = first_key_candidates(ctx, &t, keys, k, report)?
+    {
+        // as above: the later keys and the row order break the ties among the candidates
+        notes.push(format!("[first-key prefilter kept {} rows]", cand.len()));
+        ctx.check_output(cand.len(), t.width())?;
+        t = t.take_rows(&cand);
+    }
+    let note = (!notes.is_empty()).then(|| notes.join(" "));
+    Ok((order_by_rows(ctx, t, keys, limit, report)?, note))
+}
+
+/// Candidates for `ORDER BY k1 k2 … LIMIT k`: a row whose first key is worse than the
+/// first key of the k-th row in the order of the first key alone has at least k rows
+/// ahead of it, so only the rows at least as good as that one are ranked on all keys.
+/// `None` when that keeps every row.
+fn first_key_candidates(
+    ctx: &Ctx,
+    t: &Table,
+    keys: &[(Expr, bool)],
+    k: usize,
+    report: &mut ExprReport,
+) -> Result<Option<Vec<usize>>> {
+    let (e, asc) = &keys[0];
+    let col = key_column(ctx, t, e, report)?;
+    let cmp = |a: &Option<Value>, b: &Option<Value>| {
+        let o = order_cmp(a.as_ref(), b.as_ref());
+        if *asc { o } else { o.reverse() }
+    };
+    ctx.check()?;
+    let cand: Vec<usize> = match &col {
+        super::exprcache::Column::Values(p) => {
+            // rank the distinct values once (equal values share a rank), then select
+            // among the rows' ranks
+            let mut order: Vec<usize> = (0..p.vals.len()).collect();
+            order.sort_by(|&a, &b| cmp(&p.vals[a], &p.vals[b]));
+            let mut rank = vec![0u32; p.vals.len()];
+            for w in 1..order.len() {
+                let same = cmp(&p.vals[order[w - 1]], &p.vals[order[w]]) == Ordering::Equal;
+                rank[order[w]] = rank[order[w - 1]] + u32::from(!same);
+            }
+            let rows: Vec<u32> = (0..t.len()).map(|i| rank[p.index(i)]).collect();
+            let mut sel = rows.clone();
+            let (_, &mut tau, _) = sel.select_nth_unstable(k - 1);
+            (0..t.len()).filter(|&i| rows[i] <= tau).collect()
+        }
+        super::exprcache::Column::Rows(v) => {
+            let mut idx: Vec<usize> = (0..t.len()).collect();
+            let (_, &mut kth, _) = idx.select_nth_unstable_by(k - 1, |&a, &b| cmp(&v[a], &v[b]));
+            (0..t.len())
+                .filter(|&i| cmp(&v[i], &v[kth]) != Ordering::Greater)
+                .collect()
+        }
+    };
+    Ok((cand.len() < t.len()).then_some(cand))
+}
+
+/// The value of an ORDER BY key on every row (`None`: an error).
+fn key_rows(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    dec: Option<&super::expr::DecodedCols>,
+) -> Result<Vec<Option<Value>>> {
+    let map = t.var_map(ctx.nvars());
+    let f = |i: usize| {
+        eval(
+            e,
+            &Row {
+                table: t,
+                i,
+                map: &map,
+                dec,
+            },
+            ctx,
+        )
+        .ok()
+        .and_then(|v| match v {
+            Val::Id(id) => ctx.value(id),
+            Val::V(v) | Val::Dec(_, v) => Some(v),
+        })
+    };
+    map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
+}
+
+/// The value of an ORDER BY key once per distinct input value, where the key is pure
+/// over one variable and its values repeat (see [`super::exprcache`]).
+fn key_per_value(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut ExprReport,
+) -> Result<Option<super::exprcache::PerValue<Option<Value>>>> {
+    if t.len() < super::exprcache::MIN_ROWS {
+        return Ok(None);
+    }
+    super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
+        key_rows(ctx, v, e, decode_for(ctx, v, &[e]).as_ref())
+    })
+}
+
+/// The value of an ORDER BY key on every row, per distinct value where it can be.
+fn key_column(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut ExprReport,
+) -> Result<super::exprcache::Column<Option<Value>>> {
+    Ok(match key_per_value(ctx, t, e, report)? {
+        Some(p) => super::exprcache::Column::Values(p),
+        None => {
+            let dec = decode_for(ctx, t, &[e]);
+            super::exprcache::Column::Rows(key_rows(ctx, t, e, dec.as_ref())?)
+        }
+    })
 }
 
 fn order_by_rows(
@@ -1896,39 +2012,11 @@ fn order_by_rows(
     limit: Option<usize>,
     report: &mut ExprReport,
 ) -> Result<Table> {
-    // each key's value per row (`None`: an error), per distinct input value where the
-    // key is pure over one variable
-    let key_rows = |t: &Table, e: &Expr, dec: Option<&super::expr::DecodedCols>| {
-        let map = t.var_map(ctx.nvars());
-        let f = |i: usize| {
-            eval(
-                e,
-                &Row {
-                    table: t,
-                    i,
-                    map: &map,
-                    dec,
-                },
-                ctx,
-            )
-            .ok()
-            .and_then(|v| match v {
-                Val::Id(id) => ctx.value(id),
-                Val::V(v) | Val::Dec(_, v) => Some(v),
-            })
-        };
-        map_rows(ctx, t.len(), t.len() > PAR_THRESHOLD, f)
-    };
-    let mut cached: Vec<Option<super::exprcache::PerValue<Option<Value>>>> = Vec::new();
+    let mut cached = Vec::with_capacity(keys.len());
     for (e, _) in keys {
-        cached.push(if t.len() >= super::exprcache::MIN_ROWS {
-            super::exprcache::per_value(ctx, &t, &[e], false, report, |v| {
-                key_rows(v, e, decode_for(ctx, v, &[e]).as_ref())
-            })?
-        } else {
-            None
-        });
+        cached.push(key_per_value(ctx, &t, e, report)?);
     }
+    // the keys evaluated row by row share one decoding of the columns they read
     let rest: Vec<&Expr> = keys
         .iter()
         .zip(&cached)
@@ -1942,7 +2030,7 @@ fn order_by_rows(
         .map(|((e, _), c)| {
             Ok(match c {
                 Some(p) => super::exprcache::Column::Values(p),
-                None => super::exprcache::Column::Rows(key_rows(&t, e, dec.as_ref())?),
+                None => super::exprcache::Column::Rows(key_rows(ctx, &t, e, dec.as_ref())?),
             })
         })
         .collect::<Result<_>>()?;

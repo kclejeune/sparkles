@@ -78,10 +78,13 @@ pub struct Optimizations {
     /// MINUS on one variable that both sides always bind removes rows by a merge or a
     /// probe of single ids instead of hashing a key per row
     pub anti_join: bool,
+    /// ORDER BY several keys with LIMIT evaluates the later keys only on the rows that
+    /// the first key does not rule out
+    pub topk_first_key: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 16] = [
+    pub const NAMES: [&str; 17] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -98,6 +101,7 @@ impl Optimizations {
         "spatial_knn",
         "expr_cache",
         "anti_join",
+        "topk_first_key",
     ];
 
     /// Everything on.
@@ -118,6 +122,7 @@ impl Optimizations {
         spatial_knn: true,
         expr_cache: true,
         anti_join: true,
+        topk_first_key: true,
     };
 
     /// Everything off: the generic operators only.
@@ -138,6 +143,7 @@ impl Optimizations {
         spatial_knn: false,
         expr_cache: false,
         anti_join: false,
+        topk_first_key: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -158,6 +164,7 @@ impl Optimizations {
             "spatial_knn" => &mut self.spatial_knn,
             "expr_cache" => &mut self.expr_cache,
             "anti_join" => &mut self.anti_join,
+            "topk_first_key" => &mut self.topk_first_key,
             _ => return None,
         })
     }

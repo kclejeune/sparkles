@@ -856,6 +856,43 @@ fn topk_queries() -> Vec<String> {
 }
 
 #[test]
+fn first_key_prefilter_keeps_the_exact_order() {
+    let s = topk_store(0x5851_f42d_4c95_7f2d, 6000, StoreOptions::default());
+    let without = Optimizations {
+        topk_first_key: false,
+        ..Optimizations::ALL
+    };
+    let mut kept = 0;
+    let queries = [
+        "SELECT ?s ?w WHERE { ?s ex:w ?w } ORDER BY DESC(ABS(?w - 50)) ?s LIMIT 10",
+        "SELECT ?s ?w WHERE { ?s ex:w ?w } ORDER BY (?w / 50) DESC(?s) LIMIT 37 OFFSET 5",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v ?s LIMIT 10",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) DESC(?s) LIMIT 3",
+        // errors and unbound keys sort first
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ABS(?v) ?s LIMIT 20",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(ABS(?v)) ?s LIMIT 20",
+        "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(STR(?v)) ?s ?v LIMIT 5",
+        "SELECT ?s ?v ?w WHERE { ?s ex:v ?v OPTIONAL { ?s ex:w ?w FILTER(?w > 200) } } ORDER BY ?w ?v ?s LIMIT 12",
+        "SELECT ?s ?v ?w WHERE { ?s ex:v ?v OPTIONAL { ?s ex:w ?w FILTER(?w > 200) } } ORDER BY DESC(?w) ?v ?s LIMIT 12",
+        // the first key ties on every row: nothing to drop
+        "SELECT ?s ?w WHERE { ?s ex:w ?w } ORDER BY STRLEN(\"x\") ?w ?s LIMIT 10",
+    ];
+    for q in queries {
+        let fast = run(&s, q, Optimizations::ALL);
+        let slow = run(&s, q, without);
+        assert_eq!(fast.rows(), slow.rows(), "{q}");
+        assert!(!has_desc(&slow.plan, "first-key prefilter"), "{q}");
+        assert_eq!(
+            solutions(&fast),
+            solutions(&run(&s, q, Optimizations::NONE)),
+            "{q}"
+        );
+        kept += has_desc(&fast.plan, "first-key prefilter") as usize;
+    }
+    assert!(kept >= queries.len() - 2, "{kept} of {}", queries.len());
+}
+
+#[test]
 fn ordered_top_k_matches_the_sort_on_random_data() {
     for (seed, union) in [
         (0x2545_f491_4f6c_dd1d, false),
