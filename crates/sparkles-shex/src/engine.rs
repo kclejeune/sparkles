@@ -1,5 +1,10 @@
 //! Validation: expand the shape map, discover the typing graph, refine it stratum by
 //! stratum, and explain the nonconformant results.
+//!
+//! Semantic actions run during the typing without keeping their output. Each result's
+//! `print` output and the counts of actions of unknown extensions come from one more
+//! evaluation of that result's own pair with the tracing handlers, so actions of the
+//! shapes it references (decided in the typing) print nothing and are not counted.
 
 use crate::ir::{PairKind, Te};
 use crate::semact::{ActCtx, Registry, unknown_warnings};
