@@ -89,7 +89,34 @@ fn object_list(cx: &mut Ctx<'_, '_>, objects: &[NodeId]) -> DocId {
             matches!(cx.children(o).first(), Some(&Element::Node(b))
                 if cx.tree.kind(b) == NodeKind::BNodePropertyList)
         });
-    let docs: Vec<DocId> = objects.iter().map(|&o| cx.node(o)).collect();
+    // a trailing comment of the last object goes after the list, so it does not break
+    // it: printed after the entry's `;` or the statement's `.`, it would attach there
+    // the next time
+    let last = *objects.last().expect("an object list is not empty");
+    let detach = objects.len() > 1
+        && !hug
+        && !leading
+        && !cx.comments.ignored(last)
+        && cx.comments.detached_before(last).is_empty();
+    let docs: Vec<DocId> = objects
+        .iter()
+        .map(|&o| match detach && o == last {
+            true => object(cx, o),
+            false => cx.node(o),
+        })
+        .collect();
+    let mut after = Vec::new();
+    if detach {
+        for c in cx.comments.trailing(last).to_vec() {
+            if !cx.comments.copied(c) {
+                after.push(crate::trivia::trailing_comment(
+                    &mut cx.arena,
+                    cx.comments,
+                    c,
+                ));
+            }
+        }
+    }
     if (docs.len() == 1 && !leading) || (hug && !leading) {
         let mut parts = Vec::new();
         for d in docs {
@@ -106,7 +133,8 @@ fn object_list(cx: &mut Ctx<'_, '_>, objects: &[NodeId]) -> DocId {
     let inner = cx.concat(parts);
     let inner = cx.indent(inner);
     let inner = cx.indent(inner);
-    cx.group(inner)
+    let list = cx.group(inner);
+    cx.concat(std::iter::once(list).chain(after))
 }
 
 /// `Object`: the term, its reifiers and annotation blocks one space apart, then the `,`
@@ -271,6 +299,15 @@ mod tests {
         assert_eq!(
             stmt("?s ex:p 1 ; # one\n # two\n ex:q 2, # a\n 3 ."),
             "?s ex:p 1 ; # one\n  # two\n  ex:q\n      2, # a\n      3 ."
+        );
+        // a comment after the last object does not break its list
+        assert_eq!(
+            stmt("?s ex:a 1 ; ex:c 2, 3 # c\n ;\n ."),
+            "?s ex:a 1 ;\n  ex:c 2, 3 . # c"
+        );
+        assert_eq!(
+            stmt("?s ex:c 2, 3 # c\n ; ex:d 4"),
+            "?s ex:c 2, 3 ; # c\n  ex:d 4 ."
         );
     }
 
