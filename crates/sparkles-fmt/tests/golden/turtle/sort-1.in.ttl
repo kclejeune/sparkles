@@ -1,0 +1,25 @@
+# Sorting: sections are barriers, comments travel with their nodes
+
+@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# --- Things ---
+
+ex:zebra a ex:Animal ; rdfs:label "zebra"@en , "Zebra"@de , "zèbre"@fr ;
+  ex:legs 4 ; ex:eats ex:grass, ex:bark ; # mostly grass
+  ex:size [ ex:unit ex:metre ; ex:value 2.5 ] .
+ex:ant ex:legs 6 .
+
+# a blank node subject sorts by its printed form
+[ ex:value "1"^^xsd:integer ] ex:note "one" .
+<http://example.org/bee> ex:legs 6 ; a ex:Insect .
+
+# --- Lists keep their order ---
+
+ex:steps ex:order ( ex:three ex:one ex:two ) ;
+  ex:tags "b", "c", # c is second to last
+    "a" .
+# sparkles-fmt: ignore
+ex:kept   ex:as   "written" .
+ex:alpha ex:p ex:o .

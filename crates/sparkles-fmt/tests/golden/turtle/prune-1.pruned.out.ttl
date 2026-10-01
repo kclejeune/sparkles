@@ -1,0 +1,17 @@
+# Unused prefixes
+
+PREFIX ex: <http://example.org/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#> # kept: it has a comment
+
+# --- vocabularies for later ---
+
+ex:alice
+  a foaf:Person ;
+  foaf:age 42 ;
+  foaf:knows foaf:bob ;
+.
+
+PREFIX later: <http://example.org/later#>
+
+later:thing ex:p ex:o .

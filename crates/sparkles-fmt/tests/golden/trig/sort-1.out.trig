@@ -1,0 +1,29 @@
+PREFIX ex: <http://example.org/>
+
+GRAPH ex:g2 {
+  ex:b ex:p 2 .
+
+  ex:a
+    ex:p 1 ;
+    ex:o ex:x ;
+  .
+}
+
+# triples outside any block belong to the default graph
+ex:z ex:p 1 .
+
+GRAPH ex:g1 {
+  ex:c ex:p 3 .
+} # the first graph
+
+{
+  ex:d ex:p 4 .
+}
+
+ex:y ex:p 1 .
+
+# a section ends the run
+
+GRAPH ex:g0 {
+  ex:e ex:p 5 .
+}

@@ -4,8 +4,7 @@
 //! - every golden input of `tests/golden/{turtle,trig}` under the matrix of the keys that
 //!   act on Turtle: `directive-style` × `type-shorthand` × `compact-iris` ×
 //!   `quote-style` × `prefix-groups` (none, or `[["rdf", "rdfs", "xsd", "owl"]]`) × line
-//!   width (40, 100), 64 combinations. `sort`, `prune-prefixes` and `turtle-layout` join
-//!   when they act on Turtle;
+//!   width (40, 100) × `sort` × `prune-prefixes` × `turtle-layout`, 512 combinations;
 //! - with `SPARKLES_FMT_MATRIX=1`, every positive W3C Turtle and TriG test and every SHACL
 //!   file under the whole matrix (slow). The suites under the defaults and with every key
 //!   flipped are `w3c_turtle.rs`.
@@ -16,7 +15,7 @@
 mod corpus;
 
 use sparkles_fmt::turtle::Turtle;
-use sparkles_fmt::{DirectiveStyle, Language, Options, QuoteStyle, check, options};
+use sparkles_fmt::{DirectiveStyle, Language, Options, QuoteStyle, TurtleLayout, check, options};
 use std::path::Path;
 
 /// A named document and whether it is TriG.
@@ -27,7 +26,7 @@ type OptionSet = (String, Options);
 /// The Turtle matrix, each combination with a label for failure messages.
 fn turtle_matrix() -> Vec<OptionSet> {
     let mut v = Vec::new();
-    for bits in 0u32..64 {
+    for bits in 0u32..512 {
         let bit = |n: u32| bits & (1 << n) != 0;
         let o = Options {
             directive_style: match bit(0) {
@@ -50,18 +49,27 @@ fn turtle_matrix() -> Vec<OptionSet> {
                 false => Vec::new(),
             },
             line_width: if bit(5) { 40 } else { 100 },
+            sort: bit(6),
+            prune_prefixes: bit(7),
+            turtle_layout: match bit(8) {
+                true => TurtleLayout::Conventional,
+                false => TurtleLayout::Diff,
+            },
             ..Options::default()
         };
         options::validate(&o).expect("valid options");
         let label = format!(
             "directive-style={:?} type-shorthand={} compact-iris={} quote-style={:?} \
-             prefix-groups={:?} line-width={}",
+             prefix-groups={:?} line-width={} sort={} prune-prefixes={} turtle-layout={:?}",
             o.directive_style,
             o.type_shorthand,
             o.compact_iris,
             o.quote_style,
             o.prefix_groups,
-            o.line_width
+            o.line_width,
+            o.sort,
+            o.prune_prefixes,
+            o.turtle_layout
         );
         v.push((label, o));
     }
@@ -147,7 +155,7 @@ fn golden_inputs_under_the_matrix() {
     let docs = golden_inputs();
     assert!(docs.len() >= 5, "{} golden inputs", docs.len());
     let matrix = turtle_matrix();
-    assert_eq!(matrix.len(), 64);
+    assert_eq!(matrix.len(), 512);
     run(
         "Turtle and TriG golden inputs under the matrix",
         &docs,

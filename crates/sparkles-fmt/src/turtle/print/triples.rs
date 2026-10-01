@@ -35,7 +35,8 @@ use crate::lex::TokenKind;
 use crate::normalize;
 use crate::sparql::keywords::Kw;
 use crate::syntax::NodeKind;
-use crate::tree::{Element, NodeId};
+use crate::tree::{Element, NodeId, TokenId};
+use crate::trivia;
 use crate::turtle::sort::{self, Placed};
 
 /// Whether an entry ends with ` ;`.
@@ -135,8 +136,9 @@ fn statement_body(
         return (block(tx, n, subject, Some(lines), dot), true);
     }
     // the subject and the first entry on one line (unless a comment comes before the
-    // entry), the others one level deeper, then ` .`
-    let items = entry_docs(tx, &order, Semi::Never);
+    // entry), the others one level deeper, then ` .`; the last entry's trailing comment
+    // after it, where it trails the statement the next time
+    let (items, trailing) = entry_docs_detached(tx, &order);
     let (first, _, first_leading) = items[0];
     let head = match first_leading {
         true => {
@@ -157,18 +159,15 @@ fn statement_body(
     parts.push(tx.space());
     parts.push(dot_doc(tx));
     let doc = tx.concat(parts);
-    let multi = items.len() > 1 || first_leading || prints_on_lines(tx, doc, indent);
-    (doc, multi)
-}
-
-/// Whether `d`, printed at `indent` columns, takes more than one line.
-fn prints_on_lines(tx: &Tx<'_, '_>, d: DocId, indent: usize) -> bool {
-    let width = usize::from(tx.opts.line_width).saturating_sub(indent);
-    let width = u16::try_from(width).unwrap_or(u16::MAX);
-    match crate::doc::print(&tx.arena, d, tx.tree.src, width, tx.opts.indent_width, None) {
-        Ok(p) => p.text.contains(['\n', '\r']),
-        Err(_) => true,
-    }
+    // on one line when it all fits flat (a comment inside breaks it), as the flat
+    // statement the next time
+    let one_line = items.len() == 1
+        && !first_leading
+        && tx
+            .flat_width(doc)
+            .is_some_and(|(w, newline)| !newline && indent + w <= usize::from(tx.opts.line_width));
+    let doc = tx.concat(std::iter::once(doc).chain(trailing));
+    (doc, !one_line)
 }
 
 /// The entries of a subject block or a `[ … ]` or `{| … |}` block in printing order,
@@ -229,6 +228,61 @@ fn entry_docs(tx: &mut Tx<'_, '_>, order: &[Placed], last: Semi) -> Vec<(DocId, 
     items
 }
 
+/// [`entry_docs`] for the conventional layout: no ` ;` after the last entry, and its
+/// trailing comments apart, to print after the statement's ` .`.
+fn entry_docs_detached(
+    tx: &mut Tx<'_, '_>,
+    order: &[Placed],
+) -> (Vec<(DocId, bool, bool)>, Vec<DocId>) {
+    let (last, rest) = order.split_last().expect("entries");
+    let mut items = entry_docs(tx, rest, Semi::Always);
+    let opening = run_opening(tx, last);
+    let leading = opening.is_some() || tx.has_leading(last.node);
+    let body = entry_body(tx, last.node, Semi::Never);
+    let mut doc = wrap_leading(tx, last.node, body);
+    if let Some(o) = opening {
+        doc = tx.concat([o, doc]);
+    }
+    items.push((doc, last.blank, leading));
+    let trailing = tx
+        .comments
+        .trailing(last.node)
+        .iter()
+        .filter(|&&c| !tx.comments.copied(c))
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|c| {
+            let cx = &mut tx.cx;
+            trivia::trailing_comment(&mut cx.arena, cx.comments, c)
+        })
+        .collect();
+    (items, trailing)
+}
+
+/// `doc` with `n`'s detached and leading comments before it, as [`trivia::wrap`] does,
+/// without its trailing comments.
+fn wrap_leading(tx: &mut Tx<'_, '_>, n: NodeId, doc: DocId) -> DocId {
+    let comments = tx.comments;
+    let live = |c: &&TokenId| !comments.copied(**c);
+    let mut parts = Vec::new();
+    for block in comments.detached_before(n) {
+        let block: Vec<TokenId> = block.iter().filter(live).copied().collect();
+        if !block.is_empty() {
+            let cx = &mut tx.cx;
+            parts.push(trivia::comment_lines(&mut cx.arena, comments, &block));
+            parts.push(tx.empty_line());
+        }
+    }
+    for &c in comments.leading(n).iter().filter(live) {
+        let cx = &mut tx.cx;
+        parts.push(trivia::comment(&mut cx.arena, comments, c));
+        parts.push(tx.hard_line());
+    }
+    parts.push(doc);
+    tx.concat(parts)
+}
+
 /// The documents one per line, a blank line before those that ask for one; before the
 /// first only with `gap_first` (which also starts with its line break).
 fn join(tx: &mut Tx<'_, '_>, items: &[(DocId, bool, bool)], gap_first: bool) -> DocId {
@@ -278,6 +332,12 @@ fn block(tx: &mut Tx<'_, '_>, n: NodeId, open: DocId, lines: Option<DocId>, clos
 /// `PropertyListEntry`, with its comments: the verb (`a` for `rdf:type`), the object
 /// list, and ` ;` as `semi` says. A `;` is printed before the entry's trailing comment.
 pub fn entry(tx: &mut Tx<'_, '_>, n: NodeId, semi: Semi) -> DocId {
+    let doc = entry_body(tx, n, semi);
+    tx.wrap(n, doc)
+}
+
+/// [`entry`] without its comments.
+fn entry_body(tx: &mut Tx<'_, '_>, n: NodeId, semi: Semi) -> DocId {
     let source_semi = tx.child_token(n, TokenKind::Semicolon);
     let mut parts = Vec::new();
     if tx.comments.ignored(n) {
@@ -311,8 +371,7 @@ pub fn entry(tx: &mut Tx<'_, '_>, n: NodeId, semi: Semi) -> DocId {
             });
         }
     }
-    let doc = tx.concat(parts);
-    tx.wrap(n, doc)
+    tx.concat(parts)
 }
 
 /// The objects after a verb, starting with the space or line break after it: one object

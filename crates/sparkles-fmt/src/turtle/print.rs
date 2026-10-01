@@ -21,6 +21,7 @@
 //! the SPARQL printer's [`Ctx`] helpers (terms, normalizations, blocks, comments)
 //! through [`Tx`], which dispatches nodes to the Turtle printers instead.
 
+pub mod prune;
 pub mod triples;
 
 use super::sort::{self, Placed};
@@ -32,6 +33,7 @@ use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId, Tree};
 use crate::trivia::{self, CommentRules, Comments};
 use crate::{DirectiveStyle, FormatError, Options};
+use prune::Pruned;
 use std::ops::{Deref, DerefMut};
 use unicode_width::UnicodeWidthStr;
 
@@ -219,8 +221,9 @@ enum Part {
 
 /// A top-level part in printing order.
 enum Item {
-    /// consecutive directives; whether they are the leading block
-    Directives(Vec<NodeId>, bool),
+    /// consecutive directives; whether they are the leading block; what
+    /// `prune-prefixes` drops
+    Directives(Vec<NodeId>, bool, Pruned),
     /// a statement or a graph block
     Statement(Placed),
 }
@@ -241,34 +244,40 @@ fn document(tx: &mut Tx<'_, '_>, n: NodeId) -> DocId {
             (false, _) => parts_of.push(Part::Statement(c)),
         }
     }
+    // the statements between directive blocks, in printing order; a block that prints
+    // nothing (every declaration pruned) separates nothing
     let mut items = Vec::new();
-    let mut i = 0;
-    while i < parts_of.len() {
-        if let Part::Directives(ds) = &parts_of[i] {
-            items.push(Item::Directives(ds.clone(), i == 0));
-            i += 1;
-            continue;
+    let mut statements = Vec::new();
+    for (i, part) in parts_of.iter().enumerate() {
+        match part {
+            Part::Statement(s) => statements.push(*s),
+            Part::Directives(ds) => {
+                let pruned = prune::pruned(tx, ds, i == 0);
+                if pruned.prints_nothing(ds) {
+                    continue;
+                }
+                let order = statement_order(tx, &std::mem::take(&mut statements));
+                items.extend(order.into_iter().map(Item::Statement));
+                items.push(Item::Directives(ds.clone(), i == 0, pruned));
+            }
         }
-        let mut statements = Vec::new();
-        while let Some(&Part::Statement(s)) = parts_of.get(i) {
-            statements.push(s);
-            i += 1;
-        }
-        items.extend(
-            statement_order(tx, &statements)
-                .into_iter()
-                .map(Item::Statement),
-        );
     }
+    let order = statement_order(tx, &statements);
+    items.extend(order.into_iter().map(Item::Statement));
     let mut parts = Vec::new();
     parts.extend(tx.header());
     // (a directive block, prints on several lines)
     let mut prev: Option<(bool, bool)> = None;
     for item in &items {
         let (doc, blank_before, directives, multi) = match item {
-            Item::Directives(ds, leading) => {
+            Item::Directives(ds, leading, pruned) => {
                 let blank = tx.comments.blank_before(ds[0]);
-                (directive_block(tx, ds, *leading), blank, true, false)
+                (
+                    directive_block(tx, ds, *leading, pruned),
+                    blank,
+                    true,
+                    false,
+                )
             }
             Item::Statement(p) => {
                 let opening = run_opening(tx, p);
@@ -364,26 +373,43 @@ pub fn run_opening(tx: &mut Tx<'_, '_>, p: &Placed) -> Option<DocId> {
     }
 }
 
-/// Consecutive directives, one per line. The leading block (`sorted`) puts `VERSION`
-/// first and sorts, deduplicates and groups each run of `PREFIX` declarations as
-/// `prefix-groups` says (a run that binds a label twice stays as written); a `BASE`, a
-/// `VERSION` or a detached comment block ends a run, and without groups a blank line
-/// does too. Later blocks are printed as written, their blank lines kept.
-fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool) -> DocId {
+/// Consecutive directives, one per line, without those `pruned` drops (their detached
+/// comment blocks and blank lines pass on to the next item). The leading block
+/// (`sorted`) puts `VERSION` first and sorts, deduplicates and groups each run of
+/// `PREFIX` declarations as `prefix-groups` says (a run that binds a label twice stays as
+/// written); a `BASE`, a `VERSION` or a detached comment block ends a run, and without
+/// groups a blank line does too. Later blocks are printed as written, their blank lines
+/// kept.
+fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool, pruned: &Pruned) -> DocId {
     // (node, its document, whether a blank line goes before it)
     let mut items: Vec<(NodeId, DocId, bool)> = Vec::new();
+    // an item after dropped declarations: their detached blocks first
+    let passed = |tx: &mut Tx<'_, '_>, d: NodeId| -> (Vec<DocId>, bool) {
+        let blocks = pruned.blocks.get(&d).map_or(&[][..], Vec::as_slice);
+        let parts = prune::comment_blocks(tx, blocks);
+        (
+            parts,
+            tx.comments.blank_before(d) || pruned.blank.contains(&d),
+        )
+    };
     if !sorted {
         for &d in decls {
-            let doc = node(tx, d);
-            items.push((d, doc, tx.comments.blank_before(d)));
+            if pruned.nodes.contains(&d) {
+                continue;
+            }
+            let (mut parts, blank) = passed(tx, d);
+            parts.push(node(tx, d));
+            let doc = tx.concat(parts);
+            items.push((d, doc, blank));
         }
+        end_blocks(tx, pruned, &mut items);
         return lines(tx, &items);
     }
     let (versions, rest): (Vec<NodeId>, Vec<NodeId>) = decls
         .iter()
         .partition(|&&d| tx.tree.kind(d) == NodeKind::VersionDecl);
 
-    // the prefix declarations, for the run planning
+    // the prefix declarations that are printed, for the run planning
     let mut prefixes: Vec<PrefixDecl> = Vec::new();
     let mut after_other = false;
     for (i, &d) in decls.iter().enumerate() {
@@ -391,15 +417,20 @@ fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool) -> DocId
             after_other = i > 0;
             continue;
         }
-        let (label, iri) = prefix_parts(tx, d);
+        if pruned.nodes.contains(&d) {
+            continue;
+        }
+        let (label, iri) = prune::prefix_parts(tx, d);
         prefixes.push(PrefixDecl {
             node: d,
             label,
             iri,
             // a detached block stays at the start of the run, so it does not count
             has_comments: !tx.comments.leading(d).is_empty() || !tx.comments.trailing(d).is_empty(),
-            barrier_before: after_other || !tx.comments.detached_before(d).is_empty(),
-            blank_before: tx.comments.blank_before(d),
+            barrier_before: after_other
+                || !tx.comments.detached_before(d).is_empty()
+                || pruned.blocks.contains_key(&d),
+            blank_before: tx.comments.blank_before(d) || pruned.blank.contains(&d),
         });
         after_other = false;
     }
@@ -413,8 +444,10 @@ fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool) -> DocId
     let mut runs = runs.into_iter();
     for &d in &rest {
         if tx.tree.kind(d) != NodeKind::PrefixDecl {
-            let doc = node(tx, d);
-            items.push((d, doc, tx.comments.blank_before(d)));
+            let (mut parts, blank) = passed(tx, d);
+            parts.push(node(tx, d));
+            let doc = tx.concat(parts);
+            items.push((d, doc, blank));
             continue;
         }
         if prefixes.get(next_prefix).map(|p| p.node) != Some(d) {
@@ -423,17 +456,12 @@ fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool) -> DocId
         let Some(run) = runs.next() else { continue };
         let len = run.order.len() + run.drop.len();
         // the run starts where its first declaration was written, and the detached
-        // comment blocks before it (a section header) stay there, whatever moves first
-        let lead_blank = tx.comments.blank_before(d);
-        let mut detached = Vec::new();
-        for block in tx.comments.detached_before(d).to_vec() {
-            for &c in &block {
-                tx.comments.mark_printed(c);
-            }
-            let cx = &mut tx.cx;
-            detached.push(trivia::comment_lines(&mut cx.arena, cx.comments, &block));
-            detached.push(tx.empty_line());
-        }
+        // comment blocks before it (a section header, and those of the dropped
+        // declarations before it) stay there, whatever moves first
+        let lead_blank = prefixes[next_prefix].blank_before;
+        let mut blocks = pruned.blocks.get(&d).cloned().unwrap_or_default();
+        blocks.extend(tx.comments.detached_before(d).iter().cloned());
+        let mut detached = prune::comment_blocks(tx, &blocks);
         for (k, &i) in run.order.iter().enumerate() {
             let decl = prefixes[i].node;
             let mut doc = node(tx, decl);
@@ -450,7 +478,21 @@ fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool) -> DocId
         }
         next_prefix += len;
     }
+    end_blocks(tx, pruned, &mut items);
     lines(tx, &items)
+}
+
+/// The detached blocks of dropped declarations with no item after them, as the block's
+/// last item.
+fn end_blocks(tx: &mut Tx<'_, '_>, pruned: &Pruned, items: &mut Vec<(NodeId, DocId, bool)>) {
+    if pruned.end_blocks.is_empty() {
+        return;
+    }
+    let mut parts = prune::comment_blocks(tx, &pruned.end_blocks);
+    parts.pop();
+    let doc = tx.concat(parts);
+    let root = tx.tree.root();
+    items.push((root, doc, true));
 }
 
 /// The documents one per line, a blank line before those that ask for one (never before
@@ -467,22 +509,6 @@ fn lines(tx: &mut Tx<'_, '_>, items: &[(NodeId, DocId, bool)]) -> DocId {
         parts.push(doc);
     }
     tx.concat(parts)
-}
-
-/// A `PREFIX` declaration's label (without `:`) and namespace (without `<` `>`).
-fn prefix_parts(tx: &Tx<'_, '_>, d: NodeId) -> (String, String) {
-    let (mut label, mut iri) = (String::new(), String::new());
-    for e in tx.tree.children(d) {
-        if let Element::Token(t) = *e {
-            let text = tx.tree.token_text(t);
-            match tx.tree.token_kind(t) {
-                TokenKind::PnameNs => label = text.strip_suffix(':').unwrap_or(text).to_string(),
-                TokenKind::IriRef => iri = text[1..text.len() - 1].to_string(),
-                _ => {}
-            }
-        }
-    }
-    (label, iri)
 }
 
 /// `PrefixDecl`, `BaseDecl`, `VersionDecl` in the `directive-style` family: `PREFIX ex:

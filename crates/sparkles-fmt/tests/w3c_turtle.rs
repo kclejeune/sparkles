@@ -4,11 +4,12 @@
 //! - every positive syntax test and every evaluation input formats, passes the safety
 //!   checks (graph, comments, idempotence) and is a fixpoint (`format(out) == out`),
 //!   under the default options, with every style key that acts on Turtle flipped, and
-//!   with the keys that reorder or re-lay statements (`sort`, `turtle-layout`) on top;
+//!   with the keys that reorder, re-lay or drop (`sort`, `turtle-layout`,
+//!   `prune-prefixes`) on top;
 //! - every negative syntax and negative evaluation test is a positioned syntax error;
 //! - every SHACL shapes or data graph formats the same way;
 //! - a comment after any token of those inputs keeps formatting safe (comment sweeps),
-//!   sorted in both layouts too;
+//!   sorted in both layouts (and pruned) too;
 //! - nothing panics.
 //!
 //! Exceptions are listed with a reason in `tests/fmt-known-failures.txt` (the path under
@@ -67,8 +68,11 @@ fn option_sets() -> Vec<(&'static str, Options)> {
             reordered(Options::default(), false, Conventional),
         ),
         (
-            "with every key flipped, sorted and conventional",
-            reordered(flipped(), true, Conventional),
+            "with every key flipped, sorted, pruned and conventional",
+            Options {
+                prune_prefixes: true,
+                ..reordered(flipped(), true, Conventional)
+            },
         ),
     ]
 }
@@ -272,7 +276,10 @@ fn sweep(name: &str, text: &str, trig: bool, step: usize) -> Result<usize, Strin
     let sets = [
         Options::default(),
         reordered(Options::default(), true, TurtleLayout::Diff),
-        reordered(Options::default(), true, TurtleLayout::Conventional),
+        Options {
+            prune_prefixes: true,
+            ..reordered(Options::default(), true, TurtleLayout::Conventional)
+        },
     ];
     let mut formatted = 0;
     for &end in ends.iter().step_by(step) {
@@ -299,7 +306,8 @@ fn sweep(name: &str, text: &str, trig: bool, step: usize) -> Result<usize, Strin
 
 /// Comment sweeps: a trailing comment, and a comment on a line of its own, after every
 /// significant token of the golden inputs and the W3C inputs (every few tokens of the
-/// SHACL files), under the defaults and sorted in both layouts: no comment
+/// SHACL files), under the defaults and sorted in both layouts (pruned in the
+/// conventional one): no comment
 /// is lost or moves twice.
 #[test]
 fn comment_sweeps() {

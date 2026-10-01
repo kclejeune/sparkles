@@ -305,6 +305,19 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_act_without_warnings() {
+        let opts = Options {
+            sort: true,
+            prune_prefixes: true,
+            turtle_layout: TurtleLayout::Conventional,
+            ..Options::default()
+        };
+        for lang in [crate::Language::Turtle, crate::Language::TriG] {
+            assert_eq!(crate::option_warnings(&opts, lang), Vec::new());
+        }
+    }
+
+    #[test]
     fn with_the_conventional_layout() {
         let opts = Options {
             sort: true,
