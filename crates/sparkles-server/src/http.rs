@@ -26,6 +26,7 @@ use std::time::Duration;
 mod format;
 mod history;
 mod schema;
+mod shex;
 mod stream;
 mod validation;
 
@@ -108,6 +109,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
+        .route("/{ds}/shex", post(shex::shex))
         .route("/$/vector/{ds}", get(vector_status))
         .route("/{ds}/prefixes", any(dataset_prefixes))
         .route(
@@ -2091,6 +2093,10 @@ fn dataset_info(ds: &Dataset) -> J {
     {
         endpoints["shacl"] = format!("/{n}/shacl").into();
     }
+    #[cfg(feature = "shex")]
+    {
+        endpoints["shex"] = format!("/{n}/shex").into();
+    }
     let head = ds.store.head_commit();
     let mut info = json!({
         "name": n,
@@ -3035,7 +3041,8 @@ async fn shacl(
     headers: HeaderMap,
     QueryBody(body): QueryBody,
 ) -> ApiResult {
-    use crate::shacl::{DataGraph, ReportFormat};
+    use crate::shacl::ReportFormat;
+    use crate::validation_common::GraphParam;
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let ct = content_type(&headers);
@@ -3046,7 +3053,7 @@ async fn shacl(
         "text/plain" => RdfFormat::Turtle,
         ct => sparkles::io::format_for_media_type(ct).unwrap_or(RdfFormat::Turtle),
     };
-    let graph = DataGraph::parse(params.get("graph").unwrap_or("default"))
+    let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let rfmt = match params.get("format") {
         Some(f) => ReportFormat::from_name(f).ok_or_else(|| {
@@ -3071,7 +3078,7 @@ async fn shacl(
     // a client that disconnects stops the validation at its next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     let max_bytes = st.limits.max_result_bytes;
-    let max_results = crate::shacl::max_results(&st.limits);
+    let max_results = crate::validation_common::max_results(&st.limits);
     let too_large = move |requested: u64| -> ApiError {
         Error::BudgetExceeded(sparkles::Budget {
             kind: BudgetKind::ResultBytes,
@@ -3086,8 +3093,8 @@ async fn shacl(
         let shapes = sparkles_shacl::Shapes::parse(text, format, None)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
         let snap = ds.store.snapshot();
-        if let DataGraph::Named(iri) = &graph
-            && !crate::shacl::graph_exists(&snap, iri)
+        if let GraphParam::Named(iri) = &graph
+            && !crate::validation_common::graph_exists(&snap, iri)
         {
             return Err(err(
                 StatusCode::NOT_FOUND,
@@ -3099,14 +3106,16 @@ async fn shacl(
         opts.timeout = Some(timeout);
         opts.cancel = Some(cancel);
         opts.max_results = max_results;
-        opts.pool = crate::shacl::pool();
+        opts.pool = crate::validation_common::validation_pool();
         let t = std::time::Instant::now();
         let _validate = tracing::info_span!("shacl.validate").entered();
         let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
             let msg = format!("{e:#}");
             if let Some(r) = e.downcast_ref::<sparkles_shacl::TooManyResults>() {
                 // the report would be at least this large
-                return too_large((r.limit as u64 + 1) * crate::shacl::MIN_RESULT_BYTES);
+                return too_large(
+                    (r.limit as u64 + 1) * crate::validation_common::MIN_RESULT_BYTES,
+                );
             }
             match e.downcast::<Error>() {
                 Ok(e) => ApiError::from(e),

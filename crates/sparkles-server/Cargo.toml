@@ -13,6 +13,7 @@ path = "src/main.rs"
 sparkles = { workspace = true, features = ["zstd", "brotli"] }
 sparkles-reasoner = { workspace = true, optional = true }
 sparkles-shacl = { workspace = true, optional = true }
+sparkles-shex = { workspace = true, optional = true }
 oxrdf.workspace = true
 oxrdfio.workspace = true
 spargebra.workspace = true
@@ -86,11 +87,13 @@ aws-lc-rs = "1"
 sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 
 [features]
-default = ["reasoning", "shacl", "mimalloc", "text", "otel", "auth", "mcp", "backup", "fmt"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "otel", "auth", "mcp", "backup", "fmt"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
 shacl = ["dep:sparkles-shacl"]
+# ShEx validation (`/{ds}/shex`, `sparkles shex`)
+shex = ["dep:sparkles-shex"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
 # authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)

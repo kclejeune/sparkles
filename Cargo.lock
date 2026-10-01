@@ -3449,6 +3449,7 @@ dependencies = [
  "sparkles-fmt",
  "sparkles-reasoner",
  "sparkles-shacl",
+ "sparkles-shex",
  "subtle",
  "tempfile",
  "tokio",
