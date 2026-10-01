@@ -21,6 +21,7 @@ use super::GeomRef;
 use super::config::GeoConfig;
 use super::exec::{Counters, config, graph_iri, state};
 use super::geom::Geom;
+use super::join::JoinItem;
 use super::memo::{MemoKey, max_vertices, parse_value};
 use super::ops::relate::{self, Prepared};
 use super::search::{self, SearchStats};
@@ -29,6 +30,7 @@ use crate::error::Result;
 use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::sparql::ctx::Ctx;
+use crate::sparql::geojoin::JoinTest;
 use crate::sparql::georewrite::{RelateEnd, SpatialRelateSpec};
 use crate::sparql::table::{Table, VarId};
 use crate::store::Chunk;
@@ -745,9 +747,10 @@ impl ConstTest {
 }
 
 /// The pairs `(i, j)` of `items` with `R(items[i], items[j])`. A relation that needs
-/// the geometries to meet tests the pairs whose envelopes meet (a sweep over the
-/// envelopes sorted by their west edge) and every pair with a geometry that has no
-/// envelope in longitude and latitude; a disjoint relation tests every pair.
+/// the geometries to meet tests the pairs of geometries with an envelope through the
+/// spatial join's kernel ([`super::join::pairs`]: those whose envelopes meet), and every
+/// pair with a geometry that has no envelope in longitude and latitude; a disjoint
+/// relation tests every pair.
 fn literal_pairs(
     ctx: &Ctx,
     rel: Relation,
@@ -756,89 +759,88 @@ fn literal_pairs(
     st: &mut SearchStats,
 ) -> Result<Vec<(u32, u32)>> {
     let n = items.len();
-    // outer item → the items it is tested against (both orders when `both`)
-    let (order, others): (Vec<usize>, Vec<usize>) = if rel.index_usable() {
-        let mut boxed: Vec<usize> = (0..n).filter(|&i| items[i].bbox.is_some()).collect();
-        boxed.sort_by(|&a, &b| {
-            let (x, y) = (items[a].bbox.unwrap(), items[b].bbox.unwrap());
-            x[0].total_cmp(&y[0]).then(a.cmp(&b))
-        });
-        // an empty geometry meets nothing
-        let loose: Vec<usize> = (0..n)
-            .filter(|&i| items[i].bbox.is_none() && !items[i].geom.empty)
-            .collect();
-        (boxed, loose)
-    } else {
-        ((0..n).collect(), Vec::new())
-    };
-    let disjoint = !rel.index_usable();
-    // pairs of position `k` in `order` with later positions (and itself), both orders
-    let run = |ks: std::ops::Range<usize>| -> Result<(Vec<(u32, u32)>, u64)> {
-        let mut out = Vec::new();
-        let mut tests = 0u64;
-        for k in ks {
-            ctx.check()?;
-            let i = order[k];
-            let a = &items[i];
-            let mut cands: Vec<usize> = Vec::new();
-            if disjoint {
-                cands.extend(order[k..].iter().copied());
-            } else {
-                let b = a.bbox.expect("boxed");
-                for &j in &order[k..] {
-                    let c = items[j].bbox.expect("boxed");
-                    if c[0] > b[2] {
-                        break;
-                    }
-                    if meets(b, c) {
-                        cands.push(j);
-                    }
-                }
-            }
-            let prep = (cands.len() > PREPARE_OVER).then(|| Prepared::new(a.geom.clone()));
-            for j in cands {
-                let b = &items[j];
-                tests += 1;
-                let fwd = match &prep {
-                    Some(p)
-                        if u64::from(a.geom.vertices) + u64::from(b.geom.vertices)
-                            <= op_vertices =>
-                    {
-                        p.relation(&b.geom, rel).unwrap_or(false)
-                    }
-                    Some(_) => false,
-                    None => relation(&a.geom, &b.geom, rel, op_vertices),
-                };
-                if fwd {
-                    out.push((i as u32, j as u32));
-                }
-                if i != j {
-                    tests += 1;
-                    if relation(&b.geom, &a.geom, rel, op_vertices) {
-                        out.push((j as u32, i as u32));
-                    }
-                }
-            }
-        }
-        Ok((out, tests))
-    };
-    let chunk = 64usize;
-    let ranges: Vec<std::ops::Range<usize>> = (0..order.len())
-        .step_by(chunk)
-        .map(|s| s..(s + chunk).min(order.len()))
-        .collect();
     let mut pairs = Vec::new();
     let mut tests = 0u64;
-    // the disjoint relations hold for most pairs: stop at the row budget
-    for batch in ranges.chunks(rayon::current_num_threads().max(1) * 4) {
-        let parts: Vec<(Vec<(u32, u32)>, u64)> =
-            batch.par_iter().cloned().map(run).collect::<Result<_>>()?;
-        for (p, t) in parts {
-            pairs.extend(p);
-            tests += t;
+    let others: Vec<usize> = if rel.index_usable() {
+        // both orders of every pair, and each geometry with itself
+        let boxed: Vec<JoinItem> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                Some(JoinItem {
+                    row: i as u32,
+                    id: it.lit,
+                    bbox84: it.bbox?,
+                    geom: it.geom.clone(),
+                })
+            })
+            .collect();
+        super::join::pairs(
+            ctx,
+            &boxed,
+            &boxed,
+            &JoinTest::Relation(rel),
+            st,
+            &mut |p| {
+                pairs.extend_from_slice(p);
+                ctx.check_rows(pairs.len())
+            },
+        )?;
+        // an empty geometry meets nothing
+        (0..n)
+            .filter(|&i| items[i].bbox.is_none() && !items[i].geom.empty)
+            .collect()
+    } else {
+        // every pair `(i, j)` with `i <= j`, both orders
+        let run = |ks: std::ops::Range<usize>| -> Result<(Vec<(u32, u32)>, u64)> {
+            let mut out = Vec::new();
+            let mut tests = 0u64;
+            for i in ks {
+                ctx.check()?;
+                let a = &items[i];
+                let prep = (n - i > PREPARE_OVER).then(|| Prepared::new(a.geom.clone()));
+                for (j, b) in items.iter().enumerate().skip(i) {
+                    tests += 1;
+                    let fwd = match &prep {
+                        Some(p)
+                            if u64::from(a.geom.vertices) + u64::from(b.geom.vertices)
+                                <= op_vertices =>
+                        {
+                            p.relation(&b.geom, rel).unwrap_or(false)
+                        }
+                        Some(_) => false,
+                        None => relation(&a.geom, &b.geom, rel, op_vertices),
+                    };
+                    if fwd {
+                        out.push((i as u32, j as u32));
+                    }
+                    if i != j {
+                        tests += 1;
+                        if relation(&b.geom, &a.geom, rel, op_vertices) {
+                            out.push((j as u32, i as u32));
+                        }
+                    }
+                }
+            }
+            Ok((out, tests))
+        };
+        let chunk = 64usize;
+        let ranges: Vec<std::ops::Range<usize>> = (0..n)
+            .step_by(chunk)
+            .map(|s| s..(s + chunk).min(n))
+            .collect();
+        // the disjoint relations hold for most pairs: stop at the row budget
+        for batch in ranges.chunks(rayon::current_num_threads().max(1) * 4) {
+            let parts: Vec<(Vec<(u32, u32)>, u64)> =
+                batch.par_iter().cloned().map(run).collect::<Result<_>>()?;
+            for (p, t) in parts {
+                pairs.extend(p);
+                tests += t;
+            }
+            ctx.check_rows(pairs.len())?;
         }
-        ctx.check_rows(pairs.len())?;
-    }
+        Vec::new()
+    };
     // geometries without an envelope: against every geometry, both orders
     for (n_done, &i) in others.iter().enumerate() {
         if n_done % CHECK_EVERY == 0 {
