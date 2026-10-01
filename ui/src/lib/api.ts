@@ -1321,7 +1321,7 @@ export type GeoConfig = {
   graphs?: { include?: 'all' | string[]; exclude?: string[] };
   /** Not supported yet. */
   wgs84?: boolean;
-  /** Not supported yet. */
+  /** Default false: the topological geo: properties also match derived triples (query rewrite). */
   queryRewrite?: boolean;
   /** Default "geodesic". */
   distance?: 'geodesic' | 'haversine';

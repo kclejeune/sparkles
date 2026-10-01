@@ -387,7 +387,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` (zstd level 3; gzip, `.nq.gz`, in a build without zstd). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it, so `compression=gzip` gives Fuseki's `.nq.gz`; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
+| POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }` (a form takes `vocabulary` repeated and `geoDefaultGeometry`; see [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment)), or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile, rules and extras (`409` when nothing is recorded). `400` for an unknown profile or vocabulary. Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drop materialized inferences. |
@@ -1589,7 +1589,7 @@ type GeoConfig = {
   maxGeometryBytes?: number;    // default 16 MiB: longer literals are not indexed
   maxVertices?: number;         // default 1000000 per geometry: not indexed, and a type error in functions
   wgs84?: boolean;              // W3C Basic Geo lat/long pairs as points (default false)
-  queryRewrite?: boolean;       // not supported yet (true: 400)
+  queryRewrite?: boolean;       // default false: match the topological geo: properties against geometries too
   formatVersion?: 1;
 };
 type GeoStatus = {
@@ -1764,6 +1764,69 @@ pairs that passed) and `indexProbes` for a join, `batches` (runs of the group) a
 optimizations (`QueryOptions::optimizations`, `SPARKLES_DISABLE_OPTIMIZATIONS`), on by
 default.
 
+### Query rewrite, `spatial:equals` and RDFS entailment
+
+**Query rewrite** (GeoSPARQL's Query Rewrite Extension) is off by default and switched on
+per dataset with `"queryRewrite": true` in the spatial index configuration (`PUT
+/$/geo/{ds}`); `sparkles serve --no-geo-rewrite` switches it off for the whole server
+whatever the datasets say (`GET /$/geo/{ds}` shows the effective value). With it, a
+triple pattern whose predicate is one of the 24 topological properties (`geo:sfWithin`,
+`geo:ehMeet`, `geo:rcc8po`, …) matches the asserted triples and the derived ones, as one
+set:
+
+```sparql
+SELECT ?x WHERE { ?x geo:sfContains ex:g1 }   # features and geometries containing ex:g1
+```
+
+* `so1 geo:R so2` is derived when some geometry literal of `so1` and some of `so2`
+  satisfy `geof:R`, computed as the function computes it. A feature's literals are those
+  of its `geo:hasDefaultGeometry` (not `geo:hasGeometry`), a geometry's are its
+  serializations (the index's `predicates`), and a geometry literal written in the query
+  is itself. So a feature relates to its own geometry, a point contains itself, and
+  `?x geo:sfWithin ex:region` returns features and geometries alike (add `?x a
+  geo:Feature` to keep the features).
+* Variables bind features and geometries, never literals. The literals are those the
+  spatial index covers: the configured predicates, in graphs of its scope. Literals it
+  leaves out still count where the function says so: an empty geometry is
+  `sfDisjoint` from everything, and two literals in the same unknown CRS can be equal.
+* Under `GRAPH ?g` both ends' serializations and the feature links are in the graph `?g`
+  binds; in a merged default graph (`reasoning=true`, `default-graph-uri`) any of its
+  graphs. A predicate variable (`ex:a ?p ex:b`) matches asserted triples only.
+* One constant end searches the index around each of its literals (or reads every
+  literal while the index is not ready, with the same answers); two variable ends pair
+  every literal with those whose envelope meets it; the disjoint relations
+  (`sfDisjoint`, `ehDisjoint`, `rcc8dc`) test every pair, within the query's row limit
+  (`507` beyond it).
+* EXPLAIN shows `SpatialRelate ?x geo:sfContains <…g1> [asserted ∪ derived]` with the
+  spatial counters, `asserted` (asserted triples) and `pairs` (literal pairs that hold).
+
+**`spatial:equals`** (Jena) is always available, with or without query rewrite or an
+index: `?f spatial:equals ex:A` derives `sfEquals` between features, geometries and
+geometry literals in the same way, and never matches asserted triples.
+
+**RDFS entailment** of the GeoSPARQL vocabulary: `sparkles infer --loc DB --profile rdfs
+--vocab geosparql` (or `POST /$/reason/{ds}` with `"vocabularies": ["geosparql"]`) adds
+the GeoSPARQL 1.1 and Simple Features class and property axioms to the profile's rules:
+`sf:Polygon ⊑ sf:Surface ⊑ sf:Geometry ⊑ geo:Geometry`, `geo:asWKT ⊑
+geo:hasSerialization`, `geo:hasDefaultGeometry ⊑ geo:hasGeometry`, the domains and ranges
+of the feature, geometry and topological properties. The axioms are written for Sparkles
+from the standard (no OGC file is shipped). They and what the rules derive from them land
+in `urn:x-sparkles:inferred`, never in the data's graphs; queries see them with
+`reasoning=true` as other inferences:
+
+```sparql
+SELECT ?g WHERE { ?g a geo:Geometry }          # ex:gA, given ex:gA a sf:Polygon
+```
+
+**Default geometries.** Query rewrite follows `geo:hasDefaultGeometry` only. `sparkles
+infer --geo-default-geometry` (`"geoDefaultGeometry": true`) materializes `F
+geo:hasDefaultGeometry G` for every feature `F` with exactly one `geo:hasGeometry` (`G`)
+and no `geo:hasDefaultGeometry`, as Jena's `applyDefaultGeometry`. It runs with the
+profile (`rdfs` unless given), whose rules see these triples, and writes them to the
+inferred graph, so a re-run recomputes them and clearing the inferences removes them.
+The reasoning status records both (`vocabularies`, `geoDefaultGeometry`) and re-runs,
+manual or automatic, repeat them.
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.
@@ -1785,6 +1848,8 @@ type ReasoningStatus = {
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
   auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
+  vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
+  geoDefaultGeometry?: true;   // default geometries were materialized
 };
 ```
 
