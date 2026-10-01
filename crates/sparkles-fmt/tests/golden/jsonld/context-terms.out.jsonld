@@ -1,0 +1,43 @@
+{
+  "@context": [
+    {
+      "schema": "http://schema.org/",
+      "ex": "http://example.org/"
+    },
+    {
+      "@vocab": "http://example.org/vocab#",
+      "@type": {
+        "@container": "@set",
+        "@protected": true
+      },
+      "member": {
+        "@id": "ex:member",
+        "@type": "@id",
+        "@container": "@list"
+      },
+      "child": {
+        "@reverse": "ex:parent",
+        "@type": "@id"
+      },
+      "Event": {
+        "@id": "ex:Event",
+        "@context": {
+          "@vocab": "http://example.org/event#",
+          "when": "ex:when"
+        }
+      },
+      "label": {
+        "@id": "ex:label",
+        "@nest": "meta",
+        "@prefix": false,
+        "@protected": true
+      },
+      "meta": "@nest"
+    }
+  ],
+  "@id": "ex:x",
+  "@type": "Event",
+  "when": "today",
+  "member": ["ex:a", "ex:b"],
+  "meta": { "label": "nested" }
+}

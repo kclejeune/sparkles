@@ -72,10 +72,13 @@ pub struct Optimizations {
     pub spatial_join: bool,
     /// ORDER BY a distance to a constant with LIMIT searches the nearest geometries
     pub spatial_knn: bool,
+    /// pure expressions over one variable (FILTER, BIND, ORDER BY keys, aggregate
+    /// arguments) are evaluated once per distinct value
+    pub expr_cache: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 14] = [
+    pub const NAMES: [&str; 15] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -90,6 +93,7 @@ impl Optimizations {
         "star_fusion",
         "spatial_join",
         "spatial_knn",
+        "expr_cache",
     ];
 
     /// Everything on.
@@ -108,6 +112,7 @@ impl Optimizations {
         star_fusion: true,
         spatial_join: true,
         spatial_knn: true,
+        expr_cache: true,
     };
 
     /// Everything off: the generic operators only.
@@ -126,6 +131,7 @@ impl Optimizations {
         star_fusion: false,
         spatial_join: false,
         spatial_knn: false,
+        expr_cache: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -144,6 +150,7 @@ impl Optimizations {
             "star_fusion" => &mut self.star_fusion,
             "spatial_join" => &mut self.spatial_join,
             "spatial_knn" => &mut self.spatial_knn,
+            "expr_cache" => &mut self.expr_cache,
             _ => return None,
         })
     }

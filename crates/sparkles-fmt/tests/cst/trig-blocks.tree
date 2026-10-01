@@ -1,0 +1,80 @@
+TrigDoc
+  PrefixDecl
+    Kw(Prefix) "PREFIX"
+    PnameNs "ex:"
+    IriRef "<http://example.org/>"
+  GraphBlock
+    PnameLn "ex:g1"
+    LBrace "{"
+    TriplesStmt
+      PnameLn "ex:a"
+      PropertyListEntry
+        PnameLn "ex:b"
+        Object
+          PnameLn "ex:c"
+      Dot "."
+    TriplesStmt
+      PnameLn "ex:d"
+      PropertyListEntry
+        PnameLn "ex:e"
+        Object
+          PnameLn "ex:f"
+    RBrace "}"
+  GraphBlock
+    Kw(Graph) "graph"
+    PnameLn "ex:g2"
+    LBrace "{"
+    TriplesStmt
+      PnameLn "ex:a"
+      PropertyListEntry
+        PnameLn "ex:b"
+        Object
+          PnameLn "ex:c"
+      Dot "."
+    RBrace "}"
+  GraphBlock
+    Kw(Graph) "GRAPH"
+    BlankNodeLabel "_:g3"
+    LBrace "{"
+    RBrace "}"
+  GraphBlock
+    Anon "[]"
+    LBrace "{"
+    TriplesStmt
+      PnameLn "ex:a"
+      PropertyListEntry
+        PnameLn "ex:b"
+        Object
+          BNodePropertyList
+            LBracket "["
+            PropertyListEntry
+              PnameLn "ex:c"
+              Object
+                PnameLn "ex:d"
+            RBracket "]"
+    RBrace "}"
+  GraphBlock
+    LBrace "{"
+    TriplesStmt
+      PnameLn "ex:a"
+      PropertyListEntry
+        PnameLn "ex:b"
+        Object
+          PnameLn "ex:c"
+    RBrace "}"
+  TriplesStmt
+    PnameLn "ex:a"
+    PropertyListEntry
+      PnameLn "ex:b"
+      Object
+        PnameLn "ex:c"
+    Dot "."
+  TriplesStmt
+    BNodePropertyList
+      LBracket "["
+      PropertyListEntry
+        PnameLn "ex:p"
+        Object
+          PnameLn "ex:o"
+      RBracket "]"
+    Dot "."

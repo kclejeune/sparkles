@@ -1,0 +1,10 @@
+# the two directive families, mixed
+@prefix ex: <http://example.org/> .
+prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+@base <http://example.org/base/> .
+BASE <http://example.org/other/>
+VERSION "1.2"
+@version '1.2' .
+PREFIX : <http://example.org/empty#>
+
+:a ex:p <relative> .
