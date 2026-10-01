@@ -3485,6 +3485,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-shex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "oxrdfio",
+ "oxsdatatypes",
+ "oxttl",
+ "proptest",
+ "rayon",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "sparkles",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
