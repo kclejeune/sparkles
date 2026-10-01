@@ -17,7 +17,11 @@ mod validate;
 pub mod vocab;
 
 #[cfg(feature = "geo")]
+pub mod aggregates;
+#[cfg(feature = "geo")]
 pub mod column;
+#[cfg(feature = "geo")]
+pub mod convert;
 #[cfg(feature = "geo")]
 pub mod exec;
 #[cfg(feature = "geo")]
@@ -27,15 +31,29 @@ pub mod geom;
 #[cfg(feature = "geo")]
 pub mod index;
 #[cfg(feature = "geo")]
+pub mod join;
+#[cfg(feature = "geo")]
+pub mod knn;
+#[cfg(feature = "geo")]
+pub mod map;
+#[cfg(feature = "geo")]
 pub mod memo;
 #[cfg(feature = "geo")]
 pub mod ops;
 #[cfg(feature = "geo")]
 pub mod parse;
 #[cfg(feature = "geo")]
+pub mod persist;
+#[cfg(feature = "geo")]
 pub mod probe;
 #[cfg(feature = "geo")]
+pub mod rewrite;
+#[cfg(feature = "geo")]
 pub mod search;
+#[cfg(feature = "geo")]
+pub mod spatialf;
+#[cfg(feature = "geo")]
+pub(crate) mod tree;
 #[cfg(feature = "geo")]
 pub mod write;
 

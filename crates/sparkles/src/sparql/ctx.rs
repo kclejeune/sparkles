@@ -68,10 +68,14 @@ pub struct Optimizations {
     /// index joins on one subject over constant predicates are read together, walking
     /// each subject's run once when that touches fewer blocks
     pub star_fusion: bool,
+    /// a spatial FILTER between the geometries of two join components joins them
+    pub spatial_join: bool,
+    /// ORDER BY a distance to a constant with LIMIT searches the nearest geometries
+    pub spatial_knn: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 12] = [
+    pub const NAMES: [&str; 14] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -84,6 +88,8 @@ impl Optimizations {
         "decorrelate_exists",
         "batched_join",
         "star_fusion",
+        "spatial_join",
+        "spatial_knn",
     ];
 
     /// Everything on.
@@ -100,6 +106,8 @@ impl Optimizations {
         decorrelate_exists: true,
         batched_join: true,
         star_fusion: true,
+        spatial_join: true,
+        spatial_knn: true,
     };
 
     /// Everything off: the generic operators only.
@@ -116,6 +124,8 @@ impl Optimizations {
         decorrelate_exists: false,
         batched_join: false,
         star_fusion: false,
+        spatial_join: false,
+        spatial_knn: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -132,6 +142,8 @@ impl Optimizations {
             "decorrelate_exists" => &mut self.decorrelate_exists,
             "batched_join" => &mut self.batched_join,
             "star_fusion" => &mut self.star_fusion,
+            "spatial_join" => &mut self.spatial_join,
+            "spatial_knn" => &mut self.spatial_knn,
             _ => return None,
         })
     }

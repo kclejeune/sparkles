@@ -169,6 +169,7 @@ pub fn inferences_header(ds: &Dataset, seq: u64) -> Option<HeaderValue> {
 #[cfg(feature = "reasoning")]
 pub fn recorded(
     profile: &sparkles_reasoner::Profile,
+    extras: &sparkles_reasoner::Extras,
     report: &sparkles_reasoner::ReasonReport,
     store: &Store,
 ) -> ReasoningInfo {
@@ -190,6 +191,8 @@ pub fn recorded(
             sparkles_reasoner::Profile::Rules(t) => Some(t.clone()),
             _ => None,
         },
+        vocabularies: extras.names(),
+        geo_default_geometry: extras.geo_default_geometry,
         warnings: report.warnings.clone(),
         millis: Some(report.millis),
         inherited_stale: false,
@@ -208,6 +211,15 @@ pub fn recorded_profile(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasone
     Ok(info.profile.parse()?)
 }
 
+/// The extras a recorded status re-runs.
+#[cfg(feature = "reasoning")]
+pub fn recorded_extras(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner::Extras> {
+    Ok(sparkles_reasoner::Extras::parse(
+        &info.vocabularies,
+        info.geo_default_geometry,
+    )?)
+}
+
 /// Start a `reason` task: materialize, then record the status (data first, then the
 /// status file, so a crash in between reads as stale).
 #[cfg(feature = "reasoning")]
@@ -215,6 +227,7 @@ pub fn start_reason(
     st: &Arc<AppState>,
     ds: Arc<Dataset>,
     profile: sparkles_reasoner::Profile,
+    extras: sparkles_reasoner::Extras,
     auto: bool,
 ) -> crate::state::Task {
     let st2 = st.clone();
@@ -229,7 +242,8 @@ pub fn start_reason(
             progress: Some(progress),
             ..Default::default()
         };
-        let report = match sparkles_reasoner::materialize(&ds.store, &profile, &opts) {
+        let report = match sparkles_reasoner::materialize_with(&ds.store, &profile, &extras, &opts)
+        {
             Ok(r) => r,
             Err(e) => {
                 let e = match rejection_text(&e) {
@@ -240,7 +254,7 @@ pub fn start_reason(
                 return Err(e);
             }
         };
-        ds.set_reasoning(Some(recorded(&profile, &report, &ds.store)))?;
+        ds.set_reasoning(Some(recorded(&profile, &extras, &report, &ds.store)))?;
         st2.save_registry()?;
         Ok(format!(
             "{prefix}{} inferred triples in {} ms ({} iterations){}",
@@ -403,7 +417,10 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         if !due {
             continue;
         }
-        let profile = match info.as_ref().map(recorded_profile) {
+        let run = info
+            .as_ref()
+            .map(|i| Ok::<_, anyhow::Error>((recorded_profile(i)?, recorded_extras(i)?)));
+        let (profile, extras) = match run {
             Some(Ok(p)) => p,
             Some(Err(e)) => {
                 tracing::warn!("auto-reason /{}: {e:#}", ds.name);
@@ -413,7 +430,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
             None => continue,
         };
         tracing::info!("auto-reason /{}: re-running {}", ds.name, profile.name());
-        let task = start_reason(st, ds.clone(), profile, true);
+        let task = start_reason(st, ds.clone(), profile, extras, true);
         p.task = Some((task.id, head));
         p.since = now;
     }

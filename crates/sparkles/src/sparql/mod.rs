@@ -1,11 +1,14 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
+pub mod aggext;
 pub mod cache;
 pub mod ctx;
 pub mod exec;
 mod exists;
 pub mod expr;
+pub mod geojoin;
 pub mod geopf;
+pub mod georewrite;
 pub mod indexjoin;
 mod keyfilter;
 pub mod plan;
@@ -212,7 +215,7 @@ impl QueryResult {
 }
 
 pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -> Result<Query> {
-    let mut p = SparqlParser::new();
+    let mut p = aggext::register(SparqlParser::new());
     if let Some(b) = base {
         p = p
             .with_base_iri(b)

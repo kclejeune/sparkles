@@ -316,6 +316,7 @@ async fn no_automatic_runs_on_a_read_only_server() {
     .unwrap();
     ds.set_reasoning(Some(crate::reasoning::recorded(
         &sparkles_reasoner::Profile::Rdfs,
+        &Default::default(),
         &rep,
         &ds.store,
     )))

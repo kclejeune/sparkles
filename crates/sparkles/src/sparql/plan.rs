@@ -328,6 +328,14 @@ pub enum Kind {
     /// triple patterns read only for the keys of the input (child 0); see
     /// [`super::indexjoin`]
     IndexJoin(Box<super::indexjoin::IndexJoinSpec>),
+    /// two inputs joined on a spatial test of one geometry from each
+    SpatialJoin(Box<super::geojoin::SpatialJoinSpec>),
+    /// the template plan (child 0) over the nearest geometries first, until `k` rows are
+    /// proven
+    SpatialKnn(Box<super::geojoin::SpatialKnnSpec>),
+    /// a topological property matched against asserted and derived triples (Query
+    /// Rewrite), or `spatial:equals`
+    SpatialRelate(Box<super::georewrite::SpatialRelateSpec>),
 }
 
 #[derive(Clone)]
@@ -441,6 +449,9 @@ impl Node {
             Kind::SpatialPf(_) => "SpatialPf",
             Kind::IndexJoin(j) if j.probes.len() > 1 => "StarJoin",
             Kind::IndexJoin(_) => "IndexJoin",
+            Kind::SpatialJoin(_) => "SpatialJoin",
+            Kind::SpatialKnn(_) => "SpatialKnn",
+            Kind::SpatialRelate(_) => "SpatialRelate",
         }
     }
 }
@@ -849,6 +860,8 @@ impl<'a> Planner<'a> {
                     crate::vector::VECTOR_SEARCH,
                     "spk:vectorSearch",
                 )?;
+                let (rcalls, patterns) =
+                    super::georewrite::take_rewrite_triples(patterns, self.ctx)?;
                 let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
                 for tp in &patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
@@ -861,6 +874,9 @@ impl<'a> Planner<'a> {
                 }
                 for c in scalls {
                     items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
+                }
+                for c in rcalls {
+                    items.push(Item::Node(super::georewrite::rewrite_leaf(self, c, g)?));
                 }
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
@@ -1774,6 +1790,8 @@ impl<'a> Planner<'a> {
             };
             parts.push(plan);
         }
+        // components connected by a spatial conjunct are joined on it
+        super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
         parts.sort_by(|a, b| a.est.total_cmp(&b.est));
         let mut it = parts.into_iter();
@@ -2825,7 +2843,7 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
-            ordered_topk(n, ctx)
+            ordered_topk(super::geojoin::spatial_knn(n, ctx), ctx)
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -2835,7 +2853,8 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             let order = n.children.pop().unwrap();
-            n.children.push(ordered_topk(order, ctx));
+            n.children
+                .push(ordered_topk(super::geojoin::spatial_knn(order, ctx), ctx));
             n
         }
         (n, _) => n,

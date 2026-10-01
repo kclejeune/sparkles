@@ -51,7 +51,7 @@ pub fn update_as(
     kind: crate::commit::CommitKind,
 ) -> Result<UpdateStats> {
     let t0 = Instant::now();
-    let mut p = SparqlParser::new();
+    let mut p = super::aggext::register(SparqlParser::new());
     if let Some(b) = &opts.base_iri {
         p = p
             .with_base_iri(b)

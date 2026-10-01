@@ -304,6 +304,30 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
             );
             sp.filter.iter().all(deterministic)
         }
+        Kind::SpatialJoin(sp) => {
+            // the sides' scans and plans are part of `key` and of the children
+            let (epoch, config) = geo_view_key(ctx);
+            let _ = write!(s, "k{:x}e{epoch}h{config:x}", sp.key);
+            sp.filter.iter().all(deterministic)
+        }
+        Kind::SpatialKnn(sp) => {
+            let (epoch, config) = geo_view_key(ctx);
+            let _ = write!(
+                s,
+                "{:?}{:?}{:?}k{:x}e{epoch}h{config:x}",
+                sp.scan.prefix, sp.scan.graph, sp.scan.eqs, sp.key
+            );
+            true
+        }
+        Kind::SpatialRelate(sp) => {
+            let (epoch, config) = geo_view_key(ctx);
+            let _ = write!(
+                s,
+                "{:?}{:?}k{:x}e{epoch}h{config:x}",
+                sp.graph, sp.graph_var, sp.key
+            );
+            true
+        }
         Kind::SpatialPf(sp) => {
             let (epoch, config) = geo_view_key(ctx);
             let _ = write!(

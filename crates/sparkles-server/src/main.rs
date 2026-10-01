@@ -402,6 +402,14 @@ enum Cmd {
         /// hull, relate); larger ones are a type error
         #[arg(long, default_value_t = 2_000_000)]
         geo_op_vertices: u64,
+        /// Never rewrite GeoSPARQL topological properties, whatever a dataset's geo.json
+        /// says
+        #[arg(long)]
+        no_geo_rewrite: bool,
+        /// A MapLibre style JSON for the UI's maps (its origins are allowed by the
+        /// UI's Content Security Policy); without it the UI draws its bundled basemap
+        #[arg(long, value_name = "URL")]
+        map_style_url: Option<String>,
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
@@ -629,6 +637,9 @@ enum Cmd {
         /// distances on geographic coordinates: geodesic (default) or haversine
         #[arg(long)]
         distance: Option<String>,
+        /// also index W3C Basic Geo (wgs84_pos:lat / wgs84_pos:long) pairs as points
+        #[arg(long)]
+        wgs84: bool,
         /// rebuild even if the index is current
         #[arg(long, conflicts_with_all = ["status", "disable"])]
         rebuild: bool,
@@ -835,6 +846,13 @@ enum Cmd {
         profile: Option<String>,
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Add a built-in vocabulary's axioms to the rules: geosparql (repeatable)
+        #[arg(long = "vocab", value_name = "NAME")]
+        vocab: Vec<String>,
+        /// Also materialize geo:hasDefaultGeometry for features with exactly one
+        /// geo:hasGeometry
+        #[arg(long)]
+        geo_default_geometry: bool,
         /// Remove materialized inferences instead
         #[arg(long)]
         clear: bool,
@@ -1268,6 +1286,8 @@ fn run() -> Result<()> {
             geo,
             geo_mb,
             geo_op_vertices,
+            no_geo_rewrite,
+            map_style_url,
             schema_max_entries,
             no_access_log,
             no_metrics,
@@ -1340,10 +1360,15 @@ fn run() -> Result<()> {
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
+            opts.geo_query_rewrite = !no_geo_rewrite;
+            if map_style_url.is_some() {
+                bail!("--map-style-url: not supported yet");
+            }
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
+            st.map_style_url = map_style_url;
             if let Some(w) = auth::proxy_host_warning(&st, !public_host.is_empty()) {
                 tracing::warn!("{w}");
             }
@@ -1773,6 +1798,7 @@ fn run() -> Result<()> {
             feature_link,
             exclude_graph,
             distance,
+            wgs84,
             rebuild,
             status,
             disable,
@@ -1784,6 +1810,7 @@ fn run() -> Result<()> {
                 feature_link,
                 exclude_graph,
                 distance,
+                wgs84,
                 rebuild,
                 status,
                 disable,
@@ -1990,6 +2017,8 @@ fn run() -> Result<()> {
             loc,
             profile,
             rules,
+            vocab,
+            geo_default_geometry,
             clear,
             status,
             check,
@@ -2013,6 +2042,8 @@ fn run() -> Result<()> {
                 eprintln!("error: unknown diagnostics check '{bad}'");
                 std::process::exit(2);
             }
+            let extras = sparkles_reasoner::Extras::parse(&vocab, geo_default_geometry)?;
+            extras.validate()?;
             if check && !(1..=diagnostics::MAX_LIMIT).contains(&limit) {
                 eprintln!(
                     "error: --limit must be between 1 and {}",
@@ -2033,7 +2064,7 @@ fn run() -> Result<()> {
                 eprintln!("removed {n} inferred triples");
                 return Ok(());
             }
-            if !check || profile.is_some() || rules.is_some() {
+            if !check || profile.is_some() || rules.is_some() || !extras.is_empty() {
                 let profile = match rules {
                     Some(f) => sparkles_reasoner::Profile::Rules(std::fs::read_to_string(f)?),
                     None => {
@@ -2042,11 +2073,16 @@ fn run() -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("unknown profile '{p}'"))?
                     }
                 };
-                let r = sparkles_reasoner::materialize(&store, &profile, &Default::default())?;
+                let r = sparkles_reasoner::materialize_with(
+                    &store,
+                    &profile,
+                    &extras,
+                    &Default::default(),
+                )?;
                 // lets `sparkles serve` pick the inferences up for this database
                 state::write_reasoning_file(
                     &loc,
-                    Some(&reasoning::recorded(&profile, &r, &store)),
+                    Some(&reasoning::recorded(&profile, &extras, &r, &store)),
                 )?;
                 eprintln!(
                     "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",

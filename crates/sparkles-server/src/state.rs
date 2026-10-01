@@ -40,6 +40,12 @@ pub struct ReasoningInfo {
     /// rule text of profile `rules`, for re-runs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<String>,
+    /// built-in vocabularies added to the profile (`geosparql`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vocabularies: Vec<String>,
+    /// `geo:hasDefaultGeometry` materialized for features with one geometry
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub geo_default_geometry: bool,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +216,9 @@ pub struct AppState {
     pub cors_origins: Vec<String>,
     /// the `Host` names answered without auth (`serve --public-host`)
     pub hosts: crate::exposure::Hosts,
+    /// the MapLibre style of the UI's maps (`serve --map-style-url`); `None`: the
+    /// bundled basemap
+    pub map_style_url: Option<String>,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// dataset names being created by a task (clone), with the task id
@@ -462,6 +471,7 @@ impl AppState {
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
+            map_style_url: None,
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
@@ -535,6 +545,7 @@ impl AppState {
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
+            map_style_url: None,
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }
