@@ -111,7 +111,7 @@
   let uploadCtl: AbortController | null = null;
   let fileInput: HTMLInputElement | undefined = $state();
 
-  const ACCEPT = '.ttl,.nt,.nq,.trig,.rdf,.owl,.xml,.jsonld,.n3,.gz';
+  const ACCEPT = '.ttl,.nt,.nq,.trig,.rdf,.owl,.xml,.jsonld,.n3,.gz,.zst,.br,.lz4';
 
   function addFiles(list: FileList | null | undefined) {
     if (!list) return;
@@ -490,7 +490,7 @@ ex:PersonShape a sh:NodeShape ;
                 class="btn sm"
                 onclick={() => startTask('Dump', () => api.backup(name))}
                 disabled={acting != null}
-                title="Write a gzipped N-Quads dump into the server's backup directory"
+                title="Write a zstd-compressed N-Quads dump (.nq.zst) into the server's backup directory"
               >
                 <Icon name="download" size={13} /> Dump
               </button>

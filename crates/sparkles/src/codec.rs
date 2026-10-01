@@ -210,6 +210,16 @@ impl Codec {
         }
     }
 
+    /// The default codec of N-Quads dumps and backups (`/$/backup`, `sparkles backup`):
+    /// zstd (level 3) when built with the `zstd` feature, else gzip.
+    pub fn dump_default() -> Codec {
+        if cfg!(feature = "zstd") {
+            Codec::Zstd
+        } else {
+            Codec::Gzip
+        }
+    }
+
     fn unsupported(self) -> Error {
         Error::Unsupported(format!("built without {}", self.name()))
     }

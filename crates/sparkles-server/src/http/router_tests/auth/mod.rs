@@ -1299,7 +1299,7 @@ async fn anonymous_callers_get_no_version_or_limits() {
 #[tokio::test]
 async fn task_messages_show_paths_to_server_admins_only() {
     let s = auth_server();
-    let file = s.dir.path().join("backups").join("wiki.nq.gz");
+    let file = s.dir.path().join("backups").join("wiki.nq.zst");
     let msg = format!("backup written to {} (1 KiB)", file.display());
     let m = msg.clone();
     let id = s.state.start_task("backup", "wiki", move |_| Ok(m)).id;
@@ -1308,7 +1308,7 @@ async fn task_messages_show_paths_to_server_admins_only() {
     assert_eq!(bob.status, StatusCode::OK);
     assert_eq!(
         bob.json()["message"],
-        "backup written to …/wiki.nq.gz (1 KiB)"
+        "backup written to …/wiki.nq.zst (1 KiB)"
     );
     let listed = get_as(&s.app, "/$/tasks", Some(&b("bob"))).await.json();
     let t = listed
@@ -1318,7 +1318,7 @@ async fn task_messages_show_paths_to_server_admins_only() {
         .find(|t| t["id"] == id.as_str())
         .unwrap()
         .clone();
-    assert_eq!(t["message"], "backup written to …/wiki.nq.gz (1 KiB)");
+    assert_eq!(t["message"], "backup written to …/wiki.nq.zst (1 KiB)");
     let alice = get_as(&s.app, &format!("/$/tasks/{id}"), Some(&b("alice"))).await;
     assert_eq!(alice.json()["message"], msg.as_str());
 }

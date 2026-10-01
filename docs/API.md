@@ -374,7 +374,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
-| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are under [Backup repositories](#backup-repositories). |
+| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` (zstd level 3; gzip, `.nq.gz`, in a build without zstd). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it, so `compression=gzip` gives Fuseki's `.nq.gz`; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are under [Backup repositories](#backup-repositories). |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
@@ -1734,7 +1734,10 @@ same way; deletes always pass. Storage quotas per dataset do not exist yet.
 `.br` or `--compression brotli`). When a file's name and its data disagree, the data
 wins and a warning is logged; an explicit `--compression` that disagrees is an error.
 `sparkles dump --out FILE` and `sparkles backup` take `--compress CODEC`, `--level N`
-and `--threads N` (zstd). Backups stay gzip by default.
+and `--threads N` (zstd). `sparkles backup` and `/$/backup` write zstd (level 3) by default,
+about five times faster than gzip for a slightly larger file; `--compress gzip` (`?compression=gzip`)
+gives `.nq.gz`, as Fuseki writes.
+`sparkles dump --out FILE` goes by the file's extension (uncompressed without one).
 
 **Full-text documents** are stored with zstd (level 3). `"docstoreCompression": "lz4"`
 or `"none"` in the text configuration picks another; changing it rebuilds the index.

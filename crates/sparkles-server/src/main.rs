@@ -715,7 +715,7 @@ enum Cmd {
     },
     /// Back up to a backup repository (create, list, show, delete, restore, verify,
     /// policy); without a subcommand, write a compressed N-Quads dump of --loc to --out
-    /// (gzip unless --compress says otherwise)
+    /// (zstd unless --compress says otherwise)
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Backup {
         #[arg(long, required = true)]
@@ -1900,7 +1900,7 @@ fn run() -> Result<()> {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "db".into());
-            let codec = compress.codec(sparkles::codec::Codec::Gzip)?;
+            let codec = compress.codec(sparkles::codec::Codec::dump_default())?;
             let t = Instant::now();
             let p = store.backup_with(&out, &name, codec, compress.level(), compress.threads())?;
             let size = std::fs::metadata(&p).map_or(0, |m| m.len());

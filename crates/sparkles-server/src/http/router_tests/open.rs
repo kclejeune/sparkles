@@ -291,8 +291,10 @@ async fn security_headers() {
 fn task_messages_lose_absolute_paths() {
     use crate::http::redact_paths;
     assert_eq!(
-        redact_paths("backup written to /var/lib/sparkles/backups/wiki.nq.gz (1 MiB, gzip, 0.1 s)"),
-        "backup written to …/wiki.nq.gz (1 MiB, gzip, 0.1 s)"
+        redact_paths(
+            "backup written to /var/lib/sparkles/backups/wiki.nq.zst (1 MiB, zstd, 0.1 s)"
+        ),
+        "backup written to …/wiki.nq.zst (1 MiB, zstd, 0.1 s)"
     );
     assert_eq!(
         redact_paths("reading '/data/wiki/manifest.json': No such file or directory"),

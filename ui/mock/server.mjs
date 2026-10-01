@@ -1801,7 +1801,7 @@ const server = http.createServer(async (req, res) => {
             startTask(
               'backup',
               ds,
-              () => `Wrote backups/${ds.name}_${new Date().toISOString().slice(0, 10)}.nq.gz`,
+              () => `Wrote backups/${ds.name}_${new Date().toISOString().slice(0, 10)}.nq.zst`,
               1500,
             ),
           );
