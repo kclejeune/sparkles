@@ -171,11 +171,20 @@ impl Engine for ServerEngine {
         )
     }
 
-    /// The GC task of `POST /$/repositories/{repo}/gc`, with the default grace period.
+    /// The GC task of `POST /$/repositories/{repo}/gc`, with the default grace period,
+    /// admitted like it (`503 too-many-tasks` beyond the queue).
     fn start_gc(&self, st: &Arc<AppState>, repo: &str) -> Result<String, BackupError> {
+        let b = backup_state(st)?;
         let grace = GcOptions::default().grace;
-        let (task, _) =
-            super::ops::start_gc(st, repo, false, grace, "policy retention".into(), None)?;
+        let admission = b.admit()?;
+        let (task, _) = super::ops::start_gc(
+            st,
+            repo,
+            false,
+            grace,
+            "policy retention".into(),
+            Some(admission),
+        )?;
         Ok(task.id)
     }
 }
@@ -228,6 +237,8 @@ pub struct Policies {
     inner: Mutex<Inner>,
     clock: RwLock<Arc<dyn Clock>>,
     engine: RwLock<Arc<dyn Engine>>,
+    /// the scheduler said once that a read-only server runs no policies
+    read_only_logged: std::sync::atomic::AtomicBool,
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &FsPath) -> anyhow::Result<T> {
@@ -292,6 +303,7 @@ impl Policies {
             }),
             clock: RwLock::new(Arc::new(SystemClock)),
             engine: RwLock::new(Arc::new(ServerEngine)),
+            read_only_logged: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -419,6 +431,18 @@ impl Policies {
     /// and return the earliest next instant of the enabled policies.
     pub fn evaluate_all(&self, st: &Arc<AppState>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let Some(b) = &st.backup else { return None };
+        if st.read_only {
+            // a read-only server does not run policies (their instants pass)
+            if !self
+                .read_only_logged
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                && !b.registry.policies.read().is_empty()
+            {
+                tracing::info!(target: "sparkles::backup",
+                    "the server is read-only: backup policies do not run");
+            }
+            return None;
+        }
         let entries: Vec<PolicyConfig> = b
             .registry
             .policies
@@ -481,6 +505,7 @@ impl Policies {
                 started: fmt_time(now),
                 finished: Some(fmt_time(now)),
                 result: RunResult::Skipped,
+                reason: Some(why.to_string()),
                 datasets: Vec::new(),
                 retention: None,
                 gc: None,
@@ -494,9 +519,15 @@ impl Policies {
             self.record(&mut inner, run);
         } else {
             drop(inner);
-            if let Err(e) = start_run(st, p.name.clone(), trigger, Some(due)) {
-                tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(),
-                    "policy run not started: {}", e.message());
+            match start_run(st, p.name.clone(), trigger, Some(due)) {
+                Ok(_) => {}
+                // the backup task queue is full: this instant is skipped, not retried
+                Err(StartError::Other(e)) if e.code() == Code::TooManyTasks => {
+                    let run = skipped(&format!("too many backup tasks: {}", e.message()));
+                    self.record(&mut self.inner.lock(), run);
+                }
+                Err(e) => tracing::warn!(target: "sparkles::backup", policy = p.name.as_str(),
+                    "policy run not started: {}", e.message()),
             }
         }
         next
@@ -553,7 +584,9 @@ impl From<BackupError> for StartError {
 
 /// Start a `backup-policy` task for policy `name` (server-scoped: `dataset: ""`,
 /// `target` the policy). `scheduled_for` is the instant a scheduled or catch-up run is
-/// for (`{time}` of the names; the start time for a manual run).
+/// for (`{time}` of the names; the start time for a manual run). The run is admitted
+/// like any backup task (`503 too-many-tasks` beyond the queue) and holds the admission
+/// until it ends; a `--read-only` server runs no policies (`403 server-read-only`).
 pub fn start_run(
     st: &Arc<AppState>,
     name: String,
@@ -561,6 +594,9 @@ pub fn start_run(
     scheduled_for: Option<DateTime<Utc>>,
 ) -> Result<Task, StartError> {
     let b = backup_state(st)?.clone();
+    if st.read_only {
+        return Err(BackupError::new(Code::ServerReadOnly, "server is read-only").into());
+    }
     let config = b
         .registry
         .policies
@@ -569,6 +605,7 @@ pub fn start_run(
         .map(|e| e.config.clone())
         .ok_or_else(|| no_such_policy(&name))?;
     let (_, tz) = policy::check_policy(&config)?;
+    let admission = b.admit()?;
     let id = st.next_task_id();
     {
         let mut inner = b.policies.inner.lock();
@@ -581,6 +618,7 @@ pub fn start_run(
     let st2 = st.clone();
     let (task_id, target) = (id.clone(), name.clone());
     let task = st.start_task_opts(id, "backup-policy", "", Some(&target), true, move |h| {
+        let _admission = admission;
         let run = Run {
             st: &st2,
             b: &b,
@@ -642,6 +680,7 @@ impl Run<'_> {
             started: fmt_time(self.started),
             finished: None,
             result: RunResult::Ok,
+            reason: None,
             datasets: Vec::new(),
             retention: None,
             gc: None,
@@ -1284,9 +1323,11 @@ async fn remove_policy(State(st): St, Path(name): Path<String>) -> Res {
 }
 
 /// `POST /$/backup-policies/{policy}/run` → `202` task `backup-policy` (server-scoped),
-/// `detail: PolicyRun`; the schedule does not move. `409 policy-running` (with `task`)
+/// `detail: PolicyRun`; the schedule does not move. `409 policy-running` (with `task`),
+/// `503 too-many-tasks`, `403 server-read-only`
 async fn run_policy(State(st): St, Path(name): Path<String>) -> Res {
     let b = backups(&st)?;
+    writable(&st)?;
     let e = entry(&b, &name)?;
     match b.registry.repos.read().get(&e.config.repository) {
         None => {

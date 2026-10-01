@@ -121,7 +121,10 @@
                       · {fmtTime(r.scheduledFor)}</span
                     >{/if}</td
                 >
-                <td><span class="badge {resultClass(r.result)}">{r.result}</span></td>
+                <td
+                  ><span class="badge {resultClass(r.result)}" title={r.reason}>{r.result}</span
+                  ></td
+                >
                 <td class="small">{counts(r) || '—'}</td>
                 <td class="num small">{took(r)}</td>
               </tr>
@@ -129,6 +132,7 @@
                 <tr class="detail" id="run-{r.id}">
                   <td></td>
                   <td colspan="6">
+                    {#if r.reason}<p class="small">{r.reason}</p>{/if}
                     <ul class="ds">
                       {#each r.datasets as d (d.dataset)}
                         <li>

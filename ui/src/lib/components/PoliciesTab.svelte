@@ -16,7 +16,7 @@
     onstarted,
   }: {
     repositories: b.Repository[];
-    /** The server is read-only: policy changes are refused (runs still work). */
+    /** The server is read-only: policy changes and runs are refused. */
     readOnly?: boolean;
     refreshKey?: number;
     /** The loaded policies (the page counts them and checks names). */
@@ -231,7 +231,13 @@
               </label>
             </td>
             <td class="actions">
-              <button class="btn sm" onclick={() => run(p)} disabled={busy[p.name]}>Run now</button>
+              <button
+                class="btn sm"
+                onclick={() => run(p)}
+                disabled={readOnly || busy[p.name]}
+                title={readOnly ? 'The server is read-only: policies do not run' : undefined}
+                >Run now</button
+              >
               <button class="btn sm" onclick={() => previewRetention(p)}>Retention</button>
               <button class="btn sm ghost" onclick={() => open(p)}
                 >{p.source === 'config' ? 'View' : 'Edit'}</button
@@ -263,10 +269,12 @@
   datasets={app.datasets}
   taken={[...policies.map((p) => p.name), ...repositories.map((r) => r.name)]}
   onsaved={load}
-  onrun={(p) => {
-    editorOpen = false;
-    void run(p);
-  }}
+  onrun={readOnly
+    ? undefined
+    : (p) => {
+        editorOpen = false;
+        void run(p);
+      }}
   onretention={(p) => {
     editorOpen = false;
     void previewRetention(p);

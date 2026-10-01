@@ -435,7 +435,11 @@
   </form>
   {#snippet actions()}
     {#if editing}
-      <button class="btn" type="button" onclick={() => editing && onrun?.(editing)}>Run now</button>
+      {#if onrun}
+        <button class="btn" type="button" onclick={() => editing && onrun?.(editing)}
+          >Run now</button
+        >
+      {/if}
       <button class="btn" type="button" onclick={() => editing && onretention?.(editing)}
         >Preview retention</button
       >

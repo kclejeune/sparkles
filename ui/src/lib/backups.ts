@@ -209,6 +209,8 @@ export type PolicyRun = {
   started: string;
   finished: string | null;
   result: 'ok' | 'partial' | 'failed' | 'skipped';
+  /** Why a scheduled run was skipped. */
+  reason?: string;
   datasets: {
     dataset: string;
     backup: string | null;

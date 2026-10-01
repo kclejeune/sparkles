@@ -867,17 +867,18 @@ started or queued, and a `Location` where noted.
 | GET | `/$/backup-policies/{policy}` | `server-admin` | `Policy` |
 | PUT | `/$/backup-policies/{policy}` | `server-admin` | Replace the settings (body `PolicyConfig`; `name` may be left out, and cannot change): `Policy`. Enabling or disabling a policy is a PUT. `409 read-only-config` for a policy of the config file. A new schedule or time zone waits for its next instant |
 | DELETE | `/$/backup-policies/{policy}` | `server-admin` | `204`; a running run stops before its next dataset. `409 read-only-config` |
-| POST | `/$/backup-policies/{policy}/run` | `server-admin` | Run now (also a disabled policy): task `backup-policy` (server-wide) with `detail: PolicyRun`, `Location: /$/tasks/{id}`. The schedule does not move. `409 policy-running` (`task`) |
+| POST | `/$/backup-policies/{policy}/run` | `server-admin` | Run now (also a disabled policy): task `backup-policy` (server-wide) with `detail: PolicyRun`, `Location: /$/tasks/{id}`. The schedule does not move. `409 policy-running` (`task`), `503 too-many-tasks`, `403 server-read-only` |
 | POST | `/$/backup-policies/{policy}/retention[?dryRun=true]` | `server-admin` | Apply the policy's retention now: `{dryRun, delete: BackupSummary[], keep: BackupSummary[], errors?: string[]}`. With `dryRun` nothing is deleted. A deletion that fails stays in `delete` and adds to `errors` |
 | GET | `/$/backup-policies/{policy}/runs[?limit=N]` | `server-admin` | `{runs: PolicyRun[]}`, newest first (default 50, at most 1000) |
 
 A server built without the `backup` feature answers these paths `404`; the UI then hides
 its Backups page.
 
-**`--read-only` servers** create, verify and delete backups, test repositories, run
-policies and their retention, collect repositories and break locks (on writable
-repositories). Restores, and changes to repositories and policies, answer
-`403 server-read-only`.
+**`--read-only` servers** create, verify and delete backups, test repositories, apply
+a policy's retention, collect repositories and break locks (on writable repositories).
+Restores, changes to repositories and policies, and policy runs answer
+`403 server-read-only`; the scheduler runs no policies (it logs that once), so their
+instants pass.
 
 ### Restore
 
@@ -1048,6 +1049,7 @@ type PolicyRun = {
   trigger: "schedule" | "catch-up" | "manual";
   scheduledFor: string | null; started: string; finished: string | null;
   result: "ok" | "partial" | "failed" | "skipped";
+  reason?: string;              // why a scheduled run was skipped
   datasets: { dataset: string; backup: string | null; result: "ok" | "failed" | "skipped";
               reason?: string; addedBytes?: number; millis?: number }[];
   retention: { deleted: string[]; error?: string } | null;
@@ -1089,9 +1091,13 @@ while it runs), then applies its retention.
 * **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
   its next instant. Instants missed while the server was down are covered by one run
   60 s after startup (`trigger: "catch-up"`), or recorded as `skipped` with
-  `catchUp: "none"`. An instant that comes while the previous run still runs is recorded
-  as `skipped`. A disabled policy lets its instants pass; disabling or deleting one
-  during a run stops it before its next dataset (the run ends `skipped`).
+  `catchUp: "none"`. An instant that comes while the previous run still runs, or while
+  the backup task queue is full (see [Backup tasks](#backup-tasks)), is recorded as
+  `skipped`, with the `reason`. A disabled policy lets its instants pass; disabling or
+  deleting one during a run stops it before its next dataset (the run ends `skipped`).
+  A run is a backup task like any other: it is admitted to the queue (a manual run
+  beyond it answers `503 too-many-tasks`), and so is the GC it starts (not started, and
+  tried again after the next run's retention, when the queue is full).
 * **Results.** A run is `ok` when every selected dataset was backed up or skipped
   (`in-memory dataset`, `unchanged`), `partial` when some failed, `failed` when none
   succeeded. `lastSuccess` and `consecutiveFailures` follow them. The last 1000 runs of
