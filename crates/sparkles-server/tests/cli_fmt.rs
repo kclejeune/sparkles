@@ -523,7 +523,8 @@ fn config_discovery() {
     );
     // the dotfile wins over sparklesfmt.toml in one directory
     write(dir, "sub/.sparklesfmt.toml", "indent-width = 4\n");
-    expect(dir, &["--check", "sub/mid.rq"], None, 0);
+    // (indent 4: the file now needs formatting, rather than failing on the broken file)
+    expect(dir, &["--check", "sub/mid.rq"], None, 1);
     expect(dir, &["--config", "nope.toml", "top.rq"], None, 2);
     let o = expect(dir, &["--config", "nope.toml", "top.rq"], None, 2);
     assert_eq!(stderr(&o), "nope.toml: error: No such file or directory\n");
@@ -750,7 +751,6 @@ impl Drop for Server {
 }
 
 #[test]
-#[ignore = "needs printing"]
 fn reformats_messy_queries() {
     let d = tempdir();
     let dir = d.path();
@@ -758,5 +758,5 @@ fn reformats_messy_queries() {
     expect(dir, &["--check", "q.rq"], None, 1);
     expect(dir, &["--write", "q.rq"], None, 0);
     expect(dir, &["--check", "q.rq"], None, 0);
-    assert_eq!(read(dir, "q.rq"), "SELECT * WHERE {\n  ?s ?p ?o .\n}\n");
+    assert_eq!(read(dir, "q.rq"), "SELECT *\nWHERE {\n  ?s ?p ?o .\n}\n");
 }

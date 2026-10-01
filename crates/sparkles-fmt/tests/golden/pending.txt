@@ -3,6 +3,3 @@
 # skips them (and never blesses them); `-- --ignored` checks them and reports the ones
 # that pass, which then leave this list. One `<language>/<name>` per line (all its
 # variants), whitespace, and the reason.
-sparql/s3 needs the VALUES, BIND, MINUS, NOT EXISTS and operator-chain printers
-sparql/s5 needs the update printers
-sparql/s6 needs the RDF 1.2 term, VALUES and pragma printers

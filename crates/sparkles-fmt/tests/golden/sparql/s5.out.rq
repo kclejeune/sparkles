@@ -1,7 +1,7 @@
 PREFIX ex: <http://example.org/>
 
 # bump versions
-WITH <http://example.org/g>
+WITH ex:g
 DELETE {
   ?d ex:version ?v .
 }
@@ -16,7 +16,7 @@ WHERE {
 };
 
 INSERT DATA {
-  GRAPH <http://example.org/log> {
+  GRAPH ex:log {
     ex:run1 ex:note """bumped
 all""" .
   }
