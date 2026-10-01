@@ -4,11 +4,7 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
 # The ShEx counterpart of the SHACL benchmark shapes (crates/sparkles-shacl/examples/bench.rs)
 # on scripts/gen-data.py data. ShEx has no rdfs:subClassOf inference: class membership is
-# spelled out as value sets. Shape map:
-#   {FOCUS a ex:Researcher}@ex:Person, {FOCUS a ex:Manager}@ex:Person,
-#   {FOCUS a ex:Employee}@ex:Person, {FOCUS a ex:Student}@ex:Person,
-#   {FOCUS a ex:Article}@ex:Document, {FOCUS a ex:Book}@ex:Document,
-#   {FOCUS a ex:University}@ex:Org, {FOCUS a ex:Company}@ex:Org
+# spelled out as value sets. The shape map is bench.smap.
 
 ex:Person {
   a [ex:Employee ex:Researcher ex:Manager ex:Student] ;
