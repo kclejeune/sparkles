@@ -10,7 +10,6 @@
 mod corpus;
 
 use sparkles_fmt::check::{comments, sparql_equivalent, sparql_reference};
-use sparkles_fmt::doc::DocArena;
 use sparkles_fmt::lex::{LexMode, lex};
 use sparkles_fmt::sparql::parse::parse;
 use sparkles_fmt::sparql::print::{Ctx, RULES, node};
@@ -71,12 +70,7 @@ fn splice(text: &str, opts: &Options) -> Result<(String, usize), String> {
     let roots = roots(&tree);
     for &n in &roots {
         let r = tree.range(n);
-        let mut cx = Ctx {
-            tree: &tree,
-            arena: DocArena::new(&tree.tokens),
-            opts,
-            comments: &comments,
-        };
+        let mut cx = Ctx::new(&tree, &comments, opts);
         let doc = node(&mut cx, n);
         let printed = sparkles_fmt::doc::print(
             &cx.arena,
