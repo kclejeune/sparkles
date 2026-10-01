@@ -631,9 +631,9 @@ async fn verify_repository(State(st): St, Path(name): Path<String>, body: Bytes)
             .map_err(ops::task_error)?;
         h.set_detail(serde_json::to_value(&r)?);
         Ok(format!(
-            "{}: {} backups ({})",
+            "{}: {} ({})",
             wire(r.status),
-            r.backups.len(),
+            super::cli::plural(r.backups.len() as u64, "backup", "backups"),
             wire(req.level)
         ))
     });

@@ -2,6 +2,7 @@
 //! holding a task slot while it works, and count themselves in the metrics; delete runs
 //! in the request. Claims ([`super::BackupState::claim`]) are the callers'.
 
+use super::cli::plural;
 use super::metrics::{Operation, Outcome};
 use super::{BackupState, ClaimSpec, Started, swap};
 use crate::state::{AppState, Dataset, DbType, Reservation, Task, TaskHandle};
@@ -543,12 +544,16 @@ pub fn start_gc(
         h.set_detail(serde_json::to_value(&r)?);
         Ok(if dry_run {
             format!(
-                "dry run: {} blobs ({} MB) can be deleted",
-                r.candidates,
+                "dry run: {} ({} MB) can be deleted",
+                plural(r.candidates, "blob", "blobs"),
                 mb(r.deleted_bytes)
             )
         } else {
-            format!("deleted {} blobs ({} MB)", r.deleted, mb(r.deleted_bytes))
+            format!(
+                "deleted {} ({} MB)",
+                plural(r.deleted, "blob", "blobs"),
+                mb(r.deleted_bytes)
+            )
         })
     });
     Ok((task, rx))

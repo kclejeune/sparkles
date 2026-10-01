@@ -71,6 +71,11 @@ async fn list_all(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<ObjectMet
         .await?)
 }
 
+/// `1 blob`, `2 blobs` (progress messages).
+fn blobs(n: u64) -> String {
+    format!("{n} {}", if n == 1 { "blob" } else { "blobs" })
+}
+
 /// Whether an object last written at `modified` is at least `grace` old at `now`.
 fn older_than(modified: DateTime<Utc>, now: DateTime<Utc>, grace: Duration) -> bool {
     (now - modified).to_std().is_ok_and(|age| age >= grace)
@@ -281,7 +286,7 @@ impl Repository {
             }
             let done = (i * DELETE_BATCH + batch.len()) as f32 / total as f32;
             o.ctl
-                .report(0.65 + 0.25 * done, &format!("deleted {deleted} blobs"));
+                .report(0.65 + 0.25 * done, &format!("deleted {}", blobs(deleted)));
         }
 
         // leftovers of other operations: stale locks and connection-test probes
@@ -329,7 +334,7 @@ impl Repository {
             kept_young = rep.kept_young,
             "garbage collection finished"
         );
-        o.ctl.report(1.0, &format!("deleted {deleted} blobs"));
+        o.ctl.report(1.0, &format!("deleted {}", blobs(deleted)));
         Ok(rep)
     }
 

@@ -896,6 +896,30 @@ fn memory_repositories() {
     let b = json_of(&o);
     assert_eq!(b["name"], "m1");
     assert!(b["stats"]["files"].as_u64().unwrap() > 0, "{b}");
+    // backup names take upper case too, and the message says so
+    for (name, code) in [("Nightly.2026-09-30", 0), (".bad", 1), ("a b", 1)] {
+        let o = expect(
+            h,
+            &[
+                "backup",
+                "create",
+                "--loc",
+                &db,
+                "--repo",
+                "memory://",
+                "--name",
+                name,
+            ],
+            code,
+        );
+        if code == 1 {
+            assert!(
+                stderr(&o).contains("A-Z, a-z, 0-9, '.', '_' and '-'"),
+                "{}",
+                stderr(&o)
+            );
+        }
+    }
     // progress went to stderr
     assert!(stderr(&o).contains('%'), "{}", stderr(&o));
     // each process has its own memory repository

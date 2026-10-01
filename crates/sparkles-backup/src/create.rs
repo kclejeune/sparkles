@@ -176,6 +176,18 @@ fn encode(plain: Bytes) -> PutPayload {
     PutPayload::from_iter([header, plain])
 }
 
+/// `uploading 120/310 MB · 14 new blobs · 3 reused`
+fn uploading(t: &Tally, total: u64) -> String {
+    format!(
+        "uploading {}/{} MB · {} new {} · {} reused",
+        mb(t.done_bytes),
+        mb(total),
+        t.new_blobs,
+        if t.new_blobs == 1 { "blob" } else { "blobs" },
+        t.reused_blobs
+    )
+}
+
 /// The `MB` of progress messages.
 fn mb(b: u64) -> String {
     let m = b as f64 / 1e6;
@@ -392,21 +404,7 @@ impl Repository {
                 } else {
                     tally.done_bytes as f64 / total as f64
                 };
-                ctl.report(
-                    0.05 + 0.9 * frac as f32,
-                    &format!(
-                        "uploading {}/{} MB · {} new {} · {} reused",
-                        mb(tally.done_bytes),
-                        mb(total),
-                        tally.new_blobs,
-                        if tally.new_blobs == 1 {
-                            "blob"
-                        } else {
-                            "blobs"
-                        },
-                        tally.reused_blobs
-                    ),
-                );
+                ctl.report(0.05 + 0.9 * frac as f32, &uploading(&tally, total));
             }
             Ok::<_, BackupError>(())
         }
@@ -749,5 +747,19 @@ mod tests {
         assert!(read_piece(&f, 90, 20, &no).is_err());
         assert_eq!(mb(120_400_000), "120");
         assert_eq!(mb(1_234_567), "1.2");
+        let t = |new_blobs| Tally {
+            done_bytes: 1_234_567,
+            new_blobs,
+            reused_blobs: 3,
+            added_bytes: 0,
+        };
+        assert_eq!(
+            uploading(&t(1), 120_400_000),
+            "uploading 1.2/120 MB · 1 new blob · 3 reused"
+        );
+        assert_eq!(
+            uploading(&t(14), 120_400_000),
+            "uploading 1.2/120 MB · 14 new blobs · 3 reused"
+        );
     }
 }

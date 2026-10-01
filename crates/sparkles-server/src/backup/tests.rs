@@ -1232,7 +1232,7 @@ async fn e2e_cancel_and_conflicts() {
         t.id == id
             && t.message
                 .as_deref()
-                .is_some_and(|m| m.contains(" new blobs") && !m.contains(" 0 new blobs"))
+                .is_some_and(|m| m.contains(" new blob") && !m.contains(" 0 new blobs"))
     }) {
         assert!(t0.elapsed() < Duration::from_secs(30), "no upload progress");
         tokio::time::sleep(Duration::from_millis(5)).await;

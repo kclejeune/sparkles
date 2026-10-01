@@ -552,7 +552,8 @@ fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
+/// `1 blob`, `2 blobs`.
+pub(crate) fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -1456,7 +1457,9 @@ fn create(
         sparkles_backup::layout::default_backup_name(&dataset, chrono::Utc::now())
     });
     if !sparkles_backup::layout::valid_backup_name(&name) {
-        bail!("invalid backup name {name:?}: [a-z0-9][a-z0-9._-]{{0,63}}");
+        bail!(
+            "invalid backup name {name:?}: up to 64 of A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit"
+        );
     }
     let cfg = resolve(repo, config)?;
     let cli = Cli::new()?;
