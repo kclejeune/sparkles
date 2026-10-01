@@ -141,6 +141,10 @@ run = "cargo test -p sparkles --test w3c -- --nocapture --test-threads=1"
 description = "W3C SHACL Core + SHACL-SPARQL conformance"
 run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
+[tasks."test:shex"]
+description = "shexTest conformance (syntax, negative syntax and structure, representation, validation)"
+run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
+
 [tasks.ci]
 description = "Everything CI should run: formatting, lints, Rust and UI tests, third-party license notices up to date"
 depends = ["fmt:check", "lint", "test", "ui:test", "licenses:check"]
@@ -225,6 +229,18 @@ mkdir -p target/bench-data
 f="target/bench-data/shacl-$usage_people.nt"
 [ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
 cargo run --release -p sparkles-shacl --example bench -- "$f" - 5
+'''
+
+[tasks."bench:shex"]
+description = "ShEx validation benchmark on generated data"
+usage = '''
+arg "[people]" default="10000"
+'''
+run = '''
+mkdir -p target/bench-data
+f="target/bench-data/shacl-$usage_people.nt"
+[ -f "$f" ] || python3 scripts/gen-data.py "$usage_people" > "$f"
+cargo run --release -p sparkles-shex --example bench -- "$f" - 5
 '''
 
 [tasks."bench:shacl-write"]

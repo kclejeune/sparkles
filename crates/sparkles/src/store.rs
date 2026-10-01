@@ -175,6 +175,31 @@ pub struct Snapshot {
     pub historical: bool,
 }
 
+/// The kind of term an id stands for (see [`Snapshot::term_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TermKind {
+    Iri,
+    BNode,
+    Literal,
+    /// an RDF 1.2 triple term
+    Triple,
+    /// not a term of the store (UNDEF, specials, local ids)
+    Other,
+}
+
+impl TermKind {
+    /// The kind of a vocabulary key, from its first byte.
+    fn of_key_byte(b: u8) -> TermKind {
+        match b {
+            b'<' => TermKind::Iri,
+            b'"' => TermKind::Literal,
+            b'(' => TermKind::Triple,
+            b'_' => TermKind::BNode,
+            _ => TermKind::Other,
+        }
+    }
+}
+
 /// A contiguous run of rows produced by a scan.
 pub enum Chunk<'a> {
     /// rows `[start, end)` of a base block (no delta changes in between)
@@ -303,6 +328,41 @@ impl Snapshot {
             Tag::Vocab | Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
             _ => None,
         }
+    }
+
+    /// The kind of term an id stands for, without decoding the term: from the tag of
+    /// inline ids, the sort order of the base vocabulary, and the first byte of a delta
+    /// key. [`TermKind::Other`] for UNDEF, specials, local ids and unknown ids.
+    pub fn term_kind(&self, id: Id) -> TermKind {
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                TermKind::Literal
+            }
+            Tag::BNode => TermKind::BNode,
+            Tag::Vocab => {
+                let v = &self.generation.vocab;
+                match id.payload() {
+                    i if i >= v.len() => TermKind::Other,
+                    i if v.is_iri(i) => TermKind::Iri,
+                    i if v.is_triple(i) => TermKind::Triple,
+                    _ => TermKind::Literal,
+                }
+            }
+            Tag::Delta if id.payload() < self.dvocab_len => self
+                .generation
+                .dvocab
+                .with(|d| d.get(id.payload()).and_then(|k| k.first().copied()))
+                .map_or(TermKind::Other, TermKind::of_key_byte),
+            _ => TermKind::Other,
+        }
+    }
+
+    /// The base-vocabulary ids `[lo, hi)` of the IRIs that start with `prefix`. IRIs
+    /// added since the last rebuild have delta ids, outside this range: test those by
+    /// their string.
+    pub fn iri_prefix_range(&self, prefix: &str) -> (Id, Id) {
+        let (lo, hi) = self.generation.vocab.prefix_range(&id::iri_key(prefix));
+        (Id::vocab(lo), Id::vocab(hi))
     }
 
     // ---------------------------------------------------------------- scans ------

@@ -3449,6 +3449,7 @@ dependencies = [
  "sparkles-fmt",
  "sparkles-reasoner",
  "sparkles-shacl",
+ "sparkles-shex",
  "subtle",
  "tempfile",
  "tokio",
@@ -3481,6 +3482,30 @@ dependencies = [
  "spargebra",
  "sparkles",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "sparkles-shex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "oxrdfio",
+ "oxsdatatypes",
+ "oxttl",
+ "proptest",
+ "rayon",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "sparkles",
+ "tempfile",
+ "thiserror",
  "tracing",
 ]
 

@@ -692,7 +692,9 @@ fn xpath_replacement(r: &str) -> EvalResult<String> {
     Ok(out)
 }
 
-pub(crate) fn lang_matches(tag: &str, range: &str) -> bool {
+/// SPARQL `langMatches` (RFC 4647 basic filtering): `range` is `*`, the tag itself, or
+/// a prefix of it ending at a `-`, compared case-insensitively.
+pub fn lang_matches(tag: &str, range: &str) -> bool {
     if range == "*" {
         return !tag.is_empty();
     }

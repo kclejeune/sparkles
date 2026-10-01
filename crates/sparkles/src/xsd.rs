@@ -1,4 +1,5 @@
-//! Lexical well-formedness of XSD literals (`sh:datatype` requires a valid lexical form).
+//! Lexical well-formedness of XSD literals (`sh:datatype` and ShEx datatype constraints
+//! require a valid lexical form).
 
 use oxrdf::Literal;
 use oxsdatatypes::*;

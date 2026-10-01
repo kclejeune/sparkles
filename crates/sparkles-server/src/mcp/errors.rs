@@ -114,6 +114,7 @@ impl ErrorContext<'_> {
                         ("budget-decompressed-bytes", "decompressed-bytes")
                     }
                     BudgetKind::OutboundBytes => ("budget-outbound-bytes", "outbound-bytes"),
+                    BudgetKind::ValidationWork => ("budget-validation-work", "validation-work"),
                 };
                 let mut t = ToolError::new(code, 507, b.to_string()).hint(BUDGET_HINT);
                 t.budget = Some(budget);

@@ -1,7 +1,8 @@
 //! `sparkles` — Fuseki-compatible server and Jena-style command line tools
 //! (`serve` ≈ fuseki-server, `load` ≈ tdb2.tdbloader, `query` ≈ tdb2.tdbquery / arq,
 //! `update` ≈ tdb2.tdbupdate, `dump` ≈ tdb2.tdbdump, `compact`, `backup`, `stats`,
-//! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`).
+//! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`, `shex` ≈ jena `shex
+//! validate|parse`).
 
 mod alloc;
 mod auth;
@@ -25,8 +26,10 @@ mod reasoning;
 mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
+mod shex_cmd;
 mod state;
 mod ui;
+mod validation_common;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -900,6 +903,9 @@ enum Cmd {
         #[arg(long)]
         timeout: Option<f64>,
     },
+    /// ShEx: validate a database (or data files) against a schema and a shape map
+    /// (exits with status 1 when an association does not conform), or print schemas
+    Shex(shex_cmd::ShexArgs),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -1548,6 +1554,7 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
+        Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Load {
             loc,
             graph,
@@ -2255,15 +2262,15 @@ fn run() -> Result<()> {
                 .with_context(|| format!("unknown report format '{format}'"))?;
             let shapes = read_shapes(&shapes)?;
             let store = open_or_load(loc, &data, opts)?;
-            let graph = shacl::DataGraph::parse(&graph)?;
+            let graph = validation_common::GraphParam::parse(&graph)?;
             let snap = store.snapshot();
-            if let shacl::DataGraph::Named(iri) = &graph
-                && !shacl::graph_exists(&snap, iri)
+            if let validation_common::GraphParam::Named(iri) = &graph
+                && !validation_common::graph_exists(&snap, iri)
             {
                 bail!("no such graph: <{iri}>");
             }
-            let inferred =
-                shacl::graph_exists(&snap, http::INFERRED_GRAPH).then_some(http::INFERRED_GRAPH);
+            let inferred = validation_common::graph_exists(&snap, http::INFERRED_GRAPH)
+                .then_some(http::INFERRED_GRAPH);
             let mut vopts = shacl::validate_options(&snap, &graph, inferred, !no_inferences)?;
             vopts.timeout = timeout.map(Duration::from_secs_f64);
             let report = sparkles_shacl::validate(&snap, &shapes, &vopts)?;
