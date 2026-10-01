@@ -4,6 +4,13 @@
 //! the first error ends the parse with [`FormatError::Unsupported`] (the reference
 //! parser accepted the input, so any error here is the formatter's).
 //!
+//! It accepts what the reference parser (spargebra) accepts: the SPARQL 1.2 grammar, with
+//! spargebra's leniencies (no `.` needed between the triples of a quad block, a lone `;`
+//! as an update request, `{ . }` as a `CONSTRUCT` template) and its checks beyond the
+//! grammar that need no algebra: escapes, base directions, `VALUES` arity, blank node
+//! label scopes, ground quad data, reifiers after property paths. It does not check the
+//! scoping of variables.
+//!
 //! After an error the parser answers [`TokenKind::Eof`] to every lookahead, so every
 //! loop ends.
 
@@ -22,6 +29,7 @@ use crate::FormatError;
 use crate::lex::{Token, TokenKind};
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeData, NodeId, TokenId, Tree};
+use std::collections::HashSet;
 
 /// Parse a whole query or update request.
 pub fn parse<'s>(src: &'s str, tokens: Vec<Token>, unit: Unit) -> Result<Tree<'s>, FormatError> {
@@ -65,6 +73,33 @@ pub struct Parser<'t> {
     events: Vec<Event>,
     /// the first error and the byte offset it is at
     error: Option<(String, usize)>,
+    /// what the quad block being parsed may not hold
+    ground: Ground,
+    labels: Labels<'t>,
+}
+
+/// What a quad block may not hold: variables in `INSERT DATA` and `DELETE DATA`, blank
+/// nodes in `DELETE DATA`, `DELETE WHERE` and `DELETE { … }`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ground {
+    pub no_vars: bool,
+    pub no_blank_nodes: bool,
+}
+
+/// The scopes of blank node labels, as the reference parser tracks them: a label may not
+/// appear on both sides of a group's brace (`{` or `}` of a `GroupGraphPattern`, so in
+/// two basic graph patterns), within one query or update operation; and two `INSERT
+/// DATA` operations of a request may not share a label.
+#[derive(Debug, Default)]
+struct Labels<'t> {
+    /// the labels of the closed regions
+    used: HashSet<&'t str>,
+    /// the labels since the last group brace
+    current: HashSet<&'t str>,
+    /// the labels of the `INSERT DATA` operation being parsed, if any
+    insert_data: Option<HashSet<&'t str>>,
+    /// the labels of the earlier `INSERT DATA` operations
+    inserted: HashSet<&'t str>,
 }
 
 impl<'t> Parser<'t> {
@@ -82,6 +117,8 @@ impl<'t> Parser<'t> {
             pos: 0,
             events: Vec::new(),
             error: None,
+            ground: Ground::default(),
+            labels: Labels::default(),
         }
     }
 
@@ -137,11 +174,84 @@ impl<'t> Parser<'t> {
 
     /// Consume the current token, re-kinded (a keyword's word as [`TokenKind::Kw`]).
     pub fn bump_as(&mut self, kind: TokenKind) {
-        if self.current() == TokenKind::Eof {
+        // the checks of the data the token is in
+        let ok = match self.current() {
+            TokenKind::Eof => false,
+            TokenKind::Var1 | TokenKind::Var2 if self.ground.no_vars => {
+                self.error("variables are not allowed in data");
+                false
+            }
+            TokenKind::BlankNodeLabel => self.label(self.nth_text(0)),
+            TokenKind::Anon => self.blank_node_here(),
+            _ => true,
+        };
+        if !ok {
             return;
         }
         self.events.push(Event::Token { kind });
         self.pos += 1;
+    }
+
+    /// Check a blank node label against the ground rules and the label scopes.
+    fn label(&mut self, text: &'t str) -> bool {
+        if !self.blank_node_here() {
+            return false;
+        }
+        let label = text.strip_prefix("_:").unwrap_or(text);
+        if self.labels.used.contains(label) {
+            self.error("a blank node label is used in two basic graph patterns");
+            return false;
+        }
+        self.labels.current.insert(label);
+        if let Some(op) = &mut self.labels.insert_data {
+            op.insert(label);
+        }
+        true
+    }
+
+    /// A blank node (labeled, `[]`, `[ … ]`, a collection or an implicit reifier) is
+    /// here: an error where blank nodes are not allowed.
+    pub fn blank_node_here(&mut self) -> bool {
+        if self.ground.no_blank_nodes {
+            self.error("blank nodes are not allowed in deletions");
+            return false;
+        }
+        true
+    }
+
+    /// Set what the next quad block may not hold; returns the previous setting.
+    pub fn set_ground(&mut self, ground: Ground) -> Ground {
+        std::mem::replace(&mut self.ground, ground)
+    }
+
+    /// A brace of a group: the labels so far may not be used again in this query or
+    /// operation.
+    pub fn close_label_region(&mut self) {
+        let current = std::mem::take(&mut self.labels.current);
+        self.labels.used.extend(current);
+    }
+
+    /// Forget the labels since the last group brace (after a `CONSTRUCT` template, a
+    /// `DELETE` or an `INSERT` template).
+    pub fn forget_label_region(&mut self) {
+        self.labels.current.clear();
+    }
+
+    /// The end of an update operation: its labels are its own.
+    pub fn end_operation(&mut self) {
+        self.labels.used.clear();
+        self.labels.current.clear();
+        if let Some(op) = self.labels.insert_data.take() {
+            if op.iter().any(|l| self.labels.inserted.contains(l)) {
+                self.error("a blank node label is shared by two INSERT DATA operations");
+            }
+            self.labels.inserted.extend(op);
+        }
+    }
+
+    /// The start of an `INSERT DATA` operation, whose labels may not appear in another.
+    pub fn start_insert_data(&mut self) {
+        self.labels.insert_data = Some(HashSet::new());
     }
 
     /// Consume the current token if it is `kind`.

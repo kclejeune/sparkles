@@ -1,0 +1,11 @@
+PREFIX ex: <http://example.org/>
+select distinct ?s (COUNT(?o) AS ?count) (SAMPLE($n) AS ?n2)
+FROM <http://example.org/g>
+FROM NAMED ex:named
+WHERE { ?s ex:p ?o ; ex:n $n }
+GROUP BY ?s (LCASE(?o) AS ?lo) STR(?n) ex:f(?n)
+HAVING (COUNT(?o) > 1) BOUND(?s)
+ORDER BY DESC(?s) ASC(?count) ?lo STRLEN(STR(?s))
+LIMIT 10
+OFFSET 5
+VALUES ?s { ex:a UNDEF }

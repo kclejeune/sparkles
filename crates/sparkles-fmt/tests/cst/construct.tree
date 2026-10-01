@@ -1,0 +1,46 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  ConstructQuery
+    Kw(Construct) "CONSTRUCT"
+    ConstructTemplate
+      LBrace "{"
+      TriplesStmt
+        Var1 "?s"
+        PropertyListEntry
+          PnameLn "ex:p"
+          Object
+            Var1 "?o"
+        Dot "."
+      TriplesStmt
+        Var1 "?o"
+        PropertyListEntry
+          Kw(A) "a"
+          Object
+            PnameLn "ex:C"
+      RBrace "}"
+    DatasetClause
+      Kw(From) "FROM"
+      IriRef "<http://example.org/g>"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Var1 "?o"
+        RBrace "}"
+    OrderBy
+      Kw(Order) "ORDER"
+      Kw(By) "BY"
+      OrderCondition
+        Var1 "?s"
+    Limit
+      Kw(Limit) "LIMIT"
+      Integer "3"

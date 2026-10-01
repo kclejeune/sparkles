@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+SELECT * {
+  VALUES (?a $b) { (ex:a "b"@en) (UNDEF 1) ( <<( ex:s a "o" )>> false ) }
+  VALUES () { () () }
+  VALUES ?x {}
+}
+VALUES ( ) { ( ) }

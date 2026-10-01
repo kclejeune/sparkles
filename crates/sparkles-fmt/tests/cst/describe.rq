@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.org/>
+DESCRIBE ?s ex:thing <http://example.org/other>
+FROM ex:g
+WHERE { ?s a ex:C }

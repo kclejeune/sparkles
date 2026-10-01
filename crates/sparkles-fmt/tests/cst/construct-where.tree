@@ -1,0 +1,30 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  ConstructQuery
+    Kw(Construct) "CONSTRUCT"
+    DatasetClause
+      Kw(From) "FROM"
+      PnameLn "ex:g"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+          Dot "."
+        TriplesStmt
+          Var1 "?o"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Integer "1"
+          Dot "."
+        RBrace "}"
