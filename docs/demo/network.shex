@@ -1,0 +1,35 @@
+# ShEx schema of the demo dataset's people, organisations and cities (see vocab.ttl);
+# validate it with the shape map in network.smap. Written for Sparkles.
+
+PREFIX ex: <http://example.org/ns#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+ex:PersonShape EXTRA a {
+  a [ex:Person] ;
+  foaf:name xsd:string ;
+  ex:jobTitle rdf:langString + ;
+  ex:birthDate xsd:date ? ;
+  ex:publications xsd:integer MININCLUSIVE 0 ? ;
+  ex:worksFor IRI ;
+  ex:livesIn @ex:CityShape ? ;
+  foaf:knows IRI *
+}
+
+ex:OrganizationShape {
+  rdfs:label rdf:langString + ;
+  ex:founded xsd:gYear ;
+  ex:employees xsd:integer MININCLUSIVE 1 ;
+  ex:headquarters @ex:CityShape ;
+  ex:website IRI ?
+}
+
+ex:CityShape EXTRA a {
+  a [ex:City] ;
+  rdfs:label rdf:langString + ;
+  ex:population xsd:integer MININCLUSIVE 0 ;
+  geo:hasDefaultGeometry { geo:asWKT geo:wktLiteral }
+}

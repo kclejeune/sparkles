@@ -1,0 +1,304 @@
+# People and organisations of the demo dataset (see vocab.ttl). Everyone and everything
+# here is fictional. Three records carry the kind of mistakes the ShEx schema (network.shex)
+# is there to catch: Tomasz Kowalski's birth date is a plain string, Omar Haddad has no
+# foaf:name, and Corvid Labs reports zero employees.
+
+@prefix ex: <http://example.org/ns#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix orgs: <http://example.org/org/> .
+@prefix person: <http://example.org/person/> .
+@prefix place: <http://example.org/place/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# ---------------------------------------------------------------------- organisations ----
+
+orgs:helix-institute a ex:ResearchInstitute ;
+    rdfs:label "Helix Institute for Computational Biology"@en ;
+    rdfs:comment "Protein structure prediction and genome-scale models."@en ;
+    ex:founded "1998"^^xsd:gYear ;
+    ex:employees 310 ;
+    ex:headquarters place:zurich ;
+    ex:website <https://helix.example/> ;
+    ex:partnerOf orgs:lumen-university, orgs:meridian-health .
+
+orgs:lumen-university a ex:University ;
+    rdfs:label "Lumen University"@en, "Universiteit Lumen"@nl ;
+    rdfs:comment "A research university with strong computer science and linguistics."@en ;
+    ex:founded "1921"^^xsd:gYear ;
+    ex:employees 5400 ;
+    ex:headquarters place:amsterdam ;
+    ex:website <https://lumen.example/> ;
+    ex:partnerOf orgs:vltava-institute .
+
+orgs:aurora-polytechnic a ex:University ;
+    rdfs:label "Aurora Polytechnic"@en, "Aurora-ammattikorkeakoulu"@fi ;
+    ex:founded "1972"^^xsd:gYear ;
+    ex:employees 2100 ;
+    ex:headquarters place:helsinki ;
+    ex:website <https://aurora.example/> ;
+    ex:partnerOf orgs:northwind-robotics .
+
+orgs:vltava-institute a ex:ResearchInstitute ;
+    rdfs:label "Vltava Institute of Linguistics"@en, "Vltavský lingvistický ústav"@cs ;
+    ex:founded "1953"^^xsd:gYear ;
+    ex:employees 140 ;
+    ex:headquarters place:prague ;
+    ex:website <https://vltava.example/> .
+
+orgs:northwind-robotics a ex:Company ;
+    rdfs:label "Northwind Robotics"@en ;
+    rdfs:comment "Autonomous logistics robots for warehouses and ports."@en ;
+    ex:founded "2011"^^xsd:gYear ;
+    ex:employees 240 ;
+    ex:headquarters place:copenhagen ;
+    ex:website <https://northwind.example/> .
+
+orgs:meridian-health a ex:Company ;
+    rdfs:label "Meridian Health Analytics"@en ;
+    ex:founded "2008"^^xsd:gYear ;
+    ex:employees 410 ;
+    ex:headquarters place:milan ;
+    ex:website <https://meridian.example/> .
+
+orgs:kestrel-energy a ex:Company ;
+    rdfs:label "Kestrel Energy"@en ;
+    rdfs:comment "Offshore wind forecasting and grid storage."@en ;
+    ex:founded "2013"^^xsd:gYear ;
+    ex:employees 180 ;
+    ex:headquarters place:edinburgh ;
+    ex:website <https://kestrel.example/> ;
+    ex:partnerOf orgs:aurora-polytechnic .
+
+orgs:tessellate a ex:Startup ;
+    rdfs:label "Tessellate Maps"@en ;
+    rdfs:comment "Vector tiles and spatial search for the open web."@en ;
+    ex:founded "2018"^^xsd:gYear ;
+    ex:employees 36 ;
+    ex:headquarters place:berlin ;
+    ex:website <https://tessellate.example/> ;
+    ex:partnerOf orgs:atlas-open-data .
+
+orgs:corvid-labs a ex:Startup ;
+    rdfs:label "Corvid Labs"@en ;
+    rdfs:comment "Knowledge graphs for small newsrooms."@en ;
+    ex:founded "2021"^^xsd:gYear ;
+    ex:employees 0 ;
+    ex:headquarters place:lisbon ;
+    ex:website <https://corvid.example/> .
+
+orgs:atlas-open-data a ex:Nonprofit ;
+    rdfs:label "Atlas Open Data Foundation"@en, "Fondation Atlas Open Data"@fr ;
+    rdfs:comment "Publishes public-sector data as linked open data."@en ;
+    ex:founded "2009"^^xsd:gYear ;
+    ex:employees 22 ;
+    ex:headquarters place:brussels ;
+    ex:website <https://atlas.example/> .
+
+# ----------------------------------------------------------------------------- people ----
+
+person:ada-okafor a ex:Person ;
+    rdfs:label "Ada Okafor" ; foaf:name "Ada Okafor" ;
+    ex:jobTitle "Principal Scientist"@en ;
+    ex:birthDate "1981-04-17"^^xsd:date ;
+    ex:publications 64 ;
+    ex:worksFor orgs:helix-institute ;
+    ex:memberOf orgs:atlas-open-data ;
+    ex:livesIn place:zurich ;
+    foaf:knows person:kenji-watanabe, person:priya-raman, person:sofia-rossi, person:lea-moreau .
+
+person:kenji-watanabe a ex:Person ;
+    rdfs:label "Kenji Watanabe" ; foaf:name "Kenji Watanabe" ;
+    ex:jobTitle "Research Fellow"@en ;
+    ex:birthDate "1990-11-02"^^xsd:date ;
+    ex:publications 18 ;
+    ex:worksFor orgs:helix-institute ;
+    ex:livesIn place:geneva ;
+    foaf:knows person:ada-okafor, person:chiara-bianchi .
+
+person:priya-raman a ex:Person ;
+    rdfs:label "Priya Raman" ; foaf:name "Priya Raman" ;
+    ex:jobTitle "Professor of Computer Science"@en ;
+    ex:birthDate "1975-08-29"^^xsd:date ;
+    ex:publications 112 ;
+    ex:worksFor orgs:lumen-university ;
+    ex:livesIn place:amsterdam ;
+    foaf:knows person:ada-okafor, person:tomasz-kowalski, person:lukas-novak, person:isabel-garcia .
+
+person:tomasz-kowalski a ex:Person ;
+    rdfs:label "Tomasz Kowalski" ; foaf:name "Tomasz Kowalski" ;
+    ex:jobTitle "PhD Candidate"@en ;
+    ex:birthDate "30/02/1997" ;
+    ex:publications 4 ;
+    ex:worksFor orgs:lumen-university ;
+    ex:livesIn place:rotterdam ;
+    foaf:knows person:priya-raman, person:zofia-wisniewska .
+
+person:lukas-novak a ex:Person ;
+    rdfs:label "Lukáš Novák" ; foaf:name "Lukáš Novák" ;
+    ex:jobTitle "Computational Linguist"@en, "Počítačový lingvista"@cs ;
+    ex:birthDate "1986-03-12"^^xsd:date ;
+    ex:publications 27 ;
+    ex:worksFor orgs:vltava-institute ;
+    ex:livesIn place:prague ;
+    foaf:knows person:priya-raman, person:isabel-garcia .
+
+person:isabel-garcia a ex:Person ;
+    rdfs:label "Isabel García" ; foaf:name "Isabel García" ;
+    ex:jobTitle "Visiting Researcher"@en, "Investigadora visitante"@es ;
+    ex:birthDate "1979-06-05"^^xsd:date ;
+    ex:publications 45 ;
+    ex:worksFor orgs:vltava-institute ;
+    ex:livesIn place:barcelona ;
+    foaf:knows person:lukas-novak, person:priya-raman, person:joao-pereira .
+
+person:mateo-fernandez a ex:Person ;
+    rdfs:label "Mateo Fernández" ; foaf:name "Mateo Fernández" ;
+    ex:jobTitle "Robotics Engineer"@en ;
+    ex:birthDate "1992-01-23"^^xsd:date ;
+    ex:worksFor orgs:northwind-robotics ;
+    ex:livesIn place:copenhagen ;
+    foaf:knows person:ingrid-solberg, person:nils-hansen, person:isabel-garcia .
+
+person:ingrid-solberg a ex:Person ;
+    rdfs:label "Ingrid Solberg" ; foaf:name "Ingrid Solberg" ;
+    ex:jobTitle "Chief Technology Officer"@en ;
+    ex:birthDate "1977-09-30"^^xsd:date ;
+    ex:publications 9 ;
+    ex:worksFor orgs:northwind-robotics ;
+    ex:livesIn place:copenhagen ;
+    foaf:knows person:mateo-fernandez, person:nils-hansen, person:mikko-virtanen .
+
+person:nils-hansen a ex:Person ;
+    rdfs:label "Nils Hansen" ; foaf:name "Nils Hansen" ;
+    ex:jobTitle "Hardware Lead"@en ;
+    ex:birthDate "1984-12-14"^^xsd:date ;
+    ex:worksFor orgs:northwind-robotics ;
+    ex:livesIn place:stockholm ;
+    foaf:knows person:ingrid-solberg, person:mateo-fernandez .
+
+person:mikko-virtanen a ex:Person ;
+    rdfs:label "Mikko Virtanen" ; foaf:name "Mikko Virtanen" ;
+    ex:jobTitle "Professor of Physics"@en ;
+    ex:birthDate "1969-05-08"^^xsd:date ;
+    ex:publications 140 ;
+    ex:worksFor orgs:aurora-polytechnic ;
+    ex:livesIn place:helsinki ;
+    foaf:knows person:ingrid-solberg, person:zofia-wisniewska, person:freya-lindqvist .
+
+person:zofia-wisniewska a ex:Person ;
+    rdfs:label "Zofia Wiśniewska" ; foaf:name "Zofia Wiśniewska" ;
+    ex:jobTitle "Postdoctoral Researcher"@en ;
+    ex:birthDate "1993-07-19"^^xsd:date ;
+    ex:publications 11 ;
+    ex:worksFor orgs:aurora-polytechnic ;
+    ex:livesIn place:warsaw ;
+    foaf:knows person:mikko-virtanen, person:tomasz-kowalski .
+
+person:freya-lindqvist a ex:Person ;
+    rdfs:label "Freya Lindqvist" ; foaf:name "Freya Lindqvist" ;
+    ex:jobTitle "Energy Systems Analyst"@en ;
+    ex:birthDate "1988-02-11"^^xsd:date ;
+    ex:worksFor orgs:kestrel-energy ;
+    ex:livesIn place:edinburgh ;
+    foaf:knows person:mikko-virtanen, person:amara-nwosu .
+
+person:amara-nwosu a ex:Person ;
+    rdfs:label "Amara Nwosu" ; foaf:name "Amara Nwosu" ;
+    ex:jobTitle "Research Engineer"@en ;
+    ex:birthDate "1991-10-03"^^xsd:date ;
+    ex:publications 7 ;
+    ex:worksFor orgs:kestrel-energy ;
+    ex:livesIn place:london ;
+    foaf:knows person:freya-lindqvist, person:aoife-byrne .
+
+person:yusuf-demir a ex:Person ;
+    rdfs:label "Yusuf Demir" ; foaf:name "Yusuf Demir" ;
+    ex:jobTitle "Geospatial Engineer"@en ;
+    ex:birthDate "1989-04-26"^^xsd:date ;
+    ex:worksFor orgs:tessellate ;
+    ex:livesIn place:berlin ;
+    foaf:knows person:elif-yildiz, person:daniel-weber, person:lea-moreau .
+
+person:elif-yildiz a ex:Person ;
+    rdfs:label "Elif Yıldız" ; foaf:name "Elif Yıldız" ;
+    ex:jobTitle "Cartographer"@en, "Kartografin"@de ;
+    ex:birthDate "1994-09-09"^^xsd:date ;
+    ex:worksFor orgs:tessellate ;
+    ex:livesIn place:berlin ;
+    foaf:knows person:yusuf-demir .
+
+person:daniel-weber a ex:Person ;
+    rdfs:label "Daniel Weber" ; foaf:name "Daniel Weber" ;
+    ex:jobTitle "Platform Engineer"@en ;
+    ex:birthDate "1987-01-31"^^xsd:date ;
+    ex:worksFor orgs:tessellate ;
+    ex:livesIn place:vienna ;
+    foaf:knows person:yusuf-demir, person:hannah-schmidt .
+
+person:lea-moreau a ex:Person ;
+    rdfs:label "Léa Moreau" ; foaf:name "Léa Moreau" ;
+    ex:jobTitle "Data Scientist"@en, "Data scientist"@fr ;
+    ex:birthDate "1990-03-15"^^xsd:date ;
+    ex:publications 13 ;
+    ex:worksFor orgs:atlas-open-data ;
+    ex:livesIn place:brussels ;
+    foaf:knows person:ada-okafor, person:yusuf-demir, person:omar-haddad, person:hannah-schmidt .
+
+person:hannah-schmidt a ex:Person ;
+    rdfs:label "Hannah Schmidt" ; foaf:name "Hannah Schmidt" ;
+    ex:jobTitle "Policy Lead"@en ;
+    ex:birthDate "1983-11-21"^^xsd:date ;
+    ex:worksFor orgs:atlas-open-data ;
+    ex:livesIn place:munich ;
+    foaf:knows person:lea-moreau, person:daniel-weber .
+
+person:omar-haddad a ex:Person ;
+    rdfs:label "Omar Haddad" ;
+    ex:jobTitle "Operations Manager"@en ;
+    ex:birthDate "1985-06-27"^^xsd:date ;
+    ex:worksFor orgs:atlas-open-data ;
+    ex:livesIn place:paris ;
+    foaf:knows person:lea-moreau .
+
+person:sofia-rossi a ex:Person ;
+    rdfs:label "Sofia Rossi" ; foaf:name "Sofia Rossi" ;
+    ex:jobTitle "Head of Analytics"@en, "Responsabile analisi dati"@it ;
+    ex:birthDate "1980-12-01"^^xsd:date ;
+    ex:publications 22 ;
+    ex:worksFor orgs:meridian-health ;
+    ex:livesIn place:milan ;
+    foaf:knows person:ada-okafor, person:chiara-bianchi .
+
+person:chiara-bianchi a ex:Person ;
+    rdfs:label "Chiara Bianchi" ; foaf:name "Chiara Bianchi" ;
+    ex:jobTitle "Biostatistician"@en ;
+    ex:birthDate "1992-05-18"^^xsd:date ;
+    ex:publications 15 ;
+    ex:worksFor orgs:meridian-health ;
+    ex:livesIn place:rome ;
+    foaf:knows person:sofia-rossi, person:kenji-watanabe .
+
+person:joao-pereira a ex:Person ;
+    rdfs:label "João Pereira" ; foaf:name "João Pereira" ;
+    ex:jobTitle "Founder and CEO"@en, "Fundador e CEO"@pt ;
+    ex:birthDate "1986-08-08"^^xsd:date ;
+    ex:worksFor orgs:corvid-labs ;
+    ex:livesIn place:lisbon ;
+    foaf:knows person:carlos-mendes, person:aoife-byrne, person:isabel-garcia .
+
+person:carlos-mendes a ex:Person ;
+    rdfs:label "Carlos Mendes" ; foaf:name "Carlos Mendes" ;
+    ex:jobTitle "Data Engineer"@en ;
+    ex:birthDate "1995-02-14"^^xsd:date ;
+    ex:worksFor orgs:corvid-labs ;
+    ex:livesIn place:lisbon ;
+    foaf:knows person:joao-pereira .
+
+person:aoife-byrne a ex:Person ;
+    rdfs:label "Aoife Byrne" ; foaf:name "Aoife Byrne" ;
+    ex:jobTitle "Software Engineer"@en ;
+    ex:birthDate "1993-10-27"^^xsd:date ;
+    ex:worksFor orgs:corvid-labs ;
+    ex:livesIn place:dublin ;
+    foaf:knows person:joao-pereira, person:amara-nwosu .

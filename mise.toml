@@ -215,6 +215,16 @@ run = "./target/release/sparkles serve --data ./data"
 description = "API docs for the library crates"
 run = "cargo doc --workspace --no-deps --exclude sparkles-server"
 
+[tasks."docs:screenshots"]
+description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port, Playwright drives the UI in dark mode, oxipng shrinks the images (not part of ci)"
+depends = ["build", "ui:e2e:browsers"]
+dir = "ui"
+tools = { "github:shssoichiro/oxipng" = "10.2.1" }
+run = '''
+pnpm screenshots
+oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
+'''
+
 [tasks.gen-data]
 description = "Generate a synthetic N-Triples dataset (~10.5 triples per person)"
 usage = '''
