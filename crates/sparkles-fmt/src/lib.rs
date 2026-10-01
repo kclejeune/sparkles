@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(f.warnings[0].code, "undeclared-prefix");
         assert_eq!((f.warnings[0].line, f.warnings[0].column), (7, 5));
 
-        let u = "INSERT DATA { <a> <b> <c> } ;\nCLEAR ALL";
+        let u = "CLEAR ALL;\n\nDROP SILENT GRAPH <g>\n";
         assert_eq!(
             format(u, Language::Sparql, &Options::default())
                 .unwrap()
