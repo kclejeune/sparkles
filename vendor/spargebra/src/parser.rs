@@ -2440,17 +2440,17 @@ parser! {
                 }
             }
 
-        rule iriOrFunction() -> Expression = i: iri() _ a: ArgList()? {?
-            if let Some(a) = a {
+        rule iriOrFunction() -> Expression =
+            i: iri() _ a: ArgList() {?
                 if state.custom_aggregate_functions.contains(&i) {
                     Err("This custom function is an aggregate function and not a regular function")
                 } else {
                     Ok(Expression::FunctionCall(Function::Custom(i), a))
                 }
-            } else {
-                Ok(i.into())
-            }
-        }
+            } /
+            // an IRI followed by `(` that is no argument list is a custom aggregate with
+            // DISTINCT (`Aggregate`), not an IRI
+            i: iri() !(_ "(") { i.into() }
 
         rule RDFLiteral() -> Literal =
             value:String() _ "^^" _ datatype:iri() { Literal::new_typed_literal(value, datatype) } /

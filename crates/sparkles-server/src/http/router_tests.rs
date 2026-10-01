@@ -22,6 +22,8 @@ mod cost;
 mod format;
 #[cfg(feature = "geo")]
 mod geo;
+#[cfg(feature = "geo")]
+mod geo_convert;
 mod loads;
 mod open;
 #[cfg(feature = "reasoning")]
