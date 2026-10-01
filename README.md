@@ -62,7 +62,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
-| Backups and dumps (N-Quads; gzip by default, or zstd, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
+| N-Quads backups (`/$/backup`) and dumps (gzip by default, or zstd, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
 | Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
@@ -87,7 +87,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Feature | Status |
 |---|---|
 | SPARQL protocol, GSP, upload, `/$/` admin (datasets, stats, compact, backup, tasks), Jena special graphs (`urn:x-arq:DefaultGraph`/`UnionGraph`) | ✅ |
-| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl`, `schema`, `clone`, `check`), operating on the database directory directly | ✅ |
+| Jena-style CLI (`load`, `query`, `update`, `dump`, `compact`, `backup`, `repo`, `stats`, `infer`, `shacl`, `schema`, `clone`, `check`), operating on the database directory directly | ✅ |
+| Backup repositories (`sparkles-backup`; `backup` cargo feature, on by default): online backups of persistent datasets to a file system or S3 (AWS, MinIO, R2, Ceph RGW) that hold the writer lock only for a few system calls; incremental and deduplicated (content-addressed 32 MiB pieces, only the appended bytes of the WAL and catalog), manifest written last; restore to a new dataset or in place (requests get `503` + `Retry-After` during the swap, never `404`) with dataset-id rules (`auto` / `new` / `keep`) and an integrity check before publishing; verification (`exists`, `data`, `restore`); lifecycle policies (cron or `every` schedules in an IANA time zone, catch-up, retention, optional GC); two-phase GC with a grace period; lease locks judged by the storage server's clock, so several servers and the CLI share a repository; repositories from a config file or registered through the API within operator limits (named credential sources, the outbound policy, `fs` roots); `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`, `sparkles backup create\|list\|show\|restore\|verify\|delete\|policy`, a Backups page in the UI, `sparkles_backup_*` metrics and audit events; see [docs/API.md](docs/API.md#backup-repositories). Not yet: in-memory datasets, encryption, server-wide backups, running policies offline | ✅ |
 | Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`): same quads and blank-node ids, new dataset id with `forkedFrom`, inferences copied or dropped | ✅ |
 | Embedded Rust API (`sparkles::Dataset`) and fluent query builder (`sparkles::querybuilder`) | ✅ |
 | RDFS / OWL 2 RL materialization, Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`) | ✅ |
@@ -170,6 +171,7 @@ feature gaps are:
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | Basic, Bearer tokens, OIDC (UI) and trusted proxy headers, with per-dataset levels; no graph-level ACLs yet; Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |
 | SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
 | Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
+| Backups | `/$/backup/{ds}`: a gzipped N-Quads dump of the whole dataset per backup, in the server's directory; restored by loading it into a new dataset | the same dumps (`/$/backup/{ds}`, also zstd, brotli or LZ4), plus backup repositories on a file system or S3: incremental, deduplicated backups that restore to a ready database without a reload, with verification, schedules and retention |
 
 ### vs. QLever
 
@@ -204,7 +206,7 @@ appears here only as a benchmark comparison (downloaded at benchmark time).
 | Security | ledger-stored access policies, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers; no policy language, signed requests or encryption at rest |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher + Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, MCP server | SPARQL, the Rust API and an MCP server (stdio, read-only tools); JSON-LD as an RDF format only |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`) and exact vector search (`spk:vectorSearch`); no approximate (HNSW) vector index or geospatial search yet |
-| Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk |
+| Deployment | S3 / DynamoDB / IPFS storage, Raft clustering, read replicas ("query peers") | single node, local disk, plus incremental, deduplicated backups to a file system or S3 |
 | Reasoning | at query time (RDFS / OWL 2 QL rewriting, OWL 2 RL / Datalog with a fact budget) | materialized (RDFS, OWL 2 RL, Jena rules) |
 
 Where Sparkles is ahead:
@@ -234,7 +236,7 @@ queries run.
 | Area | Oxigraph has | Sparkles |
 |---|---|---|
 | Embedding | Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | Rust library (persistent or in-memory); no Python or WebAssembly bindings |
-| Storage | RocksDB (an LSM tree; C++), 9 index orders (6 for named graphs, 3 for the default graph) plus a string dictionary; updates in place; online backups via RocksDB checkpoints | immutable sorted blocks in 7 orders plus a WAL-logged in-memory delta, merged by compaction |
+| Storage | RocksDB (an LSM tree; C++), 9 index orders (6 for named graphs, 3 for the default graph) plus a string dictionary; updates in place; online backups via RocksDB checkpoints (each a complete database in a new local directory, hard-linked when on the same file system) | immutable sorted blocks in 7 orders plus a WAL-logged in-memory delta, merged by compaction; online backups into backup repositories on a file system or S3 (incremental and deduplicated across backups and datasets), with restore, verification, schedules and retention |
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI; no spatial index) | ✗ none |
 | Write durability | a RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default write options) | the WAL is fsynced before a write is acknowledged |
 
@@ -478,6 +480,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--min-free-disk-mb N` | `1024` | refuse (`507`) to spool a request body once the temporary directory's file system would keep less free, and to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) once the data directory's would (`0`: no check) |
 | `--max-mem-dataset-mb N` | `4096` | largest in-memory dataset; a commit that would grow one past it fails with `507` (`0`: unlimited) |
 | `--max-tasks N` | `4` | background tasks (compaction, clones, reasoning, full-text builds, N-Quads backups) running at once; more wait `queued` (`0`: no limit) |
+| `--backup-config FILE` | | backup repositories, policies, credential sources and the limits of repositories registered through the API (TOML, also `$SPARKLES_BACKUP_CONFIG`; re-read on SIGHUP; read-only through the API) |
+| `--backup-max-tasks N` | `2` | backup, restore, verify and GC tasks running at once; more wait `queued` |
 | `--vector-memory-mb N` | `4096` | memory for the packed vectors of `spk:vectorSearch`, per index generation |
 | `--log-format text\|json` | `text` | log format on stderr (global flag); `RUST_LOG` filters as usual |
 | `--no-access-log` | | no per-request log lines |
@@ -526,41 +530,48 @@ sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 ```
 
-Backup repositories work offline too, on a stopped database (a server's own backups go
-through its HTTP API). `--repo` takes a name from the backup config file
+Backup repositories (see [docs/API.md](docs/API.md#backup-repositories)) work offline
+too, on a stopped database; a server's own datasets are backed up through its HTTP API or
+UI, or by its policies. `--repo` takes a name from the backup config file
 (`--backup-config FILE`, `$SPARKLES_BACKUP_CONFIG`, default
 `$XDG_CONFIG_HOME/sparkles/backup.toml`) or a URL: `file:///srv/backups/r`,
 `s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true`, or `memory://`.
 Credentials never go in URLs; they come from the environment or a credentials file.
-Manifests are cached in `$XDG_CACHE_HOME/sparkles/backup/`, progress goes to stderr,
-Ctrl-C cancels, and every command takes `--format json` (or `--json`). Exit codes: 0 ok,
-1 errors, 2 warnings only (orphaned blobs in `repo verify`).
+Only `repo add` and `backup create` initialize an empty location; the other commands
+attach to an existing repository. Manifests are cached in
+`$XDG_CACHE_HOME/sparkles/backup/`, progress goes to stderr, Ctrl-C cancels (twice:
+quits), and the commands that print a result take `--format json` (or `--json`). Exit
+codes: 0 ok, 1 errors, 2 warnings only (orphaned blobs in `repo verify`).
 
 ```sh
 sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
 sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
+#   --endpoint URL --path-style --allow-http (MinIO, R2, …); --credentials default | env |
+#   env:KEY_VAR,SECRET_VAR[,TOKEN_VAR] | file:PATH; --readonly; --no-init (attach only)
 sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
 sparkles repo verify local --level data          # every backup, plus orphaned blobs
 sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
 sparkles repo locks local [--break ID]
-sparkles backup create  --loc db --repo local [--name N] [--note T]   # refused while a server has db open
-sparkles backup list    --repo file:///srv/backups/r [--dataset ds] [--policy P]
+sparkles backup create  --loc db --repo local [--name N] [--note T] [--dataset NAME]  # refused while a server has db open
+sparkles backup list    --repo file:///srv/backups/r [--dataset ds | --dataset-id UUID] [--policy P]
 sparkles backup show    --repo local b2
-sparkles backup verify  --repo local b2 --level restore   # exists | data | restore
+sparkles backup verify  --repo local b2 --level restore   # exists | data | restore; exit 1 on failure
 sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
-sparkles backup restore --repo local b2 --data /srv/sparkles --as ds  # into a stopped server
+sparkles backup restore --repo local b2 --data /srv/sparkles [--as ds]  # into a stopped server
 sparkles backup delete  --repo local b1          # blobs go at the next gc
-sparkles backup policy list | show P | history P # policies of the config file
-sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin
+sparkles backup policy list | show P | history P # policies of the config file (run: on a server)
+sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin [--count 5]
 ```
 
 `restore --identity auto|new|keep` picks the dataset id (`auto` keeps it unless a dataset
 of the target data directory has it) and `--check quick|full|none` the integrity check
-before the restored database is published. `restore --data` refuses while a server holds
-the data directory.
+before the restored database is published. `sparkles serve` holds a lock on
+`<data>/sparkles-server.lock` (one server per data directory), and `restore --data`
+refuses while a server holds it.
 
-A server (`sparkles serve --backup-config FILE`) also takes repositories registered through
-its API and UI (`POST /$/repositories`), under the operator's limits from that file. Their
+A server (`sparkles serve --backup-config FILE`) serves the file's repositories and
+policies read-only through its API, and also takes repositories registered through its
+API and UI (`POST /$/repositories`), under the operator's limits from that file. Their
 credentials only name a source defined there, never environment variables, files or the
 instance's default chain of the caller's choosing; their S3 endpoints go through the
 outbound policy below (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
@@ -576,6 +587,10 @@ secret_access_key_var = "MINIO_SECRET_KEY"
 [api]
 fs_roots = ["/srv/backups"]
 ```
+
+`scripts/backup-bench.sh DB` (`mise run bench:backup DB`) measures a full backup, an
+incremental one after small commits, a restore and a data verification of an existing
+database to an `fs` repository.
 
 `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 
@@ -814,6 +829,10 @@ owned by the `sparkles` user. Do not also set nginx `basicAuthFile`: nginx would
 its own `Authorization` header, which Sparkles would then reject. `unixSocket` makes the
 server listen on a Unix socket that nginx proxies to, so trusted proxy headers can be
 limited to it (`proxy.trusted = ["unix"]`).
+
+The module has no backup options: pass `extraArgs = [ "--backup-config" "/etc/sparkles/backup.toml" ]`,
+and add an `fs` repository's directory to `systemd.services.sparkles.serviceConfig.ReadWritePaths`
+(the service sees the rest of the file system read-only).
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so for offline work (`sparkles load`, `compact`) stop the service first,
