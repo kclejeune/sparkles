@@ -50,10 +50,6 @@ pub struct TooManyResults {
 /// skip what fails with it.
 pub(crate) const NOT_IMPLEMENTED: &str = "not implemented";
 
-pub(crate) fn parse_todo(what: &str) -> ParseError {
-    ParseError::new(format!("{what}: {NOT_IMPLEMENTED}"), 1, 1)
-}
-
 pub(crate) fn schema_todo(what: &str) -> SchemaError {
     SchemaError::new(format!("{what}: {NOT_IMPLEMENTED}"))
 }
