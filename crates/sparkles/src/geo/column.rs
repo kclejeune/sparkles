@@ -16,6 +16,7 @@ use super::crs::{CRS84, CRS84_IRI, CrsRef};
 use super::geom::GeomError;
 use super::persist::{self, FileKind, Identity, Mapped};
 use super::vocab::{GEOJSON_LITERAL, WKT_LITERAL};
+use super::wgs84::{self, Pair};
 use crate::id::{Id, KEY_SEP, Tag};
 use crate::store::Snapshot;
 use parking_lot::RwLock;
@@ -299,6 +300,9 @@ impl Counts {
 struct Extra {
     map: FxHashMap<u64, Slot>,
     counts: Counts,
+    /// W3C Basic Geo points met by commits, and their ids by `[s, g, lat, long]`
+    pairs: FxHashMap<u64, Pair>,
+    pair_ids: FxHashMap<[u64; 4], u64>,
 }
 
 /// The geometry column of one build (one generation and configuration).
@@ -312,6 +316,8 @@ pub(crate) struct Column {
     extra: RwLock<Extra>,
     /// the file the base literals were read from
     file: Option<Arc<ColumnFile>>,
+    /// the W3C Basic Geo points of the base rows (their geometries are in `base`)
+    pairs: FxHashMap<u64, Pair>,
     /// base literals the build parsed, and those it took from the previous generation
     pub parsed: u64,
     pub reused: u64,
@@ -334,6 +340,7 @@ impl Column {
             base_counts: Counts::default(),
             extra: RwLock::new(Extra::default()),
             file: None,
+            pairs: FxHashMap::default(),
             parsed: 0,
             reused: 0,
         }
@@ -393,6 +400,7 @@ impl Column {
             base_counts: counts,
             extra: RwLock::new(Extra::default()),
             file: None,
+            pairs: FxHashMap::default(),
             parsed: ids.len() as u64 - reused,
             reused,
         })
@@ -434,6 +442,59 @@ impl Column {
         x.counts.add(&s);
         x.map.insert(o.0, s.clone());
         s
+    }
+
+    /// Add the W3C Basic Geo points of the base: their pairs, and their geometries
+    /// (`None`: the column read them from its file already).
+    pub fn add_base_pairs(&mut self, pairs: Vec<(u64, Pair, Option<Arc<ColumnEntry>>)>) {
+        self.pairs.reserve(pairs.len());
+        for (id, p, e) in pairs {
+            if let Some(e) = e {
+                self.base.insert(id, Slot::Geom(e));
+            }
+            self.pairs.insert(id, p);
+        }
+    }
+
+    /// The base's W3C Basic Geo points, by id.
+    pub fn base_pairs(&self) -> Vec<(u64, Pair)> {
+        let mut v: Vec<(u64, Pair)> = self.pairs.iter().map(|(&k, &p)| (k, p)).collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v
+    }
+
+    /// The pair of the point `o` (base or commit path).
+    pub fn pair(&self, o: u64) -> Option<Pair> {
+        if let Some(p) = self.pairs.get(&o) {
+            return Some(*p);
+        }
+        self.extra.read().pairs.get(&o).copied()
+    }
+
+    /// The point of subject `s`, graph `g` and the objects `lat`, `long` met by a commit:
+    /// its id and geometry, made by `make` the first time (`None`: not a point).
+    pub fn commit_pair(
+        &self,
+        key: [u64; 4],
+        make: impl FnOnce() -> Option<(Pair, Arc<ColumnEntry>)>,
+    ) -> Option<(u64, Arc<ColumnEntry>)> {
+        let entry = |x: &Extra, id: u64| match x.map.get(&id) {
+            Some(Slot::Geom(e)) => Some((id, e.clone())),
+            _ => None,
+        };
+        if let Some(&id) = self.extra.read().pair_ids.get(&key) {
+            return entry(&self.extra.read(), id);
+        }
+        let (pair, e) = make()?;
+        let mut x = self.extra.write();
+        if let Some(&id) = x.pair_ids.get(&key) {
+            return entry(&x, id);
+        }
+        let id = wgs84::pair_id((self.pairs.len() + x.pairs.len()) as u64);
+        x.map.insert(id, Slot::Geom(e.clone()));
+        x.pairs.insert(id, pair);
+        x.pair_ids.insert(key, id);
+        Some((id, e))
     }
 
     /// Counts over every literal classified so far.
@@ -575,7 +636,10 @@ impl Column {
                 KIND_OTHER => Slot::Other,
                 k => Slot::Skipped(skip_of(k).ok_or("unknown column entry kind")?),
             };
-            counts.add(&slot);
+            // points of W3C Basic Geo pairs are no literals
+            if !wgs84::is_pair(e.o) {
+                counts.add(&slot);
+            }
             base.insert(e.o, slot);
         }
         if persist::pad8(off as usize) != file.map.data().len() {
@@ -586,6 +650,7 @@ impl Column {
             base_counts: counts,
             extra: RwLock::new(Extra::default()),
             file: Some(file),
+            pairs: FxHashMap::default(),
             parsed: 0,
             reused: 0,
         })

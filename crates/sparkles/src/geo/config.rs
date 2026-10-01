@@ -44,7 +44,7 @@ pub struct GeoConfig {
     /// graphs whose quads are indexed (as in `text.json`)
     #[serde(default)]
     pub graphs: GraphScope,
-    /// index W3C Basic Geo `lat`/`long` pairs as points (not supported yet)
+    /// index W3C Basic Geo `lat`/`long` pairs as points
     #[serde(default)]
     pub wgs84: bool,
     /// match the topological `geo:` properties against geometries (not supported yet)
@@ -108,9 +108,6 @@ impl GeoConfig {
                 "formatVersion: {} is not supported (this build reads {FORMAT_VERSION})",
                 self.format_version
             ));
-        }
-        if self.wgs84 {
-            return bad("wgs84: not supported yet".into());
         }
         if self.query_rewrite {
             return bad("queryRewrite: not supported yet".into());
@@ -273,6 +270,9 @@ pub struct GeoRows {
     pub base: u64,
     pub overlay: u64,
     pub tail: u64,
+    /// rows (of the three) that are W3C Basic Geo points
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub wgs84: u64,
 }
 
 /// Geometry literals of indexed predicates that are not indexed, by reason.
@@ -357,7 +357,7 @@ mod tests {
             })
             .contains("queryRewrite: not supported yet")
         );
-        assert!(err(GeoConfig { wgs84: true, ..d() }).contains("wgs84: not supported yet"));
+        assert!(GeoConfig { wgs84: true, ..d() }.validate().is_ok());
         assert!(
             err(GeoConfig {
                 predicates: vec!["not an iri".into()],

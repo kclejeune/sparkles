@@ -7,7 +7,8 @@
 //! geometry is tested exactly against the box. Geometries are transformed to CRS84 and
 //! simplified with Douglas–Peucker; a ring the simplification would collapse is kept as
 //! it is. Without an index the default configuration's predicates and feature links are
-//! read.
+//! read. W3C Basic Geo points (`"wgs84": true`) are reported with the predicate
+//! `wgs84_pos:lat_long`, their subject being the feature.
 
 use super::config::GeoConfig;
 use super::crs::CRS84;
@@ -58,7 +59,14 @@ pub fn features_in_box(snap: &Snapshot, q: &BoxQuery) -> Result<Value> {
         Some(p) => cfg.predicates.iter().filter(|x| *x == p).collect(),
         None => cfg.predicates.iter().collect(),
     };
-    let pred_ids: Vec<Id> = preds.iter().filter_map(|p| snap.lookup_iri(p)).collect();
+    let mut pred_ids: Vec<Id> = preds.iter().filter_map(|p| snap.lookup_iri(p)).collect();
+    let lat = search::wgs84_lat(snap);
+    if q.predicate
+        .as_ref()
+        .is_none_or(|p| p == super::wgs84::LAT_LONG)
+    {
+        pred_ids.extend(lat);
+    }
     let graph = match &q.graph {
         None => GraphFilter::All,
         Some(g) if g == crate::text::DEFAULT_GRAPH_IRI => GraphFilter::Default,
@@ -83,6 +91,7 @@ pub fn features_in_box(snap: &Snapshot, q: &BoxQuery) -> Result<Value> {
     let ctx = Ctx::new(Arc::new(snap.clone()));
     let mut out = Writer {
         snap,
+        lat,
         links: &links,
         window: &window,
         tolerance,
@@ -113,6 +122,8 @@ pub fn features_in_box(snap: &Snapshot, q: &BoxQuery) -> Result<Value> {
 /// Collects the features of the matching rows.
 struct Writer<'a> {
     snap: &'a Snapshot,
+    /// the predicate of W3C Basic Geo points
+    lat: Option<Id>,
     links: &'a [Id],
     window: &'a Geom,
     tolerance: f64,
@@ -139,7 +150,12 @@ impl Writer<'_> {
         let Some(geometry) = drawn(g, self.tolerance) else {
             return Ok(());
         };
-        let (Some(subject), Some(predicate)) = (self.name(h.s), self.name(h.p)) else {
+        let point = super::wgs84::is_pair(h.o.0) && Some(h.p) == self.lat;
+        let predicate = match point {
+            true => Some(super::wgs84::LAT_LONG.to_string()),
+            false => self.name(h.p),
+        };
+        let (Some(subject), Some(predicate)) = (self.name(h.s), predicate) else {
             return Ok(());
         };
         let graph = if h.g == Id::DEFAULT_GRAPH {
@@ -148,7 +164,10 @@ impl Writer<'_> {
             self.name(h.g).map_or(Value::Null, Value::String)
         };
         let mut feats: Vec<String> = Vec::new();
-        for &l in self.links {
+        if point {
+            feats.push(subject.clone());
+        }
+        for &l in self.links.iter().filter(|_| !point) {
             self.snap.scan(Perm::Pos, &[l.0, h.s.0], |c| {
                 let mut each = |k: [u64; 4]| {
                     if k[3] == h.g.0

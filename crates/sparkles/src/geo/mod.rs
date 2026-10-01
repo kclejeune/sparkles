@@ -55,6 +55,8 @@ pub mod spatialf;
 #[cfg(feature = "geo")]
 pub(crate) mod tree;
 #[cfg(feature = "geo")]
+pub mod wgs84;
+#[cfg(feature = "geo")]
 pub mod write;
 
 #[cfg(all(test, feature = "geo"))]

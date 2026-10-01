@@ -19,6 +19,7 @@ use super::config::{
 };
 use super::persist::{self, FileKind, Identity, Mapped, Problem};
 use super::tree::PackedTree;
+use super::wgs84::{self, Pair};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{Key, Perm};
@@ -250,6 +251,8 @@ pub(crate) struct GeoBase {
     /// base rows per predicate slot
     pub slot_rows: Vec<u64>,
     pub built_ms: f64,
+    /// base rows that are W3C Basic Geo points
+    pub pair_rows: u64,
     /// read from the generation's index files (not built in this process)
     pub opened: bool,
     /// the index files the base is read from (bytes)
@@ -268,6 +271,7 @@ impl GeoBase {
             column: Column::empty(),
             slot_rows: vec![0; cfg.predicates.len()],
             built_ms: 0.0,
+            pair_rows: 0,
             opened: false,
             files_bytes: 0,
         }
@@ -293,13 +297,14 @@ impl GeoBase {
         })?;
         self.column.write(&dir.join(persist::COLUMN_FILE), ident)?;
         let tree = self.tree.as_ref().map_or(&[][..], PackedTree::data);
+        let pairs = self.column.base_pairs();
         let mut index = persist::index_prefix(ident);
         for n in [
             self.rows.len(),
             self.skipped.len(),
             self.slot_rows.len(),
             tree.len(),
-            0, // W3C Basic Geo pairs
+            pairs.len(),
         ] {
             index.extend_from_slice(&(n as u64).to_le_bytes());
         }
@@ -329,7 +334,13 @@ impl GeoBase {
                     sink.put(&n.to_le_bytes())?;
                 }
                 sink.put(tree)?;
-                sink.align()
+                sink.align()?;
+                for (id, p) in &pairs {
+                    for x in [*id, p.lat_o, p.long_o, p.long_p, p.flags()] {
+                        sink.put(&x.to_le_bytes())?;
+                    }
+                }
+                Ok(())
             },
         )?;
         crate::store::sync_dir(dir)?;
@@ -358,7 +369,7 @@ impl GeoBase {
         let col = open(FileKind::Column)?;
         let bad = |m: &str| (persist::RTREE_FILE, Problem::Unusable(m.to_string()));
         let count = |i: usize| usize::try_from(rt.u64_at(persist::INDEX_PREFIX + 8 * i)).ok();
-        let (Some(n), Some(m), Some(k), Some(t), Some(0)) =
+        let (Some(n), Some(m), Some(k), Some(t), Some(w)) =
             (count(0), count(1), count(2), count(3), count(4))
         else {
             return Err(bad("damaged index section"));
@@ -373,10 +384,11 @@ impl GeoBase {
             let skipped_at = n.checked_mul(32)?;
             let slots_at = skipped_at.checked_add(m.checked_mul(32)?)?;
             let tree_at = slots_at.checked_add(k.checked_mul(8)?)?;
-            let end = tree_at.checked_add(t)?;
-            (persist::pad8(end) == rt.data().len()).then_some((skipped_at, slots_at, tree_at))
+            let pairs_at = persist::pad8(tree_at.checked_add(t)?);
+            let end = pairs_at.checked_add(w.checked_mul(PAIR_BYTES)?)?;
+            (end == rt.data().len()).then_some((skipped_at, slots_at, tree_at, pairs_at))
         })();
-        let Some((skipped_at, slots_at, tree_at)) = sections else {
+        let Some((skipped_at, slots_at, tree_at, pairs_at)) = sections else {
             return Err(bad("data sections have the wrong length"));
         };
         let rows = Rows::mapped(rt.clone(), 0, n).ok_or_else(|| bad("misaligned rows"))?;
@@ -408,8 +420,31 @@ impl GeoBase {
                     .ok_or_else(|| bad("damaged tree"))?,
             ),
         };
+        let mut pairs = Vec::with_capacity(w);
+        for b in rt.data()[pairs_at..].as_chunks::<PAIR_BYTES>().0 {
+            let x = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+            if !wgs84::is_pair(x(0)) || x(4) > 3 {
+                return Err(bad("damaged W3C Basic Geo pairs"));
+            }
+            let pair = Pair {
+                lat_o: x(1),
+                long_o: x(2),
+                long_p: x(3),
+                lat_base: x(4) & 1 != 0,
+                long_base: x(4) & 2 != 0,
+            };
+            pairs.push((x(0), pair, None));
+        }
         let files_bytes = rt.len() + col.len();
-        let column = Column::read(col).map_err(|m| (persist::COLUMN_FILE, Problem::Unusable(m)))?;
+        let mut column =
+            Column::read(col).map_err(|m| (persist::COLUMN_FILE, Problem::Unusable(m)))?;
+        if pairs
+            .iter()
+            .any(|(id, _, _)| column.base_entry(*id).is_none())
+        {
+            return Err(bad("W3C Basic Geo pairs without their points"));
+        }
+        column.add_base_pairs(pairs);
         Ok(GeoBase {
             generation: snap.generation.uid,
             generation_name: snap.generation.name.clone(),
@@ -419,6 +454,7 @@ impl GeoBase {
             column,
             slot_rows,
             built_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            pair_rows: w as u64,
             opened: true,
             files_bytes,
         })
@@ -509,7 +545,7 @@ pub(crate) fn build_base(
     let total = objs.len().max(1) as f32;
     let done = AtomicU64::new(0);
     let used = AtomicU64::new(rows.len() as u64 * row_bytes);
-    let column = Column::build(snap, &objs, cfg, reuse, &|k, bytes| {
+    let mut column = Column::build(snap, &objs, cfg, reuse, &|k, bytes| {
         if (ctl.cancel)() {
             return Err(Error::Cancelled);
         }
@@ -521,6 +557,12 @@ pub(crate) fn build_base(
         set_progress(ctl.progress, 0.1 + 0.8 * (d as f32 / total));
         Ok(())
     })?;
+    if cfg.wgs84 {
+        let (pair_rows, pairs) = base_pairs(snap, cfg, lookup, ctl)?;
+        base.pair_rows = pair_rows.len() as u64;
+        column.add_base_pairs(pairs);
+        rows.extend(pair_rows);
+    }
     let mut boxes: Vec<[f32; 4]> = Vec::with_capacity(rows.len());
     let mut skipped = Vec::new();
     rows.retain(|r| match column.base_entry(r.o) {
@@ -555,6 +597,167 @@ pub(crate) fn build_base(
     base.built_ms = t0.elapsed().as_secs_f64() * 1000.0;
     set_progress(ctl.progress, 1.0);
     Ok(base)
+}
+
+/// Bytes of a W3C Basic Geo pair in `rtree.spkg`: id, `lat` and `long` objects, the
+/// `long` predicate, flags.
+const PAIR_BYTES: usize = 40;
+
+/// The W3C Basic Geo points of `snap`'s generation base: their rows (`lat` the
+/// predicate, the point's id the object) and pairs, numbered in row order.
+#[allow(clippy::type_complexity)]
+fn base_pairs(
+    snap: &Snapshot,
+    cfg: &GeoConfig,
+    lookup: &Lookup,
+    ctl: &BuildCtl<'_>,
+) -> Result<(Vec<Row>, Vec<(u64, Pair, Option<Arc<ColumnEntry>>)>)> {
+    let vocab = &snap.generation.vocab;
+    let (Ok(lat), Ok(long)) = (
+        vocab.find(&crate::id::iri_key(wgs84::LAT)),
+        vocab.find(&crate::id::iri_key(wgs84::LONG)),
+    ) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let (lat_p, long_p) = (Id::vocab(lat).0, Id::vocab(long).0);
+    let perm = snap.perm(Perm::Pso);
+    // `[s, g, o]` of a predicate's quads in scope, sorted
+    let read = |p: u64| -> Result<Vec<[u64; 3]>> {
+        let mut v = Vec::new();
+        perm.for_each_range(&snap.cache, &[p], |b, s, e| {
+            if (ctl.cancel)() {
+                return Err(Error::Cancelled);
+            }
+            for i in s..e {
+                let k = b.key(i);
+                if lookup.graph(Id(k[3]), snap, cfg) {
+                    v.push([k[1], k[3], k[2]]);
+                }
+            }
+            Ok(())
+        })?;
+        v.sort_unstable();
+        Ok(v)
+    };
+    let (lats, longs) = (read(lat_p)?, read(long_p)?);
+    // the values of the objects
+    let mut objs: Vec<u64> = lats.iter().chain(&longs).map(|x| x[2]).collect();
+    objs.sort_unstable();
+    objs.dedup();
+    let mut values: FxHashMap<u64, f64> = FxHashMap::default();
+    let payloads: Vec<u64> = objs
+        .iter()
+        .filter(|&&o| Id(o).tag() == Tag::Vocab)
+        .map(|&o| Id(o).payload())
+        .collect();
+    vocab.get_sorted(&payloads, |pl, key| {
+        if let Some(x) = wgs84::number_of_key(key) {
+            values.insert(Id::vocab(pl).0, x);
+        }
+    });
+    for &o in objs.iter().filter(|&&o| Id(o).tag() != Tag::Vocab) {
+        if let Some(x) = wgs84::number(snap, Id(o)) {
+            values.insert(o, x);
+        }
+    }
+    // the cross product of each subject's lats and longs in one graph
+    let mut rows = Vec::new();
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < lats.len() && j < longs.len() {
+        let (a, b) = ((lats[i][0], lats[i][1]), (longs[j][0], longs[j][1]));
+        if a != b {
+            if a < b {
+                i += 1;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        let ie = i + lats[i..].iter().take_while(|x| (x[0], x[1]) == a).count();
+        let je = j + longs[j..].iter().take_while(|x| (x[0], x[1]) == a).count();
+        for la in &lats[i..ie] {
+            for lo in &longs[j..je] {
+                let (Some(&y), Some(&x)) = (values.get(&la[2]), values.get(&lo[2])) else {
+                    continue;
+                };
+                let Some(e) = wgs84::point(y, x) else {
+                    continue;
+                };
+                let id = wgs84::pair_id(pairs.len() as u64);
+                rows.push(Row {
+                    s: a.0,
+                    p: lat_p,
+                    o: id,
+                    g: a.1,
+                });
+                let pair = Pair {
+                    lat_o: la[2],
+                    long_o: lo[2],
+                    long_p,
+                    lat_base: true,
+                    long_base: true,
+                };
+                pairs.push((id, pair, Some(e)));
+            }
+        }
+        (i, j) = (ie, je);
+    }
+    Ok((rows, pairs))
+}
+
+/// The point rows the quad `q` (`[s, p, o, g]`, a `lat` or `long` quad inserted since
+/// the base, visible in `snap`) makes with the other half of each pair visible there.
+pub(crate) fn pair_rows(
+    snap: &Snapshot,
+    column: &Column,
+    q: [u64; 4],
+    lat: u64,
+    long: u64,
+) -> Result<Vec<TailRow>> {
+    let is_lat = q[1] == lat;
+    let ins = &snap.delta.ins[Perm::Pso.index()];
+    let in_base = |p: u64, o: u64| !ins.contains(&[p, q[0], o, q[3]]);
+    let mut out = Vec::new();
+    for other in wgs84::objects(snap, q[0], if is_lat { long } else { lat }, q[3])? {
+        let (lat_o, long_o) = if is_lat { (q[2], other) } else { (other, q[2]) };
+        let made = column.commit_pair([q[0], q[3], lat_o, long_o], || {
+            let e = wgs84::point(
+                wgs84::number(snap, Id(lat_o))?,
+                wgs84::number(snap, Id(long_o))?,
+            )?;
+            let pair = Pair {
+                lat_o,
+                long_o,
+                long_p: long,
+                lat_base: in_base(lat, lat_o),
+                long_base: in_base(long, long_o),
+            };
+            Some((pair, e))
+        });
+        if let Some((id, entry)) = made {
+            out.push(TailRow {
+                row: Row {
+                    s: q[0],
+                    p: lat,
+                    o: id,
+                    g: q[3],
+                },
+                entry,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the overlay or tail row `r` is in `snap`: its quad inserted (a point: both
+/// of its quads visible).
+pub(crate) fn delta_row_live(snap: &Snapshot, column: &Column, r: &Row) -> bool {
+    if wgs84::is_pair(r.o) {
+        column.pair(r.o).is_some_and(|p| p.live(snap, r))
+    } else {
+        snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+    }
 }
 
 /// Rows inserted by commits, in a packed tree.
@@ -640,6 +843,21 @@ pub(crate) fn overlay_of(
                 Slot::Geom(entry) => rows.push(TailRow { row, entry }),
                 s if s.rechecked() => skipped.push(row),
                 _ => {}
+            }
+        }
+    }
+    // W3C Basic Geo points with an inserted quad
+    if cfg.wgs84
+        && let Some((lat, long)) = wgs84::predicates(snap)
+    {
+        for p in [lat.0, long.0] {
+            for k in ins.range([p, 0, 0, 0]..=[p, u64::MAX, u64::MAX, u64::MAX]) {
+                if lookup.graph(Id(k[3]), snap, cfg)
+                    && let Ok(r) =
+                        pair_rows(snap, &base.column, [k[1], k[0], k[2], k[3]], lat.0, long.0)
+                {
+                    rows.extend(r);
+                }
             }
         }
     }
@@ -945,6 +1163,15 @@ impl GeoIndex {
                 base: base.map_or(0, |b| b.rows.len() as u64),
                 overlay: view.map_or(0, |v| v.overlay.rows.len() as u64),
                 tail: view.map_or(0, |v| v.tail.len() as u64),
+                wgs84: base.map_or(0, |b| b.pair_rows)
+                    + view.map_or(0, |v| {
+                        v.overlay
+                            .rows
+                            .iter()
+                            .chain(v.tail.iter())
+                            .filter(|r| wgs84::is_pair(r.row.o))
+                            .count() as u64
+                    }),
             },
             literals,
             skipped: GeoSkipped {

@@ -656,8 +656,30 @@ fn index_commit(
     let ins = &snap.delta.ins[Perm::Pso.index()];
     let was = &before.delta.ins[Perm::Pso.index()];
     let mut seen: rustc_hash::FxHashSet<Row> = Default::default();
+    let pairs = cfg
+        .wgs84
+        .then(|| crate::geo::wgs84::predicates(snap))
+        .flatten();
     for (op, q) in log {
-        if *op != super::WAL_INSERT || v.lookup.slot(q[1], snap, &cfg).is_none() {
+        if *op != super::WAL_INSERT {
+            continue;
+        }
+        // half of a W3C Basic Geo point: the pairs it makes with what is there
+        if let Some((lat, long)) = pairs
+            && (q[1] == lat || q[1] == long)
+        {
+            let k = Row::of(q).pso();
+            if ins.contains(&k) && !was.contains(&k) && v.lookup.graph(q[3], snap, &cfg) {
+                let q = [q[0].0, q[1].0, q[2].0, q[3].0];
+                for r in crate::geo::index::pair_rows(snap, &base.column, q, lat.0, long.0)? {
+                    if seen.insert(r.row) {
+                        v.tail.push_back(r);
+                    }
+                }
+            }
+            continue;
+        }
+        if v.lookup.slot(q[1], snap, &cfg).is_none() {
             continue;
         }
         let row = Row::of(q);
@@ -682,7 +704,7 @@ fn index_commit(
             .rows
             .iter()
             .chain(v.tail.iter())
-            .filter(|r| ins.contains(&r.row.pso()))
+            .filter(|r| crate::geo::index::delta_row_live(snap, &base.column, &r.row))
             .cloned()
             .collect();
         let skipped: Vec<Row> = v
@@ -1222,3 +1244,7 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
 #[cfg(all(test, feature = "geo"))]
 #[path = "geo_files_tests.rs"]
 mod files_tests;
+
+#[cfg(all(test, feature = "geo"))]
+#[path = "geo_wgs84_tests.rs"]
+mod wgs84_tests;
