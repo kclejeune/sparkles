@@ -107,6 +107,50 @@ pub struct IdRange {
     pub exact: bool,
 }
 
+/// `ORDER BY ?v LIMIT k` over a single scan whose first free key column holds `?v`: the
+/// scan is read in the order of `?v`'s values, best first, until the first `k` rows are
+/// proven.
+///
+/// The column's ids are split into pieces. In a strictly monotone numeric piece (inline
+/// integers, inline decimals of one scale, inline doubles of one sign) id order is value
+/// order, so the piece is read from its best end in geometrically growing steps, and only
+/// its best `k` rows (with their ties) are kept. Every other piece (vocabulary and delta
+/// literals, IRIs, blank nodes, NaN, dates…) is read whole. The candidates are ranked by
+/// the generic ORDER BY in the generic plan's row order, so ties break identically; a
+/// piece stops once the `k`-th candidate is strictly better than any of its unread
+/// values.
+#[derive(Clone)]
+pub struct OrderedTopK {
+    /// the scan, re-targeted so that `var` is its first free column
+    pub scan: ScanSpec,
+    pub var: VarId,
+    pub asc: bool,
+    /// OFFSET + LIMIT
+    pub k: usize,
+    /// non-empty id intervals of the order column, in id order
+    pub pieces: Vec<TopKPiece>,
+    /// FILTER conjuncts over the scan, tested on every row
+    pub filter: Vec<Expr>,
+    /// a pushed numeric range filter, tested on the rows of inexact pieces
+    pub range_filter: Vec<Expr>,
+    /// the scan's variables in the key order of the generic plan's scan: the order its
+    /// rows (and so ORDER BY's ties) come in
+    pub tie_order: Vec<VarId>,
+    /// the generic plan, run when the values are not totally ordered (NaN, dates)
+    pub fallback: Box<Node>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopKPiece {
+    pub lo: u64,
+    pub hi: u64,
+    /// every id satisfies the pushed range filter (otherwise its rows are tested)
+    pub exact: bool,
+    /// `Some(true)`: larger ids are larger values, `Some(false)`: smaller values (inline
+    /// negative doubles); `None`: ids say nothing about value order
+    pub mono: Option<bool>,
+}
+
 /// The query of a vector search.
 #[derive(Clone, Debug)]
 pub enum VectorQuery {
@@ -198,6 +242,8 @@ pub enum Kind {
     Scan(ScanSpec),
     /// scan restricted to the id ranges of a numeric range filter on its sorted column
     RangeScan(ScanSpec, RangeSpec),
+    /// ORDER BY + LIMIT over a scan, read in value order (see [`OrderedTopK`])
+    OrderedTopK(Box<OrderedTopK>),
     Values(Table),
     Empty,
     Join {
@@ -346,6 +392,7 @@ impl Node {
         match &self.kind {
             Kind::Scan(_) => "IndexScan",
             Kind::RangeScan(..) => "IndexRangeScan",
+            Kind::OrderedTopK(_) => "IndexTopK",
             Kind::Values(_) => "Values",
             Kind::Empty => "Empty",
             Kind::Join {
@@ -689,7 +736,7 @@ impl<'a> Planner<'a> {
                 length,
             } => {
                 let child = self.plan(inner, g, Vec::new())?;
-                let n = slice(child, *start, *length);
+                let n = slice(child, *start, *length, self.ctx);
                 Ok(self.apply_filters(n, filters))
             }
             GP::Group {
@@ -2515,6 +2562,224 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     (r, rest)
 }
 
+/// Id segments of a key column in id order, covering every id, with how ids order the
+/// values within each: `Some(true)` when larger ids are larger values, `Some(false)` when
+/// they are smaller (inline negative doubles: sign and magnitude), `None` when id order
+/// says nothing about value order (vocabulary and delta terms, NaN payloads, booleans,
+/// dates, blank nodes). Within a `Some` segment distinct ids are distinct numbers.
+fn value_order_segments() -> Vec<(u64, u64, Option<bool>)> {
+    use crate::id::{PAYLOAD_BITS, PAYLOAD_MASK, TAG_BITS};
+    let id = |tag: Tag, payload: u64| Id::new(tag, payload).0;
+    let half = 1u64 << (PAYLOAD_BITS - 1);
+    // inline doubles are the IEEE bits without the 4 lowest: positive values, then NaN
+    // payloads, then the negative values from -0 to -INF, then negative NaN payloads
+    let inf = f64::INFINITY.to_bits() >> TAG_BITS;
+    let neg_inf = f64::NEG_INFINITY.to_bits() >> TAG_BITS;
+    // tags in id order: (Undef, Special, Bool) < Int < Double < (BNode, Vocab, Delta,
+    // Local) < Decimal < (DateTime, Date)
+    let mut out = vec![
+        (0, id(Tag::Int, 0) - 1, None),
+        (id(Tag::Int, 0), id(Tag::Int, half - 1), Some(true)),
+        (id(Tag::Int, half), id(Tag::Int, PAYLOAD_MASK), Some(true)),
+        (id(Tag::Double, 0), id(Tag::Double, inf), Some(true)),
+        (id(Tag::Double, inf + 1), id(Tag::Double, half - 1), None),
+        (id(Tag::Double, half), id(Tag::Double, neg_inf), Some(false)),
+        (
+            id(Tag::Double, neg_inf + 1),
+            id(Tag::Double, PAYLOAD_MASK),
+            None,
+        ),
+        (id(Tag::BNode, 0), id(Tag::Decimal, 0) - 1, None),
+    ];
+    // inline decimals: 4-bit scale, then a 56-bit two's complement mantissa
+    const MANTISSA: u32 = 56;
+    for scale in 0..16u64 {
+        let base = scale << MANTISSA;
+        let m = 1u64 << (MANTISSA - 1);
+        out.push((
+            id(Tag::Decimal, base),
+            id(Tag::Decimal, base + m - 1),
+            Some(true),
+        ));
+        out.push((
+            id(Tag::Decimal, base + m),
+            id(Tag::Decimal, base + 2 * m - 1),
+            Some(true),
+        ));
+    }
+    out.push((id(Tag::Decimal, PAYLOAD_MASK) + 1, u64::MAX, None));
+    debug_assert!(out.windows(2).all(|w| w[0].1 + 1 == w[1].0));
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: choose [`OrderedTopK`] whenever it applies, whatever it costs
+    pub(crate) static FORCE_ORDERED_TOPK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn force_ordered_topk() -> bool {
+    #[cfg(test)]
+    return FORCE_ORDERED_TOPK.with(|f| f.get());
+    #[cfg(not(test))]
+    false
+}
+
+/// `ORDER BY ?v LIMIT k` over a single scan (and FILTERs over it), with `?v` one of the
+/// scan's variables: an [`OrderedTopK`] when the scan can be read in the order of `?v`
+/// and that reads at most half of its rows (counted exactly per id piece).
+fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
+    let Kind::OrderBy {
+        keys,
+        limit: Some(k),
+    } = &n.kind
+    else {
+        return n;
+    };
+    if !ctx.opt.ordered_topk || *k == 0 {
+        return n;
+    }
+    let [(Expr::Var(v), asc)] = keys.as_slice() else {
+        return n;
+    };
+    let (v, asc, k) = (*v, *asc, *k);
+    let child = &n.children[0];
+    let (leaf, mut filter) = match &child.kind {
+        Kind::Filter(es) => (&child.children[0], es.clone()),
+        _ => (child, Vec::new()),
+    };
+    if filter
+        .iter()
+        .any(|e| e.has_exists() || !super::cache::deterministic(e))
+    {
+        return n;
+    }
+    let (spec, range) = match &leaf.kind {
+        Kind::Scan(spec) => (spec, None),
+        Kind::RangeScan(spec, range) => (spec, Some(range)),
+        _ => return n,
+    };
+    let Some(scan) = reorder_scan(spec, v) else {
+        return n;
+    };
+    let col = scan.prefix.len();
+    if scan.graph_col == col || scan.cols.first().map(|c| c.1) != Some(v) {
+        return n;
+    }
+    // the generic plan's rows come in its scan's key order
+    let mut tie: Vec<(usize, VarId)> = spec.cols.clone();
+    tie.sort_by_key(|c| c.0);
+    let tie_order = tie.into_iter().map(|c| c.1).collect();
+    // a range filter on `?v` keeps its id ranges; on another variable it is tested
+    let mut desc = retarget_desc(&leaf.desc, &scan);
+    let (domain, range_filter) = match range {
+        Some(r) if r.var == v => (r.ranges.clone(), r.filter.clone()),
+        other => {
+            if let Some(r) = other {
+                filter.extend(r.filter.iter().cloned());
+                desc = format!(
+                    "{} | {}",
+                    desc.split(" | ").next().unwrap_or_default(),
+                    r.filter
+                        .iter()
+                        .map(|e| e.display(ctx))
+                        .collect::<Vec<_>>()
+                        .join(" && ")
+                );
+            }
+            let all = IdRange {
+                lo: 0,
+                hi: u64::MAX,
+                exact: true,
+            };
+            (vec![all], Vec::new())
+        }
+    };
+    if matches!(child.kind, Kind::Filter(_)) {
+        desc += &format!(" | {}", child.desc);
+    }
+    let bound = |id: u64, fill: u64| {
+        let mut key = crate::index::pad(&scan.prefix, fill);
+        key[col] = id;
+        key
+    };
+    let sel = FILTER_SELECTIVITY.powi(filter.len() as i32);
+    let (mut pieces, mut total, mut read) = (Vec::new(), 0.0, 0.0);
+    for d in &domain {
+        for (lo, hi, mono) in value_order_segments() {
+            let (lo, hi) = (lo.max(d.lo), hi.min(d.hi));
+            if lo > hi {
+                continue;
+            }
+            let Ok(rows) = ctx
+                .snap
+                .count_between(scan.perm, bound(lo, 0), bound(hi, u64::MAX))
+            else {
+                return n;
+            };
+            if rows == 0 {
+                continue;
+            }
+            let rows = rows as f64;
+            total += rows;
+            // a monotone piece is read from its best end: the leading columns of about
+            // one block are decoded to place the steps, and more rows when filters drop
+            // rows
+            let sel = if d.exact {
+                sel
+            } else {
+                sel * FILTER_SELECTIVITY
+            };
+            read += match mono {
+                Some(_) => rows.min(crate::index::BLOCK_ROWS as f64 + k as f64 / sel),
+                None => rows,
+            };
+            pieces.push(TopKPiece {
+                lo,
+                hi,
+                exact: d.exact,
+                mono,
+            });
+        }
+    }
+    if pieces.is_empty() || read * 2.0 > total && !force_ordered_topk() {
+        return n;
+    }
+    let desc = format!(
+        "{desc} | {} limit {k} [{} of {} id pieces in value order]",
+        n.desc,
+        pieces.iter().filter(|p| p.mono.is_some()).count(),
+        pieces.len(),
+    );
+    let seeks = 4.0 * pieces.len() as f64;
+    let est = n.est.min(k as f64);
+    let mut dist = n.dist.clone();
+    for d in dist.values_mut() {
+        *d = d.min(est.max(1.0));
+    }
+    Node {
+        vars: n.vars.clone(),
+        certain: n.certain.clone(),
+        kind: Kind::OrderedTopK(Box::new(OrderedTopK {
+            scan,
+            var: v,
+            asc,
+            k,
+            pieces,
+            filter,
+            range_filter,
+            tie_order,
+            fallback: Box::new(n),
+        })),
+        children: Vec::new(),
+        sorted: Vec::new(),
+        est,
+        cost: read + seeks + est,
+        dist,
+        desc,
+    }
+}
+
 pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
     let desc = vars
         .iter()
@@ -2534,15 +2799,16 @@ pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
     p
 }
 
-fn slice(child: Node, start: usize, length: Option<usize>) -> Node {
-    // ORDER BY + LIMIT → top-k (also through a projection)
-    let limit = length.map(|l| l + start);
+fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
+    // ORDER BY + LIMIT → top-k (also through a projection), over a single scan read in
+    // value order when that is cheaper
+    let limit = length.map(|l| l.saturating_add(start));
     let child = match (child, limit) {
         (mut n, Some(k)) if matches!(n.kind, Kind::OrderBy { limit: None, .. }) => {
             if let Kind::OrderBy { limit, .. } = &mut n.kind {
                 *limit = Some(k);
             }
-            n
+            ordered_topk(n, ctx)
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -2551,6 +2817,8 @@ fn slice(child: Node, start: usize, length: Option<usize>) -> Node {
             if let Kind::OrderBy { limit, .. } = &mut n.children[0].kind {
                 *limit = Some(k);
             }
+            let order = n.children.pop().unwrap();
+            n.children.push(ordered_topk(order, ctx));
             n
         }
         (n, _) => n,
@@ -3244,7 +3512,7 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id]) -> Result<bool> {
         g => g.clone(),
     };
     let node = p.plan(&spec.pattern, &graph, Vec::new())?;
-    let node = slice(node, 0, Some(1));
+    let node = slice(node, 0, Some(1), ctx);
     let (t, _) = super::exec::execute(ctx, &node)?;
     Ok(!t.is_empty())
 }

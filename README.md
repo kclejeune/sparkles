@@ -304,6 +304,18 @@ result cache, and the web UI.
   in those ranges (`IndexRangeScan` in EXPLAIN).
 * **Numeric top-k.** `ORDER BY ?v LIMIT k` over numbers ranks cheap rounded keys first.
   Exact values are computed only for rows that can still reach the first k.
+* **Ordered-scan top-k.** `ORDER BY ?v LIMIT k` (and OFFSET) over a single triple
+  pattern, with FILTERs over it, reads the pattern in the order of `?v` and stops once
+  the first k rows are proven (`IndexTopK` in EXPLAIN). The scan is re-targeted to a
+  permutation sorted on `?v`. Inline integers, decimals of one scale and doubles of
+  one sign sort by value within their id segment. Each segment is read from its best
+  end, a few rows at a time, until the k-th candidate is strictly better than its best
+  unread value. Vocabulary literals (non-canonical numerals, other numeric types,
+  strings), IRIs and blank nodes are not in value order by id, so they are read whole.
+  The candidates are ranked by the ordinary ORDER BY in the plain scan's row order, so
+  ties come out the same. NaN, dates and durations have no total order, and fall back
+  to the plain sort. The planner picks it from exact row counts per segment when it
+  reads at most half of the pattern's rows.
 * **Incremental GROUP BY.** With one group key and COUNT / SUM / AVG / MIN / MAX /
   SAMPLE over variables, each group keeps a running state in a hash map on the key id.
   Sums stay exact 64-bit integers until a value is not an inline integer.
