@@ -57,7 +57,8 @@ impl GraphFilter {
             GraphFilter::Set(s) => s.binary_search(&g).is_ok(),
         }
     }
-    fn multi(&self) -> bool {
+    /// Whether rows of several graphs can pass (so equal triples may repeat).
+    pub fn multi(&self) -> bool {
         matches!(
             self,
             GraphFilter::All | GraphFilter::Named | GraphFilter::Set(_)
@@ -321,6 +322,10 @@ pub enum Kind {
     TextSearch(Box<TextSpec>),
     /// exact vector similarity search (`spk:vectorSearch`)
     VectorSearch(Box<VectorSpec>),
+    /// scan of a spatially indexed predicate restricted by spatial filters on its object
+    SpatialScan(Box<super::geopf::SpatialScanSpec>),
+    /// a `spatial:` property function
+    SpatialPf(Box<super::geopf::SpatialPfSpec>),
 }
 
 #[derive(Clone)]
@@ -337,7 +342,7 @@ pub struct Node {
 }
 
 impl Node {
-    fn leaf(kind: Kind, vars: Vec<VarId>, est: f64, desc: String) -> Node {
+    pub(super) fn leaf(kind: Kind, vars: Vec<VarId>, est: f64, desc: String) -> Node {
         let dist = vars.iter().map(|&v| (v, est.max(1.0))).collect();
         Node {
             kind,
@@ -430,13 +435,15 @@ impl Node {
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
+            Kind::SpatialScan(_) => "SpatialScan",
+            Kind::SpatialPf(_) => "SpatialPf",
         }
     }
 }
 
 /// A term in a triple pattern.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum PT {
+pub(super) enum PT {
     C(Id),
     V(VarId),
 }
@@ -525,7 +532,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn term_pattern(&self, t: &TermPattern) -> PT {
+    pub(super) fn term_pattern(&self, t: &TermPattern) -> PT {
         match t {
             TermPattern::Variable(v) => self.var(v.as_str()),
             TermPattern::BlankNode(b) => {
@@ -838,6 +845,7 @@ impl<'a> Planner<'a> {
                     crate::vector::VECTOR_SEARCH,
                     "spk:vectorSearch",
                 )?;
+                let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
                 for tp in &patterns {
                     items.push(Item::Triple(self.triple(tp, g)));
                 }
@@ -846,6 +854,9 @@ impl<'a> Planner<'a> {
                 }
                 for (subjects, args) in vcalls {
                     items.push(Item::Node(self.vector_leaf(subjects, args, g)?));
+                }
+                for c in scalls {
+                    items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
                 }
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
@@ -1319,7 +1330,7 @@ impl<'a> Planner<'a> {
 
     // --------------------------------------------------------- graph filters ------
 
-    fn graph_filter(&self, g: &ActiveGraph) -> Option<(GraphFilter, Option<VarId>)> {
+    pub(super) fn graph_filter(&self, g: &ActiveGraph) -> Option<(GraphFilter, Option<VarId>)> {
         let ds = &self.ctx.dataset;
         Some(match g {
             ActiveGraph::Default => match &ds.default {
@@ -2340,6 +2351,7 @@ fn union(children: Vec<Node>) -> Node {
 
 pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
     let (n, exprs) = push_range(n, exprs, ctx);
+    let (n, exprs) = super::geopf::push_spatial(n, exprs, ctx);
     if exprs.is_empty() {
         return n;
     }

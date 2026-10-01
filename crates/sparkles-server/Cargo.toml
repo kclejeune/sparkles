@@ -87,7 +87,7 @@ aws-lc-rs = "1"
 sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "otel", "auth", "mcp", "backup", "fmt"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "otel", "auth", "mcp", "backup", "fmt"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -96,6 +96,8 @@ shacl = ["dep:sparkles-shacl"]
 shex = ["dep:sparkles-shex"]
 # full-text search (`text:query`, `/$/text`, `sparkles text-index`)
 text = ["sparkles/text"]
+# GeoSPARQL (`geof:` functions, `spatial:` property functions, `/$/geo`, `sparkles geo-index`)
+geo = ["sparkles/geo"]
 # authentication and dataset-level authorization (`serve --auth-config`, `sparkles auth`)
 auth = [
     "dep:subtle",

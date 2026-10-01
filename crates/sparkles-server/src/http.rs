@@ -130,6 +130,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(validation::put_validation)
                 .delete(validation::delete_validation),
         );
+    // the spatial index (`/$/geo`)
+    let app = app.merge(crate::geo::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
@@ -361,7 +363,7 @@ pub(crate) fn add_request_id(resp: &mut Response, id: Option<String>) {
     }
 }
 
-fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
+pub(crate) fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
     ApiError(status, json!({ "error": msg.into() }))
 }
 
@@ -454,9 +456,9 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-type ApiResult<T = Response> = Result<T, ApiError>;
+pub(crate) type ApiResult<T = Response> = Result<T, ApiError>;
 
-fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
+pub(crate) fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
     st.get(name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such dataset: /{name}")))
 }
@@ -464,7 +466,7 @@ fn dataset(st: &AppState, name: &str) -> ApiResult<Arc<Dataset>> {
 /// Run `f` on a blocking thread, inside the request's span (so engine events carry the
 /// request id and engine spans are its children). The thread holds the request's
 /// concurrency permits until `f` returns, even when the client is gone.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
     let span = tracing::Span::current();
@@ -2108,6 +2110,7 @@ fn dataset_info(ds: &Dataset) -> J {
         "head": head.seq,
         "modified": head.timestamp(),
         "text": text_summary(ds),
+        "geo": crate::geo::summary(ds),
     });
     // a clone: where it was forked from
     if let Some(f) = ds.store.forked_from() {
@@ -2182,18 +2185,30 @@ async fn create_dataset(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let mut params = Params::from_query(&uri);
-    let (name, kind) = if content_type(&headers) == "application/json" {
+    let (name, kind, geo) = if content_type(&headers) == "application/json" {
         let v: J = serde_json::from_slice(&body)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         (
             v["dbName"].as_str().unwrap_or_default().to_string(),
             v["dbType"].as_str().unwrap_or("persistent").to_string(),
+            crate::geo::create_option(&v["geo"])?,
         )
     } else {
         params.extend_form(&body);
+        let geo = match params.get("geo") {
+            None | Some("false") => J::Null,
+            Some("true") => J::Bool(true),
+            Some(_) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "geo must be true or false (a configuration needs a JSON body)",
+                ));
+            }
+        };
         (
             params.get("dbName").unwrap_or_default().to_string(),
             params.get("dbType").unwrap_or("persistent").to_string(),
+            crate::geo::create_option(&geo)?,
         )
     };
     let name = name.trim_start_matches('/').to_string();
@@ -2228,7 +2243,19 @@ async fn create_dataset(
         ));
     }
     let st2 = st.clone();
-    let ds = blocking(move || Ok(st2.create(&name, kind)?)).await?;
+    let ds = blocking(move || {
+        let ds = st2.create(&name, kind)?;
+        // a new dataset with a spatial index, or none at all
+        if let Some(cfg) = geo
+            && let Err(e) = ds.store.enable_geo(cfg)
+        {
+            drop(ds);
+            st2.delete(&name)?;
+            return Err(e.into());
+        }
+        Ok(ds)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(dataset_info(&ds))).into_response())
 }
 
@@ -2426,6 +2453,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             "classes": classes,
             "diskBytes": ds.store.disk_bytes(),
             "reasoning": reasoning,
+            "geo": crate::geo::status_json(&ds),
             "cache": {
                 "entries": cache.entries(),
                 "bytes": cache.bytes(),
@@ -2553,7 +2581,7 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
 /// Refuse to start a task: `503` when [`MAX_QUEUED_TASKS`](crate::state::MAX_QUEUED_TASKS)
 /// tasks already wait for a slot, `409` when a task of `kind` is queued or running for
 /// `dataset`.
-fn task_start_check(st: &AppState, kind: Option<&str>, dataset: &str) -> ApiResult<()> {
+pub(crate) fn task_start_check(st: &AppState, kind: Option<&str>, dataset: &str) -> ApiResult<()> {
     if let Some(kind) = kind
         && let Some(id) = st.active_task(kind, dataset)
     {
