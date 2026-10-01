@@ -1,0 +1,43 @@
+{
+  "@context": {
+    "@vocab": "http://example.org/vocab#"
+  },
+  "@id": "http://example.org/data",
+  "numbers": [
+    1.50,
+    1E3,
+    -0,
+    0.0e-0,
+    12345678901234567890
+  ],
+  "strings": [
+    "caf\u00e9",
+    "a\/b",
+    "tab\there",
+    "\"quoted\""
+  ],
+  "empty": [],
+  "nothing": {
+    "@type": "@json",
+    "@value": {}
+  },
+  "long": [
+    "a fairly long string value",
+    "another fairly long string value",
+    "and one more to break the line"
+  ],
+  "nested": [
+    [1, 2],
+    [3, 4]
+  ],
+  "inline": {
+    "@id": "http://example.org/one"
+  },
+  "wrapped": {
+    "inner": {
+      "a": 1,
+      "b": 2
+    }
+  },
+  "flags": [true, false, null]
+}

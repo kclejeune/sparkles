@@ -1,0 +1,13 @@
+[
+  {
+    "@id": "http://example.org/a",
+    "http://example.org/p": "x"
+  },
+  { "@id": "http://example.org/b" },
+  {
+    "@id": "http://example.org/d",
+    "http://example.org/q": [
+      { "@id": "http://example.org/c" }
+    ]
+  }
+]

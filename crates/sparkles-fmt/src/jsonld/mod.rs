@@ -18,9 +18,9 @@ use crate::trivia::{CommentRules, Comments};
 use crate::{FormatError, Language, Options, Warning};
 
 /// Whether JSON-LD formats.
-pub const IMPLEMENTED: bool = false;
+pub const IMPLEMENTED: bool = true;
 /// Whether `sort` orders JSON-LD terms.
-pub const SORT_IMPLEMENTED: bool = false;
+pub const SORT_IMPLEMENTED: bool = true;
 
 /// JSON-LD in the formatting pipeline.
 pub struct JsonLd;
