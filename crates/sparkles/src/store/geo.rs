@@ -290,6 +290,7 @@ impl Store {
                 base: None,
                 overlay: Arc::new(Overlay::empty()),
                 tail: imbl::Vector::new(),
+                skipped: imbl::Vector::new(),
             }))
         }
         #[cfg(not(feature = "geo"))]
@@ -523,12 +524,13 @@ fn index_commit(
         if !seen.insert(row) {
             continue;
         }
-        if let crate::geo::column::Slot::Geom(entry) = base.column.get_or_classify(q[2], snap, &cfg)
-        {
-            v.tail.push_back(TailRow { row, entry });
+        match base.column.get_or_classify(q[2], snap, &cfg) {
+            crate::geo::column::Slot::Geom(entry) => v.tail.push_back(TailRow { row, entry }),
+            s if s.rechecked() => v.skipped.push_back(row),
+            _ => {}
         }
     }
-    if v.tail.len() > tail_limit(v.overlay.rows.len()) {
+    if v.tail.len() + v.skipped.len() > tail_limit(v.overlay.rows.len()) {
         let rows: Vec<TailRow> = v
             .overlay
             .rows
@@ -537,8 +539,17 @@ fn index_commit(
             .filter(|r| ins.contains(&r.row.pso()))
             .cloned()
             .collect();
-        v.overlay = Arc::new(Overlay::build(rows));
+        let skipped: Vec<Row> = v
+            .overlay
+            .skipped
+            .iter()
+            .chain(v.skipped.iter())
+            .filter(|r| ins.contains(&r.pso()))
+            .copied()
+            .collect();
+        v.overlay = Arc::new(Overlay::build(rows, skipped));
         v.tail = imbl::Vector::new();
+        v.skipped = imbl::Vector::new();
     }
     Ok(())
 }

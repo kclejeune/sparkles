@@ -5,8 +5,12 @@
 //! snapshot's index is not ready (building, failed, over budget, a transaction's or a
 //! past state), the same searches scan the predicates instead (`fallback`), with the
 //! same answers.
+//!
+//! Rows whose literal the index skipped although a `geof:` function could still match
+//! it (too long to index; see [`Slot::rechecked`]) are candidates of every search,
+//! whatever the window, so a search never misses a row the plain filter would keep.
 
-use super::column::{ColumnEntry, Slot, classify};
+use super::column::{ColumnEntry, Slot, classify, recheck};
 use super::config::GeoConfig;
 use super::geom::Geom;
 use super::index::{GeoBase, GeoView, Row, intersects, window_f32};
@@ -58,6 +62,37 @@ pub struct SearchStats {
     pub nodes: u64,
     /// the index was not used
     pub fallback: bool,
+    /// candidates whose literal the index skipped (tested whatever the window)
+    pub rechecked: u64,
+}
+
+/// The geometries of skipped literals that searches hand out anyway, parsed once per
+/// search.
+struct Rechecked<'a> {
+    snap: &'a Snapshot,
+    cfg: Arc<GeoConfig>,
+    memo: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
+}
+
+impl<'a> Rechecked<'a> {
+    fn new(snap: &'a Snapshot) -> Rechecked<'a> {
+        Rechecked {
+            snap,
+            cfg: snap
+                .geo
+                .as_ref()
+                .map_or_else(|| Arc::new(GeoConfig::default()), |v| v.config.clone()),
+            memo: FxHashMap::default(),
+        }
+    }
+
+    fn entry(&mut self, o: u64) -> Option<Arc<ColumnEntry>> {
+        let (snap, cfg) = (self.snap, &self.cfg);
+        self.memo
+            .entry(o)
+            .or_insert_with(|| recheck(&snap.key(Id(o))?, cfg))
+            .clone()
+    }
 }
 
 /// Rows handed to a sink at once, and between cancellation checks.
@@ -142,6 +177,26 @@ pub fn window_with(
             flush(&mut out, st, false)?;
         }
     }
+    // skipped rows that may still match, whatever the window
+    let mut re = Rechecked::new(snap);
+    let delta = view.overlay.skipped.iter().chain(view.skipped.iter());
+    for (r, from_base) in base
+        .skipped
+        .iter()
+        .map(|r| (r, true))
+        .chain(delta.map(|r| (r, false)))
+    {
+        let valid = if from_base {
+            f.base_row(r)
+        } else {
+            f.delta_row(r)
+        };
+        if valid && let Some(e) = re.entry(r.o) {
+            st.rechecked += 1;
+            out.push(Hit::new(r, e));
+            flush(&mut out, st, false)?;
+        }
+    }
     flush(&mut out, st, true)
 }
 
@@ -195,6 +250,25 @@ pub fn nearest_with(
         let mut e = Entry::row(&lb, &r.row, r.entry.clone());
         e.from_tail = true;
         heap.push(e);
+    }
+    // skipped rows that may still match, by the bound of their own envelope (the whole
+    // world, a bound of 0, when it has no place on the globe)
+    let mut re = Rechecked::new(snap);
+    for r in &base.skipped {
+        if f.base_valid(r)
+            && let Some(en) = re.entry(r.o)
+        {
+            st.rechecked += 1;
+            heap.push(Entry::row(&lb, r, en));
+        }
+    }
+    for r in view.overlay.skipped.iter().chain(view.skipped.iter()) {
+        if let Some(en) = re.entry(r.o) {
+            st.rechecked += 1;
+            let mut e = Entry::row(&lb, r, en);
+            e.from_tail = true;
+            heap.push(e);
+        }
     }
     let mut out: Vec<Hit> = Vec::new();
     let mut size = 16;
@@ -548,6 +622,7 @@ struct Literals<'a> {
     cfg: Arc<GeoConfig>,
     base: Option<&'a Arc<GeoBase>>,
     memo: FxHashMap<u64, Slot>,
+    rechecked: Rechecked<'a>,
 }
 
 impl<'a> Literals<'a> {
@@ -558,10 +633,13 @@ impl<'a> Literals<'a> {
             cfg: view.map_or_else(|| Arc::new(GeoConfig::default()), |v| v.config.clone()),
             base: view.and_then(|v| v.base.as_ref()),
             memo: FxHashMap::default(),
+            rechecked: Rechecked::new(snap),
         }
     }
 
-    fn entry(&mut self, o: u64) -> Option<Arc<ColumnEntry>> {
+    /// The geometry of literal `o`, and whether the index skipped it (a candidate
+    /// anyway, see [`Slot::rechecked`]).
+    fn entry(&mut self, o: u64) -> Option<(Arc<ColumnEntry>, bool)> {
         if !matches!(Id(o).tag(), Tag::Vocab | Tag::Delta) {
             return None;
         }
@@ -579,7 +657,8 @@ impl<'a> Literals<'a> {
             }
         };
         match slot {
-            Slot::Geom(e) => Some(e),
+            Slot::Geom(e) => Some((e, false)),
+            s if s.rechecked() => self.rechecked.entry(o).map(|e| (e, true)),
             _ => None,
         }
     }
@@ -625,7 +704,7 @@ fn scan_fallback(
             {
                 return Ok(());
             }
-            let Some(e) = lits.entry(r.o) else {
+            let Some((e, skipped)) = lits.entry(r.o) else {
                 return Ok(());
             };
             if let Some(ws) = windows
@@ -635,6 +714,9 @@ fn scan_fallback(
             }
             if dedup && !triples.insert((r.s, r.p, r.o)) {
                 return Ok(());
+            }
+            if skipped {
+                st.rechecked += 1;
             }
             out.push(Hit::new(&r, e));
             if out.len() >= CHUNK {
@@ -685,6 +767,7 @@ fn nearest_fallback(
         Ok(())
     })?;
     st.fallback = true;
+    st.rechecked += scan.rechecked;
     all.sort_by(|a, b| {
         a.0.total_cmp(&b.0)
             .then_with(|| (a.1.s, a.1.o, a.1.g).cmp(&(b.1.s, b.1.o, b.1.g)))

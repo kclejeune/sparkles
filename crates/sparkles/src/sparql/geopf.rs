@@ -1763,6 +1763,105 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         );
     }
 
+    /// A literal the index skips for its length still matches a pushed filter and the
+    /// property functions, as it matches the plain filter.
+    #[test]
+    fn literals_too_long_to_index_still_match() {
+        let s = store();
+        fill(&s, 3000);
+        // longer than the 60 bytes indexed below; within A, 1 km from (2 2)
+        let big = "POLYGON((1.99 1.99, 2.0 1.99, 2.01 1.99, 2.01 2.01, 1.99 2.01, 1.99 1.99))";
+        let ttl = format!(
+            "@prefix ex: <http://example.org/> . \
+             @prefix geo: <http://www.opengis.net/ont/geosparql#> . \
+             ex:bigF geo:hasGeometry ex:big . ex:big geo:asWKT \"{big}\"^^geo:wktLiteral ."
+        );
+        s.load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let st = s
+            .enable_geo(GeoConfig {
+                max_geometry_bytes: 60,
+                ..GeoConfig::default()
+            })
+            .unwrap();
+        assert_eq!(st.skipped.too_large, 1);
+        let check = |s: &Store| {
+            let snap = s.snapshot();
+            let q = format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {GA})) }}");
+            let (a, r) = pushed(&snap, &q);
+            let c = find(&r.plan, "SpatialScan")
+                .unwrap()
+                .counters
+                .clone()
+                .unwrap();
+            assert!(c["rechecked"].as_u64().unwrap() >= 1, "{c:?}");
+            let q = "SELECT ?g { ?g geo:asWKT ?w FILTER(geof:metricDistance(?w, \
+                     \"POINT(2 2)\"^^geo:wktLiteral) < 50000) }";
+            let mut near = pushed(&snap, q).0;
+            near.retain(|g| g.starts_with("big") || g.starts_with("new"));
+            let pf = |q: &str| {
+                let r = run_on(&snap, q, true);
+                let c = find(&r.plan, "SpatialPf")
+                    .unwrap()
+                    .counters
+                    .clone()
+                    .unwrap();
+                assert_eq!(c["fallback"], false, "{q}");
+                names(&r)
+            };
+            (
+                a,
+                near,
+                pf("SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre) }"),
+                pf("SELECT ?f { ?f spatial:nearby (2 2 50 uom:kilometre 3) }"),
+                pf("SELECT ?f { ?f spatial:intersectBox (1 1 3 3) }"),
+            )
+        };
+        let (within, near, nearby, nearest, boxed) = check(&s);
+        assert_eq!(within, ["big", "g1", "gA"]);
+        assert_eq!(near, ["big"]);
+        assert_eq!(nearby, ["A", "bigF", "p1"]);
+        assert_eq!(nearest, ["A", "bigF", "p1"]);
+        assert_eq!(boxed, ["A", "bigF", "p1"]);
+        // inserted after the build: the commit path keeps such rows too
+        update(
+            &s,
+            &format!(
+                "INSERT DATA {{ ex:newF geo:hasGeometry ex:new . \
+                 ex:new geo:asWKT \"{big}\"^^geo:wktLiteral }}"
+            ),
+        );
+        let (within, near, nearby, _, _) = check(&s);
+        assert_eq!(within, ["big", "g1", "gA", "new"]);
+        assert_eq!(near, ["big", "new"]);
+        assert_eq!(nearby, ["A", "bigF", "newF", "p1"]);
+        // a given feature reads its links, whatever the index
+        let r = run_on(
+            &s.snapshot(),
+            "ASK { ex:newF spatial:nearby (2 2 50) }",
+            true,
+        );
+        assert!(r.boolean);
+        let c = find(&r.plan, "SpatialPf")
+            .unwrap()
+            .counters
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (&c["index"], &c["fallback"]),
+            (&"feature-links".into(), &false.into())
+        );
+    }
+
+    fn update(s: &Store, u: &str) {
+        super::super::update::update(s, &format!("{PREFIXES}{u}"), &QueryOptions::default())
+            .unwrap();
+    }
+
     #[test]
     fn the_stores_operation_limit_reaches_queries() {
         let s = Store::in_memory(StoreOptions {
