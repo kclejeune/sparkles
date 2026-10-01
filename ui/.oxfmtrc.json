@@ -12,6 +12,7 @@
     ".svelte-kit/",
     "node_modules/",
     "pnpm-lock.yaml",
+    "src/lib/basemap/*.json",
     "test-results/",
     "playwright-report/"
   ]

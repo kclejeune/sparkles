@@ -12,6 +12,12 @@ export const WELL_KNOWN: Record<string, string> = {
   schema: 'http://schema.org/',
   sh: 'http://www.w3.org/ns/shacl#',
   prov: 'http://www.w3.org/ns/prov#',
+  geo: 'http://www.opengis.net/ont/geosparql#',
+  geof: 'http://www.opengis.net/def/function/geosparql/',
+  sf: 'http://www.opengis.net/ont/sf#',
+  uom: 'http://www.opengis.net/def/uom/OGC/1.0/',
+  spatial: 'http://jena.apache.org/spatial#',
+  spatialF: 'http://jena.apache.org/function/spatial#',
 };
 
 export const RDF_TYPE = WELL_KNOWN.rdf + 'type';

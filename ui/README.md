@@ -61,6 +61,16 @@ queue for two slots, progress over a few seconds and can be cancelled
 `/srv/not-a-repo` is `not-a-repository`. `MOCK_ROLE=dataset-admin pnpm mock` answers
 `/$/whoami` as a signed-in admin of `foaf` only, for the reduced Backups view.
 
+GeoSPARQL is mocked in `mock/geo.mjs`: a `places` dataset (Paris sights and two cities, in
+CRS84, EPSG:4326, GeoJSON, a UTM zone and one malformed literal) with its spatial index on,
+the index status and `geo-index` tasks (`/$/geo/{ds}`), `GET /{ds}/geo`, `POST
+/$/geo/convert` and `spatial:nearbyGeom` queries (distances between centroids).
+
+The maps draw with MapLibre GL JS over the bundled Natural Earth basemap
+(`src/lib/basemap/`, with its source and license); MapLibre is loaded only when a map opens.
+The Playwright configurations run the full Chromium in headless mode (`channel: 'chromium'`)
+rather than the headless shell, which has no WebGL.
+
 ## Check and build
 
 ```sh
@@ -105,7 +115,9 @@ cover the backup table and details drawer, adding a repository with a failing an
 connection test, backing up from the dataset page and restoring into a new dataset,
 replacing a dataset (lost commits, typed name, identity), the policy editor's schedule
 preview, name template and retention sentence, a GC dry run then a run, and cancelling a
-task from Activity. Once the backup endpoints exist they move to `tests/e2e`.
+task from Activity. Once the backup endpoints exist they move to `tests/e2e`. `geo.spec.ts`
+covers the Map tab, the explorer's Nearby and the Spatial index panel against the mock's
+`places`.
 
 ## Serving from the Rust server
 

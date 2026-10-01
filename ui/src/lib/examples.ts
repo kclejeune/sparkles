@@ -99,4 +99,49 @@ INSERT DATA {
     foaf:knows res:Ada_Lovelace .
 }`,
   },
+  {
+    title: 'Point in polygon',
+    description: 'GeoSPARQL: features whose geometry lies within an area (the Map tab draws them)',
+    query: `PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+
+SELECT ?feature ?wkt
+WHERE {
+  ?feature geo:hasDefaultGeometry|geo:hasGeometry ?g .
+  ?g geo:asWKT ?wkt .
+  FILTER(geof:sfWithin(?wkt,
+    "POLYGON((2.22 48.81, 2.47 48.81, 2.47 48.91, 2.22 48.91, 2.22 48.81))"^^geo:wktLiteral))
+}
+LIMIT 1000`,
+  },
+  {
+    title: 'Nearby features',
+    description:
+      'Jena spatial: the 20 nearest features within 5 km of a point (latitude, longitude)',
+    query: `PREFIX spatial: <http://jena.apache.org/spatial#>
+PREFIX uom: <http://www.opengis.net/def/uom/OGC/1.0/>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+
+SELECT ?feature ?wkt
+WHERE {
+  ?feature spatial:nearby (48.8566 2.3522 5 uom:kilometre 20) .
+  OPTIONAL { ?feature geo:hasDefaultGeometry|geo:hasGeometry ?g . ?g geo:asWKT ?wkt }
+}`,
+  },
+  {
+    title: 'Distance ranking',
+    description: 'GeoSPARQL: features by distance to a point, nearest first',
+    query: `PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+PREFIX uom: <http://www.opengis.net/def/uom/OGC/1.0/>
+
+SELECT ?feature ?wkt ?km
+WHERE {
+  ?feature geo:hasDefaultGeometry|geo:hasGeometry ?g .
+  ?g geo:asWKT ?wkt .
+  BIND(geof:distance(?wkt, "POINT(2.2945 48.8584)"^^geo:wktLiteral, uom:kilometre) AS ?km)
+}
+ORDER BY ?km
+LIMIT 50`,
+  },
 ];

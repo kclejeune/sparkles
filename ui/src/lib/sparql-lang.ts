@@ -144,6 +144,49 @@ export const FUNCTIONS = [
 const KW = new Set(KEYWORDS);
 const FN = new Set(FUNCTIONS);
 
+/**
+ * GeoSPARQL and Jena spatial terms, offered after their prefix whatever the dataset
+ * holds: namespace → [local name, whether it is a function (inserted with `(`)].
+ */
+const RELATIONS = ['Equals', 'Disjoint', 'Intersects', 'Touches', 'Within', 'Contains']
+  .concat(['Overlaps', 'Crosses'])
+  .map((r) => `sf${r}`)
+  .concat(
+    ['Equals', 'Disjoint', 'Meet', 'Overlap', 'Covers', 'CoveredBy', 'Inside', 'Contains'].map(
+      (r) => `eh${r}`,
+    ),
+  )
+  .concat(['eq', 'dc', 'ec', 'po', 'tppi', 'tpp', 'ntpp', 'ntppi'].map((r) => `rcc8${r}`));
+export const SPATIAL_TERMS: Record<string, [string, boolean][]> = {
+  'http://www.opengis.net/def/function/geosparql/': [
+    ...RELATIONS,
+    ...'relate distance metricDistance buffer metricBuffer convexHull concaveHull envelope boundary boundingCircle centroid intersection union difference symDifference area metricArea length metricLength perimeter metricPerimeter getSRID transform asWKT asGeoJSON dimension coordinateDimension spatialDimension numGeometries geometryN geometryType is3D isMeasured isEmpty isSimple minX minY minZ maxX maxY maxZ aggBoundingBox aggBoundingCircle aggCentroid aggConcaveHull aggConvexHull aggUnion'.split(
+      ' ',
+    ),
+  ].map((f) => [f, true]),
+  'http://jena.apache.org/function/spatial#':
+    'convertLatLon convertLatLonBox equals nearby withinCircle distance greatCircle greatCircleGeom angle angleDeg azimuth azimuthDeg transform transformDatatype transformSRS'
+      .split(' ')
+      .map((f) => [f, true]),
+  'http://jena.apache.org/spatial#':
+    'nearby withinCircle nearbyGeom withinCircleGeom withinBox intersectBox withinBoxGeom intersectBoxGeom north south east west northGeom southGeom eastGeom westGeom equals'
+      .split(' ')
+      .map((f) => [f, false]),
+  'http://www.opengis.net/ont/geosparql#': [
+    ...'Feature Geometry SpatialObject hasGeometry hasDefaultGeometry asWKT asGeoJSON hasSerialization wktLiteral geoJSONLiteral'.split(
+      ' ',
+    ),
+    ...RELATIONS,
+  ].map((t) => [t, false]),
+  'http://www.opengis.net/def/uom/OGC/1.0/': 'metre kilometre mile nauticalMile foot degree radian'
+    .split(' ')
+    .map((u) => [u, false]),
+  'http://www.opengis.net/ont/sf#':
+    'Point LineString Polygon MultiPoint MultiLineString MultiPolygon GeometryCollection'
+      .split(' ')
+      .map((t) => [t, false]),
+};
+
 type St = { inLongString: string | null };
 
 const PN = /^(?:[A-Za-zÀ-￿][\w.\-À-￿]*)?:(?:[\wÀ-￿%\\-](?:[\w.\-À-￿%:\\]*[\w\-À-￿%:])?)?/;
@@ -290,6 +333,18 @@ function sparqlCompletions(data: CompletionData) {
             ensurePrefix(view, pfx, ns);
           },
         }));
+        for (const [local, fn] of SPATIAL_TERMS[ns] ?? []) {
+          if (locals.has(local)) continue;
+          options.push({
+            label: `${pfx}:${local}`,
+            type: fn ? 'function' : 'property',
+            detail: fn ? '()' : 'GeoSPARQL',
+            apply: (view, _c, from, to) => {
+              view.dispatch({ changes: { from, to, insert: `${pfx}:${local}${fn ? '(' : ''}` } });
+              ensurePrefix(view, pfx, ns);
+            },
+          });
+        }
         return { from: pn.from, options, validFor: /^(?:[A-Za-z][\w.-]*)?:[\wÀ-￿.-]*$/ };
       }
     }

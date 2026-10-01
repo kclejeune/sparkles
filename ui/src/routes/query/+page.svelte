@@ -8,6 +8,7 @@
   import { receiptSummary } from '$lib/commits';
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
+  import { geoColumns } from '$lib/geo';
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
@@ -16,11 +17,12 @@
   import GraphView from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
   import PlanView from '$components/PlanView.svelte';
+  import ResultMap from '$components/ResultMap.svelte';
   import ResultTable from '$components/ResultTable.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
 
   type QTab = { id: string; title: string; query: string };
-  type View = 'table' | 'graph' | 'plan' | 'raw' | 'explain';
+  type View = 'table' | 'graph' | 'map' | 'plan' | 'raw' | 'explain';
   type Outcome = {
     status: 'running' | 'done' | 'error';
     ds: string;
@@ -261,7 +263,8 @@
           sameKind &&
           prevView &&
           prevView !== 'explain' &&
-          (prevView !== 'graph' || result.queryType !== 'ASK');
+          (prevView !== 'graph' || result.queryType !== 'ASK') &&
+          (prevView !== 'map' || geoColumns(result.vars ?? [], result.rows ?? []).length > 0);
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
@@ -390,6 +393,13 @@
     }
     return out;
   });
+
+  /** The result's columns holding geometry literals (the Map view draws them). */
+  const mapColumns = $derived(
+    outcome?.result?.vars && outcome.result.rows
+      ? geoColumns(outcome.result.vars, outcome.result.rows)
+      : [],
+  );
 
   const graph = $derived(
     outcome?.view === 'graph'
@@ -747,6 +757,16 @@
                   <Icon name="graph" size={14} /> Graph
                 </button>
               {/if}
+              {#if mapColumns.length}
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={outcome.view === 'map'}
+                  onclick={() => setView('map')}
+                >
+                  <Icon name="map" size={14} /> Map
+                </button>
+              {/if}
               <button
                 class="tab"
                 role="tab"
@@ -991,6 +1011,14 @@
                 Double-click an IRI node to open it in Explore. Hover highlights its neighbourhood.
               </div>
             </div>
+          {:else if outcome.view === 'map'}
+            <ResultMap
+              vars={r.vars ?? []}
+              rows={r.rows ?? []}
+              columns={mapColumns}
+              {prefixes}
+              onopen={openIri}
+            />
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
               <PlanView plan={r.meta.plan} {prefixes} />

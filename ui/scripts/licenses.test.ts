@@ -1,5 +1,7 @@
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { permissive } from './licenses.js';
+import { bundledDependencies, permissive } from './licenses.js';
 
 describe('permissive', () => {
   it('accepts the allowed licenses', () => {
@@ -27,5 +29,17 @@ describe('permissive', () => {
     expect(permissive('(MIT OR GPL-3.0-only) AND (BSD-2-Clause OR MPL-2.0)')).toBe(true);
     expect(permissive('Apache-2.0 WITH LLVM-exception')).toBe(true);
     expect(permissive('GPL-2.0-only WITH Classpath-exception-2.0')).toBe(false);
+  });
+});
+
+describe('bundledDependencies', () => {
+  it('finds the dependencies a prebuilt bundle carries, and theirs', () => {
+    const require = createRequire(import.meta.url);
+    const dir = dirname(require.resolve('maplibre-gl/package.json'));
+    const names = bundledDependencies(dir).map((d) => require(`${d}/package.json`).name);
+    expect(names).toEqual(expect.arrayContaining(['earcut', 'gl-matrix', 'kdbush', 'pbf']));
+    // pbf through @mapbox/vector-tile as well: listed once
+    expect(names.filter((n) => n === 'pbf')).toHaveLength(1);
+    expect(names.some((n) => n.startsWith('@types/'))).toBe(false);
   });
 });

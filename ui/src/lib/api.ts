@@ -1319,9 +1319,9 @@ export type GeoConfig = {
   /** Default geo:hasDefaultGeometry, geo:hasGeometry. */
   featureLinks?: string[];
   graphs?: { include?: 'all' | string[]; exclude?: string[] };
-  /** Not supported yet. */
+  /** Index W3C Basic Geo latitude/longitude pairs as points; default false. */
   wgs84?: boolean;
-  /** Not supported yet. */
+  /** Rewrite topological properties between features; default false. */
   queryRewrite?: boolean;
   /** Default "geodesic". */
   distance?: 'geodesic' | 'haversine';
@@ -1339,16 +1339,26 @@ export type GeoStatus = {
   generation: string;
   /** The commit of the snapshot the status describes. */
   commit: number;
-  rows: { base: number; overlay: number; tail: number };
+  /** `wgs84`: the rows (of the three) that are W3C Basic Geo points, when any. */
+  rows: { base: number; overlay: number; tail: number; wgs84?: number };
   /** Distinct parsed geometries. */
   literals: number;
   skipped: { malformed: number; unknownCrs: number; tooLarge: number; empty: number };
   /** Literals per CRS IRI. */
   crs: Record<string, number>;
-  memory: { treeBytes: number; geometryBytes: number; overlayBytes: number; budgetBytes: number };
+  /** `mappedBytes`: index files read in place (not counted against the budget). */
+  memory: {
+    treeBytes: number;
+    geometryBytes: number;
+    overlayBytes: number;
+    budgetBytes: number;
+    mappedBytes?: number;
+  };
   config: GeoConfig;
   formatVersion: number;
   lastBuild?: { at: string; ms: number; rows: number };
+  /** The index files of the base (persistent stores); `opened`: read, not built. */
+  files?: { bytes: number; opened: boolean };
 };
 
 /**

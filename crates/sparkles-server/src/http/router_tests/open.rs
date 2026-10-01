@@ -287,6 +287,47 @@ async fn security_headers() {
     assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 }
 
+#[tokio::test]
+async fn map_style_url_origin_in_the_page_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.hosts = crate::exposure::Hosts::new("127.0.0.1", &[]).unwrap();
+    st.map_style_url = Some("https://tiles.example.com/styles/basic.json".into());
+    let app = router(Arc::new(st));
+    for uri in ["/ui/", "/ui/query"] {
+        let (r, h) = call(&app, "GET", uri, &[HOST], "").await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}");
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(
+            csp.contains("connect-src 'self' https://tiles.example.com;"),
+            "{csp}"
+        );
+        assert!(
+            csp.contains("img-src 'self' data: blob: https://tiles.example.com;"),
+            "{csp}"
+        );
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+    }
+    // the maps' worker runs under its own script's policy: it fetches from the UI and the
+    // style's origin
+    if let Some(worker) = crate::ui::worker_asset() {
+        let (r, h) = call(&app, "GET", &format!("/ui/{worker}"), &[HOST], "").await;
+        assert_eq!(r.status, StatusCode::OK);
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        assert!(
+            csp.contains("connect-src 'self' https://tiles.example.com;"),
+            "{csp}"
+        );
+    }
+    let (r, _) = call(&app, "GET", "/$/server", &[HOST], "").await;
+    assert_eq!(
+        r.json()["mapStyleUrl"],
+        "https://tiles.example.com/styles/basic.json"
+    );
+}
+
 #[test]
 fn task_messages_lose_absolute_paths() {
     use crate::http::redact_paths;

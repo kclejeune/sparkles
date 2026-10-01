@@ -21,6 +21,7 @@
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
   import ShexPanel from '$components/ShexPanel.svelte';
+  import SpatialIndexPanel from '$components/SpatialIndexPanel.svelte';
   import TaskList from '$components/TaskList.svelte';
   import TermView from '$components/TermView.svelte';
   import TurtleEditor from '$components/TurtleEditor.svelte';
@@ -1005,6 +1006,18 @@ ex:PersonShape a sh:NodeShape ;
           onchanged={refreshAll}
         />
 
+        <!-- spatial index -->
+        <SpatialIndexPanel
+          {name}
+          {prefixes}
+          readOnly={readOnly || !auth.can(name, 'admin')}
+          busy={acting != null}
+          refreshKey={refreshKick}
+          onstart={startTask}
+          onstarted={() => taskKick++}
+          onchanged={refreshAll}
+        />
+
         <!-- backups in repositories -->
         <BackupsPanel
           {name}
@@ -1054,6 +1067,8 @@ ex:PersonShape a sh:NodeShape ;
                   cloned = t.target;
                 } else if (t.kind === 'text-rebuild')
                   toasts.push('success', 'Full-text index built', t.message);
+                else if (t.kind === 'geo-index')
+                  toasts.push('success', 'Spatial index built', t.message);
                 else toasts.push('success', `${t.kind} finished`, t.message);
                 refreshAll();
               }}
