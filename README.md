@@ -115,34 +115,33 @@ on its own. Before timing, it checks that all engines return the same answers.
 
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
-| Bulk load | **0.6 s** (Oxigraph 1.0, Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.8 s** (Oxigraph 9.0, QLever 9.1, Fluree 10.2, TDB2 42.6) |
-| Fastest of the five | 18 of 20 queries | 15 of 20 queries |
-| Loses to QLever | none | `range-topk` 1.8×; `minus`, `path-plus` ≈ |
-| Loses to Fluree | `distinct-obj` 1.5×, `two-hop-count` ≈ | `contains` 1.6×, `distinct-obj` 1.6× |
-| vs. Fuseki | 1.6–35× faster; Fuseki errors on `foaf:knows*` | 2.7–690× faster (`path-plus` ≈) |
-| vs. Oxigraph | 2.5–44× faster (`path-plus` ≈) | 10–435× faster (`path-plus` ≈) |
-| Update latency (1 triple, real insert) | **5.1 ms** (Fluree 6.5, Oxigraph 11.2, QLever 11.8, Fuseki 41.7) | 7.6 ms (**Fluree 6.8**, Oxigraph 10.7, QLever 15.8, Fuseki 38.6) |
-| Throughput, 16 clients | **940 q/s** (Fluree 497, QLever 408, Fuseki 53, Oxigraph 25) | **191 q/s** (QLever 57, Fluree 51, Fuseki 7, Oxigraph 2) |
-| Server memory | 364 MiB (**QLever 225**, Oxigraph 890, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 897 MiB (**QLever 362 MiB**, Oxigraph 2.3 GiB, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
+| Bulk load | **0.6 s** (Oxigraph 1.0, Fluree 1.4, QLever 1.5, TDB2 4.3) | **4.7 s** (Oxigraph 9.0, QLever 9.1, Fluree 10.2, TDB2 42.6) |
+| Fastest of the five | 17 of 20 queries | 17 of 20 queries |
+| Loses to QLever | none | `minus` ≈ |
+| Loses to Fluree | `distinct-obj` 1.3×; `count-all`, `two-hop-count` ≈ | `distinct-obj` 2.2×, `contains` 1.7× |
+| vs. Fuseki | 2.0–25× faster; Fuseki errors on `foaf:knows*` | 1.8–580× faster |
+| vs. Oxigraph | 1.4–46× faster | 1.5–465× faster |
+| Update latency (1 triple, real insert) | 7.3 ms (**Fluree 6.5**, Oxigraph 11.2, QLever 11.8, Fuseki 41.7) | **5.4 ms** (Fluree 6.8, Oxigraph 10.7, QLever 15.8, Fuseki 38.6) |
+| Throughput, 16 clients | **912 q/s** (Fluree 497, QLever 408, Fuseki 53, Oxigraph 25) | **193 q/s** (QLever 57, Fluree 51, Fuseki 7, Oxigraph 2) |
+| Server memory | 440 MiB (**QLever 225**, Oxigraph 890, Fuseki 1.7 GiB, Fluree 2.2 GiB) | 921 MiB (**QLever 362 MiB**, Oxigraph 2.3 GiB, Fluree 3.1 GiB, Fuseki 3.9 GiB) |
 
-The Sparkles column was re-measured after the latest executor and allocator changes;
-the other engines' numbers are from earlier runs on the same machine and data (Oxigraph's
-the same day, after the others).
-Against QLever at 10.5M, Sparkles wins 17 of 20 queries, several by 7–24×
-(`distinct-obj`, `contains`, `regex-iri`, `lang-filter`, `knows-reach`, `count-all`).
-Fluree is 1.5–60× slower than Sparkles on general joins, OPTIONAL, subqueries, grouping,
+The Sparkles column was re-measured on 2026-09-30 after the ordered-scan top-k; the other
+engines' numbers are from earlier runs on the same machine and data. At 1.05M most queries
+take 5–30 ms and run-to-run noise is of the same order, so the 1.05M wins and losses
+within a few ms are ties.
+Against QLever at 10.5M, Sparkles wins 19 of 20 queries (`minus` is a tie), several by
+8–18× (`distinct-obj`, `contains`, `lang-filter`, `regex-iri`, `knows-reach`,
+`count-all`).
+Fluree is 1.7–74× slower than Sparkles on general joins, OPTIONAL, subqueries, grouping,
 sorting and path traversal, and was OOM-killed (26 GB) on `optional-chain` at 10.5M.
 
 Where Sparkles still loses on performance:
-* **Range filters with ORDER BY … LIMIT:** QLever is 1.8× faster on `range-topk` at
-  10.5M. Sparkles reads only the matching id ranges of inline numbers, but must still
-  test the non-canonical numerals (vocabulary literals) and decode the surviving rows.
-* **Single-predicate scans:** Fluree is 1.6× faster at 10.5M on `contains` and
-  `distinct-obj`.
-* **Update latency:** Fluree commits slightly faster at 10.5M (it indexes in the
-  background).
+* **Single-predicate scans:** Fluree is faster at 10.5M on `distinct-obj` (2.2×) and
+  `contains` (1.7×).
+* **Update latency:** Fluree commits slightly faster at 1.05M (6.5 vs 7.3 ms, within
+  noise; it indexes in the background); Sparkles is faster at 10.5M.
 * **Memory:** Sparkles materializes every intermediate result and buffers whole
-  responses, and it keeps a decoded-block cache (about 450 MiB of the 897 MiB at 10.5M).
+  responses, and it keeps a decoded-block cache (about 450 MiB of the 921 MiB at 10.5M).
   The server uses mimalloc and releases free heap memory when idle; with glibc malloc
   the same 10.5M run ended at 1.6 GiB.
 * **Untested ground:** nothing above 10.5M triples, cold caches, standard benchmarks
