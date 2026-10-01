@@ -64,7 +64,7 @@ pub fn from_json(json: &str) -> Result<ShapeMap, ParseError> {
         let shape = field(["shape", "shapeLabel"])?;
         let node = json_selector(node).map_err(|e| at(i, e.message))?;
         let shape = json_label(shape);
-        if !seen.insert((format!("{node:?}"), shape.clone())) {
+        if !seen.insert((node.clone(), shape.clone())) {
             return Err(at(i, "duplicate node and shape".to_string()));
         }
         map.push(Association { node, shape });
