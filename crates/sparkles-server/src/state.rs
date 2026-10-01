@@ -58,34 +58,29 @@ pub struct Dataset {
     pub ephemeral: bool,
     /// the last schema report served (`/$/schema/{ds}`), kept for its pagination cursors
     pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
-    /// write-time SHACL validation, when configured
-    pub validation: RwLock<Option<Arc<Validation>>>,
+    /// write-time validation (SHACL or ShEx), when configured
+    pub validation: RwLock<Option<Validation>>,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
 }
 
-#[cfg(feature = "shacl")]
-pub type Validation = sparkles_shacl::guard::ShaclGuard;
-/// Placeholder: built without SHACL validation.
-#[cfg(not(feature = "shacl"))]
-pub struct Validation;
+pub use crate::write_validation::Validation;
 
 /// Install a store's write-time validation from its `validation.json`. A configuration
 /// that cannot be loaded leaves the dataset refusing writes (the store fails closed).
-fn install_validation(store: &Store) -> Option<Arc<Validation>> {
-    #[cfg(feature = "shacl")]
-    match sparkles_shacl::guard::install(store) {
-        Ok(g) => return g,
-        Err(e) => tracing::error!(
-            "write-time validation of {}: {e:#}; writes are refused until it is fixed",
-            store
-                .root()
-                .map_or("(memory)".into(), |r| r.display().to_string())
-        ),
+fn install_validation(store: &Store) -> Option<Validation> {
+    match crate::write_validation::install(store) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(
+                "write-time validation of {}: {e:#}; writes are refused until it is fixed",
+                store
+                    .root()
+                    .map_or("(memory)".into(), |r| r.display().to_string())
+            );
+            None
+        }
     }
-    #[cfg(not(feature = "shacl"))]
-    let _ = store;
-    None
 }
 
 /// A computed schema report and what it was computed for.

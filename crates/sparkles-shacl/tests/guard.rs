@@ -20,6 +20,7 @@ const P: &str = "PREFIX ex: <http://ex.org/> ";
 fn cfg(mode: GuardMode) -> ValidationConfig {
     ValidationConfig {
         format: 1,
+        language: None,
         mode,
         shapes: ShapesSource {
             graphs: Some(vec!["urn:shapes".into()]),

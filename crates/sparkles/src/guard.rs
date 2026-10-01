@@ -1,6 +1,9 @@
 //! Write guards: checks that run on a transaction's post-state under the writer lock,
-//! before anything is written, and may reject the commit. `sparkles-shacl` provides
-//! write-time SHACL validation as a guard; the store only knows this interface.
+//! before anything is written, and may reject the commit. `sparkles-shacl` and
+//! `sparkles-shex` provide write-time SHACL and ShEx validation as guards; the store only
+//! knows this interface (and reads `mode` from [`config::CONFIG_FILE`]).
+
+pub mod config;
 
 use crate::commit::CommitKind;
 use crate::error::Result;
@@ -23,14 +26,20 @@ pub trait CommitGuard: Send + Sync {
     fn bypassed(&self) {}
     /// A short description, for errors and status.
     fn describe(&self) -> String;
+    /// The shape language this guard validates with.
+    fn language(&self) -> GuardLanguage {
+        GuardLanguage::Shacl
+    }
 }
 
 /// Sees the outcome of every guard decision of a store (for metrics and logs): the
 /// summary of a check (including rejections) or of a bypass, or the error that aborted
-/// the check, with the time the check took.
+/// the check, with the time the check took. `language` is the installed guard's (SHACL
+/// when a required guard is missing).
 pub trait GuardObserver: Send + Sync {
     fn observe(
         &self,
+        language: GuardLanguage,
         kind: CommitKind,
         outcome: std::result::Result<&ValidationSummary, &crate::Error>,
         elapsed: Duration,
@@ -140,6 +149,41 @@ pub enum GuardMode {
     Off,
 }
 
+/// The shape language of a dataset's write-time validation (`language` in
+/// `validation.json`; SHACL when absent).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardLanguage {
+    #[default]
+    Shacl,
+    Shex,
+}
+
+impl GuardLanguage {
+    pub const ALL: [GuardLanguage; 2] = [GuardLanguage::Shacl, GuardLanguage::Shex];
+
+    /// `shacl` or `shex` (the `language` label of the validation metrics).
+    pub fn name(self) -> &'static str {
+        match self {
+            GuardLanguage::Shacl => "shacl",
+            GuardLanguage::Shex => "shex",
+        }
+    }
+
+    /// `SHACL` or `ShEx`, for messages.
+    pub fn title(self) -> &'static str {
+        match self {
+            GuardLanguage::Shacl => "SHACL",
+            GuardLanguage::Shex => "ShEx",
+        }
+    }
+
+    /// The position in [`GuardLanguage::ALL`].
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
@@ -168,6 +212,9 @@ pub struct SeverityCounts {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidationSummary {
+    /// the guard's language; a ShEx guard's results are result-map entries, one per
+    /// nonconformant association, each counted as a violation
+    pub language: GuardLanguage,
     pub status: GuardStatus,
     pub mode: GuardMode,
     pub strategy: Strategy,
@@ -191,9 +238,10 @@ pub struct ValidationSummary {
 }
 
 impl ValidationSummary {
-    /// A summary with no findings.
+    /// A summary with no findings (of a SHACL guard; set `language` for another).
     pub fn empty(status: GuardStatus, mode: GuardMode, threshold: Severity) -> ValidationSummary {
         ValidationSummary {
+            language: GuardLanguage::Shacl,
             status,
             mode,
             strategy: Strategy::None,
@@ -211,7 +259,8 @@ impl ValidationSummary {
         }
     }
 
-    /// `Sparkles-Validation` header value (an RFC 9651 Dictionary).
+    /// `Sparkles-Validation` header value (an RFC 9651 Dictionary). A ShEx guard's adds
+    /// `lang=shex` after `strategy`; a SHACL guard's has no `lang`, as before format 2.
     pub fn header(&self) -> String {
         let mode = match self.mode {
             GuardMode::Reject => "reject",
@@ -223,8 +272,12 @@ impl ValidationSummary {
             Strategy::Incremental => "incremental",
             Strategy::None => "none",
         };
+        let lang = match self.language {
+            GuardLanguage::Shacl => "",
+            GuardLanguage::Shex => ", lang=shex",
+        };
         format!(
-            "status={}, mode={}, strategy={}, blocking={}, total={}, violations={}, warnings={}, infos={}, ms={}",
+            "status={}, mode={}, strategy={}{lang}, blocking={}, total={}, violations={}, warnings={}, infos={}, ms={}",
             self.status.name(),
             mode,
             strategy,
@@ -260,6 +313,20 @@ pub struct Rejection {
 
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.summary.language == GuardLanguage::Shex {
+            let n = self.summary.blocking;
+            return match &self.summary.shapes_error {
+                Some(e) => write!(
+                    f,
+                    "ShEx validation failed: the schema cannot be used ({e}); nothing was committed"
+                ),
+                None => write!(
+                    f,
+                    "ShEx validation failed: {n} nonconformant association{}; nothing was committed",
+                    if n == 1 { "" } else { "s" }
+                ),
+            };
+        }
         match &self.summary.shapes_error {
             Some(e) => write!(
                 f,
@@ -277,5 +344,45 @@ impl std::fmt::Display for Rejection {
                 }
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shex_summaries() {
+        let mut s = ValidationSummary::empty(
+            GuardStatus::Rejected,
+            GuardMode::Reject,
+            Severity::Violation,
+        );
+        s.strategy = Strategy::Full;
+        s.blocking = 3;
+        assert!(
+            s.header()
+                .starts_with("status=rejected, mode=reject, strategy=full, blocking=3,")
+        );
+        s.language = GuardLanguage::Shex;
+        assert!(
+            s.header()
+                .starts_with("status=rejected, mode=reject, strategy=full, lang=shex, blocking=3,"),
+            "{}",
+            s.header()
+        );
+        let r = Rejection {
+            summary: s,
+            head: 1,
+            kind: CommitKind::Transaction,
+        };
+        assert_eq!(
+            r.to_string(),
+            "ShEx validation failed: 3 nonconformant associations; nothing was committed"
+        );
+        assert_eq!(
+            serde_json::to_value(&r.summary).unwrap()["language"],
+            "shex"
+        );
     }
 }

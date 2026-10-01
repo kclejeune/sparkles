@@ -46,6 +46,7 @@ pub mod compile;
 pub mod engine;
 #[doc(hidden)]
 pub mod explain;
+pub mod guard;
 #[doc(hidden)]
 pub mod ir;
 #[doc(hidden)]
@@ -65,6 +66,7 @@ pub mod shapemap;
 pub mod shexc;
 #[doc(hidden)]
 pub mod shexj;
+pub mod shexr;
 #[doc(hidden)]
 pub mod typing;
 
@@ -91,19 +93,23 @@ pub enum SchemaFormat {
     ShExC,
     /// the JSON-LD syntax (`application/shex+json`)
     ShExJ,
+    /// ShExR: RDF in the ShEx vocabulary, in an RDF syntax
+    ShExR(sparkles::io::RdfFormat),
 }
 
 impl SchemaFormat {
-    /// `shexc` / `shex` or `shexj` / `json`.
+    /// `shexc` / `shex`, `shexj` / `json`, or `shexr` (Turtle).
     pub fn from_name(s: &str) -> Option<SchemaFormat> {
         match s.trim().to_ascii_lowercase().as_str() {
             "shexc" | "shex" => Some(SchemaFormat::ShExC),
             "shexj" | "json" => Some(SchemaFormat::ShExJ),
+            "shexr" => Some(SchemaFormat::ShExR(sparkles::io::RdfFormat::Turtle)),
             _ => None,
         }
     }
 
-    /// `text/shex` or `application/shex+json` (parameters ignored).
+    /// `text/shex` or `application/shex+json` (parameters ignored). RDF media types are
+    /// left to the caller, since `application/json` is also ShExJ.
     pub fn from_media_type(ct: &str) -> Option<SchemaFormat> {
         match ct.split(';').next()?.trim().to_ascii_lowercase().as_str() {
             "text/shex" => Some(SchemaFormat::ShExC),
@@ -139,6 +145,25 @@ impl Schema {
     pub fn to_shexc(&self) -> String {
         shexc::writer::write(self)
     }
+
+    /// Parse ShExR: RDF text in `format`, in the ShEx vocabulary.
+    pub fn from_shexr(
+        text: &str,
+        format: sparkles::io::RdfFormat,
+        base: Option<&str>,
+    ) -> Result<Schema, ParseError> {
+        shexr::from_text(text, format, base)
+    }
+
+    /// The ShExR form: a graph in the ShEx vocabulary.
+    pub fn to_shexr(&self) -> oxrdf::Graph {
+        shexr::to_graph(self)
+    }
+
+    /// The ShExR form as Turtle, with the schema's prefixes.
+    pub fn to_shexr_turtle(&self) -> String {
+        shexr::to_text(self, sparkles::io::RdfFormat::Turtle)
+    }
 }
 
 /// Parse a schema in `hint`'s syntax, or sniffed: ShExJ when the text starts with `{`
@@ -158,6 +183,7 @@ pub fn parse_schema(
     match format {
         SchemaFormat::ShExC => Schema::parse_shexc(text, base),
         SchemaFormat::ShExJ => Schema::from_shexj_with_base(text, base),
+        SchemaFormat::ShExR(f) => Schema::from_shexr(text, f, base),
     }
 }
 
@@ -263,7 +289,8 @@ pub enum NodeSelector {
         object: Option<Term>,
         focus_is_subject: bool,
     },
-    /// `SPARQL """…"""` (not supported yet)
+    /// `SPARQL """…"""`: the bindings of `?focus` (or of the first projected variable)
+    /// of a SELECT query on the data graph
     Sparql(String),
 }
 
@@ -472,6 +499,10 @@ pub struct ValidateOptions {
     pub only_nonconformant: bool,
     /// Keep the Test extension's `print` output in the results.
     pub semact_trace: bool,
+    /// The options `SPARQL` selectors run with: row and memory budgets, SERVICE and the
+    /// outbound policy. The dataset (the validation's data graph), the timeout and the
+    /// cancel flag are the validation's. `None`: the defaults (no budgets, no SERVICE).
+    pub selector_query: Option<sparkles::sparql::QueryOptions>,
 }
 
 /// The default of [`ValidateOptions::max_pairs`].
@@ -494,6 +525,7 @@ impl Default for ValidateOptions {
             max_partitions: Some(DEFAULT_MAX_PARTITIONS),
             only_nonconformant: false,
             semact_trace: false,
+            selector_query: None,
         }
     }
 }

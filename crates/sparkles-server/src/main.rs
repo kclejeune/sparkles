@@ -32,7 +32,10 @@ mod shacl;
 mod shex_cmd;
 mod state;
 mod ui;
+#[cfg(any(feature = "shacl", feature = "shex"))]
+mod validation_cmd;
 mod validation_common;
+mod write_validation;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -74,7 +77,7 @@ struct Cli {
     /// data stops adding its prefixes
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
     max_prefixes: usize,
-    /// Write without write-time SHACL validation (load, update, infer)
+    /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
     /// Log format on stderr: text, or json (one object per line)
@@ -428,7 +431,7 @@ enum Cmd {
         /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
         #[arg(long, default_value_t = 4096)]
         vector_memory_mb: u64,
-        /// Honor `validate=false` on writes, which skips write-time SHACL validation
+        /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
         /// Timeout of SPARQL updates without a `timeout` parameter, in seconds (0: none)
@@ -734,42 +737,10 @@ enum Cmd {
         #[command(flatten)]
         compress: CompressArgs,
     },
-    /// Write-time SHACL validation of a database: status, set, or turn off
-    #[cfg(feature = "shacl")]
-    Validation {
-        #[arg(long)]
-        loc: PathBuf,
-        /// print the configuration and status and change nothing
-        #[arg(long)]
-        status: bool,
-        /// reject or warn
-        #[arg(long, value_parser = ["reject", "warn"])]
-        mode: Option<String>,
-        /// shapes graph of the dataset (repeatable)
-        #[arg(long)]
-        shapes_graph: Vec<String>,
-        /// a shapes file (Turtle), copied into the database
-        #[arg(long, conflicts_with = "shapes_graph")]
-        shapes: Option<PathBuf>,
-        /// default, union, or graph IRIs (repeatable)
-        #[arg(long)]
-        data_graph: Vec<String>,
-        #[arg(long)]
-        include_inferences: bool,
-        /// violation, warning or info
-        #[arg(long, default_value = "violation")]
-        threshold: String,
-        #[arg(long, default_value_t = 10.0)]
-        timeout: f64,
-        #[arg(long, default_value_t = 100)]
-        report_limit: usize,
-        /// turn validation off
-        #[arg(long, conflicts_with_all = ["mode", "status"])]
-        off: bool,
-        /// text or json
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
+    /// Write-time validation of a database (SHACL, or ShEx with --lang shex): status,
+    /// set, or turn off
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    Validation(validation_cmd::ValidationArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -1148,6 +1119,16 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
         eprintln!("{r}");
         for res in r.summary.results.iter().take(10) {
             let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
+            if r.summary.language == sparkles::guard::GuardLanguage::Shex {
+                // a ShEx result: node, shape (or START) and the first failure
+                let shape = match res["shape"]["type"].as_str() {
+                    Some("start") => "START".to_string(),
+                    _ => t("shape"),
+                };
+                let reason = res["reason"].as_str().unwrap_or("");
+                eprintln!("  {} @ {shape}: {reason}", t("node"));
+                continue;
+            }
             let msg = res["messages"][0].as_str().unwrap_or("");
             eprintln!(
                 "  {} at {}{}",
@@ -1188,39 +1169,17 @@ fn validation_note(v: Option<&sparkles::guard::ValidationSummary>) -> String {
 
 /// The `sparkles stats` line of a validated database:
 /// `reject · 2 shape graphs · 20 shapes · last full 164 ms`.
-#[cfg(feature = "shacl")]
 fn validation_stats(store: &Store) -> Option<String> {
-    use sparkles_shacl::guard;
-    let cfg = match guard::read_config(store.root()?) {
-        Ok(c) => c?,
+    match sparkles::guard::config::config_language(store.root()?) {
+        Ok(None) => return None,
+        Ok(Some(_)) => {}
         Err(e) => return Some(format!("cannot be loaded: {e:#}")),
-    };
-    let mut parts = vec![
-        serde_json::to_string(&cfg.mode)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string(),
-        match &cfg.shapes.graphs {
-            Some(g) => format!(
-                "{} shape graph{}",
-                g.len(),
-                if g.len() == 1 { "" } else { "s" }
-            ),
-            None => "shapes file".to_string(),
-        },
-    ];
-    match guard::install(store) {
-        Ok(Some(g)) => {
-            let s = g.status();
-            parts.push(format!("{} shapes", s.shape_count));
-            if let Some(ms) = s.last_full_millis {
-                parts.push(format!("last full {ms} ms"));
-            }
-        }
-        Ok(None) => {}
-        Err(e) => parts.push(format!("shapes cannot be loaded: {e:#}")),
     }
-    Some(parts.join(" · "))
+    Some(match write_validation::install(store) {
+        Ok(Some(v)) => v.stats_line(),
+        Ok(None) => "off".to_string(),
+        Err(e) => format!("cannot be loaded: {e:#}"),
+    })
 }
 
 /// Open a database for a CLI write, with its write-time validation installed (unless
@@ -1237,8 +1196,7 @@ fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) 
         }
         return Ok(store);
     }
-    #[cfg(feature = "shacl")]
-    sparkles_shacl::guard::install(&store)?;
+    write_validation::install(&store)?;
     Ok(store)
 }
 
@@ -1894,110 +1852,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
-        #[cfg(feature = "shacl")]
-        Cmd::Validation {
-            loc,
-            status,
-            mode,
-            shapes_graph,
-            shapes,
-            data_graph,
-            include_inferences,
-            threshold,
-            timeout,
-            report_limit,
-            off,
-            format,
-        } => {
-            use sparkles_shacl::guard::{
-                self, DataGraphSel, SetOutcome, ShapesSource, ValidationConfig,
-            };
-            let mut opts = opts;
-            opts.unvalidated_writes = true;
-            let store = Store::open(&loc, opts)?;
-            if status || (mode.is_none() && !off) {
-                let g = guard::install(&store)?;
-                let j = match &g {
-                    Some(g) => serde_json::json!({ "config": g.config(), "status": g.status() }),
-                    None => serde_json::json!({ "config": null }),
-                };
-                if format == "json" {
-                    println!("{}", serde_json::to_string_pretty(&j)?);
-                } else {
-                    match g {
-                        Some(g) => {
-                            let s = g.status();
-                            println!(
-                                "validation {}",
-                                serde_json::to_string(&g.config().mode)?.trim_matches('"')
-                            );
-                            println!("shapes     {} shapes", s.shape_count);
-                            for w in s.warnings {
-                                println!("warning    {w}");
-                            }
-                        }
-                        None => println!("validation off"),
-                    }
-                }
-                return Ok(());
-            }
-            if off {
-                guard::set_config(&store, None)?;
-                println!("validation off");
-                return Ok(());
-            }
-            let mode: sparkles::guard::GuardMode =
-                serde_json::from_value(serde_json::json!(mode.unwrap()))?;
-            let threshold: sparkles::guard::Severity =
-                serde_json::from_value(serde_json::json!(threshold))
-                    .context("--threshold is violation, warning or info")?;
-            let data_graph = match data_graph.as_slice() {
-                [] => DataGraphSel::default(),
-                [g] if g == "default" || g == "union" => DataGraphSel::Named(g.clone()),
-                gs => DataGraphSel::Graphs(gs.to_vec()),
-            };
-            let shapes = match shapes {
-                Some(f) => ShapesSource {
-                    inline: Some(std::fs::read_to_string(&f)?),
-                    source: Some(f.display().to_string()),
-                    ..Default::default()
-                },
-                None if !shapes_graph.is_empty() => ShapesSource {
-                    graphs: Some(shapes_graph),
-                    ..Default::default()
-                },
-                None => bail!("give --shapes FILE or --shapes-graph IRI"),
-            };
-            let cfg = ValidationConfig {
-                format: 1,
-                mode,
-                shapes,
-                data_graph,
-                include_inferences,
-                threshold,
-                timeout_seconds: timeout,
-                report_limit,
-                updated: None,
-            };
-            match guard::set_config(&store, Some(cfg))? {
-                SetOutcome::Installed(_, s) => {
-                    println!(
-                        "validation on: {} results ({} blocking) in {} ms",
-                        s.total, s.blocking, s.millis
-                    );
-                    Ok(())
-                }
-                SetOutcome::NotConforming(s) => {
-                    println!("{}", serde_json::to_string_pretty(&s)?);
-                    eprintln!(
-                        "the data does not conform ({} blocking results); fix it or use --mode warn first",
-                        s.blocking
-                    );
-                    std::process::exit(1);
-                }
-                SetOutcome::Removed => Ok(()),
-            }
-        }
+        #[cfg(any(feature = "shacl", feature = "shex"))]
+        Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
@@ -2105,7 +1961,6 @@ fn run() -> Result<()> {
             if let Some(info) = state::read_reasoning_file(&loc) {
                 println!("reasoning       {}", reasoning::status_line(&info, &store));
             }
-            #[cfg(feature = "shacl")]
             if let Some(v) = validation_stats(&store) {
                 println!("validation      {v}");
             }

@@ -734,9 +734,17 @@ const SEVERITIES: [&str; 3] = ["violation", "warning", "info"];
 /// counters. They live with the dataset, so a deleted dataset's series go with it.
 pub struct ValidationMetrics {
     dataset: String,
+    /// by [`sparkles::guard::GuardLanguage::index`]
+    by_language: [LanguageCounters; 2],
+}
+
+/// The validation counters of one language.
+#[derive(Default)]
+struct LanguageCounters {
     status: [AtomicU64; 7],
     duration: [Histogram; 2],
-    /// results found by validated writes, by severity
+    /// results found by validated writes, by severity (ShEx: nonconformant associations
+    /// count as violations)
     results: [AtomicU64; 3],
 }
 
@@ -744,25 +752,28 @@ impl ValidationMetrics {
     pub fn new(dataset: &str) -> ValidationMetrics {
         ValidationMetrics {
             dataset: dataset.to_string(),
-            status: Default::default(),
-            duration: Default::default(),
-            results: Default::default(),
+            by_language: Default::default(),
         }
     }
 
-    fn seen(&self) -> bool {
-        self.status.iter().any(|c| c.load(Ordering::Relaxed) > 0)
+    fn seen(&self, language: sparkles::guard::GuardLanguage) -> bool {
+        self.by_language[language.index()]
+            .status
+            .iter()
+            .any(|c| c.load(Ordering::Relaxed) > 0)
     }
 }
 
 impl sparkles::guard::GuardObserver for ValidationMetrics {
     fn observe(
         &self,
+        language: sparkles::guard::GuardLanguage,
         kind: sparkles::commit::CommitKind,
         outcome: std::result::Result<&sparkles::guard::ValidationSummary, &sparkles::Error>,
         elapsed: Duration,
     ) {
         use sparkles::guard::{GuardStatus, Strategy};
+        let m = &self.by_language[language.index()];
         let status = match outcome {
             Ok(s) => match s.status {
                 GuardStatus::Passed => 0,
@@ -776,12 +787,12 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             Err(sparkles::Error::Cancelled) => return,
             Err(_) => 6,
         };
-        self.status[status].fetch_add(1, Ordering::Relaxed);
+        m.status[status].fetch_add(1, Ordering::Relaxed);
         let s = match outcome {
             Ok(s) => s,
             Err(_) => {
-                // Phase 1 validates in full; a timeout or failure still took its time
-                self.duration[0].observe(elapsed);
+                // validation is in full; a timeout or failure still took its time
+                m.duration[0].observe(elapsed);
                 return;
             }
         };
@@ -791,29 +802,31 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             // skipped or bypassed: nothing was validated
             Strategy::None => return,
         };
-        self.duration[strategy].observe(elapsed);
+        m.duration[strategy].observe(elapsed);
         let c = &s.by_severity;
         for (i, n) in [c.violation, c.warning, c.info].into_iter().enumerate() {
-            self.results[i].fetch_add(n, Ordering::Relaxed);
+            m.results[i].fetch_add(n, Ordering::Relaxed);
         }
         if s.status == GuardStatus::Rejected {
             let (shape, focus_node) = first_result(s).unzip();
             tracing::info!(
                 target: "sparkles::validation",
                 dataset = %self.dataset,
+                language = language.name(),
                 kind = kind.name(),
                 blocking = s.blocking,
                 total = s.total,
                 shape,
                 focus_node,
-                "write rejected by SHACL validation"
+                "write rejected by {} validation",
+                language.title()
             );
         }
     }
 }
 
 /// The source shape and focus node of a summary's first (highest ranked) result, as
-/// N-Triples-style terms.
+/// N-Triples-style terms (of a ShEx result: its shape and node; START as `START`).
 pub fn first_result(s: &sparkles::guard::ValidationSummary) -> Option<(String, String)> {
     let r = s.results.first()?;
     let term = |t: &J| {
@@ -825,6 +838,13 @@ pub fn first_result(s: &sparkles::guard::ValidationSummary) -> Option<(String, S
             _ => v.to_string(),
         }
     };
+    if s.language == sparkles::guard::GuardLanguage::Shex {
+        let shape = match r["shape"]["type"].as_str() {
+            Some("start") => "START".to_string(),
+            _ => term(&r["shape"]),
+        };
+        return Some((shape, term(&r["node"])));
+    }
     Some((term(&r["sourceShape"]), term(&r["focusNode"])))
 }
 
@@ -837,35 +857,43 @@ struct ValidationTotals {
     results: [u64; 3],
 }
 
-/// Validation counters by dataset label, for datasets with a configuration or counts.
-fn validation_totals(st: &AppState) -> BTreeMap<String, ValidationTotals> {
+/// Validation counters by dataset label and language, for the language of a dataset's
+/// configuration and the languages with counts.
+fn validation_totals(st: &AppState) -> BTreeMap<(String, &'static str), ValidationTotals> {
     let datasets: Vec<_> = st.datasets.read().values().cloned().collect();
-    let mut out: BTreeMap<String, ValidationTotals> = BTreeMap::new();
+    let mut out: BTreeMap<(String, &'static str), ValidationTotals> = BTreeMap::new();
     for d in datasets {
-        let m = &d.validation_metrics;
-        if d.validation.read().is_none() && !m.seen() {
-            continue;
-        }
-        let label = if st.metrics.enabled {
-            st.metrics.series(Some(&d.name)).0
-        } else {
-            d.name.clone()
-        };
-        let t = out.entry(label).or_default();
-        for (a, c) in t.status.iter_mut().zip(&m.status) {
-            *a += c.load(Ordering::Relaxed);
-        }
-        for ((buckets, sum), h) in t.duration.iter_mut().zip(&m.duration) {
-            for (a, n) in buckets.iter_mut().zip(h.cumulative()) {
-                *a += n;
+        let configured = d.validation.read().as_ref().map(|v| v.language());
+        for language in sparkles::guard::GuardLanguage::ALL {
+            let vm = &d.validation_metrics;
+            if configured != Some(language) && !vm.seen(language) {
+                continue;
             }
-            *sum += h.sum_nanos.load(Ordering::Relaxed);
-        }
-        for (a, c) in t.results.iter_mut().zip(&m.results) {
-            *a += c.load(Ordering::Relaxed);
+            let m = &vm.by_language[language.index()];
+            let label = if st.metrics.enabled {
+                st.metrics.series(Some(&d.name)).0
+            } else {
+                d.name.clone()
+            };
+            add_totals(out.entry((label, language.name())).or_default(), m);
         }
     }
     out
+}
+
+fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
+    for (a, c) in t.status.iter_mut().zip(&m.status) {
+        *a += c.load(Ordering::Relaxed);
+    }
+    for ((buckets, sum), h) in t.duration.iter_mut().zip(&m.duration) {
+        for (a, n) in buckets.iter_mut().zip(h.cumulative()) {
+            *a += n;
+        }
+        *sum += h.sum_nanos.load(Ordering::Relaxed);
+    }
+    for (a, c) in t.results.iter_mut().zip(&m.results) {
+        *a += c.load(Ordering::Relaxed);
+    }
 }
 
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
@@ -1132,14 +1160,14 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_validation_total",
         "counter",
-        "Write-time SHACL validations by dataset and status.",
+        "Write-time validations by dataset, language and status.",
     );
-    for (ds, t) in &validation {
+    for ((ds, lang), t) in &validation {
         let ds = escape_label(ds);
         for (status, n) in VALIDATION_STATUS.iter().zip(t.status) {
             let _ = writeln!(
                 o,
-                "sparkles_validation_total{{dataset=\"{ds}\",status=\"{status}\"}} {n}"
+                "sparkles_validation_total{{dataset=\"{ds}\",language=\"{lang}\",status=\"{status}\"}} {n}"
             );
         }
     }
@@ -1147,9 +1175,9 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_validation_duration_seconds",
         "histogram",
-        "Duration of write-time SHACL validations in seconds.",
+        "Duration of write-time validations in seconds.",
     );
-    for (ds, t) in &validation {
+    for ((ds, lang), t) in &validation {
         let ds = escape_label(ds);
         for (strategy, (cum, sum)) in STRATEGIES.iter().zip(&t.duration) {
             if cum[16] == 0 {
@@ -1158,10 +1186,10 @@ pub fn render_prometheus(st: &AppState) -> String {
             for (le, n) in BUCKET_LABELS.iter().zip(cum) {
                 let _ = writeln!(
                     o,
-                    "sparkles_validation_duration_seconds_bucket{{dataset=\"{ds}\",strategy=\"{strategy}\",le=\"{le}\"}} {n}"
+                    "sparkles_validation_duration_seconds_bucket{{dataset=\"{ds}\",language=\"{lang}\",strategy=\"{strategy}\",le=\"{le}\"}} {n}"
                 );
             }
-            let labels = format!("dataset=\"{ds}\",strategy=\"{strategy}\"");
+            let labels = format!("dataset=\"{ds}\",language=\"{lang}\",strategy=\"{strategy}\"");
             let _ = writeln!(
                 o,
                 "sparkles_validation_duration_seconds_sum{{{labels}}} {}",
@@ -1178,14 +1206,14 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_validation_results_total",
         "counter",
-        "Validation results found by validated writes, by severity.",
+        "Validation results found by validated writes, by severity (ShEx: nonconformant associations, as violations).",
     );
-    for (ds, t) in &validation {
+    for ((ds, lang), t) in &validation {
         let ds = escape_label(ds);
         for (severity, n) in SEVERITIES.iter().zip(t.results) {
             let _ = writeln!(
                 o,
-                "sparkles_validation_results_total{{dataset=\"{ds}\",severity=\"{severity}\"}} {n}"
+                "sparkles_validation_results_total{{dataset=\"{ds}\",language=\"{lang}\",severity=\"{severity}\"}} {n}"
             );
         }
     }
