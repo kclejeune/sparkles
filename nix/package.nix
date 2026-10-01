@@ -21,6 +21,7 @@ rustPlatform.buildRustPackage {
       ../rust-toolchain.toml
       ../crates
       ../vendor
+      ../THIRD_PARTY_LICENSES.md
     ];
   };
 
@@ -44,6 +45,12 @@ rustPlatform.buildRustPackage {
     "sparkles"
     "--lib"
   ];
+
+  # the licenses and notices of the linked crates (Apache-2.0 asks for NOTICE files to
+  # travel with the binary); `mise run licenses` regenerates the file
+  postInstall = ''
+    install -Dm644 THIRD_PARTY_LICENSES.md $out/share/doc/sparkles/THIRD_PARTY_LICENSES.md
+  '';
 
   meta = {
     description = "High-performance RDF/SPARQL database with a Jena/Fuseki-compatible CLI and server";

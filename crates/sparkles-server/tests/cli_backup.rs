@@ -215,6 +215,15 @@ fn bad_combinations_are_usage_errors() {
         vec!["repo", "add", "x", "--path", "/p", "--prefix", "p"],
         vec!["repo", "add", "x", "--path", "/p", "--credentials", "env"],
         vec![
+            "repo",
+            "add",
+            "x",
+            "--path",
+            "/p",
+            "--credentials-name",
+            "c",
+        ],
+        vec![
             "backup",
             "restore",
             "--repo",
@@ -251,6 +260,45 @@ fn repositories_are_named_or_given_by_url() {
     let o = expect(h, &["backup", "list", "--repo", &file_url(&empty)], 1);
     assert!(!empty.join("sparkles-repo.json").exists());
     assert!(!stderr(&o).is_empty());
+}
+
+/// `repo add --credentials-name` names a credential source of the config file: one
+/// that is not defined needs `--credentials`, one that is must match it. Nothing is
+/// written (or connected to) when they do not.
+#[test]
+fn named_credential_sources_are_checked_before_connecting() {
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let cfg = h.join("config/sparkles/backup.toml");
+    let add = |extra: &[&str]| -> Output {
+        let mut args = vec!["repo", "add", "s3-main", "--s3", "kg"];
+        args.extend_from_slice(extra);
+        expect(h, &args, 1)
+    };
+    let o = add(&["--credentials-name", "minio"]);
+    assert!(
+        stderr(&o).contains("has no [credentials.minio]"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!cfg.exists());
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cfg,
+        "version = 1\n\n[credentials.minio]\nsource = \"env\"\naccess_key_id_var = \"K\"\nsecret_access_key_var = \"S\"\n",
+    )
+    .unwrap();
+    let before = std::fs::read(&cfg).unwrap();
+    let o = add(&["--credentials-name", "minio", "--credentials", "default"]);
+    assert!(stderr(&o).contains("otherwise"), "{}", stderr(&o));
+    // a bad name, before any connection
+    let o = add(&["--credentials-name", "Not Valid", "--credentials", "env"]);
+    assert!(
+        stderr(&o).contains("invalid credential source name"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
 }
 
 /// Offline disaster recovery: list and restore from a repository with the server
@@ -848,6 +896,30 @@ fn memory_repositories() {
     let b = json_of(&o);
     assert_eq!(b["name"], "m1");
     assert!(b["stats"]["files"].as_u64().unwrap() > 0, "{b}");
+    // backup names take upper case too, and the message says so
+    for (name, code) in [("Nightly.2026-09-30", 0), (".bad", 1), ("a b", 1)] {
+        let o = expect(
+            h,
+            &[
+                "backup",
+                "create",
+                "--loc",
+                &db,
+                "--repo",
+                "memory://",
+                "--name",
+                name,
+            ],
+            code,
+        );
+        if code == 1 {
+            assert!(
+                stderr(&o).contains("A-Z, a-z, 0-9, '.', '_' and '-'"),
+                "{}",
+                stderr(&o)
+            );
+        }
+    }
     // progress went to stderr
     assert!(stderr(&o).contains('%'), "{}", stderr(&o));
     // each process has its own memory repository

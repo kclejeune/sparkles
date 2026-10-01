@@ -1012,6 +1012,9 @@ pub struct PolicyRun {
     pub started: String,
     pub finished: Option<String>,
     pub result: RunResult,
+    /// why a scheduled run was skipped
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub datasets: Vec<PolicyRunDataset>,
     pub retention: Option<RunRetention>,
     pub gc: Option<RunGc>,

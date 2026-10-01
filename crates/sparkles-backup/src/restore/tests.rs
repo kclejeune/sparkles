@@ -398,6 +398,22 @@ async fn unknown_backups_existing_targets_and_disk_space() {
         (Code::InsufficientStorage, 507)
     );
     assert!(!dir.path().join("t").exists());
+
+    // a backup that fits, but would leave less than the store's disk reserve free
+    let o = RestoreOptions {
+        store_opts: StoreOptions {
+            min_free_disk_bytes: Some(u64::MAX / 2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let e = repo
+        .restore("b1", &dir.path().join("t"), &o)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::InsufficientStorage);
+    assert!(e.message().contains("--min-free-disk-mb"), "{e}");
+    assert!(!dir.path().join("t").exists());
 }
 
 #[tokio::test]

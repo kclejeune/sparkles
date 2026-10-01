@@ -26,7 +26,7 @@ use crate::layout::{self, MAX_SEGMENTS};
 use crate::repo::{is_already_exists, is_not_found, read_only};
 use crate::{
     BackupError, BackupSummary, BlobRef, CreateOptions, Ctl, Derived, FileEntry, LockKind,
-    LockOperation, Manifest, ManifestCommit, ManifestDataset, ManifestStats, Repository,
+    LockOperation, Manifest, ManifestCommit, ManifestDataset, ManifestStats, RepoType, Repository,
     ServerInfo, Source, TextDerived, lock,
 };
 use bytes::Bytes;
@@ -176,6 +176,18 @@ fn encode(plain: Bytes) -> PutPayload {
     PutPayload::from_iter([header, plain])
 }
 
+/// `uploading 120/310 MB · 14 new blobs · 3 reused`
+fn uploading(t: &Tally, total: u64) -> String {
+    format!(
+        "uploading {}/{} MB · {} new {} · {} reused",
+        mb(t.done_bytes),
+        mb(total),
+        t.new_blobs,
+        if t.new_blobs == 1 { "blob" } else { "blobs" },
+        t.reused_blobs
+    )
+}
+
 /// The `MB` of progress messages.
 fn mb(b: u64) -> String {
     let m = b as f64 / 1e6;
@@ -224,6 +236,7 @@ impl Repository {
                 ),
             ));
         }
+        self.check_space(0, o.min_free_disk_bytes, false)?;
         let started = Instant::now();
         let created = crate::now_rfc3339();
         let guard = lock::acquire(self, LockKind::Shared, LockOperation::Create, &o.ctl).await?;
@@ -368,7 +381,10 @@ impl Repository {
             blobs = tracing::field::Empty);
         async {
             let mut results = futures::stream::iter(units)
-                .map(|u| self.upload_unit(files.clone(), u, parent_ids.clone(), seen.clone(), ctl))
+                .map(|u| {
+                    let known = (parent_ids.clone(), seen.clone());
+                    self.upload_unit(files.clone(), u, known, o.min_free_disk_bytes, ctl)
+                })
                 .buffered(self.config.concurrency());
             while let Some(up) = results.try_next().await? {
                 if let (Some(h), Some(p)) = (&mut hashers[up.unit.file], &up.plain) {
@@ -388,16 +404,7 @@ impl Repository {
                 } else {
                     tally.done_bytes as f64 / total as f64
                 };
-                ctl.report(
-                    0.05 + 0.9 * frac as f32,
-                    &format!(
-                        "uploading {}/{} MB · {} new blobs · {} reused",
-                        mb(tally.done_bytes),
-                        mb(total),
-                        tally.new_blobs,
-                        tally.reused_blobs
-                    ),
-                );
+                ctl.report(0.05 + 0.9 * frac as f32, &uploading(&tally, total));
             }
             Ok::<_, BackupError>(())
         }
@@ -569,15 +576,43 @@ impl Repository {
         })
     }
 
-    /// Read, hash and (unless it is known to exist) upload one piece.
+    /// `fs` repositories: `507 insufficient-storage` unless writing `need` more bytes
+    /// leaves `reserve` free on the repository's file system (`cached`: a measurement
+    /// up to a second old will do).
+    pub fn check_space(&self, need: u64, reserve: Option<u64>, cached: bool) -> Result<()> {
+        let (RepoType::Fs, Some(path)) = (self.config.kind, self.config.path.as_deref()) else {
+            return Ok(());
+        };
+        let reserve = reserve.unwrap_or(0);
+        match sparkles::disk::check_reserve(std::path::Path::new(path), reserve, need, cached) {
+            Ok(()) => Ok(()),
+            Err(sparkles::Error::StorageFull(msg)) => Err(BackupError::new(
+                Code::InsufficientStorage,
+                format!(
+                    "repository {}: {msg}{}",
+                    self.config.name,
+                    if reserve > 0 {
+                        " (--min-free-disk-mb)"
+                    } else {
+                        ""
+                    }
+                ),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read, hash and (unless it is known to exist) upload one piece: `known` holds
+    /// the parent's blob ids and those this backup handled already.
     async fn upload_unit(
         &self,
         files: Arc<Vec<CapturedFile>>,
         unit: Unit,
-        parent_ids: Arc<HashSet<String>>,
-        seen: Arc<Mutex<HashSet<String>>>,
+        known: (Arc<HashSet<String>>, Arc<Mutex<HashSet<String>>>),
+        reserve: Option<u64>,
         ctl: &Ctl,
     ) -> Result<Uploaded> {
+        let (parent_ids, seen) = known;
         ctl.check()?;
         let cancel = ctl.cancel.clone();
         let (plain, id) = blocking(move || {
@@ -613,6 +648,7 @@ impl Repository {
         let p2 = plain.clone();
         let payload = blocking(move || Ok(encode(p2))).await?;
         let stored = payload.content_length() as u64;
+        self.check_space(stored, reserve, true)?;
         self.upload.take(stored, ctl).await?;
         ctl.check()?;
         if single {
@@ -711,5 +747,19 @@ mod tests {
         assert!(read_piece(&f, 90, 20, &no).is_err());
         assert_eq!(mb(120_400_000), "120");
         assert_eq!(mb(1_234_567), "1.2");
+        let t = |new_blobs| Tally {
+            done_bytes: 1_234_567,
+            new_blobs,
+            reused_blobs: 3,
+            added_bytes: 0,
+        };
+        assert_eq!(
+            uploading(&t(1), 120_400_000),
+            "uploading 1.2/120 MB · 1 new blob · 3 reused"
+        );
+        assert_eq!(
+            uploading(&t(14), 120_400_000),
+            "uploading 1.2/120 MB · 14 new blobs · 3 reused"
+        );
     }
 }

@@ -515,6 +515,16 @@ async fn fs_repository() {
         .await
         .unwrap();
     assert!(dir.join("backups/b1.json").exists());
+    // a disk reserve the repository's file system cannot keep: 507, no manifest
+    let mut o = opts("b2", "ds");
+    o.min_free_disk_bytes = Some(u64::MAX / 2);
+    let e = repo.create(closed_source(&db), &o).await.unwrap_err();
+    assert_eq!(
+        (e.code(), e.http_status()),
+        (Code::InsufficientStorage, 507)
+    );
+    assert!(e.message().contains("--min-free-disk-mb"), "{e}");
+    assert!(!dir.join("backups/b2.json").exists());
     let m = repo.manifest("b1").await.unwrap();
     let spo = &m
         .files

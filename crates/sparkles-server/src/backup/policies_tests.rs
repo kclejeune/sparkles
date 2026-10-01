@@ -900,6 +900,10 @@ async fn overlapping_runs_are_skipped() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].result, RunResult::Skipped);
     assert_eq!(runs[0].trigger, RunTrigger::Schedule);
+    assert_eq!(
+        runs[0].reason.as_deref(),
+        Some("the previous run is still running")
+    );
     s.fake.release();
     let task = s.wait(&id);
     assert_eq!(task.state, "done");
@@ -908,6 +912,84 @@ async fn overlapping_runs_are_skipped() {
     assert!(j["state"]["runningTask"].is_null());
     // skipped runs do not count as failures
     assert_eq!(j["state"]["consecutiveFailures"], 0);
+}
+
+/// Policy runs are admitted like other backup tasks: a manual run beyond the queue is
+/// `503 too-many-tasks`, a scheduled one is recorded skipped, and the GC after
+/// retention is not started.
+#[tokio::test]
+async fn runs_beyond_the_task_queue_are_refused_or_skipped() {
+    let s = setup("2026-09-30T12:05:00Z");
+    s.call(
+        "POST",
+        "/$/backup-policies",
+        Some(json!({"name": "p", "repository": "local", "schedule": "*/10 * * * *"})),
+    )
+    .await;
+    let b = s.b();
+    let held: Vec<_> = (0..b.max_tasks * (1 + crate::backup::QUEUE_PER_SLOT))
+        .map(|_| b.admit().unwrap())
+        .collect();
+    let (st, j) = s.call("POST", "/$/backup-policies/p/run", None).await;
+    assert_eq!(
+        (st, j["code"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("too-many-tasks")),
+        "{j}"
+    );
+    s.clock.set("2026-09-30T12:10:00Z");
+    Scheduler::default().step(&s.st, s.clock.now());
+    let runs = s.runs("p");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].result, RunResult::Skipped);
+    assert!(
+        runs[0]
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("too many backup tasks")),
+        "{:?}",
+        runs[0].reason
+    );
+    assert!(s.b().policies.running_task("p").is_none());
+    let e = ServerEngine.start_gc(&s.st, "local").unwrap_err();
+    assert_eq!(e.code(), Code::TooManyTasks);
+    // with room again, the next instant runs
+    drop(held);
+    s.clock.set("2026-09-30T12:20:00Z");
+    Scheduler::default().step(&s.st, s.clock.now());
+    let task = s.wait_policy("p");
+    assert_eq!(task.state, "done", "{:?}", task.message);
+}
+
+/// A read-only server runs no policies: manual runs are `403 server-read-only` and the
+/// scheduler lets their instants pass.
+#[tokio::test]
+async fn read_only_servers_run_no_policies() {
+    let s = setup_with("2026-09-30T12:05:00Z", tempfile::tempdir().unwrap(), true);
+    let mut p: PolicyConfig = serde_json::from_value(
+        json!({"name": "p", "repository": "local", "schedule": "*/10 * * * *"}),
+    )
+    .unwrap();
+    p.datasets = vec!["*".into()];
+    s.b().registry.policies.write().insert(
+        "p".into(),
+        PolicyEntry {
+            config: p,
+            source: ConfigSource::Config,
+        },
+    );
+    let (st, j) = s.call("POST", "/$/backup-policies/p/run", None).await;
+    assert_eq!(
+        (st, j["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("server-read-only")),
+        "{j}"
+    );
+    let mut sched = Scheduler::default();
+    for now in ["2026-09-30T12:10:00Z", "2026-09-30T12:20:00Z"] {
+        s.clock.set(now);
+        assert_eq!(sched.step(&s.st, s.clock.now()), scheduler::MAX_SLEEP);
+    }
+    assert!(s.runs("p").is_empty());
+    assert!(s.st.tasks.lock().is_empty());
 }
 
 // Retention through the route, with a dry run first
@@ -1187,6 +1269,7 @@ fn the_run_history_is_a_ring() {
             started: "2026-09-30T12:00:00.000Z".into(),
             finished: None,
             result: RunResult::Ok,
+            reason: None,
             datasets: vec![],
             retention: None,
             gc: None,

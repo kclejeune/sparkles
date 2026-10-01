@@ -34,6 +34,7 @@ use anyhow::Context;
 use parking_lot::{Condvar, Mutex, RwLock};
 use sparkles::outbound::OutboundPolicy;
 use sparkles_backup::object_store::ObjectStore;
+use sparkles_backup::repo::RequestStats;
 pub use sparkles_backup::{BackupError, Repository};
 use sparkles_backup::{Code, ConfigSource, Credentials, OpenEnv, RepoConfig, RepoType};
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,6 +83,9 @@ pub struct BackupState {
     server_id: String,
     /// policy scheduler state, run history, and the running policy tasks
     pub policies: policies::Policies,
+    /// object requests by repository name, of every repository handle opened here
+    /// (`sparkles_backup_object_requests_total`)
+    pub requests: Mutex<BTreeMap<String, Arc<RequestStats>>>,
 }
 
 impl BackupState {
@@ -126,6 +130,7 @@ impl BackupState {
             stores: Mutex::new(BTreeMap::new()),
             server_id: server_id(data_dir),
             policies,
+            requests: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -183,6 +188,13 @@ impl BackupState {
             server_id: self.server_id.clone(),
             store: self.stores.lock().get(&cfg.name).cloned(),
             outbound: (source == ConfigSource::Api).then(|| self.outbound.read().clone()),
+            requests: Some(
+                self.requests
+                    .lock()
+                    .entry(cfg.name.clone())
+                    .or_default()
+                    .clone(),
+            ),
             ..Default::default()
         }
     }

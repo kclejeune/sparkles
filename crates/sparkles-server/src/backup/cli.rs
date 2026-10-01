@@ -93,10 +93,17 @@ pub enum RepoCmd {
         /// Allow an http:// endpoint
         #[arg(long, requires = "s3")]
         allow_http: bool,
-        /// Where S3 credentials come from: default (the AWS provider chain), env (the
-        /// AWS_* variables), env:KEY_VAR,SECRET_VAR[,TOKEN_VAR], or file:PATH (JSON)
-        #[arg(long, default_value = "default", requires = "s3")]
-        credentials: String,
+        /// Where S3 credentials come from: default (the AWS provider chain, the
+        /// default), env (the AWS_* variables), env:KEY_VAR,SECRET_VAR[,TOKEN_VAR], or
+        /// file:PATH (JSON)
+        #[arg(long, requires = "s3")]
+        credentials: Option<String>,
+        /// Keep the credential source in the config file as [credentials.NAME], which the
+        /// repository names: with --credentials it defines it, without it uses the one
+        /// defined. A server started with this file can then register S3 repositories
+        /// through its API with {"source": "named", "name": NAME}
+        #[arg(long, value_name = "NAME", requires = "s3")]
+        credentials_name: Option<String>,
         /// Never write to it (restore and verify only)
         #[arg(long)]
         readonly: bool,
@@ -545,7 +552,8 @@ fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
+/// `1 blob`, `2 blobs`.
+pub(crate) fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -597,7 +605,7 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
     match cmd {
         RepoCmd::Add {
             name,
-            path,
+            path: dir,
             s3,
             prefix,
             region,
@@ -605,6 +613,7 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
             path_style,
             allow_http,
             credentials,
+            credentials_name,
             readonly,
             no_init,
             config,
@@ -621,15 +630,20 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                 || endpoint.is_some()
                 || path_style
                 || allow_http
-                || credentials != "default";
-            if path.is_some() && s3_only {
+                || credentials.is_some()
+                || credentials_name.is_some();
+            if dir.is_some() && s3_only {
                 clap::Error::raw(
                     clap::error::ErrorKind::ArgumentConflict,
-                    "--prefix, --region, --endpoint, --path-style, --allow-http and --credentials only apply to --s3\n",
+                    "--prefix, --region, --endpoint, --path-style, --allow-http, --credentials and --credentials-name only apply to --s3\n",
                 )
                 .exit();
             }
-            match (path, s3) {
+            let path = config_path(&config)?;
+            let mut f = load_or_empty(&path)?;
+            // whether a credential source was defined in the config file
+            let mut defined = false;
+            match (dir, s3) {
                 (Some(p), _) => {
                     cfg.kind = RepoType::Fs;
                     let p = std::path::absolute(&p)
@@ -644,13 +658,13 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                     cfg.endpoint = endpoint;
                     cfg.path_style = path_style;
                     cfg.allow_http = allow_http;
-                    cfg.credentials = parse_credentials(&credentials)?;
+                    let source = credentials.as_deref().map(parse_credentials).transpose()?;
+                    (cfg.credentials, defined) =
+                        credential_source(&mut f, &path, source, credentials_name)?;
                 }
                 (None, None) => bail!("--path or --s3 is required"),
             }
             cfg.validate(&[])?;
-            let path = config_path(&config)?;
-            let mut f = load_or_empty(&path)?;
             if f.repositories.contains_key(&name) || f.policies.contains_key(&name) {
                 bail!("{} already defines {name:?}", path.display());
             }
@@ -666,7 +680,7 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                 );
             }
             let cli = Cli::new()?;
-            let repo = cli.open(&cfg, !no_init && !readonly)?;
+            let repo = cli.open(&f.resolve_credentials(cfg.clone())?, !no_init && !readonly)?;
             let test = cli.block_on(repo.test())?;
             if !test.ok {
                 print_test(&test);
@@ -688,12 +702,19 @@ pub fn run_repo(cmd: RepoCmd) -> Result<()> {
                 }))?;
             } else {
                 println!(
-                    "added repository {name} ({} {}) to {} · id {} · conditional writes {}{}",
+                    "added repository {name} ({} {}) to {} · id {} · conditional writes {}{}{}",
                     cfg.kind.as_str(),
                     cfg.location(),
                     path.display(),
                     repo.id(),
                     yes_no(test.conditional_writes),
+                    match &cfg.credentials {
+                        Credentials::Named { name } if defined => {
+                            format!(" · credentials {name} (defined)")
+                        }
+                        Credentials::Named { name } => format!(" · credentials {name}"),
+                        _ => String::new(),
+                    },
                     if readonly { " · read-only" } else { "" }
                 );
             }
@@ -894,6 +915,41 @@ fn json_str<T: Serialize>(v: &T) -> String {
         Ok(J::String(s)) => s,
         _ => String::new(),
     }
+}
+
+/// The credentials of a repository `repo add` writes to config file `f` (at `file`):
+/// `source` itself (default: the provider chain), or with `name` the credential source
+/// `[credentials.<name>]`, which `source` defines if it does not exist yet (`f` gets it)
+/// and must match if it does. Whether it was defined.
+fn credential_source(
+    f: &mut ConfigFile,
+    file: &Path,
+    source: Option<Credentials>,
+    name: Option<String>,
+) -> Result<(Credentials, bool)> {
+    let Some(name) = name else {
+        return Ok((source.unwrap_or_default(), false));
+    };
+    if !sparkles_backup::layout::valid_repo_name(&name) {
+        bail!("invalid credential source name {name:?}: use a-z, 0-9, '_' and '-' (max 64)");
+    }
+    let existing = f.credentials.get(&name).cloned().map(Credentials::from);
+    let defined = match (source, existing) {
+        (Some(s), Some(e)) if s != e => bail!(
+            "{} defines [credentials.{name}] otherwise; leave out --credentials to use it",
+            file.display()
+        ),
+        (Some(s), None) => {
+            f.credentials.insert(name.clone(), (&s).into());
+            true
+        }
+        (None, None) => bail!(
+            "{} has no [credentials.{name}]: define it with --credentials",
+            file.display()
+        ),
+        _ => false,
+    };
+    Ok((Credentials::Named { name }, defined))
 }
 
 /// `--credentials`: default, env, env:KEY,SECRET[,TOKEN] or file:PATH.
@@ -1401,7 +1457,9 @@ fn create(
         sparkles_backup::layout::default_backup_name(&dataset, chrono::Utc::now())
     });
     if !sparkles_backup::layout::valid_backup_name(&name) {
-        bail!("invalid backup name {name:?}: [a-z0-9][a-z0-9._-]{{0,63}}");
+        bail!(
+            "invalid backup name {name:?}: up to 64 of A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit"
+        );
     }
     let cfg = resolve(repo, config)?;
     let cli = Cli::new()?;
@@ -1415,6 +1473,7 @@ fn create(
         policy: None,
         dataset_name: dataset,
         extra,
+        min_free_disk_bytes: None,
         ctl: cli.ctl(),
     };
     let s = cli.block_on(r.create(src, &o))?;
@@ -1934,4 +1993,80 @@ fn policy_json(
         }
     }
     j
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_credential_sources_are_defined_once_and_then_named() {
+        let file = Path::new("/etc/sparkles/backup.toml");
+        let mut f = ConfigFile {
+            version: 1,
+            ..Default::default()
+        };
+        let env = parse_credentials("env:MINIO_KEY,MINIO_SECRET").unwrap();
+        // without a name: the source itself, the provider chain by default
+        assert_eq!(
+            credential_source(&mut f, file, None, None).unwrap(),
+            (Credentials::Default, false)
+        );
+        assert_eq!(
+            credential_source(&mut f, file, Some(env.clone()), None).unwrap(),
+            (env.clone(), false)
+        );
+        assert!(f.credentials.is_empty());
+        // a name not defined yet needs a source
+        let e = credential_source(&mut f, file, None, Some("minio".into())).unwrap_err();
+        assert!(e.to_string().contains("no [credentials.minio]"), "{e}");
+        // defined with one, then named by itself or with the same source
+        let named = Credentials::Named {
+            name: "minio".into(),
+        };
+        assert_eq!(
+            credential_source(&mut f, file, Some(env.clone()), Some("minio".into())).unwrap(),
+            (named.clone(), true)
+        );
+        assert_eq!(
+            Credentials::from(f.credentials["minio"].clone()),
+            env.clone()
+        );
+        assert_eq!(
+            credential_source(&mut f, file, None, Some("minio".into())).unwrap(),
+            (named.clone(), false)
+        );
+        assert_eq!(
+            credential_source(&mut f, file, Some(env), Some("minio".into())).unwrap(),
+            (named.clone(), false)
+        );
+        // another source under the same name is refused
+        let e = credential_source(
+            &mut f,
+            file,
+            Some(Credentials::Default),
+            Some("minio".into()),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("otherwise"), "{e}");
+        assert!(credential_source(&mut f, file, None, Some("Bad Name".into())).is_err());
+        // the file a server reads: the repository names the source
+        let cfg = RepoConfig {
+            name: "s3-main".into(),
+            kind: RepoType::S3,
+            bucket: Some("kg".into()),
+            credentials: named,
+            ..Default::default()
+        };
+        f.repositories
+            .insert(cfg.name.clone(), RepoToml::from_config(&cfg));
+        let text = f.to_text().unwrap();
+        assert!(text.contains("[credentials.minio]"), "{text}");
+        let back = ConfigFile::parse(&text).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(
+            back.resolve_credentials(cfg).unwrap().credentials,
+            Credentials::from(f.credentials["minio"].clone())
+        );
+    }
 }

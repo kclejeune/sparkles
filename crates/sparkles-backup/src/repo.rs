@@ -497,17 +497,30 @@ fn check_destination(cfg: &RepoConfig, p: &OutboundPolicy) -> Result<()> {
 
 /// Resolves the host names of a repository's connections through an outbound policy
 /// (every address must be allowed; the connection goes to exactly those addresses).
+/// Every host name and every address: excluded from the placeholder proxy of
+/// repositories under an outbound policy.
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+const NO_PROXY_EXCLUDES: &str = "*,0.0.0.0/0,::/0";
+
 #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 #[derive(Debug)]
 struct PolicyResolver(std::panic::AssertUnwindSafe<OutboundPolicy>);
 
 #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 impl PolicyResolver {
-    /// Client options whose connections resolve through `p`.
+    /// Client options whose connections resolve through `p`, and never through a proxy
+    /// of the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`): a proxy would
+    /// resolve and connect to the endpoint itself, past this resolver. A proxy that
+    /// excludes every host and address takes the place of the environment's (the HTTP
+    /// client reads the environment only when no proxy is configured) and is never
+    /// used.
     fn options(p: &OutboundPolicy) -> object_store::ClientOptions {
-        object_store::ClientOptions::new().with_dns_resolver(Arc::new(PolicyResolver(
-            std::panic::AssertUnwindSafe(p.clone()),
-        )))
+        object_store::ClientOptions::new()
+            .with_dns_resolver(Arc::new(PolicyResolver(std::panic::AssertUnwindSafe(
+                p.clone(),
+            ))))
+            .with_proxy_url("http://127.0.0.1:9")
+            .with_proxy_excludes(NO_PROXY_EXCLUDES)
     }
 }
 
@@ -769,7 +782,7 @@ impl Repository {
                 (s, attempts)
             }
         };
-        let requests = Arc::new(RequestStats::default());
+        let requests = env.requests.clone().unwrap_or_default();
         let store: Arc<dyn ObjectStore> =
             Arc::new(RepoStore::new(inner, requests.clone(), attempts));
         let marker = attach_or_init(&store, cfg, env).await?;

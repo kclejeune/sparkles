@@ -1,5 +1,6 @@
 # NixOS VM test: the service starts, serves a declared dataset through nginx, keeps
-# data across restarts and serves the embedded UI; with authentication (node `authed`),
+# data across restarts, serves the embedded UI, and backs a dataset up into an `fs`
+# repository of its backup config and restores it; with authentication (node `authed`),
 # it tells clients behind nginx apart for the failed-login budget.
 { self }:
 {
@@ -19,6 +20,22 @@
           enable = true;
           virtualHost = "sparkles.test";
         };
+        backup = {
+          configFile = "/etc/sparkles/backup.toml";
+          maxTasks = 1;
+          fsRoots = [ "/var/lib/sparkles-backups" ];
+        };
+      };
+      environment.etc."sparkles/backup.toml" = {
+        mode = "0400";
+        user = "sparkles";
+        text = ''
+          version = 1
+
+          [repositories.local]
+          type = "fs"
+          path = "/var/lib/sparkles-backups/local"
+        '';
       };
       networking.hosts."127.0.0.1" = [ "sparkles.test" ];
       # commits keep --min-free-disk-mb (1 GiB) free on the data disk
@@ -61,8 +78,26 @@
     };
 
   testScript = ''
+    import json
+    import time
+
     def last_value(csv):
         return csv.strip().splitlines()[-1].strip()
+
+    def wait_task(node, base, task):
+        for _ in range(240):
+            t = json.loads(node.succeed(f"curl -sf {base}/\\$/tasks/{task['id']}"))
+            if t["state"] not in ("queued", "running"):
+                return t
+            time.sleep(0.5)
+        raise Exception(f"task {task['id']} did not end")
+
+    def post_json(node, url, body):
+        return json.loads(
+            node.succeed(
+                f"curl -sf -X POST {url} -H 'Content-Type: application/json' -d '{json.dumps(body)}'"
+            )
+        )
 
     machine.wait_for_unit("sparkles.service")
     machine.wait_for_open_port(3030)
@@ -103,6 +138,27 @@
         + "'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'"
     )
     assert last_value(out) == "0", out
+
+    # a backup into the fs repository of the backup config, restored as a new dataset
+    repos = json.loads(machine.succeed(f"curl -sf {base}/\\$/repositories"))
+    assert [r["name"] for r in repos["repositories"]] == ["local"], repos
+    task = post_json(machine, f"{base}/\\$/backups/demo", {"repository": "local", "name": "vm1"})
+    task = wait_task(machine, base, task)
+    assert task["state"] == "done", task
+    machine.succeed("test -f /var/lib/sparkles-backups/local/backups/vm1.json")
+    task = post_json(
+        machine, f"{base}/\\$/backups/demo/local/vm1/restore", {"target": "restored"}
+    )
+    task = wait_task(machine, base, task)
+    assert task["state"] == "done", task
+    out = machine.succeed(
+        f"curl -sf {base}/restored/sparql -H 'Accept: text/csv' --data-urlencode "
+        + "'query=SELECT (SUM(?v) AS ?s) WHERE { ?x <urn:p> ?v }'"
+    )
+    assert last_value(out) == "49", out
+    # the config file is re-read on reload
+    machine.succeed("systemctl reload sparkles.service")
+    machine.succeed(f"curl -sf {base}/\\$/repositories/local | grep -q reachable")
 
     # the CLI is installed; the served database is locked against a second process
     machine.succeed("sparkles --version")

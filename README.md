@@ -561,6 +561,10 @@ sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0
 sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
 #   --endpoint URL --path-style --allow-http (MinIO, R2, …); --credentials default | env |
 #   env:KEY_VAR,SECRET_VAR[,TOKEN_VAR] | file:PATH; --readonly; --no-init (attach only)
+sparkles repo add lab --s3 lab --endpoint http://127.0.0.1:9000 --path-style --allow-http \
+  --credentials-name minio --credentials env:MINIO_ACCESS_KEY,MINIO_SECRET_KEY
+#   keeps the source as [credentials.minio], which the repository names (without
+#   --credentials: uses the one defined); a server reading the file can then name it too
 sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
 sparkles repo verify local --level data          # every backup, plus orphaned blobs
 sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
@@ -588,7 +592,8 @@ API and UI (`POST /$/repositories`), under the operator's limits from that file.
 credentials only name a source defined there, never environment variables, files or the
 instance's default chain of the caller's choosing; their S3 endpoints go through the
 outbound policy below (a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
-`--outbound-allow-private`); `fs` ones stay out of the data directory and the config
+`--outbound-allow-private`), never through a proxy of the environment (`HTTPS_PROXY`;
+the config file's repositories and the CLI's use it); `fs` ones stay out of the data directory and the config
 files' directories, and under `[api] fs_roots` when it is set:
 
 ```toml
@@ -600,6 +605,11 @@ secret_access_key_var = "MINIO_SECRET_KEY"
 [api]
 fs_roots = ["/srv/backups"]
 ```
+
+So to register an S3 repository through the API, define its credential source in the
+file first (by hand, or with `sparkles repo add … --credentials-name minio --credentials
+…` on the same file), start the server with it (or send it SIGHUP), then
+`POST /$/repositories` with `"credentials": {"source": "named", "name": "minio"}`.
 
 `scripts/backup-bench.sh DB` (`mise run bench:backup DB`) measures a full backup, an
 incremental one after small commits, a restore and a data verification of an existing
@@ -743,7 +753,14 @@ mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
+mise run licenses     # regenerate THIRD_PARTY_LICENSES.md after a Cargo.lock change (licenses:check)
 ```
+
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) holds the license and NOTICE files of
+every crate the binary links (on Linux and macOS), each text once; crates that ship no
+license file get their license's standard text. `scripts/third-party-licenses.py`
+generates it from `cargo metadata`, so it only changes with `Cargo.lock`; ship it with
+binaries (the Nix packages install it as `share/doc/sparkles/THIRD_PARTY_LICENSES.md`).
 
 Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with
 [prek](https://github.com/j178/prek) (plain `pre-commit` reads the same file). On staged files
@@ -766,7 +783,8 @@ The flake (flake-parts + rust-overlay, using the toolchain from `rust-toolchain.
 provides:
 
 * **Packages:**
-  * `sparkles` (default): the binary with the UI embedded.
+  * `sparkles` (default): the binary with the UI embedded, and the third-party licenses
+    and notices in `share/doc/sparkles/`.
   * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
   * `sparkles-ui`: the static UI build.
 * **Other outputs:**
@@ -852,9 +870,19 @@ its own `Authorization` header, which Sparkles would then reject. `unixSocket` m
 server listen on a Unix socket that nginx proxies to, so trusted proxy headers can be
 limited to it (`proxy.trusted = ["unix"]`).
 
-The module has no backup options: pass `extraArgs = [ "--backup-config" "/etc/sparkles/backup.toml" ]`,
-and add an `fs` repository's directory to `systemd.services.sparkles.serviceConfig.ReadWritePaths`
-(the service sees the rest of the file system read-only).
+Backup repositories: `backup.configFile` passes `--backup-config` (like
+`auth.configFile` it stays out of the Nix store, and `systemctl reload sparkles`
+re-reads it), `backup.maxTasks` `--backup-max-tasks`, and `backup.fsRoots` lists the
+directories of `fs` repositories, which the module creates for the service user and
+makes writable (the service sees the rest of the file system read-only):
+
+```nix
+services.sparkles.backup = {
+  configFile = "/run/secrets/sparkles-backup.toml";  # [repositories.local] path = "/srv/backups/sparkles/local"
+  fsRoots = [ "/srv/backups/sparkles" ];             # also [api] fs_roots, for API registrations
+  maxTasks = 1;
+};
+```
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so for offline work (`sparkles load`, `compact`) stop the service first,

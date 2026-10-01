@@ -2,6 +2,7 @@
 //! holding a task slot while it works, and count themselves in the metrics; delete runs
 //! in the request. Claims ([`super::BackupState::claim`]) are the callers'.
 
+use super::cli::plural;
 use super::metrics::{Operation, Outcome};
 use super::{BackupState, ClaimSpec, Started, swap};
 use crate::state::{AppState, Dataset, DbType, Reservation, Task, TaskHandle};
@@ -174,7 +175,7 @@ fn create_now(
     let t0 = Instant::now();
     let what = format!("backup {} of /{} into {repo}", a.name, ds.name);
     tracing::info!(target: "sparkles::backup", "{what}: started");
-    let r = create_in(b, ds, repo, a, ctl);
+    let r = create_in(b, ds, repo, a, st.limits.min_free_disk_bytes, ctl);
     count(st, b, repo, Operation::Create, &r, t0);
     log_end(&what, &r, t0);
     b.refresh_later(repo);
@@ -186,6 +187,7 @@ fn create_in(
     ds: &Arc<Dataset>,
     repo_name: &str,
     a: CreateArgs,
+    reserve: Option<u64>,
     ctl: Ctl,
 ) -> Result<(BackupSummary, Outcome), BackupError> {
     let repo = b.repo(repo_name)?;
@@ -216,6 +218,7 @@ fn create_in(
         policy: a.policy,
         dataset_name: ds.name.clone(),
         extra,
+        min_free_disk_bytes: reserve,
         ctl,
     };
     let s = b.block_on(repo.create(Source::from(cap), &o))??;
@@ -330,12 +333,18 @@ fn restore_in(
         None
     };
     let c = ctl(h, 0.0, 0.9);
+    // the free-space check keeps the server's disk reserve (`--min-free-disk-mb`)
+    let mut store_opts = st.store_opts.clone();
+    store_opts.min_free_disk_bytes = st
+        .limits
+        .min_free_disk_bytes
+        .or(store_opts.min_free_disk_bytes);
     let o = RestoreOptions {
         identity: a.req.identity,
         check: a.req.check,
         id_in_use,
         in_place_head,
-        store_opts: st.store_opts.clone(),
+        store_opts,
         ctl: c.clone(),
     };
     let report = match b.block_on(repo.restore(&a.backup, &tmp, &o)) {
@@ -448,12 +457,7 @@ fn verify_in(
             )
         }),
     );
-    let q = report.requests;
-    let out = Outcome {
-        requests: vec![("list", q.list), ("head", q.head), ("get", q.get)],
-        ..Default::default()
-    };
-    Ok((report, out))
+    Ok((report, Outcome::default()))
 }
 
 // --------------------------------------------------------------------- gc ------
@@ -482,12 +486,7 @@ pub fn gc(
             ctl: ctl(h, 0.0, 1.0),
         };
         let report = b.block_on(r.gc(&o))??;
-        let q = report.requests;
-        let out = Outcome {
-            requests: vec![("list", q.list), ("get", q.get), ("delete", q.delete)],
-            ..Default::default()
-        };
-        Ok((report, out))
+        Ok((report, Outcome::default()))
     })();
     count(st, &b, repo, Operation::Gc, &r, t0);
     log_end(&what, &r, t0);
@@ -545,12 +544,16 @@ pub fn start_gc(
         h.set_detail(serde_json::to_value(&r)?);
         Ok(if dry_run {
             format!(
-                "dry run: {} blobs ({} MB) can be deleted",
-                r.candidates,
+                "dry run: {} ({} MB) can be deleted",
+                plural(r.candidates, "blob", "blobs"),
                 mb(r.deleted_bytes)
             )
         } else {
-            format!("deleted {} blobs ({} MB)", r.deleted, mb(r.deleted_bytes))
+            format!(
+                "deleted {} ({} MB)",
+                plural(r.deleted, "blob", "blobs"),
+                mb(r.deleted_bytes)
+            )
         })
     });
     Ok((task, rx))

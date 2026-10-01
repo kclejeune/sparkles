@@ -1512,7 +1512,7 @@ function createMock({
     try {
       return JSON.parse(body.toString('utf8'));
     } catch {
-      throw err(400, 'invalid-config', 'the body is not valid JSON');
+      throw err(400, 'invalid-request', 'the body is not valid JSON');
     }
   }
 
@@ -1810,7 +1810,7 @@ function createMock({
           getRepo(a, { write: true });
           const body = await jsonBody(req);
           const grace = Number(body.graceHours ?? 24);
-          if (!(grace >= 0)) throw err(400, 'invalid-config', 'graceHours must be ≥ 0');
+          if (!(grace >= 0)) throw err(400, 'invalid-request', 'graceHours must be ≥ 0');
           reply(202, gcJob(repo, body.dryRun === true, grace));
           return true;
         }

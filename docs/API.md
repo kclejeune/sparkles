@@ -856,7 +856,7 @@ started or queued, and a `Location` where noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Break a lock (`204`; audited). `404 no-such-lock`; `409 repository-read-only` |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`: the dataset's backups in every repository (or `R` only), newest first, with `sameLineage`. A repository that cannot be reached is left out (one found unreachable in the last minute is not tried again) |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Back up now (body `{repository, name?, note?}`): task `backup-create` with `detail: BackupSummary`, `Location: /$/backups/{ds}/{repo}/{name}`. `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only`, `409 backup-exists`, `409 backup-in-progress` (`task`: one backup of a dataset into a repository at a time), `501 backup-unsupported` (in-memory dataset) |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Back up now (body `{repository, name?, note?}`): task `backup-create` with `detail: BackupSummary`, `Location: /$/backups/{ds}/{repo}/{name}`. `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only`, `409 backup-exists`, `409 backup-in-progress` (`task`: one backup of a dataset into a repository at a time), `501 backup-unsupported` (in-memory dataset), `507 insufficient-storage` (an `fs` repository whose file system has less than `--min-free-disk-mb` free; the task also fails with it when a blob would leave less) |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary with the manifest's files, blobs and upload statistics |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Delete the backup's manifest (`204`); its blobs go at the next GC. `409 backup-busy` (`task`) while a restore or verification of it runs here; `409 repository-read-only` |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restore (body `RestoreRequest`): task `backup-restore`, `Location: /$/datasets/{target}`. See [Restore](#restore) |
@@ -867,17 +867,18 @@ started or queued, and a `Location` where noted.
 | GET | `/$/backup-policies/{policy}` | `server-admin` | `Policy` |
 | PUT | `/$/backup-policies/{policy}` | `server-admin` | Replace the settings (body `PolicyConfig`; `name` may be left out, and cannot change): `Policy`. Enabling or disabling a policy is a PUT. `409 read-only-config` for a policy of the config file. A new schedule or time zone waits for its next instant |
 | DELETE | `/$/backup-policies/{policy}` | `server-admin` | `204`; a running run stops before its next dataset. `409 read-only-config` |
-| POST | `/$/backup-policies/{policy}/run` | `server-admin` | Run now (also a disabled policy): task `backup-policy` (server-wide) with `detail: PolicyRun`, `Location: /$/tasks/{id}`. The schedule does not move. `409 policy-running` (`task`) |
+| POST | `/$/backup-policies/{policy}/run` | `server-admin` | Run now (also a disabled policy): task `backup-policy` (server-wide) with `detail: PolicyRun`, `Location: /$/tasks/{id}`. The schedule does not move. `409 policy-running` (`task`), `503 too-many-tasks`, `403 server-read-only` |
 | POST | `/$/backup-policies/{policy}/retention[?dryRun=true]` | `server-admin` | Apply the policy's retention now: `{dryRun, delete: BackupSummary[], keep: BackupSummary[], errors?: string[]}`. With `dryRun` nothing is deleted. A deletion that fails stays in `delete` and adds to `errors` |
 | GET | `/$/backup-policies/{policy}/runs[?limit=N]` | `server-admin` | `{runs: PolicyRun[]}`, newest first (default 50, at most 1000) |
 
 A server built without the `backup` feature answers these paths `404`; the UI then hides
 its Backups page.
 
-**`--read-only` servers** create, verify and delete backups, test repositories, run
-policies and their retention, collect repositories and break locks (on writable
-repositories). Restores, and changes to repositories and policies, answer
-`403 server-read-only`.
+**`--read-only` servers** create, verify and delete backups, test repositories, apply
+a policy's retention, collect repositories and break locks (on writable repositories).
+Restores, changes to repositories and policies, and policy runs answer
+`403 server-read-only`; the scheduler runs no policies (it logs that once), so their
+instants pass.
 
 ### Restore
 
@@ -893,7 +894,10 @@ type RestoreRequest = {
 
 A restore downloads into `databases/.restore-{target}-{task}` and publishes the directory
 only once it is complete and checked, so a failed or cancelled restore leaves nothing
-behind.
+behind. It needs 1.1 × the backup's `logicalBytes` free in the data directory's file
+system, plus the `--min-free-disk-mb` reserve: otherwise the request answers
+`507 insufficient-storage`, and the task checks again before downloading (the free
+space may have shrunk while it waited for a slot).
 
 * **A new dataset** (`replace: false`): `target` must not exist (`409 dataset-exists`);
   its name is reserved while the task runs. The directory is renamed into
@@ -1045,6 +1049,7 @@ type PolicyRun = {
   trigger: "schedule" | "catch-up" | "manual";
   scheduledFor: string | null; started: string; finished: string | null;
   result: "ok" | "partial" | "failed" | "skipped";
+  reason?: string;              // why a scheduled run was skipped
   datasets: { dataset: string; backup: string | null; result: "ok" | "failed" | "skipped";
               reason?: string; addedBytes?: number; millis?: number }[];
   retention: { deleted: string[]; error?: string } | null;
@@ -1086,9 +1091,13 @@ while it runs), then applies its retention.
 * **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
   its next instant. Instants missed while the server was down are covered by one run
   60 s after startup (`trigger: "catch-up"`), or recorded as `skipped` with
-  `catchUp: "none"`. An instant that comes while the previous run still runs is recorded
-  as `skipped`. A disabled policy lets its instants pass; disabling or deleting one
-  during a run stops it before its next dataset (the run ends `skipped`).
+  `catchUp: "none"`. An instant that comes while the previous run still runs, or while
+  the backup task queue is full (see [Backup tasks](#backup-tasks)), is recorded as
+  `skipped`, with the `reason`. A disabled policy lets its instants pass; disabling or
+  deleting one during a run stops it before its next dataset (the run ends `skipped`).
+  A run is a backup task like any other: it is admitted to the queue (a manual run
+  beyond it answers `503 too-many-tasks`), and so is the GC it starts (not started, and
+  tried again after the next run's retention, when the queue is full).
 * **Results.** A run is `ok` when every selected dataset was backed up or skipped
   (`in-memory dataset`, `unchanged`), `partial` when some failed, `failed` when none
   succeeded. `lastSuccess` and `consecutiveFailures` follow them. The last 1000 runs of
@@ -1120,7 +1129,7 @@ Errors are `{error, code, requestId}` plus, for some codes, `task`, `holder`,
 
 | Status | `code` |
 |---|---|
-| 400 | `invalid-name`; `invalid-config` (a repository or policy setting, a malformed repository or backup request body, a refused destination; `field` names the setting); `invalid-request` (a malformed query parameter or policy request body, a repository verification at level `restore`); `invalid-schedule` (also an unknown time zone) |
+| 400 | `invalid-name`; `invalid-config` (a repository or policy setting, a repository body that is JSON but not a repository configuration, a refused destination; `field` names the setting); `invalid-request` (a body that is not JSON, on every route; a backup, restore, verification, GC or policy body of the wrong shape; a malformed query parameter; a repository verification at level `restore`; a negative `graceHours`); `invalid-schedule` (also an unknown time zone) |
 | 403 | `server-read-only` |
 | 404 | `no-such-repository`, `no-such-backup` (also a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (`policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (`task`), `backup-busy` (`task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait; `holder`), `dataset-exists`, `dataset-busy` (`task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (`task`) |
@@ -1129,7 +1138,7 @@ Errors are `{error, code, requestId}` plus, for some codes, `task`, `holder`,
 | 501 | `backup-unsupported` (an in-memory dataset); `not-implemented` |
 | 502 | `repository-unavailable` (a storage error after retries; messages never include URL query strings) |
 | 503 | `catalog-lagging` (the commit catalog could not be flushed; retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`); `cancelled` (a task's) |
-| 507 | `insufficient-storage` (reserved: a restore does not check the free space beforehand yet) |
+| 507 | `insufficient-storage` (a restore without room for 1.1 × the backup's size plus the `--min-free-disk-mb` reserve; a backup into an `fs` repository whose file system would keep less than the reserve) |
 
 Callers without `server-admin` see absolute paths in these messages cut to their last
 component. Storage requests are retried with exponential backoff (up to 10 retries within
@@ -1223,12 +1232,26 @@ access wherever they like:
   `[credentials.<name>]` source of the config file (`400 invalid-config`, `field:
   "credentials"` or `"credentials.name"`, otherwise); never environment variables, files
   or the default provider chain of the caller's choosing. Without a config file an `s3`
-  repository cannot be registered through the API.
+  repository cannot be registered through the API. The flow: define the source in the
+  config file (by hand, or `sparkles repo add NAME --s3 BUCKET … --credentials-name lab
+  --credentials env:LAB_ACCESS_KEY,LAB_SECRET_KEY`, which writes `[credentials.lab]`
+  next to its own repository, or names an existing one without `--credentials`), start
+  the server with `--backup-config` on that file or send it SIGHUP, then register:
+
+  ```sh
+  curl -X POST http://localhost:3030/$/repositories -H 'Content-Type: application/json' -d '{
+    "name": "lab", "type": "s3", "bucket": "lab", "endpoint": "http://127.0.0.1:9000",
+    "pathStyle": true, "allowHttp": true,
+    "credentials": {"source": "named", "name": "lab"}}'
+  ```
 * An `s3` endpoint, and every address its host name resolves to, must pass the server's
   outbound policy (the `--outbound-*` flags of `SERVICE` and `LOAD`: public addresses
   only by default), and connections go only to the addresses checked. A MinIO on
   localhost needs `--outbound-allow 127.0.0.1` or `--outbound-allow-private`. A refused
-  endpoint is `400 invalid-config` (`field: "endpoint"`).
+  endpoint is `400 invalid-config` (`field: "endpoint"`). These connections never go
+  through a proxy of the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`), which
+  would reach the endpoint past the address checks; repositories of the config file, and
+  the CLI's, use the environment's proxies as usual.
 * `fs` repositories must lie under one of `[api] fs_roots` when it is set.
 * `gcs` and `azure` repositories use the server's own credentials and can only come from
   the config file; `memory` is for tests.
@@ -1244,7 +1267,7 @@ the directories of the server's config files (`--backup-config`, `--auth-config`
 | `sparkles_backup_operation_duration_seconds` | histogram (1 s … 2 h) | `operation` |
 | `sparkles_backup_bytes_uploaded_total`, `…_bytes_downloaded_total` | counter | `repository` |
 | `sparkles_backup_blobs_uploaded_total`, `…_blobs_reused_total` | counter | `repository` |
-| `sparkles_backup_object_requests_total` | counter (the requests verifications and GC report) | `repository`, `op` = `list` \| `head` \| `get` \| `delete`, `result` = `ok` |
+| `sparkles_backup_object_requests_total` | counter (every storage request of every operation: backups, restores, verifications, GC, listings, connection tests, locks; "not found" and "already exists" answers are `ok`, a failed request is `error`) | `repository`, `op` = `put` \| `get` \| `head` \| `list` \| `delete`, `result` = `ok` \| `error` |
 | `sparkles_backup_last_success_timestamp_seconds` | gauge (the last backup of the dataset into the repository) | `dataset`, `repository` |
 | `sparkles_backup_capture_lock_seconds` | histogram (0.5 ms … 1 s; the writer-lock hold of a capture) | |
 | `sparkles_backup_repository_stored_bytes`, `…_logical_bytes`, `…_backups` | gauge (from the last listing) | `repository` |
