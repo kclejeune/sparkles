@@ -53,8 +53,8 @@ QueryUnit
                   Object
                     Integer "1"
               RBrace "}"
-          Kw(Union) "UNION"
           UnionBranch
+            Kw(Union) "UNION"
             GroupGraphPattern
               LBrace "{"
               TriplesStmt
@@ -64,8 +64,8 @@ QueryUnit
                   Object
                     Integer "2"
               RBrace "}"
-          Kw(Union) "UNION"
           UnionBranch
+            Kw(Union) "UNION"
             GroupGraphPattern
               LBrace "{"
               TriplesStmt
