@@ -45,46 +45,26 @@ impl Ctx<'_, '_> {
     pub fn verbatim(&mut self, n: NodeId) -> DocId {
         let r = self.tree.range(n);
         self.comments.mark_copied(self.tree, r.clone());
-        let (mut before, mut after) = (Vec::new(), Vec::new());
+        let mut doc = self.arena.verbatim(r);
+        // the nodes inside with comments left (outside the range), outer before inner;
+        // the inner ones wrap first
+        let mut with_comments = Vec::new();
         let mut inside: Vec<NodeId> = self.tree.child_nodes(n).collect();
         while let Some(d) = inside.pop() {
-            for c in self.comments.own(d) {
-                let start = self.tree.token(c).start as usize;
-                if self.comments.copied(c) || r.contains(&start) {
-                    continue;
-                }
-                match start < r.start {
-                    true => before.push(c),
-                    false => after.push(c),
-                }
+            if self.comments.has_comments(d) {
+                with_comments.push(d);
             }
             inside.extend(self.tree.child_nodes(d));
         }
-        let v = self.arena.verbatim(r);
-        if before.is_empty() && after.is_empty() {
-            return v;
+        for &d in with_comments.iter().rev() {
+            doc = trivia::wrap(&mut self.arena, self.comments, d, doc);
         }
-        for v in [&mut before, &mut after] {
-            v.sort();
-            v.dedup();
+        for d in with_comments {
+            for c in self.comments.own(d) {
+                self.comments.mark_printed(c);
+            }
         }
-        for &c in before.iter().chain(&after) {
-            self.comments.mark_printed(c);
-        }
-        let mut parts = Vec::new();
-        if !before.is_empty() {
-            parts.push(trivia::comment_lines(
-                &mut self.arena,
-                self.comments,
-                &before,
-            ));
-            parts.push(self.arena.hard_line());
-        }
-        parts.push(v);
-        for c in after {
-            parts.push(trivia::trailing_comment(&mut self.arena, self.comments, c));
-        }
-        self.arena.concat(parts)
+        doc
     }
 
     /// A child element: a node with [`Ctx::node`], a token with [`Ctx::kw`].
@@ -703,6 +683,34 @@ mod tests {
         let list = cx.delimited(entry, open, &objects, close, true);
         let p = crate::doc::print(&cx.arena, list, t.src, 100, 2, None).unwrap();
         assert_eq!(p.text, "[ ?a , ?b , ?d ]");
+    }
+
+    #[test]
+    fn moved_comments_warn_and_the_cursor_follows() {
+        let src = "PREFIX # c\n ex: <http://e/>\nASK {}";
+        let opts = Options {
+            // on `ex:`
+            cursor: Some(13),
+            ..Options::default()
+        };
+        let f = crate::format(src, crate::Language::Sparql, &opts).unwrap();
+        assert_eq!(f.text, "# c\nPREFIX ex: <http://e/>\n\nASK {}\n");
+        assert_eq!(f.cursor, Some(12));
+        let w: Vec<_> = f
+            .warnings
+            .iter()
+            .map(|w| (w.code, w.line, w.column))
+            .collect();
+        assert_eq!(w, [("comment-moved", 1, 8)]);
+
+        // a comment that stays where it was gives no warning
+        let f = crate::format(
+            "PREFIX ex: <http://e/> # c\nASK {}\n",
+            crate::Language::Sparql,
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(f.warnings.is_empty());
     }
 
     #[test]

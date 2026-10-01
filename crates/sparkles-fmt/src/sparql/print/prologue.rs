@@ -5,30 +5,27 @@ use super::Ctx;
 use crate::doc::DocId;
 use crate::tree::NodeId;
 
-/// `Prologue`.
+/// `Prologue`: one declaration per line, blank lines kept as written.
 ///
-/// TODO: the layout (stub: as written).
+/// TODO: `VERSION` first, and the `PREFIX` runs sorted, deduplicated and grouped.
 pub fn prologue(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    cx.verbatim(n)
+    let decls = cx.child_nodes(n);
+    cx.lines(&decls)
 }
 
-/// `BaseDecl`.
-///
-/// TODO: the layout (stub: as written).
+/// `BaseDecl`: `BASE <…>`.
 pub fn base_decl(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    cx.verbatim(n)
+    cx.words(n)
 }
 
-/// `PrefixDecl`.
-///
-/// TODO: the layout (stub: as written).
+/// `PrefixDecl`: `PREFIX ex: <…>`, one space after the label.
 pub fn prefix_decl(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    cx.verbatim(n)
+    cx.words(n)
 }
 
-/// `VersionDecl`.
+/// `VersionDecl`: `VERSION "1.2"`.
 ///
-/// TODO: the layout (stub: as written).
+/// TODO: the version string in the configured quote style.
 pub fn version_decl(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    cx.verbatim(n)
+    cx.words(n)
 }
