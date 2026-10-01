@@ -335,6 +335,16 @@ result cache, and the web UI.
 * **Selective column decoding.** The block cache holds decoded columns. Scans decode
   only the key columns they read (variables, graph, repeated variables), which also
   leaves room for more of the cache.
+* **Decorrelated EXISTS.** `FILTER EXISTS { P }` / `FILTER NOT EXISTS { P }`, where `P`
+  is made of triple patterns, paths without `*` or `?`, `GRAPH` and deterministic
+  FILTERs, evaluates `P` once and keeps the distinct values of the variables the outer
+  rows bind. Each outer row then probes that set instead of evaluating the substituted
+  pattern. A row that leaves some of them unbound (after OPTIONAL) probes the set of
+  its bound ones. A row that binds a variable only a FILTER inside `P` uses is still
+  evaluated by substitution. The key set is built once per query, only when `P` costs
+  less than evaluating it per distinct outer key, and the EXISTS stays per row when
+  the set does not fit in the memory budget (`[EXISTS decorrelated on ?y: …]` in
+  EXPLAIN, or the reason it was not, with `exists*` counters).
 * Every one of these can be switched off per query (`QueryOptions::optimizations`) or
   per process (`SPARKLES_DISABLE_OPTIMIZATIONS=range_pushdown,…`), and EXPLAIN shows
   which one ran.

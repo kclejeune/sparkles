@@ -16,7 +16,6 @@ use crate::id::{Id, Tag};
 use crate::index::{G, O, P, Perm, S};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term};
-use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
@@ -503,18 +502,18 @@ impl<'a> Planner<'a> {
     pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
         let ctx = self.ctx;
         let g = graph.clone();
+        let subst = &self.subst;
         let exists = move |p: &GraphPattern| -> Arc<ExistsSpec> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
             let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
             vars.sort_unstable();
             vars.dedup();
-            Arc::new(ExistsSpec {
-                pattern: p.clone(),
-                graph: g.clone(),
-                vars,
-                memo: Mutex::new(FxHashMap::default()),
-            })
+            let bound = vars
+                .iter()
+                .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
+                .collect();
+            Arc::new(ExistsSpec::new(p.clone(), g.clone(), vars, bound))
         };
         Compiler {
             ctx,
@@ -3291,6 +3290,8 @@ fn substitute(e: &mut Expr, v: VarId, c: Id) {
             substitute(d, v, c);
         }
         Expr::Coalesce(l) | Expr::Call(_, l) => l.iter_mut().for_each(|x| substitute(x, v, c)),
+        // the EXISTS pattern is substituted when it is evaluated: it keeps the constant
+        Expr::Exists(spec) if spec.vars.contains(&v) => *spec = Arc::new(spec.with_bound(v, c)),
         _ => {}
     }
 }
@@ -3408,7 +3409,7 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
     walk(gp, out);
 }
 
-fn expr_vars(e: &Expression, out: &mut Vec<String>) {
+pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out.push(v.as_str().to_string()),
