@@ -63,6 +63,12 @@ pub fn update_as(
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
     let parsed = p.parse_update(u)?;
+    // malformed geometry constants fail before the writer lock is taken
+    for op in &parsed.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
+            crate::geo::validate_query(pattern, &mut |_| {})?;
+        }
+    }
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut stats = UpdateStats {
         operations: parsed.operations.len(),

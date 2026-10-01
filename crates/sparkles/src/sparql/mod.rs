@@ -4,6 +4,7 @@ pub mod cache;
 pub mod ctx;
 pub mod exec;
 pub mod expr;
+pub mod geopf;
 mod keyfilter;
 pub mod plan;
 pub mod results;
@@ -427,6 +428,7 @@ pub fn execute_query(
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
     let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
+    crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
     for (name, term) in &opts.initial_bindings {
@@ -451,7 +453,8 @@ pub fn execute_query(
     let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
     let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let t2 = Instant::now();
-    let (table, plan) = exec::execute(&ctx, &node)?;
+    let (table, mut plan) = exec::execute(&ctx, &node)?;
+    plan.warnings = ctx.warnings();
     let mut result = QueryResult {
         kind,
         vars: Vec::new(),
@@ -521,8 +524,11 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let (pattern, dataset, base) = split(&parsed);
     let ctx = make_ctx(snap, opts, dataset, base);
+    crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
-    Ok((parsed.to_sse(), exec::describe(&ctx, &node)))
+    let mut info = exec::describe(&ctx, &node);
+    info.warnings = ctx.warnings();
+    Ok((parsed.to_sse(), info))
 }
 
 /// Instantiate a template term (CONSTRUCT / INSERT), recursing into RDF 1.2 triple

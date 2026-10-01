@@ -5,6 +5,7 @@ pub mod commit;
 pub mod dataset;
 pub mod disk;
 pub mod error;
+pub mod geo;
 pub mod guard;
 pub mod history;
 pub mod id;

@@ -57,10 +57,12 @@ pub struct Optimizations {
     pub ordered_topk: bool,
     /// scans decode (and cache) only the key columns they read
     pub selective_columns: bool,
+    /// spatial FILTERs on an indexed predicate's object search the spatial index
+    pub spatial_pushdown: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 8] = [
+    pub const NAMES: [&str; 9] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -69,6 +71,7 @@ impl Optimizations {
         "topk_prefilter",
         "ordered_topk",
         "selective_columns",
+        "spatial_pushdown",
     ];
 
     /// Everything on.
@@ -81,6 +84,7 @@ impl Optimizations {
         topk_prefilter: true,
         ordered_topk: true,
         selective_columns: true,
+        spatial_pushdown: true,
     };
 
     /// Everything off: the generic operators only.
@@ -93,6 +97,7 @@ impl Optimizations {
         topk_prefilter: false,
         ordered_topk: false,
         selective_columns: false,
+        spatial_pushdown: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -105,6 +110,7 @@ impl Optimizations {
             "topk_prefilter" => &mut self.topk_prefilter,
             "ordered_topk" => &mut self.ordered_topk,
             "selective_columns" => &mut self.selective_columns,
+            "spatial_pushdown" => &mut self.spatial_pushdown,
             _ => return None,
         })
     }
@@ -142,6 +148,15 @@ impl Default for Optimizations {
     }
 }
 
+/// A note about a plan for its reader (explain output, MCP): something did not run the
+/// way the query suggests, though the answer is the same.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PlanWarning {
+    /// stable identifier (`geo-not-pushed`, `geo-index-building`, `geo-not-built`, …)
+    pub code: &'static str,
+    pub message: String,
+}
+
 pub struct Ctx {
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
@@ -175,6 +190,10 @@ pub struct Ctx {
     /// consult / fill the store's result cache
     pub use_cache: bool,
     pub opt: Optimizations,
+    /// parsed geometries of this query
+    pub geo: crate::geo::memo::GeoMemo,
+    /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
+    warnings: parking_lot::Mutex<Vec<PlanWarning>>,
 }
 
 impl Ctx {
@@ -203,7 +222,22 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             opt: Optimizations::default(),
+            geo: Default::default(),
+            warnings: Default::default(),
         }
+    }
+
+    /// Record a warning for the plan (once, however often it is raised).
+    pub fn warn(&self, w: PlanWarning) {
+        let mut ws = self.warnings.lock();
+        if !ws.contains(&w) {
+            ws.push(w);
+        }
+    }
+
+    /// The warnings recorded so far.
+    pub fn warnings(&self) -> Vec<PlanWarning> {
+        self.warnings.lock().clone()
     }
 
     #[inline]
