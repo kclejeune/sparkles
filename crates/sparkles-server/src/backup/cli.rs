@@ -11,8 +11,8 @@
 //! Only `repo add` and `backup create` initialize an empty location; the other
 //! commands attach to an existing repository (`memory://` is always new).
 //!
-//! `sparkles backup --loc DB --out DIR` (no subcommand) keeps writing a gzipped N-Quads
-//! dump (handled in `main.rs`).
+//! `sparkles backup --loc DB --out DIR` (no subcommand) keeps writing a compressed
+//! N-Quads dump, zstd by default (handled in `main.rs`).
 
 use super::config::{self, ConfigFile, RepoToml};
 use crate::state;

@@ -308,7 +308,7 @@ async fn backups_take_a_codec() {
     )
     .await;
     assert!(r.status.is_success());
-    for (q, ext) in [("", ".nq.gz"), ("?compression=zstd&level=5", ".nq.zst")] {
+    for (q, ext) in [("", ".nq.zst"), ("?compression=gzip&level=5", ".nq.gz")] {
         let r = send(
             &app,
             Request::post(format!("/$/backup/c{q}"))

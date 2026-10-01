@@ -160,8 +160,9 @@ fn the_legacy_dump_is_unchanged() {
     assert!(stderr(&o).contains("backup written to"), "{}", stderr(&o));
     let files: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
     assert_eq!(files.len(), 1);
+    // zstd by default
     assert!(
-        files[0].file_name().to_string_lossy().ends_with(".nq.gz"),
+        files[0].file_name().to_string_lossy().ends_with(".nq.zst"),
         "{:?}",
         files[0].file_name()
     );
@@ -173,9 +174,15 @@ fn the_legacy_dump_is_unchanged() {
         "--out",
         out.to_str().unwrap(),
         "--compress",
-        "zstd",
+        "gzip",
     ]);
     assert!(o.status.success(), "{}", stderr(&o));
+    let gz = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .filter(|f| f.file_name().to_string_lossy().ends_with(".nq.gz"))
+        .count();
+    assert_eq!(gz, 1);
 
     // without --loc and without a subcommand: a usage error
     let o = run(&["backup"]);

@@ -2622,16 +2622,16 @@ impl<W: std::io::Write> std::io::Write for GuardedFile<W> {
 }
 
 /// `POST /$/backup/{ds}[?compression=gzip|zstd|brotli|lz4|none&level=N]`: an N-Quads
-/// backup in `backups/`, gzip by default (as Fuseki). One per dataset at a time; `507`
-/// when the data directory's file system keeps less than `--min-free-disk-mb` free, and
-/// the task fails once writing would go below it.
+/// backup in `backups/`, zstd by default (`compression=gzip` writes Fuseki's `.nq.gz`).
+/// One per dataset at a time; `507` when the data directory's file system keeps less
+/// than `--min-free-disk-mb` free, and the task fails once writing would go below it.
 async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     use sparkles::codec::{Codec, Level};
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let codec = match params.get("compression") {
         Some(c) => Codec::parse(c)?,
-        None => Codec::Gzip,
+        None => Codec::dump_default(),
     };
     let level = backup_level(codec, params.get("level"))?.map(Level);
     task_start_check(&st, Some("backup"), &name)?;
@@ -2886,7 +2886,7 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
 
 /// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
 /// the strings of its `detail` are cut to their last component (`backup written to
-/// …/wiki_2026-01-01.nq.gz`).
+/// …/wiki_2026-01-01.nq.zst`).
 fn task_for(p: &Principal, t: &crate::state::Task) -> crate::state::Task {
     let mut t = t.clone();
     if !p.has(crate::auth::ServerPerm::ServerAdmin) {

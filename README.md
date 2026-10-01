@@ -62,7 +62,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Durable commit ids: dataset UUID, gap-free commit sequence with timestamps and net counts, receipts on writes, `Sparkles-Commit` headers, commit catalog (`/$/commits`, `sparkles log`) | ✅ |
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
-| N-Quads backups (`/$/backup`) and dumps (gzip by default, or zstd, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
+| N-Quads backups (`/$/backup`) and dumps (zstd by default, or gzip, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
 | Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
@@ -170,7 +170,7 @@ feature gaps are:
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix read/write endpoints | Basic, Bearer tokens, OIDC (UI) and trusted proxy headers, with per-dataset levels; no graph-level ACLs yet; Prometheus `/$/metrics` with Sparkles metric names (not Fuseki's `fuseki_requests_*`), no JVM metrics; datasets are configured by CLI flags / admin API only; prefixes via `/{ds}/prefixes` |
 | SERVICE | bulk / batched / cached SERVICE (serviceenhancer) | plain SERVICE only |
 | Transactions over HTTP | — | — (same as Fuseki: one request = one transaction) |
-| Backups | `/$/backup/{ds}`: a gzipped N-Quads dump of the whole dataset per backup, in the server's directory; restored by loading it into a new dataset | the same dumps (`/$/backup/{ds}`, also zstd, brotli or LZ4), plus backup repositories on a file system or S3: incremental, deduplicated backups that restore to a ready database without a reload, with verification, schedules and retention |
+| Backups | `/$/backup/{ds}`: a gzipped N-Quads dump of the whole dataset per backup, in the server's directory; restored by loading it into a new dataset | the same dumps (`/$/backup/{ds}`), zstd by default (`?compression=gzip` for Fuseki's `.nq.gz`; also brotli or LZ4), plus backup repositories on a file system or S3: incremental, deduplicated backups that restore to a ready database without a reload, with verification, schedules and retention |
 
 ### vs. QLever
 
@@ -362,6 +362,7 @@ result cache, and the web UI.
 | `--max-export-mb` stays `0` (unlimited) by default, while query responses are capped at 1 GiB (`--max-result-mb`) | A Graph Store GET of a graph or a whole dataset is the export path, streamed from one snapshot, and a finite default would cut off legitimate dumps. The cost: any reader can make the server stream its whole dataset (CPU and bandwidth, not memory). Deployments that expose reads to untrusted clients should set `--max-export-mb` and rate-limit the `query` class. |
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0`: no cap) for queries, updates and Graph Store writes alike; the default query timeout stays 60 s, and writes have no default deadline (`--update-timeout 0`) but are cancelled when their client disconnects | A request may ask for a longer timeout than the default, but not hold a worker indefinitely; a long load is not cut off by a default it did not ask for, and a disconnected one stops (its rate-limit concurrency slot stays taken until it has). |
 | The full-text index is committed lazily: a write stages its documents, and the next text query that needs them (or a tick about once a second) commits them | A Tantivy commit flushes a segment and cost more than the indexing itself; a burst of writes now shares one. Each snapshot still searches exactly its own documents (later ones are filtered out against it, removed ones are kept until their batch is committed), and after a crash the WAL restores what was only staged. Jena's text index commits with each transaction. |
+| N-Quads backups (`/$/backup/{ds}`, `sparkles backup`) are zstd (level 3, `.nq.zst`) by default, where Fuseki writes gzip (`.nq.gz`); `?compression=gzip` or `--compress gzip` writes Fuseki's format | At 10.5M triples zstd took 8.2 s for 81.5 MB and gzip (level 6) 41 s for 74.9 MB: five times faster for a file 9% larger. `sparkles load` and uploads read both. |
 | Out of scope for v1 | JS scripting functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's Lucene index format and assembler configuration (Sparkles implements `text:query` itself), GeoSPARQL, ShEx, SHACL-AF rules (also absent in Jena), RDF Patch, backward-chaining (LP) rules, Shiro auth. |
 
 ## Using the library (no server)
@@ -532,7 +533,7 @@ sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
-sparkles backup  --loc db --out backups/      # gzip; --compress zstd --level 9 --threads 8
+sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)

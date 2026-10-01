@@ -451,7 +451,7 @@ async fn nquads_backups_are_bounded() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert_eq!(files.len(), 1, "{files:?}");
-    assert!(files[0].starts_with("ds_") && files[0].ends_with(".nq.gz"));
+    assert!(files[0].starts_with("ds_") && files[0].ends_with(".nq.zst"));
 
     // no backup when the disk keeps less than the reserve free
     let s = limited(&[], |st| {
