@@ -278,6 +278,23 @@ its server used 890 MiB and 2.3 GiB after the runs. Its update latency (11.2 and
 | SHACL validation, 20 shapes, 1.05M triples, 48,428 results (`mise run bench:shacl 100000`) | 164 ms parallel, 741 ms sequential |
 | `ASK { ?s ?p ?o }` / `SELECT * … LIMIT 100` at 10.5M (early termination) | 1.9 ms / 1.8 ms |
 
+### Backup repositories (10.5M triples)
+
+`mise run bench:backup` (`scripts/backup-bench.sh`) on the 10.5M-quad benchmark database
+(301 MB), Sparkles alone, release build, an `fs` repository on the same ext4 file system,
+warm page cache; 3 rounds, median (min–max), wall clock including process start:
+
+| Case | Seconds | Size |
+|---|---:|---|
+| Full backup into an empty repository | 0.56 (0.55–0.60) | 301.3 MB logical, 281.5 MB stored, 534 MB/s |
+| Incremental backup after 1,000 single-quad commits | 0.34 (0.31–0.35) | 55.3 KB added (3 new blobs, 28 reused) |
+| Restore into a new directory (quick check) | 0.79 (0.78–0.93) | 301.5 MB |
+| Verify at level `data` (every blob read and hashed) | 0.08 (0.07–0.13) | 32 blobs, ok |
+
+An incremental backup stores only the appended tail of the update log and the files that
+changed, so its size follows the writes since the last backup, not the database size.
+Not measured yet: S3, cold caches, and databases larger than memory.
+
 ### Full-text index and observability (10.5M triples)
 
 Sparkles alone, one configuration at a time, same machine and harness
