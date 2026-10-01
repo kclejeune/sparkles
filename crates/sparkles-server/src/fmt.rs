@@ -3,12 +3,19 @@
 //! `--check` / `--list-different` exit 1 when something would change, `--write`
 //! rewrites in place, and any error exits 2.
 
-use anyhow::{Result, bail};
+mod config;
+mod report;
+mod walk;
+
+use anyhow::{Context, Result, bail};
 use clap::Args;
+use rayon::prelude::*;
 use sparkles_fmt::options::{self, OptionError, Value};
-use sparkles_fmt::{Detection, FormatError, Language, Options};
+use sparkles_fmt::{Detection, FormatError, Language, Options, Warning};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct FmtArgs {
@@ -30,7 +37,7 @@ pub struct FmtArgs {
     #[arg(long, requires = "check")]
     pub diff: bool,
     /// Name of the stdin input, for language detection, config and ignore files
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", conflicts_with = "paths")]
     pub stdin_filepath: Option<PathBuf>,
     /// sparql | turtle | trig | ntriples | nquads | jsonld
     #[arg(long, value_name = "LANG", value_parser = parse_language)]
@@ -187,6 +194,77 @@ fn flag(key: &str) -> String {
     }
 }
 
+/// What a run does with each formatted document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// print the formatted text to stdout
+    Print,
+    /// `--check` (with `--diff`: a unified diff per changed file on stdout)
+    Check { diff: bool },
+    /// `--list-different`
+    List,
+    /// `--write`
+    Write,
+}
+
+impl Mode {
+    fn of(args: &FmtArgs) -> Mode {
+        if args.check {
+            Mode::Check { diff: args.diff }
+        } else if args.list_different {
+            Mode::List
+        } else if args.write {
+            Mode::Write
+        } else {
+            Mode::Print
+        }
+    }
+}
+
+/// One document to format.
+struct Job {
+    /// the name in messages: the path as given, or `<stdin>` / `--stdin-filepath`
+    name: String,
+    /// the file to read and write (`None`: stdin)
+    file: Option<PathBuf>,
+    /// the path whose extension names the language
+    lang_path: Option<PathBuf>,
+    /// stdin's text
+    text: Option<String>,
+    /// stdin whose `--stdin-filepath` an ignore file matches: passed through as it is
+    ignored: bool,
+    /// `None`: its config file is broken (reported once, before formatting)
+    options: Option<Arc<Options>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Status {
+    #[default]
+    Unchanged,
+    Changed,
+    Error,
+}
+
+/// What formatting one document printed, collected so parallel runs print in order.
+#[derive(Default)]
+struct Outcome {
+    status: Status,
+    stdout: String,
+    /// errors and `[warn]` lines, after the warnings
+    stderr: Vec<String>,
+    warnings: Vec<Warning>,
+}
+
+impl Outcome {
+    fn error(line: Option<String>) -> Outcome {
+        Outcome {
+            status: Status::Error,
+            stderr: line.into_iter().collect(),
+            ..Outcome::default()
+        }
+    }
+}
+
 /// Run `sparkles fmt`, exiting with 1 (changes found) or 2 (errors) as Prettier does.
 pub fn run(args: FmtArgs) -> Result<()> {
     let code = match run_inner(&args) {
@@ -203,100 +281,299 @@ pub fn run(args: FmtArgs) -> Result<()> {
 }
 
 fn run_inner(args: &FmtArgs) -> Result<i32> {
-    let opts = args
-        .options_over(Options::default())
+    // the flags alone, so a bad one stops the run before any file
+    args.options_over(Options::default())
         .map_err(|e| anyhow::anyhow!("{}: {}", flag(&e.key), e.message))?;
-    if !args.paths.is_empty() {
-        // TODO: walks, config discovery, ignore files, --write, --diff
-        bail!("formatting files is not available yet; pipe a document through stdin");
-    }
-    if args.write {
+    if args.write && args.paths.is_empty() {
         bail!("--write needs file paths");
     }
-    let mut text = String::new();
-    std::io::stdin()
-        .read_to_string(&mut text)
-        .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-    let name = args
-        .stdin_filepath
-        .as_deref()
-        .map_or_else(|| "<stdin>".to_string(), |p| p.display().to_string());
-    let lang = match args.language {
-        Some(l) => l,
-        None => match language_of(args.stdin_filepath.as_deref(), &text) {
-            Ok(l) => l,
-            Err(msg) => {
-                eprintln!("{name}: error: {msg}");
+    let mode = Mode::of(args);
+    let cwd = std::env::current_dir().context("the current directory")?;
+    let mut configs = match (&args.config, args.no_config) {
+        (_, true) => config::Source::None,
+        (Some(path), _) => {
+            let c = config::Config::load(path, path);
+            if let Err(e) = &c.options {
+                eprintln!("{e}");
                 return Ok(2);
             }
+            config::Source::Fixed(Arc::new(c))
+        }
+        (None, false) => config::Source::Discover {
+            cwd: cwd.clone(),
+            cache: HashMap::new(),
         },
     };
-    let formatted = match sparkles_fmt::format(&text, lang, &opts) {
-        Ok(f) => f,
+    let ignores = match walk::Ignores::load(&cwd, &args.ignore_path) {
+        Ok(i) => Arc::new(i),
         Err(e) => {
-            eprintln!("{}", error_line(&name, lang, &e));
+            eprintln!("{e}");
             return Ok(2);
         }
     };
-    for w in &formatted.warnings {
-        match w.line {
-            0 => eprintln!("{name}: warning: {}", w.message),
-            l => eprintln!("{name}:{l}:{}: warning: {}", w.column, w.message),
+    if matches!(mode, Mode::Check { .. }) {
+        eprintln!("Checking formatting...");
+    }
+    let mut errors = 0;
+    let mut broken = HashSet::new();
+    // the options of a file in `dir`; a broken config file is reported once, and every
+    // file under it fails
+    let mut options_in = |dir: &Path| -> Option<Arc<Options>> {
+        let base = match configs.for_dir(dir) {
+            None => Options::default(),
+            Some(c) => match &c.options {
+                Ok(o) => o.clone(),
+                Err(e) => {
+                    if broken.insert(c.path.clone()) {
+                        eprintln!("{e}");
+                    }
+                    return None;
+                }
+            },
+        };
+        // the flags passed the same checks over the defaults above
+        args.options_over(base).ok().map(Arc::new)
+    };
+    let mut jobs = Vec::new();
+    if args.paths.is_empty() {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("reading stdin")?;
+        let abs = args
+            .stdin_filepath
+            .as_deref()
+            .map(|p| walk::absolute(&cwd, p));
+        let dir = abs
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&cwd)
+            .to_path_buf();
+        jobs.push(Job {
+            name: args
+                .stdin_filepath
+                .as_deref()
+                .map_or_else(|| "<stdin>".to_string(), |p| p.display().to_string()),
+            file: None,
+            lang_path: args.stdin_filepath.clone(),
+            text: Some(text),
+            ignored: abs.is_some_and(|a| ignores.ignored(&a, false)),
+            options: options_in(&dir),
+        });
+    } else {
+        let (inputs, walk_errors) = walk::collect(&args.paths, &cwd, &ignores);
+        for e in &walk_errors {
+            eprintln!("{e}");
+        }
+        errors += walk_errors.len();
+        for input in inputs {
+            let dir = input.abs.parent().unwrap_or(&cwd).to_path_buf();
+            jobs.push(Job {
+                name: input.path.display().to_string(),
+                lang_path: Some(input.path.clone()),
+                file: Some(input.path),
+                text: None,
+                ignored: false,
+                options: options_in(&dir),
+            });
         }
     }
-    if args.check {
-        if formatted.changed {
-            eprintln!("[warn] {name}");
-            return Ok(1);
-        }
-        return Ok(0);
-    }
-    if args.list_different {
-        if formatted.changed {
-            println!("{name}");
-            return Ok(1);
-        }
-        return Ok(0);
-    }
+
+    let outcomes: Vec<Outcome> = if jobs.len() > 1 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads.unwrap_or(0))
+            .build()
+            .context("starting the formatting threads")?;
+        pool.install(|| {
+            jobs.par_iter()
+                .map(|j| process(j, args.language, mode))
+                .collect()
+        })
+    } else {
+        jobs.iter()
+            .map(|j| process(j, args.language, mode))
+            .collect()
+    };
+
+    let mut changed = 0;
+    let mut once = HashSet::new();
     let mut out = std::io::stdout().lock();
-    out.write_all(formatted.text.as_bytes())?;
-    out.flush()?;
-    Ok(0)
+    for (job, o) in jobs.iter().zip(&outcomes) {
+        for w in &o.warnings {
+            // the same for every file: said once
+            if w.code == "option-not-implemented" {
+                if once.insert(w.message.clone()) {
+                    eprintln!("warning: {}", w.message);
+                }
+                continue;
+            }
+            eprintln!("{}", report::warning_line(&job.name, w));
+        }
+        for l in &o.stderr {
+            eprintln!("{l}");
+        }
+        match o.status {
+            Status::Unchanged => {}
+            Status::Changed => changed += 1,
+            Status::Error => errors += 1,
+        }
+        if let Err(e) = out.write_all(o.stdout.as_bytes()) {
+            // a closed pipe (`| head`) ends the output, not the run's verdict
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(e).context("writing stdout");
+            }
+        }
+    }
+    let _ = out.flush();
+    if let Mode::Check { .. } = mode
+        && let Some(line) = report::check_summary(changed, errors)
+    {
+        eprintln!("{line}");
+    }
+    Ok(match mode {
+        _ if errors > 0 => 2,
+        Mode::Check { .. } | Mode::List if changed > 0 => 1,
+        _ => 0,
+    })
 }
 
-/// The language of a document without `--language`.
-fn language_of(path: Option<&Path>, text: &str) -> Result<Language, String> {
-    match sparkles_fmt::detect(path, text) {
-        Detection::Lang(l) => Ok(l),
+/// Format one document and do with it what `mode` says.
+fn process(job: &Job, flag: Option<Language>, mode: Mode) -> Outcome {
+    let name = job.name.as_str();
+    let fail = |message: &str| Outcome::error(Some(format!("{name}: error: {message}")));
+    let Some(opts) = job.options.as_deref() else {
+        return Outcome::error(None);
+    };
+    // the language by name first, so files that are never formatted are not read
+    let by_name = match language_by_name(flag, job.lang_path.as_deref()) {
+        Ok(l) => l,
+        Err(e) => return fail(&e),
+    };
+    if let Some(l) = by_name
+        && !l.is_implemented()
+    {
+        return fail(&FormatError::unsupported_language(l).to_string());
+    }
+    let read;
+    let text = match (&job.text, &job.file) {
+        (Some(t), _) => t.as_str(),
+        (None, Some(path)) => match std::fs::read(path).map(String::from_utf8) {
+            Ok(Ok(t)) => {
+                read = t;
+                read.as_str()
+            }
+            Ok(Err(_)) => return fail("not UTF-8 text"),
+            Err(e) => return fail(&report::io(&e)),
+        },
+        (None, None) => return Outcome::error(None),
+    };
+    if job.ignored {
+        return Outcome {
+            stdout: match mode {
+                Mode::Print => text.to_string(),
+                _ => String::new(),
+            },
+            ..Outcome::default()
+        };
+    }
+    let lang = match by_name {
+        Some(l) => l,
+        None => match sniffed(text) {
+            Ok(l) => l,
+            Err(e) => return fail(&e),
+        },
+    };
+    let f = match sparkles_fmt::format(text, lang, opts) {
+        Ok(f) => f,
+        Err(e) => return Outcome::error(Some(report::error_line(name, lang, &e))),
+    };
+    let mut o = Outcome {
+        status: match f.changed {
+            true => Status::Changed,
+            false => Status::Unchanged,
+        },
+        warnings: f.warnings,
+        ..Outcome::default()
+    };
+    match mode {
+        Mode::Print => o.stdout = f.text,
+        Mode::Check { diff } if f.changed => {
+            o.stderr.push(format!("[warn] {name}"));
+            if diff {
+                o.stdout = report::diff(name, text, &f.text);
+            }
+        }
+        Mode::List if f.changed => o.stdout = format!("{name}\n"),
+        Mode::Write if f.changed => {
+            if let Some(path) = &job.file
+                && let Err(e) = write_atomically(path, &f.text)
+            {
+                return fail(&format!("writing the formatted file: {}", report::io(&e)));
+            }
+        }
+        _ => {}
+    }
+    o
+}
+
+/// The language from `--language` or the path's extension; `Ok(None)` when the content
+/// must tell. Compressed files are refused even with `--language`.
+fn language_by_name(
+    flag: Option<Language>,
+    path: Option<&Path>,
+) -> Result<Option<Language>, String> {
+    let by_path = path.and_then(sparkles_fmt::detect_path);
+    if by_path == Some(Detection::Compressed) {
+        return Err("compressed input: decompress first".to_string());
+    }
+    if flag.is_some() {
+        return Ok(flag);
+    }
+    match by_path {
+        Some(Detection::Lang(l)) => Ok(Some(l)),
+        Some(Detection::RdfXml) => Err(sparkles_fmt::RDF_XML_MESSAGE.to_string()),
+        Some(Detection::SkipInWalk) => Err(format!(
+            "cannot tell the language of a .{} file; use --language",
+            path.and_then(Path::extension)
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// The language of a document by its content (stdin without a name, or an unknown
+/// extension).
+fn sniffed(text: &str) -> Result<Language, String> {
+    match sparkles_fmt::detect(None, text) {
+        Detection::Lang(l) if l.is_implemented() => Ok(l),
+        Detection::Lang(l) => Err(FormatError::unsupported_language(l).to_string()),
         Detection::RdfXml => Err(sparkles_fmt::RDF_XML_MESSAGE.to_string()),
-        Detection::Compressed => Err("compressed input: decompress first".to_string()),
-        Detection::SkipInWalk | Detection::Unknown => {
+        Detection::Compressed | Detection::SkipInWalk | Detection::Unknown => {
             Err("cannot tell the language; use --language".to_string())
         }
     }
 }
 
-/// `path:LINE:COL: error: …` (or `path: error: …` without a position).
-fn error_line(name: &str, lang: Language, e: &FormatError) -> String {
-    match e {
-        FormatError::Syntax {
-            message,
-            line,
-            column,
-            ..
-        } => format!(
-            "{name}:{line}:{column}: error: {} syntax error: {message}",
-            lang.display_name()
-        ),
-        FormatError::Unsupported {
-            message,
-            line,
-            column,
-        } => format!(
-            "{name}:{line}:{column}: error: the formatter cannot handle this yet ({message}); input left unchanged; please report"
-        ),
-        e => format!("{name}: error: {e}"),
-    }
+/// Replace `path` (through symbolic links) with `text`: a temporary file in the same
+/// directory with the same permissions, synced, then renamed over it, so a reader sees
+/// the old file or the new one, never a partial one.
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path)?;
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let permissions = std::fs::metadata(&target)?.permissions();
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".sparklesfmt-")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.as_file().set_permissions(permissions)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map_err(|e| e.error)?;
+    // the rename itself
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -415,31 +692,43 @@ mod tests {
     }
 
     #[test]
-    fn error_lines() {
-        let e = FormatError::Syntax {
-            message: "expected one of …".into(),
-            line: 3,
-            column: 14,
-            offset: 40,
-        };
+    fn languages() {
+        let l = |flag, p: &str| language_by_name(flag, Some(Path::new(p)));
+        assert_eq!(l(None, "q.rq"), Ok(Some(Language::Sparql)));
+        assert_eq!(l(None, "Q.SPARQL"), Ok(Some(Language::Sparql)));
+        assert_eq!(l(None, "d.ttl"), Ok(Some(Language::Turtle)));
+        assert_eq!(l(None, "q.txt"), Ok(None));
         assert_eq!(
-            error_line("queries/bad.rq", Language::Sparql, &e),
-            "queries/bad.rq:3:14: error: SPARQL syntax error: expected one of …"
-        );
-        let e = FormatError::Unsafe {
-            check: sparkles_fmt::Check::Algebra,
-        };
-        assert_eq!(
-            error_line("q.rq", Language::Sparql, &e),
-            "q.rq: error: formatter refused its own output (algebra differs); input left unchanged; please report"
-        );
-        assert_eq!(
-            language_of(Some(Path::new("x.owl")), ""),
+            l(None, "x.owl"),
             Err(sparkles_fmt::RDF_XML_MESSAGE.to_string())
         );
         assert_eq!(
-            language_of(Some(Path::new("q.rq")), ""),
-            Ok(Language::Sparql)
+            l(Some(Language::Sparql), "x.owl"),
+            Ok(Some(Language::Sparql))
         );
+        assert_eq!(
+            l(None, "x.json"),
+            Err("cannot tell the language of a .json file; use --language".to_string())
+        );
+        assert_eq!(
+            l(Some(Language::JsonLd), "x.json"),
+            Ok(Some(Language::JsonLd))
+        );
+        assert!(
+            l(Some(Language::Sparql), "q.rq.gz")
+                .unwrap_err()
+                .contains("decompress")
+        );
+        assert_eq!(language_by_name(None, None), Ok(None));
+        assert_eq!(sniffed("# c\nSELECT * {}"), Ok(Language::Sparql));
+        assert_eq!(
+            sniffed("<?xml version=\"1.0\"?>"),
+            Err(sparkles_fmt::RDF_XML_MESSAGE.to_string())
+        );
+        assert_eq!(
+            sniffed("<a> <b> <c> ."),
+            Err("turtle formatting is not available yet".to_string())
+        );
+        assert!(sniffed("# only a comment").is_err());
     }
 }
