@@ -92,13 +92,15 @@ impl Table {
 
     /// Keep only rows where `keep[i]`.
     pub fn filter_rows(&mut self, keep: &[bool]) {
+        let keep = &keep[..self.len];
         for col in &mut self.cols {
-            let mut i = 0;
-            col.retain(|_| {
-                let k = keep[i];
-                i += 1;
-                k
-            });
+            // branch-free compaction: masks are often unpredictable
+            let mut w = 0;
+            for r in 0..keep.len() {
+                col[w] = col[r];
+                w += keep[r] as usize;
+            }
+            col.truncate(w);
         }
         self.len = keep.iter().filter(|&&k| k).count();
     }

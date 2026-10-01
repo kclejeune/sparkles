@@ -96,6 +96,7 @@ use super::table::{Table, VarId};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
@@ -331,6 +332,26 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
         }
         Err(e) => return Err(e),
     };
+    // one key read from a column that binds it on every row with a plain term: each row
+    // is one lookup (what the loop below does, without its per-row bookkeeping)
+    if let ([key], [], KeySet::One(set)) = (keys.as_slice(), risky.as_slice(), &build.full)
+        && let Some(c) = key.col
+        && !t.cols[c]
+            .par_iter()
+            .any(|id| id.is_undef() || id.tag() == Tag::Special)
+    {
+        ctx.check()?;
+        let keep: Vec<bool> = t.cols[c]
+            .par_iter()
+            .map(|id| set.contains(id) != negated)
+            .collect();
+        drop(held);
+        decor.probed.fetch_add(keep.len() as u64, Ordering::Relaxed);
+        let sorted = t.sorted.clone();
+        t.filter_rows(&keep);
+        t.sorted = sorted;
+        return Ok(true);
+    }
     let width = keys.len();
     let all = if width == 64 {
         u64::MAX

@@ -564,6 +564,20 @@ fn run_len(col: &[u64], v: u64) -> usize {
     }
 }
 
+/// End of the run of ids equal to `col[i]` in a sorted column: short runs are stepped
+/// through instead of binary-searching the rest of the column.
+#[inline]
+fn run_end(col: &[Id], i: usize) -> usize {
+    const PROBE: usize = 16;
+    let v = col[i];
+    let end = col.len().min(i + PROBE);
+    match col[i..end].iter().position(|x| *x != v) {
+        Some(n) => i + n,
+        None if end < col.len() => end + col[end..].partition_point(|x| *x == v),
+        None => end,
+    }
+}
+
 /// The distinct values of a scan's first free key column with the number of rows of each,
 /// in key order.
 fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
@@ -1329,6 +1343,8 @@ fn join_pairs(
     if merge && lsorted && rsorted {
         // zipper join with galloping (QLever)
         let (a, b) = (&l.cols[lk], &r.cols[rk]);
+        // most merge joins match each row of the smaller side about once
+        pairs.reserve(a.len().min(b.len()));
         let (mut i, mut j) = (0usize, 0usize);
         let mut steps = 0usize;
         while i < a.len() && j < b.len() {
@@ -1341,14 +1357,14 @@ fn join_pairs(
                 Ordering::Less => i = gallop(a, i, b[j]),
                 Ordering::Greater => j = gallop(b, j, a[i]),
                 Ordering::Equal => {
-                    let v = a[i];
-                    let ie = i + a[i..].partition_point(|x| *x == v);
-                    let je = j + b[j..].partition_point(|x| *x == v);
+                    let ie = run_end(a, i);
+                    let je = run_end(b, j);
                     // an equal-key run emits up to the product of its lengths: with a
                     // single key that is exact, so an oversized run fails before it is
-                    // expanded; otherwise the budget is checked while expanding
+                    // expanded; otherwise the budget is checked while expanding. Small
+                    // runs are covered by the periodic check above.
                     let run = (ie - i).saturating_mul(je - j);
-                    if lay.shared.len() == 1 {
+                    if lay.shared.len() == 1 && run > 64 {
                         ctx.check_output(pairs.len().saturating_add(run), w)?;
                     }
                     for ii in i..ie {
@@ -1449,9 +1465,8 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
                     Ordering::Less => i = gallop(a, i, b[j]),
                     Ordering::Greater => j = gallop(b, j, a[i]),
                     Ordering::Equal => {
-                        let v = a[i];
-                        let ie = i + a[i..].partition_point(|x| *x == v);
-                        let je = j + b[j..].partition_point(|x| *x == v);
+                        let ie = run_end(a, i);
+                        let je = run_end(b, j);
                         n += ((ie - i) * (je - j)) as u64;
                         i = ie;
                         j = je;
@@ -1997,28 +2012,60 @@ fn group(
         return Ok(out);
     }
     let kcols: Vec<Option<usize>> = keys.iter().map(|k| t.col_of(*k)).collect();
+    // the keys of each group, in order of first appearance, and each row's group
     let mut order: Vec<Vec<Id>> = Vec::new();
-    let mut groups: FxHashMap<Vec<Id>, Vec<u32>> = FxHashMap::default();
-    for i in 0..t.len() {
-        if i % 65_536 == 0 {
-            ctx.check()?;
-            ctx.check_output(order.len(), keys.len() + aggs.len())?;
-        }
-        let key: Vec<Id> = kcols
-            .iter()
-            .map(|c| c.map_or(Id::UNDEF, |c| t.cols[c][i]))
-            .collect();
-        match groups.get_mut(&key) {
-            Some(g) => g.push(i as u32),
-            None => {
-                order.push(key.clone());
-                groups.insert(key, vec![i as u32]);
+    let mut gid: Vec<u32> = Vec::with_capacity(t.len());
+    let key_of = |c: &Option<usize>, i: usize| c.map_or(Id::UNDEF, |c| t.cols[c][i]);
+    if let [kc] = kcols.as_slice() {
+        let mut ids: FxHashMap<Id, u32> = FxHashMap::default();
+        for i in 0..t.len() {
+            if i % 65_536 == 0 {
+                ctx.check()?;
+                ctx.check_output(order.len(), keys.len() + aggs.len())?;
             }
+            let k = key_of(kc, i);
+            gid.push(*ids.entry(k).or_insert_with(|| {
+                order.push(vec![k]);
+                (order.len() - 1) as u32
+            }));
+        }
+    } else {
+        let mut ids: FxHashMap<Vec<Id>, u32> = FxHashMap::default();
+        let mut key = Vec::with_capacity(kcols.len());
+        for i in 0..t.len() {
+            if i % 65_536 == 0 {
+                ctx.check()?;
+                ctx.check_output(order.len(), keys.len() + aggs.len())?;
+            }
+            key.clear();
+            key.extend(kcols.iter().map(|c| key_of(c, i)));
+            let g = match ids.get(&key) {
+                Some(g) => *g,
+                None => {
+                    order.push(key.clone());
+                    ids.insert(key.clone(), (order.len() - 1) as u32);
+                    (order.len() - 1) as u32
+                }
+            };
+            gid.push(g);
         }
     }
     if t.is_empty() && keys.is_empty() {
         order.push(Vec::new());
-        groups.insert(Vec::new(), Vec::new());
+    }
+    // the rows of each group, in row order: group g's rows are rows[start[g]..start[g + 1]]
+    let mut start = vec![0u32; order.len() + 1];
+    for &g in &gid {
+        start[g as usize + 1] += 1;
+    }
+    for g in 0..order.len() {
+        start[g + 1] += start[g];
+    }
+    let mut rows = vec![0u32; gid.len()];
+    let mut next = start.clone();
+    for (i, &g) in gid.iter().enumerate() {
+        rows[next[g as usize] as usize] = i as u32;
+        next[g as usize] += 1;
     }
     let mut vars = keys.to_vec();
     vars.extend(aggs.iter().map(|(v, _)| *v));
@@ -2049,10 +2096,9 @@ fn group(
             _ => None,
         });
     }
-    for key in order {
+    for (g, mut row) in order.into_iter().enumerate() {
         ctx.check()?;
-        let rows = &groups[&key];
-        let mut row = key.clone();
+        let rows = &rows[start[g] as usize..start[g + 1] as usize];
         for ((_, agg), arg) in aggs.iter().zip(&args) {
             row.push(aggregate(ctx, t, &map, rows, agg, arg.as_ref()));
         }
