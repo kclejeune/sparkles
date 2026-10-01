@@ -134,6 +134,12 @@ type MetricsSnapshot = {
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
+    geo: null | {                          // the spatial index, or queries that ran spatial operators
+      enabled: boolean;
+      rows: { base: number; overlay: number; tail: number };
+      buildSeconds: number | null;
+      candidates: number; refined: number; matches: number;
+    };
   }[];
 };
 ```
@@ -209,7 +215,9 @@ observable instruments read at collection time, so nothing is counted twice and
 `sparkles.budget.exceeded`, `sparkles.rate_limited`, `sparkles.dataset.quads`,
 `sparkles.delta.quads`, `sparkles.wal.size`, `sparkles.disk.size`,
 `sparkles.block_cache.{size,capacity,hits,misses}`,
-`sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.ready`,
+`sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.geo.rows`
+(`dataset`, `part`), `sparkles.geo.build.duration`,
+`sparkles.geo.{candidates,refined,matches}`, `sparkles.ready`,
 `process.uptime` and `process.memory.usage`.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
@@ -1495,9 +1503,7 @@ geometry of a binary function is transformed into the first one's CRS.
 Operations over more input vertices than `serve --geo-op-vertices` (2,000,000) are type
 errors; constructed geometries count against the query's memory budget.
 
-**`spatial:` property functions** (Jena's syntax; constant arguments). *Being added:
-until they land, a `spatial:` call answers `501`, and spatial FILTERs are evaluated row by
-row without the index.*
+**`spatial:` property functions** (Jena's syntax; constant arguments):
 
 ```sparql
 SELECT ?f WHERE { ?f spatial:nearby (48.8566 2.3522 5 uom:kilometre 10) }   # lat lon radius [unit [limit]]

@@ -935,6 +935,57 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
             |j, f| per_dataset(j, f, |d| d["resultCache"]["misses"].as_f64()),
         ),
         (
+            "sparkles.geo.rows",
+            "{row}",
+            "Rows of the spatial index by part (base, overlay, tail).",
+            Kind::Gauge,
+            |j, f| {
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    let rows = &d["geo"]["rows"];
+                    if d["geo"]["enabled"] != true {
+                        continue;
+                    }
+                    for part in ["base", "overlay", "tail"] {
+                        f(
+                            rows[part].as_f64().unwrap_or(0.0),
+                            vec![
+                                KeyValue::new("dataset", str_of(&d["name"])),
+                                KeyValue::new("part", part),
+                            ],
+                        );
+                    }
+                }
+            },
+        ),
+        (
+            "sparkles.geo.build.duration",
+            "s",
+            "Duration of the last build of the spatial index's base.",
+            Kind::Gauge,
+            |j, f| per_dataset(j, f, |d| d["geo"]["buildSeconds"].as_f64()),
+        ),
+        (
+            "sparkles.geo.candidates",
+            "{row}",
+            "Index candidates of spatial operators (rows whose envelope matched).",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["geo"]["candidates"].as_f64()),
+        ),
+        (
+            "sparkles.geo.refined",
+            "{test}",
+            "Exact geometry tests run by spatial operators.",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["geo"]["refined"].as_f64()),
+        ),
+        (
+            "sparkles.geo.matches",
+            "{row}",
+            "Rows that passed the exact test of spatial operators.",
+            Kind::Counter,
+            |j, f| per_dataset(j, f, |d| d["geo"]["matches"].as_f64()),
+        ),
+        (
             "sparkles.ready",
             "1",
             "Whether the server is ready to serve requests (1) or not (0).",

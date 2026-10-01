@@ -1370,10 +1370,12 @@ pub fn metrics_json(st: &AppState) -> J {
             }),
         );
     }
+    let geo = crate::geo::series(st);
     let datasets: Vec<J> = gauges(st)
         .into_iter()
         .map(|(ds, g)| {
             json!({
+                "geo": crate::geo::series_json(geo.get(&ds)),
                 "name": ds,
                 "quads": g.quads,
                 "deltaInserts": g.delta_inserts,

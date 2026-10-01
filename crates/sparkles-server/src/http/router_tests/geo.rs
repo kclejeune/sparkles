@@ -282,6 +282,71 @@ async fn metrics_report_the_index() {
         m.contains("sparkles_geo_build_seconds{dataset=\"ds\"} "),
         "{m}"
     );
+    // a FILTER the index answers counts its work (with enough rows elsewhere for the
+    // planner to prefer the index to a scan)
+    let store = &s.state.get("ds").unwrap().store;
+    let far: String = (0..5000)
+        .map(|i| {
+            format!(
+                "<http://example.org/far{i}> <http://www.opengis.net/ont/geosparql#asWKT> \"POINT({} {})\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> .\n",
+                100 + i % 50,
+                -40 + i / 50
+            )
+        })
+        .collect();
+    store
+        .load(&[Source::from_bytes(
+            far.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    store.wait_geo();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?g { ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, \
+             \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral)) }";
+    let body: String = form_urlencoded::Serializer::new(String::new())
+        .append_pair("query", q)
+        .finish();
+    let r = send(
+        &s.app,
+        Request::post("/ds/sparql")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["results"]["bindings"].as_array().unwrap().len(), 2);
+    let value = |m: &str, name: &str| -> u64 {
+        let prefix = format!("{name}{{dataset=\"ds\"}} ");
+        m.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("{name}\n{m}"))
+            .parse()
+            .unwrap()
+    };
+    let m = send(&s.app, get("/$/metrics")).await.text();
+    let candidates = value(&m, "sparkles_geo_candidates_total");
+    assert!(candidates >= 2, "{m}");
+    assert!(value(&m, "sparkles_geo_refined_total") >= 2);
+    assert_eq!(value(&m, "sparkles_geo_matches_total"), 2);
+    // the same series in the JSON snapshot
+    let j = send(&s.app, get("/$/metrics?format=json")).await.json();
+    let ds = j["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "ds")
+        .unwrap();
+    assert_eq!(ds["geo"]["enabled"], true);
+    assert_eq!(ds["geo"]["rows"]["base"], 5007);
+    assert_eq!(ds["geo"]["candidates"], candidates);
+    assert_eq!(ds["geo"]["matches"], 2);
+    assert!(ds["geo"]["buildSeconds"].as_f64().is_some());
 }
 
 #[test]
