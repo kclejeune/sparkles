@@ -23,6 +23,7 @@ use tower::ServiceExt;
 
 #[derive(Default)]
 struct Opts {
+    #[cfg(feature = "auth")]
     auth: bool,
     read_only: bool,
     /// `repositories.json` entries
@@ -46,6 +47,7 @@ impl Srv {
     }
 }
 
+#[cfg(feature = "auth")]
 fn auth_config() -> String {
     let h = |pw: &str| crate::auth::hash_password_with(pw, 8, 1, 1).unwrap();
     format!(

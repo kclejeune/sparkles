@@ -3,10 +3,13 @@
 //!
 //! - every positive syntax test and every evaluation input formats, passes the safety
 //!   checks (graph, comments, idempotence) and is a fixpoint (`format(out) == out`),
-//!   under the default options and with every style key that acts on Turtle flipped;
+//!   under the default options, with every style key that acts on Turtle flipped, and
+//!   with the keys that reorder, re-lay or drop (`sort`, `turtle-layout`,
+//!   `prune-prefixes`) on top;
 //! - every negative syntax and negative evaluation test is a positioned syntax error;
 //! - every SHACL shapes or data graph formats the same way;
-//! - a comment after any token of those inputs keeps formatting safe (comment sweeps);
+//! - a comment after any token of those inputs keeps formatting safe (comment sweeps),
+//!   sorted in both layouts (and pruned) too;
 //! - nothing panics.
 //!
 //! Exceptions are listed with a reason in `tests/fmt-known-failures.txt` (the path under
@@ -23,7 +26,9 @@ use corpus::rdf::{self, RdfCase};
 use sparkles_fmt::check;
 use sparkles_fmt::lex::{LexMode, TokenKind, lex};
 use sparkles_fmt::turtle::Turtle;
-use sparkles_fmt::{Check, DirectiveStyle, FormatError, Language, Options, QuoteStyle};
+use sparkles_fmt::{
+    Check, DirectiveStyle, FormatError, Language, Options, QuoteStyle, TurtleLayout,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Every style key that acts on Turtle and TriG, away from its default.
@@ -41,6 +46,35 @@ fn flipped() -> Options {
         quote_style: QuoteStyle::Preserve,
         ..Options::default()
     }
+}
+
+/// `base` sorted, in the conventional layout or both.
+fn reordered(base: Options, sort: bool, layout: TurtleLayout) -> Options {
+    Options {
+        sort,
+        turtle_layout: layout,
+        ..base
+    }
+}
+
+/// The option sets every input formats under, after the defaults, with their names.
+fn option_sets() -> Vec<(&'static str, Options)> {
+    use TurtleLayout::*;
+    vec![
+        ("with every key flipped", flipped()),
+        ("sorted", reordered(Options::default(), true, Diff)),
+        (
+            "conventional",
+            reordered(Options::default(), false, Conventional),
+        ),
+        (
+            "with every key flipped, sorted, pruned and conventional",
+            Options {
+                prune_prefixes: true,
+                ..reordered(flipped(), true, Conventional)
+            },
+        ),
+    ]
 }
 
 /// Format `text`, then its output: the output must be a fixpoint. Whether it changed.
@@ -76,14 +110,16 @@ fn run(text: Result<String, std::io::Error>, trig: bool) -> Outcome {
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let changed = format_twice(&text, trig, &Options::default())?;
-        format_twice(&text, trig, &flipped()).map_err(|e| match e {
-            FormatError::Syntax { .. } => e,
-            e => FormatError::Unsupported {
-                message: format!("with every key flipped: {e}"),
-                line: 0,
-                column: 0,
-            },
-        })?;
+        for (name, opts) in option_sets() {
+            format_twice(&text, trig, &opts).map_err(|e| match e {
+                FormatError::Syntax { .. } => e,
+                e => FormatError::Unsupported {
+                    message: format!("{name}: {e}"),
+                    line: 0,
+                    column: 0,
+                },
+            })?;
+        }
         Ok::<bool, FormatError>(changed)
     }));
     match result {
@@ -237,18 +273,31 @@ fn sweep(name: &str, text: &str, trig: bool, step: usize) -> Result<usize, Strin
         .filter(|t| !t.kind.is_trivia() && t.kind != TokenKind::Eof)
         .map(|t| t.end())
         .collect();
+    let sets = [
+        Options::default(),
+        reordered(Options::default(), true, TurtleLayout::Diff),
+        Options {
+            prune_prefixes: true,
+            ..reordered(Options::default(), true, TurtleLayout::Conventional)
+        },
+    ];
     let mut formatted = 0;
     for &end in ends.iter().step_by(step) {
         for comment in [" # c\n", "\n# c\n"] {
             let mut s = text.to_string();
             s.insert_str(end, comment);
-            match catch_unwind(AssertUnwindSafe(|| {
-                format_twice(&s, trig, &Options::default())
-            })) {
-                Ok(Ok(_)) => formatted += 1,
-                Ok(Err(FormatError::Syntax { .. })) => {}
-                Ok(Err(e)) => return Err(format!("{name}: {comment:?} at byte {end}: {e}")),
-                Err(_) => return Err(format!("{name}: {comment:?} at byte {end}: panicked")),
+            for opts in &sets {
+                match catch_unwind(AssertUnwindSafe(|| format_twice(&s, trig, opts))) {
+                    Ok(Ok(_)) => formatted += 1,
+                    Ok(Err(FormatError::Syntax { .. })) => {}
+                    Ok(Err(e)) => {
+                        return Err(format!(
+                            "{name}: {comment:?} at byte {end} (sort {}, {:?}): {e}",
+                            opts.sort, opts.turtle_layout
+                        ));
+                    }
+                    Err(_) => return Err(format!("{name}: {comment:?} at byte {end}: panicked")),
+                }
             }
         }
     }
@@ -257,7 +306,9 @@ fn sweep(name: &str, text: &str, trig: bool, step: usize) -> Result<usize, Strin
 
 /// Comment sweeps: a trailing comment, and a comment on a line of its own, after every
 /// significant token of the golden inputs and the W3C inputs (every few tokens of the
-/// SHACL files): no comment is lost or moves twice.
+/// SHACL files), under the defaults and sorted in both layouts (pruned in the
+/// conventional one): no comment
+/// is lost or moves twice.
 #[test]
 fn comment_sweeps() {
     let mut inputs: Vec<(String, String, bool, usize)> = Vec::new();

@@ -403,3 +403,121 @@ async fn diagnostics_endpoint() {
     .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+/// Instances of `geo:Geometry` and the features' default geometries, with inferences.
+async fn geometries(app: &Router, ds: &str) -> Vec<String> {
+    let r = send(
+        app,
+        Request::post(format!("/{ds}/sparql"))
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .body(Body::from(
+                "PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+                 SELECT ?s ?k { { ?s a geo:Geometry BIND(\"geometry\" AS ?k) }
+                   UNION { ?s geo:hasDefaultGeometry ?g BIND(\"default\" AS ?k) } }
+                 ORDER BY ?k ?s",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["results"]["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            format!(
+                "{} {}",
+                b["k"]["value"].as_str().unwrap(),
+                b["s"]["value"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn geosparql_vocabulary_and_default_geometries() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(
+        &st,
+        "t",
+        "@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+         @prefix sf: <http://www.opengis.net/ont/sf#> .
+         ex:gA a sf:Polygon .
+         ex:p1 geo:hasGeometry ex:g1 .
+         ex:p2 geo:hasGeometry ex:g2a , ex:g2b .",
+    );
+    let app = router(st.clone());
+    // an unknown vocabulary is refused, in JSON and in a form
+    let r = post_json(&app, "/$/reason/t", r#"{"vocabularies":["dublin-core"]}"#).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.text().contains("unknown vocabulary"), "{}", r.text());
+    let r = send(
+        &app,
+        Request::post("/$/reason/t")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("profile=rdfs&vocabulary=nope"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let r = post_json(
+        &app,
+        "/$/reason/t",
+        r#"{"profile":"rdfs","vocabularies":["geosparql"],"geoDefaultGeometry":true}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["vocabularies"], serde_json::json!(["geosparql"]));
+    assert_eq!(s["geoDefaultGeometry"], true);
+    let inferred = s["inferred"].as_u64().unwrap();
+    let want = [
+        "default http://ex.org/p1",
+        "geometry http://ex.org/g1",
+        "geometry http://ex.org/g2a",
+        "geometry http://ex.org/g2b",
+        "geometry http://ex.org/gA",
+    ];
+    assert_eq!(geometries(&app, "t").await, want);
+    // the vocabulary's axioms are inferences, not data of the default graph
+    let r = send(
+        &app,
+        Request::get(
+            "/t/sparql?reasoning=false&query=ASK%7B%3Fs%20%3Chttp%3A%2F%2Fwww.w3.org%2F2000%2F01%2Frdf-schema%23subClassOf%3E%20%3Fo%7D",
+        )
+        .header(header::ACCEPT, "application/sparql-results+json")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(r.json()["boolean"], false);
+
+    // a re-run repeats the extras
+    update(
+        &app,
+        "t",
+        "INSERT DATA { ex:p3 <http://www.opengis.net/ont/geosparql#hasGeometry> ex:g3 }",
+    )
+    .await;
+    let r = post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["vocabularies"], serde_json::json!(["geosparql"]));
+    assert_eq!(s["geoDefaultGeometry"], true);
+    assert!(s["inferred"].as_u64().unwrap() > inferred);
+    let g = geometries(&app, "t").await;
+    assert!(g.contains(&"default http://ex.org/p3".to_string()), "{g:?}");
+
+    // without the extras the vocabulary and the default geometries go away
+    let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert!(s.get("vocabularies").is_none() && s.get("geoDefaultGeometry").is_none());
+    assert_eq!(geometries(&app, "t").await, Vec::<String>::new());
+}

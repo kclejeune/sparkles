@@ -1,0 +1,21 @@
+PREFIX ex: <http://example.org/>
+PREFIX sh: <http://www.w3.org/ns/shacl#>
+
+ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path ex:name ; sh:minCount 1 ] , [ sh:path ex:email ] ;
+  sh:property [ sh:path ex:status ; sh:in ( "active" "inactive" ) ] .
+
+ex:alice ex:knows ex:bob ~ ex:r {| ex:since 2020 ; ex:source ex:hr |} ;
+  ex:name "Alice" . # a trailing comment
+
+ex:bob
+  # a comment before the first entry
+  ex:name "Bob" ;
+  ex:age 42 ;
+  # a comment before the dot
+.
+
+ex:carol ex:name "Carol" ; # the last entry's comment
+.
+
+ex:dave ex:knows ex:alice, ex:bob, ex:carol, ex:erin, ex:frank, ex:grace, ex:heidi, ex:ivan .

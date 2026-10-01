@@ -134,6 +134,12 @@ description = "Clippy (warnings are errors) + svelte-check"
 depends = ["ui:check", "ui:build"]
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
+[tasks."lint:features"]
+description = "Clippy (warnings are errors) over feature combinations: the server with no optional feature, each default feature alone, mcp with shacl and with shex; the library crates with their features off"
+# ui:build first, as for lint: the server embeds ui/build
+depends = ["ui:build"]
+run = "scripts/lint-features.sh"
+
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
 depends = ["ui:check", "ui:build"]
@@ -158,7 +164,7 @@ run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks.ci]
 description = "Everything CI should run: formatting, lints, Rust and UI tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "test", "ui:test", "licenses:check"]
+depends = ["fmt:check", "lint", "lint:features", "test", "ui:test", "licenses:check"]
 
 # -------------------------------------------------------------------------- build / run ----
 

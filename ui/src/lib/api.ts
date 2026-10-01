@@ -1321,7 +1321,7 @@ export type GeoConfig = {
   graphs?: { include?: 'all' | string[]; exclude?: string[] };
   /** Index W3C Basic Geo latitude/longitude pairs as points; default false. */
   wgs84?: boolean;
-  /** Rewrite topological properties between features; default false. */
+  /** Default false: the topological geo: properties also match derived triples (query rewrite). */
   queryRewrite?: boolean;
   /** Default "geodesic". */
   distance?: 'geodesic' | 'haversine';

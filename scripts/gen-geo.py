@@ -15,11 +15,14 @@ Seeded, so equal arguments give equal output:
   levels lie on one lattice, so neighbours share their borders exactly (touches) and every
   cell is within its parent (within);
 * every geometry is linked from a feature with `geo:hasDefaultGeometry` and typed with its
-  Simple Features class; half of the features also have a label and a type, and 10% of the
-  point features carry W3C Basic Geo `lat`/`long` as well.
+  Simple Features class; half of the features also have a label and a type (every
+  administrative feature has both), and 10% of the point features carry W3C Basic Geo
+  `lat`/`long` as well.
 
 `--queries DIR` also writes the benchmark queries over this data (Q1-Q4, Q8, Q9; Q10 is
-Q1 without the index) with their constants taken from the generated geometries.
+Q1 without the index; with the administrative levels, Q5 points per state and Q6 the
+touching counties, spatial joins; Q7 the 10 points nearest to a constant) with their
+constants taken from the generated geometries.
 """
 import argparse
 import math
@@ -72,8 +75,9 @@ def wrap_lon(x):
 feature_no = 0
 
 
-def feature(geom_wkt, sf_class, kind, label_prefix, latlon=None):
-    """A feature, its geometry and the geometry's serialization."""
+def feature(geom_wkt, sf_class, kind, label_prefix, latlon=None, typed=False):
+    """A feature, its geometry and the geometry's serialization (`typed`: always with
+    its label and type)."""
     global feature_no
     i = feature_no
     feature_no += 1
@@ -81,7 +85,7 @@ def feature(geom_wkt, sf_class, kind, label_prefix, latlon=None):
     w(f"{f} <{GEO}hasDefaultGeometry> {g} .\n")
     w(f"{g} <{RDF}type> <{SF}{sf_class}> .\n")
     w(f"{g} <{GEO}asWKT> {wkt_lit(geom_wkt)} .\n")
-    if rnd.random() < 0.5:
+    if typed or rnd.random() < 0.5:
         w(f'{f} <{RDFS}label> "{label_prefix} {i}" .\n')
         w(f"{f} <{RDF}type> <{EX}{kind}> .\n")
     if latlon is not None:
@@ -198,7 +202,7 @@ for level, kx, ky in LEVELS:
     cells = nxt
     admin[level] = []
     for box in cells:
-        f = feature("POLYGON(" + ring(cell_ring(*box)) + ")", "Polygon", level, level)
+        f = feature("POLYGON(" + ring(cell_ring(*box)) + ")", "Polygon", level, level, typed=True)
         admin[level].append((f, box))
 
 # ------------------------------------------------------------------------ queries
@@ -229,7 +233,22 @@ if args.queries:
         "geo-q4-withinbox": f"SELECT (COUNT(*) AS ?n) WHERE {{ ?f spatial:withinBox ({num(lat0 - 9)} {num(lon0 - 18)} {num(lat0 + 9)} {num(lon0 + 18)}) }}",
         "geo-q8-area": "SELECT (SUM(geof:metricArea(?w)) AS ?area) WHERE { ?g a sf:Polygon ; geo:asWKT ?w }",
         "geo-q9-star": f"SELECT ?f ?l ?t WHERE {{ ?f geo:hasDefaultGeometry ?g ; rdfs:label ?l ; a ?t . ?g a sf:Point ; geo:asWKT ?w {within} }}",
+        # the 10 nearest points (a k-nearest-neighbour search under the top-k)
+        "geo-q7-knn": f"SELECT ?g ?d WHERE {{ ?g a sf:Point ; geo:asWKT ?w BIND(geof:metricDistance(?w, {wkt_lit(point)}) AS ?d) FILTER(BOUND(?d)) }} ORDER BY ?d LIMIT 10",
     }
+    # spatial joins over the administrative hierarchy
+    if "State" in admin:
+        qs["geo-q5-points-per-state"] = (
+            "SELECT ?s (COUNT(?g) AS ?n) WHERE { ?s a ex:State ; geo:hasDefaultGeometry ?sg . "
+            "?sg geo:asWKT ?sw . ?g a sf:Point ; geo:asWKT ?w FILTER(geof:sfContains(?sw, ?w)) } "
+            "GROUP BY ?s"
+        )
+    if "County" in admin:
+        qs["geo-q6-touching-counties"] = (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?a a ex:County ; geo:hasDefaultGeometry ?ga . "
+            "?ga geo:asWKT ?wa . ?b a ex:County ; geo:hasDefaultGeometry ?gb . "
+            "?gb geo:asWKT ?wb FILTER(geof:sfTouches(?wa, ?wb)) }"
+        )
     for name, q in qs.items():
         with open(os.path.join(args.queries, name + ".rq"), "w") as fh:
             fh.write(P + q + "\n")
