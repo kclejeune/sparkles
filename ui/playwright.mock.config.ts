@@ -19,7 +19,17 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        // the full browser in headless mode (not the headless shell): it has WebGL 2,
+        // which the maps need
+        channel: 'chromium',
+      },
+    },
+  ],
   webServer: [
     {
       command: 'node mock/server.mjs',

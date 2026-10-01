@@ -11,11 +11,11 @@
 //
 // The build fails when a shipped package has no license that PERMISSIVE allows.
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 
-/** @typedef {{ dir: string, name: string, version: string, license: string }} Package */
+/** @typedef {{ dir: string, name: string, version: string, license: string, author: string }} Package */
 
 /**
  * SPDX identifiers a shipped package may be used under. All of them only ask for the
@@ -95,6 +95,47 @@ export function permissive(expr) {
 }
 
 /**
+ * Packages whose published files already hold the code of their dependencies (MapLibre's
+ * dist bundles them, without imports the bundle would show): those dependencies ship too.
+ */
+const PREBUNDLED = new Set(['maplibre-gl']);
+
+/**
+ * The directories of a package's dependencies and theirs in turn (installed next to it,
+ * as pnpm and npm lay them out), real paths; type declarations, which ship no code, left
+ * out.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function bundledDependencies(dir) {
+  /** @type {Set<string>} */
+  const seen = new Set();
+  const todo = [realpathSync(dir)];
+  while (todo.length) {
+    const d = /** @type {string} */ (todo.pop());
+    const pkg = JSON.parse(readFileSync(join(d, 'package.json'), 'utf8'));
+    for (const name of Object.keys(pkg.dependencies ?? {})) {
+      if (name.startsWith('@types/')) continue;
+      // next to the package in its node_modules, or in one further up
+      let found = null;
+      for (let up = d; !found;) {
+        const m = /^(.*\/node_modules)\//.exec(up.replaceAll('\\', '/'));
+        if (!m) break;
+        const cand = join(m[1], name);
+        if (existsSync(join(cand, 'package.json'))) found = realpathSync(cand);
+        up = m[1];
+      }
+      if (!found) throw new Error(`licenses: ${pkg.name} depends on ${name}, not installed`);
+      if (!seen.has(found)) {
+        seen.add(found);
+        todo.push(found);
+      }
+    }
+  }
+  return [...seen].sort();
+}
+
+/**
  * The package directory of a file under node_modules (the last `node_modules/` of its
  * path, then the scope and the name), or null.
  * @param {string} file
@@ -117,7 +158,11 @@ function readPackage(dir) {
       : Array.isArray(pkg.licenses)
         ? pkg.licenses.map((/** @type {{ type: string }} */ l) => l.type).join(' OR ')
         : '';
-  return { dir, name: pkg.name, version: pkg.version, license };
+  // `author`: a string ("Name <mail> (url)") or { name }
+  const author = (typeof pkg.author === 'string' ? pkg.author : (pkg.author?.name ?? ''))
+    .replace(/\s*[<(].*$/, '')
+    .trim();
+  return { dir, name: pkg.name, version: pkg.version, license, author };
 }
 
 /**
@@ -136,6 +181,43 @@ function licenseFiles(dir) {
         .split(BUNDLED)[0]
         .replace(/^\n+|\s+$/g, ''),
     ]);
+}
+
+/** The MIT License, for packages that declare it without a license file. */
+const MIT = `MIT License
+
+Copyright (c) {holders}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`;
+
+/**
+ * The license texts of a package: its files, or, without any, the standard text of its
+ * license (MIT only), as `[file, text]` pairs.
+ * @param {Package} p
+ * @returns {[string, string][]}
+ */
+function licenseTexts(p) {
+  const files = licenseFiles(p.dir);
+  if (files.length > 0) return files;
+  if (/\bMIT\b/.test(p.license))
+    return [['MIT (standard text)', MIT.replace('{holders}', p.author || `the ${p.name} authors`)]];
+  throw new Error(`${p.name} ${p.version}: no license file`);
 }
 
 /**
@@ -162,8 +244,7 @@ export function render(pkgs) {
   /** @type {[Package, string[]][]} */
   const rows = [];
   for (const p of pkgs) {
-    const files = licenseFiles(p.dir);
-    if (files.length === 0) throw new Error(`${p.name} ${p.version}: no license file`);
+    const files = licenseTexts(p);
     rows.push([p, files.map(([f]) => f)]);
     for (const [file, text] of files) {
       const k = key(text);
@@ -241,6 +322,9 @@ export function licenses() {
           }
         }
       }
+      for (const dir of [...dirs])
+        if (PREBUNDLED.has(readPackage(dir).name))
+          for (const dep of bundledDependencies(dir)) dirs.add(dep);
       const pkgs = [...dirs]
         .map(readPackage)
         .sort((a, b) => cmp(a.name, b.name) || cmp(a.version, b.version));

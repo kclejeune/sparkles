@@ -11,6 +11,7 @@ import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
+import { geoQuery, handleGeo } from './geo.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -1053,6 +1054,8 @@ async function handleQuery(req, res, ds, p) {
   const query = p.get('query');
   if (!query) return fail(res, 400, 'Missing query parameter');
   if (handleSearchQuery(req, res, ds, p, query)) return;
+  const near = geoQuery(ds, query, Number(p.get('send') ?? Infinity), headCommit(ds).seq);
+  if (near) return send(res, 200, near, 'application/x-sparkles+json', commitHeaders(ds));
   const accept = String(req.headers.accept ?? '');
   const t0 = performance.now();
   let result;
@@ -1707,6 +1710,20 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end();
     }
+    // the spatial index, the map box query and geometry conversion (mock/geo.mjs)
+    if (
+      await handleGeo(req, res, url, seg, {
+        datasets,
+        tasks,
+        nextTaskId: () => String(taskSeq++),
+        makeDataset,
+        addCommit,
+        headCommit,
+        send,
+        readBody,
+      })
+    )
+      return;
     // backup repositories, backups, policies and task cancellation (mock/backups.mjs)
     if (
       seg[0] === '$' &&

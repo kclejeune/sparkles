@@ -12,6 +12,7 @@
   import { formatFailure } from '$lib/fmt-view';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
+  import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
   import { load, save } from '$lib/storage';
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
@@ -20,6 +21,8 @@
   import HistoryPanel from '$components/HistoryPanel.svelte';
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
+  import ShexPanel from '$components/ShexPanel.svelte';
+  import SpatialIndexPanel from '$components/SpatialIndexPanel.svelte';
   import TaskList from '$components/TaskList.svelte';
   import TermView from '$components/TermView.svelte';
   import TurtleEditor from '$components/TurtleEditor.svelte';
@@ -174,6 +177,18 @@
     } finally {
       clearingCache = false;
     }
+  }
+
+  // the Validate panel's language, per dataset (ShEx only where the server offers it)
+  let validateLang = $state<ValidateLang>('shacl');
+  let shexConforms = $state<boolean | null>(null);
+  $effect(() => {
+    validateLang = readLang(load<unknown>(validateLangKey(name), null));
+  });
+  const lang = $derived<ValidateLang>(info?.endpoints?.shex ? validateLang : 'shacl');
+  function setLang(l: ValidateLang) {
+    validateLang = l;
+    save(validateLangKey(name), l);
   }
 
   // SHACL validation
@@ -610,16 +625,45 @@ ex:PersonShape a sh:NodeShape ;
         <!-- SHACL validation -->
         <section class="panel">
           <div class="panel-head">
-            <h2>Validate (SHACL)</h2>
+            <h2>Validate</h2>
+            {#if info?.endpoints?.shex}
+              <div class="tabs" role="tablist" aria-label="Validation language">
+                {#each [['shacl', 'SHACL'], ['shex', 'ShEx']] as const as [l, title] (l)}
+                  <button
+                    class="tab"
+                    role="tab"
+                    aria-selected={lang === l}
+                    onclick={() => setLang(l)}>{title}</button
+                  >
+                {/each}
+              </div>
+            {/if}
             <span class="spacer"></span>
-            {#if report}
+            {#if lang === 'shex'}
+              {#if shexConforms != null}
+                <span class="badge {shexConforms ? 'ok' : 'danger'}">
+                  <Icon name={shexConforms ? 'check' : 'alert'} size={12} />
+                  {shexConforms ? 'Conforms' : 'Does not conform'}
+                </span>
+              {/if}
+            {:else if report}
               <span class="badge {report.conforms ? 'ok' : 'danger'}">
                 <Icon name={report.conforms ? 'check' : 'alert'} size={12} />
                 {report.conforms ? 'Conforms' : 'Does not conform'}
               </span>
             {/if}
           </div>
-          <div class="panel-body shacl">
+          {#if lang === 'shex'}
+            <ShexPanel
+              {name}
+              {info}
+              {prefixes}
+              {namedGraphs}
+              {explore}
+              bind:conforms={shexConforms}
+            />
+          {/if}
+          <div class="panel-body shacl" hidden={lang === 'shex'}>
             <TurtleEditor
               bind:this={shapesEditor}
               value={shapes}
@@ -698,7 +742,7 @@ ex:PersonShape a sh:NodeShape ;
               </p>
             {/if}
           </div>
-          {#if report && report.results.length}
+          {#if lang === 'shacl' && report && report.results.length}
             <div class="shacl-results">
               <table class="data">
                 <thead>
@@ -963,6 +1007,18 @@ ex:PersonShape a sh:NodeShape ;
           onchanged={refreshAll}
         />
 
+        <!-- spatial index -->
+        <SpatialIndexPanel
+          {name}
+          {prefixes}
+          readOnly={readOnly || !auth.can(name, 'admin')}
+          busy={acting != null}
+          refreshKey={refreshKick}
+          onstart={startTask}
+          onstarted={() => taskKick++}
+          onchanged={refreshAll}
+        />
+
         <!-- backups in repositories -->
         <BackupsPanel
           {name}
@@ -1012,6 +1068,8 @@ ex:PersonShape a sh:NodeShape ;
                   cloned = t.target;
                 } else if (t.kind === 'text-rebuild')
                   toasts.push('success', 'Full-text index built', t.message);
+                else if (t.kind === 'geo-index')
+                  toasts.push('success', 'Spatial index built', t.message);
                 else toasts.push('success', `${t.kind} finished`, t.message);
                 refreshAll();
               }}
@@ -1192,6 +1250,9 @@ ex:PersonShape a sh:NodeShape ;
   .shacl {
     display: grid;
     gap: 10px;
+  }
+  .shacl[hidden] {
+    display: none;
   }
   .shacl-opts {
     flex-wrap: wrap;

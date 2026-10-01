@@ -406,8 +406,9 @@ enum Cmd {
         /// says
         #[arg(long)]
         no_geo_rewrite: bool,
-        /// A MapLibre style JSON for the UI's maps (its origins are allowed by the
-        /// UI's Content Security Policy); without it the UI draws its bundled basemap
+        /// A MapLibre style JSON for the UI's maps (an http(s) URL whose origin the UI's
+        /// Content Security Policy allows; the style's tiles, glyphs and sprites must come
+        /// from that origin too); without it the UI draws its bundled basemap
         #[arg(long, value_name = "URL")]
         map_style_url: Option<String>,
         /// Largest number of classes, and of predicates, a schema report may have
@@ -1363,8 +1364,8 @@ fn run() -> Result<()> {
             opts.geo_query_rewrite = !no_geo_rewrite;
             // a read-only server writes no index files (it still reads good ones)
             opts.geo_files = !read_only;
-            if map_style_url.is_some() {
-                bail!("--map-style-url: not supported yet");
+            if let Some(url) = &map_style_url {
+                ui::map_style_origin(url)?;
             }
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;

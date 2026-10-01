@@ -34,7 +34,7 @@ test('Shift+Alt+F formats the shapes, and one undo restores them', async ({ page
 test('the Format button formats; a syntax error highlights its line', async ({ page }) => {
   await page.goto('/ui/datasets/foaf');
   const panel = page.locator('section.panel').filter({
-    has: page.getByRole('heading', { name: 'Validate (SHACL)' }),
+    has: page.getByRole('heading', { name: 'Validate', exact: true }),
   });
   const format = panel.getByRole('button', { name: 'Format', exact: true });
   await expect(format).toHaveAttribute('title', 'Format (Shift+Alt+F)');

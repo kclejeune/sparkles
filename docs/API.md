@@ -1827,6 +1827,22 @@ inferred graph, so a re-run recomputes them and clearing the inferences removes 
 The reasoning status records both (`vocabularies`, `geoDefaultGeometry`) and re-runs,
 manual or automatic, repeat them.
 
+### Maps in the web UI
+
+The UI draws geometries with MapLibre GL JS (loaded when a map first opens): the Map tab
+of query results (literals in CRS84, EPSG:4326 and Web Mercator are read in the browser,
+others go through `POST /$/geo/convert`), the explorer's map card with Nearby
+(`spatial:nearbyGeom`), and the map of the Spatial index panel (`GET /{ds}/geo` for the
+box in view). The basemap is the UI's own Natural Earth 1:110m land, coastlines and
+boundaries (public domain), so the maps work offline and contact nothing else.
+
+`serve --map-style-url URL` (an absolute `http(s)` URL of a MapLibre style JSON) replaces
+it. `GET /$/server` reports it as `mapStyleUrl` (`null` without it), and the pages'
+Content Security Policy adds the URL's origin to `connect-src` and `img-src` (and the map
+worker's to `connect-src`): the style's tiles, glyphs and sprites must come from that same
+origin. Scripts stay the UI's own. Attribution, when the style needs it, comes from the
+style.
+
 ## Reasoning status and diagnostics
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally.

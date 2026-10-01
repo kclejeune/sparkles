@@ -12,6 +12,7 @@
   import { displayIri, isVectorLiteral, literalText, RDF_TYPE, termKey } from '$lib/rdf';
   import { Generation, LatestRun } from '$lib/supersede';
   import ClassTree from '$components/ClassTree.svelte';
+  import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
   import SimilarPanel from '$components/SimilarPanel.svelte';
@@ -798,6 +799,7 @@
               </table>
 
               {#key n.iri}
+                <GeoMapCard {ds} iri={n.iri} props={detail.props} {prefixes} />
                 <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
               {/key}
 
