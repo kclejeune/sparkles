@@ -1,0 +1,7 @@
+PREFIX ex: <http://example.org/>
+PREFIX dct: <http://purl.org/dc/terms/>
+
+ex:report dct:title "Quarterly report"@en, "Rapport trimestriel"@fr, "Quartalsbericht"@de, "Informe trimestral"@es ;
+  ex:authors ( ex:alice ex:bob ) ; ex:steps ( [ ex:label "collect" ] [ ex:label "clean" ; ex:tool ex:openrefine ] [ ex:label "publish" ] ) ;
+  dct:description """Line one
+  line two""" .

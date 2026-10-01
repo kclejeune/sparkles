@@ -1,5 +1,5 @@
-//! The kinds of syntax tree nodes. One enum for every language: the SPARQL section first;
-//! Turtle and the other languages append theirs. New kinds are only ever appended.
+//! The kinds of syntax tree nodes. One enum for every language: the SPARQL section first,
+//! then Turtle/TriG and JSON-LD. New kinds are only ever appended.
 
 /// The kind of a [`crate::tree::Tree`] node. Its children are nodes and significant
 /// tokens; trivia is found by token adjacency.
@@ -146,4 +146,25 @@ pub enum NodeKind {
     // ---- shared
     /// a span kept exactly as written (also what unfinished parsers produce)
     Opaque,
+
+    // ---- Turtle and TriG (directives, statements, entries, objects and terms use the
+    // SPARQL kinds above)
+    /// the root of a Turtle document; its range is the whole input, trivia included
+    TurtleDoc,
+    /// the root of a TriG document; its range is the whole input, trivia included
+    TrigDoc,
+    /// TriG's `GRAPH g { … }`, `g { … }` or `{ … }`
+    GraphBlock,
+
+    // ---- JSON-LD
+    /// the root of a JSON document; its range is the whole input, trivia included
+    JsonDocument,
+    /// `{ … }`
+    JsonObject,
+    /// a key, its `:`, its value, and the `,` after it
+    JsonMember,
+    /// `[ … ]` with its values and their `,`
+    JsonArray,
+    /// a string, number, `true`, `false` or `null`
+    JsonScalar,
 }

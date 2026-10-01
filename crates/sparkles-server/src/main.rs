@@ -16,6 +16,8 @@ mod exposure;
 mod fmt;
 mod geo;
 mod http;
+#[cfg(feature = "fmt")]
+mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod obs;
@@ -582,6 +584,10 @@ enum Cmd {
     /// Format SPARQL queries and updates: print, check (--check, -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
     Fmt(fmt::FmtArgs),
+    /// A language server for editors (stdio): formatting and syntax diagnostics for the
+    /// languages `sparkles fmt` formats
+    #[cfg(feature = "fmt")]
+    Lsp(lsp::LspArgs),
     /// Build, rebuild or inspect a database's full-text index
     TextIndex {
         #[arg(long)]
@@ -1602,6 +1608,8 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
+        #[cfg(feature = "fmt")]
+        Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Load {
             loc,

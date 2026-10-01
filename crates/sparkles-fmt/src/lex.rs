@@ -100,6 +100,8 @@ pub enum TokenKind {
     LBracePipe,
     /// `|}`
     PipeRBrace,
+    /// `:` between a JSON key and its value (JSON only)
+    Colon,
     /// one character no terminal starts with
     Unknown,
     /// the end of the input (empty)
@@ -162,15 +164,20 @@ impl Token {
 pub enum LexMode {
     /// variables, operators, keywords
     Sparql,
-    /// `@prefix`, `@base`, `@version` (not implemented yet)
+    /// Turtle, TriG, N-Triples and N-Quads. Their terminals are a subset of SPARQL's, so
+    /// the tokens are the same: `@prefix`, `@base` and `@version` match `LANG_DIR` and are
+    /// [`TokenKind::LangDir`] tokens the Turtle parser takes for directives (Turtle §6.5
+    /// leaves `"x"@prefix` undefined; oxttl rejects what is not RDF).
     Turtle,
+    /// JSON ([`crate::jsonld::lex`])
+    Json,
 }
 
 /// Tokenize `src` (at most `u32::MAX` bytes). A leading BOM belongs to no token; the
 /// last token is an empty [`TokenKind::Eof`].
 pub fn lex(src: &str, mode: LexMode) -> Vec<Token> {
-    if mode == LexMode::Turtle {
-        todo!("Turtle lexing")
+    if mode == LexMode::Json {
+        return crate::jsonld::lex::lex(src);
     }
     let mut out = Vec::with_capacity(src.len() / 4 + 1);
     let mut pos = if src.starts_with('\u{feff}') { 3 } else { 0 };

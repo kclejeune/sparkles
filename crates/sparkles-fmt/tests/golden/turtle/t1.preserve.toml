@@ -1,0 +1,5 @@
+directive-style = "turtle"
+prefix-groups = [["rdf", "rdfs", "xsd", "owl"]]
+type-shorthand = false
+compact-iris = false
+quote-style = "preserve"

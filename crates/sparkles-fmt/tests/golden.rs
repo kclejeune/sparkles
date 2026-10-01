@@ -273,6 +273,74 @@ fn sparql_outputs_mean_what_their_inputs_mean() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Every expected output of the RDF syntaxes, pending ones included, parses to a graph or
+/// dataset isomorphic to its input's and keeps its comments, and every expected JSON-LD
+/// output gives its input's dataset: like the SPARQL ones, the hand-written outputs pass
+/// the safety checks before any printer produces them.
+#[test]
+fn rdf_outputs_mean_what_their_inputs_mean() {
+    use sparkles_fmt::check::{comments, graph};
+    use sparkles_fmt::lex::LexMode;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    let jsonld = |text: &str| -> Result<Vec<oxrdf::Quad>, String> {
+        oxjsonld::JsonLdParser::new()
+            .for_slice(text)
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    };
+    for lang in [
+        Language::Turtle,
+        Language::TriG,
+        Language::NTriples,
+        Language::NQuads,
+        Language::JsonLd,
+    ] {
+        let dir = root.join(lang.name());
+        if !dir.exists() {
+            continue;
+        }
+        for (input, name, ext) in inputs(&dir) {
+            let text = std::fs::read_to_string(&input).unwrap();
+            let reference = match lang {
+                Language::JsonLd => None,
+                _ => Some(
+                    graph::rdf_reference(&text, lang)
+                        .unwrap_or_else(|e| panic!("{}/{name}: the input: {e}", lang.name())),
+                ),
+            };
+            for variant in variants(&dir, &name, &ext) {
+                let out_path = match variant.as_str() {
+                    "" => dir.join(format!("{name}.out.{ext}")),
+                    v => dir.join(format!("{name}.{v}.out.{ext}")),
+                };
+                let Ok(out) = std::fs::read_to_string(&out_path) else {
+                    continue;
+                };
+                checked += 1;
+                let result = match &reference {
+                    Some(r) => graph::rdf_equivalent(r, &out)
+                        .and_then(|()| comments::same(&text, &out, LexMode::Turtle))
+                        .map_err(|e| e.to_string()),
+                    None => jsonld(&text).and_then(|a| {
+                        let b = jsonld(&out)?;
+                        match graph::isomorphic(&a, &b) {
+                            true => Ok(()),
+                            false => Err("graph differs".to_string()),
+                        }
+                    }),
+                };
+                if let Err(e) = result {
+                    failures.push(format!("{}: {e}", out_path.display()));
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn toml_options_use_the_config_keys() {
     let o = options_from_toml(

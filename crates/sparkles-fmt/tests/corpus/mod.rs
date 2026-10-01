@@ -1,12 +1,14 @@
 //! The test corpora shared by the W3C, property and matrix suites: the W3C SPARQL test
-//! files classified by their manifests, the golden inputs, and the list of documented
-//! formatter failures (`tests/fmt-known-failures.txt`).
+//! files classified by their manifests, the RDF ones ([`rdf`]), the golden inputs, and
+//! the list of documented formatter failures (`tests/fmt-known-failures.txt`).
 //!
-//! The manifests are Turtle. This crate has no RDF parser among its dependencies, so a
-//! small reader over the crate's own lexer (SPARQL mode, whose tokens cover what the
-//! manifests use) collects their triples.
+//! The manifests are Turtle. A small reader over the crate's own lexer (whose tokens cover
+//! what the manifests use) collects their triples, so classifying the suites depends on
+//! neither a reference parser nor the formatter.
 
 #![allow(dead_code)]
+
+pub mod rdf;
 
 use sparkles_fmt::lex::{LexMode, Token, TokenKind, lex};
 use std::collections::{BTreeMap, BTreeSet, HashMap};

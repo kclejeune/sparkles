@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+ex:s ex:p 01 .
+ex:s ex:p "1"^^xsd:decimal .
+ex:s ex:p "042"@EN .

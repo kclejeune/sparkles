@@ -1,24 +1,38 @@
 [package]
 name = "sparkles-fmt"
-description = "Opinionated, comment-preserving formatter for SPARQL (and later the RDF syntaxes)"
+description = "Opinionated, comment-preserving formatter for SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 # No server dependency, and no std-only dependency where it is cheap to avoid one, so the
-# library can later build for wasm32-unknown-unknown.
+# library builds for wasm32-unknown-unknown (crates/sparkles-fmt-wasm).
 [dependencies]
 spargebra.workspace = true
 thiserror.workspace = true
 unicode-width.workspace = true
+# the reference parsers of the RDF syntaxes, the graph comparison and RDFC-1.0
+oxttl.workspace = true
+oxrdf.workspace = true
+# the reference parser of JSON-LD (strict JSON)
+json-event-parser.workspace = true
+# the sorted runs the line formats spill to disk
+lz4_flex.workspace = true
+# the line formats' chunks on every core (feature `parallel`)
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 # the crate itself with the test-only fault switch, for tests/fault.rs
 sparkles-fmt = { path = ".", features = ["fault-injection"] }
 proptest.workspace = true
 toml.workspace = true
+# the datasets of JSON-LD documents, to compare inputs and golden outputs
+oxjsonld.workspace = true
 
 [features]
+default = ["parallel"]
+# format the statements of N-Triples and N-Quads on every core (off for the WASM build)
+parallel = ["dep:rayon"]
 # Test only: with `SPARKLES_FMT_FAULT=drop-token` in the environment the printer drops one
 # token, which proves that the safety checks fire.
 fault-injection = []
