@@ -44,7 +44,7 @@ pub struct GeoConfig {
     /// graphs whose quads are indexed (as in `text.json`)
     #[serde(default)]
     pub graphs: GraphScope,
-    /// index W3C Basic Geo `lat`/`long` pairs as points (not supported yet)
+    /// index W3C Basic Geo `lat`/`long` pairs as points
     #[serde(default)]
     pub wgs84: bool,
     /// match the topological `geo:` properties against geometries (not supported yet)
@@ -108,9 +108,6 @@ impl GeoConfig {
                 "formatVersion: {} is not supported (this build reads {FORMAT_VERSION})",
                 self.format_version
             ));
-        }
-        if self.wgs84 {
-            return bad("wgs84: not supported yet".into());
         }
         if self.query_rewrite {
             return bad("queryRewrite: not supported yet".into());
@@ -247,6 +244,22 @@ pub struct GeoStatus {
     pub format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_build: Option<GeoBuild>,
+    /// the index files the base is read from (persistent stores)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<GeoFiles>,
+}
+
+/// The index files of the base (`gen-NNNN/geo/`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoFiles {
+    pub bytes: u64,
+    /// the base was read from files written before (no literal parsed), not built
+    pub opened: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Indexed rows: in the generation's base, the overlay of committed transactions, and
@@ -257,6 +270,9 @@ pub struct GeoRows {
     pub base: u64,
     pub overlay: u64,
     pub tail: u64,
+    /// rows (of the three) that are W3C Basic Geo points
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub wgs84: u64,
 }
 
 /// Geometry literals of indexed predicates that are not indexed, by reason.
@@ -276,6 +292,9 @@ pub struct GeoMemory {
     pub geometry_bytes: u64,
     pub overlay_bytes: u64,
     pub budget_bytes: u64,
+    /// bytes of the index files read in place (not counted against the budget)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mapped_bytes: u64,
 }
 
 /// The last build of the base.
@@ -338,7 +357,7 @@ mod tests {
             })
             .contains("queryRewrite: not supported yet")
         );
-        assert!(err(GeoConfig { wgs84: true, ..d() }).contains("wgs84: not supported yet"));
+        assert!(GeoConfig { wgs84: true, ..d() }.validate().is_ok());
         assert!(
             err(GeoConfig {
                 predicates: vec!["not an iri".into()],
@@ -404,6 +423,7 @@ mod tests {
             config: GeoConfig::default(),
             format_version: FORMAT_VERSION,
             last_build: None,
+            files: None,
         };
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["state"], "over-budget");
@@ -411,6 +431,7 @@ mod tests {
         assert!(j["skipped"].get("unknownCrs").is_some());
         assert!(j["memory"].get("budgetBytes").is_some());
         assert!(j.get("progress").is_none() && j.get("lastBuild").is_none());
+        assert!(j.get("files").is_none() && j["memory"].get("mappedBytes").is_none());
         assert_eq!(IndexState::Building(0.37).to_string(), "building (37%)");
     }
 }

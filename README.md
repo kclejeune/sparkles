@@ -64,7 +64,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Point-in-time reads (`?at=commit:N`, `time:…`, `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers) and named snapshots that keep a commit readable across compaction; optional retention window (`/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at`, `dump --at`) | ✅ |
 | Compaction into a new generation (`gen-NNNN`, atomic `CURRENT` switch) | ✅ |
 | N-Quads backups (`/$/backup`) and dumps (zstd by default, or gzip, brotli, LZ4); compressed request bodies and responses (`zstd`, `br`, `gzip`) | ✅ |
-| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums, the spatial index's `geo.json`; safe next to a running server | ✅ |
+| Read-only integrity check (`sparkles check`, `sparkles::check`): layout, every block of the 7 permutations, cross-permutation consistency, vocabulary order and id ranges, WAL checksums and commit continuity, catalog, full-text segment checksums, the spatial index's `geo.json` and index files; safe next to a running server | ✅ |
 | In-memory datasets (same engine, temp-dir base) | ✅ |
 
 ### SPARQL (ARQ equivalent)
@@ -81,7 +81,10 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Vector similarity: `spk:vector` literals, `spk:cosine`/`dot`/`euclidean`, exact top-k `spk:vectorSearch` scoped to the active graph (no approximate / HNSW index yet) | ✅ |
 | Full-text search: Jena `text:query` subset, BM25 via Tantivy, per-quad documents kept current in each commit (staged, committed by the next search or a 1 s tick), graph-scoped top-k (`text` cargo feature, on in the server) | ✅ |
 | GeoSPARQL 1.1 functions (`geo` cargo feature, on in the server): `geo:wktLiteral` and `geo:geoJSONLiteral` (Z/M layouts, EMPTY, byte offsets in parse errors), built-in CRSs (CRS84, CRS84h, EPSG:4326/4979 with their latitude-first axes, Web Mercator) and OGC/QUDT/EPSG units, the 24 topological relations and `relate` on DE-9IM, `distance` (geodesic on WGS 84 by default, haversine per dataset, Euclidean for projected CRSs), `buffer` (metric buffers through a local projection), `convexHull`, `envelope`, `boundary`, `centroid`, the four overlay operations, `area`/`length`/`perimeter` (geodesic) and the accessors; see [docs/API.md](docs/API.md#geosparql) | ✅ |
-| Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), rebuilt on open and by compaction, within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
+| Spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`): packed Hilbert R-tree over a generation's geometry literals plus an overlay of committed writes, exact for every snapshot (MVCC), within a memory budget (`--geo-mb`); status, rows, skipped literals and CRSs; `sparkles_geo_*` metrics | ✅ |
+| Spatial index files (`gen-NNNN/geo/`, checksummed, read in place): opening a database or re-enabling the same configuration parses no literal; damaged or foreign files are rebuilt; compactions and bulk loads parse only new literals; never in backups or clones | ✅ |
+| W3C Basic Geo (`wgs84_pos:lat`/`long` pairs, `geo.json` `"wgs84": true`) as indexed points for the `spatial:` functions and the map view | ✅ |
+| `GET /{ds}/geo?bbox=…`: the indexed geometries in a box as simplified CRS84 GeoJSON, for map views | ✅ |
 | Jena `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, their `…Geom` forms) and spatial FILTERs answered from the index (`SpatialScan`, `SpatialPf` in EXPLAIN, per-operator counters, plan warnings) | ✅ |
 | GeoSPARQL `boundingCircle`, `concaveHull`, `isSimple`; the six `geof:agg…` aggregates (GROUP BY, DISTINCT); Jena's 15 `spatialF:` filter functions; the 120 UTM zones (EPSG:326NN/327NN, Krüger's series); `POST /$/geo/convert` (literals as CRS84 GeoJSON for maps); Oxigraph's GeoSPARQL tests (37/44, the rest listed with reasons) and Jena-derived tests; see [docs/API.md](docs/API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion) | ✅ |
 | Results: JSON, XML, CSV, TSV, `x-sparkles+json` (with executed plan); RDF: Turtle, N-Triples, N-Quads, TriG, JSON-LD, RDF/XML | ✅ |
@@ -596,7 +599,7 @@ sparkles infer   --loc db --profile owl-rl    # materialize inferences
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
-sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph,
+sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 ```
 
@@ -839,7 +842,7 @@ prints the same report as JSON. The exit status is **0** when everything is clea
 | `wal` | records are well formed; every commit record's checksum matches (a damaged final transaction is a warning: open truncates it); commit numbers continue from the generation's base commit; ids resolve |
 | `catalog` | `commits.bin` record checksums and continuity, its dataset id, and agreement with the WAL; a lagging catalog, or damage open can rebuild from the WAL, is a warning, lost history before the generation an error |
 | `text` | `text.json` parses; the index opens read-only, every committed segment file exists and matches its checksum; its commit against the WAL (behind is a warning: caught up or rebuilt on open) |
-| `geo` | `geo.json` parses and is a valid configuration (the index itself is built in memory when the database is opened) |
+| `geo` | `geo.json` parses and is a valid configuration; the current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`): header, footer, that they belong to this generation and configuration, index checksums, and in full mode the data checksums (a damaged file is a warning: rebuilt on open) |
 | `reasoning` | `reasoning.json` parses and names an existing commit |
 
 Errors are what `Store::open` refuses, what loses acknowledged data or history, or what
