@@ -614,6 +614,7 @@ impl CommentRules for SparqlRules {
             K::GroupGraphPattern
                 | K::ConstructTemplate
                 | K::QuadPattern
+                | K::QuadsGraph
                 | K::BNodePropertyList
                 | K::Collection
                 | K::AnnotationBlock

@@ -751,7 +751,6 @@ impl Drop for Server {
 }
 
 #[test]
-#[ignore = "needs printing"]
 fn reformats_messy_queries() {
     let d = tempdir();
     let dir = d.path();
@@ -759,5 +758,5 @@ fn reformats_messy_queries() {
     expect(dir, &["--check", "q.rq"], None, 1);
     expect(dir, &["--write", "q.rq"], None, 0);
     expect(dir, &["--check", "q.rq"], None, 0);
-    assert_eq!(read(dir, "q.rq"), "SELECT * WHERE {\n  ?s ?p ?o .\n}\n");
+    assert_eq!(read(dir, "q.rq"), "SELECT *\nWHERE {\n  ?s ?p ?o .\n}\n");
 }

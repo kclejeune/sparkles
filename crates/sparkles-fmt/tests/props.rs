@@ -6,8 +6,7 @@
 //! - **convergence:** for the keys that fully determine their construct
 //!   (`operator-position`, `directive-style`, `align-values`), formatting under one value
 //!   and then another equals formatting under the second directly;
-//! - **layout independence:** re-spacing the input does not change the output (ignored
-//!   until the printers replace the verbatim stubs: verbatim output keeps the layout).
+//! - **layout independence:** re-spacing the input does not change the output.
 //!
 //! `PROPTEST_CASES` sets the number of cases (default 64).
 
@@ -273,9 +272,10 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "needs the printers: the verbatim stubs keep the input's layout"]
     fn layout_does_not_matter(i in any::<Index>(), seeds in prop::collection::vec(any::<u8>(), 1..32)) {
         let (name, text) = pick(&i);
+        // a node kept as written keeps its layout by design
+        prop_assume!(!text.contains("sparkles-fmt: ignore"));
         let respaced = respace(text, &seeds);
         let a = format(text, Language::Sparql, &Options::default()).map(|f| f.text);
         let b = format(&respaced, Language::Sparql, &Options::default()).map(|f| f.text);
