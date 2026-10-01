@@ -14,18 +14,39 @@
 //! the configuration is set, with its imports resolved then, so a write never fetches
 //! anything; the shape map is expanded again on every validated state, so new focus
 //! nodes are picked up.
+//!
+//! A write is not validated when it cannot change the result map: when it touches no
+//! graph of the data graph, or when every quad it changes has a predicate that no triple
+//! constraint and no `{FOCUS p …}` selector mentions (a neighbourhood holds only the arcs
+//! of the predicates its shape mentions; a CLOSED shape reads every outgoing arc, so a
+//! schema with one is always validated).
 
+use crate::ast::Schema;
+use crate::ir::Ir;
 use crate::resolve::Resolver;
-use crate::{CompiledSchema, ShapeMap};
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
-use sparkles::guard::config::{Baseline, CONFIG_FILE, Counters, DataGraphSel};
-use sparkles::guard::{
-    Candidate, CommitGuard, GuardLanguage, GuardMode, ValidationSummary, WriteOptions,
+use crate::{
+    CompiledSchema, NoImports, NodeSelector, PrefixMap, ResultMap, SchemaFormat, ShapeMap,
+    ValidateOptions,
 };
+use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
+use sparkles::commit::CommitKind;
+use sparkles::guard::config::{
+    Baseline, CONFIG_FILE, Counters, DataGraphSel, DecisionCounts, sha256_hex, write_atomic,
+};
+use sparkles::guard::{
+    Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
+    SeverityCounts, Strategy, ValidationSummary, WriteOptions,
+};
+use sparkles::id::Id;
 use sparkles::store::{Snapshot, Store};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub use sparkles::guard::config::{SHEX_SCHEMA_SHEXC_FILE, SHEX_SCHEMA_SHEXJ_FILE};
 
@@ -82,6 +103,10 @@ pub struct SchemaSource {
     /// the base IRI the schema's relative IRIs resolve against
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// the schema's prefixes, for the shape map, when the copy is ShExJ made from a
+    /// schema that had them (ShExJ has none); set when the configuration is set
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prefixes: BTreeMap<String, String>,
     /// informational: where the schema came from, and the SHA-256 of its text as given
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -147,47 +172,261 @@ pub struct ShexValidationStatus {
 /// Write-time ShEx validation of one store.
 pub struct ShexGuard {
     cfg: ShexValidationConfig,
-    #[allow(dead_code)]
     schema: Arc<CompiledSchema>,
-    #[allow(dead_code)]
     map: ShapeMap,
+    shape_count: usize,
+    /// the predicates a validation can read (see [`read_predicates`])
+    reads: Option<Vec<String>>,
+    pending: Mutex<Option<(u64, Baseline)>>,
+    baseline: Mutex<Option<Baseline>>,
+    counters: DecisionCounts,
+    last_full: AtomicU64,
+    /// associations of the last validation (`u64::MAX`: none yet)
+    associations: AtomicU64,
+    /// the last validation's warnings (semantic actions not run, …)
+    warnings: Mutex<Vec<String>>,
 }
 
 impl ShexGuard {
+    fn new(cfg: ShexValidationConfig, loaded: Loaded, map: ShapeMap) -> ShexGuard {
+        ShexGuard {
+            reads: read_predicates(loaded.compiled.ir(), &map),
+            cfg,
+            schema: Arc::new(loaded.compiled),
+            map,
+            shape_count: loaded.shape_count,
+            pending: Mutex::new(None),
+            baseline: Mutex::new(None),
+            counters: DecisionCounts::default(),
+            last_full: AtomicU64::new(u64::MAX),
+            associations: AtomicU64::new(u64::MAX),
+            warnings: Mutex::new(Vec::new()),
+        }
+    }
+
     pub fn config(&self) -> &ShexValidationConfig {
         &self.cfg
     }
 
     pub fn status(&self) -> ShexValidationStatus {
+        let last = self.last_full.load(Ordering::Relaxed);
+        let associations = self.associations.load(Ordering::Relaxed);
+        let mut warnings = self.warnings.lock().clone();
+        if associations == 0 {
+            warnings.push("the shape map selects no nodes".to_string());
+        }
+        if last != u64::MAX && last > 1000 {
+            warnings.push(format!(
+                "full validation took {last} ms; every write waits for it"
+            ));
+        }
         ShexValidationStatus {
             mode: self.cfg.mode,
-            shape_count: 0,
-            associations: None,
-            baseline: None,
-            last_full_millis: None,
-            counters: Counters::default(),
-            warnings: Vec::new(),
+            shape_count: self.shape_count,
+            associations: (associations != u64::MAX).then_some(associations),
+            baseline: self.baseline.lock().clone(),
+            last_full_millis: (last != u64::MAX).then_some(last),
+            counters: self.counters.get(),
+            warnings,
         }
     }
 
     /// Validate `view` and summarize under this configuration.
-    #[allow(dead_code)]
     fn validate_state(
         &self,
-        _view: &Arc<Snapshot>,
-        _o: &WriteOptions,
+        view: &Arc<Snapshot>,
+        o: &WriteOptions,
     ) -> sparkles::Result<ValidationSummary> {
-        Err(not_implemented())
+        let t0 = Instant::now();
+        let limit = o
+            .report_limit
+            .unwrap_or(self.cfg.report_limit)
+            .clamp(1, 10_000);
+        let Some(graphs) = self
+            .cfg
+            .data_graph
+            .graphs(view, self.cfg.include_inferences, &[])
+        else {
+            // none of the listed data graphs exists: nothing to validate
+            self.associations.store(0, Ordering::Relaxed);
+            let empty = ResultMap {
+                conforms: true,
+                ..Default::default()
+            };
+            return Ok(self.summarize(empty, limit, 0));
+        };
+        let mut deadline = t0 + Duration::from_secs_f64(self.cfg.timeout_seconds);
+        if let Some(d) = o.deadline {
+            deadline = deadline.min(d);
+        }
+        let vo = ValidateOptions {
+            data_graph: graphs.data_graph,
+            extra_graphs: graphs.extra_graphs,
+            exclude_graphs: graphs.exclude_graphs,
+            timeout: Some(deadline.saturating_duration_since(Instant::now())),
+            cancel: o.cancel.clone(),
+            only_nonconformant: true,
+            // a guard never runs SERVICE
+            selector_query: Some(sparkles::sparql::QueryOptions {
+                forbid_service: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rm = crate::validate(view, &self.schema, &self.map, &vo).map_err(engine_error)?;
+        let ms = t0.elapsed().as_millis() as u64;
+        self.last_full.store(ms, Ordering::Relaxed);
+        self.associations
+            .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
+        *self.warnings.lock() = rm.warnings.clone();
+        Ok(self.summarize(rm, limit, ms))
+    }
+
+    /// Count and bound the results, and decide: every nonconformant association blocks.
+    fn summarize(&self, mut rm: ResultMap, limit: usize, millis: u64) -> ValidationSummary {
+        let blocking = rm.nonconformant as u64;
+        let status = match (blocking > 0, self.cfg.mode) {
+            (true, GuardMode::Reject) => GuardStatus::Rejected,
+            (true, _) => GuardStatus::Warned,
+            (false, _) => GuardStatus::Passed,
+        };
+        let truncated = rm.results.len() > limit;
+        rm.results.truncate(limit);
+        let results = match rm.to_json()["results"].take() {
+            serde_json::Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        ValidationSummary {
+            language: GuardLanguage::Shex,
+            status,
+            mode: self.cfg.mode,
+            strategy: Strategy::Full,
+            threshold: Severity::Violation,
+            conforms: rm.conforms,
+            blocking,
+            total: (rm.conformant + rm.nonconformant) as u64,
+            by_severity: SeverityCounts {
+                violation: blocking,
+                ..Default::default()
+            },
+            limit,
+            truncated,
+            millis,
+            results,
+            shapes_error: None,
+            report_turtle: None,
+        }
+    }
+
+    /// Whether a change can change the result map: a changed quad in a graph of the
+    /// data graph, with a predicate a validation reads (any, when it may read any).
+    fn relevant(&self, view: &Snapshot, changes: &Changes<'_>) -> bool {
+        let (log, bulk) = match changes {
+            Changes::Log(log) => (*log, &[][..]),
+            Changes::Rebuilt { log, bulk } => (*log, *bulk),
+            Changes::Unknown => return true,
+        };
+        let preds: Option<FxHashSet<Id>> = self
+            .reads
+            .as_ref()
+            .map(|ps| ps.iter().filter_map(|p| view.lookup_iri(p)).collect());
+        let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
+        for q in log.iter().map(|(_, q)| q).chain(bulk) {
+            if preds.as_ref().is_some_and(|ps| !ps.contains(&q[1])) {
+                continue;
+            }
+            let g = q[3].0;
+            if *graphs.entry(g).or_insert_with(|| {
+                self.cfg
+                    .data_graph
+                    .touches(view, g, self.cfg.include_inferences, &[])
+            }) {
+                return true;
+            }
+        }
+        false
     }
 }
 
-fn not_implemented() -> sparkles::Error {
-    sparkles::Error::Unsupported("write-time ShEx validation is not implemented yet".into())
+/// The predicates a validation reads: those of the schema's triple constraints and of
+/// the map's `{FOCUS p …}` selectors; `None` when it may read any (a CLOSED shape reads
+/// every outgoing arc of its nodes, a SPARQL selector anything).
+fn read_predicates(ir: &Ir, map: &ShapeMap) -> Option<Vec<String>> {
+    if ir.shapes.iter().any(|s| s.closed) {
+        return None;
+    }
+    let mut ps: Vec<String> = ir
+        .shapes
+        .iter()
+        .flat_map(|s| s.tcs.iter().map(|t| t.pred.clone()))
+        .collect();
+    for a in &map.0 {
+        match &a.node {
+            NodeSelector::Term(_) => {}
+            NodeSelector::Focus { predicate, .. } => ps.push(predicate.as_str().to_string()),
+            NodeSelector::Sparql(_) => return None,
+        }
+    }
+    ps.sort_unstable();
+    ps.dedup();
+    Some(ps)
+}
+
+/// An error of the validation engine as a store error: timeouts, cancellation and
+/// budgets keep their kind.
+fn engine_error(e: anyhow::Error) -> sparkles::Error {
+    match e.downcast::<sparkles::Error>() {
+        Ok(e) => e,
+        Err(e) => sparkles::Error::Invalid(format!("ShEx validation failed: {e:#}")),
+    }
 }
 
 impl CommitGuard for ShexGuard {
-    fn check(&self, _c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
-        Err(not_implemented())
+    fn check(&self, c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
+        let seq = c.base.commit + 1;
+        if !self.relevant(&c.view, &c.changes) {
+            self.counters.count(GuardStatus::Skipped);
+            let baseline = self
+                .baseline
+                .lock()
+                .clone()
+                .map(|b| Baseline { commit: seq, ..b });
+            if let Some(b) = baseline {
+                *self.pending.lock() = Some((seq, b));
+            }
+            let mut s =
+                ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, Severity::Violation);
+            s.language = GuardLanguage::Shex;
+            s.limit = self.cfg.report_limit;
+            return Ok(s);
+        }
+        let summary = self.validate_state(&c.view, c.opts)?;
+        self.counters.count(summary.status);
+        if summary.status != GuardStatus::Rejected {
+            *self.pending.lock() = Some((seq, baseline_of(&summary, seq)));
+        }
+        Ok(summary)
+    }
+
+    fn committed(&self, seq: u64) {
+        let p = self.pending.lock().take();
+        match p {
+            Some((s, b)) if s == seq => *self.baseline.lock() = Some(b),
+            // a commit the guard did not judge: the state is unknown
+            _ => {
+                if let Some(b) = self.baseline.lock().as_mut() {
+                    b.commit = seq;
+                    b.conforms = None;
+                }
+            }
+        }
+    }
+
+    fn bypassed(&self) {
+        self.counters.count(GuardStatus::Bypassed);
+        if let Some(b) = self.baseline.lock().as_mut() {
+            b.conforms = None;
+        }
     }
 
     fn describe(&self) -> String {
@@ -206,6 +445,145 @@ impl CommitGuard for ShexGuard {
     }
 }
 
+fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
+    Baseline {
+        commit,
+        conforms: Some(s.blocking == 0),
+        blocking: s.blocking,
+        total: s.total,
+        millis: s.millis,
+    }
+}
+
+// ------------------------------------------------------------ the schema ---------
+
+/// A schema ready for the guard, and the copy the database keeps of it.
+struct Loaded {
+    compiled: CompiledSchema,
+    /// shape declarations, imports included
+    shape_count: usize,
+    /// the copy: its file name, `format` and text
+    file: &'static str,
+    format: &'static str,
+    text: String,
+    /// the prefixes the copy cannot hold (a ShExJ copy of a schema that had some)
+    prefixes: PrefixMap,
+    /// the base of the closed schema (`BASE`, or the one given)
+    base: Option<String>,
+}
+
+/// Parse a schema text, resolve its imports and EXTERNAL shapes through `resolver`,
+/// check and compile it, and choose its copy: the text itself when nothing was
+/// resolved into it (ShExC or ShExJ), otherwise the closed schema as ShExJ. `prefixes`
+/// stand in for a text without its own (a ShExJ copy).
+fn load(
+    text: String,
+    format: Option<&str>,
+    base: Option<&str>,
+    prefixes: &BTreeMap<String, String>,
+    resolver: &dyn Resolver,
+) -> Result<Loaded> {
+    let format = match format {
+        Some(f) => SchemaFormat::from_name(f)
+            .with_context(|| format!("schema.format must be shexc, shexj or shexr, not {f:?}"))?,
+        None if text.trim_start().starts_with('{') => SchemaFormat::ShExJ,
+        None => SchemaFormat::ShExC,
+    };
+    let mut parsed =
+        crate::parse_schema(&text, base, Some(format)).map_err(|e| anyhow!("schema: {e}"))?;
+    if parsed.prefixes.is_empty() {
+        parsed.prefixes = prefixes
+            .iter()
+            .map(|(p, ns)| (p.clone(), ns.clone()))
+            .collect();
+    }
+    let closed = crate::resolve::close(&parsed, resolver).map_err(|e| anyhow!("schema: {e}"))?;
+    if let Some(d) = closed
+        .shapes
+        .iter()
+        .find(|d| matches!(d.expr, crate::ShapeExpr::External))
+    {
+        bail!(
+            "schema: the EXTERNAL shape {} has no definition (write-time validation takes none)",
+            d.label
+        );
+    }
+    let checked = crate::check::check(&closed).map_err(|e| anyhow!("schema: {e}"))?;
+    let compiled =
+        crate::compile::compile(&closed, &checked).map_err(|e| anyhow!("schema: {e}"))?;
+    let verbatim = parsed.imports.is_empty() && closed == parsed;
+    let (file, format, text) = match format {
+        SchemaFormat::ShExC if verbatim => (SHEX_SCHEMA_SHEXC_FILE, "shexc", text),
+        SchemaFormat::ShExJ if verbatim => (SHEX_SCHEMA_SHEXJ_FILE, "shexj", text),
+        _ => {
+            let merged = Schema {
+                imports: Vec::new(),
+                ..closed.clone()
+            };
+            let text = serde_json::to_string_pretty(&merged.to_shexj())?;
+            (SHEX_SCHEMA_SHEXJ_FILE, "shexj", text)
+        }
+    };
+    Ok(Loaded {
+        compiled,
+        shape_count: closed.shapes.len(),
+        file,
+        format,
+        text,
+        prefixes: if file == SHEX_SCHEMA_SHEXJ_FILE {
+            closed.prefixes.clone()
+        } else {
+            Vec::new()
+        },
+        base: closed.base.clone(),
+    })
+}
+
+/// Load the copy of the schema a configuration names (nothing is resolved: the copy
+/// holds its imports).
+fn load_copy(cfg: &ShexValidationConfig, root: &Path) -> Result<Loaded> {
+    let file = cfg.schema.file.as_deref().unwrap_or_default();
+    let format = match file {
+        SHEX_SCHEMA_SHEXC_FILE => "shexc",
+        SHEX_SCHEMA_SHEXJ_FILE => "shexj",
+        _ => bail!(
+            "schema.file must be {SHEX_SCHEMA_SHEXC_FILE} or {SHEX_SCHEMA_SHEXJ_FILE} (the copy in the database), not {file:?}"
+        ),
+    };
+    let text =
+        std::fs::read_to_string(root.join(file)).with_context(|| format!("reading {file}"))?;
+    load(
+        text,
+        Some(format),
+        cfg.schema.base.as_deref(),
+        &cfg.schema.prefixes,
+        &NoImports,
+    )
+}
+
+/// Parse a configuration's shape map against the schema: labels it does not define,
+/// START without a start shape, and SPARQL selectors (which every validated write would
+/// run) are errors.
+fn parse_map(src: &MapSource, schema: &CompiledSchema) -> Result<ShapeMap> {
+    let map = match src {
+        MapSource::Compact(s) => ShapeMap::parse(s, schema.prefixes(), schema.base()),
+        MapSource::Json(v) => ShapeMap::from_json(&serde_json::to_string(v)?),
+    }
+    .map_err(|e| anyhow!("shapeMap: {e}"))?;
+    if map.0.is_empty() {
+        bail!("shapeMap: the shape map has no associations");
+    }
+    for a in &map.0 {
+        if matches!(a.node, NodeSelector::Sparql(_)) {
+            bail!(
+                "shapeMap: SPARQL node selectors are not allowed in write-time validation; use {{FOCUS p o}} selectors or nodes"
+            );
+        }
+        crate::shapemap::label_kind(schema, &a.shape).map_err(|e| anyhow!("shapeMap: {e}"))?;
+    }
+    Ok(map)
+}
+
 // ------------------------------------------------------------ configuration ------
 
 /// The ShEx configuration of a database, if `validation.json` is one (`None` without a
@@ -218,13 +596,14 @@ pub fn read_config(root: &Path) -> Result<Option<ShexValidationConfig>> {
         Err(e) => return Err(e.into()),
     };
     let cfg: ShexValidationConfig =
-        serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     cfg.check()?;
     Ok(Some(cfg))
 }
 
 /// Install the guard of a persistent store from its ShEx `validation.json` (after
-/// [`Store::open`]). Without a configuration nothing happens. A configuration that
+/// [`Store::open`]): the schema is read from its copy in the database, without
+/// resolving anything. Without a configuration nothing happens. A configuration that
 /// cannot be loaded is an error, and the store keeps refusing writes (fail closed).
 pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     let Some(root) = store.root() else {
@@ -237,7 +616,12 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         store.set_guard_required(false);
         return Ok(None);
     }
-    Err(not_implemented().into())
+    let loaded = load_copy(&cfg, root)?;
+    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
+    let g = Arc::new(ShexGuard::new(cfg, loaded, map));
+    store.set_guard(Some(g.clone()));
+    store.set_guard_required(true);
+    Ok(Some(g))
 }
 
 /// The outcome of [`set_config`].
@@ -251,7 +635,8 @@ pub enum SetOutcome {
 }
 
 /// Set (or with `None` / mode `off`, remove) the write-time ShEx validation of a store.
-/// The schema is parsed from `cfg.schema.inline`, its imports resolved through
+/// The schema is parsed from `cfg.schema.inline` (or, without it, read from the copy an
+/// earlier configuration left in the database), its imports resolved through
 /// `resolver` and checked, and copied into the database with the configuration. Runs
 /// under the writer lock: the current state is validated with the new configuration,
 /// and `reject` is refused when an association does not conform, so no write can commit
@@ -261,95 +646,70 @@ pub fn set_config(
     cfg: Option<ShexValidationConfig>,
     resolver: &dyn Resolver,
 ) -> Result<SetOutcome> {
-    let _ = resolver;
-    let Some(cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
-        let txn = store.write_as(sparkles::commit::CommitKind::Transaction);
+    let root = store.root().map(Path::to_path_buf);
+    let txn = store.write_as(CommitKind::Transaction);
+    let Some(mut cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
         store.set_guard(None);
         store.set_guard_required(false);
-        if let Some(r) = store.root() {
+        if let Some(r) = &root {
             sparkles::guard::config::remove_files(r, &[])?;
         }
         drop(txn);
         return Ok(SetOutcome::Removed);
     };
     cfg.check()?;
-    Err(not_implemented().into())
+    let mut loaded = match cfg.schema.inline.take() {
+        Some(text) => {
+            cfg.schema.sha256 = Some(sha256_hex(text.as_bytes()));
+            load(
+                text,
+                cfg.schema.format.as_deref(),
+                cfg.schema.base.as_deref(),
+                &BTreeMap::new(),
+                resolver,
+            )?
+        }
+        None => {
+            let r = root
+                .as_deref()
+                .context("schema: give the schema inline (an in-memory dataset keeps no copy)")?;
+            load_copy(&cfg, r)?
+        }
+    };
+    let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
+    // the configuration as written
+    cfg.format = CONFIG_FORMAT;
+    cfg.updated = Some(sparkles::guard::config::now_rfc3339());
+    cfg.schema.file = Some(loaded.file.to_string());
+    cfg.schema.format = Some(loaded.format.to_string());
+    cfg.schema.prefixes = loaded.prefixes.iter().cloned().collect();
+    if loaded.file == SHEX_SCHEMA_SHEXJ_FILE && cfg.schema.base.is_none() {
+        cfg.schema.base = loaded.base.clone();
+    }
+    let file = loaded.file;
+    let text = std::mem::take(&mut loaded.text);
+    let guard = Arc::new(ShexGuard::new(cfg, loaded, map));
+
+    let view = Arc::new(txn.view());
+    let summary = guard.validate_state(&view, &WriteOptions::default())?;
+    if guard.cfg.mode == GuardMode::Reject && summary.blocking > 0 {
+        return Ok(SetOutcome::NotConforming(summary));
+    }
+    if let Some(r) = &root {
+        // a configuration of either language this one replaces leaves nothing behind
+        sparkles::guard::config::remove_files(r, &[CONFIG_FILE, file])?;
+        write_atomic(&r.join(file), text.as_bytes())?;
+        write_atomic(
+            &r.join(CONFIG_FILE),
+            &serde_json::to_vec_pretty(&guard.cfg)?,
+        )?;
+    }
+    *guard.baseline.lock() = Some(baseline_of(&summary, view.commit));
+    store.set_guard(Some(guard.clone()));
+    store.set_guard_required(true);
+    drop(txn);
+    Ok(SetOutcome::Installed(guard, summary))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(j: serde_json::Value) -> Result<ShexValidationConfig> {
-        let c: ShexValidationConfig = serde_json::from_value(j)?;
-        c.check()?;
-        Ok(c)
-    }
-
-    #[test]
-    fn configuration_fields() {
-        let c = config(serde_json::json!({
-            "format": 2, "language": "shex", "mode": "reject",
-            "schema": {"file": "validation-schema.shex", "format": "shexc",
-                       "source": "/abs/s.shex", "sha256": "00"},
-            "shapeMap": "{FOCUS a <http://ex.org/Person>}@<http://ex.org/Person>",
-        }))
-        .unwrap();
-        assert_eq!(c.data_graph, DataGraphSel::default());
-        assert_eq!((c.timeout_seconds, c.report_limit), (10.0, 100));
-        let back = serde_json::to_value(&c).unwrap();
-        assert_eq!(back["language"], "shex");
-        assert_eq!(back["schema"]["file"], "validation-schema.shex");
-        assert!(back.get("updated").is_none());
-        // JSON shape maps
-        let c = config(serde_json::json!({
-            "language": "shex", "mode": "warn", "schema": {"inline": "<http://ex.org/S> {}"},
-            "shapeMap": [{"node": "<http://ex.org/a>", "shape": "<http://ex.org/S>"}],
-        }))
-        .unwrap();
-        assert_eq!(c.format, 2);
-        assert!(matches!(c.shape_map, MapSource::Json(_)));
-        // the inline schema is not written back
-        assert!(
-            serde_json::to_value(&c).unwrap()["schema"]
-                .get("inline")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn rejected_configurations() {
-        let base = || {
-            serde_json::json!({"format": 2, "language": "shex", "mode": "reject",
-                "schema": {"inline": "<http://ex.org/S> {}"}, "shapeMap": "<http://ex.org/a>@START"})
-        };
-        let with = |k: &str, v: serde_json::Value| {
-            let mut j = base();
-            j[k] = v;
-            config(j)
-        };
-        assert!(config(base()).is_ok());
-        assert!(with("format", 1.into()).is_err());
-        assert!(with("language", "shacl".into()).is_err());
-        // no severities in ShEx
-        assert!(with("threshold", "warning".into()).is_err());
-        assert!(with("reportLimit", 0.into()).is_err());
-        assert!(with("timeoutSeconds", 0.into()).is_err());
-        assert!(with("dataGraph", "other".into()).is_err());
-        assert!(with("schema", serde_json::json!({})).is_err());
-    }
-
-    #[test]
-    fn stubs_fail_cleanly() {
-        let store = Store::in_memory(Default::default());
-        let cfg = config(serde_json::json!({"language": "shex", "mode": "reject",
-            "schema": {"inline": "<http://ex.org/S> {}"}, "shapeMap": "<http://ex.org/a>@<http://ex.org/S>"}))
-        .unwrap();
-        assert!(set_config(&store, Some(cfg), &crate::NoImports).is_err());
-        assert!(matches!(
-            set_config(&store, None, &crate::NoImports).unwrap(),
-            SetOutcome::Removed
-        ));
-        assert!(install(&store).unwrap().is_none());
-    }
-}
+mod tests;

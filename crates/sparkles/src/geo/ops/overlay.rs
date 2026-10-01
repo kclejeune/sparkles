@@ -68,6 +68,50 @@ pub fn overlay(a: &Geom, b: &Geom, op: Overlay) -> Result<Geom, OpError> {
     })
 }
 
+/// The union of every geometry of `gs`, in the CRS of the first (the others are
+/// transformed into it), for `geof:aggUnion`: all areas unioned in one pass, curves
+/// added without the stretches already present, points without repeats. `None`
+/// when `gs` is empty.
+pub fn union_many(gs: &[&Geom]) -> Result<Option<Geom>, OpError> {
+    let Some(first) = gs.first() else {
+        return Ok(None);
+    };
+    let mut acc = Parts::default();
+    let mut polys = Vec::new();
+    let mut inputs = Vec::with_capacity(gs.len());
+    for g in gs {
+        let g = in_crs(g, &first.crs)?;
+        let mut p = Parts::default();
+        p.add(&g.g, &mut polys);
+        let more = subtract_lines(&p.lines, &acc.lines);
+        acc.lines.extend(more);
+        acc.points.extend(p.points);
+        inputs.push(g.into_owned().g);
+    }
+    acc.areas = guarded("union", || union_all(polys))?;
+    let dim = gs.iter().map(|g| g.dim()).max().unwrap_or(-1);
+    Ok(Some(match guarded("union", || acc.assemble())? {
+        Some(mut g) => {
+            let inputs = Geometry::GeometryCollection(GeometryCollection(inputs));
+            snap_to_inputs(
+                &mut g,
+                &inputs,
+                &Geometry::GeometryCollection(GeometryCollection(vec![])),
+            );
+            made(first, g)
+        }
+        None => Geom::empty(
+            first.crs.clone(),
+            match dim {
+                -1 => GeomType::GeometryCollection,
+                0 => GeomType::Point,
+                1 => GeomType::LineString,
+                _ => GeomType::Polygon,
+            },
+        ),
+    }))
+}
+
 /// Put output vertices that are input vertices up to rounding back on them exactly:
 /// `geo`'s boolean operations compute on a fixed-point grid, so `-83.6` can come back as
 /// `-83.60000000018627`. Vertices within a billionth (relative) of an input vertex take

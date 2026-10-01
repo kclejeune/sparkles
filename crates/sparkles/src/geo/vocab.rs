@@ -30,6 +30,17 @@ pub const HAS_SERIALIZATION: &str = "http://www.opengis.net/ont/geosparql#hasSer
 pub const HAS_DEFAULT_GEOMETRY: &str = "http://www.opengis.net/ont/geosparql#hasDefaultGeometry";
 pub const HAS_GEOMETRY: &str = "http://www.opengis.net/ont/geosparql#hasGeometry";
 
+/// The local names of the GeoSPARQL aggregates (`geof:aggUnion(?w)` and the like),
+/// which the parser reads as aggregate calls.
+pub const AGGREGATES: [&str; 6] = [
+    "aggBoundingBox",
+    "aggBoundingCircle",
+    "aggCentroid",
+    "aggConcaveHull",
+    "aggConvexHull",
+    "aggUnion",
+];
+
 /// Whether `dt` is a geometry literal datatype this build understands
 /// (`geo:wktLiteral`, `geo:geoJSONLiteral`).
 pub fn is_geometry_datatype(dt: &str) -> bool {

@@ -3,16 +3,17 @@
 //! [`config_language`] tells the server and the CLI which validator installs the guard.
 //!
 //! Format 1 is SHACL (`sparkles_shacl::guard::ValidationConfig`). Format 2 adds
-//! `language` (`"shacl"` or `"shex"`); a file without `language` is SHACL, so format 1
-//! files keep working unchanged.
+//! `language` (`"shacl"` or `"shex"`) and is what both guards write; a file without
+//! `language` is SHACL, so format 1 files keep working unchanged.
 
-use super::GuardLanguage;
+use super::{GuardLanguage, GuardStatus};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
 use crate::store::Snapshot;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The configuration file in a database directory.
 pub const CONFIG_FILE: &str = "validation.json";
@@ -217,9 +218,49 @@ pub struct Counters {
     pub bypassed: u64,
 }
 
+/// A guard's decision counters, updated as it decides.
+#[derive(Debug, Default)]
+pub struct DecisionCounts([AtomicU64; 5]);
+
+impl DecisionCounts {
+    /// Count one decision.
+    pub fn count(&self, s: GuardStatus) {
+        let i = match s {
+            GuardStatus::Passed => 0,
+            GuardStatus::Warned => 1,
+            GuardStatus::Rejected => 2,
+            GuardStatus::Skipped => 3,
+            GuardStatus::Bypassed => 4,
+        };
+        self.0[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts so far.
+    pub fn get(&self) -> Counters {
+        let c = |i: usize| self.0[i].load(Ordering::Relaxed);
+        Counters {
+            passed: c(0),
+            warned: c(1),
+            rejected: c(2),
+            skipped: c(3),
+            bypassed: c(4),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decision_counts() {
+        let c = DecisionCounts::default();
+        c.count(GuardStatus::Rejected);
+        c.count(GuardStatus::Rejected);
+        c.count(GuardStatus::Bypassed);
+        let got = c.get();
+        assert_eq!((got.passed, got.rejected, got.bypassed), (0, 2, 1));
+    }
 
     #[test]
     fn language_of_a_config() {

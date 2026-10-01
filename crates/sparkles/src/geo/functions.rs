@@ -1,4 +1,5 @@
-//! The `geof:` functions in SPARQL expressions (the `spatialF:` ones come later).
+//! The `geof:` functions in SPARQL expressions (Jena's `spatialF:` ones are in
+//! [`super::spatialf`]).
 //!
 //! Every argument error is a SPARQL type error: an argument that is not a geometry
 //! literal (or is ill-typed), an unknown unit, CRSs without a transform between them, an
@@ -9,7 +10,7 @@ use super::crs::{self, CrsRef};
 use super::geom::Geom;
 use super::ops::accessors::{self, Bound};
 use super::ops::overlay::{Overlay, overlay};
-use super::ops::{self, OpError, construct, distance, measure, relate};
+use super::ops::{self, OpError, construct, distance, hull, measure, relate, simple};
 use super::units::{Unit, UnitKind, unit};
 use super::vocab::{GEOF, GEOJSON_LITERAL, Relation, WKT_LITERAL};
 use super::{DistanceModel, GeomRef, memo, write};
@@ -46,6 +47,9 @@ pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalRe
         "buffer" => f.buffer(Some(2)),
         "metricBuffer" => f.buffer(None),
         "convexHull" => f.construct(construct::convex_hull),
+        "boundingCircle" => f.construct(hull::bounding_circle),
+        "concaveHull" => f.concave_hull(),
+        "isSimple" => f.accessor(|g| boolean(simple::is_simple(&g.g))),
         "envelope" => f.construct(construct::envelope),
         "boundary" => f.construct(construct::boundary),
         "centroid" => f.construct(construct::centroid),
@@ -217,6 +221,19 @@ impl Call<'_, '_> {
         let g = self.geom(0)?;
         self.sized(&[&g])?;
         self.geometry(&f(&g).map_err(op)?, self.datatype(0))
+    }
+
+    /// `concaveHull(g)` or `concaveHull(g, targetPercent)` (see [`hull::concavity`]).
+    fn concave_hull(&self) -> EvalResult<Val> {
+        let concavity = match self.args.len() {
+            1 => hull::DEFAULT_CONCAVITY,
+            2 => hull::concavity(self.number(1)?).ok_or(TypeError)?,
+            _ => return Err(TypeError),
+        };
+        let g = self.geom(0)?;
+        self.sized(&[&g])?;
+        let out = hull::concave_hull(&g, concavity).map_err(op)?;
+        self.geometry(&out, self.datatype(0))
     }
 
     fn overlay(&self, o: Overlay) -> EvalResult<Val> {
@@ -572,6 +589,78 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         // a GeoJSON argument gives a GeoJSON result
         let (_, dt) = lit(&s, "geof:envelope(?p3)");
         assert_eq!(dt, crate::geo::vocab::GEOJSON_LITERAL);
+    }
+
+    #[test]
+    fn hulls_simplicity_and_utm() {
+        let s = store();
+        let t = |e: &str| truth(&s, e);
+        let pts = "\"MULTIPOINT((0 0),(4 0),(2 1))\"^^geo:wktLiteral";
+        // the circle on the diameter (0 0)–(4 0) holds the third point
+        assert!(t(&format!(
+            "geof:sfContains(geof:boundingCircle({pts}), \"POINT(2 1)\"^^geo:wktLiteral)"
+        )));
+        assert!(t(&format!(
+            "geof:sfWithin(geof:boundingCircle({pts}), \"POLYGON((-1 -3, 5 -3, 5 3, -1 3, -1 -3))\"^^geo:wktLiteral)"
+        )));
+        assert!(t(
+            "geof:sfEquals(geof:boundingCircle(\"POINT(1 2)\"^^geo:wktLiteral), \"POINT(1 2)\"^^geo:wktLiteral)"
+        ));
+        assert!(t(
+            "geof:sfWithin(geof:concaveHull(?a), geof:convexHull(?a))"
+        ));
+        assert!(t("geof:sfEquals(geof:concaveHull(?a, 100), ?a)"));
+        assert!(t("geof:sfEquals(geof:concaveHull(?a, 20.5), ?a)"));
+        assert!(t("geof:isSimple(?a)"));
+        assert!(t("geof:isSimple(?m)"));
+        assert!(!t(
+            "geof:isSimple(\"LINESTRING(0 0, 2 2, 2 0, 0 2)\"^^geo:wktLiteral)"
+        ));
+        // a GeoJSON argument gives a GeoJSON result
+        assert_eq!(
+            lit(&s, "geof:boundingCircle(?p3)"),
+            (
+                r#"{"type":"Point","coordinates":[30,30]}"#.into(),
+                crate::geo::vocab::GEOJSON_LITERAL.into()
+            )
+        );
+        // UTM: GeographicLib's GeoConvert example, there and back
+        let (w, dt) = lit(
+            &s,
+            "geof:transform(\"POINT(44.4 33.3)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/32638>)",
+        );
+        assert_eq!(dt, WKT);
+        let xy: Vec<f64> = w
+            .strip_prefix("<http://www.opengis.net/def/crs/EPSG/0/32638> POINT(")
+            .and_then(|r| r.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{w}"))
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert!((xy[0] - 444_140.54).abs() < 0.005 && (xy[1] - 3_684_706.36).abs() < 0.005);
+        let d = num(
+            &s,
+            "geof:metricDistance(\"<http://www.opengis.net/def/crs/EPSG/0/32638> POINT(444140.54 3684706.36)\"^^geo:wktLiteral, \"POINT(44.4 33.3)\"^^geo:wktLiteral)",
+        );
+        assert!(d < 0.01, "{d}");
+        // projected: Euclidean metres in the zone
+        let d = num(
+            &s,
+            "geof:metricDistance(\"<http://www.opengis.net/def/crs/EPSG/0/32638> POINT(400000 3000000)\"^^geo:wktLiteral, \"<http://www.opengis.net/def/crs/EPSG/0/32638> POINT(403000 3004000)\"^^geo:wktLiteral)",
+        );
+        assert!((d - 5000.0).abs() < 1e-9, "{d}");
+        for e in [
+            "geof:concaveHull(?a, 0)",
+            "geof:concaveHull(?a, 101)",
+            "geof:concaveHull(?a, \"x\")",
+            "geof:concaveHull(?a, 50, 1)",
+            "geof:isSimple(?x)",
+            "geof:boundingCircle(?x)",
+            // longitude 120 is too far from zone 38
+            "geof:transform(\"POINT(120 0)\"^^geo:wktLiteral, <http://www.opengis.net/def/crs/EPSG/0/32638>)",
+        ] {
+            assert_eq!(eval(&s, e), None, "{e}");
+        }
     }
 
     #[test]
