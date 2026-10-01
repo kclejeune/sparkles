@@ -1,11 +1,13 @@
-//! `sparkles fmt`: format SPARQL queries and updates, N-Triples and N-Quads (Turtle, TriG
-//! and JSON-LD later). Prettier's modes and exit codes: print to stdout by default,
+//! `sparkles fmt`: format SPARQL queries and updates, Turtle, TriG, N-Triples, N-Quads and
+//! JSON-LD. Prettier's modes and exit codes: print to stdout by default,
 //! `--check` / `--list-different` exit 1 when something would change, `--write`
 //! rewrites in place, and any error exits 2.
 //!
 //! N-Triples and N-Quads stream: a file (or stdin) of any size is formatted in one pass
 //! in bounded memory, printed as it goes, checked into `io::sink()`, or written to a
 //! temporary file next to it; `--diff` formats them in memory like the other languages.
+//! Turtle and TriG over `--max-bytes` stream the same way unless sorted (with
+//! `prune-prefixes` the input is read twice: stdin is kept in a temporary file).
 
 pub(crate) mod config;
 pub(crate) mod report;
@@ -114,8 +116,9 @@ pub struct FmtArgs {
     /// Line formats: the most quads --canonicalize holds in memory
     #[arg(long, value_name = "N", default_value_t = 20_000_000)]
     pub max_canonicalize_quads: u64,
-    /// The largest document formatted in memory: every language but N-Triples and
-    /// N-Quads, which stream (bytes, or with a KiB, MiB, GiB or TiB suffix)
+    /// The largest document formatted in memory: N-Triples and N-Quads stream, and so do
+    /// larger Turtle and TriG documents unless sorted, statement by statement (then it is
+    /// the largest statement) (bytes, or with a KiB, MiB, GiB or TiB suffix)
     #[arg(long, value_name = "SIZE", default_value = "256MiB", value_parser = parse_size)]
     pub max_bytes: u64,
     /// Files formatted in parallel (default: available cores)
@@ -274,6 +277,8 @@ struct Job {
     lang_path: Option<PathBuf>,
     /// stdin's text
     text: Option<String>,
+    /// the first bytes of stdin, past `--max-bytes`: the rest is still to read
+    head: Option<Vec<u8>>,
     /// stdin whose `--stdin-filepath` an ignore file matches: passed through as it is
     ignored: bool,
     /// `None`: its config file is broken (reported once, before formatting)
@@ -380,15 +385,22 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
     let mut jobs = Vec::new();
     if args.paths.is_empty() {
         // N-Triples and N-Quads named by --language or --stdin-filepath stream; anything
-        // else is read whole
-        let text = match line_format(args.language, args.stdin_filepath.as_deref(), mode) {
-            Some(_) => None,
+        // else is read whole, up to --max-bytes (then Turtle and TriG stream)
+        let (text, head) = match line_format(args.language, args.stdin_filepath.as_deref(), mode) {
+            Some(_) => (None, None),
             None => {
-                let mut text = String::new();
+                let mut bytes = Vec::new();
                 std::io::stdin()
-                    .read_to_string(&mut text)
+                    .take(args.max_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
                     .context("reading stdin")?;
-                Some(text)
+                match bytes.len() as u64 > args.max_bytes {
+                    true => (None, Some(bytes)),
+                    false => (
+                        Some(String::from_utf8(bytes).context("reading stdin: not UTF-8 text")?),
+                        None,
+                    ),
+                }
             }
         };
         let abs = args
@@ -408,6 +420,7 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
             file: None,
             lang_path: args.stdin_filepath.clone(),
             text,
+            head,
             ignored: abs.is_some_and(|a| ignores.ignored(&a, false)),
             options: options_in(&dir),
         });
@@ -424,6 +437,7 @@ fn run_inner(args: &FmtArgs) -> Result<i32> {
                 lang_path: Some(input.path.clone()),
                 file: Some(input.path),
                 text: None,
+                head: None,
                 ignored: false,
                 options: options_in(&dir),
             });
@@ -520,7 +534,7 @@ fn process(job: &Job, args: &FmtArgs, mode: Mode) -> Outcome {
     };
     let over_limit = |len: u64, lang: Option<Language>| {
         (len > args.max_bytes && in_memory(lang))
-            .then(|| fail(&too_large_message(len, args.max_bytes, lang)))
+            .then(|| fail(&too_large_message(Some(len), args.max_bytes, lang)))
     };
     if let (None, Some(path)) = (&job.text, &job.file)
         && let Ok(meta) = std::fs::metadata(path)
@@ -539,7 +553,28 @@ fn process(job: &Job, args: &FmtArgs, mode: Mode) -> Outcome {
             Ok(Err(_)) => return fail("not UTF-8 text"),
             Err(e) => return fail(&report::io(&e)),
         },
-        (None, None) => return Outcome::error(None),
+        // stdin past --max-bytes that does not stream
+        (None, None) => match &job.head {
+            // passed through as it is
+            Some(head) if job.ignored => {
+                let mut all = head.clone();
+                if let Err(e) = std::io::stdin().read_to_end(&mut all) {
+                    return fail(&report::io(&e));
+                }
+                return Outcome {
+                    stdout: match mode {
+                        Mode::Print => String::from_utf8_lossy(&all).into_owned(),
+                        _ => String::new(),
+                    },
+                    ..Outcome::default()
+                };
+            }
+            Some(head) => {
+                let lang = by_name.or_else(|| sniffed(&String::from_utf8_lossy(head)).ok());
+                return fail(&too_large_message(None, args.max_bytes, lang));
+            }
+            None => return Outcome::error(None),
+        },
     };
     if job.ignored {
         return Outcome {
@@ -605,12 +640,38 @@ fn line_format(flag: Option<Language>, path: Option<&Path>, mode: Mode) -> Optio
         .filter(|l| l.is_line_format() && l.is_implemented())
 }
 
-/// The line format `job` streams in, if it does (a file, or stdin left unread).
+/// The language `job` streams in, if it does (a file, or stdin left unread or read past
+/// `--max-bytes`).
 fn streamed(job: &Job, args: &FmtArgs, mode: Mode) -> Option<Language> {
     match (&job.text, &job.options) {
-        (None, Some(_)) => line_format(args.language, job.lang_path.as_deref(), mode),
+        (None, Some(opts)) => line_format(args.language, job.lang_path.as_deref(), mode)
+            .or_else(|| turtle_streamed(job, args, mode, opts)),
         _ => None,
     }
+}
+
+/// Turtle or TriG over `--max-bytes` (a file, or stdin read that far), not sorted, outside
+/// `--diff`: formatted as a stream, statement by statement.
+fn turtle_streamed(job: &Job, args: &FmtArgs, mode: Mode, opts: &Options) -> Option<Language> {
+    use sparkles_fmt::turtle::stream::can_stream;
+    if matches!(mode, Mode::Check { diff: true }) || !can_stream(opts) {
+        return None;
+    }
+    let by_name = language_by_name(args.language, job.lang_path.as_deref()).ok()?;
+    let (lang, over) = match (&job.file, &job.head) {
+        (Some(path), _) => (
+            by_name?,
+            std::fs::metadata(path).is_ok_and(|m| m.len() > args.max_bytes),
+        ),
+        (None, Some(head)) => {
+            let valid = std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), str::len);
+            let sniff = || sniffed(std::str::from_utf8(&head[..valid]).unwrap_or("")).ok();
+            (by_name.or_else(sniff)?, true)
+        }
+        (None, None) => return None,
+    };
+    (over && matches!(lang, Language::Turtle | Language::TriG) && lang.is_implemented())
+        .then_some(lang)
 }
 
 /// Keeps the first I/O error of a reader or a writer, which the formatter only reports
@@ -667,9 +728,10 @@ impl<T: Write> Write for Noted<T> {
     }
 }
 
-/// Stream one N-Triples or N-Quads document (a file, or stdin) and do with it what `mode`
-/// says: print it to `stdout` (given for [`Mode::Print`]), check it into a sink, or write
-/// it to a temporary file next to the original, renamed over it only if it changed.
+/// Stream one N-Triples, N-Quads, Turtle or TriG document (a file, or stdin) and do with it
+/// what `mode` says: print it to `stdout` (given for [`Mode::Print`]), check it into a
+/// sink, or write it to a temporary file next to the original, renamed over it only if it
+/// changed.
 fn stream(
     job: &Job,
     args: &FmtArgs,
@@ -682,12 +744,14 @@ fn stream(
     let Some(opts) = job.options.as_deref() else {
         return Outcome::error(None);
     };
-    let input: Box<dyn std::io::BufRead> = match &job.file {
-        Some(path) => match std::fs::File::open(path) {
+    let input: Box<dyn std::io::BufRead> = match (&job.file, &job.head) {
+        (Some(path), _) => match std::fs::File::open(path) {
             Ok(f) => Box::new(std::io::BufReader::with_capacity(256 << 10, f)),
             Err(e) => return fail(&report::io(&e)),
         },
-        None => Box::new(std::io::stdin().lock()),
+        // the bytes read already, then the rest
+        (None, Some(head)) => Box::new(head.as_slice().chain(std::io::stdin().lock())),
+        (None, None) => Box::new(std::io::stdin().lock()),
     };
     let mut input = Noted::new(input);
     let mut tmp = None;
@@ -715,8 +779,12 @@ fn stream(
         _ => Box::new(std::io::sink()),
     };
     let mut output = Noted::new(output);
-    let result =
-        sparkles_fmt::format_lines(&mut input, &mut output, lang, opts, &args.lines_config());
+    let result = match lang.is_line_format() {
+        true => {
+            sparkles_fmt::format_lines(&mut input, &mut output, lang, opts, &args.lines_config())
+        }
+        false => turtle_stream(job, args, lang, opts, &mut input, &mut output),
+    };
     let (read_error, write_error) = (input.error.take(), output.error.take());
     drop(output);
     let stats = match (result, read_error, write_error) {
@@ -731,6 +799,12 @@ fn stream(
                 Mode::Write => format!("writing the formatted file: {}", report::io(&e)),
                 _ => format!("writing stdout: {}", report::io(&e)),
             });
+        }
+        (Err(FormatError::TooLarge), None, None) if !lang.is_line_format() => {
+            return fail(&format!(
+                "a statement is larger than --max-bytes ({}) allows to format in memory",
+                args.max_bytes
+            ));
         }
         (Err(e), None, None) => return Outcome::error(Some(report::error_line(name, lang, &e))),
     };
@@ -756,6 +830,48 @@ fn stream(
         _ => {}
     }
     o
+}
+
+/// Stream Turtle or TriG from `input`; with `prune-prefixes`, which reads the input
+/// twice, the file is opened again, and stdin is first kept in a temporary file.
+fn turtle_stream<'a>(
+    job: &Job,
+    args: &FmtArgs,
+    lang: Language,
+    opts: &Options,
+    input: &'a mut Noted<Box<dyn std::io::BufRead + '_>>,
+    output: &mut impl Write,
+) -> Result<sparkles_fmt::LineStats, FormatError> {
+    use sparkles_fmt::lines::assemble::io_error as io;
+    use sparkles_fmt::turtle::stream::{StreamConfig, format_stream, reads_twice};
+    let cfg = StreamConfig {
+        max_statement_bytes: args.max_bytes,
+        ..StreamConfig::default()
+    };
+    let spooled = match (&job.file, reads_twice(opts)) {
+        (None, true) => {
+            let mut t = tempfile::NamedTempFile::new().map_err(io)?;
+            std::io::copy(input, &mut t).map_err(io)?;
+            Some(t)
+        }
+        _ => None,
+    };
+    let mut first = match spooled {
+        None => Some(input),
+        Some(_) => None,
+    };
+    let open = || -> std::io::Result<Box<dyn std::io::BufRead + 'a>> {
+        if let Some(i) = first.take() {
+            return Ok(Box::new(i));
+        }
+        let f = match (&spooled, &job.file) {
+            (Some(t), _) => t.reopen()?,
+            (None, Some(path)) => std::fs::File::open(path)?,
+            (None, None) => return Err(std::io::Error::other("stdin cannot be read twice")),
+        };
+        Ok(Box::new(std::io::BufReader::with_capacity(256 << 10, f)))
+    };
+    format_stream(open, output, lang, opts, &cfg)
 }
 
 /// A temporary file next to `path` (through symbolic links), to write the formatted text
@@ -788,14 +904,22 @@ fn replace_with(tmp: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()
 }
 
 /// The message for a document over `--max-bytes`.
-fn too_large_message(len: u64, max: u64, lang: Option<Language>) -> String {
+fn too_large_message(len: Option<u64>, max: u64, lang: Option<Language>) -> String {
     let hint = match lang {
-        Some(Language::Turtle | Language::TriG | Language::JsonLd) => {
+        // they stream unless sorted, and --diff formats in memory
+        Some(Language::Turtle | Language::TriG) => {
+            "; sorting and --diff need it in memory: without them it streams, or raise --max-bytes"
+        }
+        Some(Language::JsonLd) => {
             "; convert it to N-Triples or N-Quads, which stream, to format it"
         }
         _ => "",
     };
-    format!("{len} bytes is more than --max-bytes ({max}) allows to format in memory{hint}")
+    let len = match len {
+        Some(n) => format!("{n} bytes"),
+        None => "the input".to_string(),
+    };
+    format!("{len} is more than --max-bytes ({max}) allows to format in memory{hint}")
 }
 
 /// The language from `--language` or the path's extension; `Ok(None)` when the content
