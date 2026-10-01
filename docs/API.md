@@ -2871,10 +2871,22 @@ open-world when SERVICE is allowed). Common arguments:
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`, `text` being the matched literal (escaped, ≤ 300 characters) and `types` at most 3. Only in builds with the `text` feature; a dataset without an index (`textSearch: false`) gives `text-disabled` |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: exact `spk:vectorSearch` over the stored `spk:vector` literals (it never computes embeddings). `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector |
+| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation), most severe results first (then by shape and focus node). `severity` is `Violation`, `Warning`, `Info` (SHACL 1.2 `Debug` and `Trace` count as info); a complex `path` is a SPARQL property path. Only in builds with the `shacl` feature |
+| `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), results in shape-map order. `shape` is `START` for a START association; `failures` are the report's `appinfo.failures` with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused (`bad-argument`: put the imported shapes into the schema) and EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE and with no prefixes but their own (a failing selector query is `invalid-schema`). Only in builds with the `shex` feature |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
 has the complete JSON Schemas.
+
+**Validation tools.** `validate_shacl` and `validate_shex` read one snapshot (they take
+`atCommit` and `reasoning` like the other tools), write nothing and fetch nothing: no
+imports, no SERVICE (SHACL-SPARQL refuses it as over HTTP). `total` and `counts` cover
+every result; `results` holds the first `maxResults`, cut earlier when the results
+would pass `--mcp-max-bytes`, and `truncated` says whether any were left out. A call
+runs under its timeout, in the validation thread pool of `/{ds}/shacl`, with the
+memory budget bounding the report (512 bytes a result: a SHACL report or ShEx result
+map larger than that is `budget-memory`) and the ShEx typing (64 bytes a pair:
+`budget-validation-work`).
 
 **Terms** in results use Turtle/SPARQL syntax, so they can be pasted into queries:
 `ex:alice` (a dataset prefix whose namespace fits), `<http://…>`, `_:b1f`, `"text"`,
@@ -2924,14 +2936,15 @@ A failed call is a result with `isError: true`, one text block `"<message>\nHint
 |---|---|---|
 | `bad-argument` | 400 | an argument outside its schema (unknown field, out of range, bad IRI) |
 | `unknown-dataset` | 404 | no such dataset, or `dataset` omitted on a server with several (the hint lists them) |
-| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes) |
+| `syntax` | 400 | SPARQL syntax error (line and column; the hint lists the predeclared prefixes); a shapes graph, ShEx schema or shape map that does not parse |
+| `invalid-shapes`, `invalid-schema` | 400 | shapes the SHACL validator cannot use; a ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape) or a shape-map label it does not define |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query` |
 | `timeout` | 408 | the call's timeout passed |
-| `budget-memory`, `budget-rows` | 507 | a query budget was exceeded |
+| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | a query or validation budget was exceeded |
 | `service-disabled` | 403 | a query uses SERVICE and it is not allowed |
 | `unknown-commit` | 404 / 410 | `atCommit` in the future / no longer held |
 | `stale-cursor` | 409 / 400 | a schema cursor whose snapshot is gone / a malformed cursor |
-| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors |
+| `unknown-graph`, `too-many-entries` | 404, 413 | schema discovery errors; `unknown-graph` also for the `graph` of a validation tool |
 | `text-disabled` | 400 | `search_text` on a dataset without a full-text index |
 | `no-vectors` | 400 | `similar_entities`: no vectors under the predicate, a dimension mismatch, or an entity without a vector |
 | `text-unavailable`, `write-failed`, `unsupported` | 503, 503, 501 | as over HTTP |

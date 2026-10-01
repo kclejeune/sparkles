@@ -160,6 +160,10 @@ impl Client {
     }
 }
 
+#[cfg(any(feature = "shacl", feature = "shex"))]
+#[path = "validate_tests.rs"]
+mod validate;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -331,6 +335,32 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "withLabels": {"type":"boolean","default":true},
                 "reasoning": rs, "atCommit": at}}),
         ),
+        #[cfg(feature = "shacl")]
+        (
+            "validate_shacl",
+            json!({"type":"object","additionalProperties":false,"required":["shapes"],"properties":{
+                "dataset": ds,
+                "shapes": {"type":"string","minLength":1,"maxLength":1048576,"description":"The shapes graph in Turtle"},
+                "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
+                "reasoning": rs,
+                "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},
+                "timeoutSeconds": to,
+                "atCommit": at}}),
+        ),
+        #[cfg(feature = "shex")]
+        (
+            "validate_shex",
+            json!({"type":"object","additionalProperties":false,"required":["schema","shapeMap"],"properties":{
+                "dataset": ds,
+                "schema": {"type":"string","minLength":1,"maxLength":1048576,"description":"The schema in ShExC or ShExJ (told apart by a leading `{`)"},
+                "shapeMap": {"type":"string","minLength":1,"maxLength":65536,"description":"A compact shape map; prefixed names use the schema's prefixes, then the dataset's"},
+                "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
+                "reasoning": rs,
+                "onlyNonconformant": {"type":"boolean","default":true,"description":"List only nonconformant results (the counts cover all)"},
+                "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},
+                "timeoutSeconds": to,
+                "atCommit": at}}),
+        ),
     ]
 }
 
@@ -355,7 +385,11 @@ async fn a03_tool_list() {
             "list_commits",
             #[cfg(feature = "text")]
             "search_text",
-            "similar_entities"
+            "similar_entities",
+            #[cfg(feature = "shacl")]
+            "validate_shacl",
+            #[cfg(feature = "shex")]
+            "validate_shex",
         ]
     );
     let expected = expected_input_schemas();
