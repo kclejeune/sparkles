@@ -296,3 +296,35 @@ fn inline_shapes_file_and_union_data_graph() {
     guard::install(&s).unwrap();
     assert!(matches!(upd(&s, named), Err(Error::Rejected(_))));
 }
+
+#[test]
+fn configurations_are_written_as_format_2_and_format_1_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let mut c = cfg(GuardMode::Reject);
+    c.shapes = ShapesSource {
+        inline: Some(SHAPES.into()),
+        ..Default::default()
+    };
+    // given as format 1: written as format 2 with the language
+    enable(&s, c);
+    let j: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(guard::CONFIG_FILE)).unwrap()).unwrap();
+    assert_eq!(j["format"], 2);
+    assert_eq!(j["language"], "shacl");
+    drop(s);
+    // a format 1 file (an older Sparkles wrote it) installs and rejects as before
+    std::fs::write(
+        root.join(guard::CONFIG_FILE),
+        r#"{"format":1,"mode":"reject","shapes":{"file":"validation-shapes.ttl"}}"#,
+    )
+    .unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let g = guard::install(&s).unwrap().unwrap();
+    assert_eq!((g.config().format, g.config().language), (1, None));
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:b a ex:Person }"),
+        Err(Error::Rejected(_))
+    ));
+}
