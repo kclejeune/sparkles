@@ -27,7 +27,7 @@ description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install"]
 dir = "ui"
 run = "pnpm build"
-sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json"]
+sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
 # not index.html: the server build writes a placeholder one when the UI is missing
 outputs = ["build/_app/version.json"]
 
@@ -157,12 +157,20 @@ depends = ["ui:build"]
 run = "cargo build --release -p sparkles-server"
 
 [tasks.licenses]
-description = "Regenerate THIRD_PARTY_LICENSES.md (the license and NOTICE files of the crates the binary links) from Cargo.lock"
-run = "python3 scripts/third-party-licenses.py"
+description = "Regenerate THIRD_PARTY_LICENSES.md (the crates the binary links, from Cargo.lock) and THIRD_PARTY_LICENSES-UI.md (the npm packages in the UI bundle, written by the UI build)"
+depends = ["ui:build"]
+run = [
+  "python3 scripts/third-party-licenses.py",
+  "cp ui/build/licenses.txt THIRD_PARTY_LICENSES-UI.md",
+]
 
 [tasks."licenses:check"]
-description = "Check that THIRD_PARTY_LICENSES.md matches Cargo.lock"
-run = "python3 scripts/third-party-licenses.py --check"
+description = "Check that THIRD_PARTY_LICENSES.md matches Cargo.lock and THIRD_PARTY_LICENSES-UI.md the UI bundle (the UI build fails on a non-permissive license)"
+depends = ["ui:build"]
+run = [
+  "python3 scripts/third-party-licenses.py --check",
+  "cmp -s ui/build/licenses.txt THIRD_PARTY_LICENSES-UI.md || { echo 'THIRD_PARTY_LICENSES-UI.md is out of date: run `mise run licenses`' >&2; exit 1; }",
+]
 
 [tasks.serve]
 description = "Run the server (UI at http://localhost:3030/ui/); extra args go to `sparkles serve`"

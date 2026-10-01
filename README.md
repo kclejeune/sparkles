@@ -834,7 +834,7 @@ mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
-mise run licenses     # regenerate THIRD_PARTY_LICENSES.md after a Cargo.lock change (licenses:check)
+mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
 ```
 
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) holds the license and NOTICE files of
@@ -842,6 +842,23 @@ every crate the binary links (on Linux and macOS), each text once; crates that s
 license file get their license's standard text. `scripts/third-party-licenses.py`
 generates it from `cargo metadata`, so it only changes with `Cargo.lock`; ship it with
 binaries (the Nix packages install it as `share/doc/sparkles/THIRD_PARTY_LICENSES.md`).
+
+[`THIRD_PARTY_LICENSES-UI.md`](THIRD_PARTY_LICENSES-UI.md) does the same for the npm
+packages whose code or fonts end up in the embedded web UI (CodeMirror, Cytoscape, the
+Svelte and SvelteKit runtime, Vite's and Rolldown's runtime helpers, the Fontsource fonts and
+their dependencies), whether dependencies or devDependencies; build tools that ship nothing
+are left out. A Vite plugin
+(`ui/scripts/licenses.js`) takes them from the bundle's module graph and the source files
+of its assets, reads their license files from `node_modules`, and writes the notices into
+the build as `licenses.txt`, which the server serves at `/ui/licenses.txt` (the `sparkles`
+Nix package also installs it as `share/doc/sparkles/THIRD_PARTY_LICENSES-UI.md`). The UI
+build fails when a shipped package's license allows none of MIT, MIT-0, ISC, 0BSD,
+BSD-2-Clause, BSD-3-Clause, Apache-2.0, Zlib, Unlicense, CC0-1.0, BlueOak-1.0.0 or
+OFL-1.1 (the fonts' license). The UI notices are a separate file because they change with
+`ui/pnpm-lock.yaml` and need the UI build, and `sparkles-cli` ships without the UI.
+`mise run licenses` builds the UI and copies the file; `mise run licenses:check` (part of
+`mise run ci`) fails when either file is out of date, and so does the flake check
+`ui-licenses`.
 
 Git hooks live in [`.pre-commit-config.yaml`](.pre-commit-config.yaml) and run with
 [prek](https://github.com/j178/prek) (plain `pre-commit` reads the same file). On staged files
@@ -871,7 +888,8 @@ provides:
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
-  * `checks`: the packages; on Linux also a NixOS VM test of the module behind nginx and
+  * `checks`: the packages, `ui-licenses` (`THIRD_PARTY_LICENSES-UI.md` matches the UI
+    build); on Linux also a NixOS VM test of the module behind nginx and
     `ui-e2e`, the Playwright UI tests against the release binary in nixpkgs' headless
     Chromium (in the build sandbox, on 127.0.0.1);
   * `nixosModules.default`.
