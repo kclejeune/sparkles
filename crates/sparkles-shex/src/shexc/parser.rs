@@ -379,15 +379,30 @@ impl<'a> Parser<'a> {
     }
 
     fn shape_and(&mut self, inline: bool) -> Result<ShapeExpr> {
+        let first_pair = self.starts_pair();
         let first = self.shape_not(inline)?;
         if !self.at_kw("AND") {
             return Ok(first);
         }
-        let mut exprs = vec![first];
+        // a node constraint next to a shape (`IRI @<S>`) is a conjunction of its own;
+        // in a longer conjunction its two parts become members of that one
+        let mut exprs = Vec::new();
+        let mut push = |e: ShapeExpr, pair: bool| match e {
+            ShapeExpr::And(parts) if pair => exprs.extend(parts),
+            e => exprs.push(e),
+        };
+        push(first, first_pair);
         while self.eat_kw("AND") {
-            exprs.push(self.shape_not(inline)?);
+            let pair = self.starts_pair();
+            push(self.shape_not(inline)?, pair);
         }
         Ok(ShapeExpr::And(exprs))
+    }
+
+    /// Whether a `shapeNot` starting here could be a node constraint and a shape side
+    /// by side (not negated, not parenthesized).
+    fn starts_pair(&self) -> bool {
+        !(self.kind() == TokenKind::LParen || self.at_kw("NOT"))
     }
 
     fn shape_not(&mut self, inline: bool) -> Result<ShapeExpr> {
@@ -869,7 +884,7 @@ impl<'a> Parser<'a> {
         let next = self.peek();
         if next.kind == TokenKind::LangTag {
             self.bump();
-            lit.language = Some(self.text(next)[1..].to_string());
+            lit.language = Some(self.text(next)[1..].to_ascii_lowercase());
         } else if self.eat(TokenKind::HatHat) {
             if !self.starts_iri() {
                 return Err(self.expected(&["a datatype IRI after '^^'"]));

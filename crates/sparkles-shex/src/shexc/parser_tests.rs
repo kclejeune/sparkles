@@ -221,6 +221,14 @@ fn shape_expressions() {
         matches!(&or[1], ShapeExpr::And(a) if matches!(a[..], [ShapeExpr::Not(_), ShapeExpr::Nc(_)]))
     );
     assert_eq!(or[2], ShapeExpr::Ref(Label::Iri("http://x/".into())));
+    // a constraint-and-shape pair joins an enclosing conjunction; parentheses keep it
+    let s = ok("ex:S IRI @ex:T AND { } BNODE AND NOT IRI @ex:T AND (IRI @ex:T)");
+    let ShapeExpr::And(and) = &s.shapes[0].expr else {
+        panic!("{:?}", s.shapes[0].expr)
+    };
+    assert_eq!(and.len(), 6, "{and:?}");
+    assert!(matches!(&and[4], ShapeExpr::Not(n) if matches!(**n, ShapeExpr::And(_))));
+    assert!(matches!(&and[5], ShapeExpr::And(a) if a.len() == 2));
     let s = ok("ex:S @_:b ex:T @ # comment\n ex:U ex:V @ex: ex:W { } MINLENGTH 2");
     assert_eq!(s.shapes[0].expr, ShapeExpr::Ref(Label::BNode("b".into())));
     assert_eq!(s.shapes[1].expr, ShapeExpr::Ref(Label::Iri(ex("U"))));
@@ -245,7 +253,8 @@ fn node_constraints() {
         Some(NumericLiteral::Double("-1.5e0".into()))
     );
     assert_eq!(n.total_digits, Some(3));
-    let s = ok("ex:S BNODE LENGTH 2 ex:T [ex:a \"b\"@en 1 true 'c'^^ex:d 2.5] ex:U MAXEXCLUSIVE 5");
+    let s =
+        ok("ex:S BNODE LENGTH 2 ex:T [ex:a \"b\"@en-GB 1 true 'c'^^ex:d 2.5] ex:U MAXEXCLUSIVE 5");
     assert_eq!(nc(&s, 0).node_kind, Some(NodeKind::BNode));
     assert_eq!(nc(&s, 0).length, Some(2));
     let lit = |value: &str, language: Option<&str>, datatype: Option<String>| {
@@ -259,7 +268,7 @@ fn node_constraints() {
         nc(&s, 1).values.as_deref().unwrap(),
         [
             ValueSetValue::Object(ObjectValue::Iri(ex("a"))),
-            lit("b", Some("en"), None),
+            lit("b", Some("en-gb"), None),
             lit("1", None, Some(format!("{XSD}integer"))),
             lit("true", None, Some(format!("{XSD}boolean"))),
             lit("c", None, Some(ex("d"))),

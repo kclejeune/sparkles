@@ -8,10 +8,6 @@ use sparkles_shex::Schema;
 use sparkles_shex::shexc::lexer::{TokenKind, lex};
 use std::path::{Path, PathBuf};
 
-/// Negative-syntax schemas that only the facet rules reject (two facets that cannot be
-/// combined, which the grammar allows). They may parse until those rules are in place.
-const FACET_RULES: &[&str] = &["1unknowndatatypeMaxInclusive.shex"];
-
 fn suite_dir() -> Option<PathBuf> {
     let p = std::env::var("SPARKLES_SHEX_TESTS")
         .map(PathBuf::from)
@@ -85,20 +81,15 @@ fn negative_syntax_fails() {
         suite.display()
     );
     let mut accepted = Vec::new();
-    let mut pending = Vec::new();
     for f in &files {
         let text = std::fs::read_to_string(f).unwrap();
         if Schema::parse_shexc(&text, None).is_ok() {
-            if FACET_RULES.contains(&name(f).as_str()) {
-                pending.push(name(f));
-            } else {
-                accepted.push(name(f));
-            }
+            accepted.push(name(f));
         }
     }
     eprintln!(
-        "negativeSyntax: {}/{} rejected; waiting for the facet rules: {pending:?}",
-        files.len() - accepted.len() - pending.len(),
+        "negativeSyntax: {}/{} rejected",
+        files.len() - accepted.len(),
         files.len()
     );
     assert!(accepted.is_empty(), "accepted: {accepted:?}");
