@@ -3,7 +3,8 @@
 //!
 //! The shapes: a `GroupGraphPattern` holds `{`, then either a `SubSelect` or its
 //! elements, then `}`. A nested group, alone or in a `UNION` chain, is a `Union` of
-//! `UnionBranch`es (one branch when there is no `UNION`). The optional `.` after an
+//! `UnionBranch`es (one branch when there is no `UNION`); every branch but the first
+//! starts with its `UNION`. The optional `.` after an
 //! element that is not a triples statement is a token of the group itself (a triples
 //! statement holds its own `.`).
 
@@ -67,13 +68,15 @@ fn at_pattern_not_triples(p: &Parser<'_>) -> bool {
 fn graph_pattern_not_triples(p: &mut Parser<'_>) {
     if p.at(TokenKind::LBrace) {
         let m = p.start(NodeKind::Union);
-        loop {
+        let b = p.start(NodeKind::UnionBranch);
+        group_graph_pattern(p);
+        b.complete(p);
+        // `UNION` starts the next branch, so a comment before it leads that branch
+        while p.at_kw(Kw::Union) {
             let b = p.start(NodeKind::UnionBranch);
+            p.bump_as(TokenKind::Kw(Kw::Union));
             group_graph_pattern(p);
             b.complete(p);
-            if !p.eat_kw(Kw::Union) {
-                break;
-            }
         }
         m.complete(p);
         return;

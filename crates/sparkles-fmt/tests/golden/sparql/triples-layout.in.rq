@@ -1,0 +1,14 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT * WHERE {
+  ?s ex:p ?o
+  .
+  ?s rdf:type ex:C; ex:name "x"@EN ; ex:b 'single' ;; ex:c '''long''', 'it\'s', 'say "hi"' ;
+  .
+  ?s <http://example.org/full> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> .
+  ?s ex:n "1"^^xsd:integer, "1"^^xsd:decimal, "1.5"^^<http://www.w3.org/2001/XMLSchema#decimal>, "true"^^xsd:boolean, "01"^^xsd:integer .
+  ?s ex:listOfManyObjects ex:aVeryLongObjectNameNumberOne, ex:aVeryLongObjectNameNumberTwo, ex:aVeryLongObjectNameNumberThree .
+  ?s ex:first ex:a ; ex:second ex:aVeryLongObjectNameNumberOne, ex:aVeryLongObjectNameNumberTwo, ex:aVeryLongObjectNameNumberThree .
+  $this ex:var ?that .
+}

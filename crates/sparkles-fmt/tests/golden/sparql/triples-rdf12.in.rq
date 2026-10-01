@@ -1,0 +1,10 @@
+VERSION "1.2"
+PREFIX ex: <http://example.org/>
+SELECT * WHERE {
+  ?who ex:knows ?other ~ ?r {| ex:since ?since |} .
+  <<   ?who ex:worksFor ?org ~ ?claim >> ex:source ?src .
+  ?claim ex:asserted <<( ?who ex:worksFor ?org )>> .
+  << ex:a ex:b ex:c >> .
+  ?s ex:p ?o ~ {| ex:a 1 ; ex:b 2 |} .
+  ?s ex:p ?o ~ ex:r1 ~ ex:r2 .
+}

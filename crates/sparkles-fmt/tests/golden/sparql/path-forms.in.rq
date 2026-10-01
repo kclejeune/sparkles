@@ -1,0 +1,12 @@
+PREFIX ex: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT * {
+  ?s a/rdfs:subClassOf* ?c .
+  ?s ^ex:p ?o .
+  ?s (ex:a|ex:b)+ ?o .
+  ?s ex:a|ex:b/ex:c|^ex:d? ?o .
+  ?s !(a|^a|ex:p) ?o .
+  ?s !^<http://example.org/p> ?o .
+  ?s ((ex:p)) ?o .
+  ?s ?v ?o ; ex:p/ex:q ?o2 .
+}

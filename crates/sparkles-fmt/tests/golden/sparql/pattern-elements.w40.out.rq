@@ -1,0 +1,41 @@
+PREFIX ex: <http://example.org/>
+
+SELECT *
+WHERE {
+  ?s ex:p ?o .
+  OPTIONAL {
+    ?s ex:q ?q .
+  }
+  MINUS {
+    ?s a ex:Hidden .
+  }
+  {
+    ?s ex:r 1 .
+  } UNION {
+    ?s ex:r 2 .
+  } UNION {
+    ?s ex:r 3 .
+  }
+  {
+    ?s ex:alone ?x .
+  }
+  GRAPH ?g {
+    ?o ex:p ?z .
+  }
+  GRAPH ex:g {}
+  SERVICE SILENT ex:sparql {
+    ?z ex:p ?w .
+  }
+  SERVICE ?endpoint {}
+  FILTER(?o != ?z)
+  FILTER REGEX(?w, "x")
+  FILTER ex:check(?w)
+  BIND(?w AS ?bound)
+  {}
+  {
+    SELECT ?s
+    WHERE {
+      ?s ex:p ?o .
+    }
+  }
+}

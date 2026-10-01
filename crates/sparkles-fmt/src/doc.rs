@@ -334,6 +334,11 @@ impl<'a> Printer<'a, '_> {
             };
             match arena.get(d) {
                 Doc::Nil | Doc::BreakParent => {}
+                // spaces at the start of a line go (a line suffix that moved to a line of
+                // its own starts with one): indentation is the printer's
+                Doc::Text(s) if self.pending.is_some() => {
+                    self.write(s.trim_start_matches(' '), mode);
+                }
                 Doc::Text(s) => {
                     self.write(s, mode);
                 }
@@ -821,7 +826,7 @@ mod tests {
         let d = a.text(" # d");
         let suffix2 = a.line_suffix(d);
         let all = a.concat([x, suffix, y, suffix2, hl, x]);
-        assert_eq!(show(&a, all, 80), "xy # c\n # d\nx");
+        assert_eq!(show(&a, all, 80), "xy # c\n# d\nx");
 
         // a suffix with a break parent breaks its group
         let bp = a.break_parent();
