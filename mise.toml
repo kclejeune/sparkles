@@ -231,3 +231,16 @@ flag "--delta <n>" default="10000" help="pending delta quads of the second round
 run = '''
 WARMUP="$usage_warmup" RUNS="$usage_runs" DELTA="$usage_delta" scripts/bench-shacl-write.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
+
+[tasks."bench:backup"]
+description = "Backup repositories on an existing database: full and incremental backup, restore and verify times to an fs repository"
+depends = ["build"]
+usage = '''
+arg "<db>" help="the database directory (copied, never changed; it must not be open in a server)"
+arg "[workdir]" default="target/bench-backup" help="the repository, copies and results/ (backup.md); on the file system to measure"
+flag "--runs <n>" default="3" help="rounds (each: full, commits, incremental, restore, verify)"
+flag "--commits <n>" default="1000" help="single-quad commits before the incremental backup"
+'''
+run = '''
+RUNS="$usage_runs" COMMITS="$usage_commits" scripts/backup-bench.sh "$usage_db" "$(realpath -m "$usage_workdir")"
+'''

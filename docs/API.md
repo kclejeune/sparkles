@@ -105,6 +105,9 @@ client state is in `sparkles_rate_limit_keys{limiter}`, `sparkles_rate_limit_max
 `sparkles_rate_limit_untrusted_forwarded_total{limiter}` counts requests whose
 `X-Forwarded-For` or `Forwarded` came from a peer that is not a trusted proxy (ignored).
 
+Backup repositories add the `sparkles_backup_*` families listed under
+[Backup repositories](#backup-metrics).
+
 ```ts
 type MetricsSnapshot = {
   formatVersion: 1;
@@ -371,7 +374,7 @@ one every two seconds). `--rate-limit preauth=RATE[,burst=N][,failure-cost=N]` o
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merge delta (updates) into a freshly built, sorted base index. Returns `Task`; `409` while a compaction of the dataset is queued or running. |
-| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). |
+| POST   | `/$/backup/{ds}`             | Write an N-Quads dump to `<data>/backups/{ds}_{time}.nq.gz`. `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec (the extension follows it; levels: gzip 0–9, zstd 1–19, brotli 0–11, none for lz4 and none, else `400`). Returns a cancellable `Task`; its message gives the size and time. `409` while a backup of the dataset is queued or running; `507` when the data directory's file system keeps less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are under [Backup repositories](#backup-repositories). |
 | POST   | `/$/reason/{ds}`             | Materialize inferences. JSON body `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string }`, or `{ "rerun": true }` (also `?rerun=true`) to re-run the recorded profile and rules (`409` when nothing is recorded). Returns `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
@@ -399,6 +402,8 @@ type DatasetInfo = {
   };
   forkedFrom?: { id: string; seq: number };   // clones: source dataset id and copied commit
   origin?: DatasetOrigin;                     // clones: origin.json (see Clone)
+  restoredFrom?: { repository: string; backup: string; datasetId: string; seq: number };
+                                              // restored from a backup repository
   access?: "read" | "write" | "admin";        // with auth: the caller's level (absent without)
 };
 
@@ -419,9 +424,11 @@ type DatasetStats = {
 };
 
 type Task = {
-  id: string; kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild";
+  id: string;
+  kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild"
+      | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy";
   dataset: string;          // "" for a server-wide task (listed for server admins only)
-  target?: string /* the dataset a clone creates */;
+  target?: string;          // the dataset a clone creates; for backup tasks see Backup repositories
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   startedAt: string; finishedAt?: string; progress?: number /*0..1*/;
   message?: string;         // absolute paths cut to "…/" and their last component,
@@ -748,6 +755,540 @@ CLI: `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT]`,
 `sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL`. These open the
 database, so stop a server that holds it or use the HTTP API. In Rust:
 `Store::snapshot_at`, `create_snapshot`, `set_retention`, `history`.
+
+## Backup repositories
+
+*Extension* (the `backup` cargo feature of `sparkles-server`, on by default). A
+**repository** is a directory (`fs`: a local or mounted file system) or a bucket prefix
+(`s3`: AWS S3 or an S3-compatible service such as MinIO, Cloudflare R2 or Ceph RGW) that
+holds deduplicated, content-addressed copies of dataset files. A **backup** is one
+persistent dataset at one commit, described by an immutable manifest. Backups are made,
+listed, restored and verified per dataset under `/$/backups/{ds}`; repositories are
+registered and maintained under `/$/repositories`; lifecycle policies (schedules and
+retention) live under `/$/backup-policies`. The web UI has a Backups page for all three.
+The older `POST /$/backup/{ds}` (an N-Quads dump in the data directory) is unchanged.
+
+**What a backup holds.** The files of the dataset's current index generation
+(`gen-NNNN/…`: the permutations, the vocabulary, `wal.log`, `delta.vocab`), the commit
+catalog `commits.bin`, and `CURRENT`, `dataset.json` and `prefixes.json`, plus, when the
+dataset has them, `text.json`, `origin.json`, `validation.json` and
+`validation-shapes.ttl`, and `reasoning.json` unless its inferences were made at a later
+commit than the captured one. The full-text index is left out and rebuilt when the
+restored dataset opens (`derived.text.rebuildOnRestore`). Older index generations, named
+snapshots and the retention window (`history.json`) are left out too, so point-in-time
+reads of a restored dataset reach back to the start of the backup's generation only.
+In-memory datasets cannot be backed up (`501 backup-unsupported`).
+
+**Capture.** A backup pins one commit (the head when the task starts) without blocking
+writers: under the writer lock it only records the length of the append-only files and
+the prefixes (`sparkles_backup_capture_lock_seconds`), then reads through open file
+handles. Writes, compactions and bulk commits continue during the upload. The backup
+holds a lease on its generation, so history collection keeps the directory until the
+upload ends; `GET /$/history/{ds}` shows it as a hold `backup:<name>`.
+
+**Incremental and deduplicated.** Files are stored as blobs named by the SHA-256 of their
+content. Generation files are immutable, so each is cut into 32 MiB pieces and a piece
+the repository already holds is not uploaded again: a piece the parent backup (the
+newest backup of the same dataset id) references is reused without a request, and any
+other piece over 1 MiB is looked for with a `HEAD` first (which deduplicates across
+datasets and after an interrupted backup). Of the append-only files (`wal.log`, `delta.vocab`, `commits.bin`)
+only the bytes appended since the parent are uploaded, as new segments; a file with more
+than 64 segments, or one that no longer extends the parent's copy, is stored from scratch.
+So a backup after a few writes adds little more than the new WAL records and catalog
+entries, and a backup after a compaction uploads the new generation in full. Blobs are
+LZ4-compressed when that saves at least 10 %. `addedBytes` of a backup is what it
+uploaded first; `logicalBytes` is the size of its files.
+
+**Consistency.** The manifest `backups/<name>.json` is written last with a conditional
+create, so a backup exists if and only if its manifest does: a failed or cancelled backup
+leaves only unreferenced blobs, which the next backup reuses and garbage collection
+removes. Manifests and blobs are never changed after they are written. A restore
+validates the manifest before writing anything (paths, sizes, format), checks every
+blob's length and SHA-256 and every file's SHA-256, runs `sparkles check` on the
+restored directory (`quick` by default), opens it and compares its head commit and quad
+count with the manifest (`500 restore-mismatch` otherwise) before it publishes it.
+
+**Names.** Repository and policy names follow `[a-z0-9][a-z0-9_-]{0,63}` and share one
+namespace on a server (a policy cannot take a repository's name, or the other way
+round); a policy cannot be named `preview`. Backup names follow
+`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; the default is `{dataset}-{YYYYMMDDtHHMMSSz}`
+(`wiki-20260930t140511z`), with the dataset part shortened or its other characters
+replaced by `-` when needed.
+
+**Identity.** Every dataset has a dataset id (a UUID, see [Commits](#commits)); a backup
+records it. A restore gives the restored dataset:
+
+| `identity` | Dataset id |
+|---|---|
+| `auto` (default) | the backup's id, unless a dataset on this server has it (the dataset being replaced included, so restoring in place of the live dataset it came from mints a new one); then as `new` |
+| `new` | a fresh id; `forkedFrom: {id, seq}` names the backup's dataset and commit. Commit numbers continue from the backup's commit |
+| `keep` | the backup's id; `409 duplicate-dataset-id` if another dataset has it, or when replacing in place a dataset with that id whose head is past the backup's commit (the same commit numbers would name different commits) |
+
+A restored dataset's `DatasetInfo` has `restoredFrom: {repository, backup, datasetId,
+seq}`, and its directory a `restore.json`.
+
+**Which backups belong to `/{ds}`.** By dataset id, not by name alone, so a new dataset
+that reuses a deleted one's name does not reach the old one's backups: the backups of the
+live dataset `ds`, and of the dataset it replaced by an in-place restore (its
+`forkedFrom` id) under the same name. A `server-admin` also sees every backup taken of a
+dataset named `ds`, which is how a deleted dataset is restored (disaster recovery). A
+backup outside these answers `404 no-such-backup`, as a missing one does.
+`sameLineage` in `GET /$/backups/{ds}` marks backups of the live dataset (or the one it
+replaced).
+
+### Backup routes
+
+Every request body is JSON; an empty body is `{}`. Unknown fields are ignored. Tasks
+answer `202` with the `Task` (see [Datasets (admin)](#datasets-admin)), once it has
+started or queued, and a `Location` where noted.
+
+| Method | Path | Needs | Description |
+|--------|------|-------|-------------|
+| GET | `/$/repositories` | any caller | `{repositories: (Repository \| RepositoryBrief)[]}`: every repository for `server-admin`; `{name, type, readonly, reachable}` for callers with `admin` on some dataset (to pick a target); `[]` otherwise |
+| POST | `/$/repositories[?verify=false]` | `server-admin` | Register a repository (body `RepositoryConfig`). An empty location is initialized (unless `readonly`), an existing repository is attached; then the connection test runs (`?verify=false` skips it). `201` + `Location: /$/repositories/{repo}` + `Repository` with `test`. A location that cannot be reached is registered anyway, shown unreachable, with a failed `test`. `409 repository-exists` for a taken name, a location or repository id registered under another name; `409 not-a-repository` for a location that holds other files; `422 incompatible-repository` |
+| GET | `/$/repositories/{repo}` | `server-admin` | `Repository` (its totals and last GC are refreshed in the background) |
+| PUT | `/$/repositories/{repo}` | `server-admin` | Change the settings (body `RepositoryConfig`; `name` may be left out, and cannot change). `409 location-immutable` if `type`, `path`, `bucket`, `prefix` or `endpoint` changes; `409 read-only-config` for a repository of the config file. The repository is reopened with the new settings at its next use |
+| DELETE | `/$/repositories/{repo}` | `server-admin` | Unregister (`204`); the repository's contents stay. `409 repository-in-use` while a policy backs up into it (`policies`) or a task uses it (`task`); `409 read-only-config` |
+| POST | `/$/repositories/{repo}/test` | `server-admin` | The connection test: `TestReport`. Its steps create an object under `probe/` with a conditional create, create it again (expecting "already exists": conditional writes work), read it, list it and delete it |
+| POST | `/$/repositories/{repo}/verify` | `server-admin` | Verify every backup and count orphaned blobs (body `{level?: "exists" \| "data"}`, default `exists`; `restore` is `400 invalid-request`): task `backup-verify` (server-wide) with `detail: VerifyReport` |
+| GET | `/$/repositories/{repo}/backups` | `server-admin` | `{backups: BackupSummary[], next: string \| null}`, newest `completed` first. `?dataset=NAME`, `?datasetId=UUID`, `?policy=P`, `?limit=N` (default 100, at most 1000), `?before=T` (only backups completed before the RFC 3339 instant `T`; pass `next` to get the following page) |
+| POST | `/$/repositories/{repo}/gc` | `server-admin` | Delete unreferenced blobs (body `{dryRun?: boolean, graceHours?: number}`, grace default 24): task `backup-gc` (server-wide) with `detail: GcReport`. `409 repository-read-only` |
+| GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
+| DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Break a lock (`204`; audited). `404 no-such-lock`; `409 repository-read-only` |
+| GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`: the dataset's backups in every repository (or `R` only), newest first, with `sameLineage`. A repository that cannot be reached is left out (one found unreachable in the last minute is not tried again) |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Back up now (body `{repository, name?, note?}`): task `backup-create` with `detail: BackupSummary`, `Location: /$/backups/{ds}/{repo}/{name}`. `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only`, `409 backup-exists`, `409 backup-in-progress` (`task`: one backup of a dataset into a repository at a time), `501 backup-unsupported` (in-memory dataset) |
+| GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary with the manifest's files, blobs and upload statistics |
+| DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Delete the backup's manifest (`204`); its blobs go at the next GC. `409 backup-busy` (`task`) while a restore or verification of it runs here; `409 repository-read-only` |
+| POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restore (body `RestoreRequest`): task `backup-restore`, `Location: /$/datasets/{target}`. See [Restore](#restore) |
+| POST | `/$/backups/{ds}/{repo}/{backup}/verify` | `admin` on `ds` | Verify one backup (body `{level?: "exists" \| "data" \| "restore"}`, default `exists`): task `backup-verify` with `detail: VerifyReport`; the result is remembered as the backup's `verified` |
+| GET | `/$/backup-policies` | `server-admin` | `{policies: Policy[]}` |
+| POST | `/$/backup-policies` | `server-admin` | Create a policy (body `PolicyConfig`): `201` + `Location: /$/backup-policies/{policy}` + `Policy`. `409 policy-exists` (a policy or repository has the name), `404 no-such-repository`, `409 repository-read-only`. It first runs at its next scheduled instant |
+| POST | `/$/backup-policies/preview` | `server-admin` | Body `{schedule, timezone?: string /* UTC */, count?: number /* 5, at most 20 */, nameTemplate?, dataset?}` → `{next: string[] /* RFC 3339 UTC */, description, sample?}`; `sample` renders `nameTemplate` for `dataset` at `next[0]` |
+| GET | `/$/backup-policies/{policy}` | `server-admin` | `Policy` |
+| PUT | `/$/backup-policies/{policy}` | `server-admin` | Replace the settings (body `PolicyConfig`; `name` may be left out, and cannot change): `Policy`. Enabling or disabling a policy is a PUT. `409 read-only-config` for a policy of the config file. A new schedule or time zone waits for its next instant |
+| DELETE | `/$/backup-policies/{policy}` | `server-admin` | `204`; a running run stops before its next dataset. `409 read-only-config` |
+| POST | `/$/backup-policies/{policy}/run` | `server-admin` | Run now (also a disabled policy): task `backup-policy` (server-wide) with `detail: PolicyRun`, `Location: /$/tasks/{id}`. The schedule does not move. `409 policy-running` (`task`) |
+| POST | `/$/backup-policies/{policy}/retention[?dryRun=true]` | `server-admin` | Apply the policy's retention now: `{dryRun, delete: BackupSummary[], keep: BackupSummary[], errors?: string[]}`. With `dryRun` nothing is deleted. A deletion that fails stays in `delete` and adds to `errors` |
+| GET | `/$/backup-policies/{policy}/runs[?limit=N]` | `server-admin` | `{runs: PolicyRun[]}`, newest first (default 50, at most 1000) |
+
+A server built without the `backup` feature answers these paths `404`; the UI then hides
+its Backups page.
+
+**`--read-only` servers** create, verify and delete backups, test repositories, run
+policies and their retention, collect repositories and break locks (on writable
+repositories). Restores, and changes to repositories and policies, answer
+`403 server-read-only`.
+
+### Restore
+
+```ts
+type RestoreRequest = {
+  target?: string;          // the dataset to create (default: {ds}), or to replace
+  replace?: boolean;        // replace the registered dataset `target` in place
+  identity?: "auto" | "new" | "keep";   // default auto (see Identity)
+  check?: "quick" | "full" | "none";    // sparkles check before publishing; default quick
+  keepReplaced?: boolean;   // in place: keep the old files as databases/.kept-{target}-{task}
+};
+```
+
+A restore downloads into `databases/.restore-{target}-{task}` and publishes the directory
+only once it is complete and checked, so a failed or cancelled restore leaves nothing
+behind.
+
+* **A new dataset** (`replace: false`): `target` must not exist (`409 dataset-exists`);
+  its name is reserved while the task runs. The directory is renamed into
+  `databases/{target}` and the dataset registered, as a clone is.
+* **In place** (`replace: true`): `target` must be a persistent dataset of this server's
+  data directory (`404 no-such-dataset`; `409 not-managed` for an in-memory dataset or one
+  attached with `--loc`) that no backup task works on (`409 dataset-busy`, `task`).
+  Once downloaded and checked, requests to `/{target}` are answered
+  `503 {code: "dataset-restoring"}` with `Retry-After: 5`, never `404`. The swap waits up
+  to 30 s for requests in progress to finish (`409 dataset-busy` after that, and the
+  dataset stays as it was), renames `databases/{target}` to
+  `databases/.replaced-{target}-{task}` and the restored directory into its place,
+  reopens the dataset, and removes the old files (unless `keepReplaced`). If the new
+  database fails to open, the old one is put back. A crash between the two renames is
+  undone at the next start.
+
+The task can be cancelled until it publishes the dataset (`cancellable` turns `false`
+then). A restore needs `admin` on the target name too (`403 no admin access to the
+target name /x`). The task's `detail` is `{backup: BackupSummary, dataset, datasetId,
+identity: "kept" | "new", forkedFrom?: {id, seq}, check: object | null, millis}`.
+
+### Backup types
+
+```ts
+type RepositoryConfig = {
+  name: string;
+  type: "fs" | "s3" | "gcs" | "azure";   // gcs, azure: experimental, config file only
+  path?: string;            // fs: absolute; not inside the data directory or a config file's directory
+  bucket?: string;          // s3, gcs, azure (azure: the container)
+  prefix?: string;          // key prefix inside the bucket
+  region?: string;          // s3
+  endpoint?: string;        // s3: https:// (http:// with allowHttp) URL of MinIO, R2, Ceph RGW, …; no credentials, query or fragment
+  pathStyle?: boolean;      // s3: path-style addressing (MinIO)
+  allowHttp?: boolean;      // s3: allow an http:// endpoint
+  credentials?: Credentials;             // s3; default {source: "default"}
+  sse?: "AES256" | "aws:kms";            // s3 server-side encryption
+  kmsKeyId?: string;        // with sse "aws:kms"
+  conditionalWrites?: boolean;           // default true: creates with If-None-Match: *;
+                                         // false: HEAD then PUT, one writer at a time
+  readonly?: boolean;       // never write (restore, list and verify only; no locks)
+  maxConcurrency?: number;  // parallel object requests (default 8 for s3, 4 otherwise)
+  maxUploadBytesPerSec?: number;         // bandwidth limits shared by the repository's
+  maxDownloadBytesPerSec?: number;       // tasks (default unlimited)
+};
+
+type Credentials =        // references only: Sparkles stores no secrets
+  | { source: "default" }   // the AWS environment and provider chain (AWS_*, web identity, instance metadata)
+  | { source: "env"; accessKeyIdVar: string; secretAccessKeyVar: string; sessionTokenVar?: string }
+  | { source: "file"; path: string }     // JSON {accessKeyId, secretAccessKey, sessionToken?}, re-read at each open
+  | { source: "named"; name: string };   // a [credentials.<name>] source of the backup config file
+
+type Repository = RepositoryConfig & {
+  source: "api" | "config";  // config: from --backup-config, read-only through the API
+  id: string | null;         // from the repository's marker, once reached
+  status: { reachable: boolean; checked: string; error?: string;
+            conditionalWrites?: boolean; singleWriter: boolean };
+  stats: { backups: number; datasets: number; storedBytes: number; logicalBytes: number;
+           dedupRatio: number /* logical / stored */; asOf: string } | null;
+  lastGc: (GcReport & { finished: string }) | null;
+  policies: string[];        // policies that back up into it
+  test?: TestReport;         // POST /$/repositories only
+};
+type RepositoryBrief = { name: string; type: string; readonly: boolean; reachable: boolean };
+
+type TestReport = {
+  ok: boolean; conditionalWrites: boolean;
+  steps: { step: "create" | "create-again" | "read" | "list" | "delete";
+           ok: boolean; millis: number; error?: string }[];
+};
+
+type BackupSummary = {
+  name: string;
+  repository: string;        // the repository's name on this server
+  dataset: { name: string; id: string };
+  commit: { seq: number; timestamp: string; quads: number; ref: string /* commit:<seq> */ };
+  created: string; completed: string; millis: number;
+  logicalBytes: number;      // the size of its files
+  addedBytes: number;        // stored bytes of the blobs it uploaded first
+  policy: string | null; run: string | null; note: string | null;
+  sameLineage?: boolean;     // GET /$/backups/{ds} only
+  verified: { level: "exists" | "data" | "restore"; status: "ok" | "error"; at: string } | null;
+                             // the last verification on this server
+};
+
+type Backup = BackupSummary & {
+  format: 1; generation: string /* gen-NNNN */; indexFormat: number;
+  parent: string | null;     // the backup whose blobs it reused
+  server: { version: string };
+  files: { path: string; kind: "immutable" | "append" | "meta"; size: number;
+           sha256: string; blobs: { id: string; size: number }[] }[];
+  stats: { logicalBytes: number; addedBytes: number; files: number; blobs: number;
+           newBlobs: number; reusedBlobs: number };
+  derived: { text: { rebuildOnRestore: boolean } | null };
+};
+
+type VerifyReport = {
+  level: "exists" | "data" | "restore";
+  status: "ok" | "warning" /* orphans only */ | "error";
+  backups: { name: string; status: "ok" | "error";
+             missing: string[];   // blobs missing or of the wrong size
+             corrupt: string[];   // blobs whose content does not hash to their id
+             check?: object }[];  // restore: the sparkles check report
+  orphans?: { blobs: number; bytes: number };   // repository verification only
+  requests: { list: number; head: number; get: number };
+  millis: number;
+};
+
+type GcReport = {
+  dryRun: boolean; manifests: number; referencedBlobs: number; listedBlobs: number;
+  candidates: number;        // unreferenced blobs
+  deleted: number; deletedBytes: number;   // dry run: what a real run would delete
+  keptYoung: number;         // unreferenced, but younger than the grace period
+  storedBytesAfter: number;
+  requests: { list: number; get: number; delete: number };
+  millis: number; lockWaitMillis: number;
+};
+
+type Lock = {
+  id: string; kind: "shared" | "exclusive";
+  operation: "create" | "restore" | "verify" | "delete" | "gc";
+  holder: { host: string; pid: number; server: string /* hash of its data directory; "" for the CLI */; version: string };
+  created: string;
+  lastModified: string;      // the storage server's time of its last refresh
+  stale: boolean;            // not refreshed for 30 min: ignored, removed by GC
+};
+
+type PolicyConfig = {
+  name: string;
+  repository: string;
+  datasets?: string[];       // names or * globs; default ["*"] (in-memory datasets are skipped)
+  schedule: string;          // cron, or "every <duration>"
+  timezone?: string;         // IANA name; default UTC
+  nameTemplate?: string;     // default "{policy}-{dataset}-{time}"
+  retention?: { expireAfter?: string | null; minCount?: number /* 1 */; maxCount?: number | null };
+  skipUnchanged?: boolean;   // skip a dataset whose head is its last policy backup's commit
+  gcAfterRetention?: boolean;   // collect the repository after retention deleted something
+  catchUp?: "one" | "none";  // default one
+  enabled?: boolean;         // default true
+};
+
+type Policy = PolicyConfig & {
+  source: "api" | "config";
+  state: { nextRun: string | null; lastScheduledFor: string | null; lastRun: PolicyRun | null;
+           lastSuccess: string | null; consecutiveFailures: number; runningTask: string | null };
+};
+
+type PolicyRun = {
+  id: string; policy: string;
+  trigger: "schedule" | "catch-up" | "manual";
+  scheduledFor: string | null; started: string; finished: string | null;
+  result: "ok" | "partial" | "failed" | "skipped";
+  datasets: { dataset: string; backup: string | null; result: "ok" | "failed" | "skipped";
+              reason?: string; addedBytes?: number; millis?: number }[];
+  retention: { deleted: string[]; error?: string } | null;
+  gc: { task: string } | null;   // the backup-gc task it started
+};
+```
+
+Timestamps are RFC 3339 in UTC with milliseconds; sizes are bytes.
+
+### Lifecycle policies
+
+A policy backs up the datasets matching `datasets` into `repository` on a schedule, one
+dataset after another (each a backup like `POST /$/backups/{ds}`, holding a task slot
+while it runs), then applies its retention.
+
+* **Schedules.** Cron with 5 fields (minute hour day-of-month month day-of-week), or 6
+  with seconds first (no `@daily`-style macros), evaluated in the policy's `timezone`: a
+  local time skipped by a daylight-saving change runs at the first instant after the
+  gap, a repeated one runs once, at its first occurrence. `every <duration>` (at least
+  one minute) counts from the Unix epoch in UTC, so `every 6h` runs at 00:00, 06:00, …
+  UTC whatever the time zone or restarts. A schedule that does not parse, or never runs,
+  and an unknown time zone are `400 invalid-schedule`.
+* **Durations** (`expireAfter`, `every`): one or more `<n><unit>` terms, such as `30d`,
+  `12h`, `1w`, `90m`, `1d 12h`; units `s`, `m`, `h`, `d`, `w` (or `sec`, `min`, `hr`,
+  `hour`, `day`, `week`, and plurals).
+* **Name templates.** `{policy}`, `{dataset}`, `{seq}` (the head commit), `{run}` (the
+  first 8 hex digits of the run id), `{time}` (the scheduled instant,
+  `YYYYMMDDtHHMMSSz` in UTC), `{date:FMT}` (the scheduled instant in the policy's zone;
+  `%Y %m %d %H %M %S %j %V`). The result must be a valid backup name; characters of the
+  dataset name outside the grammar become `-`, and a long dataset name is shortened to
+  keep the result within 64 characters. A name that is taken gets `-2`, `-3`, …
+* **Retention** considers only the policy's own backups in its repository, per dataset
+  id, newest `completed` first: the first `minCount` are kept; of the others, those at
+  a position ≥ `maxCount` or completed more than `expireAfter` ago are deleted, except
+  backups a restore or verification uses at that moment (kept until the next run).
+  Deleting a backup removes its manifest; GC removes the blobs. With `gcAfterRetention`
+  a run whose retention deleted something starts a `backup-gc` task, at most once per
+  24 h per repository.
+* **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
+  its next instant. Instants missed while the server was down are covered by one run
+  60 s after startup (`trigger: "catch-up"`), or recorded as `skipped` with
+  `catchUp: "none"`. An instant that comes while the previous run still runs is recorded
+  as `skipped`. A disabled policy lets its instants pass; disabling or deleting one
+  during a run stops it before its next dataset (the run ends `skipped`).
+* **Results.** A run is `ok` when every selected dataset was backed up or skipped
+  (`in-memory dataset`, `unchanged`), `partial` when some failed, `failed` when none
+  succeeded. `lastSuccess` and `consecutiveFailures` follow them. The last 1000 runs of
+  all policies are kept.
+
+### Backup tasks
+
+| Kind | `dataset` | `target` | `detail` |
+|---|---|---|---|
+| `backup-create` | the dataset | the backup name | `BackupSummary` |
+| `backup-restore` | `{ds}` of the route | the dataset created or replaced | see [Restore](#restore) |
+| `backup-verify` | the dataset, or `""` for a repository | the backup name, or the repository | `VerifyReport` |
+| `backup-gc` | `""` | the repository | `GcReport` |
+| `backup-policy` | `""` | the policy | `PolicyRun` |
+
+Server-wide tasks (`dataset: ""`) are listed for `server-admin` only. Backup tasks take
+their own slots: at most `sparkles serve --backup-max-tasks` (default 2) run at once, the
+others wait `queued`. Up to 4 more per slot may wait; past that a request answers
+`503 too-many-tasks`. Every backup task can be cancelled (`DELETE /$/tasks/{id}`), while
+queued too; cancellation is checked between object requests and every 8 MiB of data,
+and the task ends `cancelled`. A failed task's `message` starts with the error code
+(`repository-unavailable: …`). A cancelled backup leaves only unreferenced blobs; a
+cancelled restore leaves the target as it was.
+
+### Backup errors
+
+Errors are `{error, code, requestId}` plus, for some codes, `task`, `holder`,
+`policies` or `field`.
+
+| Status | `code` |
+|---|---|
+| 400 | `invalid-name`; `invalid-config` (a repository or policy setting, a malformed repository or backup request body, a refused destination; `field` names the setting); `invalid-request` (a malformed query parameter or policy request body, a repository verification at level `restore`); `invalid-schedule` (also an unknown time zone) |
+| 403 | `server-read-only` |
+| 404 | `no-such-repository`, `no-such-backup` (also a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
+| 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (`policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (`task`), `backup-busy` (`task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait; `holder`), `dataset-exists`, `dataset-busy` (`task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (`task`) |
+| 422 | `incompatible-repository` (a newer repository format, or encryption), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation; `field`) |
+| 500 | `restore-mismatch`, `internal` |
+| 501 | `backup-unsupported` (an in-memory dataset); `not-implemented` |
+| 502 | `repository-unavailable` (a storage error after retries; messages never include URL query strings) |
+| 503 | `catalog-lagging` (the commit catalog could not be flushed; retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`); `cancelled` (a task's) |
+| 507 | `insufficient-storage` (reserved: a restore does not check the free space beforehand yet) |
+
+Callers without `server-admin` see absolute paths in these messages cut to their last
+component. Storage requests are retried with exponential backoff (up to 10 retries within
+3 minutes each); a downloaded blob that fails its hash is fetched again twice.
+
+### Locks and garbage collection
+
+Operations take a lease object `locks/<uuid>.json` in the repository: a **shared** lock
+for create, delete, restore and verify, an **exclusive** one for GC's sweep. A held lock
+is rewritten every 5 minutes; one not rewritten for 30 minutes (by the storage server's
+clock, never this host's) is **stale**: ignored by others and removed by GC. An
+operation that meets a conflicting lock retries with backoff for up to 10 minutes, then
+fails with `409 repository-locked`. Read-only repositories take no locks. So several
+servers, and the CLI, can share a repository.
+
+GC marks the blobs every manifest references under a shared lock (backups continue),
+then takes the exclusive lock, lists the manifests again and deletes the unreferenced
+blobs older than the grace period (default 24 h, again by the storage server's clock).
+The last GC's report is kept in the repository (`gc/last.json`, `lastGc`); a dry run
+reports what a real run would delete and changes nothing.
+
+A repository with `conditionalWrites: false` (or a service without conditional creates,
+found by the connection test: `status.singleWriter`) must have one writer at a time.
+
+### Configuration file
+
+`sparkles serve --backup-config FILE` (or `$SPARKLES_BACKUP_CONFIG`) reads repositories,
+policies and the limits of API registrations from a TOML file. Keys are snake_case
+forms of the JSON fields; unknown keys are errors (with line and column), and a file that
+does not load stops the server at startup. SIGHUP re-reads it: its repositories and
+policies replace the previous ones, the API's stay; a file that does not load leaves
+everything as it was (logged). Its entries have `source: "config"` and answer
+`409 read-only-config` to `PUT` and `DELETE`. The file holds no secrets, only references
+to them; the server warns when it is readable by group or others. `sparkles repo add`
+and `repo remove` edit the same file for the CLI.
+
+```toml
+version = 1
+
+[repositories.local]
+type = "fs"
+path = "/srv/backups/sparkles"
+
+[repositories.s3-main]
+type = "s3"
+bucket = "kg-backups"
+prefix = "prod/sparkles"
+region = "eu-central-1"
+credentials = { source = "file", path = "/run/secrets/sparkles-s3.json" }
+sse = "aws:kms"
+kms_key_id = "arn:aws:kms:eu-central-1:111122223333:key/…"
+max_upload_bytes_per_sec = 104857600
+# also: endpoint, path_style, allow_http, conditional_writes, readonly,
+# max_concurrency, max_download_bytes_per_sec
+
+[repositories.minio]
+type = "s3"
+bucket = "lab"
+endpoint = "http://127.0.0.1:9000"
+path_style = true
+allow_http = true
+credentials = { source = "named", name = "lab" }
+
+[policies.nightly]
+repository = "s3-main"
+datasets = ["*"]
+schedule = "30 2 * * *"
+timezone = "Europe/Berlin"
+name_template = "{policy}-{dataset}-{date:%Y%m%d}"
+retention = { expire_after = "30d", min_count = 7, max_count = 60 }
+gc_after_retention = true
+# also: skip_unchanged, catch_up = "one" | "none", enabled
+
+# credential sources, by name; the only ones repositories registered through the API may use
+[credentials.lab]
+source = "env"                  # or "file" (path = …), or "default"
+access_key_id_var = "LAB_ACCESS_KEY"
+secret_access_key_var = "LAB_SECRET_KEY"
+# session_token_var = "LAB_SESSION_TOKEN"
+
+# limits of repositories registered through the API
+[api]
+fs_roots = ["/srv/backups"]
+```
+
+**Repositories registered through the API** (and the UI) are held to the operator's
+choices, since a caller could otherwise point the server's credentials or its network
+access wherever they like:
+
+* `s3` credentials can only be `{"source": "named", "name": …}`, naming a
+  `[credentials.<name>]` source of the config file (`400 invalid-config`, `field:
+  "credentials"` or `"credentials.name"`, otherwise); never environment variables, files
+  or the default provider chain of the caller's choosing. Without a config file an `s3`
+  repository cannot be registered through the API.
+* An `s3` endpoint, and every address its host name resolves to, must pass the server's
+  outbound policy (the `--outbound-*` flags of `SERVICE` and `LOAD`: public addresses
+  only by default), and connections go only to the addresses checked. A MinIO on
+  localhost needs `--outbound-allow 127.0.0.1` or `--outbound-allow-private`. A refused
+  endpoint is `400 invalid-config` (`field: "endpoint"`).
+* `fs` repositories must lie under one of `[api] fs_roots` when it is set.
+* `gcs` and `azure` repositories use the server's own credentials and can only come from
+  the config file; `memory` is for tests.
+
+Every `fs` repository, from either source, lies outside the data directory and outside
+the directories of the server's config files (`--backup-config`, `--auth-config`).
+
+### Backup metrics
+
+| Name | Type | Labels |
+|------|------|--------|
+| `sparkles_backup_operations_total` | counter | `repository`, `operation` = `create` \| `restore` \| `verify` \| `delete` \| `gc`, `result` = `ok` \| `failed` \| `cancelled` |
+| `sparkles_backup_operation_duration_seconds` | histogram (1 s … 2 h) | `operation` |
+| `sparkles_backup_bytes_uploaded_total`, `…_bytes_downloaded_total` | counter | `repository` |
+| `sparkles_backup_blobs_uploaded_total`, `…_blobs_reused_total` | counter | `repository` |
+| `sparkles_backup_object_requests_total` | counter (the requests verifications and GC report) | `repository`, `op` = `list` \| `head` \| `get` \| `delete`, `result` = `ok` |
+| `sparkles_backup_last_success_timestamp_seconds` | gauge (the last backup of the dataset into the repository) | `dataset`, `repository` |
+| `sparkles_backup_capture_lock_seconds` | histogram (0.5 ms … 1 s; the writer-lock hold of a capture) | |
+| `sparkles_backup_repository_stored_bytes`, `…_logical_bytes`, `…_backups` | gauge (from the last listing) | `repository` |
+| `sparkles_backup_lock_conflicts_total` | counter (`repository-locked` failures) | `repository` |
+| `sparkles_backup_policy_runs_total` | counter | `policy`, `result` |
+| `sparkles_backup_policy_last_success_timestamp_seconds`, `…_next_run_timestamp_seconds`, `…_consecutive_failures` | gauge | `policy` |
+
+`repository` is capped like `dataset` (`--metrics-max-datasets`; the rest share
+`$other`). Each backup task is a span `task backup-*` with children such as
+`backup.capture` (`sparkles.commit`, `sparkles.backup.lock_ms`). Task starts and ends are
+logged under `sparkles::backup`; `repository_added`, `repository_changed`,
+`repository_removed`, `backup_deleted`, `restore_started`, `restore_finished`,
+`gc_finished`, `lock_broken` and `policy_changed` go to the `sparkles::audit` target with
+the principal.
+
+### Files on the server
+
+Under `<data>/backup/`: `repositories.json` and `policies.json` (the API's entries),
+`policy-state.json` (when each policy last ran and succeeded), `runs.json` (the run
+history), `verify.json` (each backup's last verification on this server: `verified`) and
+`cache/<repository id>/` (a manifest cache). Restores use
+`<data>/databases/.restore-*` and `.replaced-*` (removed or undone at the next start),
+`.kept-*` (`keepReplaced`), and restore-level verifications `<data>/tmp/verify-*`.
+
+**The data-directory lock.** `sparkles serve` holds an OS lock on
+`<data>/sparkles-server.lock` while it runs: a second server on the same data directory
+fails at startup, and an offline `sparkles backup restore --data` refuses to write into
+it.
+
+A repository's own layout (format 1), shared by the server and the CLI:
+
+```text
+<prefix>/
+  sparkles-repo.json            marker: format, repository id, piece size (created once)
+  blobs/<hh>/<sha-256>          content blobs, immutable (<hh>: the id's first two hex digits)
+  backups/<name>.json           manifests, immutable, created last
+  locks/<uuid>.json             lock leases
+  probe/<uuid>                  connection-test objects
+  gc/last.json                  the last GC's report
+```
+
+A blob is a 16-byte header (`SPKB`, format 1, codec: raw or LZ4, encryption: none, the
+plaintext length) and its payload; its id is the SHA-256 of the plaintext, so writers
+that compress differently still deduplicate.
 
 ## Full-text search
 
@@ -1184,8 +1725,10 @@ with `400` for parse errors, `401`/`403` for authentication and permissions, `40
 dataset, `405` an update sent with GET, `408` timeout, `409` conflict, `413` a body
 over its ceiling or a compressed body over `--max-decompressed-mb`, `415` an unsupported content type or
 `Content-Encoding`, `429` over a rate limit, `503` for a cancelled query, over a concurrency limit (see
-[Rate limiting](#rate-limiting)) or when a write-ahead log write failed (writes are refused
-until restart; reads continue), `500` otherwise.
+[Rate limiting](#rate-limiting)), when a write-ahead log write failed (writes are refused
+until restart; reads continue) or while an in-place restore replaces the dataset
+(`{code: "dataset-restoring"}`, `Retry-After: 5`), `500` otherwise. The backup routes add
+a machine-readable `code` (see [Backup repositories](#backup-errors)).
 
 ### Budgets
 
@@ -1288,7 +1831,7 @@ Per dataset, by name or `*` pattern (`"team-*"`): `read` < `write` < `admin`.
 |---|---|
 | `read` | queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}`, the dataset's tasks |
 | `write` | `read` plus SPARQL Update, Graph Store PUT/POST/DELETE, upload |
-| `admin` | `write` plus compact, backup, reason/unreason, text index configuration, result-cache clear, clone (source), delete |
+| `admin` | `write` plus compact, backup (N-Quads dumps; backups to repositories: create, delete, verify, restore), reason/unreason, text index configuration, result-cache clear, clone (source), delete |
 
 Server permissions: `metrics` (`/$/metrics`, the full `/$/ready` list), `federate`
 (`SERVICE` and `LOAD <http…>`), and `server-admin` (everything: `admin` on every dataset,
@@ -1335,6 +1878,10 @@ the permission is `403` before any connection or file is opened, even under `SIL
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read` (a backup of another dataset is `404`) |
+| `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin` (a restore also on its target name) |
+| `/$/repositories` | GET | any caller; the full list for `server-admin`, names and types for callers with `admin` on some dataset, else empty |
+| `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | by operation: `update=` or `application/sparql-update` → `write`; queries and GET → `read`; other writes → `write` |
