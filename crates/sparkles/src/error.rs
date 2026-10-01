@@ -74,15 +74,19 @@ pub enum BudgetKind {
     /// bytes received by the outbound calls (SERVICE, `LOAD <http…>`) of one SPARQL
     /// request, summed over its calls
     OutboundBytes,
+    /// the work of one validation: the partitions tried to match a node's neighbourhood
+    /// to a shape, or the (node, shape) pairs of a ShEx typing
+    ValidationWork,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 5] = [
+    pub const ALL: [BudgetKind; 6] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
         BudgetKind::DecompressedBytes,
         BudgetKind::OutboundBytes,
+        BudgetKind::ValidationWork,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -92,6 +96,7 @@ impl BudgetKind {
             BudgetKind::ResultBytes => "result-bytes",
             BudgetKind::DecompressedBytes => "decompressed-bytes",
             BudgetKind::OutboundBytes => "outbound-bytes",
+            BudgetKind::ValidationWork => "validation-work",
         }
     }
 }
@@ -132,6 +137,11 @@ impl std::fmt::Display for Budget {
                 f,
                 "the outbound requests (SERVICE, LOAD) of this request exceed their total of {}",
                 human_bytes(self.limit)
+            ),
+            BudgetKind::ValidationWork => write!(
+                f,
+                "validation exceeds its work budget of {} (partitions of one match, or typing pairs)",
+                self.limit
             ),
         }
     }

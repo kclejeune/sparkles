@@ -711,6 +711,37 @@ fn chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// GET `url` through `policy` and return its body as UTF-8 text (a ShEx `IMPORT`, for
+/// example), with `accept` as the `Accept` header. The response is held to the policy's
+/// timeout and [`max_response_bytes`](OutboundPolicy::max_response_bytes), and counted
+/// in `budget`. A refused destination is [`Error::NotPermitted`](crate::Error), a spent
+/// budget [`Error::BudgetExceeded`](crate::Error), anything else (an HTTP error status,
+/// a network failure, a body that is not UTF-8) [`Error::Invalid`](crate::Error).
+pub fn fetch_text(
+    policy: &OutboundPolicy,
+    budget: &Arc<RequestBudget>,
+    url: &str,
+    accept: &str,
+) -> crate::Result<String> {
+    let failed = |m: String| crate::Error::invalid(format!("GET {url}: {m}"));
+    let resp = policy
+        .send(budget, url, policy.timeout, |client, u| {
+            client.get(u).header("Accept", accept)
+        })
+        .map_err(|f| f.into_error(&format!("GET <{url}>"), failed))?;
+    if !resp.status.is_success() {
+        return Err(failed(resp.status.to_string()));
+    }
+    let mut bytes = Vec::new();
+    let mut body = resp.body;
+    body.read_to_end(&mut bytes)
+        .map_err(|e| match crate::codec::io_error(e) {
+            crate::Error::Io(e) => failed(e.to_string()),
+            e => e,
+        })?;
+    String::from_utf8(bytes).map_err(|_| failed("the response is not UTF-8".into()))
+}
+
 /// A response whose headers are in.
 pub(crate) struct Response {
     pub status: reqwest::StatusCode,

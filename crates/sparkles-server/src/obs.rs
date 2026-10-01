@@ -76,18 +76,20 @@ pub enum Op {
     Gsp,
     Upload,
     Shacl,
+    Shex,
     Explain,
     Admin,
     Other,
 }
 
 impl Op {
-    pub const ALL: [Op; 8] = [
+    pub const ALL: [Op; 9] = [
         Op::Query,
         Op::Update,
         Op::Gsp,
         Op::Upload,
         Op::Shacl,
+        Op::Shex,
         Op::Explain,
         Op::Admin,
         Op::Other,
@@ -100,6 +102,7 @@ impl Op {
             Op::Gsp => "gsp",
             Op::Upload => "upload",
             Op::Shacl => "shacl",
+            Op::Shex => "shex",
             Op::Explain => "explain",
             Op::Admin => "admin",
             Op::Other => "other",
@@ -225,6 +228,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         "/{ds}/data" | "/{ds}/get" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
         "/{ds}/shacl" => Op::Shacl,
+        "/{ds}/shex" => Op::Shex,
         "/{ds}/explain" => Op::Explain,
         "/{ds}" => {
             let q = req.uri().query().unwrap_or("");
@@ -569,9 +573,9 @@ struct OpMetrics {
 /// Counters of one dataset label.
 #[derive(Default)]
 pub struct DsMetrics {
-    ops: [OpMetrics; 8],
+    ops: [OpMetrics; Op::ALL.len()],
     result_rows: AtomicU64,
-    budget: [AtomicU64; 5],
+    budget: [AtomicU64; BudgetKind::ALL.len()],
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
 }
 
@@ -582,6 +586,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::ResultBytes => 2,
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
+        BudgetKind::ValidationWork => 5,
     }
 }
 
@@ -591,7 +596,7 @@ pub struct Metrics {
     datasets: RwLock<BTreeMap<String, Arc<DsMetrics>>>,
     /// in-flight requests per operation of the matched route (kept even when metrics
     /// are off)
-    active: [AtomicI64; 8],
+    active: [AtomicI64; Op::ALL.len()],
 }
 
 impl Metrics {
@@ -1066,7 +1071,7 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_budget_exceeded_total",
         "counter",
-        "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes).",
+        "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes, validation-work).",
     );
     for (ds, m) in &series {
         let ds = escape_label(ds);

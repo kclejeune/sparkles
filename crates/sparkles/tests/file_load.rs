@@ -191,3 +191,32 @@ fn compressed_files_load() {
     r.unwrap();
     assert_eq!(n, 1);
 }
+
+#[test]
+fn check_resolves_paths_without_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let inside = dir.path().join("schema.shex");
+    std::fs::write(&inside, "<S> {}").unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let outside = other.path().join("x.shex");
+    std::fs::write(&outside, "<S> {}").unwrap();
+    let under = FileLoads::under(dir.path()).unwrap();
+    assert_eq!(
+        under.check(&file_url(&inside)).unwrap(),
+        std::fs::canonicalize(&inside).unwrap()
+    );
+    assert!(matches!(
+        under.check(&file_url(&outside)),
+        Err(Error::NotPermitted(_))
+    ));
+    let missing = under.check(&file_url(&dir.path().join("nope.shex")));
+    assert!(matches!(missing, Err(Error::Invalid(m)) if m.contains("no such file")));
+    assert!(matches!(
+        FileLoads::Disabled.check(&file_url(&inside)),
+        Err(Error::NotPermitted(_))
+    ));
+    assert_eq!(
+        FileLoads::Anywhere.check(&file_url(&outside)).unwrap(),
+        outside
+    );
+}

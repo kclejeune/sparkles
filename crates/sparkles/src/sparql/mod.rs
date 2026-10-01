@@ -102,6 +102,49 @@ impl FileLoads {
         }
         Ok(FileLoads::Under(d))
     }
+
+    /// The local path of a `file:` URL, if these rules let it be read (the errors name
+    /// `LOAD`): any path for `Anywhere`, relative ones (`file://data.ttl`) included; a
+    /// regular file inside the directory, with `..` and symbolic links resolved, for
+    /// `Under`; [`Error::NotPermitted`] otherwise.
+    pub fn check(&self, url: &str) -> Result<std::path::PathBuf> {
+        use std::path::PathBuf;
+        let parsed = reqwest::Url::parse(url)
+            .ok()
+            .filter(|u| u.scheme() == "file")
+            .and_then(|u| u.to_file_path().ok());
+        let dir = match self {
+            FileLoads::Anywhere => {
+                return Ok(parsed
+                    .unwrap_or_else(|| PathBuf::from(url.strip_prefix("file://").unwrap_or(url))));
+            }
+            FileLoads::Disabled => {
+                return Err(Error::NotPermitted(
+                    "LOAD <file:…> is not enabled: no load directory is configured".into(),
+                ));
+            }
+            FileLoads::Under(dir) => dir,
+        };
+        let outside =
+            || Error::NotPermitted(format!("LOAD <{url}>: not a file in the load directory"));
+        // (the URL parser already resolved `..` segments)
+        let path = parsed.ok_or_else(outside)?;
+        match std::fs::canonicalize(&path) {
+            // with symbolic links resolved, inside the directory, and a regular file (a
+            // FIFO would block the reader)
+            Ok(real)
+                if real.starts_with(dir) && std::fs::metadata(&real).is_ok_and(|m| m.is_file()) =>
+            {
+                Ok(real)
+            }
+            // a missing file is told apart only inside the directory, so that files
+            // elsewhere cannot be probed
+            Err(_) if path.starts_with(dir) => {
+                Err(Error::invalid(format!("LOAD <{url}>: no such file")))
+            }
+            _ => Err(outside()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

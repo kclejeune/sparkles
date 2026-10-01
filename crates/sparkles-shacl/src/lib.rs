@@ -35,7 +35,6 @@ pub mod shapes;
 pub mod sparql;
 mod validate;
 pub mod vocab;
-mod xsd;
 
 pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
@@ -43,7 +42,5 @@ pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
 pub use sparkles::io::RdfFormat;
 pub use validate::{TooManyResults, ValidateOptions, validate, validate_node};
 
-/// Lexical validity of an XSD literal (as used by `sh:datatype`).
-pub fn is_valid_literal(l: &oxrdf::Literal) -> bool {
-    xsd::is_valid(l)
-}
+/// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles::xsd`]).
+pub use sparkles::xsd::is_valid as is_valid_literal;

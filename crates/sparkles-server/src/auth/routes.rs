@@ -110,6 +110,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/upload", &["POST"]),
     ("/{ds}/explain", &["GET", "POST"]),
     ("/{ds}/shacl", &["POST"]),
+    ("/{ds}/shex", &["POST"]),
     ("/{ds}/prefixes", &["*"]),
 ];
 
@@ -181,7 +182,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/query"
         | "/{ds}/explain"
         | "/{ds}/get"
-        | "/{ds}/shacl" => Dataset(Read),
+        | "/{ds}/shacl"
+        | "/{ds}/shex" => Dataset(Read),
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
@@ -894,6 +896,14 @@ mod tests {
         assert_eq!(n(Method::POST, "/ds", "text/turtle"), w);
         assert_eq!(n(Method::PUT, "/ds", "text/turtle"), w);
         assert_eq!(n(Method::DELETE, "/ds", ""), w);
+    }
+
+    #[test]
+    fn validation_routes_read_the_dataset() {
+        for route in ["/{ds}/shacl", "/{ds}/shex"] {
+            let n = need(route, &Method::POST, &"/ds/x".parse().unwrap(), &h(&[]));
+            assert_eq!(n, Some(Need::Dataset(Level::Read)), "{route}");
+        }
     }
 
     #[test]
