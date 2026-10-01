@@ -1123,7 +1123,7 @@ Errors are `{error, code, requestId}` plus, for some codes, `task`, `holder`,
 
 | Status | `code` |
 |---|---|
-| 400 | `invalid-name`; `invalid-config` (a repository or policy setting, a malformed repository or backup request body, a refused destination; `field` names the setting); `invalid-request` (a malformed query parameter or policy request body, a repository verification at level `restore`); `invalid-schedule` (also an unknown time zone) |
+| 400 | `invalid-name`; `invalid-config` (a repository or policy setting, a repository body that is JSON but not a repository configuration, a refused destination; `field` names the setting); `invalid-request` (a body that is not JSON, on every route; a backup, restore, verification, GC or policy body of the wrong shape; a malformed query parameter; a repository verification at level `restore`; a negative `graceHours`); `invalid-schedule` (also an unknown time zone) |
 | 403 | `server-read-only` |
 | 404 | `no-such-repository`, `no-such-backup` (also a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (`policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (`task`), `backup-busy` (`task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait; `holder`), `dataset-exists`, `dataset-busy` (`task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (`task`) |

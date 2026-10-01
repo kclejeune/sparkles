@@ -313,6 +313,7 @@ async fn registrations_are_checked_before_any_repository_is_touched() {
     )
     .await;
     expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    // JSON, but not a configuration
     let r = call(
         &s.app,
         "POST",
@@ -322,6 +323,42 @@ async fn registrations_are_checked_before_any_repository_is_touched() {
     )
     .await;
     expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+}
+
+/// A body that is not JSON answers `400 invalid-request` on every route that reads one.
+#[tokio::test]
+async fn malformed_bodies_are_invalid_requests() {
+    let s = server(Opts {
+        repos: vec![fs_repo("local", "/srv/r")],
+        ..Default::default()
+    });
+    for (method, uri) in [
+        ("POST", "/$/repositories"),
+        ("PUT", "/$/repositories/local"),
+        ("POST", "/$/repositories/local/verify"),
+        ("POST", "/$/repositories/local/gc"),
+        ("POST", "/$/backups/ds"),
+        ("POST", "/$/backups/ds/local/b1/restore"),
+        ("POST", "/$/backups/ds/local/b1/verify"),
+        ("POST", "/$/backup-policies"),
+        ("POST", "/$/backup-policies/preview"),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(Peer::Tcp("127.0.0.2:1".parse().unwrap())))
+            .body(Body::from("{\"name\": "))
+            .unwrap();
+        let res = s.app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: J = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+        assert_eq!(body["code"], "invalid-request", "{method} {uri}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -496,7 +533,7 @@ async fn backup_requests_are_checked_in_order() {
         json!({"graceHours": -1}),
     )
     .await;
-    expect(&r, StatusCode::BAD_REQUEST, "invalid-config");
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-request");
     let r = post(
         &s.app,
         "/$/repositories/local/verify",

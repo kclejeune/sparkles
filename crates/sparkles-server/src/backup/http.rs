@@ -165,15 +165,34 @@ fn writable_server(st: &AppState) -> Result<(), Fail> {
     Ok(())
 }
 
-/// A JSON body (an empty one is `{}`); `400 invalid-config` if it does not parse.
-fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, Fail> {
+/// A JSON body of the shape `T` (an empty one is `{}`): `400 invalid-request` if it is
+/// not JSON, or not of that shape. Every route of repositories, backups and policies
+/// reads its body so.
+pub fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, BackupError> {
+    parse_as(body, Code::InvalidRequest)
+}
+
+/// [`parse`] for a repository configuration: a body that is not JSON is
+/// `400 invalid-request`, one that is not a configuration (an unknown type, a field of
+/// the wrong type) `400 invalid-config`.
+fn parse_config<T: DeserializeOwned>(body: &[u8]) -> Result<T, BackupError> {
+    parse_as(body, Code::InvalidConfig)
+}
+
+/// Parse a JSON body; `shape` is the code of a body that is JSON but not a `T`.
+fn parse_as<T: DeserializeOwned>(body: &[u8], shape: Code) -> Result<T, BackupError> {
     let bytes: &[u8] = if body.iter().all(u8::is_ascii_whitespace) {
         b"{}"
     } else {
         body
     };
     serde_json::from_slice(bytes).map_err(|e| {
-        BackupError::new(Code::InvalidConfig, format!("invalid request body: {e}")).into()
+        let code = if e.is_data() {
+            shape
+        } else {
+            Code::InvalidRequest
+        };
+        BackupError::new(code, format!("invalid request body: {e}"))
     })
 }
 
@@ -306,7 +325,7 @@ async fn add_repository(
 ) -> Res {
     let b = backups(&st)?;
     writable_server(&st)?;
-    let cfg: RepoConfig = parse(&body)?;
+    let cfg: RepoConfig = parse_config(&body)?;
     let name = cfg.name.clone();
     if !layout::valid_repo_name(&name) {
         return Err(BackupError::new(
@@ -675,7 +694,7 @@ async fn gc_repository(
     let req: GcRequest = parse(&body)?;
     let hours = req.grace_hours.unwrap_or(24.0);
     if !(hours.is_finite() && hours >= 0.0) {
-        return Err(BackupError::new(Code::InvalidConfig, "graceHours must be \u{2265} 0").into());
+        return Err(BackupError::new(Code::InvalidRequest, "graceHours must be \u{2265} 0").into());
     }
     b.open_repo(&name).await?;
     let grace = Duration::from_secs_f64(hours * 3600.0);

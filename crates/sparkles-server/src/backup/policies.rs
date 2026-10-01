@@ -1069,12 +1069,7 @@ fn writable(st: &AppState) -> Result<(), ApiErr> {
 }
 
 fn body<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiErr> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        fail(BackupError::new(
-            Code::InvalidRequest,
-            format!("invalid request body: {e}"),
-        ))
-    })
+    super::http::parse(bytes).map_err(fail)
 }
 
 fn entry(b: &BackupState, name: &str) -> Result<PolicyEntry, ApiErr> {
