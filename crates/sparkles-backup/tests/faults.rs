@@ -110,7 +110,9 @@ async fn cancel_then_reuse() {
         let (f, m) = seen.last().unwrap();
         assert!(*f > 0.05 && *f < 0.95, "{f}");
         assert!(
-            m.starts_with("uploading ") && m.contains(" new blobs · "),
+            // "1 new blob" or "N new blobs", depending on how far the upload got
+            m.starts_with("uploading ")
+                && (m.contains(" new blob · ") || m.contains(" new blobs · ")),
             "{m}"
         );
     }
