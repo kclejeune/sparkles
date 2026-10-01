@@ -1,0 +1,11 @@
+prefix foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX ex:<http://example.org/>   # our vocabulary
+prefix foaf: <http://xmlns.com/foaf/0.1/>
+select distinct ?name ?mbox where {
+  # people only
+  ?p a foaf:Person; foaf:name ?name .
+  optional { ?p foaf:mbox ?mbox } .
+  { ?p ex:role ex:Admin } union { ?p ex:role ex:Owner }
+  filter( lang(?name)="en" || lang(?name)="" ) # English or untagged
+}
+order by ?name limit 10

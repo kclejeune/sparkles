@@ -1,72 +1,188 @@
-//! The W3C SPARQL test suites (sparql10, sparql11, sparql12) through the formatter:
-//! every query and update either formats and passes the checks, or is a syntax error;
-//! nothing panics, and nothing is refused.
+//! The W3C SPARQL test suites (sparql10, sparql11, sparql12) through the formatter,
+//! classified by their manifests:
+//!
+//! - every positive syntax test and every query and update of an evaluation test formats,
+//!   passes the safety checks and is a fixpoint (`format(out) == out`);
+//! - every negative syntax test is a syntax error;
+//! - every other `.rq`/`.ru` file formats or is a syntax error;
+//! - nothing panics.
+//!
+//! Exceptions are listed with a reason in `tests/fmt-known-failures.txt`; listed files
+//! that pass are reported so the list can shrink. Negative tests the reference parser
+//! wrongly accepts are taken from the engine's `w3c-known-failures.txt`.
 //!
 //! Set `SPARKLES_W3C_DIR` to the `rdf-tests-cg/sparql` directory (as for the engine's
-//! suite); without it the default sibling checkout is used, and the test is skipped when
-//! that is absent.
+//! suite); without it the default sibling checkout is used, and the tests are skipped
+//! when that is absent.
 
+mod corpus;
+
+use corpus::{Case, Kind};
+use sparkles_fmt::check::{sparql_equivalent, sparql_reference};
+use sparkles_fmt::lex::{LexMode, lex};
 use sparkles_fmt::{FormatError, Language, Options, format};
-use std::path::{Path, PathBuf};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-fn suite_dir() -> Option<PathBuf> {
-    let p = std::env::var("SPARKLES_W3C_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../apache/jena/jena-arq/testing/rdf-tests-cg/sparql")
-        });
-    p.exists().then_some(p)
+fn suite() -> Option<Vec<Case>> {
+    let Some(dir) = corpus::suite_dir() else {
+        eprintln!("W3C suite not found (set SPARKLES_W3C_DIR): skipped");
+        return None;
+    };
+    let cases = corpus::cases(&dir);
+    assert!(!cases.is_empty(), "no queries under {}", dir.display());
+    Some(cases)
 }
 
-/// Every `.rq` and `.ru` file under `dir`, sorted.
-fn sparql_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if matches!(p.extension().and_then(|e| e.to_str()), Some("rq" | "ru")) {
-                out.push(p);
-            }
-        }
+/// What became of one file.
+enum Outcome {
+    /// formatted; whether the output differs from the input
+    Formatted {
+        changed: bool,
+    },
+    Syntax,
+    /// not UTF-8 (a few negative tests)
+    NotText,
+    Failed(String),
+}
+
+/// Format `text`, then its output, under `opts`: the output must be a fixpoint.
+pub fn format_twice(text: &str, opts: &Options) -> Result<bool, FormatError> {
+    let out = format(text, Language::Sparql, opts)?;
+    let again = format(&out.text, Language::Sparql, opts)?;
+    if again.text != out.text {
+        return Err(FormatError::Unsafe {
+            check: sparkles_fmt::Check::Idempotence,
+        });
     }
-    out.sort();
-    out
+    Ok(out.changed)
+}
+
+fn run(case: &Case) -> Outcome {
+    let Ok(text) = std::fs::read_to_string(&case.path) else {
+        return Outcome::NotText;
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        format_twice(&text, &Options::default())
+    })) {
+        Ok(Ok(changed)) => Outcome::Formatted { changed },
+        Ok(Err(FormatError::Syntax { .. })) => Outcome::Syntax,
+        Ok(Err(e)) => Outcome::Failed(e.to_string()),
+        Err(_) => Outcome::Failed("panicked".to_string()),
+    }
 }
 
 #[test]
-fn corpus_formats_or_is_a_syntax_error() {
-    let Some(dir) = suite_dir() else {
-        eprintln!("W3C suite not found (set SPARKLES_W3C_DIR): skipped");
-        return;
-    };
-    let files = sparql_files(&dir);
-    assert!(!files.is_empty(), "no queries under {}", dir.display());
-    let (mut formatted, mut syntax, mut failures) = (0, 0, Vec::new());
-    for path in &files {
-        // a few negative tests are not UTF-8
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
+fn corpus_by_manifest() {
+    let Some(cases) = suite() else { return };
+    let known = corpus::fmt_known_failures();
+    let w3c_known = corpus::w3c_known_failures();
+    let outcomes = corpus::par_map(&cases, run);
+
+    let mut failures = Vec::new();
+    let mut now_passing = Vec::new();
+    let count = |kind: Kind| cases.iter().filter(|c| c.kind == kind).count();
+    let (positives, negatives, unlisted) = (
+        count(Kind::Positive),
+        count(Kind::Negative),
+        count(Kind::Unlisted),
+    );
+    let (mut formatted, mut changed, mut rejected, mut syntax_ok, mut known_hit) = (0, 0, 0, 0, 0);
+    for (case, outcome) in cases.iter().zip(&outcomes) {
+        let listed = known.contains_key(&case.rel);
+        let failure = match (case.kind, outcome) {
+            (_, Outcome::Failed(e)) if e == "panicked" => Some("panicked".to_string()),
+            (Kind::Positive | Kind::Unlisted, Outcome::Formatted { changed: c }) => {
+                formatted += 1;
+                changed += usize::from(*c);
+                None
+            }
+            (Kind::Positive, Outcome::Syntax) => Some("rejected as a syntax error".to_string()),
+            (Kind::Positive, Outcome::NotText) => Some("not UTF-8".to_string()),
+            (Kind::Unlisted, Outcome::Syntax | Outcome::NotText) => {
+                syntax_ok += 1;
+                None
+            }
+            (Kind::Negative, Outcome::Syntax | Outcome::NotText) => {
+                rejected += 1;
+                None
+            }
+            (Kind::Negative, Outcome::Formatted { .. }) => {
+                if case.ids.iter().any(|id| w3c_known.contains(id)) {
+                    None
+                } else {
+                    Some("a negative syntax test was accepted".to_string())
+                }
+            }
+            (_, Outcome::Failed(e)) => Some(e.clone()),
         };
-        let rel = path
-            .strip_prefix(&dir)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        match std::panic::catch_unwind(|| format(&text, Language::Sparql, &Options::default())) {
-            Ok(Ok(_)) => formatted += 1,
-            Ok(Err(FormatError::Syntax { .. })) => syntax += 1,
-            Ok(Err(e)) => failures.push(format!("{rel}: {e}")),
-            Err(_) => failures.push(format!("{rel}: panicked")),
+        match failure {
+            Some(_) if listed => known_hit += 1,
+            Some(e) => failures.push(format!("{}: {e}", case.rel)),
+            None if listed => now_passing.push(case.rel.clone()),
+            None => {}
         }
     }
     eprintln!(
-        "W3C SPARQL: {formatted} formatted, {syntax} syntax errors, {} failures of {} files",
-        failures.len(),
-        files.len()
+        "W3C SPARQL through the formatter: {} files\n  \
+         positive {positives}, negative {negatives}, in no manifest {unlisted}\n  \
+         {formatted} formatted ({changed} changed), {rejected} negative tests rejected, \
+         {syntax_ok} unlisted syntax errors, {known_hit} known failures, {} new failures",
+        cases.len(),
+        failures.len()
+    );
+    if !now_passing.is_empty() {
+        eprintln!(
+            "now passing (remove from tests/fmt-known-failures.txt):\n  {}",
+            now_passing.join("\n  ")
+        );
+    }
+    assert!(
+        positives > 1000 && negatives > 150,
+        "the manifests were not read: {positives} positive, {negatives} negative"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn negative_tests_include_the_codepoint_escapes() {
+    let Some(cases) = suite() else { return };
+    for n in 1..=4 {
+        let rel = format!("sparql12/codepoint-escapes/codepoint-esc-0{n}-bad.rq");
+        let case = cases.iter().find(|c| c.rel == rel).expect(&rel);
+        assert_eq!(case.kind, Kind::Negative, "{rel}");
+        let text = std::fs::read_to_string(&case.path).unwrap();
+        assert!(
+            matches!(
+                format(&text, Language::Sparql, &Options::default()),
+                Err(FormatError::Syntax { .. })
+            ),
+            "{rel}"
+        );
+    }
+}
+
+/// Two parses of one document make up different blank nodes and variables; the algebra
+/// check must still find them equal. Run on every positive file, so the canonical form
+/// is known to cover everything spargebra makes up.
+#[test]
+fn every_parse_equals_itself() {
+    let Some(cases) = suite() else { return };
+    let positive: Vec<&Case> = cases.iter().filter(|c| c.kind == Kind::Positive).collect();
+    let results = corpus::par_map(&positive, |c| {
+        let text = std::fs::read_to_string(&c.path).ok()?;
+        let r = match sparql_reference(&text, &lex(&text, LexMode::Sparql)) {
+            Ok(r) => r,
+            Err(e) => return Some(format!("{}: {e}", c.rel)),
+        };
+        sparql_equivalent(&r, &text)
+            .err()
+            .map(|e| format!("{}: {e}", c.rel))
+    });
+    let failures: Vec<String> = results.into_iter().flatten().collect();
+    eprintln!(
+        "algebra self-comparison: {} positive files, {} differ",
+        positive.len(),
+        failures.len()
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

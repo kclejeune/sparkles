@@ -1,0 +1,3 @@
+# Documented formatter failures: files the W3C, property and matrix suites expect to fail.
+# One per line: the path under the suite directory (or golden/sparql/<name>), whitespace,
+# and the reason. The suites report listed files that pass, so the list only shrinks.
