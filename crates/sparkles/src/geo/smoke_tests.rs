@@ -4,11 +4,9 @@
 use geo_index::rtree::sort::HilbertSort;
 use geo_index::rtree::{RTreeBuilder, RTreeIndex, RTreeRef};
 use georust::{
-    Area, BooleanOps, BoundingRect, Buffer, ClosestPoint, ConvexHull, Distance, Geodesic,
-    GeodesicArea, Geometry, Haversine, Length, LineString, Point, PreparedGeometry, Relate,
-    polygon, unary_union,
+    Area, BooleanOps, Buffer, ClosestPoint, ConvexHull, Distance, Geodesic, GeodesicArea, Geometry,
+    Haversine, Length, LineString, Point, PreparedGeometry, Relate, polygon, unary_union,
 };
-use std::str::FromStr;
 
 fn square(x: f64, y: f64, side: f64) -> georust::Polygon<f64> {
     polygon![
@@ -90,41 +88,4 @@ fn packed_hilbert_rtree() {
     let bytes = tree.into_inner();
     let r = RTreeRef::<f32>::try_new(&bytes).unwrap();
     assert_eq!(r.search(0.0, 0.0, 1.0, 1.0).len(), 4);
-}
-
-#[test]
-fn wkt_layouts_and_empty_geometries() {
-    use wkt::types::Dimension;
-    let dim = |s: &str| wkt::Wkt::<f64>::from_str(s).unwrap().dimension();
-    assert_eq!(dim("POINT Z (1 2 3)"), Dimension::XYZ);
-    assert_eq!(dim("POINT M (1 2 3)"), Dimension::XYM);
-    assert_eq!(dim("POINT ZM (1 2 3 4)"), Dimension::XYZM);
-    assert_eq!(dim("LINESTRING Z EMPTY"), Dimension::XYZ);
-    let geo =
-        |s: &str| -> Geometry<f64> { wkt::Wkt::<f64>::from_str(s).unwrap().try_into().unwrap() };
-    // Z is dropped in conversion; an empty point has no `geo` form but an empty multipoint
-    assert_eq!(
-        geo("POINT Z (1 2 3)"),
-        Geometry::Point(Point::new(1.0, 2.0))
-    );
-    assert!(matches!(geo("POINT EMPTY"), Geometry::MultiPoint(m) if m.0.is_empty()));
-    assert!(matches!(geo("POLYGON EMPTY"), Geometry::Polygon(_)));
-    assert_eq!(
-        geo("MULTIPOINT ((1 2), (3 4))"),
-        geo("MULTIPOINT (1 2, 3 4)")
-    );
-    assert!(
-        geo("GEOMETRYCOLLECTION (POINT (1 2), LINESTRING EMPTY)")
-            .bounding_rect()
-            .is_some()
-    );
-    // three coordinates without a Z tag
-    assert!(wkt::Wkt::<f64>::from_str("POINT (1 2 3)").is_err());
-}
-
-#[test]
-fn geojson_geometries() {
-    let g = geojson::Geometry::from_str(r#"{"type":"Point","coordinates":[1,2,3]}"#).unwrap();
-    let g: Geometry<f64> = g.try_into().unwrap();
-    assert_eq!(g, Geometry::Point(Point::new(1.0, 2.0)));
 }

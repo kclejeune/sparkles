@@ -43,8 +43,6 @@ tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "s
 tempfile = "3"
 # GeoSPARQL (feature `geo`)
 georust = { workspace = true, optional = true }
-wkt = { workspace = true, optional = true }
-geojson = { workspace = true, optional = true }
 geo-index = { workspace = true, optional = true }
 geographiclib-rs = { workspace = true, optional = true }
 
@@ -64,8 +62,6 @@ text = ["dep:tantivy"]
 # GeoSPARQL: `geof:` functions, `spatial:` property functions and a spatial index
 geo = [
     "dep:georust",
-    "dep:wkt",
-    "dep:geojson",
     "dep:geo-index",
     "dep:geographiclib-rs",
 ]
