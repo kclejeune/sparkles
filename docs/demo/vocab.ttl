@@ -1,0 +1,162 @@
+# The demo dataset of the README's screenshots (`mise run docs:screenshots`): a small
+# research network of people, organisations and European cities. Written for Sparkles and
+# released under the project's license. The people and organisations are fictional; the
+# cities are real, with approximate coordinates and populations.
+#
+# This file is the vocabulary: classes and properties with labels, comments, domains and
+# ranges, which the explorer's Schema tab shows.
+
+@prefix ex: <http://example.org/ns#> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# ---------------------------------------------------------------------------- classes ----
+
+ex:Agent a owl:Class ;
+    rdfs:label "Agent"@en ;
+    rdfs:comment "Someone or something that can act: a person or an organisation."@en .
+
+ex:Person a owl:Class ;
+    rdfs:subClassOf ex:Agent ;
+    rdfs:label "Person"@en ;
+    rdfs:comment "A researcher, engineer or other member of the network."@en .
+
+ex:Organization a owl:Class ;
+    rdfs:subClassOf ex:Agent ;
+    rdfs:label "Organisation"@en ;
+    rdfs:comment "A body that employs people and has a headquarters."@en .
+
+ex:University a owl:Class ;
+    rdfs:subClassOf ex:Organization ;
+    rdfs:label "University"@en ;
+    rdfs:comment "A degree-granting institution of higher education."@en .
+
+ex:ResearchInstitute a owl:Class ;
+    rdfs:subClassOf ex:Organization ;
+    rdfs:label "Research institute"@en ;
+    rdfs:comment "An independent laboratory or institute."@en .
+
+ex:Company a owl:Class ;
+    rdfs:subClassOf ex:Organization ;
+    rdfs:label "Company"@en ;
+    rdfs:comment "A commercial enterprise."@en .
+
+ex:Startup a owl:Class ;
+    rdfs:subClassOf ex:Company ;
+    rdfs:label "Startup"@en ;
+    rdfs:comment "A young company, founded in the last ten years."@en .
+
+ex:Nonprofit a owl:Class ;
+    rdfs:subClassOf ex:Organization ;
+    rdfs:label "Non-profit"@en ;
+    rdfs:comment "A foundation or association."@en .
+
+ex:Place a owl:Class ;
+    rdfs:subClassOf geo:Feature ;
+    rdfs:label "Place"@en ;
+    rdfs:comment "Somewhere on Earth with a geometry."@en .
+
+ex:City a owl:Class ;
+    rdfs:subClassOf ex:Place ;
+    rdfs:label "City"@en ;
+    rdfs:comment "A city, drawn as a point."@en .
+
+ex:Region a owl:Class ;
+    rdfs:subClassOf ex:Place ;
+    rdfs:label "Region"@en ;
+    rdfs:comment "An area, drawn as a polygon."@en .
+
+ex:Country a owl:Class ;
+    rdfs:subClassOf ex:Region ;
+    rdfs:label "Country"@en .
+
+ex:Route a owl:Class ;
+    rdfs:subClassOf geo:Feature ;
+    rdfs:label "Route"@en ;
+    rdfs:comment "A line between places, such as a rail link."@en .
+
+# ------------------------------------------------------------------------- properties ----
+
+ex:worksFor a owl:ObjectProperty ;
+    rdfs:label "works for"@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range ex:Organization .
+
+ex:livesIn a owl:ObjectProperty ;
+    rdfs:label "lives in"@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range ex:City .
+
+ex:memberOf a owl:ObjectProperty ;
+    rdfs:label "member of"@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range ex:Organization .
+
+ex:headquarters a owl:ObjectProperty, owl:FunctionalProperty ;
+    rdfs:label "headquarters"@en ;
+    rdfs:domain ex:Organization ;
+    rdfs:range ex:City .
+
+ex:partnerOf a owl:ObjectProperty, owl:SymmetricProperty ;
+    rdfs:label "partner of"@en ;
+    rdfs:domain ex:Organization ;
+    rdfs:range ex:Organization .
+
+ex:country a owl:ObjectProperty ;
+    rdfs:label "country"@en ;
+    rdfs:domain ex:City ;
+    rdfs:range ex:Country .
+
+ex:connects a owl:ObjectProperty ;
+    rdfs:label "connects"@en ;
+    rdfs:domain ex:Route ;
+    rdfs:range ex:City .
+
+ex:jobTitle a owl:DatatypeProperty ;
+    rdfs:label "job title"@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range rdf:langString .
+
+ex:birthDate a owl:DatatypeProperty, owl:FunctionalProperty ;
+    rdfs:label "birth date"@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range xsd:date .
+
+ex:publications a owl:DatatypeProperty ;
+    rdfs:label "publications"@en ;
+    rdfs:comment "Number of peer-reviewed publications."@en ;
+    rdfs:domain ex:Person ;
+    rdfs:range xsd:integer .
+
+ex:founded a owl:DatatypeProperty ;
+    rdfs:label "founded"@en ;
+    rdfs:domain ex:Organization ;
+    rdfs:range xsd:gYear .
+
+ex:employees a owl:DatatypeProperty ;
+    rdfs:label "employees"@en ;
+    rdfs:domain ex:Organization ;
+    rdfs:range xsd:integer .
+
+ex:website a owl:ObjectProperty ;
+    rdfs:label "website"@en ;
+    rdfs:domain ex:Organization .
+
+ex:population a owl:DatatypeProperty ;
+    rdfs:label "population"@en ;
+    rdfs:domain ex:Place ;
+    rdfs:range xsd:integer .
+
+ex:elevation a owl:DatatypeProperty ;
+    rdfs:label "elevation"@en ;
+    rdfs:comment "Metres above sea level."@en ;
+    rdfs:domain ex:City ;
+    rdfs:range xsd:decimal .
+
+ex:lengthKm a owl:DatatypeProperty ;
+    rdfs:label "length (km)"@en ;
+    rdfs:domain ex:Route ;
+    rdfs:range xsd:decimal .

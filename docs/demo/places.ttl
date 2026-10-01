@@ -1,0 +1,228 @@
+# Places of the demo dataset (see vocab.ttl): European cities as points, two areas as
+# polygons and two rail links as lines, in WKT (longitude latitude, CRS84). Coordinates,
+# outlines and populations are approximate.
+
+@prefix ex: <http://example.org/ns#> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+@prefix place: <http://example.org/place/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# ----------------------------------------------------------------------------- cities ----
+
+place:lisbon a ex:City ;
+    rdfs:label "Lisbon"@en, "Lisboa"@pt ;
+    ex:country place:portugal ;
+    ex:population 545000 ;
+    geo:hasDefaultGeometry place:lisbon-geom .
+place:lisbon-geom a geo:Geometry ; geo:asWKT "POINT(-9.1393 38.7223)"^^geo:wktLiteral .
+
+place:madrid a ex:City ;
+    rdfs:label "Madrid"@en ;
+    ex:country place:spain ;
+    ex:population 3330000 ;
+    ex:elevation 667.0 ;
+    geo:hasDefaultGeometry place:madrid-geom .
+place:madrid-geom a geo:Geometry ; geo:asWKT "POINT(-3.7038 40.4168)"^^geo:wktLiteral .
+
+place:barcelona a ex:City ;
+    rdfs:label "Barcelona"@en, "Barcelona"@ca ;
+    ex:country place:spain ;
+    ex:population 1620000 ;
+    geo:hasDefaultGeometry place:barcelona-geom .
+place:barcelona-geom a geo:Geometry ; geo:asWKT "POINT(2.1686 41.3874)"^^geo:wktLiteral .
+
+place:paris a ex:City ;
+    rdfs:label "Paris"@en ;
+    ex:country place:france ;
+    ex:population 2100000 ;
+    ex:elevation 35.0 ;
+    geo:hasDefaultGeometry place:paris-geom .
+place:paris-geom a geo:Geometry ; geo:asWKT "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+
+place:london a ex:City ;
+    rdfs:label "London"@en, "Londres"@fr ;
+    ex:country place:united-kingdom ;
+    ex:population 8900000 ;
+    ex:elevation 11.0 ;
+    geo:hasDefaultGeometry place:london-geom .
+place:london-geom a geo:Geometry ; geo:asWKT "POINT(-0.1276 51.5072)"^^geo:wktLiteral .
+
+place:dublin a ex:City ;
+    rdfs:label "Dublin"@en, "Baile Átha Cliath"@ga ;
+    ex:country place:ireland ;
+    ex:population 590000 ;
+    geo:hasDefaultGeometry place:dublin-geom .
+place:dublin-geom a geo:Geometry ; geo:asWKT "POINT(-6.2603 53.3498)"^^geo:wktLiteral .
+
+place:edinburgh a ex:City ;
+    rdfs:label "Edinburgh"@en, "Dùn Èideann"@gd ;
+    ex:country place:united-kingdom ;
+    ex:population 525000 ;
+    geo:hasDefaultGeometry place:edinburgh-geom .
+place:edinburgh-geom a geo:Geometry ; geo:asWKT "POINT(-3.1883 55.9533)"^^geo:wktLiteral .
+
+place:amsterdam a ex:City ;
+    rdfs:label "Amsterdam"@en ;
+    ex:country place:netherlands ;
+    ex:population 920000 ;
+    ex:elevation -2.0 ;
+    geo:hasDefaultGeometry place:amsterdam-geom .
+place:amsterdam-geom a geo:Geometry ; geo:asWKT "POINT(4.9041 52.3676)"^^geo:wktLiteral .
+
+place:rotterdam a ex:City ;
+    rdfs:label "Rotterdam"@en ;
+    ex:country place:netherlands ;
+    ex:population 655000 ;
+    geo:hasDefaultGeometry place:rotterdam-geom .
+place:rotterdam-geom a geo:Geometry ; geo:asWKT "POINT(4.4777 51.9244)"^^geo:wktLiteral .
+
+place:brussels a ex:City ;
+    rdfs:label "Brussels"@en, "Bruxelles"@fr, "Brussel"@nl ;
+    ex:country place:belgium ;
+    ex:population 1220000 ;
+    geo:hasDefaultGeometry place:brussels-geom .
+place:brussels-geom a geo:Geometry ; geo:asWKT "POINT(4.3517 50.8503)"^^geo:wktLiteral .
+
+place:berlin a ex:City ;
+    rdfs:label "Berlin"@en ;
+    ex:country place:germany ;
+    ex:population 3770000 ;
+    ex:elevation 34.0 ;
+    geo:hasDefaultGeometry place:berlin-geom .
+place:berlin-geom a geo:Geometry ; geo:asWKT "POINT(13.4050 52.5200)"^^geo:wktLiteral .
+
+place:munich a ex:City ;
+    rdfs:label "Munich"@en, "München"@de ;
+    ex:country place:germany ;
+    ex:population 1510000 ;
+    ex:elevation 519.0 ;
+    geo:hasDefaultGeometry place:munich-geom .
+place:munich-geom a geo:Geometry ; geo:asWKT "POINT(11.5820 48.1351)"^^geo:wktLiteral .
+
+place:copenhagen a ex:City ;
+    rdfs:label "Copenhagen"@en, "København"@da ;
+    ex:country place:denmark ;
+    ex:population 650000 ;
+    geo:hasDefaultGeometry place:copenhagen-geom .
+place:copenhagen-geom a geo:Geometry ; geo:asWKT "POINT(12.5683 55.6761)"^^geo:wktLiteral .
+
+place:stockholm a ex:City ;
+    rdfs:label "Stockholm"@en ;
+    ex:country place:sweden ;
+    ex:population 980000 ;
+    geo:hasDefaultGeometry place:stockholm-geom .
+place:stockholm-geom a geo:Geometry ; geo:asWKT "POINT(18.0686 59.3293)"^^geo:wktLiteral .
+
+place:helsinki a ex:City ;
+    rdfs:label "Helsinki"@en, "Helsingfors"@sv ;
+    ex:country place:finland ;
+    ex:population 660000 ;
+    geo:hasDefaultGeometry place:helsinki-geom .
+place:helsinki-geom a geo:Geometry ; geo:asWKT "POINT(24.9384 60.1699)"^^geo:wktLiteral .
+
+place:zurich a ex:City ;
+    rdfs:label "Zurich"@en, "Zürich"@de ;
+    ex:country place:switzerland ;
+    ex:population 430000 ;
+    ex:elevation 408.0 ;
+    geo:hasDefaultGeometry place:zurich-geom .
+place:zurich-geom a geo:Geometry ; geo:asWKT "POINT(8.5417 47.3769)"^^geo:wktLiteral .
+
+place:geneva a ex:City ;
+    rdfs:label "Geneva"@en, "Genève"@fr ;
+    ex:country place:switzerland ;
+    ex:population 205000 ;
+    ex:elevation 375.0 ;
+    geo:hasDefaultGeometry place:geneva-geom .
+place:geneva-geom a geo:Geometry ; geo:asWKT "POINT(6.1432 46.2044)"^^geo:wktLiteral .
+
+place:milan a ex:City ;
+    rdfs:label "Milan"@en, "Milano"@it ;
+    ex:country place:italy ;
+    ex:population 1370000 ;
+    geo:hasDefaultGeometry place:milan-geom .
+place:milan-geom a geo:Geometry ; geo:asWKT "POINT(9.1900 45.4642)"^^geo:wktLiteral .
+
+place:rome a ex:City ;
+    rdfs:label "Rome"@en, "Roma"@it ;
+    ex:country place:italy ;
+    ex:population 2750000 ;
+    geo:hasDefaultGeometry place:rome-geom .
+place:rome-geom a geo:Geometry ; geo:asWKT "POINT(12.4964 41.9028)"^^geo:wktLiteral .
+
+place:vienna a ex:City ;
+    rdfs:label "Vienna"@en, "Wien"@de ;
+    ex:country place:austria ;
+    ex:population 1980000 ;
+    ex:elevation 190.0 ;
+    geo:hasDefaultGeometry place:vienna-geom .
+place:vienna-geom a geo:Geometry ; geo:asWKT "POINT(16.3738 48.2082)"^^geo:wktLiteral .
+
+place:prague a ex:City ;
+    rdfs:label "Prague"@en, "Praha"@cs ;
+    ex:country place:czechia ;
+    ex:population 1360000 ;
+    geo:hasDefaultGeometry place:prague-geom .
+place:prague-geom a geo:Geometry ; geo:asWKT "POINT(14.4378 50.0755)"^^geo:wktLiteral .
+
+place:warsaw a ex:City ;
+    rdfs:label "Warsaw"@en, "Warszawa"@pl ;
+    ex:country place:poland ;
+    ex:population 1860000 ;
+    geo:hasDefaultGeometry place:warsaw-geom .
+place:warsaw-geom a geo:Geometry ; geo:asWKT "POINT(21.0122 52.2297)"^^geo:wktLiteral .
+
+# -------------------------------------------------------------------------- countries ----
+# Labels only, except Switzerland, which has a rough outline.
+
+place:portugal a ex:Country ; rdfs:label "Portugal"@en, "Portugal"@pt .
+place:spain a ex:Country ; rdfs:label "Spain"@en, "España"@es .
+place:france a ex:Country ; rdfs:label "France"@en, "France"@fr .
+place:united-kingdom a ex:Country ; rdfs:label "United Kingdom"@en .
+place:ireland a ex:Country ; rdfs:label "Ireland"@en, "Éire"@ga .
+place:netherlands a ex:Country ; rdfs:label "Netherlands"@en, "Nederland"@nl .
+place:belgium a ex:Country ; rdfs:label "Belgium"@en, "Belgique"@fr, "België"@nl .
+place:germany a ex:Country ; rdfs:label "Germany"@en, "Deutschland"@de .
+place:denmark a ex:Country ; rdfs:label "Denmark"@en, "Danmark"@da .
+place:sweden a ex:Country ; rdfs:label "Sweden"@en, "Sverige"@sv .
+place:finland a ex:Country ; rdfs:label "Finland"@en, "Suomi"@fi .
+place:italy a ex:Country ; rdfs:label "Italy"@en, "Italia"@it .
+place:austria a ex:Country ; rdfs:label "Austria"@en, "Österreich"@de .
+place:czechia a ex:Country ; rdfs:label "Czechia"@en, "Česko"@cs .
+place:poland a ex:Country ; rdfs:label "Poland"@en, "Polska"@pl .
+
+place:switzerland a ex:Country ;
+    rdfs:label "Switzerland"@en, "Schweiz"@de, "Suisse"@fr, "Svizzera"@it ;
+    ex:population 8900000 ;
+    geo:hasDefaultGeometry place:switzerland-geom .
+place:switzerland-geom a geo:Geometry ;
+    geo:asWKT "POLYGON((5.96 46.13, 6.80 46.43, 7.04 45.93, 7.86 45.92, 8.44 46.46, 9.04 45.84, 9.48 46.37, 10.47 46.55, 10.49 46.93, 9.56 47.06, 9.62 47.52, 8.56 47.80, 7.59 47.58, 6.85 47.10, 5.96 46.13))"^^geo:wktLiteral .
+
+# ---------------------------------------------------------------------------- regions ----
+
+place:randstad a ex:Region ;
+    rdfs:label "Randstad"@en ;
+    rdfs:comment "The conurbation of Amsterdam, Rotterdam, The Hague and Utrecht."@en ;
+    ex:population 8400000 ;
+    geo:hasDefaultGeometry place:randstad-geom .
+place:randstad-geom a geo:Geometry ;
+    geo:asWKT "POLYGON((4.20 52.08, 4.50 52.45, 4.95 52.48, 5.25 52.22, 5.20 52.02, 4.85 51.84, 4.35 51.86, 4.20 52.08))"^^geo:wktLiteral .
+
+# ----------------------------------------------------------------------------- routes ----
+
+place:eurostar a ex:Route ;
+    rdfs:label "Eurostar London–Paris"@en ;
+    ex:connects place:london, place:paris ;
+    ex:lengthKm 492.0 ;
+    geo:hasDefaultGeometry place:eurostar-geom .
+place:eurostar-geom a geo:Geometry ;
+    geo:asWKT "LINESTRING(-0.1262 51.5315, 0.8740 51.1430, 1.8100 50.9000, 3.0750 50.6390, 2.3553 48.8809)"^^geo:wktLiteral .
+
+place:oresund-line a ex:Route ;
+    rdfs:label "Copenhagen–Stockholm rail link"@en ;
+    ex:connects place:copenhagen, place:stockholm ;
+    ex:lengthKm 650.0 ;
+    geo:hasDefaultGeometry place:oresund-line-geom .
+place:oresund-line-geom a geo:Geometry ;
+    geo:asWKT "LINESTRING(12.5683 55.6761, 13.0038 55.6050, 13.7700 56.1600, 14.5500 56.9000, 14.7000 57.6500, 15.6200 58.4100, 16.1900 58.5900, 17.6300 59.2000, 18.0686 59.3293)"^^geo:wktLiteral .

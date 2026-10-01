@@ -1,0 +1,1 @@
+{FOCUS a ex:Person}@ex:PersonShape, {FOCUS ex:headquarters _}@ex:OrganizationShape
