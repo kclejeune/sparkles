@@ -30,6 +30,8 @@ struct Opts {
     /// a backup config file (loaded without the checks of `BackupState::new`)
     config: Option<&'static str>,
     max_tasks: usize,
+    /// `--min-free-disk-mb` (default: the server's default)
+    min_free_disk: Option<u64>,
 }
 
 struct Srv {
@@ -87,6 +89,9 @@ fn server(o: Opts) -> Srv {
     let mut st =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     st.read_only = o.read_only;
+    if let Some(m) = o.min_free_disk {
+        st.limits.min_free_disk_bytes = Some(m);
+    }
     #[cfg(feature = "auth")]
     if o.auth {
         let cfg = dir.path().join("auth.toml");
@@ -1133,6 +1138,19 @@ async fn e2e_backup_restore_delete_and_metrics() {
     assert!(text.contains(
         "sparkles_backup_last_success_timestamp_seconds{dataset=\"ds\",repository=\"local\"}"
     ));
+    // the object requests of every operation: the uploads of the backups, the
+    // downloads of the restores, the listings
+    let requests = |op: &str| -> u64 {
+        let prefix = format!(
+            "sparkles_backup_object_requests_total{{repository=\"local\",op=\"{op}\",result=\"ok\"}} "
+        );
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map_or(0, |n| n.parse().unwrap())
+    };
+    for op in ["put", "get", "head", "list", "delete"] {
+        assert!(requests(op) > 0, "no {op} requests counted in\n{text}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1648,6 +1666,49 @@ async fn fs_repositories_stay_out_of_the_servers_directories_and_under_the_api_r
         cfg.validate(&b.forbid).unwrap_err().code(),
         Code::InvalidConfig
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backups_and_restores_keep_the_disk_reserve() {
+    let (s, repo) = with_local(false).await;
+    backup_ds(&s, "b1").await;
+    // a second server on the same repository whose disk reserve cannot be met
+    let full = server(Opts {
+        repos: vec![fs_repo("local", repo.path().to_str().unwrap())],
+        min_free_disk: Some(u64::MAX / 2),
+        ..Default::default()
+    });
+    start(&full.st, &Handle::current());
+    let r = post(&full.app, "/$/backups/ds", json!({"repository": "local"})).await;
+    expect(&r, StatusCode::INSUFFICIENT_STORAGE, "insufficient-storage");
+    assert!(
+        r.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("--min-free-disk-mb"),
+        "{}",
+        r.body
+    );
+    let r = post(
+        &full.app,
+        "/$/backups/ds/local/b1/restore",
+        json!({"target": "copy"}),
+    )
+    .await;
+    expect(&r, StatusCode::INSUFFICIENT_STORAGE, "insufficient-storage");
+    assert!(full.st.get("copy").is_none());
+    assert!(full.st.tasks.lock().is_empty());
+    // the task checks again (the free space may shrink while it waits)
+    let st = full.st.clone();
+    let o = sparkles_backup::CreateOptions {
+        name: "b2".into(),
+        ..Default::default()
+    };
+    let e = tokio::task::spawn_blocking(move || ops::create_for_policy(&st, "ds", "local", o))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(e.code(), Code::InsufficientStorage);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

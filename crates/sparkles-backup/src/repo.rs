@@ -769,7 +769,7 @@ impl Repository {
                 (s, attempts)
             }
         };
-        let requests = Arc::new(RequestStats::default());
+        let requests = env.requests.clone().unwrap_or_default();
         let store: Arc<dyn ObjectStore> =
             Arc::new(RepoStore::new(inner, requests.clone(), attempts));
         let marker = attach_or_init(&store, cfg, env).await?;

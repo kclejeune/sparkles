@@ -856,7 +856,7 @@ started or queued, and a `Location` where noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Break a lock (`204`; audited). `404 no-such-lock`; `409 repository-read-only` |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`: the dataset's backups in every repository (or `R` only), newest first, with `sameLineage`. A repository that cannot be reached is left out (one found unreachable in the last minute is not tried again) |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Back up now (body `{repository, name?, note?}`): task `backup-create` with `detail: BackupSummary`, `Location: /$/backups/{ds}/{repo}/{name}`. `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only`, `409 backup-exists`, `409 backup-in-progress` (`task`: one backup of a dataset into a repository at a time), `501 backup-unsupported` (in-memory dataset) |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Back up now (body `{repository, name?, note?}`): task `backup-create` with `detail: BackupSummary`, `Location: /$/backups/{ds}/{repo}/{name}`. `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only`, `409 backup-exists`, `409 backup-in-progress` (`task`: one backup of a dataset into a repository at a time), `501 backup-unsupported` (in-memory dataset), `507 insufficient-storage` (an `fs` repository whose file system has less than `--min-free-disk-mb` free; the task also fails with it when a blob would leave less) |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary with the manifest's files, blobs and upload statistics |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Delete the backup's manifest (`204`); its blobs go at the next GC. `409 backup-busy` (`task`) while a restore or verification of it runs here; `409 repository-read-only` |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restore (body `RestoreRequest`): task `backup-restore`, `Location: /$/datasets/{target}`. See [Restore](#restore) |
@@ -893,7 +893,10 @@ type RestoreRequest = {
 
 A restore downloads into `databases/.restore-{target}-{task}` and publishes the directory
 only once it is complete and checked, so a failed or cancelled restore leaves nothing
-behind.
+behind. It needs 1.1 × the backup's `logicalBytes` free in the data directory's file
+system, plus the `--min-free-disk-mb` reserve: otherwise the request answers
+`507 insufficient-storage`, and the task checks again before downloading (the free
+space may have shrunk while it waited for a slot).
 
 * **A new dataset** (`replace: false`): `target` must not exist (`409 dataset-exists`);
   its name is reserved while the task runs. The directory is renamed into
@@ -1129,7 +1132,7 @@ Errors are `{error, code, requestId}` plus, for some codes, `task`, `holder`,
 | 501 | `backup-unsupported` (an in-memory dataset); `not-implemented` |
 | 502 | `repository-unavailable` (a storage error after retries; messages never include URL query strings) |
 | 503 | `catalog-lagging` (the commit catalog could not be flushed; retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`); `cancelled` (a task's) |
-| 507 | `insufficient-storage` (reserved: a restore does not check the free space beforehand yet) |
+| 507 | `insufficient-storage` (a restore without room for 1.1 × the backup's size plus the `--min-free-disk-mb` reserve; a backup into an `fs` repository whose file system would keep less than the reserve) |
 
 Callers without `server-admin` see absolute paths in these messages cut to their last
 component. Storage requests are retried with exponential backoff (up to 10 retries within
@@ -1244,7 +1247,7 @@ the directories of the server's config files (`--backup-config`, `--auth-config`
 | `sparkles_backup_operation_duration_seconds` | histogram (1 s … 2 h) | `operation` |
 | `sparkles_backup_bytes_uploaded_total`, `…_bytes_downloaded_total` | counter | `repository` |
 | `sparkles_backup_blobs_uploaded_total`, `…_blobs_reused_total` | counter | `repository` |
-| `sparkles_backup_object_requests_total` | counter (the requests verifications and GC report) | `repository`, `op` = `list` \| `head` \| `get` \| `delete`, `result` = `ok` |
+| `sparkles_backup_object_requests_total` | counter (every storage request of every operation: backups, restores, verifications, GC, listings, connection tests, locks; "not found" and "already exists" answers are `ok`, a failed request is `error`) | `repository`, `op` = `put` \| `get` \| `head` \| `list` \| `delete`, `result` = `ok` \| `error` |
 | `sparkles_backup_last_success_timestamp_seconds` | gauge (the last backup of the dataset into the repository) | `dataset`, `repository` |
 | `sparkles_backup_capture_lock_seconds` | histogram (0.5 ms … 1 s; the writer-lock hold of a capture) | |
 | `sparkles_backup_repository_stored_bytes`, `…_logical_bytes`, `…_backups` | gauge (from the last listing) | `repository` |

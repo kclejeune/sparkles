@@ -193,21 +193,12 @@ impl Repository {
             sparkles::builder::FORMAT_VERSION,
         )?;
         let keep = identity_rule(&m, o)?;
-        let logical = manifest::logical_size(&m);
-        let need = logical.saturating_add(logical / 10);
-        let free = free_disk_bytes(tmp)?;
-        if free < need {
-            return Err(BackupError::new(
-                Code::InsufficientStorage,
-                format!(
-                    "restoring {name} needs {} MB of free disk space; {} has {} MB",
-                    need.div_ceil(1 << 20),
-                    tmp.display(),
-                    free >> 20
-                ),
-            )
-            .into());
-        }
+        check_free_space(
+            tmp,
+            manifest::logical_size(&m),
+            o.store_opts.min_free_disk_bytes.unwrap_or(0),
+            &format!("restoring {name}"),
+        )?;
         o.ctl.report(0.02, "downloading");
         self.download(&m, tmp, &o.ctl).await?;
         o.ctl.check()?;
@@ -645,26 +636,31 @@ fn write_at(f: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
     }
 }
 
-/// Free space for an unprivileged user on the file system of `dir`.
-#[cfg(unix)]
-fn free_disk_bytes(dir: &Path) -> std::io::Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
-    let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `s` is valid for writes; statvfs initializes
-    // it when it returns 0
-    if unsafe { libc::statvfs(path.as_ptr(), s.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// `507 insufficient-storage` unless the file system of `dir` has room for a restore
+/// of `logical` bytes: 1.1 × `logical`, plus `reserve` (the disk reserve the server or
+/// the restored store keeps, `--min-free-disk-mb`) left free afterwards. `what` starts
+/// the message ("restoring nightly-2026…").
+pub fn check_free_space(dir: &Path, logical: u64, reserve: u64, what: &str) -> Result<()> {
+    let need = logical.saturating_add(logical / 10);
+    let free = sparkles::disk::free_bytes(dir)?;
+    if free >= need.saturating_add(reserve) {
+        return Ok(());
     }
-    // SAFETY: initialized by the successful call above
-    let s = unsafe { s.assume_init() };
-    #[allow(clippy::unnecessary_cast)] // the field types differ between platforms
-    Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
-}
-
-#[cfg(not(unix))]
-fn free_disk_bytes(_: &Path) -> std::io::Result<u64> {
-    Ok(u64::MAX)
+    let h = sparkles::error::human_bytes;
+    Err(BackupError::new(
+        Code::InsufficientStorage,
+        format!(
+            "{what} needs {} of free disk space{}; {} has {}",
+            h(need),
+            if reserve > 0 {
+                format!(" and {} kept free (--min-free-disk-mb)", h(reserve))
+            } else {
+                String::new()
+            },
+            dir.display(),
+            h(free)
+        ),
+    ))
 }
 
 /// Replace the database directory `target` with the restored directory `restored` (a

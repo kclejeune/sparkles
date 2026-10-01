@@ -82,6 +82,10 @@ pub struct OpenEnv {
     /// addresses (`None`: anywhere; the server sets it for repositories registered
     /// through its API)
     pub outbound: Option<sparkles::outbound::OutboundPolicy>,
+    /// count this repository's object requests here (`None`: counters of its own,
+    /// [`Repository::requests`]); a server keeps one per repository name, so the
+    /// counts survive reopening
+    pub requests: Option<Arc<repo::RequestStats>>,
 }
 
 impl Default for OpenEnv {
@@ -94,6 +98,7 @@ impl Default for OpenEnv {
             server_id: String::new(),
             store: None,
             outbound: None,
+            requests: None,
         }
     }
 }
@@ -174,6 +179,10 @@ pub struct CreateOptions {
     pub dataset_name: String,
     /// extra meta files `(path, content)`, e.g. `reasoning.json`
     pub extra: Vec<(String, Vec<u8>)>,
+    /// `fs` repositories: free space to keep on the repository's file system (the
+    /// server's `--min-free-disk-mb`); a blob that would leave less fails the backup
+    /// with `507 insufficient-storage` (`None`: only the blob itself must fit)
+    pub min_free_disk_bytes: Option<u64>,
     pub ctl: Ctl,
 }
 

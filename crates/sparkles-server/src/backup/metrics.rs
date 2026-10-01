@@ -15,11 +15,15 @@
 //! | `sparkles_backup_policy_runs_total` | counter | `policy`, `result` |
 //! | `sparkles_backup_policy_last_success_timestamp_seconds`, `…_next_run_timestamp_seconds`, `…_consecutive_failures` | gauge | `policy` |
 //!
-//! Object requests are counted from the request totals that verification and GC
-//! reports carry. The policy series are rendered by `policies::render_metrics`.
+//! Object requests are those of every repository handle the server opened (backups,
+//! restores, verifications, GC, listings, connection tests, …), by request kind (`op`:
+//! `put`, `get`, `head`, `list`, `delete`) and `result` (`ok` or `error`, each attempt
+//! of a retried request counted; "not found" and "already exists" answers are `ok`).
+//! The policy series are rendered by `policies::render_metrics`.
 
 use crate::state::AppState;
 use parking_lot::Mutex;
+use sparkles_backup::repo::RequestOp;
 use sparkles_backup::{BackupError, Code};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -117,7 +121,6 @@ struct Inner {
     downloaded: BTreeMap<String, u64>,
     blobs_uploaded: BTreeMap<String, u64>,
     blobs_reused: BTreeMap<String, u64>,
-    requests: BTreeMap<(String, &'static str, &'static str), u64>,
     last_success: BTreeMap<(String, String), f64>,
     capture_lock: Hist,
     lock_conflicts: BTreeMap<String, u64>,
@@ -139,7 +142,6 @@ impl Default for BackupMetrics {
                 downloaded: BTreeMap::new(),
                 blobs_uploaded: BTreeMap::new(),
                 blobs_reused: BTreeMap::new(),
-                requests: BTreeMap::new(),
                 last_success: BTreeMap::new(),
                 capture_lock: Hist::new(&LOCK_BUCKETS),
                 lock_conflicts: BTreeMap::new(),
@@ -178,8 +180,6 @@ pub struct Outcome {
     pub downloaded: u64,
     pub blobs_uploaded: u64,
     pub blobs_reused: u64,
-    /// object requests by `op` (`list`, `head`, `get`, `put`, `delete`), all `ok`
-    pub requests: Vec<(&'static str, u64)>,
     /// a create: the dataset label of `last_success`
     pub dataset: Option<String>,
 }
@@ -212,9 +212,6 @@ impl BackupMetrics {
                 *m.downloaded.entry(label.clone()).or_default() += o.downloaded;
                 *m.blobs_uploaded.entry(label.clone()).or_default() += o.blobs_uploaded;
                 *m.blobs_reused.entry(label.clone()).or_default() += o.blobs_reused;
-                for (k, n) in &o.requests {
-                    *m.requests.entry((label.clone(), k, "ok")).or_default() += n;
-                }
                 if op == Operation::Create
                     && let Some(ds) = &o.dataset
                 {
@@ -268,7 +265,27 @@ pub fn render(st: &AppState, out: &mut String) {
         .iter()
         .map(|(n, e)| (n.clone(), e.stats.clone()))
         .collect();
+    let counted: Vec<(String, sparkles_backup::repo::RequestCounts)> = b
+        .requests
+        .lock()
+        .iter()
+        .map(|(n, s)| (n.clone(), s.snapshot()))
+        .collect();
     let mut m = b.metrics.inner.lock();
+    let mut requests: BTreeMap<(String, &'static str, &'static str), u64> = BTreeMap::new();
+    for (name, c) in counted {
+        let label = m.label(&name, cap);
+        for op in RequestOp::ALL {
+            let n = c.get(op);
+            for (res, k) in [("ok", n.ok), ("error", n.error)] {
+                if k > 0 {
+                    *requests
+                        .entry((label.clone(), op.as_str(), res))
+                        .or_default() += k;
+                }
+            }
+        }
+    }
     for (name, stats) in repos {
         let Some(s) = stats else { continue };
         let label = m.label(&name, cap);
@@ -338,7 +355,7 @@ pub fn render(st: &AppState, out: &mut String) {
         "counter",
         "Object requests to backup repositories by operation and result.",
     );
-    for ((r, op, res), n) in &m.requests {
+    for ((r, op, res), n) in &requests {
         let _ = writeln!(
             o,
             "sparkles_backup_object_requests_total{{repository=\"{}\",op=\"{op}\",result=\"{res}\"}} {n}",
@@ -417,7 +434,6 @@ mod tests {
             blobs_uploaded: 3,
             blobs_reused: 2,
             dataset: Some("ds".into()),
-            requests: vec![("list", 2)],
             ..Default::default()
         };
         m.operation(
@@ -450,6 +466,16 @@ mod tests {
             Duration::from_secs(1),
         );
         m.capture_lock(Duration::from_micros(700));
+        let b = st.backup.as_ref().unwrap();
+        let stats = b.requests.lock().entry("local".into()).or_default().clone();
+        for ok in [true, true, true, true, false] {
+            stats.record(RequestOp::List, ok);
+        }
+        b.requests
+            .lock()
+            .entry("third".into())
+            .or_default()
+            .record(RequestOp::Put, true);
         let mut o = String::new();
         render(&st, &mut o);
         for want in [
@@ -459,6 +485,8 @@ mod tests {
             "sparkles_backup_bytes_uploaded_total{repository=\"local\"} 200",
             "sparkles_backup_blobs_reused_total{repository=\"local\"} 4",
             "sparkles_backup_object_requests_total{repository=\"local\",op=\"list\",result=\"ok\"} 4",
+            "sparkles_backup_object_requests_total{repository=\"local\",op=\"list\",result=\"error\"} 1",
+            "sparkles_backup_object_requests_total{repository=\"third\",op=\"put\",result=\"ok\"} 1",
             "sparkles_backup_lock_conflicts_total{repository=\"$other\"} 1",
             "sparkles_backup_capture_lock_seconds_count 1",
             "sparkles_backup_capture_lock_seconds_bucket{le=\"0.001\"} 1",

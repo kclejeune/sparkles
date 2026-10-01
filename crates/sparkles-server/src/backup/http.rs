@@ -884,6 +884,9 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
         .into());
     }
     let r = b.open_repo(&repo).await?;
+    // `fs` repositories keep the disk reserve (each blob is checked again as it is
+    // written)
+    r.check_space(0, st.limits.min_free_disk_bytes, false)?;
     // an early check: the conditional create of the manifest decides for good
     if r.manifest(&name).await.is_ok() {
         return Err(BackupError::new(
@@ -1040,6 +1043,13 @@ async fn restore_backup(
         }
     }
     drop(existing);
+    // checked again by the restore itself, once it holds the repository lock
+    sparkles_backup::restore::check_free_space(
+        &st.data_dir,
+        sparkles_backup::manifest::logical_size(&m),
+        st.limits.min_free_disk_bytes.unwrap_or(0),
+        &format!("restoring {name}"),
+    )?;
     let admission = b.admit()?;
     let id = st.next_task_id();
     let claim = b.claim(
