@@ -643,6 +643,28 @@ mod tests {
       ?d
   )"
         );
+        // a comment before an operator trails the operand the operator ends, not the
+        // last operand of the nested chain before it, so the nested chain need not
+        // break; a comment after the operator too would end the same line, so it leads
+        // the next operand
+        let src = "(?a && ?b # c\n || # d\n ?e)";
+        assert_eq!(
+            filter(src),
+            "  FILTER(
+    ?a && ?b # c
+      ||
+      # d
+      ?e
+  )"
+        );
+        assert_eq!(
+            filter_with(src, &opts(100, OperatorPosition::Trailing)),
+            "  FILTER(
+    ?a && ?b || # c
+      # d
+      ?e
+  )"
+        );
     }
 
     #[test]

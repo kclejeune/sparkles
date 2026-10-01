@@ -49,11 +49,3 @@ pub struct TooManyResults {
 /// The message of a part that is not written yet; callers (the conformance harness)
 /// skip what fails with it.
 pub(crate) const NOT_IMPLEMENTED: &str = "not implemented";
-
-pub(crate) fn parse_todo(what: &str) -> ParseError {
-    ParseError::new(format!("{what}: {NOT_IMPLEMENTED}"), 1, 1)
-}
-
-pub(crate) fn todo(what: &str) -> anyhow::Error {
-    anyhow::anyhow!("{what}: {NOT_IMPLEMENTED}")
-}

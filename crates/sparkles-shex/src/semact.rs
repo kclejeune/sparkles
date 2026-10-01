@@ -12,6 +12,14 @@ use std::sync::Arc;
 /// The extension IRI of the built-in Test extension.
 pub const TEST_EXTENSION: &str = "http://shex.io/extensions/Test/";
 
+/// Is `iri` the Test extension: its IRI, or that IRI with a fragment
+/// (`http://shex.io/extensions/Test/#a`), which the test suite uses to give external
+/// actions distinct names?
+pub fn is_test_extension(iri: &str) -> bool {
+    iri.strip_prefix(TEST_EXTENSION)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
+}
+
 /// Where an action runs, and what it sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Site<'t> {
@@ -166,8 +174,9 @@ impl Registry {
 
     /// Can any of `acts` fail (so matching must enumerate assignments for them)?
     pub fn can_fail(&self, acts: &[SemAct]) -> bool {
-        acts.iter()
-            .any(|a| self.handlers.contains_key(&a.name) || (self.test && a.name == TEST_EXTENSION))
+        acts.iter().any(|a| {
+            self.handlers.contains_key(&a.name) || (self.test && is_test_extension(&a.name))
+        })
     }
 
     /// Run the start actions, once per validation; `false`: an action failed.
@@ -211,7 +220,7 @@ impl Registry {
             cx.failure = None;
             let ok = if let Some(h) = self.handlers.get(&a.name) {
                 h.run(a.code.as_deref(), site, cx)?
-            } else if self.test && a.name == TEST_EXTENSION {
+            } else if self.test && is_test_extension(&a.name) {
                 run_test(a.code.as_deref(), site, cx)
             } else {
                 *cx.unknown.entry(a.name.clone()).or_default() += 1;
@@ -334,7 +343,13 @@ fn run_test(code: Option<&str>, site: Site<'_>, cx: &mut ActCtx<'_>) -> bool {
             }
             true
         }
+        // a failure also prints its message, as the test suite expects
         TestCall::Fail(arg) => {
+            if cx.registry.trace
+                && let Some(t) = text(&arg, cx, true)
+            {
+                cx.prints.push(t);
+            }
             let msg = text(&arg, cx, false).unwrap_or_default();
             fail(cx, msg)
         }
@@ -436,7 +451,7 @@ mod tests {
         let mut cx = ActCtx::new(&reg, &snap);
         let acts = [test("print(s)"), test("fail(s)"), test("print(o)")];
         assert!(!reg.on_tc(&acts, t, &mut cx).unwrap());
-        assert_eq!(cx.prints, ["http://a.example/s1"]);
+        assert_eq!(cx.prints, ["http://a.example/s1", "http://a.example/s1"]);
         assert_eq!(
             cx.failure,
             Some(ActFailure {
@@ -446,6 +461,14 @@ mod tests {
         );
         assert!(!reg.start(&[test(r#"fail("no")"#)], &mut cx).unwrap());
         assert_eq!(cx.failure.as_ref().unwrap().message, "no");
+        assert_eq!(cx.prints.last().unwrap(), "\"no\"");
+        // the suite names external Test actions with fragments
+        assert!(is_test_extension("http://shex.io/extensions/Test/#a"));
+        assert!(!is_test_extension("http://shex.io/extensions/Test/a"));
+        let named = [act("http://shex.io/extensions/Test/#b", Some("print(p)"))];
+        assert!(reg.can_fail(&named));
+        assert!(reg.on_tc(&named, t, &mut cx).unwrap());
+        assert_eq!(cx.prints.last().unwrap(), "http://a.example/p1");
         // code the Test extension does not know fails, with a message
         assert!(!reg.on_shape(&[test("explode()")], t[0], &mut cx).unwrap());
         assert!(cx.failure.as_ref().unwrap().message.contains("explode()"));

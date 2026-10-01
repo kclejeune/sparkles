@@ -154,14 +154,10 @@ impl<'s> Compiler<'s, '_> {
             ShapeExpr::Nc(nc) => {
                 let regex = match &nc.pattern {
                     None => None,
-                    Some(p) => {
-                        let flags = nc.flags.as_deref().unwrap_or("");
-                        Some(
-                            sparkles::sparql::expr::compile_regex(p, flags).map_err(|_| {
-                                SchemaError::new(format!("invalid pattern /{p}/{flags}"))
-                            })?,
-                        )
-                    }
+                    Some(p) => Some(
+                        crate::nc::compile_pattern(p, nc.flags.as_deref())
+                            .map_err(SchemaError::new)?,
+                    ),
                 };
                 let id = NcId(self.ir.ncs.len() as u32);
                 self.ir.ncs.push(NcIr {
@@ -380,10 +376,20 @@ pub fn shape_label(
             .ir
             .start
             .ok_or_else(|| SchemaError::new("the schema has no start shape")),
-        Some(l) => schema.label(&l).ok_or_else(|| {
-            let shown = show_label(&Label::from_shexj(&l), &schema.prefixes);
-            SchemaError::new(format!("undefined shape label {shown}"))
-        }),
+        Some(l) => {
+            let shown = || show_label(&Label::from_shexj(&l), &schema.prefixes);
+            let k = schema
+                .label(&l)
+                .ok_or_else(|| SchemaError::new(format!("undefined shape label {}", shown())))?;
+            let se = schema.ir.pairs[k.index()].se;
+            if matches!(schema.ir.ses[se.index()], Se::External) {
+                return Err(SchemaError::new(format!(
+                    "external shape {} has no definition",
+                    shown()
+                )));
+            }
+            Ok(k)
+        }
     }
 }
 

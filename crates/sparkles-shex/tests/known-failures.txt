@@ -8,3 +8,8 @@
 # Not listed: Jena skips syntax/_all and syntax/1refbnode_with_spanning_PN_CHARS_BASE1
 # as "ill-formed surrogate pairs", but both files are valid UTF-8 whose characters
 # outside the BMP (U+10000, U+EFFFD, ...) trip Java's UTF-16 strings, not the grammar.
+
+# A facet on a blank node label without the LexicalBNode trait that marks the others
+# (skipped: the store does not keep blank node labels).
+validation/1focusMinLength-dot_pass-bnode-long  blank node labels are not preserved by the store
+validation-shexj/1focusMinLength-dot_pass-bnode-long  blank node labels are not preserved by the store

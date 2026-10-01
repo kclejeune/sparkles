@@ -15,11 +15,18 @@
 //!   intervals for EachOf (every iteration takes a part of each child) and their sum for
 //!   OneOf (every iteration takes one branch); then `{ j : [j·m, j·n] ∩ B ≠ ∅ }`.
 //!
-//! The vector matches iff the root's interval holds 1. This is the bag derivative of
-//! the expression by each constraint's count at once, kept as the iteration counts the
-//! remaining expression allows, so its cost is linear in the expression whatever the
-//! counts (`(a|b){2}` matches `{a, b}` because the two iterations take different
-//! branches).
+//! The vector matches iff the root's interval holds 1. Why this is exact: the children
+//! of a group have disjoint constraints, so how one child's arcs are cut into
+//! iterations never constrains another's; `j` iterations of an EachOf exist iff every
+//! child splits into `j` parts, and of a OneOf iff the branches' part counts add up to
+//! `j`. Parts are bags, so `I` body iterations group into `j` iterations of `{m,n}`
+//! iff `j·m ≤ I ≤ j·n`. Sums and intersections of integer intervals are intervals, so
+//! nothing is lost by keeping only the bounds. The cost is linear in the expression
+//! whatever the counts (`(a|b){2}` matches `{a, b}` because the two iterations take
+//! different branches); a brute-force enumeration of the partitions the definition
+//! describes is the property test's oracle. Bag derivatives by `k` copies of a symbol
+//! would compute the same, but they copy group bodies when the copies spread over
+//! iterations.
 //!
 //! **Three-valued reads.** During discovery the typing is unknown. An arc whose value
 //! may satisfy a constraint may be assigned to it; an EXTRA arc that satisfies nothing
