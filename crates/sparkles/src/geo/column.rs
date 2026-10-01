@@ -450,6 +450,8 @@ impl Column {
         self.pairs.reserve(pairs.len());
         for (id, p, e) in pairs {
             if let Some(e) = e {
+                // memory, but no literal of the counts
+                self.base_counts.bytes += e.bytes();
                 self.base.insert(id, Slot::Geom(e));
             }
             self.pairs.insert(id, p);
@@ -491,6 +493,7 @@ impl Column {
             return entry(&x, id);
         }
         let id = wgs84::pair_id((self.pairs.len() + x.pairs.len()) as u64);
+        x.counts.bytes += e.bytes();
         x.map.insert(id, Slot::Geom(e.clone()));
         x.pairs.insert(id, pair);
         x.pair_ids.insert(key, id);
