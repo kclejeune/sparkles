@@ -1672,6 +1672,25 @@ const server = http.createServer(async (req, res) => {
       switch (what) {
         case 'ping':
           return send(res, 200, new Date().toISOString(), 'text/plain');
+        // the formatter: echoes the text and cursor, unchanged
+        case 'format': {
+          if (req.method !== 'POST') return fail(res, 405, 'method not allowed');
+          let body;
+          try {
+            body = JSON.parse((await readBody(req)).toString('utf8'));
+          } catch {
+            return fail(res, 400, 'invalid JSON', { code: 'bad-request' });
+          }
+          if (typeof body?.text !== 'string')
+            return fail(res, 400, 'expected `text`', { code: 'bad-request' });
+          return send(res, 200, {
+            text: body.text,
+            changed: false,
+            language: body.language ?? 'sparql',
+            cursorOffset: body.cursorOffset ?? null,
+            warnings: [],
+          });
+        }
         // the mock runs open, like a server without --auth-config
         case 'whoami':
           return send(res, 200, {

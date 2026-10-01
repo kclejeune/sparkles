@@ -272,6 +272,8 @@ type ApiErrorExtra = {
   column?: number;
   requestId?: string;
   budget?: Budget;
+  /** the machine-readable error code of bodies that have one (`syntax`, `bad-request` …) */
+  code?: string;
 };
 
 /** Error shape for non-2xx responses: `{ error, detail?, line?, column? }`. */
@@ -283,6 +285,7 @@ export class ApiError extends Error {
   /** The server's `X-Request-Id` for this request, to find it in the server log. */
   requestId?: string;
   budget?: Budget;
+  code?: string;
   constructor(status: number, message: string, extra: ApiErrorExtra = {}) {
     super(message);
     this.name = 'ApiError';
@@ -292,6 +295,7 @@ export class ApiError extends Error {
     this.column = extra.column;
     this.requestId = extra.requestId;
     this.budget = extra.budget;
+    this.code = extra.code;
   }
 }
 
@@ -345,6 +349,7 @@ async function toError(res: Response): Promise<ApiError> {
         column: body.column,
         requestId,
         budget: budgetOf(body),
+        code: typeof body.code === 'string' ? body.code : undefined,
       });
     }
   } catch {
@@ -451,6 +456,55 @@ export async function ready(signal?: AbortSignal): Promise<ReadyInfo> {
 /** The metrics registry as JSON (`404` when the server runs with `--no-metrics`). */
 export const metricsSnapshot = (signal?: AbortSignal) =>
   json<MetricsSnapshot>('/$/metrics?format=json', { signal, cache: 'no-store' });
+
+// --- formatting ---------------------------------------------------------------
+
+/** The languages `POST /$/format` knows (only `sparql` formats so far). */
+export type FormatLanguage = 'sparql' | 'turtle' | 'trig' | 'ntriples' | 'nquads' | 'jsonld';
+
+/** The style options (the `.sparklesfmt.toml` keys in camelCase); omitted ones take the defaults. */
+export type FormatOptions = {
+  lineWidth?: number;
+  indentWidth?: number;
+  sort?: boolean;
+  prunePrefixes?: boolean;
+  directiveStyle?: 'sparql' | 'turtle';
+  prefixGroups?: string[][];
+  typeShorthand?: boolean;
+  compactIris?: boolean;
+  quoteStyle?: 'double' | 'preserve';
+  operatorPosition?: 'leading' | 'trailing';
+  turtleLayout?: 'diff' | 'conventional';
+  alignValues?: boolean;
+};
+
+export type FormatRequest = {
+  text: string;
+  /** sniffed from the text when absent */
+  language?: FormatLanguage;
+  /** the cursor, in UTF-16 code units (the editor's unit) */
+  cursorOffset?: number;
+  options?: FormatOptions;
+};
+
+export type FormatWarning = { code: string; message: string; line: number; column: number };
+
+export type FormatResult = {
+  text: string;
+  changed: boolean;
+  language: FormatLanguage;
+  /** the cursor mapped into `text` (UTF-16 code units), `null` without one */
+  cursorOffset: number | null;
+  warnings: FormatWarning[];
+};
+
+/**
+ * Format a document. Throws an `ApiError`: `400` with `code` `syntax` and the error's `line`
+ * and `column`, `400` `bad-request`, `415` for a language that does not format, `422` when the
+ * formatter refuses its own output (`unsafe-format`, `unstable-format`, `unsupported-syntax`).
+ */
+export const format = (req: FormatRequest, signal?: AbortSignal) =>
+  json<FormatResult>('/$/format', { ...jsonBody(req), signal });
 
 // --- datasets -----------------------------------------------------------------
 
