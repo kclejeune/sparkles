@@ -12,21 +12,25 @@ QueryUnit
         Var1 "?s"
       ProjectionItem
         LParen "("
-        Opaque
-          Word "COUNT"
-          LParen "("
-          Var1 "?o"
-          RParen ")"
+        Aggregate
+          Kw(Count) "COUNT"
+          ArgList
+            LParen "("
+            Arg
+              Var1 "?o"
+            RParen ")"
         Kw(As) "AS"
         Var1 "?count"
         RParen ")"
       ProjectionItem
         LParen "("
-        Opaque
-          Word "SAMPLE"
-          LParen "("
-          Var2 "$n"
-          RParen ")"
+        Aggregate
+          Kw(Sample) "SAMPLE"
+          ArgList
+            LParen "("
+            Arg
+              Var2 "$n"
+            RParen ")"
         Kw(As) "AS"
         Var1 "?n2"
         RParen ")"
@@ -60,68 +64,85 @@ QueryUnit
         Var1 "?s"
       GroupCondition
         LParen "("
-        Opaque
-          Word "LCASE"
-          LParen "("
-          Var1 "?o"
-          RParen ")"
+        Call
+          Kw(Lcase) "LCASE"
+          ArgList
+            LParen "("
+            Arg
+              Var1 "?o"
+            RParen ")"
         Kw(As) "AS"
         Var1 "?lo"
         RParen ")"
       GroupCondition
-        Opaque
-          Word "STR"
-          LParen "("
-          Var1 "?n"
-          RParen ")"
+        Call
+          Kw(Str) "STR"
+          ArgList
+            LParen "("
+            Arg
+              Var1 "?n"
+            RParen ")"
       GroupCondition
-        Opaque
+        Call
           PnameLn "ex:f"
-          LParen "("
-          Var1 "?n"
-          RParen ")"
+          ArgList
+            LParen "("
+            Arg
+              Var1 "?n"
+            RParen ")"
     Having
       Kw(Having) "HAVING"
-      Opaque
+      Bracketed
         LParen "("
-        Word "COUNT"
-        LParen "("
-        Var1 "?o"
+        Binary
+          Aggregate
+            Kw(Count) "COUNT"
+            ArgList
+              LParen "("
+              Arg
+                Var1 "?o"
+              RParen ")"
+          Gt ">"
+          Integer "1"
         RParen ")"
-        Gt ">"
-        Integer "1"
-        RParen ")"
-      Opaque
-        Word "BOUND"
-        LParen "("
-        Var1 "?s"
-        RParen ")"
+      Call
+        Kw(Bound) "BOUND"
+        ArgList
+          LParen "("
+          Arg
+            Var1 "?s"
+          RParen ")"
     OrderBy
       Kw(Order) "ORDER"
       Kw(By) "BY"
       OrderCondition
         Kw(Desc) "DESC"
-        Opaque
+        Bracketed
           LParen "("
           Var1 "?s"
           RParen ")"
       OrderCondition
         Kw(Asc) "ASC"
-        Opaque
+        Bracketed
           LParen "("
           Var1 "?count"
           RParen ")"
       OrderCondition
         Var1 "?lo"
       OrderCondition
-        Opaque
-          Word "STRLEN"
-          LParen "("
-          Word "STR"
-          LParen "("
-          Var1 "?s"
-          RParen ")"
-          RParen ")"
+        Call
+          Kw(Strlen) "STRLEN"
+          ArgList
+            LParen "("
+            Arg
+              Call
+                Kw(Str) "STR"
+                ArgList
+                  LParen "("
+                  Arg
+                    Var1 "?s"
+                  RParen ")"
+            RParen ")"
     Limit
       Kw(Limit) "LIMIT"
       Integer "10"

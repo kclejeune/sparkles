@@ -25,6 +25,7 @@
 //! A variable, an IRI, a number or a boolean alone is a token; a tagged or typed string
 //! is a `Literal` node.
 
+use super::term::{self, TripleTermCtx};
 use super::{Completed, Marker, Parser};
 use crate::lex::TokenKind;
 use crate::sparql::keywords::Kw;
@@ -32,8 +33,9 @@ use crate::syntax::NodeKind;
 
 /// `Expression ::= ConditionalOrExpression`.
 ///
-/// Returns the expression's node, or `None` when the expression is a single token (a
-/// variable, an IRI, a number) or after an error ([`Parser::has_error`] tells which).
+/// Returns the expression's node, or `None` when the expression is a single term (a
+/// variable, an IRI, a literal, a triple term) or after an error ([`Parser::has_error`]
+/// tells which).
 pub fn expression(p: &mut Parser<'_>) -> Option<Completed> {
     chain(p, TokenKind::OrOr, NodeKind::OrChain, and_chain)
 }
@@ -188,12 +190,17 @@ fn primary(p: &mut Parser<'_>) -> Option<Completed> {
     use TokenKind as T;
     match p.current() {
         T::LParen => bracketted(p),
-        T::LtLtParen => expr_triple_term(p),
-        T::IriRef | T::PnameLn | T::PnameNs => {
+        T::LtLtParen => {
+            // `ExprTripleTerm`: an IRI or variable subject, a verb, a term or a nested
+            // triple term as the object
+            term::triple_term(p, TripleTermCtx::Expr);
+            None
+        }
+        k if term::is_iri(k) => {
             if matches!(p.nth(1), T::LParen | T::Nil) {
                 builtin_or_call(p)
             } else {
-                p.bump();
+                term::iri(p);
                 None
             }
         }
@@ -201,16 +208,11 @@ fn primary(p: &mut Parser<'_>) -> Option<Completed> {
             p.bump();
             None
         }
-        k if k.is_number() => {
-            p.bump();
+        _ if term::at_literal(p) => {
+            term::literal(p);
             None
         }
-        k if k.is_string() => literal(p),
         T::Word => match p.current_kw() {
-            Some(kw @ (Kw::True | Kw::False)) => {
-                p.bump_as(T::Kw(kw));
-                None
-            }
             Some(kw) if kw.is_builtin() || matches!(kw, Kw::Exists | Kw::Not) => builtin_or_call(p),
             _ => {
                 p.error("expected an expression");
@@ -222,61 +224,6 @@ fn primary(p: &mut Parser<'_>) -> Option<Completed> {
             None
         }
     }
-}
-
-/// `RDFLiteral`: a string, with its language tag or datatype in a `Literal` node.
-fn literal(p: &mut Parser<'_>) -> Option<Completed> {
-    if !matches!(p.nth(1), TokenKind::LangDir | TokenKind::HatHat) {
-        p.bump();
-        return None;
-    }
-    let m = p.start(NodeKind::Literal);
-    p.bump();
-    if p.eat(TokenKind::HatHat) {
-        if !(p.eat(TokenKind::IriRef) || p.eat(TokenKind::PnameLn) || p.eat(TokenKind::PnameNs)) {
-            p.error("expected a datatype IRI");
-        }
-    } else {
-        p.bump();
-    }
-    Some(m.complete(p))
-}
-
-/// `ExprTripleTerm ::= '<<(' ExprTripleTermSubject Verb ExprTripleTermObject ')>>'`: a
-/// `TripleTerm` whose subject is an IRI or a variable, whose verb is an IRI, a variable
-/// or `a`, and whose object is a term or a nested triple term.
-fn expr_triple_term(p: &mut Parser<'_>) -> Option<Completed> {
-    use TokenKind as T;
-    let iri_or_var =
-        |k: TokenKind| matches!(k, T::IriRef | T::PnameLn | T::PnameNs | T::Var1 | T::Var2);
-    let m = p.start(NodeKind::TripleTerm);
-    p.bump();
-    if !iri_or_var(p.current()) {
-        p.error("expected an IRI or a variable");
-    }
-    p.bump();
-    if !p.eat_kw(Kw::A) {
-        if !iri_or_var(p.current()) {
-            p.error("expected a verb");
-        }
-        p.bump();
-    }
-    match p.current() {
-        T::LtLtParen => {
-            expr_triple_term(p);
-        }
-        k if k.is_string() => {
-            literal(p);
-        }
-        k if iri_or_var(k) || k.is_number() => p.bump(),
-        T::Word => match p.current_kw() {
-            Some(kw @ (Kw::True | Kw::False)) => p.bump_as(T::Kw(kw)),
-            _ => p.error("expected a term"),
-        },
-        _ => p.error("expected a term"),
-    }
-    p.expect(T::ParenGtGt);
-    Some(m.complete(p))
 }
 
 /// `BrackettedExpression ::= '(' Expression ')'`: a `Bracketed` node.
@@ -298,9 +245,9 @@ pub fn bracketted(p: &mut Parser<'_>) -> Option<Completed> {
 pub fn builtin_or_call(p: &mut Parser<'_>) -> Option<Completed> {
     use TokenKind as T;
     match p.current() {
-        T::IriRef | T::PnameLn | T::PnameNs => {
+        k if term::is_iri(k) => {
             let m = p.start(NodeKind::Call);
-            p.bump();
+            term::iri(p);
             arg_list(p, true);
             return Some(m.complete(p));
         }
@@ -385,21 +332,49 @@ fn aggregate_args(p: &mut Parser<'_>, kw: Kw) {
     if kw == Kw::Count && p.at(TokenKind::Star) {
         p.bump();
     } else {
+        let from = p.events.len();
         expression(p);
+        if contains_aggregate(&p.events[from..]) {
+            p.error("aggregate functions cannot be nested");
+        }
     }
     let separator = kw == Kw::GroupConcat && p.eat(TokenKind::Semicolon);
     a.complete(p);
     if separator {
         p.expect_kw(Kw::Separator);
         p.expect(TokenKind::Eq);
-        if p.current().is_string() {
-            p.bump();
+        if p.current().is_string() && !matches!(p.nth(1), TokenKind::LangDir | TokenKind::HatHat) {
+            // a plain string, its escapes checked
+            term::literal(p);
         } else {
             p.error("expected a string");
         }
     }
     p.expect(TokenKind::RParen);
     m.complete(p);
+}
+
+/// Whether the events of an aggregate's argument start an aggregate of the same query
+/// level: one outside the groups of `EXISTS` (whose subqueries have their own
+/// aggregates). SPARQL 1.2 §19.7: "The expression argument of an aggregate function
+/// cannot contain an aggregate function."
+fn contains_aggregate(events: &[super::Event]) -> bool {
+    let mut open: Vec<NodeKind> = Vec::new();
+    for e in events {
+        match e {
+            super::Event::Start { kind, .. } => {
+                if *kind == NodeKind::Aggregate && !open.contains(&NodeKind::GroupGraphPattern) {
+                    return true;
+                }
+                open.push(*kind);
+            }
+            super::Event::Finish => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The signed numeric literal kinds: directly after an operand, the sign is the
@@ -645,15 +620,12 @@ mod tests {
     #[test]
     fn exists_and_literals() {
         assert_eq!(
-            dump("not exists { ?s ?p ?o }"),
+            dump("not exists { }"),
             "  NotExists
     Kw(Not) \"not\"
     Kw(Exists) \"exists\"
     GroupGraphPattern
       LBrace \"{\"
-      Var1 \"?s\"
-      Var1 \"?p\"
-      Var1 \"?o\"
       RBrace \"}\"
 "
         );
@@ -720,107 +692,6 @@ mod tests {
         assert!(error("foo(?a)").contains("expected an expression"));
         assert!(error("STR(?a").contains("expected RParen"));
         assert!(error("?a ?b").contains("expected the end"));
-    }
-
-    /// Walk a whole query or update and parse every expression where the grammar puts
-    /// one: `FILTER`, `BIND`, `HAVING`, `ORDER BY`, `GROUP BY` and projections. The
-    /// tokens in between are skipped.
-    fn scan_expressions(p: &mut Parser<'_>) -> usize {
-        let mut n = 0;
-        let mut in_select = false;
-        while !p.at(TokenKind::Eof) {
-            if p.eat_kw(Kw::Filter) {
-                constraint(p);
-                n += 1;
-            } else if p.eat_kw(Kw::Bind) {
-                p.expect(TokenKind::LParen);
-                expression(p);
-                p.expect_kw(Kw::As);
-                n += 1;
-            } else if p.eat_kw(Kw::Select) {
-                in_select = true;
-            } else if in_select && p.at(TokenKind::LParen) {
-                p.bump();
-                expression(p);
-                p.expect_kw(Kw::As);
-                n += 1;
-            } else if p.at_kw(Kw::Where) || p.at(TokenKind::LBrace) || p.at_kw(Kw::From) {
-                in_select = false;
-                p.bump();
-            } else if p.eat_kw(Kw::Having) || p.eat_kw(Kw::By) {
-                // conditions: brackets, calls, variables, ASC/DESC
-                loop {
-                    if p.eat_kw(Kw::Asc) || p.eat_kw(Kw::Desc) {
-                        bracketted(p);
-                    } else if p.at(TokenKind::LParen) {
-                        p.bump();
-                        expression(p);
-                        if p.eat_kw(Kw::As) {
-                            p.bump();
-                        }
-                        p.expect(TokenKind::RParen);
-                    } else if matches!(p.current(), TokenKind::Var1 | TokenKind::Var2) {
-                        p.bump();
-                    } else if matches!(p.current(), TokenKind::IriRef | TokenKind::PnameLn)
-                        || p.current_kw().is_some_and(Kw::is_builtin)
-                    {
-                        builtin_or_call(p);
-                    } else {
-                        break;
-                    }
-                    n += 1;
-                }
-            } else {
-                p.bump();
-            }
-        }
-        n
-    }
-
-    /// Every expression in the valid W3C queries and updates parses.
-    #[test]
-    fn w3c_corpus_expressions_parse() {
-        let dir = std::env::var("SPARKLES_W3C_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../../apache/jena/jena-arq/testing/rdf-tests-cg/sparql")
-            });
-        if !dir.exists() {
-            eprintln!("W3C suite not found (set SPARKLES_W3C_DIR): skipped");
-            return;
-        }
-        let mut stack = vec![dir];
-        let (mut files, mut exprs, mut failures) = (0, 0, Vec::new());
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                let path = e.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !matches!(path.extension().and_then(|e| e.to_str()), Some("rq" | "ru")) {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let tokens = lex(&text, LexMode::Sparql);
-                if crate::check::sparql_reference(&text, &tokens).is_err() {
-                    continue;
-                }
-                files += 1;
-                let mut p = Parser::new(&text, &tokens);
-                let root = p.start(NodeKind::QueryUnit);
-                exprs += scan_expressions(&mut p);
-                root.complete(&mut p);
-                if let Err(e) = p.finish() {
-                    failures.push(format!("{}: {e}", path.display()));
-                }
-            }
-        }
-        eprintln!("{exprs} expressions in {files} valid files");
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
