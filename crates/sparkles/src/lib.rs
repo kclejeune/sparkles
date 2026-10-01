@@ -16,8 +16,10 @@ pub mod schema;
 pub mod sparql;
 pub mod store;
 pub mod text;
+pub mod validation;
 pub mod vector;
 pub mod vocab;
+pub mod xsd;
 
 pub use dataset::{Dataset, GraphView, Solution, Solutions, Transaction};
 pub use error::{Budget, BudgetKind, Error, Result};

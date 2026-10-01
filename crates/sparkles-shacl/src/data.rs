@@ -1,6 +1,7 @@
-//! Data graph access over a store [`Snapshot`]: index scans for `(s p ?)`, `(? p o)`,
-//! `(s ? ?)`, `(? p ?)`, restricted to the graphs that make up the data graph, plus
-//! term resolution for shape constants that are not in the store (local ids).
+//! Data graph access over a store [`Snapshot`]: the shared data graph of
+//! [`sparkles::validation`] (index scans restricted to the graphs that make it up), plus
+//! term resolution for shape constants that are not in the store (local ids) and the
+//! subclass closure of `sh:class`.
 
 use crate::shapes::Shapes;
 use crate::vocab::{rdf, rdfs};
@@ -9,50 +10,15 @@ use oxrdf::{Graph, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles::id::{Id, Tag};
 use sparkles::index::{Key, Perm};
-use sparkles::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
 use sparkles::sparql::value::Value;
 use sparkles::store::{Chunk, Snapshot};
+use sparkles::validation::{self, graph_id};
 use std::sync::{Arc, RwLock};
 
-/// Which graphs of the store form the data graph.
-#[derive(Clone, Debug)]
-pub(crate) enum GraphSel {
-    /// every graph (union default graph)
-    All,
-    /// these graph ids (sorted)
-    Set(Vec<u64>),
-    /// every graph but these (sorted)
-    AllExcept(Vec<u64>),
-}
-
-impl GraphSel {
-    #[inline]
-    fn accepts(&self, g: u64) -> bool {
-        match self {
-            GraphSel::All => true,
-            GraphSel::Set(gs) => gs.len() == 1 && gs[0] == g || gs.binary_search(&g).is_ok(),
-            GraphSel::AllExcept(ex) => ex.binary_search(&g).is_err(),
-        }
-    }
-
-    /// The graph ids, listing every graph of `snap` for `All` / `AllExcept`.
-    pub fn ids(&self, snap: &Snapshot) -> Result<Vec<Id>> {
-        Ok(match self {
-            GraphSel::Set(gs) => gs.iter().map(|&g| Id(g)).collect(),
-            _ => {
-                let mut all = vec![Id::DEFAULT_GRAPH];
-                all.extend(snap.graph_ids()?);
-                all.retain(|g| self.accepts(g.0));
-                all
-            }
-        })
-    }
-}
-
-/// The data graph plus the id mapping of a shapes graph's terms.
+/// The data graph ([`sparkles::validation::DataGraph`], whose scans it derefs to) plus
+/// the id mapping of a shapes graph's terms.
 pub(crate) struct DataGraph {
-    pub snap: Arc<Snapshot>,
-    pub sel: GraphSel,
+    graph: validation::DataGraph,
     /// terms that are not in the store; `Id::local(i)` ↔ `locals[i]`
     locals: Vec<Term>,
     local_index: FxHashMap<Term, Id>,
@@ -62,12 +28,11 @@ pub(crate) struct DataGraph {
     subclasses: RwLock<FxHashMap<Id, Arc<FxHashSet<Id>>>>,
 }
 
-/// Resolve a graph IRI to its id (`None` if the graph does not exist).
-fn graph_id(snap: &Snapshot, iri: &str) -> Option<Id> {
-    if iri == DEFAULT_GRAPH_IRI {
-        return Some(Id::DEFAULT_GRAPH);
+impl std::ops::Deref for DataGraph {
+    type Target = validation::DataGraph;
+    fn deref(&self) -> &validation::DataGraph {
+        &self.graph
     }
-    snap.lookup_iri(iri)
 }
 
 impl DataGraph {
@@ -78,40 +43,11 @@ impl DataGraph {
         exclude: &[String],
         shapes: &Shapes,
     ) -> Result<(DataGraph, Vec<Id>)> {
-        let mut excluded: Vec<u64> = exclude
-            .iter()
-            .filter_map(|g| graph_id(&snap, g))
-            .map(|g| g.0)
-            .collect();
-        excluded.sort_unstable();
-        excluded.dedup();
-        let sel = match data_graph {
-            Some(UNION_GRAPH_IRI) => GraphSel::All,
-            None if snap.union_default_graph => GraphSel::All,
-            _ => {
-                let mut gs = vec![match data_graph {
-                    None => Id::DEFAULT_GRAPH.0,
-                    Some(iri) => match graph_id(&snap, iri) {
-                        Some(g) => g.0,
-                        None => bail!("data graph <{iri}> does not exist"),
-                    },
-                }];
-                gs.extend(extra.iter().filter_map(|g| graph_id(&snap, g)).map(|g| g.0));
-                gs.sort_unstable();
-                gs.dedup();
-                gs.retain(|g| excluded.binary_search(g).is_err());
-                GraphSel::Set(gs)
-            }
-        };
-        let sel = match sel {
-            GraphSel::All if !excluded.is_empty() => GraphSel::AllExcept(excluded),
-            s => s,
-        };
+        let graph = validation::DataGraph::new(snap, data_graph, extra, exclude)?;
         let mut d = DataGraph {
             rdf_type: Id::UNDEF,
             sub_class_of: Id::UNDEF,
-            snap,
-            sel,
+            graph,
             locals: Vec::new(),
             local_index: FxHashMap::default(),
             subclasses: RwLock::new(FxHashMap::default()),
@@ -153,101 +89,6 @@ impl DataGraph {
 
     pub fn value(&self, id: Id) -> Option<Value> {
         self.term(id).map(|t| Value::from_term(&t))
-    }
-
-    #[inline]
-    fn stored(id: Id) -> bool {
-        !matches!(id.tag(), Tag::Local | Tag::Undef)
-    }
-
-    fn scan(&self, perm: Perm, prefix: &[u64], mut f: impl FnMut(&Key)) -> Result<()> {
-        let sel = &self.sel;
-        let gcol = 3; // graph is the last key column of every non-GSPO permutation
-        self.snap.scan(perm, prefix, |c| {
-            match c {
-                Chunk::Block(b, s, e) => {
-                    let gs = &b.cols[gcol];
-                    for (i, &g) in gs.iter().enumerate().take(e).skip(s) {
-                        if sel.accepts(g) {
-                            f(&b.key(i));
-                        }
-                    }
-                }
-                Chunk::Row(k) => {
-                    if sel.accepts(k[gcol]) {
-                        f(&k)
-                    }
-                }
-            }
-            Ok(true)
-        })?;
-        Ok(())
-    }
-
-    /// Objects of `(s, p, ?)` (distinct).
-    pub fn objects(&self, s: Id, p: Id) -> Result<Vec<Id>> {
-        let mut out: Vec<Id> = Vec::new();
-        if !Self::stored(s) || !Self::stored(p) {
-            return Ok(out);
-        }
-        self.scan(Perm::Spo, &[s.0, p.0], |k| {
-            if out.last().map(|l| l.0) != Some(k[2]) {
-                out.push(Id(k[2]));
-            }
-        })?;
-        Ok(out)
-    }
-
-    /// Subjects of `(?, p, o)` (distinct).
-    pub fn subjects(&self, p: Id, o: Id) -> Result<Vec<Id>> {
-        let mut out: Vec<Id> = Vec::new();
-        if !Self::stored(o) || !Self::stored(p) {
-            return Ok(out);
-        }
-        self.scan(Perm::Pos, &[p.0, o.0], |k| {
-            if out.last().map(|l| l.0) != Some(k[2]) {
-                out.push(Id(k[2]));
-            }
-        })?;
-        Ok(out)
-    }
-
-    /// `(p, o)` pairs of all triples with subject `s` (distinct).
-    pub fn out_edges(&self, s: Id) -> Result<Vec<(Id, Id)>> {
-        let mut out: Vec<(Id, Id)> = Vec::new();
-        if !Self::stored(s) {
-            return Ok(out);
-        }
-        self.scan(Perm::Spo, &[s.0], |k| {
-            let e = (Id(k[1]), Id(k[2]));
-            if out.last() != Some(&e) {
-                out.push(e);
-            }
-        })?;
-        Ok(out)
-    }
-
-    /// Distinct subjects of triples with predicate `p`.
-    pub fn subjects_of(&self, p: Id) -> Result<Vec<Id>> {
-        self.distinct_second(Perm::Pso, p)
-    }
-
-    /// Distinct objects of triples with predicate `p`.
-    pub fn objects_of(&self, p: Id) -> Result<Vec<Id>> {
-        self.distinct_second(Perm::Pos, p)
-    }
-
-    fn distinct_second(&self, perm: Perm, p: Id) -> Result<Vec<Id>> {
-        let mut out: Vec<Id> = Vec::new();
-        if !Self::stored(p) {
-            return Ok(out);
-        }
-        self.scan(perm, &[p.0], |k| {
-            if out.last().map(|l| l.0) != Some(k[1]) {
-                out.push(Id(k[1]));
-            }
-        })?;
-        Ok(out)
     }
 
     /// `class` and all its subclasses (rdfs:subClassOf* in the data graph), cached.

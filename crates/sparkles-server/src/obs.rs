@@ -571,7 +571,7 @@ struct OpMetrics {
 pub struct DsMetrics {
     ops: [OpMetrics; 8],
     result_rows: AtomicU64,
-    budget: [AtomicU64; 5],
+    budget: [AtomicU64; BudgetKind::ALL.len()],
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
 }
 
@@ -582,6 +582,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::ResultBytes => 2,
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
+        BudgetKind::ValidationWork => 5,
     }
 }
 
@@ -1066,7 +1067,7 @@ pub fn render_prometheus(st: &AppState) -> String {
         &mut o,
         "sparkles_budget_exceeded_total",
         "counter",
-        "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes).",
+        "Requests that exceeded a budget (rows, memory, result-bytes, decompressed-bytes, outbound-bytes, validation-work).",
     );
     for (ds, m) in &series {
         let ds = escape_label(ds);

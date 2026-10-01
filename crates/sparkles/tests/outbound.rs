@@ -730,3 +730,53 @@ fn connection_errors_are_generic() {
     let m = failure(service("http://nowhere.test/sparql", false, p));
     assert!(m.ends_with("cannot resolve nowhere.test"), "{m}");
 }
+
+#[test]
+fn fetch_text_through_the_policy() {
+    use sparkles::outbound::{RequestBudget, fetch_text};
+    let s = Server::start(|path| match path {
+        "/schema.shex" => reply(
+            "200 OK",
+            &[("content-type", "text/shex")],
+            "<S> { <p> . } # ✓".as_bytes(),
+        ),
+        "/latin1" => reply("200 OK", &[("content-type", "text/plain")], b"caf\xe9"),
+        "/big" => reply("200 OK", &[("content-type", "text/plain")], &[b'x'; 4096]),
+        _ => reply("404 Not Found", &[], b""),
+    });
+    let fetch = |path: &str, policy: &OutboundPolicy| {
+        fetch_text(
+            policy,
+            &RequestBudget::new(policy),
+            &s.url(path),
+            "text/shex",
+        )
+    };
+    // refused before any connection
+    let m = refusal(fetch("/schema.shex", &Default::default()));
+    assert!(m.contains("loopback"), "{m}");
+    assert_eq!(s.conns(), 0);
+    assert_eq!(
+        fetch("/schema.shex", &private_ok()).unwrap(),
+        "<S> { <p> . } # ✓"
+    );
+    assert!(failure(fetch("/missing", &private_ok())).contains("404"));
+    assert!(failure(fetch("/latin1", &private_ok())).contains("not UTF-8"));
+    let small = OutboundPolicy {
+        max_response_bytes: 1024,
+        ..private_ok()
+    };
+    let m = failure(fetch("/big", &small));
+    assert!(m.contains("larger than the outbound limit"), "{m}");
+    // the requests of one request share its budget
+    let tight = OutboundPolicy {
+        max_request_bytes: 6000,
+        ..private_ok()
+    };
+    let budget = RequestBudget::new(&tight);
+    fetch_text(&tight, &budget, &s.url("/big"), "*/*").unwrap();
+    let r = fetch_text(&tight, &budget, &s.url("/big"), "*/*");
+    assert!(matches!(r, Err(Error::BudgetExceeded(_))), "{r:?}");
+    let r = fetch_text(&private_ok(), &budget, "ftp://example.org/s.shex", "*/*");
+    assert!(failure(r).contains("only http and https"));
+}
