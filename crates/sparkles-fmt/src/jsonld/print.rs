@@ -119,7 +119,7 @@ impl Table {
     /// keywords (group 0) by their place in the table, unknown `@` keys (1) and terms (2)
     /// in source order (terms by codepoint with `sort`), `@graph` of a node object last
     /// (3). A literal keeps every member in place.
-    fn rank(self, key: &str) -> (u8, usize) {
+    pub fn rank(self, key: &str) -> (u8, usize) {
         let keywords = match self {
             Table::Literal => return (0, 0),
             Table::Node if key == "@graph" => return (3, 0),
