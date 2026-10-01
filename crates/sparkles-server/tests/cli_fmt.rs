@@ -614,6 +614,141 @@ fn config_errors_name_the_key_and_the_file() {
     }
 }
 
+/// With the test-only fault switch the printer drops a token: the check refuses the
+/// output, `--write` leaves the file alone, and the endpoint answers 422.
+#[test]
+fn refused_output_is_never_written() {
+    let d = tempdir();
+    let dir = d.path();
+    let unformatted = format!("{BOM}{QUERY}");
+    write(dir, "x.rq", &unformatted);
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .arg("fmt")
+            .args(args)
+            .current_dir(dir)
+            .env("SPARKLES_FMT_FAULT", "drop-token")
+            .output()
+            .unwrap()
+    };
+    for args in [&["--write", "x.rq"][..], &["--check", "x.rq"], &["x.rq"]] {
+        let o = run(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "x.rq: error: formatter refused its own output (algebra differs); input left unchanged; please report"
+            ),
+            "{}",
+            stderr(&o)
+        );
+        assert_eq!(stdout(&o), "");
+        assert_eq!(read(dir, "x.rq"), unformatted);
+    }
+
+    let server = Server::start(dir, &[("SPARKLES_FMT_FAULT", "drop-token")]);
+    let (status, body) = server.post(
+        "/$/format",
+        "application/json",
+        r#"{"text": "SELECT ?s WHERE { ?s ?p ?o }"}"#,
+    );
+    assert_eq!(status, 422, "{body}");
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["code"], "unsafe-format", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("algebra differs"),
+        "{j}"
+    );
+    assert!(j["requestId"].is_string(), "{j}");
+}
+
+/// The endpoint on a real server without auth, for an anonymous caller: both body
+/// forms and RDF/XML refused.
+#[test]
+fn the_endpoint_on_a_running_server() {
+    let d = tempdir();
+    let server = Server::start(d.path(), &[]);
+    let (status, body) = server.post(
+        "/$/format",
+        "application/json",
+        r#"{"text": "ASK {}", "language": "sparql", "cursorOffset": 3}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["language"], "sparql");
+    assert_eq!(j["text"], formatted("ASK {}"));
+    let (status, body) = server.post("/$/format", "application/sparql-query", QUERY);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, formatted(QUERY));
+    let (status, _) = server.post("/$/format", "application/rdf+xml", "<rdf:RDF/>");
+    assert_eq!(status, 415);
+}
+
+/// A server on a temporary data directory, stopped when dropped.
+struct Server {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Server {
+    fn start(data: &Path, env: &[(&str, &str)]) -> Server {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut c = Command::new(BIN);
+        c.args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
+            .arg("--data")
+            .arg(data.join("data"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let s = Server {
+            child: c.spawn().unwrap(),
+            port,
+        };
+        let t0 = std::time::Instant::now();
+        while s.request("GET", "/$/ping", "", "").map(|r| r.0) != Some(200) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "server did not start"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        s
+    }
+
+    fn request(&self, method: &str, path: &str, ct: &str, body: &str) -> Option<(u16, String)> {
+        use std::io::Read;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", self.port)).ok()?;
+        write!(
+            c,
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .ok()?;
+        let mut buf = String::new();
+        c.read_to_string(&mut buf).ok()?;
+        let (head, body) = buf.split_once("\r\n\r\n")?;
+        let status = head.split(' ').nth(1)?.parse().ok()?;
+        Some((status, body.to_string()))
+    }
+
+    fn post(&self, path: &str, ct: &str, body: &str) -> (u16, String) {
+        self.request("POST", path, ct, body)
+            .unwrap_or_else(|| panic!("POST {path}"))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
 #[ignore = "needs printing"]
 fn reformats_messy_queries() {
