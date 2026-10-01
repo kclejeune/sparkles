@@ -19,6 +19,12 @@ pub fn all_tools() -> Vec<&'static str> {
         v.push("search_text");
     }
     v.push("similar_entities");
+    if cfg!(feature = "shacl") {
+        v.push("validate_shacl");
+    }
+    if cfg!(feature = "shex") {
+        v.push("validate_shex");
+    }
     v
 }
 
@@ -56,6 +62,16 @@ fn nullable(ty: &str) -> Value {
 
 fn strings() -> Value {
     json!({"type":"array","items":{"type":"string"}})
+}
+
+/// `graph` of describe_schema and the validation tools.
+fn graph() -> Value {
+    json!({"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"})
+}
+
+/// `maxResults` of the validation tools, with the server's maximum inlined.
+fn max_results(cfg: &McpConfig) -> Value {
+    json!({"type":"integer","minimum":1,"maximum":cfg.max_rows,"default":20.min(cfg.max_rows)})
 }
 
 fn prefixes() -> Value {
@@ -134,7 +150,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
                 "section": {"enum":["summary","classes","predicates"],"default":"summary"},
-                "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
+                "graph": graph(),
                 "reasoning": rs(),
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
                 "limit": {"type":"integer","minimum":1,"maximum":500,"description":"Entries per list (default 25 for summary, 100 otherwise)"},
@@ -249,6 +265,57 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "metric":{"enum":["cosine","dot","euclidean"]},"higherIsBetter":{"type":"boolean"},
                 "hits":{"type":"array","items":{"type":"object","required":["iri","score"],"properties":{
                     "iri":{"type":"string"},"score":{"type":["number","null"]},"label":{"type":"string"}}}},
+                "prefixes":prefixes()}})),
+        ),
+        read(
+            "validate_shacl",
+            "Validate with SHACL",
+            "Validate a dataset's data graph against a SHACL shapes graph (Turtle; SHACL Core and SHACL-SPARQL). Returns conforms, the result counts by severity and the first maxResults results, most severe first: focus node, path, value, shape, constraint component, severity and message. Runs under a timeout and a memory budget; nothing is written.",
+            json!({"type":"object","additionalProperties":false,"required":["shapes"],"properties":{
+                "dataset": ds(),
+                "shapes": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The shapes graph in Turtle"},
+                "graph": graph(),
+                "reasoning": rs(),
+                "maxResults": max_results(cfg),
+                "timeoutSeconds": to(cfg),
+                "atCommit": at()}}),
+            Some(json!({"type":"object","required":["dataset","commit","reasoning","conforms","total","bySeverity","results","truncated","prefixes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},"reasoning":{"type":"boolean"},
+                "conforms":{"type":"boolean"},"total":{"type":"integer"},
+                "bySeverity":{"type":"object","required":["violation","warning","info"],"properties":{
+                    "violation":{"type":"integer"},"warning":{"type":"integer"},"info":{"type":"integer"}}},
+                "results":{"type":"array","items":{"type":"object","required":["focus","shape","constraint","severity"],"properties":{
+                    "focus":{"type":"string"},"path":{"type":"string"},"value":{"type":"string"},
+                    "shape":{"type":"string"},"constraint":{"type":"string"},"severity":{"type":"string"},
+                    "message":{"type":"string"}}}},
+                "truncated":{"type":"boolean"},
+                "prefixes":prefixes()}})),
+        ),
+        read(
+            "validate_shex",
+            "Validate with ShEx",
+            "Validate nodes of a dataset against a ShEx schema (ShExC or ShExJ) with a compact shape map such as `{FOCUS a ex:Person}@ex:PersonShape, ex:alice@START`. Returns conforms, the conformant and nonconformant counts and the first maxResults results (only nonconformant ones by default): node, shape, status, reason and failures. IMPORT is not supported. Runs under a timeout and a memory budget; nothing is written.",
+            json!({"type":"object","additionalProperties":false,"required":["schema","shapeMap"],"properties":{
+                "dataset": ds(),
+                "schema": {"type":"string","minLength":1,"maxLength":1_048_576,"description":"The schema in ShExC or ShExJ (told apart by a leading `{`)"},
+                "shapeMap": {"type":"string","minLength":1,"maxLength":65536,"description":"A compact shape map; prefixed names use the schema's prefixes, then the dataset's"},
+                "graph": graph(),
+                "reasoning": rs(),
+                "onlyNonconformant": {"type":"boolean","default":true,"description":"List only nonconformant results (the counts cover all)"},
+                "maxResults": max_results(cfg),
+                "timeoutSeconds": to(cfg),
+                "atCommit": at()}}),
+            Some(json!({"type":"object","required":["dataset","commit","reasoning","conforms","counts","results","truncated","warnings","prefixes"],"properties":{
+                "dataset":{"type":"string"},"commit":{"type":"integer"},"reasoning":{"type":"boolean"},
+                "conforms":{"type":"boolean"},
+                "counts":{"type":"object","required":["conformant","nonconformant"],"properties":{
+                    "conformant":{"type":"integer"},"nonconformant":{"type":"integer"}}},
+                "results":{"type":"array","items":{"type":"object","required":["node","shape","status"],"properties":{
+                    "node":{"type":"string"},"shape":{"type":"string"},
+                    "status":{"enum":["conformant","nonconformant"]},"reason":{"type":"string"},
+                    "failures":{"type":"array","items":{"type":"object","required":["kind"],"properties":{"kind":{"type":"string"}}}}}}},
+                "truncated":{"type":"boolean"},
+                "warnings":strings(),
                 "prefixes":prefixes()}})),
         ),
     ]

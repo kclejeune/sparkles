@@ -14,6 +14,8 @@ mod render;
 mod schemas;
 mod search;
 mod tools;
+#[cfg(any(feature = "shacl", feature = "shex"))]
+mod validate;
 
 #[cfg(test)]
 mod tests;
