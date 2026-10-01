@@ -1,0 +1,11 @@
+VERSION "1.2"
+PREFIX ex: <http://example.org/>
+SELECT * {
+  <<( ex:s ex:p "o" )>> ex:q <<( ?s a <<( ex:a ex:b ex:c )>> )>> .
+  << ex:s ex:p ?o >> ex:source ex:web .
+  << ex:s ex:p ?o ~ ex:r >> .
+  << << ex:a ex:b ex:c >> ex:p _:x ~ >> ex:q 1 .
+  ex:s ex:p ex:o ~ ex:r1 {| ex:since 2020 |} ~ ~ _:r2 {| ex:a 1 |} {| ex:b 2 |} .
+  ex:s ^ex:p ex:o ~ ?r .
+  ?s ex:p ?o ~ ?reifier .
+}

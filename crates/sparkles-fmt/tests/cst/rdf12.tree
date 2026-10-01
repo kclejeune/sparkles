@@ -1,0 +1,139 @@
+QueryUnit
+  Prologue
+    VersionDecl
+      Kw(Version) "VERSION"
+      String2 "\"1.2\""
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  SelectQuery
+    SelectClause
+      Kw(Select) "SELECT"
+      Star "*"
+    WhereClause
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          TripleTerm
+            LtLtParen "<<("
+            PnameLn "ex:s"
+            PnameLn "ex:p"
+            String2 "\"o\""
+            ParenGtGt ")>>"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              TripleTerm
+                LtLtParen "<<("
+                Var1 "?s"
+                Kw(A) "a"
+                TripleTerm
+                  LtLtParen "<<("
+                  PnameLn "ex:a"
+                  PnameLn "ex:b"
+                  PnameLn "ex:c"
+                  ParenGtGt ")>>"
+                ParenGtGt ")>>"
+          Dot "."
+        TriplesStmt
+          ReifiedTriple
+            LtLt "<<"
+            PnameLn "ex:s"
+            PnameLn "ex:p"
+            Var1 "?o"
+            GtGt ">>"
+          PropertyListEntry
+            PnameLn "ex:source"
+            Object
+              PnameLn "ex:web"
+          Dot "."
+        TriplesStmt
+          ReifiedTriple
+            LtLt "<<"
+            PnameLn "ex:s"
+            PnameLn "ex:p"
+            Var1 "?o"
+            Reifier
+              Tilde "~"
+              PnameLn "ex:r"
+            GtGt ">>"
+          Dot "."
+        TriplesStmt
+          ReifiedTriple
+            LtLt "<<"
+            ReifiedTriple
+              LtLt "<<"
+              PnameLn "ex:a"
+              PnameLn "ex:b"
+              PnameLn "ex:c"
+              GtGt ">>"
+            PnameLn "ex:p"
+            BlankNodeLabel "_:x"
+            Reifier
+              Tilde "~"
+            GtGt ">>"
+          PropertyListEntry
+            PnameLn "ex:q"
+            Object
+              Integer "1"
+          Dot "."
+        TriplesStmt
+          PnameLn "ex:s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              PnameLn "ex:o"
+              Reifier
+                Tilde "~"
+                PnameLn "ex:r1"
+              AnnotationBlock
+                LBracePipe "{|"
+                PropertyListEntry
+                  PnameLn "ex:since"
+                  Object
+                    Integer "2020"
+                PipeRBrace "|}"
+              Reifier
+                Tilde "~"
+              Reifier
+                Tilde "~"
+                BlankNodeLabel "_:r2"
+              AnnotationBlock
+                LBracePipe "{|"
+                PropertyListEntry
+                  PnameLn "ex:a"
+                  Object
+                    Integer "1"
+                PipeRBrace "|}"
+              AnnotationBlock
+                LBracePipe "{|"
+                PropertyListEntry
+                  PnameLn "ex:b"
+                  Object
+                    Integer "2"
+                PipeRBrace "|}"
+          Dot "."
+        TriplesStmt
+          PnameLn "ex:s"
+          PropertyListEntry
+            PathInverse
+              Hat "^"
+              PnameLn "ex:p"
+            Object
+              PnameLn "ex:o"
+              Reifier
+                Tilde "~"
+                Var1 "?r"
+          Dot "."
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+              Reifier
+                Tilde "~"
+                Var1 "?reifier"
+          Dot "."
+        RBrace "}"

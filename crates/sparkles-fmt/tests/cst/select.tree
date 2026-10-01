@@ -1,0 +1,139 @@
+QueryUnit
+  Prologue
+    PrefixDecl
+      Kw(Prefix) "PREFIX"
+      PnameNs "ex:"
+      IriRef "<http://example.org/>"
+  SelectQuery
+    SelectClause
+      Kw(Select) "select"
+      Kw(Distinct) "distinct"
+      ProjectionItem
+        Var1 "?s"
+      ProjectionItem
+        LParen "("
+        Opaque
+          Word "COUNT"
+          LParen "("
+          Var1 "?o"
+          RParen ")"
+        Kw(As) "AS"
+        Var1 "?count"
+        RParen ")"
+      ProjectionItem
+        LParen "("
+        Opaque
+          Word "SAMPLE"
+          LParen "("
+          Var2 "$n"
+          RParen ")"
+        Kw(As) "AS"
+        Var1 "?n2"
+        RParen ")"
+    DatasetClause
+      Kw(From) "FROM"
+      IriRef "<http://example.org/g>"
+    DatasetClause
+      Kw(From) "FROM"
+      Kw(Named) "NAMED"
+      PnameLn "ex:named"
+    WhereClause
+      Kw(Where) "WHERE"
+      GroupGraphPattern
+        LBrace "{"
+        TriplesStmt
+          Var1 "?s"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              Var1 "?o"
+            Semicolon ";"
+          PropertyListEntry
+            PnameLn "ex:n"
+            Object
+              Var2 "$n"
+        RBrace "}"
+    GroupBy
+      Kw(Group) "GROUP"
+      Kw(By) "BY"
+      GroupCondition
+        Var1 "?s"
+      GroupCondition
+        LParen "("
+        Opaque
+          Word "LCASE"
+          LParen "("
+          Var1 "?o"
+          RParen ")"
+        Kw(As) "AS"
+        Var1 "?lo"
+        RParen ")"
+      GroupCondition
+        Opaque
+          Word "STR"
+          LParen "("
+          Var1 "?n"
+          RParen ")"
+      GroupCondition
+        Opaque
+          PnameLn "ex:f"
+          LParen "("
+          Var1 "?n"
+          RParen ")"
+    Having
+      Kw(Having) "HAVING"
+      Opaque
+        LParen "("
+        Word "COUNT"
+        LParen "("
+        Var1 "?o"
+        RParen ")"
+        Gt ">"
+        Integer "1"
+        RParen ")"
+      Opaque
+        Word "BOUND"
+        LParen "("
+        Var1 "?s"
+        RParen ")"
+    OrderBy
+      Kw(Order) "ORDER"
+      Kw(By) "BY"
+      OrderCondition
+        Kw(Desc) "DESC"
+        Opaque
+          LParen "("
+          Var1 "?s"
+          RParen ")"
+      OrderCondition
+        Kw(Asc) "ASC"
+        Opaque
+          LParen "("
+          Var1 "?count"
+          RParen ")"
+      OrderCondition
+        Var1 "?lo"
+      OrderCondition
+        Opaque
+          Word "STRLEN"
+          LParen "("
+          Word "STR"
+          LParen "("
+          Var1 "?s"
+          RParen ")"
+          RParen ")"
+    Limit
+      Kw(Limit) "LIMIT"
+      Integer "10"
+    Offset
+      Kw(Offset) "OFFSET"
+      Integer "5"
+    ValuesClause
+      Kw(Values) "VALUES"
+      Var1 "?s"
+      LBrace "{"
+      DataValue
+        PnameLn "ex:a"
+      DataValue
+        Kw(Undef) "UNDEF"
+      RBrace "}"
