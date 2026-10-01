@@ -1,0 +1,89 @@
+TurtleDoc
+  PrefixDecl
+    Kw(Prefix) "PREFIX"
+    PnameNs "ex:"
+    IriRef "<http://example.org/>"
+  VersionDecl
+    Kw(Version) "VERSION"
+    String2 "\"1.2\""
+  TriplesStmt
+    PnameLn "ex:a"
+    PropertyListEntry
+      PnameLn "ex:b"
+      Object
+        PnameLn "ex:c"
+        Reifier
+          Tilde "~"
+          PnameLn "ex:r1"
+        AnnotationBlock
+          LBracePipe "{|"
+          PropertyListEntry
+            PnameLn "ex:since"
+            Object
+              Integer "2020"
+          PipeRBrace "|}"
+        Reifier
+          Tilde "~"
+          BlankNodeLabel "_:r2"
+        Reifier
+          Tilde "~"
+        AnnotationBlock
+          LBracePipe "{|"
+          PropertyListEntry
+            PnameLn "ex:p"
+            Object
+              PnameLn "ex:o"
+          PipeRBrace "|}"
+    Dot "."
+  TriplesStmt
+    ReifiedTriple
+      LtLt "<<"
+      PnameLn "ex:a"
+      PnameLn "ex:b"
+      PnameLn "ex:c"
+      GtGt ">>"
+    PropertyListEntry
+      PnameLn "ex:statedBy"
+      Object
+        PnameLn "ex:d"
+    Dot "."
+  TriplesStmt
+    ReifiedTriple
+      LtLt "<<"
+      PnameLn "ex:a"
+      PnameLn "ex:b"
+      PnameLn "ex:c"
+      Reifier
+        Tilde "~"
+        PnameLn "ex:r"
+      GtGt ">>"
+    Dot "."
+  TriplesStmt
+    ReifiedTriple
+      LtLt "<<"
+      Anon "[]"
+      PnameLn "ex:b"
+      ReifiedTriple
+        LtLt "<<"
+        PnameLn "ex:c"
+        PnameLn "ex:d"
+        PnameLn "ex:e"
+        GtGt ">>"
+      GtGt ">>"
+    PropertyListEntry
+      PnameLn "ex:p"
+      Object
+        TripleTerm
+          LtLtParen "<<("
+          PnameLn "ex:a"
+          PnameLn "ex:b"
+          TripleTerm
+            LtLtParen "<<("
+            PnameLn "ex:c"
+            PnameLn "ex:d"
+            Literal
+              String2 "\"e\""
+              LangDir "@en--ltr"
+            ParenGtGt ")>>"
+          ParenGtGt ")>>"
+    Dot "."

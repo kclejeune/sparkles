@@ -3,7 +3,7 @@
 //! `--check` / `--list-different` exit 1 when something would change, `--write`
 //! rewrites in place, and any error exits 2.
 
-mod config;
+pub(crate) mod config;
 pub(crate) mod report;
 mod walk;
 

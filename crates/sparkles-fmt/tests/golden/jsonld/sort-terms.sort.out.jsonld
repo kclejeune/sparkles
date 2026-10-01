@@ -1,0 +1,30 @@
+{
+  "@context": {
+    "@vocab": "http://example.org/v#",
+    "Mixed": "http://example.org/Mixed",
+    "alpha": "http://example.org/alpha",
+    "zeta": "http://example.org/zeta",
+    "éclair": "http://example.org/eclair"
+  },
+  "@id": "http://example.org/s",
+  "@reverse": {
+    "alpha": { "@id": "http://example.org/r2" },
+    "zeta": { "@id": "http://example.org/r1" }
+  },
+  "Mixed": "m",
+  "alpha": "a",
+  "list": { "@list": ["z", "a"] },
+  "literal": {
+    "@type": "@json",
+    "@value": {
+      "z": 1,
+      "a": 2
+    }
+  },
+  "middle": {
+    "alpha": 2,
+    "zeta": 1
+  },
+  "zeta": "z",
+  "\u00e9clair": "e"
+}

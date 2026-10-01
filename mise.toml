@@ -119,6 +119,14 @@ description = "Check formatting (CI)"
 depends = ["ui:fmt:check"]
 run = "cargo fmt --all --check"
 
+[tasks."fmt:jsonld-compare"]
+description = "Compare the JSON-LD formatter's golden outputs with oxfmt (Prettier's JSON conventions) and show the differences; not part of ci"
+depends = ["ui:install"]
+usage = '''
+flag "--strict" help="exit 1 when an output differs"
+'''
+run = 'scripts/fmt-jsonld-prettier.sh ${usage_strict:+--strict}'
+
 [tasks.lint]
 description = "Clippy (warnings are errors) + svelte-check"
 # ui:build first: the server embeds ui/build, which a concurrent UI build rewrites

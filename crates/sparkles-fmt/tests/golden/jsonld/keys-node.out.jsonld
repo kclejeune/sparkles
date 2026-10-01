@@ -1,0 +1,24 @@
+{
+  "@context": {
+    "@vocab": "http://example.org/vocab#",
+    "knows": { "@type": "@id" }
+  },
+  "@id": "http://example.org/alice",
+  "@type": ["Person", "Agent"],
+  "@index": "people",
+  "@reverse": { "parent": { "@id": "http://example.org/carol" } },
+  "@included": [
+    {
+      "@id": "http://example.org/inc",
+      "name": "included"
+    }
+  ],
+  "knows": { "@id": "http://example.org/bob" },
+  "name": "Alice",
+  "@graph": [
+    {
+      "@id": "http://example.org/g1",
+      "name": "in the graph"
+    }
+  ]
+}

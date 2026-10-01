@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "@base": "http://example.org/",
+    "@vocab": "http://example.org/vocab#",
+    "@language": "en",
+    "@direction": "ltr",
+    "@propagate": true,
+    "@protected": true,
+    "title": {
+      "@id": "http://purl.org/dc/terms/title",
+      "@language": "en",
+      "@container": "@language"
+    }
+  },
+  "@id": "http://example.org/doc",
+  "title": "Hello"
+}

@@ -102,9 +102,10 @@ fn variants(dir: &Path, name: &str, ext: &str) -> Vec<String> {
     v
 }
 
-/// `tests/golden/pending.txt`: golden names (`<language>/<name>`, every variant) whose
-/// outputs were written by hand ahead of the printers, with the reason. The default run
-/// skips them; `cargo test -p sparkles-fmt --test golden -- --ignored` checks them.
+/// `tests/golden/pending.txt`: golden names (`<language>/<name>`, every variant, or
+/// `<language>/<name>.<variant>`, that variant only) whose outputs were written by hand
+/// ahead of the printers, with the reason. The default run skips them;
+/// `cargo test -p sparkles-fmt --test golden -- --ignored` checks them.
 fn pending() -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/pending.txt");
     std::fs::read_to_string(path)
@@ -123,8 +124,19 @@ fn pending() -> Vec<String> {
         .collect()
 }
 
-/// Check the golden files `select` picks (by `<language>/<name>`): `(checks, failures,
-/// names that passed every check)`. `bless` writes the outputs instead of comparing.
+/// Whether the golden check `key` (`<language>/<name>` for the default output,
+/// `<language>/<name>.<variant>` for a variant) is pending, by its name or by itself.
+fn is_pending(pending: &[String], key: &str) -> bool {
+    let name = match key.split_once('.') {
+        Some((name, _)) => name,
+        None => key,
+    };
+    pending.iter().any(|p| p == key || p == name)
+}
+
+/// Check the golden files `select` picks (by `<language>/<name>` for the default output,
+/// `<language>/<name>.<variant>` for a variant): `(checks, failures, keys that passed
+/// their checks)`. `bless` writes the outputs instead of comparing.
 fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>, Vec<String>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let mut failures = Vec::new();
@@ -142,12 +154,20 @@ fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>
         let lang = Language::from_name(&lang_name)
             .unwrap_or_else(|| panic!("tests/golden/{lang_name}: not a language"));
         for (input, name, ext) in inputs(&dir) {
-            if !select(&format!("{lang_name}/{name}")) {
+            let key = |variant: &str| match variant {
+                "" => format!("{lang_name}/{name}"),
+                v => format!("{lang_name}/{name}.{v}"),
+            };
+            let selected: Vec<String> = variants(&dir, &name, &ext)
+                .into_iter()
+                .filter(|v| select(&key(v)))
+                .collect();
+            if selected.is_empty() {
                 continue;
             }
-            let before = failures.len();
             let text = std::fs::read_to_string(&input).unwrap();
-            for variant in variants(&dir, &name, &ext) {
+            for variant in selected {
+                let before = failures.len();
                 checked += 1;
                 let label = match variant.as_str() {
                     "" => format!("{lang_name}/{name}"),
@@ -192,9 +212,9 @@ fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>
                     )),
                     Err(e) => failures.push(format!("{label}: formatting the output: {e}")),
                 }
-            }
-            if failures.len() == before {
-                passed.push(format!("{lang_name}/{name}"));
+                if failures.len() == before {
+                    passed.push(key(&variant));
+                }
             }
         }
     }
@@ -204,7 +224,7 @@ fn run_golden(select: &dyn Fn(&str) -> bool, bless: bool) -> (usize, Vec<String>
 #[test]
 fn golden_files() {
     let pending = pending();
-    let (checked, failures, _) = run_golden(&|name| !pending.iter().any(|p| p == name), bless());
+    let (checked, failures, _) = run_golden(&|key| !is_pending(&pending, key), bless());
     assert!(checked > 0, "no golden files");
     assert!(
         failures.is_empty(),
@@ -219,7 +239,7 @@ fn golden_files() {
 #[ignore = "golden outputs written ahead of the printers (tests/golden/pending.txt)"]
 fn pending_golden_files() {
     let pending = pending();
-    let (checked, failures, passed) = run_golden(&|name| pending.iter().any(|p| p == name), false);
+    let (checked, failures, passed) = run_golden(&|key| is_pending(&pending, key), false);
     eprintln!(
         "pending golden files: {} names, {checked} checks, {} failures",
         pending.len(),

@@ -262,6 +262,10 @@ add lang-filter 'SELECT (COUNT(*) AS ?c) WHERE { ?d ex:title ?t FILTER(LANGMATCH
 add star-lookup 'SELECT ?p ?n ?a ?s WHERE { ?p ex:worksFor <http://example.org/org/7> ; foaf:name ?n ; foaf:age ?a ; ex:salary ?s }'
 add values-star 'SELECT ?p ?n ?a ?k WHERE { VALUES ?p { <http://example.org/person/1> <http://example.org/person/10> <http://example.org/person/100> <http://example.org/person/1000> <http://example.org/person/10000> } ?p foaf:name ?n ; foaf:age ?a ; foaf:knows ?k }'
 add employee-docs 'SELECT ?p ?d ?t WHERE { ?p ex:worksFor <http://example.org/org/7> . ?p ex:authorOf ?d . ?d ex:title ?t }'
+# expressions over values that repeat (years, ages): BIND, ORDER BY keys and aggregate arguments
+add expr-bind-group 'SELECT ?decade (COUNT(*) AS ?c) WHERE { ?d ex:year ?y BIND(FLOOR(?y / 10) * 10 AS ?decade) } GROUP BY ?decade ORDER BY ?decade'
+add expr-order-key 'SELECT ?p ?a WHERE { ?p foaf:age ?a } ORDER BY DESC(ABS(?a - 50)) ?p LIMIT 10'
+add expr-agg-arg 'SELECT ?o (SUM(?a * 12) AS ?months) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } GROUP BY ?o ORDER BY DESC(?months) ?o LIMIT 10'
 
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
