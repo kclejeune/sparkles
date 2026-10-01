@@ -1,0 +1,139 @@
+TurtleDoc
+  PrefixDecl
+    Kw(Prefix) "PREFIX"
+    PnameNs "ex:"
+    IriRef "<http://example.org/>"
+  PrefixDecl
+    Kw(Prefix) "PREFIX"
+    PnameNs "xsd:"
+    IriRef "<http://www.w3.org/2001/XMLSchema#>"
+  TriplesStmt
+    PnameLn "ex:s"
+    PropertyListEntry
+      Kw(A) "a"
+      Object
+        PnameLn "ex:C"
+      Semicolon ";"
+    PropertyListEntry
+      PnameLn "ex:p"
+      Object
+        Literal
+          String2 "\"x\""
+          LangDir "@en-GB"
+        Comma ","
+      Object
+        String1 "'y'"
+        Comma ","
+      Object
+        StringLong2 "\"\"\"z\"\"\""
+        Comma ","
+      Object
+        Literal
+          String2 "\"1\""
+          HatHat "^^"
+          PnameLn "xsd:integer"
+      Semicolon ";"
+      Semicolon ";"
+    PropertyListEntry
+      PnameLn "ex:q"
+      Object
+        Integer "1"
+        Comma ","
+      Object
+        DecimalNegative "-2.5"
+        Comma ","
+      Object
+        Double "3e1"
+        Comma ","
+      Object
+        Kw(True) "true"
+      Semicolon ";"
+    PropertyListEntry
+      PnameLn "ex:r"
+      Object
+        BNodePropertyList
+          LBracket "["
+          PropertyListEntry
+            PnameLn "ex:a"
+            Object
+              PnameLn "ex:b"
+            Semicolon ";"
+          PropertyListEntry
+            PnameLn "ex:c"
+            Object
+              Anon "[]"
+          RBracket "]"
+        Comma ","
+      Object
+        Collection
+          LParen "("
+          CollectionItem
+            PnameLn "ex:a"
+          CollectionItem
+            Nil "( )"
+          CollectionItem
+            Collection
+              LParen "("
+              CollectionItem
+                Integer "1"
+              CollectionItem
+                BNodePropertyList
+                  LBracket "["
+                  PropertyListEntry
+                    PnameLn "ex:d"
+                    Object
+                      Integer "2"
+                  RBracket "]"
+              RParen ")"
+          RParen ")"
+        Comma ","
+      Object
+        BlankNodeLabel "_:b1"
+    Dot "."
+  TriplesStmt
+    BNodePropertyList
+      LBracket "["
+      PropertyListEntry
+        PnameLn "ex:p"
+        Object
+          PnameLn "ex:o"
+      RBracket "]"
+    Dot "."
+  TriplesStmt
+    BNodePropertyList
+      LBracket "["
+      PropertyListEntry
+        PnameLn "ex:p"
+        Object
+          PnameLn "ex:o"
+      RBracket "]"
+    PropertyListEntry
+      PnameLn "ex:q"
+      Object
+        PnameLn "ex:r"
+    Dot "."
+  TriplesStmt
+    Collection
+      LParen "("
+      CollectionItem
+        PnameLn "ex:a"
+      RParen ")"
+    PropertyListEntry
+      PnameLn "ex:p"
+      Object
+        PnameLn "ex:o"
+    Dot "."
+  TriplesStmt
+    BlankNodeLabel "_:b1"
+    PropertyListEntry
+      PnameLn "ex:p"
+      Object
+        BNodePropertyList
+          LBracket "["
+          RBracket "]"
+        Comma ","
+      Object
+        Collection
+          LParen "("
+          RParen ")"
+    Dot "."
