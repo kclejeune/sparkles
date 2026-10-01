@@ -62,6 +62,12 @@ The changes, all in `src/parser.rs` unless noted:
   action instead of the grammar. Triple terms in graph patterns (rule [120]) are
   unchanged.
 
+- **Custom aggregates with DISTINCT.** In `iriOrFunction`, an IRI is a plain IRI only
+  when no `(` follows it. 0.4.7 read the IRI of `ex:agg(DISTINCT ?x)` as a complete
+  primary expression once `(DISTINCT ?x)` failed to parse as an argument list, so the
+  `Aggregate` rule's custom `DISTINCT` form (registered with
+  `with_custom_aggregate_function`) could never match and the query was a syntax error.
+
 Upstream Oxigraph (the development version after 0.4.7) has a rewritten parser that
 follows the SPARQL 1.2 grammar rules [123] and [138] and moves an OPTIONAL group's own
 FILTERs into the `LeftJoin`; the changes here are written against 0.4.7's rust-peg

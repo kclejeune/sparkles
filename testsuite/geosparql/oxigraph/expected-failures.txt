@@ -1,0 +1,18 @@
+# Oxigraph GeoSPARQL tests where Sparkles deliberately answers otherwise: one test name
+# (the manifest entry's local name) per line, then the reason. The run fails on any other
+# failure, and reports listed tests that start passing.
+
+# EPSG:4326 is latitude first (GeoSPARQL Req 16): "<…/EPSG/0/4326> Point(-83.38 33.95)" is
+# longitude 33.95, latitude -83.38, not equal to CRS84 Point(-83.38 33.95), so sfEquals is
+# false. Oxigraph has no EPSG:4326 and leaves the result unbound.
+wkt_default_spatial_reference_system  EPSG:4326 is supported, with its latitude-first axes
+
+# These use polygons whose rings are not closed ("Polygon((0 0, 0 3, 3 3, 3 0))"). Simple
+# Features WKT requires closed rings, so Sparkles reads them as malformed literals and
+# the relation is unbound (a type error); Oxigraph closes such rings silently.
+sf_contains     unclosed polygon rings are malformed
+sf_disjoint     unclosed polygon rings are malformed
+sf_intersects   unclosed polygon rings are malformed
+sf_overlaps     unclosed polygon rings are malformed
+sf_touches      unclosed polygon rings are malformed
+sf_within       unclosed polygon rings are malformed

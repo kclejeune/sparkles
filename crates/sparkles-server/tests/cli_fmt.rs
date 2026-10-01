@@ -274,7 +274,6 @@ fn walks_and_explicit_paths() {
         "w/d.trig",
         "w/d.nt",
         "w/d.nq",
-        "w/d.jsonld",
         "w/x.rdf",
         "w/x.owl",
         "w/d.ttl.gz",
@@ -306,10 +305,6 @@ fn walks_and_explicit_paths() {
         (
             "w/d.nt",
             "w/d.nt: error: ntriples formatting is not available yet",
-        ),
-        (
-            "w/d.jsonld",
-            "w/d.jsonld: error: jsonld formatting is not available yet",
         ),
         (
             "w/x.rdf",
@@ -638,17 +633,6 @@ fn documents_over_max_bytes_are_refused() {
     assert!(stderr(&o).contains("--max-bytes"), "{}", stderr(&o));
     expect(dir, &["--max-bytes", "1KiB", "big.rq"], None, 0);
     expect(dir, &["--max-bytes", "lots", "big.rq"], None, 2);
-}
-
-#[test]
-fn the_language_server_is_not_available_yet() {
-    let o = Command::new(BIN).args(["lsp", "--stdio"]).output().unwrap();
-    assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("sparkles lsp is not available yet"),
-        "{}",
-        stderr(&o)
-    );
 }
 
 #[test]

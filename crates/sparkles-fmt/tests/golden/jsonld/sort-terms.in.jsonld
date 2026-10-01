@@ -1,0 +1,5 @@
+{"zeta":"z","@context":{"zeta":"http://example.org/zeta","alpha":"http://example.org/alpha","@vocab":"http://example.org/v#","Mixed":"http://example.org/Mixed","éclair":"http://example.org/eclair"},
+"alpha":"a","Mixed":"m","\u00e9clair":"e","@id":"http://example.org/s","middle":{"zeta":1,"alpha":2},
+"@reverse":{"zeta":{"@id":"http://example.org/r1"},"alpha":{"@id":"http://example.org/r2"}},
+"literal":{"@type":"@json","@value":{"z":1,"a":2}},
+"list":{"@list":["z","a"]}}

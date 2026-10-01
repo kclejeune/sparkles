@@ -1,0 +1,12 @@
+Oxigraph GeoSPARQL tests
+
+The files manifest.ttl, *.rq and *.srx in this directory are copied unchanged from
+Oxigraph (https://github.com/oxigraph/oxigraph), testsuite/oxigraph-tests/geosparql/,
+at commit e0f286b0ad0ab10f58c292377abf800b7f40301b.
+
+Copyright (c) 2018 Oxigraph developers. Oxigraph is dual-licensed under the Apache
+License, Version 2.0 (LICENSE-APACHE) or the MIT license (LICENSE-MIT), at your option;
+both license texts are in this directory.
+
+expected-failures.txt and this NOTICE are Sparkles' own. Sparkles runs the manifest with
+its W3C test harness (crates/sparkles/tests/w3c.rs, test geosparql_oxigraph).

@@ -1,0 +1,11 @@
+PREFIX ex: <http://example.org/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+ex:s a ex:C ; ex:p "x"@en-GB, 'y', """z""", "1"^^xsd:integer ;; ex:q 1, -2.5, 3e1, true ;
+  ex:r [ ex:a ex:b ; ex:c [] ], ( ex:a ( ) ( 1 [ ex:d 2 ] ) ), _:b1 .
+[ ex:p ex:o ] .
+[ ex:p ex:o ] ex:q ex:r .
+( ex:a ) ex:p ex:o .
+_:b1 ex:p [ # a comment makes these two tokens
+] , ( # and these
+) .
