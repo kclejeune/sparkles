@@ -141,8 +141,8 @@ description = "W3C SHACL Core + SHACL-SPARQL conformance"
 run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, Rust and UI tests"
-depends = ["fmt:check", "lint", "test", "ui:test"]
+description = "Everything CI should run: formatting, lints, Rust and UI tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "test", "ui:test", "licenses:check"]
 
 # -------------------------------------------------------------------------- build / run ----
 

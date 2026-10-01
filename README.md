@@ -748,7 +748,7 @@ mise run lint         # clippy -D warnings + svelte-check
 mise run test         # all Rust tests            (test:w3c, test:shacl for suite summaries)
 mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
-mise run ci           # fmt:check + lint + test + ui:test
+mise run ci           # fmt:check + lint + test + ui:test + licenses:check
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
@@ -933,7 +933,7 @@ only stdio is served for now. Logs go to stderr; stdout carries JSON-RPC only.
 ## Testing
 
 ```sh
-mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
 mise run ui:e2e        # Playwright end-to-end tests against a real server
