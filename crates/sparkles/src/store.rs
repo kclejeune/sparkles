@@ -2629,9 +2629,10 @@ impl Store {
         dump_snapshot(&self.snapshot().without_cache_fill(), w)
     }
 
-    /// Gzipped N-Quads backup into `dir` (Fuseki `/$/backup`). Returns the file path.
+    /// Compressed N-Quads backup into `dir` (Fuseki `/$/backup`), with
+    /// [`Codec::dump_default`] (zstd, or gzip in builds without zstd). Returns the file path.
     pub fn backup(&self, dir: &Path, name: &str) -> Result<PathBuf> {
-        self.backup_with(dir, name, Codec::Gzip, None, 1)
+        self.backup_with(dir, name, Codec::dump_default(), None, 1)
     }
 
     /// N-Quads backup into `dir` as `{name}_{timestamp}.nq{codec extension}`, written to a

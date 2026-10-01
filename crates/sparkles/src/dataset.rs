@@ -378,7 +378,8 @@ impl Dataset {
         self.store.compact()
     }
 
-    /// Write a gzipped N-Quads backup into `dir`; returns the file path.
+    /// Write a compressed N-Quads backup into `dir` (zstd, or gzip in builds without zstd);
+    /// returns the file path.
     pub fn backup(&self, dir: impl AsRef<Path>) -> Result<PathBuf> {
         let name = self
             .store

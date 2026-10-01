@@ -110,9 +110,14 @@ fn backups_round_trip_in_every_codec() {
         .unwrap();
     let mut expected = Vec::new();
     store.dump_nquads(&mut expected).unwrap();
-    // the default stays gzip
+    // the default is zstd (gzip in builds without it)
     let p = store.backup(&dir.path().join("b"), "db").unwrap();
-    assert!(p.to_string_lossy().ends_with(".nq.gz"), "{}", p.display());
+    let ext = if Codec::Zstd.supported() {
+        ".nq.zst"
+    } else {
+        ".nq.gz"
+    };
+    assert!(p.to_string_lossy().ends_with(ext), "{}", p.display());
     for c in Codec::ALL {
         if !c.supported() {
             continue;
