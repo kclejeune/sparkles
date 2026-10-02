@@ -303,3 +303,304 @@ fn check_selection_and_timeouts() {
     let clean = store("ex:a a ex:B .");
     assert_eq!(check(&clean, &opts()).status, ReportStatus::NoneFound);
 }
+
+// ------------------------------------------------- OWL 2 RL rules, one by one ------
+
+/// The findings of one check on `ttl`, which must be the only check with findings.
+fn only(ttl: &str, id: &str) -> Vec<J> {
+    let r = check(&store(ttl), &opts());
+    let all = r.to_json()["findings"].as_array().unwrap().clone();
+    let f = findings(&r, id);
+    assert_eq!(all.len(), f.len(), "other checks found something: {all:#?}");
+    if !f.is_empty() {
+        assert_eq!(r.status, ReportStatus::ViolationsFound);
+        assert!(f.iter().all(|x| x["severity"] == "inconsistency"));
+    }
+    f
+}
+
+fn one(ttl: &str, id: &str, rule: &str) -> J {
+    let f = only(ttl, id);
+    assert_eq!(f.len(), 1, "{f:#?}");
+    assert_eq!(f[0]["rule"], rule);
+    f[0].clone()
+}
+
+#[test]
+fn prp_irp_irreflexive_property() {
+    let f = one(
+        "ex:knows a owl:IrreflexiveProperty . ex:a ex:knows ex:a .",
+        "irreflexive-property",
+        "prp-irp",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    assert_eq!(f["evidence"]["property"], uri("knows"));
+    assert_eq!(
+        f["message"],
+        "ex:a is related to itself by the irreflexive property ex:knows"
+    );
+    assert!(
+        only(
+            "ex:knows a owl:IrreflexiveProperty . ex:a ex:knows ex:b . ex:c ex:other ex:c .",
+            "irreflexive-property"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn prp_asyp_asymmetric_property() {
+    let f = one(
+        "ex:parentOf a owl:AsymmetricProperty .
+         ex:a ex:parentOf ex:b . ex:b ex:parentOf ex:a .",
+        "asymmetric-property",
+        "prp-asyp",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    assert_eq!(f["evidence"]["other"], uri("b"));
+    assert_eq!(
+        f["message"],
+        "ex:a and ex:b are related in both directions by the asymmetric property ex:parentOf"
+    );
+    // a self-loop is a violation too
+    one(
+        "ex:parentOf a owl:AsymmetricProperty . ex:c ex:parentOf ex:c .",
+        "asymmetric-property",
+        "prp-asyp",
+    );
+    assert!(
+        only(
+            "ex:parentOf a owl:AsymmetricProperty .
+             ex:a ex:parentOf ex:b . ex:b ex:parentOf ex:c .",
+            "asymmetric-property"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn prp_pdw_disjoint_properties() {
+    let f = one(
+        "ex:likes owl:propertyDisjointWith ex:hates .
+         ex:a ex:likes ex:b ; ex:hates ex:b .",
+        "disjoint-properties",
+        "prp-pdw",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    assert_eq!(
+        f["evidence"]["properties"],
+        json!([uri("hates"), uri("likes")])
+    );
+    assert_eq!(f["evidence"]["value"], uri("b"));
+    assert!(
+        only(
+            "ex:likes owl:propertyDisjointWith ex:hates .
+             ex:a ex:likes ex:b ; ex:hates ex:c .",
+            "disjoint-properties"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn prp_adp_all_disjoint_properties() {
+    let f = one(
+        "[] a owl:AllDisjointProperties ; owl:members (ex:p ex:q ex:r) .
+         ex:a ex:p 1 ; ex:r 1 ; ex:q 2 .",
+        "all-disjoint-properties",
+        "prp-adp",
+    );
+    assert_eq!(f["evidence"]["properties"], json!([uri("p"), uri("r")]));
+    assert_eq!(f["evidence"]["value"]["value"], "1");
+    assert_eq!(f["evidence"]["axiom"]["type"], "bnode");
+    assert!(
+        only(
+            "[] a owl:AllDisjointProperties ; owl:members (ex:p ex:q) .
+             ex:a ex:p 1 ; ex:q 2 . ex:b ex:q 1 .",
+            "all-disjoint-properties"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn cls_com_complement_classes() {
+    let f = one(
+        "ex:Dead owl:complementOf ex:Alive . ex:Zombie rdfs:subClassOf ex:Dead .
+         ex:z a ex:Zombie, ex:Alive .",
+        "complement-classes",
+        "cls-com",
+    );
+    assert_eq!(f["focus"], uri("z"));
+    assert_eq!(f["evidence"]["classes"], json!([uri("Alive"), uri("Dead")]));
+    assert_eq!(
+        f["message"],
+        "ex:z is an instance of both ex:Dead and its complement ex:Alive"
+    );
+    assert!(
+        only(
+            "ex:Dead owl:complementOf ex:Alive . ex:z a ex:Dead . ex:y a ex:Alive .",
+            "complement-classes"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn cls_maxc1_max_cardinality_zero() {
+    let ttl = "ex:Childless owl:maxCardinality \"0\"^^xsd:nonNegativeInteger ;
+                 owl:onProperty ex:hasChild .
+               ex:a a ex:Childless .";
+    let f = one(
+        &format!("{ttl} ex:a ex:hasChild ex:c ."),
+        "max-cardinality-zero",
+        "cls-maxc1",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    assert_eq!(f["evidence"]["restriction"], uri("Childless"));
+    assert_eq!(f["evidence"]["property"], uri("hasChild"));
+    assert_eq!(f["evidence"]["value"], uri("c"));
+    // a plain integer 0 is the same cardinality
+    one(
+        "[] owl:maxCardinality 0 ; owl:onProperty ex:p ; owl:equivalentClass ex:None .
+         ex:R owl:maxCardinality 0 ; owl:onProperty ex:p . ex:b a ex:R ; ex:p 1 .",
+        "max-cardinality-zero",
+        "cls-maxc1",
+    );
+    assert!(
+        only(
+            &format!("{ttl} ex:b ex:hasChild ex:c ."),
+            "max-cardinality-zero"
+        )
+        .is_empty()
+    );
+    assert!(
+        only(
+            "ex:One owl:maxCardinality 1 ; owl:onProperty ex:p . ex:a a ex:One ; ex:p 1 .",
+            "max-cardinality-zero"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn cls_maxqc1_and_maxqc2_max_qualified_cardinality_zero() {
+    let ttl = "ex:NoDogs owl:maxQualifiedCardinality \"0\"^^xsd:nonNegativeInteger ;
+                 owl:onProperty ex:owns ; owl:onClass ex:Dog .
+               ex:Puppy rdfs:subClassOf ex:Dog .
+               ex:a a ex:NoDogs .";
+    let f = one(
+        &format!("{ttl} ex:a ex:owns ex:rex . ex:rex a ex:Puppy ."),
+        "max-qualified-cardinality-zero",
+        "cls-maxqc1",
+    );
+    assert_eq!(f["evidence"]["class"], uri("Dog"));
+    assert_eq!(f["evidence"]["value"], uri("rex"));
+    // a value outside the qualifying class is allowed
+    assert!(
+        only(
+            &format!("{ttl} ex:a ex:owns ex:tom . ex:tom a ex:Cat ."),
+            "max-qualified-cardinality-zero"
+        )
+        .is_empty()
+    );
+    // with owl:Thing any value counts, typed or not (cls-maxqc2)
+    let thing = "ex:Nothingness owl:maxQualifiedCardinality 0 ;
+                   owl:onProperty ex:owns ; owl:onClass owl:Thing .
+                 ex:b a ex:Nothingness .";
+    let f = one(
+        &format!("{thing} ex:b ex:owns ex:x ."),
+        "max-qualified-cardinality-zero",
+        "cls-maxqc2",
+    );
+    assert_eq!(f["focus"], uri("b"));
+    assert!(only(thing, "max-qualified-cardinality-zero").is_empty());
+}
+
+#[test]
+fn eq_diff2_and_eq_diff3_all_different() {
+    let f = one(
+        "[] a owl:AllDifferent ; owl:members (ex:a ex:b ex:c) . ex:a owl:sameAs ex:x .
+         ex:c owl:sameAs ex:x .",
+        "all-different",
+        "eq-diff2",
+    );
+    assert_eq!(f["evidence"]["individuals"], json!([uri("a"), uri("c")]));
+    let f = one(
+        "[] a owl:AllDifferent ; owl:distinctMembers (ex:a ex:b) . ex:b owl:sameAs ex:a .",
+        "all-different",
+        "eq-diff3",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    // an individual listed twice
+    let f = one(
+        "[] a owl:AllDifferent ; owl:members (ex:a ex:b ex:a) .",
+        "all-different",
+        "eq-diff2",
+    );
+    assert_eq!(f["evidence"]["individuals"], json!([uri("a"), uri("a")]));
+    assert!(
+        only(
+            "[] a owl:AllDifferent ; owl:members (ex:a ex:b ex:c) . ex:a owl:sameAs ex:x .
+             [] a owl:AllDifferent ; owl:distinctMembers (ex:d ex:e) .",
+            "all-different"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn prp_npa1_and_prp_npa2_negative_property_assertions() {
+    let f = one(
+        "ex:n1 owl:sourceIndividual ex:a ; owl:assertionProperty ex:knows ;
+             owl:targetIndividual ex:b .
+         ex:a ex:knows ex:b .",
+        "negative-property-assertion",
+        "prp-npa1",
+    );
+    assert_eq!(f["focus"], uri("a"));
+    assert_eq!(f["evidence"]["axiom"], uri("n1"));
+    assert_eq!(f["evidence"]["target"], uri("b"));
+    assert_eq!(
+        f["message"],
+        "ex:a ex:knows ex:b is stated, but the negative property assertion ex:n1 denies it"
+    );
+    let f = one(
+        "ex:n2 owl:sourceIndividual ex:a ; owl:assertionProperty ex:age ;
+             owl:targetValue 30 .
+         ex:a ex:age 30 .",
+        "negative-property-assertion",
+        "prp-npa2",
+    );
+    assert_eq!(f["evidence"]["target"]["value"], "30");
+    assert!(
+        only(
+            "ex:n1 owl:sourceIndividual ex:a ; owl:assertionProperty ex:knows ;
+                 owl:targetIndividual ex:b .
+             ex:n2 owl:sourceIndividual ex:a ; owl:assertionProperty ex:age ;
+                 owl:targetValue 30 .
+             ex:a ex:knows ex:c ; ex:age 31 . ex:b ex:knows ex:a .",
+            "negative-property-assertion"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn property_checks_see_inferred_assertions_with_their_basis() {
+    // ex:p is a subproperty of an irreflexive property: only the inferences show it
+    let s =
+        store("ex:q a owl:IrreflexiveProperty . ex:p rdfs:subPropertyOf ex:q . ex:a ex:p ex:a .");
+    assert!(findings(&check(&s, &opts()), "irreflexive-property").is_empty());
+    materialize(&s, &Profile::Rdfs, &ReasonOptions::default()).unwrap();
+    let r = check(
+        &s,
+        &DiagnoseOptions {
+            inferences: true,
+            ..opts()
+        },
+    );
+    let f = findings(&r, "irreflexive-property");
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0]["basis"], "uses-inferences");
+}

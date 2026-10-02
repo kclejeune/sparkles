@@ -2077,13 +2077,28 @@ establish OWL consistency.
 | `nothing-member` | `cls-nothing2` (+`cax-sco`) | inconsistency | [nothing-member.rq](../crates/sparkles-reasoner/diagnostics/nothing-member.rq) |
 | `disjoint-classes` | `cax-dw` | inconsistency | [disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/disjoint-classes.rq) |
 | `all-disjoint-classes` | `cax-adc` | inconsistency | [all-disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-classes.rq) |
+| `complement-classes` | `cls-com` (+`cax-sco`) | inconsistency | [complement-classes.rq](../crates/sparkles-reasoner/diagnostics/complement-classes.rq) |
+| `max-cardinality-zero` | `cls-maxc1` (+`cax-sco`) | inconsistency | [max-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-cardinality-zero.rq) |
+| `max-qualified-cardinality-zero` | `cls-maxqc1`, `cls-maxqc2` (+`cax-sco`) | inconsistency | [max-qualified-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-qualified-cardinality-zero.rq) |
 | `same-different` | `eq-diff1` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [same-different.rq](../crates/sparkles-reasoner/diagnostics/same-different.rq) |
+| `all-different` | `eq-diff2`, `eq-diff3` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [all-different.rq](../crates/sparkles-reasoner/diagnostics/all-different.rq) |
 | `functional-literal-conflict` | `prp-fp`, `dt-diff`, `eq-diff1` | inconsistency | [functional-literal-conflict.rq](../crates/sparkles-reasoner/diagnostics/functional-literal-conflict.rq) |
+| `irreflexive-property` | `prp-irp` | inconsistency | [irreflexive-property.rq](../crates/sparkles-reasoner/diagnostics/irreflexive-property.rq) |
+| `asymmetric-property` | `prp-asyp` | inconsistency | [asymmetric-property.rq](../crates/sparkles-reasoner/diagnostics/asymmetric-property.rq) |
+| `disjoint-properties` | `prp-pdw` | inconsistency | [disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/disjoint-properties.rq) |
+| `all-disjoint-properties` | `prp-adp` | inconsistency | [all-disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-properties.rq) |
+| `negative-property-assertion` | `prp-npa1`, `prp-npa2` | inconsistency | [negative-property-assertion.rq](../crates/sparkles-reasoner/diagnostics/negative-property-assertion.rq) |
 | `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
 | `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
 
+A check that implements two rules reports the one that matched in each finding's `rule`.
+For example, `all-different` reports `eq-diff2` for `owl:members` and `eq-diff3` for
+`owl:distinctMembers`. Property assertions are matched as stated. A subproperty or
+inverse assertion counts only when the inferences are included and contain it.
+Cardinality restrictions match the value 0 of any numeric datatype.
+
 There is no unique name assumption. Two IRIs count as different individuals only through
-`owl:differentFrom`. Literal values of a functional property are compared with SPARQL
+`owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL
 `!=`, restricted to numbers, strings, language-tagged strings and booleans, so a pair it
 cannot compare is never reported. With inferences included, each finding is re-checked
 with the same bindings over the asserted data alone. `basis` is `asserted` when the

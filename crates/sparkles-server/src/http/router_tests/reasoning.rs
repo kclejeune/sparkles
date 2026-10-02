@@ -403,7 +403,7 @@ async fn diagnostics_endpoint() {
     assert_eq!(r["dataset"], "t");
     assert_eq!(r["status"], "violations-found");
     assert_eq!(r["scope"]["inferences"]["included"], false);
-    assert_eq!(r["checks"].as_array().unwrap().len(), 7);
+    assert_eq!(r["checks"].as_array().unwrap().len(), 16);
     assert_eq!(r["findings"].as_array().unwrap().len(), 1);
     let f = &r["findings"][0];
     assert_eq!(f["check"], "disjoint-classes");

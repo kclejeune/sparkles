@@ -1,0 +1,11 @@
+# disjoint-properties: the same pair of individuals related by two properties declared
+# disjoint (OWL 2 RL prp-pdw).
+#
+# The checker appends a LIMIT.
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?y ?p1 ?p2 WHERE {
+  ?p1 owl:propertyDisjointWith ?p2 .
+  ?x ?p1 ?y .
+  ?x ?p2 ?y .
+}
