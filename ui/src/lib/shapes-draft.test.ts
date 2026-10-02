@@ -52,6 +52,7 @@ const draft = (shapes: DraftShape[]): ShapesDraft => ({
   },
   shapes,
   shacl: '@prefix sh: <http://www.w3.org/ns/shacl#> .\n',
+  shaclc: 'shape <AS> -> <A> {\n}\n',
   shex: 'PREFIX ex: <http://ex.org/>\n',
   shapeMap: '{FOCUS a <A>}@<AS>,\n{FOCUS a <B>}@<BS>',
 });
@@ -87,9 +88,10 @@ describe('summaryLine', () => {
 });
 
 describe('draftText', () => {
-  it('gives the Turtle, or the ShExC with its shape map as comments', () => {
+  it('gives the Turtle, the SHACLC, or the ShExC with its shape map as comments', () => {
     const d = draft([]);
     expect(draftText(d, 'shacl')).toBe(d.shacl);
+    expect(draftText(d, 'shaclc')).toBe(d.shaclc);
     expect(draftText(d, 'shex')).toBe(
       'PREFIX ex: <http://ex.org/>\n\n# Shape map:\n# {FOCUS a <A>}@<AS>,\n# {FOCUS a <B>}@<BS>\n',
     );

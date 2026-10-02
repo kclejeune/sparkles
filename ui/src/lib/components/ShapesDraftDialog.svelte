@@ -1,6 +1,6 @@
 <script lang="ts">
-  // The schema browser's "Draft shapes" dialog: SHACL shapes or a ShEx schema drafted from
-  // the data, the constraints that would reject current instances, and two ways to use the
+  // The schema browser's "Draft shapes" dialog: SHACL shapes (in Turtle or SHACLC) or a
+  // ShEx schema drafted from the data, the constraints that would reject current instances, and two ways to use the
   // draft (the dataset page's shapes editor, or a write-time guard in warn mode).
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
@@ -17,6 +17,7 @@
     summaryLine,
     type DraftLang,
   } from '$lib/shapes-draft';
+  import { shaclSyntaxKey } from '$lib/shacl';
   import { shexDraftKey, validateLangKey } from '$lib/shex';
   import { save } from '$lib/storage';
   import Icon from './Icon.svelte';
@@ -84,9 +85,12 @@
 
   function openInEditor() {
     if (!draft) return;
-    if (lang === 'shacl') save(`sparkles.shacl.${ds}`, draft.shacl);
-    else save(shexDraftKey(ds), { schema: draft.shex, map: draft.shapeMap });
-    save(validateLangKey(ds), lang);
+    if (lang === 'shex') save(shexDraftKey(ds), { schema: draft.shex, map: draft.shapeMap });
+    else {
+      save(`sparkles.shacl.${ds}`, lang === 'shaclc' ? draft.shaclc : draft.shacl);
+      save(shaclSyntaxKey(ds), lang === 'shaclc' ? 'shaclc' : 'turtle');
+    }
+    save(validateLangKey(ds), lang === 'shex' ? 'shex' : 'shacl');
     open = false;
     void goto(`${resolve('/datasets/[name]', { name: ds })}#validate`);
   }
@@ -97,9 +101,10 @@
     try {
       await api.installWarnGuard(
         ds,
-        lang === 'shacl'
-          ? { language: 'shacl', shapes: draft.shacl }
-          : { language: 'shex', schema: draft.shex, shapeMap: draft.shapeMap },
+        // SHACL is installed from the Turtle draft, whichever syntax is shown
+        lang === 'shex'
+          ? { language: 'shex', schema: draft.shex, shapeMap: draft.shapeMap }
+          : { language: 'shacl', shapes: draft.shacl },
       );
       confirming = false;
       toasts.push(
@@ -155,15 +160,15 @@
       <input type="checkbox" bind:checked={closed} />
       <span>closed shapes</span>
     </label>
-    {#if shexOffered}
-      <div class="tabs" role="tablist" aria-label="Shape language">
-        {#each [['shacl', 'SHACL'], ['shex', 'ShEx']] as const as [l, title] (l)}
+    <div class="tabs" role="tablist" aria-label="Shape language">
+      {#each [['shacl', 'SHACL'], ['shaclc', 'SHACLC'], ['shex', 'ShEx']] as const as [l, title] (l)}
+        {#if l !== 'shex' || shexOffered}
           <button class="tab" role="tab" aria-selected={lang === l} onclick={() => (lang = l)}
             >{title}</button
           >
-        {/each}
-      </div>
-    {/if}
+        {/if}
+      {/each}
+    </div>
     <span class="spacer"></span>
     <button class="btn sm primary" onclick={run} disabled={loading || support == null}>
       {#if loading}<span class="spinner"></span>{:else}<Icon name="wand" size={13} />{/if}

@@ -1728,6 +1728,7 @@ function draftShapes(name, report, p) {
       shapes
         .map((s) => `\n<${s.shape}>\n    a sh:NodeShape ;\n    sh:targetClass <${s.class}> .`)
         .join('\n'),
+    shaclc: shapes.map((s) => `shape <${s.shape}> -> <${s.class}> {\n}`).join('\n'),
     shex: shapes.map((s) => `<${s.shape}> {\n}`).join('\n'),
     shapeMap: shapes
       .map(
