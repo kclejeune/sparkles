@@ -133,12 +133,6 @@ pub fn create_for_policy(
     let ds = st.get(dataset).ok_or_else(|| {
         BackupError::new(Code::InvalidRequest, format!("no such dataset: /{dataset}"))
     })?;
-    if ds.kind == DbType::Mem {
-        return Err(BackupError::new(
-            Code::BackupUnsupported,
-            "in-memory datasets cannot be backed up yet",
-        ));
-    }
     writable(&b.registry.config(repo)?)?;
     // the claim names the policy's task
     let task = o
@@ -175,11 +169,50 @@ fn create_now(
     let t0 = Instant::now();
     let what = format!("backup {} of /{} into {repo}", a.name, ds.name);
     tracing::info!(target: "sparkles::backup", "{what}: started");
-    let r = create_in(b, ds, repo, a, st.limits.min_free_disk_bytes, ctl);
+    let tmp = st.data_dir.join("tmp");
+    let r = create_in(b, ds, repo, a, st.limits.min_free_disk_bytes, &tmp, ctl);
     count(st, b, repo, Operation::Create, &r, t0);
     log_end(&what, &r, t0);
     b.refresh_later(repo);
     r.map(|(s, _)| s)
+}
+
+/// Progress `p` of `ctl` reported as `lo + p × (hi − lo)`.
+fn scaled(ctl: &Ctl, lo: f32, hi: f32) -> Ctl {
+    let inner = ctl.progress.clone();
+    Ctl {
+        cancel: ctl.cancel.clone(),
+        progress: inner.map(|f| -> sparkles_backup::ProgressFn {
+            Arc::new(move |p, m: &str| f(lo + p * (hi - lo), m))
+        }),
+    }
+}
+
+/// The capture of `ds`: of its files, or for an in-memory dataset of a temporary
+/// database built from its snapshot in `<data>/tmp` (the first 40 % of the progress).
+fn capture(
+    ds: &Dataset,
+    name: &str,
+    reserve: Option<u64>,
+    tmp: &std::path::Path,
+    ctl: &Ctl,
+) -> Result<sparkles::store::BackupCapture, BackupError> {
+    if ds.kind != DbType::Mem {
+        return Ok(ds.store.backup_capture(name)?);
+    }
+    let build = scaled(ctl, 0.02, 0.4);
+    let o = sparkles::store::MemoryCaptureOptions {
+        tmp_dir: tmp.to_path_buf(),
+        min_free_disk_bytes: reserve,
+        cancel: Some(ctl.cancel.clone()),
+        progress: build
+            .progress
+            .clone()
+            .map(|f| -> sparkles::store::ProgressFn {
+                Arc::new(move |p, m: &str| f(p, &format!("building a temporary copy: {m}")))
+            }),
+    };
+    Ok(ds.store.memory_backup_capture(name, &o)?)
 }
 
 fn create_in(
@@ -188,6 +221,7 @@ fn create_in(
     repo_name: &str,
     a: CreateArgs,
     reserve: Option<u64>,
+    tmp: &std::path::Path,
     ctl: Ctl,
 ) -> Result<(BackupSummary, Outcome), BackupError> {
     let repo = b.repo(repo_name)?;
@@ -202,7 +236,7 @@ fn create_in(
             "sparkles.backup.lock_ms" = tracing::field::Empty,
         );
         let _g = span.enter();
-        let cap = ds.store.backup_capture(&a.name)?;
+        let cap = capture(ds, &a.name, reserve, tmp, &ctl)?;
         span.record("sparkles.commit", cap.commit.seq);
         span.record(
             "sparkles.backup.lock_ms",
@@ -211,7 +245,18 @@ fn create_in(
         cap
     };
     b.metrics.capture_lock(cap.lock_hold);
-    let extra = reasoning_file(ds, cap.commit.seq).into_iter().collect();
+    let mut extra: Vec<_> = reasoning_file(ds, cap.commit.seq).into_iter().collect();
+    // an in-memory dataset keeps its validation configuration in the guard
+    if cap.in_memory
+        && let Some(v) = ds.validation.read().as_ref()
+    {
+        extra.extend(v.memory_files());
+    }
+    let ctl = if cap.in_memory {
+        scaled(&ctl, 0.4, 1.0)
+    } else {
+        ctl
+    };
     let o = CreateOptions {
         name: a.name.clone(),
         note: a.note,

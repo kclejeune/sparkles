@@ -46,6 +46,46 @@ impl Validation {
         }
     }
 
+    /// The files of this validation in a database directory, for a backup of an
+    /// in-memory dataset, which has no directory: `validation.json`, and the copy of
+    /// SHACL shapes given inline or of the ShEx schema. They are what a persistent
+    /// dataset with the same configuration keeps.
+    #[cfg(feature = "backup")]
+    pub fn memory_files(&self) -> Vec<(String, Vec<u8>)> {
+        #[cfg(any(feature = "shacl", feature = "shex"))]
+        let config = sparkles::guard::config::CONFIG_FILE.to_string();
+        match *self {
+            #[cfg(feature = "shacl")]
+            Validation::Shacl(ref g) => {
+                // inline shapes become the copy a persistent dataset keeps
+                let mut cfg = g.config().clone();
+                let mut out = Vec::new();
+                if let Some(text) = cfg.shapes.inline.take() {
+                    let file = sparkles::guard::config::SHACL_SHAPES_FILE;
+                    cfg.shapes.file = Some(file.to_string());
+                    cfg.shapes.sha256 = Some(sparkles::guard::config::sha256_hex(text.as_bytes()));
+                    cfg.shapes.format = None;
+                    out.push((file.to_string(), text.into_bytes()));
+                }
+                match serde_json::to_vec_pretty(&cfg) {
+                    Ok(b) => out.insert(0, (config, b)),
+                    Err(_) => out.clear(),
+                }
+                out
+            }
+            #[cfg(feature = "shex")]
+            Validation::Shex(ref g) => {
+                let Some((file, text)) = g.schema_copy() else {
+                    return Vec::new();
+                };
+                match serde_json::to_vec_pretty(g.config()) {
+                    Ok(b) => vec![(config, b), (file.to_string(), text.as_bytes().to_vec())],
+                    Err(_) => Vec::new(),
+                }
+            }
+        }
+    }
+
     /// The `sparkles stats` line: `reject · 2 shape graphs · 20 shapes · last full 164 ms`.
     pub fn stats_line(&self) -> String {
         match *self {
@@ -189,6 +229,61 @@ mod tests {
             insert(&store),
             Err(sparkles::Error::GuardMissing(_))
         ));
+    }
+
+    /// The files of an in-memory dataset's validation install the same guard in a
+    /// database directory (a backup restored as a persistent dataset).
+    #[cfg(all(feature = "shex", feature = "shacl", feature = "backup"))]
+    #[test]
+    fn in_memory_validation_files_install_in_a_directory() {
+        let mem = Store::in_memory(Default::default());
+        let cfg = serde_json::from_value(json!({
+            "language": "shex",
+            "mode": "reject",
+            "schema": {"inline": "<http://ex.org/S> { <http://ex.org/name> . }"},
+            "shapeMap": "{FOCUS a <http://ex.org/P>}@<http://ex.org/S>",
+        }))
+        .unwrap();
+        let g = match sparkles_shex::guard::set_config(&mem, Some(cfg), &sparkles_shex::NoImports)
+            .unwrap()
+        {
+            sparkles_shex::guard::SetOutcome::Installed(g, _) => g,
+            _ => panic!("not installed"),
+        };
+        let shacl = {
+            let mem = Store::in_memory(Default::default());
+            let cfg = serde_json::from_value(json!({
+                "mode": "reject",
+                "shapes": {"inline": "<urn:S> a <http://www.w3.org/ns/shacl#NodeShape> ; \
+                    <http://www.w3.org/ns/shacl#targetClass> <http://ex.org/P> ; \
+                    <http://www.w3.org/ns/shacl#property> [ \
+                    <http://www.w3.org/ns/shacl#path> <http://ex.org/name> ; \
+                    <http://www.w3.org/ns/shacl#minCount> 1 ] ."},
+            }))
+            .unwrap();
+            match sparkles_shacl::guard::set_config(&mem, Some(cfg)).unwrap() {
+                sparkles_shacl::guard::SetOutcome::Installed(g, _) => Validation::Shacl(g),
+                _ => panic!("not installed"),
+            }
+        };
+        for v in [Validation::Shex(g), shacl] {
+            let files = v.memory_files();
+            assert_eq!(
+                files.len(),
+                2,
+                "{:?}",
+                files.iter().map(|f| &f.0).collect::<Vec<_>>()
+            );
+            let dir = tempfile::tempdir().unwrap();
+            drop(Store::open(dir.path(), Default::default()).unwrap());
+            for (name, bytes) in &files {
+                std::fs::write(dir.path().join(name), bytes).unwrap();
+            }
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let installed = install(&store).unwrap().unwrap();
+            assert_eq!(installed.language(), v.language());
+            assert!(matches!(insert(&store), Err(sparkles::Error::Rejected(_))));
+        }
     }
 
     #[cfg(not(feature = "shex"))]

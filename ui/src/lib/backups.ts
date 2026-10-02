@@ -113,7 +113,8 @@ export type RepositoryBrief = {
 export type BackupSummary = {
   name: string;
   repository: string;
-  dataset: { name: string; id: string };
+  /** `type` is `mem` for a backup of an in-memory dataset. Older servers leave it out. */
+  dataset: { name: string; id: string; type?: 'persistent' | 'mem' };
   commit: { seq: number; timestamp: string; quads: number; ref: string };
   created: string;
   completed: string;
@@ -295,6 +296,9 @@ export const reachable = (r: Repository | RepositoryBrief) =>
   isFull(r) ? r.status.reachable : r.reachable;
 
 export const isReadonly = (r: Repository | RepositoryBrief) => r.readonly === true;
+
+/** Whether a backup was taken from an in-memory dataset. */
+export const fromMemory = (s: Pick<BackupSummary, 'dataset'>) => s.dataset.type === 'mem';
 
 // --- repositories ------------------------------------------------------------------
 

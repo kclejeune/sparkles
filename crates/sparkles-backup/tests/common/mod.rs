@@ -96,6 +96,7 @@ pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
             .collect(),
         lock_hold: Duration::ZERO,
         lease: LeaseGuard::none(),
+        in_memory: false,
     }
 }
 

@@ -1016,14 +1016,14 @@ The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot
 `sparkles-server`, which is on by default. A **repository** holds deduplicated,
 content-addressed copies of dataset files. It is either a directory (`fs`, a local or
 mounted file system) or a bucket prefix (`s3`, AWS S3 or an S3-compatible service such as
-MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one persistent dataset at one commit,
-described by an immutable manifest.
+MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one dataset at one commit, described
+by an immutable manifest. Persistent and in-memory datasets can both be backed up.
 
 Backups are made, listed, restored and verified per dataset under `/$/backups/{ds}`.
 Repositories are registered and maintained under `/$/repositories`. Lifecycle policies,
 which hold schedules and retention, live under `/$/backup-policies`. The web UI has a
 Backups page for all three. The older `POST /$/backup/{ds}`, which writes an N-Quads dump
-in the data directory, is unchanged.
+in the data directory, is unchanged and works for in-memory datasets too.
 
 **What a backup holds.** A backup contains:
 
@@ -1039,8 +1039,30 @@ in the data directory, is unchanged.
 The full-text index is left out and rebuilt when the restored dataset opens
 (`derived.text.rebuildOnRestore`). Older index generations, named snapshots and the
 retention window (`history.json`) are left out too. Point-in-time reads of a restored
-dataset therefore reach back only to the start of the backup's generation. In-memory
-datasets cannot be backed up (`501 backup-unsupported`).
+dataset therefore reach back only to the start of the backup's generation.
+
+**In-memory datasets.** An in-memory dataset has no files to copy, so its backup builds
+them first. The task takes a snapshot of the head commit under the writer lock and writes
+it as a new index generation with the bulk builder, the same way a compaction does. The
+copy goes to a temporary directory under `<data>/tmp`. Next to the generation it holds an
+empty WAL, a commit catalog with only the head commit, and the dataset's id and prefixes.
+It also holds the settings of the full-text and spatial indexes and the write-time
+validation configuration, with the SHACL shapes or the ShEx schema. Vectors are literals
+in the data and need nothing extra. The upload then follows the normal path, and the
+manifest's `dataset.type` is `mem`. The temporary directory is removed when the upload
+ends. A server that stops during such a backup removes the directory at its next start.
+
+Writes continue while the copy is built, but the snapshot keeps the captured state in
+memory until the build ends. The copy needs about as much disk space as a compacted
+generation of the dataset. The build stops with `507 insufficient-storage` when the data
+directory's file system would keep less than `--min-free-disk-mb` free. Every backup
+rebuilds the whole generation. When the dataset has not changed, the index files come
+out the same, and only a few small files are uploaded again. After a write, most pieces
+of the index files differ and are uploaded again.
+
+An in-memory dataset gets a new dataset id each time the server starts. Its backups from
+an earlier run of the server therefore belong to another lineage (`sameLineage: false`),
+and a policy's retention counts them separately (see [Lifecycle policies](#lifecycle-policies)).
 
 **Capture.** A backup pins one commit, the head when the task starts, without blocking
 writers. Under the writer lock it only records the length of the append-only files and
@@ -1125,7 +1147,7 @@ has started or been queued. Some also return a `Location`, as noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Breaks a lock (`204`). The action is audited. `404 no-such-lock`, `409 repository-read-only`. |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`. Lists the dataset's backups in every repository, or in `R` only, newest first, with `sameLineage`. A repository that cannot be reached is left out. One found unreachable in the last minute is not tried again. |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. `501 backup-unsupported` means an in-memory dataset. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less. |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. An in-memory dataset is first copied to a temporary generation on disk, as described above. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less, or when the temporary copy of an in-memory dataset would leave the data directory's file system with less. |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary plus the manifest's files, blobs and upload statistics. |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Deletes the backup's manifest (`204`). Its blobs go at the next GC. `409 backup-busy` (with `task`) while a restore or verification of the backup runs on this server. `409 repository-read-only`. |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restores the backup. The body is a `RestoreRequest`. Starts a `backup-restore` task with `Location: /$/datasets/{target}`. See [Restore](#restore). |
@@ -1191,6 +1213,14 @@ turns `false`. A restore also needs `admin` on the target name, or it fails with
 `{backup: BackupSummary, dataset, datasetId, identity: "kept" | "new", forkedFrom?: {id,
 seq}, check: object | null, millis}`.
 
+A backup of an in-memory dataset restores as a new persistent dataset or replaces a
+persistent one, like any other backup. The restored dataset's head has the backup's
+commit number, and its commit history starts at that commit. A restore cannot replace an
+in-memory dataset (`409 not-managed`), because it always produces a database directory.
+To get the data back into memory, create an in-memory dataset and load a dump of the
+restored one into it. While the in-memory source is still running, it holds the dataset
+id, so `identity: "auto"` gives the restored copy a new id with `forkedFrom`.
+
 ### Backup types
 
 ```ts
@@ -1243,7 +1273,7 @@ type TestReport = {
 type BackupSummary = {
   name: string;
   repository: string;        // the repository's name on this server
-  dataset: { name: string; id: string };
+  dataset: { name: string; id: string; type: "persistent" | "mem" };
   commit: { seq: number; timestamp: string; quads: number; ref: string /* commit:<seq> */ };
   created: string; completed: string; millis: number;
   logicalBytes: number;      // the size of its files
@@ -1299,7 +1329,7 @@ type Lock = {
 type PolicyConfig = {
   name: string;
   repository: string;
-  datasets?: string[];       // names or * globs; default ["*"] (in-memory datasets are skipped)
+  datasets?: string[];       // names or * globs, in-memory datasets included; default ["*"]
   schedule: string;          // cron, or "every <duration>"
   timezone?: string;         // IANA name; default UTC
   nameTemplate?: string;     // default "{policy}-{dataset}-{time}"
@@ -1335,7 +1365,8 @@ Timestamps are RFC 3339 in UTC with milliseconds. Sizes are in bytes.
 
 A policy backs up the datasets that match `datasets` into `repository` on a schedule, then
 applies its retention. It backs up one dataset after another. Each is a backup like
-`POST /$/backups/{ds}` and holds a task slot while it runs.
+`POST /$/backups/{ds}` and holds a task slot while it runs. In-memory datasets that match
+are backed up too, each through its temporary copy on disk.
 
 * **Schedules.** A schedule is a cron expression with 5 fields (minute hour day-of-month
   month day-of-week), or 6 fields with seconds first. `@daily`-style macros are not
@@ -1366,6 +1397,11 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   run. Deleting a backup removes its manifest, and GC removes the blobs. With
   `gcAfterRetention`, a run whose retention deleted something starts a `backup-gc` task,
   at most once per 24 h per repository.
+
+  An in-memory dataset gets a new id each time the server starts, so retention treats
+  the backups of each earlier server run as another dataset and keeps `minCount` of
+  them. A policy for such datasets can set `expireAfter` with a `minCount` of 0, or the
+  old backups can be deleted by hand.
 * **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
   its next instant. Instants missed while the server was down are covered by one run
   60 s after startup (`trigger: "catch-up"`). With `catchUp: "none"` they are recorded as
@@ -1380,7 +1416,7 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   admitted the same way. When the queue is full, that GC is not started and is tried again
   after the next run's retention.
 * **Results.** A run is `ok` when every selected dataset was backed up or skipped
-  (`in-memory dataset`, `unchanged`). It is `partial` when some failed, and `failed` when
+  (`unchanged`). It is `partial` when some failed, and `failed` when
   none succeeded. `lastSuccess` and `consecutiveFailures` follow these results. The last
   1000 runs of all policies are kept.
 
@@ -1416,7 +1452,7 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`) |
 | 422 | `incompatible-repository` (a newer repository format, or encryption), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
-| 501 | `backup-unsupported` (an in-memory dataset), `not-implemented` |
+| 501 | `not-implemented` (backup repositories are not enabled on this server) |
 | 502 | `repository-unavailable`: a storage error after retries. The message never includes URL query strings. |
 | 503 | `catalog-lagging` (the commit catalog could not be flushed, so retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`), `cancelled` (a cancelled task) |
 | 507 | `insufficient-storage`. A restore has no room for 1.1 × the backup's size plus the `--min-free-disk-mb` reserve, or a backup into an `fs` repository would leave its file system with less than the reserve. |

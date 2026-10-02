@@ -75,7 +75,8 @@ impl Clock for FakeClock {
     }
 }
 
-/// One repository in memory, and two datasets (`ds` persistent, `mem1` in memory).
+/// One repository in memory, and two datasets (`ds` persistent, `mem1` in memory, which
+/// policies back up like any other).
 struct Fake {
     clock: Arc<FakeClock>,
     datasets: Mutex<Vec<DatasetInfo>>,
@@ -100,13 +101,11 @@ impl Fake {
             datasets: Mutex::new(vec![
                 DatasetInfo {
                     name: "ds".into(),
-                    in_memory: false,
                     id: Uuid::from_u128(DS_ID),
                     head: 7,
                 },
                 DatasetInfo {
                     name: "mem1".into(),
-                    in_memory: true,
                     id: Uuid::from_u128(9),
                     head: 1,
                 },
@@ -156,6 +155,7 @@ fn summary(
         dataset: DatasetRef {
             name: dataset.into(),
             id,
+            kind: "persistent".into(),
         },
         commit: CommitRef {
             seq,
@@ -710,11 +710,15 @@ async fn scheduled_and_manual_runs() {
     assert_eq!(task.dataset, "");
     assert_eq!(task.target.as_deref(), Some("p"));
     assert_eq!(task.state, "done", "{:?}", task.message);
-    assert_eq!(task.message.as_deref(), Some("1/2 datasets backed up"));
+    assert_eq!(task.message.as_deref(), Some("2/2 datasets backed up"));
     let detail = task.detail.unwrap();
     assert_eq!(detail["trigger"], "schedule");
     assert_eq!(detail["scheduledFor"], "2026-09-30T12:10:00.000Z");
-    assert_eq!(s.fake.names(), ["p-ds-20260930t121000z"]);
+    // in-memory datasets are backed up like the others
+    assert_eq!(
+        s.fake.names(),
+        ["p-ds-20260930t121000z", "p-mem1-20260930t121000z"]
+    );
     let runs = s.runs("p");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger, RunTrigger::Schedule);
@@ -724,10 +728,10 @@ async fn scheduled_and_manual_runs() {
         Some("p-ds-20260930t121000z")
     );
     assert_eq!(runs[0].datasets[0].added_bytes, Some(70));
-    assert_eq!(runs[0].datasets[1].result, DatasetRunResult::Skipped);
+    assert_eq!(runs[0].datasets[1].result, DatasetRunResult::Ok);
     assert_eq!(
-        runs[0].datasets[1].reason.as_deref(),
-        Some("in-memory dataset")
+        runs[0].datasets[1].backup.as_deref(),
+        Some("p-mem1-20260930t121000z")
     );
     assert_eq!(runs[0].retention, Some(RunRetention::default()));
     // the backup names this policy and run
@@ -809,7 +813,10 @@ async fn one_catch_up_run_after_a_restart() {
         Some("2026-09-30T12:00:00.000Z")
     );
     assert_eq!(runs[0].started, "2026-09-30T12:41:00.000Z");
-    assert_eq!(s.fake.names(), ["hourly-ds-20260930t120000z"]);
+    assert_eq!(
+        s.fake.names(),
+        ["hourly-ds-20260930t120000z", "hourly-mem1-20260930t120000z"]
+    );
     // on to 13:00, a minute at a time
     let mut d = d;
     while s.clock.now() < t("2026-09-30T13:00:00Z") {
@@ -1115,7 +1122,6 @@ async fn failures_names_and_unchanged_datasets() {
     .await;
     s.fake.datasets.lock().push(DatasetInfo {
         name: "ds2".into(),
-        in_memory: false,
         id: Uuid::from_u128(2),
         head: 3,
     });
@@ -1195,7 +1201,6 @@ async fn cancelling_a_run() {
         0,
         DatasetInfo {
             name: "a".into(),
-            in_memory: false,
             id: Uuid::from_u128(5),
             head: 1,
         },
@@ -1230,7 +1235,6 @@ async fn a_policy_disabled_mid_run_stops() {
         0,
         DatasetInfo {
             name: "a".into(),
-            in_memory: false,
             id: Uuid::from_u128(5),
             head: 1,
         },
@@ -1310,7 +1314,7 @@ async fn end_to_end_policy_run() {
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
     state.backup = Some(Arc::new(BackupState::new(dir.path(), None, 2).unwrap()));
     let st = Arc::new(state);
-    st.create("ds", DbType::Persistent).unwrap();
+    st.create("ds", crate::state::DbType::Persistent).unwrap();
     let app = crate::http::router(st.clone());
     let call = |method: &str, uri: &str, body: J| {
         let req = Request::builder()
