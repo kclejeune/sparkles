@@ -31,6 +31,24 @@ pub enum Target {
     SubjectsOf(Tid),
     /// `sh:targetObjectsOf`
     ObjectsOf(Tid),
+    /// `sh:targetWhere` (SHACL 1.2 Core §3.1.3.6): the nodes of the data graph that
+    /// conform to the shape
+    Where(ShapeId),
+}
+
+/// Where the nodes that may conform to a shape are found (see [`Shapes::candidates`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Candidates {
+    /// every node of the data graph
+    All,
+    /// the SHACL instances of a class
+    Instances(Tid),
+    /// these terms
+    Terms(Vec<Tid>),
+    /// the subjects of a predicate
+    SubjectsOf(NamedNode),
+    /// the objects of a predicate
+    ObjectsOf(NamedNode),
 }
 
 /// Values of `sh:nodeKind`.
@@ -234,6 +252,30 @@ impl Shapes {
         Shapes::from_graph(g)
     }
 
+    /// Read RDF text into a graph for [`Shapes::from_store_graphs_with`]. Its blank
+    /// nodes get fresh labels, so they never name a blank node of the store.
+    pub fn read_graph(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Graph> {
+        let mut src = Source::from_bytes(text.as_bytes().to_vec(), format, None);
+        src.base = base.map(str::to_string);
+        src.name = "<shapes>".into();
+        let (quads, _) = sparkles::io::parse_to_vec(&src).context("parsing shapes graph")?;
+        let mut fresh: FxHashMap<oxrdf::BlankNode, oxrdf::BlankNode> = FxHashMap::default();
+        let mut relabel = |b: oxrdf::BlankNode| fresh.entry(b).or_default().clone();
+        let mut g = Graph::new();
+        for q in quads {
+            let s: oxrdf::NamedOrBlankNode = match q.subject {
+                oxrdf::NamedOrBlankNode::BlankNode(b) => relabel(b).into(),
+                s => s,
+            };
+            let o: Term = match q.object {
+                Term::BlankNode(b) => relabel(b).into(),
+                o => o,
+            };
+            g.insert(&Triple::new(s, q.predicate, o));
+        }
+        Ok(g)
+    }
+
     /// Parse the shapes of an RDF graph.
     pub fn from_graph(graph: Graph) -> Result<Shapes> {
         Parser::new(&graph).parse(false)
@@ -258,7 +300,17 @@ impl Shapes {
         snap: &sparkles::store::Snapshot,
         graphs: &[String],
     ) -> Result<Shapes> {
-        let mut g = oxrdf::Graph::new();
+        Shapes::from_store_graphs_with(snap, graphs, None)
+    }
+
+    /// [`Shapes::from_store_graphs`], merged with the triples of `extra` (shapes read
+    /// from a file, see [`Shapes::read_graph`]).
+    pub fn from_store_graphs_with(
+        snap: &sparkles::store::Snapshot,
+        graphs: &[String],
+        extra: Option<&Graph>,
+    ) -> Result<Shapes> {
+        let mut g = extra.cloned().unwrap_or_default();
         for iri in graphs {
             if let Ok(part) = crate::data::read_graph(snap, Some(iri)) {
                 g.extend(part.iter());
@@ -290,6 +342,51 @@ impl Shapes {
     /// Shapes that have targets (the ones validation starts from).
     pub fn targeted(&self) -> impl Iterator<Item = &Shape> {
         self.shapes.iter().filter(|s| !s.targets.is_empty())
+    }
+
+    /// The nodes that can conform to shape `si`, found from its constraints: a node
+    /// conforms only if it is an instance of its `sh:class`, one of its `sh:hasValue` or
+    /// `sh:in` values, or the subject (object) of a predicate (inverse) path with
+    /// `sh:minCount` 1 or more. [`Candidates::All`] when no constraint narrows them.
+    pub fn candidates(&self, si: ShapeId) -> Candidates {
+        self.candidates_at(si, 0)
+    }
+
+    fn candidates_at(&self, si: ShapeId, depth: usize) -> Candidates {
+        let shape = &self.shapes[si];
+        if shape.deactivated || depth > 16 {
+            return Candidates::All;
+        }
+        // the value nodes of a property shape are not the node itself
+        let own = shape.path.is_none();
+        for c in &shape.constraints {
+            let narrowed = match c {
+                Constraint::Class(t) if own => Candidates::Instances(*t),
+                Constraint::HasValue(t) if own => Candidates::Terms(vec![*t]),
+                Constraint::In(ts) if own => Candidates::Terms(ts.clone()),
+                Constraint::MinCount(n) if *n > 0 => match &shape.path {
+                    Some(PropertyPath::Predicate(p)) => Candidates::SubjectsOf(p.clone()),
+                    Some(PropertyPath::Inverse(x)) => match x.as_ref() {
+                        PropertyPath::Predicate(p) => Candidates::ObjectsOf(p.clone()),
+                        _ => continue,
+                    },
+                    _ => continue,
+                },
+                Constraint::Property(s) | Constraint::Node(s) if own => {
+                    self.candidates_at(*s, depth + 1)
+                }
+                Constraint::And(ss) if own => ss
+                    .iter()
+                    .map(|s| self.candidates_at(*s, depth + 1))
+                    .find(|c| *c != Candidates::All)
+                    .unwrap_or(Candidates::All),
+                _ => continue,
+            };
+            if narrowed != Candidates::All {
+                return narrowed;
+            }
+        }
+        Candidates::All
     }
 
     /// A term of the term table.
@@ -326,6 +423,10 @@ impl fmt::Display for Shapes {
                     Target::Class(t) => ("targetClass", t),
                     Target::SubjectsOf(t) => ("targetSubjectsOf", t),
                     Target::ObjectsOf(t) => ("targetObjectsOf", t),
+                    Target::Where(w) => {
+                        writeln!(f, "    targetWhere {}", self.shapes[*w].node)?;
+                        continue;
+                    }
                 };
                 writeln!(f, "    {k} {}", self.term(*v))?;
             }
@@ -521,6 +622,7 @@ impl<'g> Parser<'g> {
             sh::TARGET_CLASS,
             sh::TARGET_SUBJECTS_OF,
             sh::TARGET_OBJECTS_OF,
+            sh::TARGET_WHERE,
         ] {
             for t in self.g.g.triples_for_predicate(p) {
                 add(Term::from(t.subject.into_owned()), &mut roots);
@@ -588,7 +690,7 @@ impl<'g> Parser<'g> {
         });
         self.out.by_node.insert(node.clone(), id);
 
-        let targets = self.targets(node);
+        let targets = self.targets(node)?;
         self.out.shapes[id].targets = targets;
         let constraints = self
             .constraints(node, id)
@@ -597,7 +699,7 @@ impl<'g> Parser<'g> {
         Ok(id)
     }
 
-    fn targets(&mut self, node: &Term) -> Vec<Target> {
+    fn targets(&mut self, node: &Term) -> Result<Vec<Target>> {
         let mut out = Vec::new();
         for t in self.g.objects(node, sh::TARGET_NODE) {
             out.push(Target::Node(self.out.intern(t)));
@@ -622,7 +724,13 @@ impl<'g> Parser<'g> {
         for t in self.g.objects(node, sh::TARGET_OBJECTS_OF) {
             out.push(Target::ObjectsOf(self.out.intern(t)));
         }
-        out
+        for t in self.g.objects(node, sh::TARGET_WHERE) {
+            let w = self
+                .shape(&t)
+                .with_context(|| format!("sh:targetWhere of shape {node}"))?;
+            out.push(Target::Where(w));
+        }
+        Ok(out)
     }
 
     fn shape_list(&mut self, head: &Term) -> Result<Vec<ShapeId>> {

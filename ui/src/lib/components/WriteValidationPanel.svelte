@@ -124,7 +124,8 @@
           <dt>Decides on</dt>
           <dd>
             {#if v.language === 'shex'}
-              every nonconformant association
+              every nonconformant association{#if v.config.baseline === 'grandfather'}, new ones
+                only (grandfather){/if}
             {:else}
               results at or above <strong>{v.config.threshold ?? 'violation'}</strong
               >{#if v.config.baseline === 'grandfather'}, new ones only (grandfather){/if}

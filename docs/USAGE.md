@@ -118,6 +118,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
+| `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
@@ -223,6 +224,9 @@ sparkles update --loc db --message 'Fix the labels of ex:alice' 'DELETE … INSE
 sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly import' data.ttl
 sparkles log    --loc db                      # the message follows each commit's columns
 ```
+
+A commit that skipped the dataset's write-time validation, through `--no-validate` or an
+HTTP bypass, shows `[unvalidated]` before its message in `sparkles log`.
 
 Past states are read with `--at`, which takes a commit number, `commit:N`,
 `time:<RFC 3339>` or `snapshot:NAME`. Every commit since the last compaction or bulk

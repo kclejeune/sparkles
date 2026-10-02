@@ -136,6 +136,8 @@ pub struct CommitInfo {
     /// the commit may have changed the default graph (`false` only when it is known to
     /// have changed named graphs alone)
     pub default_graph: bool,
+    /// the write skipped the write-time validation the dataset requires (a bypass)
+    pub unvalidated: bool,
 }
 
 impl CommitInfo {
@@ -200,6 +202,9 @@ impl CommitInfo {
         m.serialize_entry("exact", &self.exact)?;
         if self.reconstructed {
             m.serialize_entry("reconstructed", &true)?;
+        }
+        if self.unvalidated {
+            m.serialize_entry("unvalidated", &true)?;
         }
         Ok(())
     }
@@ -609,6 +614,8 @@ struct CommitJson {
     /// absent in files written before the flag existed: assume the default graph changed
     #[serde(default = "yes")]
     default_graph: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unvalidated: bool,
 }
 
 fn yes() -> bool {
@@ -633,6 +640,7 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             exact: c.exact,
             reconstructed: c.reconstructed,
             default_graph: c.default_graph,
+            unvalidated: c.unvalidated,
         },
     })
     .unwrap()
@@ -664,6 +672,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
             exact: c.exact,
             reconstructed: c.reconstructed,
             default_graph: c.default_graph,
+            unvalidated: c.unvalidated,
         },
         f.origin,
     )))
@@ -696,7 +705,8 @@ fn encode_record(c: &CommitInfo) -> [u8; REC] {
     r[45] = c.exact as u8
         | (c.bulk as u8) << 1
         | (c.reconstructed as u8) << 2
-        | (!c.default_graph as u8) << 3;
+        | (!c.default_graph as u8) << 3
+        | (c.unvalidated as u8) << 4;
     let crc = crc32(&[&r[..60]]);
     r[60..64].copy_from_slice(&crc.to_le_bytes());
     r
@@ -720,6 +730,7 @@ pub(crate) fn decode_record(r: &[u8]) -> Option<CommitInfo> {
         bulk: r[45] & 2 != 0,
         reconstructed: r[45] & 4 != 0,
         default_graph: r[45] & 8 == 0,
+        unvalidated: r[45] & 16 != 0,
     })
 }
 
@@ -1083,31 +1094,38 @@ fn existing_is_invalid(path: &Path) -> Result<bool> {
 /// Version byte of a WAL commit record carrying commit metadata.
 pub(crate) const WAL_COMMIT_V2: u8 = 2;
 
+/// The flag of byte 27 of a WAL commit record: the write bypassed write-time
+/// validation. Records written before it existed have zero there.
+pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
+
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
-/// node): seq, timestamp, kind, version and a CRC over the transaction's data records
-/// followed by bytes 0..29 of this record.
+/// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
+/// transaction's data records followed by bytes 0..29 of this record.
 pub(crate) fn seal_wal_commit(
     rec: &mut [u8; 33],
     seq: u64,
     ts: i64,
     kind: CommitKind,
+    flags: u8,
     data: &[u8],
 ) {
     rec[9..17].copy_from_slice(&seq.to_le_bytes());
     rec[17..25].copy_from_slice(&ts.to_le_bytes());
     rec[25] = kind.code();
     rec[26] = WAL_COMMIT_V2;
-    rec[27..29].fill(0);
+    rec[27] = flags;
+    rec[28] = 0;
     let crc = crc32(&[data, &rec[..29]]);
     rec[29..33].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// Commit metadata of a WAL commit record: `None` for a legacy record (version 0),
-/// `Some(Err)` for a version-2 record whose CRC does not match.
+/// Commit metadata of a WAL commit record (seq, timestamp, kind and flags): `None` for
+/// a legacy record (version 0), `Some(Err)` for a version-2 record whose CRC does not
+/// match.
 pub(crate) fn open_wal_commit(
     rec: &[u8],
     data: &[u8],
-) -> Option<Result<(u64, i64, CommitKind), ()>> {
+) -> Option<Result<(u64, i64, CommitKind, u8), ()>> {
     if rec[26] != WAL_COMMIT_V2 {
         return None;
     }
@@ -1119,6 +1137,7 @@ pub(crate) fn open_wal_commit(
         u64::from_le_bytes(rec[9..17].try_into().unwrap()),
         i64::from_le_bytes(rec[17..25].try_into().unwrap()),
         CommitKind::from_code(rec[25]),
+        rec[27],
     )))
 }
 
@@ -1149,6 +1168,7 @@ mod tests {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         };
         let mut r = encode_record(&c);
         assert_eq!(decode_record(&r), Some(c));
@@ -1156,6 +1176,7 @@ mod tests {
         assert_eq!(r[45] & 8, 0);
         let named_only = CommitInfo {
             default_graph: false,
+            unvalidated: false,
             ..c
         };
         assert_eq!(decode_record(&encode_record(&named_only)), Some(named_only));

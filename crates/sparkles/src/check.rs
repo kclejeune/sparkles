@@ -1249,7 +1249,7 @@ impl Checker<'_> {
                             prev_seq = Some(seq);
                             commits.push((seq, prev_ts, 255));
                         }
-                        Some(Ok((seq, ts, kind))) => {
+                        Some(Ok((seq, ts, kind, _))) => {
                             seen_v2 = true;
                             let expect = prev_seq.map_or(0, |s| s + 1);
                             if seq != expect {

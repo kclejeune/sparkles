@@ -777,16 +777,21 @@ fn nonconformant(v: &[(Term, crate::ShapeLabel, Status)]) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    // `SPARKLES_SHEX_CASES=n` runs n cases
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("SPARKLES_SHEX_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(128)
+    ))]
 
     /// Every write's counts are those of a full validation, and every association the
     /// write makes nonconformant is listed, whether the guard validated incrementally
-    /// or in full.
+    /// or in full. In grandfather `reject` mode a write is rejected exactly when it
+    /// introduces a nonconformant association, and `introduced` counts them.
     #[test]
     fn incremental_counts_equal_full_validation(
         base in proptest::collection::vec(triple(), 0..24),
         writes in proptest::collection::vec(proptest::collection::vec(change(), 1..5), 1..8),
         closed in any::<bool>(),
+        grandfather in any::<bool>(),
     ) {
         let s = Store::in_memory(StoreOptions::default());
         write(&s, &base.iter().map(|t| (true, *t)).collect::<Vec<_>>()).unwrap();
@@ -798,20 +803,49 @@ proptest! {
         };
         let map = format!("{SKIP_MAP}, ex:n2@ex:W");
         let map = if closed { map.as_str() } else { SKIP_MAP };
-        let (g, _) = installed(set_config(&s, Some(cfg("warn", &schema, map)), &NoImports).unwrap());
+        let mut c = cfg(if grandfather { "reject" } else { "warn" }, &schema, map);
+        if grandfather {
+            c.baseline = BaselinePolicy::Grandfather;
+        }
+        let (g, _) = installed(set_config(&s, Some(c), &NoImports).unwrap());
         for w in &writes {
             let before = verdicts(&g, &s.snapshot());
-            let r = write(&s, w).unwrap();
-            let Some(v) = r.validation else { continue };
+            let head = s.head_commit().seq;
+            let r = write(&s, w);
             let after = verdicts(&g, &s.snapshot());
+            let (nb, na) = (nonconformant(&before), nonconformant(&after));
+            let r = match r {
+                Err(Error::Rejected(rej)) => {
+                    prop_assert!(grandfather);
+                    prop_assert_eq!(s.head_commit().seq, head);
+                    prop_assert_eq!(&after, &before);
+                    let v = rej.summary;
+                    prop_assert!(v.introduced.unwrap() > 0);
+                    // the first result listed is new
+                    let first = &v.results[0];
+                    let x = format!(
+                        "{}|{}",
+                        first["node"]["value"].as_str().unwrap_or_default(),
+                        first["shape"]["value"].as_str().unwrap_or("null")
+                    );
+                    prop_assert!(!nb.contains(&x), "{} was not new", x);
+                    continue;
+                }
+                r => r.unwrap(),
+            };
+            let Some(v) = r.validation else { continue };
             if v.status == GuardStatus::Skipped {
                 prop_assert_eq!(&after, &before);
                 continue;
             }
-            let (nb, na) = (nonconformant(&before), nonconformant(&after));
             prop_assert_eq!(v.blocking as usize, na.len());
             prop_assert_eq!(v.total as usize, after.len());
             prop_assert_eq!(g.status().baseline.unwrap().blocking as usize, na.len());
+            if grandfather {
+                prop_assert_eq!(v.introduced, Some(0));
+                let new: Vec<&String> = na.iter().filter(|x| !nb.contains(x)).collect();
+                prop_assert!(new.is_empty(), "committed with new {:?}", new);
+            }
             let listed: Vec<String> = v
                 .results
                 .iter()
@@ -831,6 +865,111 @@ proptest! {
             }
         }
     }
+}
+
+/// Grandfather mode: `reject` is enabled while carol does not conform, writes that
+/// leave her as she is pass, a write that adds a nonconformant person is rejected, and
+/// the setting survives a restart.
+#[test]
+fn grandfather_mode_blocks_only_new_associations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = loaded(&root);
+    let mut c = cfg("reject", SCHEMA, MAP);
+    c.baseline = BaselinePolicy::Grandfather;
+    let (_, sum) = installed(set_config(&s, Some(c), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.introduced), (1, Some(0)));
+    assert_eq!(stored_config(&root)["baseline"], "grandfather");
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:dave a ex:Person ; foaf:name \"Dave\" }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.status, v.strategy, v.blocking, v.introduced),
+        (GuardStatus::Passed, Strategy::Incremental, 1, Some(0))
+    );
+    // carol's own write keeps her nonconformant: nothing new
+    let v = summary(&upd(&s, "INSERT DATA { ex:carol foaf:knows ex:dave }").unwrap());
+    assert_eq!((v.status, v.introduced), (GuardStatus::Passed, Some(0)));
+    let Err(Error::Rejected(r)) = upd(&s, "INSERT DATA { ex:erin a ex:Person }") else {
+        panic!("erin has no name")
+    };
+    assert_eq!((r.summary.blocking, r.summary.introduced), (2, Some(1)));
+    assert_eq!(r.summary.results[0]["node"]["value"], "http://ex.org/erin");
+    assert!(
+        r.to_string().contains("1 new nonconformant association;"),
+        "{r}"
+    );
+    drop(s);
+    let s = open(&root);
+    install(&s).unwrap().unwrap();
+    assert!(matches!(
+        upd(&s, "INSERT DATA { ex:erin a ex:Person }"),
+        Err(Error::Rejected(_))
+    ));
+    // a full validation (the state unknown) compares with the state before the write
+    s.guard().unwrap().bypassed();
+    let v = summary(&upd(&s, "INSERT DATA { ex:fay a ex:Person ; foaf:name \"F\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.fallback.as_deref(), v.introduced),
+        (Strategy::Full, Some("baseline"), Some(0))
+    );
+}
+
+/// A recursive reference over a connected graph (a ring of people who know the next
+/// one): a write that changes no typing validates only the node it touches, and one
+/// that does validates the nodes the change reaches.
+#[test]
+fn typing_changes_propagate_along_references() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 300;
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n",
+    );
+    for i in 0..n {
+        data.push_str(&format!(
+            "ex:p{i} a ex:Person ; foaf:name \"P{i}\" ; foaf:knows ex:p{} .\n",
+            (i + 1) % n
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (_, sum) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.total), (0, n));
+    // every person reaches p0, but p0's typing does not change
+    let v = summary(&upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(1), 0)
+    );
+    // a nameless person p3 knows: everyone reaches p3, and no one conforms
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:bad a ex:Person . ex:p3 foaf:knows ex:bad }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking, v.total),
+        (Strategy::Incremental, Some(n + 1), n + 1, n + 1)
+    );
+    // a write between nonconformant people changes nothing either
+    let v = summary(&upd(&s, "INSERT DATA { ex:p9 foaf:knows ex:p20 }").unwrap());
+    assert_eq!((v.focus_nodes, v.blocking), (Some(1), n + 1));
+    // naming bad fixes everyone
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(n + 1), 0)
+    );
 }
 
 /// Writes after enabling are incremental; the state survives a restart; a bulk load

@@ -9,6 +9,11 @@
 //!   data to conform;
 //! * `warn`: the commit is written; its receipt carries the findings.
 //!
+//! With `baseline: "grandfather"`, `reject` may be enabled on data that does not
+//! conform, and a write is judged by the nonconformant associations it introduces: those
+//! of the state after it that the state before it did not have (matched by node and
+//! shape, as a multiset).
+//!
 //! ShEx has no severities and no threshold: every nonconformant association blocks, and
 //! counts as one violation of the summary. The schema is copied into the database when
 //! the configuration is set, with its imports resolved then, so a write never fetches
@@ -25,13 +30,15 @@
 //! kept up to date by every validated write and persisted in `validation-status.json`).
 //! A write then validates only the associations whose result it can change (see
 //! [`incremental`]), in the states before and after it, and moves the counts by the
-//! difference. It validates in full when the state of the head is unknown, in `reject`
-//! mode when the head does not conform, for bulk writes, for a map with a SPARQL
+//! difference. It validates in full when the state of the head is unknown, in strict
+//! `reject` mode when the head does not conform, for bulk writes, for a map with a SPARQL
 //! selector, and when too many nodes are affected.
 
 use crate::ast::Schema;
-use crate::ir::Ir;
+use crate::engine::PairValues;
+use crate::ir::{Ir, PairKind};
 use crate::resolve::Resolver;
+use crate::typing::Verdict;
 use crate::{
     CompiledSchema, NoImports, NodeSelector, PrefixMap, ResultMap, SchemaFormat, ShapeMap,
     ValidateOptions,
@@ -41,6 +48,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
+pub use sparkles::guard::config::BaselinePolicy;
 use sparkles::guard::config::{
     Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
     STATUS_FILE, StatusFile, sha256_hex, write_atomic,
@@ -79,6 +87,10 @@ pub struct ShexValidationConfig {
     pub data_graph: DataGraphSel,
     #[serde(default)]
     pub include_inferences: bool,
+    /// `strict` (the default) or `grandfather`: a write is judged by the nonconformant
+    /// associations it introduces
+    #[serde(default, skip_serializing_if = "BaselinePolicy::is_strict")]
+    pub baseline: BaselinePolicy,
     #[serde(default = "ten")]
     pub timeout_seconds: f64,
     #[serde(default = "hundred")]
@@ -189,6 +201,19 @@ mod incremental;
 /// stops there).
 const MAX_FOCUS: usize = 50_000;
 
+/// The outcome of propagating the typings a write changes.
+enum Propagation {
+    Done(Box<Checked>),
+    /// the region grew past [`MAX_FOCUS`] nodes
+    Budget,
+    /// the typing of the head is not known (or misses a pair it should have)
+    Unknown,
+}
+
+/// A validated write: its summary, the exact counts it leaves, and what it does to the
+/// typing of the head.
+type Checked = (ValidationSummary, Exact, TypingUpdate);
+
 /// The exact counts of the result map of a commit.
 #[derive(Clone, Copy, Debug)]
 struct Exact {
@@ -201,6 +226,53 @@ struct Pending {
     seq: u64,
     baseline: Baseline,
     exact: Option<Exact>,
+    typing: TypingUpdate,
+}
+
+/// The typing of the head: every pair the validations of its shape map discovered,
+/// with its value. It is exact for the head, and closed: the pairs any of its pairs
+/// reads are in it. Kept for schemas whose references follow arcs, so a write can
+/// propagate only the typings it changes ([`ShexGuard::propagated`]).
+struct HeadTyping {
+    commit: u64,
+    /// the generation whose ids it uses (a compaction renumbers terms)
+    generation: u64,
+    values: FxHashMap<(Id, PairKind), Verdict>,
+    /// the pair kinds of each node
+    by_node: FxHashMap<Id, Vec<PairKind>>,
+}
+
+impl HeadTyping {
+    fn new(commit: u64, generation: u64, values: PairValues) -> HeadTyping {
+        let mut t = HeadTyping {
+            commit,
+            generation,
+            values: FxHashMap::default(),
+            by_node: FxHashMap::default(),
+        };
+        t.apply(values);
+        t
+    }
+
+    fn apply(&mut self, values: PairValues) {
+        for ((n, k), v) in values {
+            if self.values.insert((n, k), v).is_none() {
+                self.by_node.entry(n).or_default().push(k);
+            }
+        }
+    }
+}
+
+/// What a commit does to the typing of the head.
+enum TypingUpdate {
+    /// nothing changes (a write no validation reads)
+    Keep,
+    /// the typing of a full validation, over the generation with this uid
+    Replace(u64, PairValues),
+    /// the pairs a write changed or added
+    Delta(PairValues),
+    /// unknown from now on
+    Drop,
 }
 
 /// Write-time ShEx validation of one store.
@@ -216,6 +288,7 @@ pub struct ShexGuard {
     pending: Mutex<Option<Pending>>,
     baseline: Mutex<Option<Baseline>>,
     exact: Mutex<Option<Exact>>,
+    typing: Mutex<Option<HeadTyping>>,
     /// the database directory and the SHA-256 of its `validation.json`, where the state
     /// of each validated commit is kept
     persist: Option<(PathBuf, String)>,
@@ -242,6 +315,7 @@ impl ShexGuard {
             reads: read_predicates(loaded.compiled.ir(), &map),
             plan: incremental::Plan::new(loaded.compiled.ir(), &map),
             exact: Mutex::new(None),
+            typing: Mutex::new(None),
             persist,
             cfg,
             schema: Arc::new(loaded.compiled),
@@ -294,33 +368,75 @@ impl ShexGuard {
         }
     }
 
-    /// Validate `view` and summarize under this configuration.
+    fn grandfather(&self) -> bool {
+        self.cfg.baseline == BaselinePolicy::Grandfather
+    }
+
+    fn limit(&self, o: &WriteOptions) -> usize {
+        o.report_limit
+            .unwrap_or(self.cfg.report_limit)
+            .clamp(1, 10_000)
+    }
+
+    /// Whether the guard keeps the typing of the head: when references follow arcs.
+    fn keeps_typing(&self) -> bool {
+        self.plan.refers()
+    }
+
+    /// The result map of all of `snap`, and its typing when the guard keeps it.
+    fn validate_map(
+        &self,
+        snap: &Arc<Snapshot>,
+        o: &WriteOptions,
+        deadline: Instant,
+    ) -> sparkles::Result<(ResultMap, PairValues)> {
+        match self.options(snap, o, deadline) {
+            Some(vo) => {
+                let (rm, mut values) =
+                    crate::engine::validate_typed(snap, &self.schema, &self.map, &vo, None, &[])
+                        .map_err(engine_error)?;
+                if !self.keeps_typing() {
+                    values = Vec::new();
+                }
+                Ok((rm, values))
+            }
+            // none of the listed data graphs exists: nothing to validate
+            None => Ok((
+                ResultMap {
+                    conforms: true,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )),
+        }
+    }
+
+    /// Validate all of `view` and summarize under this configuration. In grandfather
+    /// mode `before` (the state before the write) is validated too, and the
+    /// nonconformant associations `view` adds decide; without it none counts as added.
     fn validate_state(
         &self,
         view: &Arc<Snapshot>,
+        before: Option<&Arc<Snapshot>>,
         o: &WriteOptions,
-    ) -> sparkles::Result<ValidationSummary> {
+    ) -> sparkles::Result<(ValidationSummary, PairValues)> {
         let t0 = Instant::now();
-        let limit = o
-            .report_limit
-            .unwrap_or(self.cfg.report_limit)
-            .clamp(1, 10_000);
-        let Some(vo) = self.options(view, o, self.deadline(t0, o)) else {
-            // none of the listed data graphs exists: nothing to validate
-            self.associations.store(0, Ordering::Relaxed);
-            let empty = ResultMap {
-                conforms: true,
-                ..Default::default()
-            };
-            return Ok(self.summarize(empty, limit, 0));
+        let deadline = self.deadline(t0, o);
+        let (rm, typing) = self.validate_map(view, o, deadline)?;
+        let introduced = match before {
+            Some(base) if self.grandfather() => {
+                let (pre, _) = self.validate_map(base, o, deadline)?;
+                Some(new_nonconformant(&rm.results, &pre.results))
+            }
+            _ if self.grandfather() => Some(vec![false; rm.results.len()]),
+            _ => None,
         };
-        let rm = crate::validate(view, &self.schema, &self.map, &vo).map_err(engine_error)?;
         let ms = t0.elapsed().as_millis() as u64;
         self.last_full.store(ms, Ordering::Relaxed);
         self.associations
             .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
         *self.warnings.lock() = rm.warnings.clone();
-        Ok(self.summarize(rm, limit, ms))
+        Ok((self.summarize(rm, introduced, self.limit(o), ms), typing))
     }
 
     fn deadline(&self, t0: Instant, o: &WriteOptions) -> Instant {
@@ -356,12 +472,9 @@ impl ShexGuard {
     }
 
     /// Validate in full, saying why it is not incremental.
-    fn full(
-        &self,
-        c: &Candidate<'_>,
-        reason: &str,
-    ) -> sparkles::Result<(ValidationSummary, Exact)> {
-        let mut s = self.validate_state(&c.view, c.opts)?;
+    fn full(&self, c: &Candidate<'_>, reason: &str) -> sparkles::Result<Checked> {
+        let base = Arc::new(c.base.clone());
+        let (mut s, typing) = self.validate_state(&c.view, Some(&base), c.opts)?;
         s.fallback = Some(reason.to_string());
         s.focus_nodes = Some(s.total);
         let exact = Exact {
@@ -369,12 +482,217 @@ impl ShexGuard {
             nonconformant: s.blocking,
             total: s.total,
         };
-        Ok((s, exact))
+        let typing = if self.keeps_typing() {
+            TypingUpdate::Replace(c.view.generation.uid, typing)
+        } else {
+            TypingUpdate::Drop
+        };
+        Ok((s, exact, typing))
+    }
+
+    /// Validate a write by propagating the typings it changes (see the module
+    /// documentation of `incremental`), when the guard knows the typing of the head.
+    ///
+    /// The region starts with the nodes whose neighbourhood the write changed. Its
+    /// pairs are typed in the state after the write, with every other pair the typing
+    /// of the head has as `true` read as `true`; other pairs (`false`, or not typed
+    /// before) are typed too. A pair whose value changed adds its node and the nodes
+    /// that read it, transitively, to the region, and the region is typed again, until
+    /// no value outside it changes. The typing of every pair the region does not reach
+    /// is then the head's, so the associations of the region's nodes are the only ones
+    /// whose results the write can change.
+    fn propagated(
+        &self,
+        c: &Candidate<'_>,
+        changes: &[[Id; 3]],
+        exact: &Exact,
+        post: &Option<(ValidateOptions, DataGraph)>,
+        pre: &Option<(ValidateOptions, DataGraph)>,
+        t0: Instant,
+    ) -> sparkles::Result<Propagation> {
+        let typing = self.typing.lock();
+        let Some(t) = typing
+            .as_ref()
+            .filter(|t| t.commit == c.base.commit && t.generation == c.base.generation.uid)
+        else {
+            return Ok(Propagation::Unknown);
+        };
+        let (Some((vo, post_data)), Some((_, pre_data))) = (post, pre) else {
+            return Ok(Propagation::Unknown);
+        };
+        let r = self.plan.resolve(&c.view);
+        let mut region: FxHashSet<Id> = FxHashSet::default();
+        let mut queue: Vec<Id> = Vec::new();
+        for x in incremental::Plan::direct(&r, changes) {
+            if region.insert(x) {
+                queue.push(x);
+            }
+        }
+        let mut seeds: Vec<(Id, PairKind)> = Vec::new();
+        let (after, values, nodes) = loop {
+            for n in queue.drain(..) {
+                if let Some(ks) = t.by_node.get(&n) {
+                    seeds.extend(ks.iter().map(|&k| (n, k)));
+                }
+            }
+            if region.len() > MAX_FOCUS {
+                return Ok(Propagation::Budget);
+            }
+            let mut ids: Vec<Id> = region.iter().copied().collect();
+            ids.sort_unstable();
+            let nodes: Vec<(Id, oxrdf::Term)> = ids
+                .into_iter()
+                .filter_map(|id| c.view.term(id).map(|term| (id, term)))
+                .collect();
+            let map = incremental::associations(&self.map, &c.view, Some(post_data), &nodes)?;
+            // outside the region: what conformed, and what fails whatever it reads
+            let fixed = |n: Id, k: PairKind| -> Option<bool> {
+                if region.contains(&n) {
+                    return None;
+                }
+                match t.values.get(&(n, k))? {
+                    Verdict::True => Some(true),
+                    Verdict::AlwaysFalse => Some(false),
+                    Verdict::False => None,
+                }
+            };
+            let (after, values) = crate::engine::validate_typed(
+                &c.view,
+                &self.schema,
+                &map,
+                vo,
+                Some(&fixed),
+                &seeds,
+            )
+            .map_err(engine_error)?;
+            // a changed value is read by the pair's node and the nodes that refer to it;
+            // those reached from them backwards join at once, so a change that runs
+            // along a chain takes one more typing, not one per link
+            let mut stack: Vec<Id> = Vec::new();
+            for &((n, k), v) in &values {
+                if t.values
+                    .get(&(n, k))
+                    .is_some_and(|old| old.holds() != v.holds())
+                {
+                    stack.push(n);
+                }
+            }
+            let mut grown = false;
+            while let Some(y) = stack.pop() {
+                if region.insert(y) {
+                    queue.push(y);
+                    grown = true;
+                }
+                for x in incremental::Plan::readers(&r, post_data, y)? {
+                    if region.insert(x) {
+                        queue.push(x);
+                        stack.push(x);
+                        grown = true;
+                    }
+                }
+                if region.len() > MAX_FOCUS {
+                    return Ok(Propagation::Budget);
+                }
+            }
+            if !grown {
+                break (after, values, nodes);
+            }
+        };
+        // the results before the write at the region's nodes, from the head's typing
+        let before_map = incremental::associations(&self.map, &c.view, Some(pre_data), &nodes)?;
+        let mut before: Vec<crate::ShapeResult> = Vec::new();
+        let mut before_total = 0usize;
+        for a in &before_map.0 {
+            let NodeSelector::Term(node) = &a.node else {
+                return Ok(Propagation::Unknown);
+            };
+            let (Some(id), Ok(kind)) = (
+                c.view.lookup_term(node),
+                crate::shapemap::label_kind(&self.schema, &a.shape),
+            ) else {
+                return Ok(Propagation::Unknown);
+            };
+            match t.values.get(&(id, kind)).map(|v| v.holds()) {
+                Some(true) => {}
+                Some(false) => before.push(crate::ShapeResult {
+                    node: node.clone(),
+                    shape: a.shape.clone(),
+                    status: crate::Status::Nonconformant,
+                    reason: None,
+                    failures: Vec::new(),
+                    prints: Vec::new(),
+                }),
+                None => return Ok(Propagation::Unknown),
+            }
+            before_total += 1;
+        }
+        let Some(checked) = self.moved(c, exact, after, &before, (before.len(), before_total), t0)
+        else {
+            return Ok(Propagation::Unknown);
+        };
+        let (s, exact, _) = checked;
+        Ok(Propagation::Done(Box::new((
+            s,
+            exact,
+            TypingUpdate::Delta(values),
+        ))))
+    }
+
+    /// Move the counts of `exact` by the results of the associations validated in the
+    /// states after (`after`) and before (`before`, with its nonconformant and total
+    /// counts) the write, and summarize; `None` when the counts of the head cannot hold
+    /// them (they are wrong).
+    fn moved(
+        &self,
+        c: &Candidate<'_>,
+        exact: &Exact,
+        after: ResultMap,
+        before: &[crate::ShapeResult],
+        (before_nc, before_total): (usize, usize),
+        t0: Instant,
+    ) -> Option<Checked> {
+        // the associations elsewhere are unchanged: move the counts by the difference
+        let move_by =
+            |n: u64, minus: usize, plus: usize| (n + plus as u64).checked_sub(minus as u64);
+        let nonconformant = move_by(exact.nonconformant, before_nc, after.nonconformant)?;
+        let total = move_by(
+            exact.total,
+            before_total,
+            after.conformant + after.nonconformant,
+        )?;
+        let focus = (after.conformant + after.nonconformant) as u64;
+        let introduced = self
+            .grandfather()
+            .then(|| new_nonconformant(&after.results, before));
+        let mut s = self.summarize(
+            after,
+            introduced,
+            self.limit(c.opts),
+            t0.elapsed().as_millis() as u64,
+        );
+        s.strategy = Strategy::Incremental;
+        s.blocking = nonconformant;
+        s.total = total;
+        s.by_severity.violation = nonconformant;
+        s.conforms = nonconformant == 0;
+        s.status = match (s.introduced.unwrap_or(nonconformant) > 0, self.cfg.mode) {
+            (true, GuardMode::Reject) => GuardStatus::Rejected,
+            (true, _) => GuardStatus::Warned,
+            (false, _) => GuardStatus::Passed,
+        };
+        s.focus_nodes = Some(focus);
+        self.associations.store(total, Ordering::Relaxed);
+        let exact = Exact {
+            commit: c.base.commit + 1,
+            nonconformant,
+            total,
+        };
+        Some((s, exact, TypingUpdate::Drop))
     }
 
     /// Validate a write to the data graph: the associations it can affect when the
     /// counts of the head are known, everything otherwise.
-    fn check_data(&self, c: &Candidate<'_>) -> sparkles::Result<(ValidationSummary, Exact)> {
+    fn check_data(&self, c: &Candidate<'_>) -> sparkles::Result<Checked> {
         let t0 = Instant::now();
         let Changes::Log(log) = c.changes else {
             return self.full(c, "bulk");
@@ -386,7 +704,7 @@ impl ShexGuard {
         let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
             return self.full(c, "baseline");
         };
-        if self.cfg.mode == GuardMode::Reject && exact.nonconformant > 0 {
+        if self.cfg.mode == GuardMode::Reject && !self.grandfather() && exact.nonconformant > 0 {
             // the report must show the associations that block every write
             return self.full(c, "baseline");
         }
@@ -420,6 +738,11 @@ impl ShexGuard {
             };
         let post = state(&c.view)?;
         let pre = state(&base)?;
+        match self.propagated(c, &changes, &exact, &post, &pre, t0)? {
+            Propagation::Done(checked) => return Ok(*checked),
+            Propagation::Budget => return self.full(c, "budget"),
+            Propagation::Unknown => {}
+        }
         let affected = self.plan.affected(
             &c.view,
             [post.as_ref().map(|s| &s.1), pre.as_ref().map(|s| &s.1)],
@@ -448,54 +771,41 @@ impl ShexGuard {
         };
         let after = run(&c.view, &post)?;
         let before = run(&base, &pre)?;
-        // the associations elsewhere are unchanged: move the counts by the difference
-        let move_by =
-            |n: u64, minus: usize, plus: usize| (n + plus as u64).checked_sub(minus as u64);
-        let (Some(nonconformant), Some(total)) = (
-            move_by(
-                exact.nonconformant,
-                before.nonconformant,
-                after.nonconformant,
-            ),
-            move_by(
-                exact.total,
-                before.conformant + before.nonconformant,
-                after.conformant + after.nonconformant,
-            ),
-        ) else {
-            return self.full(c, "baseline");
-        };
-        let focus = (after.conformant + after.nonconformant) as u64;
-        let limit = c
-            .opts
-            .report_limit
-            .unwrap_or(self.cfg.report_limit)
-            .clamp(1, 10_000);
-        let mut s = self.summarize(after, limit, t0.elapsed().as_millis() as u64);
-        s.strategy = Strategy::Incremental;
-        s.blocking = nonconformant;
-        s.total = total;
-        s.by_severity.violation = nonconformant;
-        s.conforms = nonconformant == 0;
-        s.status = match (nonconformant > 0, self.cfg.mode) {
-            (true, GuardMode::Reject) => GuardStatus::Rejected,
-            (true, _) => GuardStatus::Warned,
-            (false, _) => GuardStatus::Passed,
-        };
-        s.focus_nodes = Some(focus);
-        self.associations.store(total, Ordering::Relaxed);
-        let exact = Exact {
-            commit: c.base.commit + 1,
-            nonconformant,
-            total,
-        };
-        Ok((s, exact))
+        let counts = (
+            before.nonconformant,
+            before.conformant + before.nonconformant,
+        );
+        match self.moved(c, &exact, after, &before.results, counts, t0) {
+            Some(checked) => Ok(checked),
+            None => self.full(c, "baseline"),
+        }
     }
 
-    /// Count and bound the results, and decide: every nonconformant association blocks.
-    fn summarize(&self, mut rm: ResultMap, limit: usize, millis: u64) -> ValidationSummary {
+    /// Count and bound the results, and decide: every nonconformant association blocks,
+    /// or in grandfather mode (`introduced`: which results are new) every new one. New
+    /// results are listed first.
+    fn summarize(
+        &self,
+        mut rm: ResultMap,
+        introduced: Option<Vec<bool>>,
+        limit: usize,
+        millis: u64,
+    ) -> ValidationSummary {
         let blocking = rm.nonconformant as u64;
-        let status = match (blocking > 0, self.cfg.mode) {
+        let introduced_n = introduced
+            .as_ref()
+            .map(|v| v.iter().filter(|x| **x).count() as u64);
+        if let Some(new) = &introduced {
+            let mut ranked: Vec<(bool, crate::ShapeResult)> = new
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut rm.results))
+                .collect();
+            // stable: map order within each group
+            ranked.sort_by_key(|(n, _)| !*n);
+            rm.results = ranked.into_iter().map(|(_, r)| r).collect();
+        }
+        let status = match (introduced_n.unwrap_or(blocking) > 0, self.cfg.mode) {
             (true, GuardMode::Reject) => GuardStatus::Rejected,
             (true, _) => GuardStatus::Warned,
             (false, _) => GuardStatus::Passed,
@@ -524,7 +834,7 @@ impl ShexGuard {
             millis,
             results,
             shapes_error: None,
-            introduced: None,
+            introduced: introduced_n,
             focus_nodes: None,
             fallback: None,
             report_turtle: None,
@@ -610,6 +920,7 @@ impl CommitGuard for ShexGuard {
                     seq,
                     baseline,
                     exact,
+                    typing: TypingUpdate::Keep,
                 });
             }
             let mut s =
@@ -618,7 +929,7 @@ impl CommitGuard for ShexGuard {
             s.limit = self.cfg.report_limit;
             return Ok(s);
         }
-        let (summary, exact) = self.check_data(c)?;
+        let (summary, exact, typing) = self.check_data(c)?;
         self.counters.count(summary.status);
         self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {
@@ -626,6 +937,7 @@ impl CommitGuard for ShexGuard {
                 seq,
                 baseline: baseline_of(&summary, seq),
                 exact: Some(exact),
+                typing,
             });
         }
         Ok(summary)
@@ -642,6 +954,24 @@ impl CommitGuard for ShexGuard {
                 }
                 *self.baseline.lock() = Some(p.baseline);
                 *self.exact.lock() = p.exact;
+                let mut typing = self.typing.lock();
+                match p.typing {
+                    TypingUpdate::Keep => match typing.as_mut() {
+                        Some(t) if t.commit + 1 == seq => t.commit = seq,
+                        _ => *typing = None,
+                    },
+                    TypingUpdate::Replace(generation, values) => {
+                        *typing = Some(HeadTyping::new(seq, generation, values))
+                    }
+                    TypingUpdate::Delta(values) => match typing.as_mut() {
+                        Some(t) if t.commit + 1 == seq => {
+                            t.apply(values);
+                            t.commit = seq;
+                        }
+                        _ => *typing = None,
+                    },
+                    TypingUpdate::Drop => *typing = None,
+                }
             }
             // a commit the guard did not judge: the state is unknown
             _ => {
@@ -650,6 +980,7 @@ impl CommitGuard for ShexGuard {
                     b.conforms = None;
                 }
                 *self.exact.lock() = None;
+                *self.typing.lock() = None;
             }
         }
     }
@@ -660,6 +991,7 @@ impl CommitGuard for ShexGuard {
             b.conforms = None;
         }
         *self.exact.lock() = None;
+        *self.typing.lock() = None;
     }
 
     fn describe(&self) -> String {
@@ -676,6 +1008,34 @@ impl CommitGuard for ShexGuard {
     fn language(&self) -> GuardLanguage {
         GuardLanguage::Shex
     }
+}
+
+/// For each result of `after`: whether it is nonconformant and not among `before`
+/// (associations, by node and shape, are matched as a multiset).
+fn new_nonconformant(after: &[crate::ShapeResult], before: &[crate::ShapeResult]) -> Vec<bool> {
+    let key = |r: &crate::ShapeResult| (r.node.to_string(), format!("{:?}", r.shape));
+    let mut left: FxHashMap<(String, String), usize> = FxHashMap::default();
+    for r in before
+        .iter()
+        .filter(|r| r.status == crate::Status::Nonconformant)
+    {
+        *left.entry(key(r)).or_default() += 1;
+    }
+    after
+        .iter()
+        .map(|r| {
+            if r.status != crate::Status::Nonconformant {
+                return false;
+            }
+            match left.get_mut(&key(r)) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect()
 }
 
 fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
@@ -950,8 +1310,8 @@ pub fn set_config(
     }
 
     let view = Arc::new(txn.view());
-    let summary = guard.validate_state(&view, &WriteOptions::default())?;
-    if guard.cfg.mode == GuardMode::Reject && summary.blocking > 0 {
+    let (summary, typing) = guard.validate_state(&view, None, &WriteOptions::default())?;
+    if guard.cfg.mode == GuardMode::Reject && !guard.grandfather() && summary.blocking > 0 {
         return Ok(SetOutcome::NotConforming(summary));
     }
     let head = txn.base().commit;
@@ -972,6 +1332,9 @@ pub fn set_config(
         nonconformant: summary.blocking,
         total: summary.total,
     });
+    if guard.keeps_typing() {
+        *guard.typing.lock() = Some(HeadTyping::new(head, view.generation.uid, typing));
+    }
     *guard.baseline.lock() = Some(baseline);
     let guard = Arc::new(guard);
     store.set_guard(Some(guard.clone()));

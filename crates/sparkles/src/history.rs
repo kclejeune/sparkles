@@ -860,6 +860,7 @@ mod tests {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         }
     }
 
