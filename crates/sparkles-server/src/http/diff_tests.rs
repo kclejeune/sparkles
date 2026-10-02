@@ -480,6 +480,44 @@ async fn the_change_feed_keeps_its_budget() {
 }
 
 #[tokio::test]
+async fn the_catalog_horizon_prunes_commits() {
+    let s = server(|_| {}).await;
+    let r = send(
+        &s.app,
+        Request::post("/$/compact/h").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success());
+    for _ in 0..500 {
+        if get(&s.app, "/$/history/h").await.json()["oldestReconstructable"] == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r = put_json(&s.app, "/$/history/h", r#"{"catalog": {"keepCommits": 2}}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["catalog"]["keepCommits"], 2);
+    assert_eq!(j["catalog"]["firstRetained"], 3);
+    assert_eq!(get(&s.app, "/$/commits/h/1").await.status, StatusCode::GONE);
+    assert_eq!(get(&s.app, "/$/commits/h").await.json()["firstRetained"], 3);
+    // a PUT without `catalog` keeps the horizon; null turns it off
+    let j = put_json(&s.app, "/$/history/h", "{}").await.json();
+    assert_eq!(j["catalog"]["keepCommits"], 2);
+    let j = put_json(&s.app, "/$/history/h", r#"{"catalog": null}"#)
+        .await
+        .json();
+    assert_eq!(j["catalog"]["keepCommits"], J::Null);
+    for bad in [r#"{"catalog": 3}"#, r#"{"catalog": {"keepAge": "soon"}}"#] {
+        assert_eq!(
+            put_json(&s.app, "/$/history/h", bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn diff_errors_tags_and_budgets() {
     let s = server(|l| l.max_rows = 1).await;
     let r = get(&s.app, "/h/diff?from=abc").await;

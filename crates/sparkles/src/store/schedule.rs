@@ -48,7 +48,14 @@ impl Store {
         };
         let _w = self.writer.lock();
         let mut h = hist.lock();
-        crate::history::write_file(root, self.dataset_id, &h.pins, h.retention, &schedules)?;
+        crate::history::write_file(
+            root,
+            self.dataset_id,
+            &h.pins,
+            h.retention,
+            &schedules,
+            h.catalog,
+        )?;
         h.schedules = schedules;
         Ok(())
     }
@@ -103,9 +110,12 @@ impl Store {
             }
         }
         if let Some(hist) = &self.history {
-            let w = self.writer.lock();
-            let current = commit::generation_number(&self.snapshot().generation.name);
-            self.collect_locked(&mut hist.lock(), current, w.head.seq);
+            {
+                let w = self.writer.lock();
+                let current = commit::generation_number(&self.snapshot().generation.name);
+                self.collect_locked(&mut hist.lock(), current, w.head.seq);
+            }
+            report.pruned = self.prune_commits_with(false)?;
         } else if let Some(m) = &self.mem_history {
             let head = self.writer.lock().head.seq;
             let mut m = m.lock();
@@ -137,7 +147,14 @@ impl Store {
         for n in &gone {
             pins.remove(n);
         }
-        crate::history::write_file(root, self.dataset_id, &pins, h.retention, &h.schedules)?;
+        crate::history::write_file(
+            root,
+            self.dataset_id,
+            &pins,
+            h.retention,
+            &h.schedules,
+            h.catalog,
+        )?;
         h.pins = pins;
         self.collect_locked(&mut h, current, w.head.seq);
         Ok(gone)

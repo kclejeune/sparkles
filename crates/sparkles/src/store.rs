@@ -1798,9 +1798,14 @@ impl Store {
             expires_ms,
         };
         h.pins.insert(name.to_string(), pin.clone());
-        if let Err(e) =
-            crate::history::write_file(root, self.dataset_id, &h.pins, h.retention, &h.schedules)
-        {
+        if let Err(e) = crate::history::write_file(
+            root,
+            self.dataset_id,
+            &h.pins,
+            h.retention,
+            &h.schedules,
+            h.catalog,
+        ) {
             h.pins.remove(name);
             return Err(e);
         }
@@ -1820,9 +1825,14 @@ impl Store {
         let Some(pin) = h.pins.remove(name) else {
             return Ok(false);
         };
-        if let Err(e) =
-            crate::history::write_file(root, self.dataset_id, &h.pins, h.retention, &h.schedules)
-        {
+        if let Err(e) = crate::history::write_file(
+            root,
+            self.dataset_id,
+            &h.pins,
+            h.retention,
+            &h.schedules,
+            h.catalog,
+        ) {
             h.pins.insert(name.to_string(), pin);
             return Err(e);
         }
@@ -1860,15 +1870,102 @@ impl Store {
             let mut h = hist.lock();
             let old = h.retention;
             h.retention = r;
-            if let Err(e) =
-                crate::history::write_file(root, self.dataset_id, &h.pins, r, &h.schedules)
-            {
+            if let Err(e) = crate::history::write_file(
+                root,
+                self.dataset_id,
+                &h.pins,
+                r,
+                &h.schedules,
+                h.catalog,
+            ) {
                 h.retention = old;
                 return Err(e);
             }
             self.collect_locked(&mut h, current, w.head.seq);
         }
         Ok(self.history())
+    }
+
+    /// Set how long the commit catalog keeps the metadata of commits that can no longer
+    /// be read ([`CatalogHorizon`](crate::history::CatalogHorizon)), durably, and prune
+    /// what it no longer keeps.
+    pub fn set_catalog_horizon(
+        &self,
+        c: crate::history::CatalogHorizon,
+    ) -> Result<crate::history::HistoryStatus> {
+        let (Some(root), Some(hist)) = (&self.root, &self.history) else {
+            return Err(Error::HistoryUnsupported(
+                "a catalog horizon needs a persistent dataset (an in-memory one keeps a ring of commits)".into(),
+            ));
+        };
+        {
+            let _w = self.writer.lock();
+            let mut h = hist.lock();
+            let old = h.catalog;
+            h.catalog = c;
+            if let Err(e) = crate::history::write_file(
+                root,
+                self.dataset_id,
+                &h.pins,
+                h.retention,
+                &h.schedules,
+                c,
+            ) {
+                h.catalog = old;
+                return Err(e);
+            }
+        }
+        self.prune_commits()?;
+        Ok(self.history())
+    }
+
+    /// Prune the commit records (and annotations) the catalog horizon no longer keeps:
+    /// those of commits older than both the readable history and the horizon. Returns
+    /// the records dropped (0 when the horizon is off).
+    pub fn prune_commits(&self) -> Result<u64> {
+        self.prune_commits_with(true)
+    }
+
+    /// [`prune_commits`](Self::prune_commits); unless `force`, only once at least 1,024
+    /// records, and an eighth of them, can go, so a file is not rewritten for a few.
+    pub(crate) fn prune_commits_with(&self, force: bool) -> Result<u64> {
+        let Some(hist) = &self.history else {
+            return Ok(0);
+        };
+        let w = self.writer.lock();
+        let head = w.head.seq;
+        let now = self.now_ms();
+        let cutoff = {
+            let current = commit::generation_number(&self.snapshot().generation.name);
+            let h = hist.lock();
+            let cat = self.catalog.lock();
+            let Some(by_horizon) = h.catalog.cutoff(head, now, &|ms| cat.first_at_or_after(ms))
+            else {
+                return Ok(0);
+            };
+            let oldest = h
+                .reconstructable(current, head)
+                .first()
+                .map_or(head, |r| r.0);
+            let cutoff = by_horizon.min(oldest).min(head);
+            let first = cat.first().map_or(head, |c| c.seq);
+            let n = cutoff.saturating_sub(first);
+            let held = head.saturating_sub(first) + 1;
+            if n == 0 || (!force && (n < 1024 || n < held / 8)) {
+                return Ok(0);
+            }
+            cutoff
+        };
+        let n = self.catalog.lock().prune_before(cutoff)?;
+        self.annotations
+            .lock()
+            .prune_before(cutoff, self.dataset_id)?;
+        drop(w);
+        if n > 0 {
+            self.quota.invalidate();
+            tracing::info!(pruned = n, first = cutoff, "pruned the commit catalog");
+        }
+        Ok(n)
     }
 
     /// Retained generations, readable commits, retention and cache counters.
@@ -1887,6 +1984,8 @@ impl Store {
                 bytes: 0,
                 retention: m.as_ref().map(|m| m.retention).unwrap_or_default(),
                 snapshots: m.as_ref().map_or(0, |m| m.pins.len()),
+                catalog: Default::default(),
+                first_commit: self.catalog.lock().first().map_or(head, |c| c.seq),
                 cache_entries: m.as_ref().map_or(0, |m| m.window.len()),
                 cache_bytes: 0,
                 hits: m.as_ref().map_or(0, |m| m.hits),
@@ -1931,6 +2030,8 @@ impl Store {
             generations,
             retention: h.retention,
             snapshots: h.pins.len(),
+            catalog: h.catalog,
+            first_commit: self.catalog.lock().first().map_or(head, |c| c.seq),
             cache_entries: h.cache.len(),
             cache_bytes: h.cache.iter().map(|e| e.bytes).sum(),
             hits: h.hits,
@@ -4150,6 +4251,7 @@ fn open_history(
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
     h.schedules = cfg.schedules;
+    h.catalog = cfg.catalog;
     for (no, name, base, fold_legacy) in history::scan_generations(root, dataset_id)? {
         let dir = root.join(&name);
         if no > current {
