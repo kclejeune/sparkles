@@ -678,7 +678,7 @@ impl Store {
     }
 
     #[inline]
-    fn failpoint(&self, name: &'static str) {
+    pub(super) fn failpoint(&self, name: &'static str) {
         #[cfg(any(test, feature = "failpoints"))]
         {
             let hook = self.failpoints.lock().get(name).cloned();

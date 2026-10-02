@@ -33,7 +33,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Diffs between any two readable commits (`GET /{ds}/diff`, `sparkles diff`, `Store::diff`), as JSON counts and quads, as N-Quads lines marked `+` and `-`, or as RDF Patch in text or RDF Thrift, for one graph or all. Within the retained write-ahead logs a diff reads only the changes between the two commits. Across a bulk commit it compares the two states with a sorted merge. | ✅ |
 | A change feed (`GET /{ds}/changes`, `Store::changes`): the commits after a given one with their changes, as JSON or one RDF Patch per commit, in pages bounded by commits and quads. It resumes from any readable commit, long-polls with `wait=`, and streams server-sent events that resume with `Last-Event-ID`. | ✅ |
 | A commit catalog horizon (`catalog` in `PUT /$/history/{ds}`, `sparkles snapshot catalog`) that prunes the records, messages and digests of commits older than both the readable history and the horizon. | ✅ |
-| Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. | ✅ |
+| Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. The build reads a snapshot while writes go on. The commits made meanwhile are carried into the new generation's log, and the writer lock is held only for the switch. | ✅ |
+| Automatic compaction ([C13](specs/C13-automatic-compaction.md)). A server compacts a dataset when its delta reaches a share of the base index or a size, its log a size, its oldest change an age, or after a quiet period. Flags set the policy, and `compaction.json` (`/$/compaction/{ds}`, `sparkles compaction`) overrides it per dataset. It waits for bulk loads, backups, restores, the retention window and free disk space, takes a task slot only when one is free, and builds with fewer threads at a lower priority. The status is in `/$/stats`, the metrics and the dataset page. See [API.md](API.md#automatic-compaction). | ✅ |
 | N-Quads backups (`/$/backup`) and dumps, compressed with zstd by default or with gzip, brotli or LZ4. Request bodies and responses can be compressed with `zstd`, `br` or `gzip`. | ✅ |
 | A read-only integrity check (`sparkles check`, `sparkles::check`). It checks the layout, every block of the 7 permutations, consistency across permutations, vocabulary order and id ranges, WAL checksums and commit continuity, the catalog, full-text segment checksums, and the spatial index's `geo.json` and index files. It is safe to run next to a running server ([USAGE.md](USAGE.md#checking-a-database)). | ✅ |
 | In-memory datasets, on the same engine with the base in a temporary directory. | ✅ |
@@ -73,11 +74,12 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 |---|---|
 | The SPARQL protocol, GSP, upload, the `/$/` admin API (datasets, stats, compact, backup, tasks) and Jena's special graphs (`urn:x-arq:DefaultGraph` and `UnionGraph`). | ✅ |
 | A SPARQL 1.1 Service Description at `/{ds}/sparql` and `/{ds}/query` for a GET without a query. It describes the query and update services, their languages, formats and features, every extension function, aggregate and property function, the entailment regime of materialized inferences and the default dataset, and links the VoID description. Named graphs and counts follow the caller's grants ([API.md](API.md#service-description)). | ✅ |
+| Fuseki compatibility beyond the endpoints. The admin API has Fuseki's `/$/backups` alias (an N-Quads dump unless the body is JSON), `/$/backups-list`, `/$/stats` with request counters, `?state=offline\|active`, `deleteOld`, the `/$/validate/*` services and assembler bodies on `POST /$/datasets` for the part of a `config.ttl` that maps to a dataset. Dataset, task and server JSON carry Fuseki's members (`ds.name`, `ds.services`, `taskId`, `finished`, `success`). The protocol has `using-graph-uri`, `?graph=union`, `?target=` on `/shacl`, direct Graph Store naming (`--gsp-direct-naming`), `output=`, `results=` and `force-accept`, and Jena's RDF Thrift, RDF Protobuf, RDF/JSON and SPARQL Results Thrift. Jena's own clients (`RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`, `UpdateExecHTTP`) are tested against the server with `mise run test:jena-clients`. | ✅ |
 | A Jena-style CLI that works on the database directory: `load`, `query`, `update`, `dump`, `compact`, `backup`, `repo`, `stats`, `infer`, `shacl`, `shex`, `schema`, `queries`, `clone` and `check`. | ✅ |
 | Backup repositories (`sparkles-backup`, with the `backup` cargo feature, on by default). Online backups go to a file system or S3 (AWS, MinIO, R2, Ceph RGW) and hold the writer lock for only a few system calls. An in-memory dataset is backed up through a temporary generation that the bulk builder writes from its snapshot. Backups are incremental and deduplicated: data is stored as content-addressed 32 MiB pieces, only the appended bytes of the WAL and catalog are copied, and the manifest is written last. A restore goes to a new dataset or replaces one in place. It follows dataset-id rules (`auto`, `new`, `keep`) and runs an integrity check before publishing. During an in-place swap, requests get `503` with `Retry-After`, never `404`. Backups can be verified (`exists`, `data`, `restore`). Lifecycle policies run on cron or `every` schedules in an IANA time zone, with catch-up, retention and optional GC. GC runs in two phases with a grace period. Lease locks are judged by the storage server's clock, so several servers and the CLI can share a repository. Repositories come from a config file or are registered through the API, within operator limits on named credential sources, the outbound policy and `fs` roots. The interfaces are `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`, `sparkles backup create\|list\|show\|restore\|verify\|delete\|policy` and a Backups page in the UI. Backups report `sparkles_backup_*` metrics and audit events. See [API.md](API.md#backup-repositories) and [USAGE.md](USAGE.md#backup-repositories). Not supported yet: encryption, server-wide backups and running policies offline. | ✅ |
 | Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`). The clone has the same quads and blank-node ids, and a new dataset id with `forkedFrom`. Inferences are copied or dropped. | ✅ |
 | The embedded Rust API (`sparkles::Dataset`) and a fluent query builder (`sparkles::querybuilder`); see [USAGE.md](USAGE.md#embedding-the-library). | ✅ |
-| Python bindings: the `sparkles` package (`crates/sparkles-py`, PyO3 and maturin, abi3 wheels for CPython 3.10 and later). It has persistent and in-memory datasets, loads of every format with compressed inputs, SPARQL queries and updates, term classes that convert to and from rdflib's, streaming quad iteration, transactions, dumps, compaction, reasoning and SHACL and ShEx validation, with type stubs. Calls release the GIL. See [USAGE.md](USAGE.md#python) and [spec P01](specs/P01-python-bindings.md). | ✅ |
+| Python bindings: the `sparkles` package (`crates/sparkles-py`, abi3 wheels for CPython 3.10 and later, built and tested for Linux, macOS and Windows by a GitHub Actions workflow). It covers datasets, loads, SPARQL, transactions, history, search indexes, reasoning and validation, and has an rdflib store plugin and the query builder. Calls release the GIL, and Ctrl-C stops a running query. See [USAGE.md](USAGE.md#python) and [spec P01](specs/P01-python-bindings.md). | ✅ |
 | RDFS and OWL 2 RL materialization, and Jena rule syntax (`sparkles-reasoner`, `/$/reason`, `sparkles infer`). | ✅ |
 | Incremental materialization. A re-run, an automatic run or `sparkles infer` updates the previous materialization from its input graphs' changes since its commit, with the backward/forward algorithm, and writes what a full run would. Rules that are not monotonic or create blank nodes, RDF list changes under OWL 2 RL, large deletions and a changed set of input graphs run in full. | ✅ |
 | Input graphs and `owl:imports`. A materialization reads the default graph unless data and ontology graphs are named, and follows `owl:imports` to graphs of the dataset through a Jena-style location mapping. With `imports: fetch`, missing imports are loaded under the `LOAD` rules into the graph of the import IRI, so later runs work offline. See [API.md](API.md#input-graphs-and-imports). | ✅ |
@@ -154,15 +156,17 @@ These are features other RDF stores have and Sparkles does not have yet.
   whose queries are not anchored at the focus node, in full on every write. ShEx keeps no
   typing across a restart, so after one the first writes to a recursive schema over a
   large connected graph may be validated in full.
-* **Formats and change logs.** There is no RDF Thrift for data, and no RDF Protobuf, TriX
-  or RDF/JSON. RDF Patch is written for diffs, the change feed and write previews, but
-  Sparkles cannot apply a patch.
+* **Formats and change logs.** RDF Thrift, RDF Protobuf and RDF/JSON are read and written
+  by the server only, not by the CLI or the library, and there is no TriX. RDF Patch is
+  written for diffs, the change feed and write previews, but Sparkles cannot apply
+  a patch.
 * **Stored queries.** There are no stored updates, no parameters bound to several values
   at once, and no private queries per user.
-* **Operations.** There are no JVM metrics, no assembler configuration and no ontology
-  object API. Validation endpoints refuse callers whose grants cover only some graphs or
-  triples. The change feed refuses callers whose protections depend on the data, and
-  protections hide triples, not the IRIs that visible triples mention. Backups cannot be encrypted, cover the whole
+* **Operations.** There are no JVM metrics and no ontology object API. Assembler bodies
+  are read only for the part that maps to a dataset, and direct Graph Store naming is on
+  for every dataset or none. Validation endpoints refuse callers whose grants cover only
+  some graphs or triples. The change feed refuses callers whose protections depend on the
+  data, and protections hide triples, not the IRIs that visible triples mention. Backups cannot be encrypted, cover the whole
   server at once or run their policies offline.
 * **History.** There are no history queries across commits, such as when a triple
   changed, and no branches or merges. A diff across a bulk commit compares the two
@@ -170,5 +174,6 @@ These are features other RDF stores have and Sparkles does not have yet.
 * **Deployment.** Sparkles runs as a single node on local disk. There is no clustering,
   no replicas, no data in object storage and no encryption at rest.
 * **Embedding.** The database has Rust and Python APIs and no WebAssembly build. The
-  Python package is not on PyPI, has no Windows, PyPy or free-threaded wheels, and cannot
-  interrupt a running query or run an update inside a transaction.
+  Python package is not on PyPI and has no PyPy or free-threaded wheels. Its Windows
+  wheel is built and tested only by the release workflow, because the engine is tested on
+  Linux and macOS.

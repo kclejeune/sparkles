@@ -53,6 +53,60 @@ pub fn update_as(
     kind: crate::commit::CommitKind,
 ) -> Result<UpdateStats> {
     let t0 = Instant::now();
+    let parsed = parse_update(u, opts)?;
+    let depth = super::depth::check_update(&parsed)?;
+    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+}
+
+/// Run a SPARQL Update request inside an open write transaction without committing it.
+/// The operations see the transaction's earlier changes, and the transaction commits or
+/// discards them with the rest of its work. The request's timeout and cancellation apply
+/// to its own operations. `opts.write` does not apply, because the transaction was
+/// opened with write options of its own.
+pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
+    let t0 = Instant::now();
+    let parsed = parse_update(u, opts)?;
+    let depth = super::depth::check_update(&parsed)?;
+    super::depth::with_stack(depth, || {
+        validate_geometry(&parsed)?;
+        if let Some(access) = opts.graphs.as_ref() {
+            for op in &parsed.operations {
+                check_constant_graphs(access, op)?;
+            }
+        }
+        let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut stats = UpdateStats {
+            operations: parsed.operations.len(),
+            ..Default::default()
+        };
+        let t1 = Instant::now();
+        let req = Request {
+            opts,
+            deadline: opts.timeout.map(|t| t0 + t),
+            base: parsed.base_iri.clone(),
+            budget: RequestBudget::new(&opts.outbound),
+            produced: Default::default(),
+        };
+        for op in &parsed.operations {
+            req.check()?;
+            run_op(txn, op, &req, &mut stats)?;
+        }
+        req.check()?;
+        stats.rows_produced = req.produced.load(std::sync::atomic::Ordering::Relaxed);
+        let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        stats.timing = Timing {
+            parse_ms,
+            plan_ms: 0.0,
+            exec_ms,
+            serialize_ms: 0.0,
+            total_ms: parse_ms + exec_ms,
+        };
+        Ok(stats)
+    })
+}
+
+/// Parse an update request with the base IRI and prefixes of `opts`.
+fn parse_update(u: &str, opts: &QueryOptions) -> Result<spargebra::Update> {
     let mut p = super::aggext::register(SparqlParser::new());
     if let Some(b) = &opts.base_iri {
         p = p
@@ -64,9 +118,55 @@ pub fn update_as(
             .with_prefix(k, v)
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
-    let parsed = p.parse_update(u)?;
-    let depth = super::depth::check_update(&parsed)?;
-    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+    let mut parsed = p.parse_update(u)?;
+    protocol_dataset(&mut parsed, opts)?;
+    Ok(parsed)
+}
+
+/// Malformed geometry constants fail before anything is written.
+fn validate_geometry(parsed: &spargebra::Update) -> Result<()> {
+    for op in &parsed.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
+            crate::geo::validate_query(pattern, &mut |_| {})?;
+        }
+    }
+    Ok(())
+}
+
+/// SPARQL 1.1 Protocol §2.2.3: for an update, [`QueryOptions::default_graph_uris`] and
+/// [`QueryOptions::named_graph_uris`] are the `using-graph-uri` and
+/// `using-named-graph-uri` parameters. They are the `USING` and `USING NAMED` of every
+/// DELETE/INSERT operation, and an operation with `USING`, `USING NAMED` or `WITH` of
+/// its own makes the request an error.
+fn protocol_dataset(u: &mut spargebra::Update, opts: &QueryOptions) -> Result<()> {
+    if opts.default_graph_uris.is_empty() && opts.named_graph_uris.is_empty() {
+        return Ok(());
+    }
+    let iris = |v: &[String]| -> Result<Vec<NamedNode>> {
+        v.iter()
+            .map(|s| {
+                NamedNode::new(s.clone())
+                    .map_err(|e| Error::invalid(format!("invalid graph IRI <{s}>: {e}")))
+            })
+            .collect()
+    };
+    let default = iris(&opts.default_graph_uris)?;
+    let named = iris(&opts.named_graph_uris)?;
+    for op in &mut u.operations {
+        if let GraphUpdateOperation::DeleteInsert { using, .. } = op {
+            if using.is_some() {
+                return Err(Error::invalid(
+                    "using-graph-uri and using-named-graph-uri cannot be combined with USING, \
+                     USING NAMED or WITH",
+                ));
+            }
+            *using = Some(QueryDataset {
+                default: default.clone(),
+                named: Some(named.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether `u` parses as an update that only inserts or deletes data (`INSERT DATA`,
@@ -106,11 +206,7 @@ fn run_update(
     t0: Instant,
 ) -> Result<UpdateStats> {
     // malformed geometry constants fail before the writer lock is taken
-    for op in &parsed.operations {
-        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
-            crate::geo::validate_query(pattern, &mut |_| {})?;
-        }
-    }
+    validate_geometry(parsed)?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut stats = UpdateStats {
         operations: parsed.operations.len(),
@@ -148,7 +244,7 @@ fn run_update(
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
-        run_op(&mut txn, op, &req, &mut stats, store)?;
+        run_op(&mut txn, op, &req, &mut stats)?;
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
@@ -232,7 +328,6 @@ fn run_op(
     op: &GraphUpdateOperation,
     req: &Request<'_>,
     stats: &mut UpdateStats,
-    store: &Store,
 ) -> Result<()> {
     match op {
         GraphUpdateOperation::InsertData { data } => {
@@ -553,7 +648,6 @@ fn run_op(
         }
         GraphUpdateOperation::Create { .. } => {}
     }
-    let _ = store;
     Ok(())
 }
 
@@ -904,5 +998,50 @@ mod tests {
         assert!(!data_only("CLEAR ALL", &o));
         assert!(!data_only("INSERT DATA { <urn:a> <urn:p> ", &o));
         assert!(!data_only("", &o));
+    }
+}
+
+#[cfg(test)]
+mod protocol_dataset_tests {
+    use crate::sparql::{QueryOptions, query, update::update};
+    use crate::store::{Store, StoreOptions};
+
+    fn ask(s: &Store, q: &str) -> bool {
+        query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .boolean
+    }
+
+    #[test]
+    fn using_graph_uri_is_the_using_of_each_modify() {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = "INSERT DATA { <urn:a> <urn:p> 1 . GRAPH <urn:g1> { <urn:b> <urn:p> 2 } \
+                    GRAPH <urn:g2> { <urn:c> <urn:p> 3 } }";
+        update(&s, data, &QueryOptions::default()).unwrap();
+        let copy = "INSERT { GRAPH <urn:out> { ?s <urn:p> ?o } } WHERE { ?s <urn:p> ?o }";
+        let opts = QueryOptions {
+            default_graph_uris: vec!["urn:g1".into()],
+            ..Default::default()
+        };
+        update(&s, copy, &opts).unwrap();
+        assert!(ask(&s, "ASK { GRAPH <urn:out> { <urn:b> <urn:p> 2 } }"));
+        assert!(!ask(&s, "ASK { GRAPH <urn:out> { <urn:a> <urn:p> 1 } }"));
+        // only named graphs: the default graph is empty
+        let named = QueryOptions {
+            named_graph_uris: vec!["urn:g2".into()],
+            ..Default::default()
+        };
+        let both = "INSERT { GRAPH <urn:out2> { ?s <urn:p> ?o } } \
+                    WHERE { { ?s <urn:p> ?o } UNION { GRAPH ?g { ?s <urn:p> ?o } } }";
+        let r = update(&s, both, &named).unwrap();
+        assert_eq!(r.inserted, 1);
+        assert!(ask(&s, "ASK { GRAPH <urn:out2> { <urn:c> <urn:p> 3 } }"));
+        // USING or WITH of the request's own is an error
+        let with = "WITH <urn:g1> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }";
+        let e = update(&s, with, &opts);
+        assert!(matches!(e, Err(crate::error::Error::Invalid(_))), "{e:?}");
+        let using = "INSERT { <urn:x> <urn:y> <urn:z> } USING <urn:g2> WHERE {}";
+        let e = update(&s, using, &opts);
+        assert!(matches!(e, Err(crate::error::Error::Invalid(_))), "{e:?}");
     }
 }

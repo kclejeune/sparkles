@@ -549,6 +549,16 @@ impl HistoryState {
         }
     }
 
+    /// A copy of what decides which generations are kept (pins, retention, leases and
+    /// the generation table), without the open generations and cached states, for
+    /// working out what a change would keep.
+    pub fn clone_for_simulation(&self) -> HistoryState {
+        let mut h = HistoryState::new(self.pins.clone(), self.retention);
+        h.leases = self.leases.clone();
+        h.gens = self.gens.clone();
+        h
+    }
+
     /// Generation ranges `(number, base, end)`; the current generation ends at `head`.
     fn ranges(&self, current: u32, head: u64) -> Vec<(u32, u64, u64)> {
         self.gens
@@ -894,15 +904,18 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
         if no > current {
             continue;
         }
+        let dir = root.join(&name);
+        // a generation whose commits a compaction carried over has none of its own
         let end = recs
             .iter()
             .rev()
             .find(|c| c.generation == no)
-            .map_or(base.seq, |c| c.seq.max(base.seq));
+            .map(|c| c.seq.max(base.seq))
+            .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy));
         h.gens.insert(
             no,
             GenEntry {
-                dir: root.join(&name),
+                dir,
                 name,
                 base,
                 end,
@@ -928,14 +941,23 @@ pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
 
 /// Remove a generation directory crash-safely: rename, sync the parent, delete.
 pub(crate) fn delete_generation(root: &Path, dir: &Path) -> Result<()> {
+    if let Some(doomed) = retire_generation(root, dir)? {
+        std::fs::remove_dir_all(&doomed)?;
+    }
+    Ok(())
+}
+
+/// The first half of [`delete_generation`]: rename the directory to `*.deleting` and
+/// sync the parent. The caller deletes the returned directory, perhaps later, and an
+/// open finishes the deletion after a crash.
+pub(crate) fn retire_generation(root: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     let Some(name) = dir.file_name() else {
-        return Ok(());
+        return Ok(None);
     };
     let doomed = root.join(format!("{}.deleting", name.to_string_lossy()));
     std::fs::rename(dir, &doomed)?;
     crate::store::sync_dir(root)?;
-    std::fs::remove_dir_all(&doomed)?;
-    Ok(())
+    Ok(Some(doomed))
 }
 
 #[cfg(test)]

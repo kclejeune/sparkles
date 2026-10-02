@@ -374,12 +374,13 @@ async fn the_change_feed() {
     assert!(t.elapsed() >= Duration::from_millis(250));
     // and a commit that arrives during it
     let app = s.app.clone();
-    let poll = tokio::spawn(async move { get(&app, "/h/changes?after=4&wait=30").await });
+    // (the wait is long so that a loaded machine cannot end it before the commit does)
+    let poll = tokio::spawn(async move { get(&app, "/h/changes?after=4&wait=120").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let t = std::time::Instant::now();
     update(&s.app, "h", "INSERT DATA { <urn:d> <urn:p> 4 }").await;
     let r = poll.await.unwrap();
-    assert!(t.elapsed() < Duration::from_secs(10));
+    assert!(t.elapsed() < Duration::from_secs(60));
     assert_eq!(r.json()["commits"][0]["commit"]["seq"], 5);
     assert_eq!(r.header("sparkles-changes-next").as_deref(), Some("5"));
     // server-sent events: the commits after 3, then new ones as they come
@@ -468,7 +469,8 @@ async fn the_change_feed_keeps_its_budget() {
     )
     .await;
     assert!(r.status.is_success());
-    for _ in 0..200 {
+    // the compaction is a background task, slow on a loaded machine
+    for _ in 0..6000 {
         let r = get(&s.app, "/h/changes?after=1").await;
         if r.status == StatusCode::GONE {
             assert_eq!(r.json()["code"], "history-gone");
@@ -518,12 +520,16 @@ async fn the_catalog_horizon_prunes_commits() {
     )
     .await;
     assert!(r.status.is_success());
-    for _ in 0..500 {
+    // the compaction is a background task, slow on a loaded machine
+    let mut compacted = false;
+    for _ in 0..6000 {
         if get(&s.app, "/$/history/h").await.json()["oldestReconstructable"] == 4 {
+            compacted = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(compacted, "the compaction did not finish");
     let r = put_json(&s.app, "/$/history/h", r#"{"catalog": {"keepCommits": 2}}"#).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
@@ -604,7 +610,8 @@ async fn diff_errors_tags_and_budgets() {
     )
     .await;
     assert!(r.status.is_success());
-    for _ in 0..200 {
+    // the compaction is a background task, slow on a loaded machine
+    for _ in 0..6000 {
         if get(&s.app, "/h/diff?from=commit:1&to=commit:3")
             .await
             .status

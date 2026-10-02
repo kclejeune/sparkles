@@ -478,6 +478,43 @@ one-triple commits and of 20 commits of 1,000 `geo:asWKT` points each, over thre
 The index adds no measurable time to a commit. The differences are within run-to-run
 noise.
 
+### Automatic compaction (1.05M triples)
+
+This test loaded the 1.05M-triple benchmark data (`gen-data.py 100000`) and sent the
+50,000 single-triple commits of `bench-writes.py gen` (35,000 inserts, 15,000 deletes),
+each as its own HTTP request on a new connection. It ran on 2026-10-02 with a release
+build at `9de1492` and `--result-cache-mb 0`. Other builds and tests were running on the
+machine (a load average of about 38 on 16 cores), so the tails are noisy. The scripts are
+not checked in.
+
+The statistics-answered queries are medians of 20 runs after 3 warm-up runs. "Before"
+has the 50,000-quad delta with automatic compaction turned off for the dataset. "After"
+follows the automatic compaction that started once the dataset was turned back on with
+`idleSeconds` 5. That compaction took 2.0 s and held the writer lock for 5.7 ms.
+
+| Query | With the delta | After the compaction |
+|---|---:|---:|
+| `types-grouped` | 5.8 ms | 1.9 ms |
+| `predicate-counts` | 2.0 ms | 1.9 ms |
+| `distinct-obj` | 7.8 ms | 2.2 ms |
+
+The write latency was measured over the same 50,000 commits twice. The first run had
+automatic compaction off. The second set `deltaRatio` 0.01, so two compactions ran during
+the commits, at about 20,500 delta quads each. They took 1.26 s and 1.44 s, carried 348
+and 497 commits made during their builds into the new generation, and held the writer
+lock for 3.4 ms and 3.3 ms.
+
+| Commit latency | Compaction off | During the compactions (860 commits) | Rest of the run with compactions |
+|---|---:|---:|---:|
+| p50 | 2.7 ms | 2.0 ms | 2.0 ms |
+| p99 | 21.0 ms | 15.1 ms | 14.2 ms |
+| p99.9 | 622 ms | 28.7 ms | 250 ms |
+| max | 9.8 s | 58.7 ms | 12.1 s |
+
+Commits during a compaction were no slower than the others. The multi-second outliers
+appeared in both runs outside any compaction, and most likely come from `fsync`
+stalls on the shared machine.
+
 ### GeoSPARQL Compliance Benchmark
 
 The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021) has 206 queries

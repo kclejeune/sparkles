@@ -36,21 +36,21 @@ full feature list is in [FEATURES.md](FEATURES.md).
 | Service description | Fuseki answers a GET of the query endpoint without a query with `404` | A SPARQL 1.1 Service Description of the query and update services, with the extension functions and aggregates, the entailment regime and the default dataset, filtered by the caller's grants ([API.md](API.md#service-description)). |
 | Extension points | Registries for functions, property functions, aggregates, SERVICE executors and DESCRIBE handlers, algebra transforms and query engine factories | None are public. Extension functions are built in, and DESCRIBE always returns Jena's default, the resource's triples with their blank-node closure. |
 | SPARQL parser | JavaCC grammar | `spargebra` 0.4.7, vendored with fixes for the W3C tests it failed ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)) |
-| RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD only) |
+| RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD everywhere. The server also reads and writes RDF Thrift, RDF Protobuf and RDF/JSON in Graph Store requests, uploads and CONSTRUCT results, and writes SELECT results in SPARQL Results Thrift, which is what `RDFConnectionFuseki` uses. No TriX, and the CLI and the library read none of Jena's binary formats. |
 | Change logs | RDF Patch (jena-rdfpatch): writing, applying, capturing a dataset's changes and logging them to rotating files. Fuseki's `patch` operation applies one. | RDF Patch output, as text and as RDF Thrift, for diffs between commits and for a change feed with long polling and server-sent events. Sparkles writes patches but does not apply them, so it has no `/patch` endpoint. |
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix endpoints | Basic and Bearer tokens, OIDC sign-in for the UI and trusted proxy headers, with per-dataset access levels. Grants can be limited to some named graphs, for reading and writing, and to some endpoints, which covers fuseki-access and endpoint `allowedUsers`. Protections hide triples by predicate, by subject class or by a SPARQL pattern with the caller bound, which covers what the retired jena-permissions module's `SecurityEvaluator` decided per triple, as sets computed once per commit. Prometheus `/$/metrics` with Sparkles metric names, plus Fuseki's `fuseki_requests*` names with `--metrics-fuseki-names`, and no JVM metrics. Datasets are configured by CLI flags and the admin API. Prefixes through `/{ds}/prefixes`. |
 | SERVICE | Bulk, batched and cached SERVICE (serviceenhancer) | Plain SERVICE only |
 | Transactions over HTTP | — | — (as in Fuseki, one request is one transaction) |
 | Backups | `/$/backup/{ds}`: a gzipped N-Quads dump of the whole dataset in the server's directory, restored by loading it into a new dataset | The same dumps, zstd by default (`?compression=gzip` gives Fuseki's `.nq.gz`; brotli and LZ4 also work). Also backup repositories on a file system or S3: incremental, deduplicated backups that restore to a ready database without a reload, with verification, schedules and retention. |
-| Admin API | `/$/datasets` (also from an uploaded assembler, and `?state=offline`), `/$/server`, `/$/backup` with its alias `/$/backups`, `/$/backups-list`, `/$/compact` with `deleteOld`, `/$/tasks`, `/$/stats`, `/$/ping`, `/$/metrics` and `/$/validate/*` | The same routes except `/$/backups-list` and `/$/validate/*`, without assembler bodies, offline datasets or `deleteOld`. `/$/backups/{ds}` makes and lists repository backups, not dumps. Sparkles adds routes for commits, snapshots, schema, reasoning, validation, indexes, quotas, clones and stored queries. |
-| Graph Store naming | Indirect (`?graph=`) and direct naming, where the request URL is the graph | Indirect naming only |
+| Admin API | `/$/datasets` (also from an uploaded assembler, and `?state=offline`), `/$/server`, `/$/backup` with its alias `/$/backups`, `/$/backups-list`, `/$/compact` with `deleteOld`, `/$/tasks`, `/$/stats`, `/$/ping`, `/$/metrics` and `/$/validate/*` | The same routes, with Fuseki's JSON members in dataset, task and statistics responses. `POST /$/backups/{ds}` without a JSON body is Fuseki's dump, and with one it is a backup into a repository. Assembler bodies are read for the part that maps to a Sparkles dataset, and the rest is refused by name. `deleteOld=false` is refused, as compaction always removes the old generation, and the offline state is not persisted. `/$/validate/query` gives the algebra but not its quad and optimized forms. Sparkles adds routes for commits, snapshots, schema, reasoning, validation, indexes, quotas and clones. |
+| Graph Store naming | Indirect (`?graph=`, with `default` and `union`) and direct naming, where the request URL is the graph, configured per service | Both, with `?graph=union` read-only as in Fuseki. Direct naming is on for every dataset or none, with `serve --gsp-direct-naming`. |
 | Fuseki modules | Fuseki Main builds a server from modules (admin, UI, Shiro, Prometheus, graph access, GeoSPARQL index tasks), found through Java's `ServiceLoader` or `--modules` | The same functions are compiled in and chosen by cargo features and flags. There is no plugin interface. |
 | Command-line tools | `riot` (parse, validate, convert), `arq`/`sparql`, `qparse`, `uparse`, `update`, `rsparql`, `rupdate`, `rset`, `rdfdiff`, `infer`, `shacl`, `shex`, `rdfpatch`, `iri`, `langtag`, `schemagen` and `tdb2.*` | `load`, `query`, `update`, `dump`, `compact`, `backup`, `stats`, `infer`, `shacl` and `shex` cover `tdb2.*`, `arq`, `shacl` and `shex`. There is no converter like `riot`, algebra printer like `qparse`, file comparison like `rdfdiff`, or `iri` and `langtag` checker. |
 | Storage | TDB2 on copy-on-write B+trees, and TDB1, which is deprecated | Sorted, compressed permutation files with a delta and a WAL. Sparkles reads neither TDB format, so data moves between Jena and Sparkles as N-Quads or other RDF dumps. |
-| RDFConnection / RDFLink | One interface for query, update, Graph Store operations and transactions, over a local dataset or a remote endpoint (`RDFConnectionRemote`, `RDFConnectionFuseki`) | `Dataset`, in Rust and Python, covers local databases. The CLI's `--server` mode is the only remote client, and there is no remote client library. |
+| RDFConnection / RDFLink | One interface for query, update, Graph Store operations and transactions, over a local dataset or a remote endpoint (`RDFConnectionRemote`, `RDFConnectionFuseki`) | `Dataset`, in Rust and Python, covers local databases. The CLI's `--server` mode is the only remote client, and there is no remote client library. Jena's own remote clients work against the server: `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP` and `UpdateExecHTTP` are tested with every result format and RDF syntax (`mise run test:jena-clients`). |
 | Query builder | jena-querybuilder (`SelectBuilder`, `ConstructBuilder`, `AskBuilder`, `DescribeBuilder`, `UpdateBuilder`, `WhereBuilder`, `ExprFactory`) | `sparkles::querybuilder`, with the same builders, typed terms, escaped literals and `set_var` |
 | Commons RDF | jena-commonsrdf adapts Jena's terms to the Apache Commons RDF API | Terms are `oxrdf`'s, shared with the Rust crates built on it. Python terms convert to and from rdflib's. |
-| IRIs and language tags | jena-iri3986 checks RFC 3986 and 3987 syntax and scheme rules (`http`, `urn`, `uuid`, `file`, `did`) with configurable severities. jena-langtag parses BCP 47 tags and writes them in canonical case. Parsers warn about problems, and `iri`, `langtag` and `/$/validate/*` report them. | `oxiri` and `oxilangtag` refuse malformed IRIs and language tags while parsing. There are no scheme rules, warnings or checker commands. |
+| IRIs and language tags | jena-iri3986 checks RFC 3986 and 3987 syntax and scheme rules (`http`, `urn`, `uuid`, `file`, `did`) with configurable severities. jena-langtag parses BCP 47 tags and writes them in canonical case. Parsers warn about problems, and `iri`, `langtag` and `/$/validate/*` report them. | `oxiri` and `oxilangtag` refuse malformed IRIs and language tags while parsing. `/$/validate/iri` reports syntax errors and relative IRIs, and `/$/validate/langtag` checks BCP 47 well-formedness and gives the canonical case. There are no scheme rules, parser warnings or checker commands. |
 
 ### vs. QLever
 
@@ -109,9 +109,10 @@ Sparkles is ahead on:
 * **GeoSPARQL and validation.** The GeoSPARQL 1.1 functions with a spatial index and
   spatial joins, and ShEx next to SHACL.
 * **Index design.** Fluree keeps 4 index orders, Sparkles 7. Fluree's planner is greedy;
-  Sparkles uses dynamic programming. Fluree indexes in the background once uncommitted
-  changes pass a threshold; Sparkles keeps updates in an in-memory delta and compacts on
-  request.
+  Sparkles uses dynamic programming. Both index in the background once uncommitted
+  changes pass a threshold. Sparkles keeps updates in an in-memory delta and compacts it
+  into a new generation when it passes a share of the base index, a size or an age
+  ([C13](specs/C13-automatic-compaction.md)).
 
 [BENCHMARKS.md](BENCHMARKS.md) has the head-to-head numbers.
 
@@ -125,7 +126,7 @@ Sparkles' own.
 
 | Area | Oxigraph | Sparkles |
 |---|---|---|
-| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels built from the repository, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning and validation. No WebAssembly build. |
+| Embedding | A Rust library, Python (`pyoxigraph`) and JavaScript/WebAssembly packages, an in-memory store | A Rust library and a Python package (`sparkles`, abi3 wheels for Linux, macOS and Windows built by a release workflow, not on PyPI), persistent or in-memory. The Python API follows pyoxigraph's names for terms, `query`, `load`, `dump` and `quads_for_pattern`, and adds transactions as context managers, reasoning, validation, history and an rdflib store plugin whose SPARQL runs in Sparkles. No WebAssembly build. |
 | Storage | RocksDB (a C++ LSM tree) with 9 index orders (6 for named graphs, 3 for the default graph) and a string dictionary; updates in place; online backups as RocksDB checkpoints (a complete copy in a new local directory, hard-linked on the same file system) | Immutable sorted blocks in 7 orders, plus an in-memory delta logged to a WAL and merged by compaction. Online backups to repositories on a file system or S3, incremental and deduplicated across backups and datasets, with restore, verification, schedules and retention. |
 | Spatial | GeoSPARQL functions (`spargeo`, on by default in the CLI); no spatial index | GeoSPARQL 1.1 functions (geodesic measures, EPSG:4326 axis order, metric buffers) and a per-dataset spatial index |
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged. A commit waits for one `fdatasync`. When it adds terms the dataset has not seen before, they go to a separate file, which is synced at the same time as the WAL. A commit message or change digest adds one more. |
@@ -178,6 +179,7 @@ or web UI.
 | `serve` listens on `127.0.0.1` by default. Without `--auth-config` it refuses a non-loopback address unless `--allow-open-network` (or `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given. Fuseki listens on all interfaces. | Without authentication every caller can read, write and administer everything, so exposing that must be explicit. The override logs a warning, as does a network listener without rate limits. |
 | Without `--auth-config`, `serve` sends no CORS headers unless `--cors-origin` names an origin, refuses cross-site writes (`Origin`, `Sec-Fetch-Site`), and accepts only IP addresses, `localhost`, `--host` and `--public-host` names in `Host`. Fuseki answers CORS from any origin. | Every caller of an open server is its administrator. Without these checks, any web page the operator opens could read, write and `LOAD` local files through the browser, directly or by rebinding its DNS name. |
 | `--max-export-mb` defaults to `0` (unlimited), while query responses are capped at 1 GiB (`--max-result-mb`) | A Graph Store GET of a graph or dataset is the export path, streamed from one snapshot, and a finite default would cut off legitimate dumps. The cost is that any reader can make the server stream the whole dataset (CPU and bandwidth, not memory). Deployments that expose reads to untrusted clients should set `--max-export-mb` and rate-limit the `query` class. |
+| Compaction runs on its own (`--no-auto-compact` turns it off). A dataset is compacted when its delta reaches 10,000 quads plus 5% of the base index, a million quads, 512 MiB or a day's age, or after five quiet minutes. Writes go on during the build. TDB2 compacts only on request and blocks writers meanwhile. | Statistics, characteristic sets and block skipping are exact only on the base index, and a large delta slows scans and costs memory, so a long-running server needs compaction without an operator. Writes wait only for the final switch, which takes milliseconds. The cost is a full rebuild per compaction, CPU and I/O that the build limits to a quarter of the cores at a lower priority, and a full upload at the next incremental backup. |
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0` for no cap) for queries, updates and Graph Store writes. The default query timeout is 60 s. Writes have no default deadline (`--update-timeout 0`) but are cancelled when their client disconnects. | A request may ask for more than the default but cannot hold a worker forever. A long load is not cut off by a default it did not ask for, and a disconnected load stops (its rate-limit concurrency slot stays taken until it has). |
 
 ### GeoSPARQL
@@ -195,8 +197,9 @@ or web UI.
 
 ### Out of scope for v1
 
-JavaScript functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's
-Lucene index format and assembler configuration (Sparkles implements `text:query` itself),
+JavaScript functions, TriX, RDF Thrift and RDF Protobuf outside the server, jena-ontapi
+object mapping, jena-text's Lucene index format and assembler configuration (Sparkles
+implements `text:query` itself),
 SHACL-AF rules (also absent from Jena), applying RDF Patch, backward-chaining (LP) rules
 and Shiro authentication.
 
@@ -218,6 +221,13 @@ and Shiro authentication.
   version. A scan merges the delta into the blocks it changes. It finds the base rows
   between two delta keys by binary search, and only those blocks have every column
   decoded.
+* **Rebuilds in the background.** Like QLever's index rebuild, a compaction builds the
+  new index from a snapshot while updates continue, then carries the updates made since
+  the snapshot into the new index with their ids remapped. Sparkles carries each commit
+  into the new generation's log, so the commits made during the build stay readable at
+  `?at=`. The automatic trigger takes QLever's `min`, `max` and `fraction` form
+  (`--rebuild-index-strategy automatic:min:max:fraction`), adds the size of the log, age
+  and idle time, and waits for bulk loads, backups and the retention window.
 * **Columnar execution and planning.** Execution is column-major. The planner orders joins
   with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
   sort order, and merge joins run on sorted scans. A hash join's output keeps the order of

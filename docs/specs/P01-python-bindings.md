@@ -1,12 +1,13 @@
 # P01: Python bindings
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phase 1, most of Phase 2)
 >
 > **Phases:** Phase 1 shipped. It is the `sparkles-py` crate and the `sparkles` Python
 > package. It covers datasets, loading, SPARQL, terms, quad access, transactions, dumps,
 > compaction, reasoning and SHACL and ShEx validation, with type stubs, a pytest suite,
-> `mise run py:test` and `py:build`, and a flake check. Phase 2, listed in §9, is not
-> built.
+> `mise run py:test` and `py:build`, and a flake check. Phase 2, listed in §9, shipped
+> except for publishing itself, PyPy and free-threaded wheels, and async wrappers. The
+> [Outcome](#outcome) lists what it added.
 >
 > **User docs:** [Usage: Python](../USAGE.md#python) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
@@ -519,7 +520,8 @@ passed to a term constructor raises `ValueError`, and a wrong argument type rais
 
 **Phase 1** is everything in §2 to §8.
 
-**Phase 2** lists what is left out of Phase 1, in no particular order:
+**Phase 2** lists what is left out of Phase 1, in no particular order. The
+[Outcome](#phase-2) records which items shipped.
 
 * free-threaded (3.14t) wheels, and Windows and PyPy wheels;
 * publishing to PyPI, with a release workflow that builds the manylinux and macOS wheels
@@ -679,9 +681,88 @@ and `cargo test -p sparkles` covers the new `Dataset::quads`.
 symbols stripped, is 25 MB unpacked. `py:build` takes 4.5 minutes from a cold release
 build of the crate, with thin LTO.
 
-**Not built.** Everything in the Phase 2 list of §9 except pickling: PyPI publishing and
-manylinux, Windows, PyPy and free-threaded wheels, interrupting queries, an rdflib
-`Store` plugin, results serialization, streaming `parse` and file-object loads, `update`
-inside a transaction, history, snapshots and cloning, the text and vector index
-administration, write-time validation, the query builder and query budgets, and async
-wrappers.
+**Not built in Phase 1.** Everything in the Phase 2 list of §9 except pickling.
+
+### Phase 2
+
+**Delivered.** Phase 2 landed on 2026-10-02. It built these items of §9:
+
+* **An rdflib `Store` plugin.** `sparkles.rdflib.SparklesStore` is registered with an
+  `rdflib.plugins.store` entry point as `Sparkles`. It is context-, formula- and
+  graph-aware and serves `Graph`, `ConjunctiveGraph` and `Dataset`. SPARQL queries, with
+  `initNs` and `initBindings`, and updates of the default graph run in Sparkles' engine.
+  Prepared queries, updates with `initBindings` and updates of other graphs raise
+  `NotImplementedError`, so rdflib evaluates them itself over the store.
+* **A release workflow.** `.github/workflows/python-wheels.yml` builds abi3 wheels for
+  manylinux 2.28 and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and
+  Windows x64, and an sdist, and tests each installation. Its publish job uses PyPI
+  trusted publishing and runs only for a `py-v*` tag when the repository variable
+  `PYPI_PUBLISH` is `true`, so nothing is published as committed.
+* **Cancellation.** Ctrl-C raises `KeyboardInterrupt` and stops a running query or
+  update. A `CancelToken` cancels from any thread.
+* **Results serialization.** `QuerySolutions.serialize` writes JSON, XML, CSV or TSV, and
+  `QueryTriples.serialize` writes any RDF format.
+* **Streaming.** `parse` parses as it reads, and `Dataset.load` streams a file object
+  into one transaction.
+* **`update` inside a transaction**, and `query` there too, both seeing the
+  transaction's changes.
+* **History.** `head_commit`, `commits`, `at=` on the query methods, named snapshots,
+  `history`, `set_retention` and `clone_to`.
+* **The text and vector index administration**, and **write-time validation** with
+  SHACL or ShEx guards, configured with dicts in the engine's JSON shape.
+* **The query builder** (`sparkles.querybuilder`) and the budgets `max_rows`,
+  `max_memory_bytes` and `max_rows_produced`.
+
+The engine gained additive APIs for them: `Transaction::insert_linked`, `blank_node`,
+`query_with` and `update_with`, `sparql::update::update_in`, `WriteTxn::bnode_allocated`,
+`Dataset::quads_by_triple` and `Codec::reader_send`.
+
+**Deviations and decisions.**
+
+* Every query and update from Python's main thread runs on a long-lived helper thread
+  while the main thread waits without the GIL and runs signal handlers every 20 ms.
+  Open question 3 proposed the hop only with `interruptible=True`. A thread spawned per
+  request cost about 30 µs, so the binding keeps one helper thread instead. A small ASK
+  query then takes about 20 µs from the main thread and 14 µs from another thread, where
+  the request runs in place because Python handles signals only on its main thread.
+  Ctrl-C therefore works without an option. A query in a transaction is interrupted the
+  same way.
+* A blank node label that Sparkles hands out (`b…`) now names its stored node in writes
+  too, through `Transaction::insert_linked`. Phase 1 made a new node for it on insert,
+  which left no way to add a triple to an existing blank node from Python.
+* An update in a transaction that fails after it began to change data aborts the
+  transaction, since the engine has no savepoints. A syntax error does not.
+* The rdflib store maps contexts named by blank nodes to IRIs under
+  `urn:x-sparkles:rdflib:graph:` so that SPARQL can name them, and N3 formulae and
+  variables to IRIs under `urn:x-sparkles:rdflib:formula:` and `variable:`. It keeps a
+  table from rdflib blank node labels to stored nodes for the store's lifetime, the
+  label table that open question 4 avoided for `Dataset`. It gathers writes and commits
+  them before the next read, so a parse costs one commit. It refuses relative IRIs,
+  which rdflib accepts.
+* Empty graphs added through rdflib's `Dataset.graph()` are listed until the store
+  closes, because Sparkles keeps no empty graphs.
+* `maturin sdist` leaves out the vendored spargebra that `[patch.crates-io]` names, so
+  `scripts/py-sdist.py` adds it. The workflow and `mise run py:sdist` use the script.
+* Opening a database directory installs the write-time validation of its
+  `validation.json`, as the server does. Phase 1 left it out, so such a database refused
+  every write from Python.
+* The stub test now passes an allowlist to stubtest instead of
+  `--ignore-missing-stub`, so a runtime name without a stub fails it.
+
+**Test results at landing.** The suite has 140 tests. They pass in `mise run py:test`
+with CPython 3.14, where the entry point test skips because the test build is not
+installed, and in `mise run ci`. A manylinux 2.28 wheel built in the `quay.io/pypa` image passed it on
+CPython 3.10 and 3.14, and a musllinux 1.2 wheel built from the sdist passed it in
+Alpine, where requests run slower and the cancellation tests no longer bound the time a
+cancelled query takes to stop. rdflib's own store tests from its repository, `test_graph_context.py`,
+`test_graph_formula.py` and `test_dataset.py`, run the plugin through 16 tests and pass
+once their relative IRIs are made absolute. `tests/test_rdflib_store.py` follows their
+scenarios.
+
+**Measurements.** On 100,000 triples and against rdflib's in-memory store on the same
+machine, a parse into the plugin takes about as long, iterating every triple takes
+about four times as long, `g.value` lookups about three times, and a SPARQL join with
+grouping is 40 to 80 times faster.
+
+**Not built.** Publishing itself, PyPy and free-threaded wheels, and async wrappers. The
+macOS, Windows and aarch64 wheels have not been built outside the workflow.

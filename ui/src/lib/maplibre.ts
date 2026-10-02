@@ -9,7 +9,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 import basemapUrl from './basemap/ne-110m.json?url';
 import { basemapStyle, type StyleSpec } from './basemap/style';
-import { serverInfo } from './api';
+import { cachedServerInfo } from './api';
 
 setWorkerUrl(new URL(workerUrl, location.href).href);
 
@@ -19,7 +19,7 @@ let configured: Promise<string | null> | null = null;
 
 /** The server's `--map-style-url`, asked once (null: the bundled basemap). */
 function styleUrl(): Promise<string | null> {
-  configured ??= serverInfo().then(
+  configured ??= cachedServerInfo().then(
     (s) => s?.mapStyleUrl ?? null,
     () => null,
   );

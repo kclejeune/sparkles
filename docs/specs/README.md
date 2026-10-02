@@ -35,7 +35,7 @@ behaviour, and the Outcome explains the difference.
 | Prefix | Group |
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
-| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation, the MCP server, write previews and stored queries. |
+| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
 | `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL and ShEx. |
 | `P` | Bindings that embed the engine in other languages: Python. |
@@ -63,6 +63,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |
 | [C12b](C12b-triple-access-control.md) | C12 Phase 2: protections that hide triples by predicate, subject class or a SPARQL pattern with the caller bound, lifted by grants and enforced by a masked snapshot in the engine | implemented |
+| [C13](C13-automatic-compaction.md) | Background compaction triggered by the delta's size, the log's size, age and idle time, with writes continuing during the build | implemented |
 | [C15](C15-write-previews.md) | Dry runs of updates, Graph Store writes, uploads and the MCP write tool, which report the commit, the changes, validation, quota and preconditions and roll back | implemented |
 | [C16](C16-stored-queries.md) | Named queries per dataset with typed parameters bound as terms, versions, runs by name, MCP tools and the UI's saved queries | implemented |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
@@ -71,7 +72,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
-| [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1) |
+| [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1, most of Phase 2) |
 | [X01](X01-compression-codecs.md) | zstd and brotli next to gzip and LZ4 for inputs, responses, dumps, backups and the UI's assets | implemented in part (Phase 1) |
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |
 

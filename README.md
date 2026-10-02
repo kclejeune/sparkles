@@ -46,6 +46,8 @@ running queries.
 **Storage and engine**
 * MVCC snapshots with a single writer and a crash-safe WAL. Compaction writes immutable
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
+* Automatic compaction in the background when a dataset's updates grow, with writes going
+  on during the build ([API](docs/API.md#automatic-compaction)).
 * Durable commit ids, point-in-time reads by commit (`?at=commit:N`), time or named
   snapshot, and diffs between any two readable commits, as JSON or RDF Patch
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
@@ -78,6 +80,8 @@ running queries.
   endpoints for commits, schema discovery, clones, reasoning and validation ([API](docs/API.md)).
 * Stored queries with typed parameters, which clients and MCP agents run by name. Values
   are bound as terms and never spliced into the text ([API](docs/API.md#stored-queries)).
+* Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
+  against the server ([usage](docs/USAGE.md#fuseki-and-jena-clients)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)).
 
@@ -231,7 +235,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 |---|---|
 | `serve` | Run the SPARQL server with the web UI. |
 | `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
-| `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics or the commit history, and verify a database. |
+| `compact`, `compaction`, `clone`, `stats`, `log`, `check` | Merge updates, set a dataset's automatic compaction, copy a dataset, show statistics or the commit history, and verify a database. |
 | `snapshot`, `diff` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, and show the quads added and removed between two commits, also as RDF Patch. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |
@@ -269,7 +273,10 @@ are separate crates. [docs/USAGE.md](docs/USAGE.md#embedding-the-library) maps e
 them to its Jena equivalent.
 
 The same engine is a Python package, built from `crates/sparkles-py` with
-`mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms.
+`mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms. It also
+registers an rdflib store plugin, so `rdflib.Graph("Sparkles")` keeps its triples in
+Sparkles and runs SPARQL in its engine. A GitHub Actions workflow builds and tests the
+wheels for Linux, macOS and Windows.
 
 ```python
 from sparkles import Dataset

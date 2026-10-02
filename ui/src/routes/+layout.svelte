@@ -8,6 +8,7 @@
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { fmtCompact } from '$lib/format';
+  import { poll } from '$lib/poll';
   import Icon from '$components/Icon.svelte';
   import Toasts from '$components/Toasts.svelte';
   import UserMenu from '$components/UserMenu.svelte';
@@ -53,18 +54,22 @@
 
   onMount(() => {
     void auth.ensure().then(() => auth.guard());
-    app.refreshDatasets();
-    app.ping();
-    const pingTimer = setInterval(() => app.ping(), 10_000);
-    const dsTimer = setInterval(() => app.refreshDatasets(), 30_000);
+    // While the page is visible: the connection status every 30 s, and the dataset list
+    // (other clients write too) every 30 s while it changes, backing off to 5 min while
+    // it does not. Pages refresh it at once after their own changes.
+    const pinger = poll(() => app.ping(), { interval: 30_000 });
+    const datasets = poll(() => app.refreshDatasets(), {
+      interval: 30_000,
+      maxIdle: 300_000,
+    });
     const onDoc = (e: MouseEvent) => {
       if (switcherOpen && switcherEl && !switcherEl.contains(e.target as Node))
         switcherOpen = false;
     };
     document.addEventListener('mousedown', onDoc);
     return () => {
-      clearInterval(pingTimer);
-      clearInterval(dsTimer);
+      pinger.stop();
+      datasets.stop();
       document.removeEventListener('mousedown', onDoc);
     };
   });

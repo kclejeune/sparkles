@@ -1,8 +1,8 @@
 # Usage
 
 This guide covers operating the `sparkles` binary: running the server, the command-line
-tools, the formatter, backups, outbound requests, integrity checks, the MCP server,
-embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
+tools, automatic compaction, the formatter, backups, outbound requests, integrity checks,
+the MCP server, embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
 specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and
 testing.
 
@@ -14,6 +14,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Endpoints and operations](#endpoints-and-operations)
   * [`serve` options](#serve-options)
 * [Command-line tools](#command-line-tools)
+* [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
@@ -119,6 +120,30 @@ INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:title> "A" . <urn:b> <urn:title> "B" 
 To make a graph equal to a file, `PUT` the file to `/ds/data?graph=…`. The commit records
 only the quads that changed.
 
+### Fuseki and Jena clients
+
+Clients written for Fuseki work unchanged. Jena's `RDFConnectionRemote` and
+`RDFConnectionFuseki` connect to `http://host:3030/ds`, and `GSP`, `DSP`,
+`QueryExecHTTP` and `UpdateExecHTTP` to the endpoints under it. `RDFConnectionFuseki`
+sends and asks for RDF Thrift, which the server reads and writes. Fuseki's admin calls
+work too: `POST /$/datasets?dbName=ds&dbType=tdb2`, a `config.ttl` body on
+`POST /$/datasets`, `POST /$/backup/ds` and its alias `POST /$/backups/ds`,
+`GET /$/backups-list`, `POST /$/compact/ds?deleteOld=true`, `GET /$/tasks/{id}`,
+`GET /$/stats`, `POST /$/datasets/ds?state=offline` and the `/$/validate/*` services.
+[API.md](API.md#datasets-admin) lists where Sparkles differs, such as the assembler
+settings it refuses.
+
+Fuseki's direct Graph Store naming, where the request URL names the graph, is off by
+default. `sparkles serve --gsp-direct-naming` turns it on for every dataset, so that
+`curl -X PUT -H 'Content-Type: text/turtle' --data-binary @g.ttl
+http://localhost:3030/ds/graphs/one` writes the graph
+`<http://localhost:3030/ds/graphs/one>`. Behind a proxy, the graph IRI takes its scheme
+and host from `X-Forwarded-Proto` and `X-Forwarded-Host`.
+
+`mise run test:jena-clients` runs Jena's own clients against a server on a temporary
+directory. It takes Jena and a JDK from nixpkgs, or from `JENA_HOME` and `JAVA`
+([DEVELOPMENT.md](DEVELOPMENT.md)).
+
 ### Restricting users to some graphs
 
 With `--auth-config`, a grant can cover only some named graphs of a dataset, or only some
@@ -221,6 +246,7 @@ happens to materialized inferences, and the limits.
 | `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
 | `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
+| `--no-auto-compact` | | Never compact automatically. `POST /$/compact/{ds}` and `sparkles compact` still work. See [Automatic compaction](#automatic-compaction) for the `--auto-compact-*` flags. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
 | `--format-endpoint on\|authenticated\|off` | `on` | Who may use `POST /$/format` (see [API.md](API.md#formatting)). `on` admits every caller the server admits, `authenticated` every caller but the anonymous principal (`401`), and `off` nobody (`404`). A UI built with the formatter's WebAssembly module formats in the page and needs the endpoint only as a fallback. |
@@ -238,6 +264,7 @@ happens to materialized inferences, and the limits.
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
 | `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
 | `--metrics-fuseki-names` | off | Also expose Fuseki's metric names (`fuseki_requests`, `fuseki_requests_good`, `fuseki_requests_bad`) on `/$/metrics`, for dashboards built for Fuseki. See [API.md](API.md#fuseki-metric-names). |
+| `--gsp-direct-naming` | off | Fuseki's direct Graph Store naming on every dataset: a request to `/{ds}/{path}` that names no endpoint reads or writes the graph whose IRI is the request URL. See [Fuseki and Jena clients](#fuseki-and-jena-clients). |
 | `--metrics-addr HOST:PORT` | | Also serve `/$/metrics` on this address, with the same authentication. Without `--auth-config`, an address that is not loopback needs `--allow-open-network`. |
 | `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
 | `--otel-logs` | off | Export log events over OTLP as well. |
@@ -290,6 +317,7 @@ sparkles query   --data file.ttl --query q.rq # query files in memory (arq --dat
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
+sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
@@ -314,6 +342,7 @@ sparkles vector create --loc db --name emb --predicate http://example.org/emb --
 sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server URL --dataset NAME
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
+sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 ```
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
@@ -416,6 +445,8 @@ The other commands are:
 * `queries`, for stored queries ([below](#stored-queries));
 * `snapshot`, for named snapshots and history retention;
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
+* `compaction`, for a dataset's automatic compaction settings, locally or on a `--server`
+  ([below](#automatic-compaction));
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
   ([below](#backup-repositories));
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
@@ -485,6 +516,51 @@ Each change is a new version with its time, author and message. The MCP server o
 every stored query as a tool named `<dataset>__<query>`, and the UI's query page lists
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
+
+## Automatic compaction
+
+A server compacts each dataset in the background when its delta of updates grows large,
+and writes go on while it does. By default a dataset is compacted when its delta reaches
+10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
+its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
+after 5 minutes without a commit, and any change is compacted within a day. The build
+runs on a quarter of the cores at a lower priority, and at most one automatic compaction
+runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
+compaction waits and the status at `/$/compaction/{ds}`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
+| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
+| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
+| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
+| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
+| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
+| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
+| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
+| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
+| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
+| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
+| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
+
+A dataset can override every setting but the threads, the rate and the running limit.
+The settings are stored in `compaction.json` in its directory:
+
+```sh
+sparkles compaction --loc db                                  # the policy, the delta and the verdict
+sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
+sparkles compaction --loc db --set enabled=false              # off for this dataset
+sparkles compaction --loc db --default                        # back to the server's settings
+sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
+curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
+```
+
+A database that no server holds is never compacted on its own. `sparkles compact --loc db
+--if-due` compacts it only when its policy says so, which suits a cron job.
+
+Each compaction makes the next incremental backup upload the whole new generation, and a
+retention window keeps the old generation until its commits age out. Raise the ratio or
+the minimum interval for datasets where that costs too much.
 
 ## Formatting
 
@@ -961,13 +1037,16 @@ the API documentation of the library crates.
 
 The `sparkles` Python package embeds the same engine. It is built from
 `crates/sparkles-py` with PyO3 and maturin into an abi3 wheel, which works on CPython
-3.10 and later on Linux and macOS. The package is not on PyPI. Build and install it from
-the repository:
+3.10 and later. The release workflow builds wheels for Linux (manylinux 2.28 and
+musllinux 1.2, on x86_64 and aarch64), macOS (x86_64 and arm64) and Windows x64, and a
+source distribution. The package is not on PyPI. Build and install it from the
+repository:
 
 ```sh
 mise run py:build                                  # target/wheels/sparkles_rdf-*.whl
 pip install target/wheels/sparkles_rdf-*.whl
 pip install ./crates/sparkles-py                   # or build from source with pip (needs Rust)
+mise run py:sdist                                  # the source distribution
 nix build .#sparkles-py                            # or the flake's package for nixpkgs' Python
 ```
 
@@ -984,7 +1063,7 @@ ds = Dataset()                                     # in memory
 ds = Dataset("mydb")                               # a database directory, locked while open
 ds.load(path="data.ttl.gz")                        # format and compression from the name
 ds.load(text, "turtle", to_graph="http://ex.org/g")
-ds.load(open("data.nq.zst", "rb"), "nq")           # compressed data is recognized by its bytes
+ds.load(open("data.nq.zst", "rb"), "nq")           # read as it is parsed, in one commit
 
 rows = ds.query("""
     PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -998,6 +1077,9 @@ ds.ask("ASK { ?s ?p ?o }")                         # True or False
 for t in ds.construct("CONSTRUCT WHERE { ?s ?p ?o }"):
     print(t.subject, t.predicate, t.object)
 ds.update("INSERT DATA { <http://ex.org/a> <http://ex.org/p> 1 }").inserted   # 1
+
+ds.select(query).serialize("results.srj")          # SPARQL results: json, xml, csv or tsv
+ds.construct(query).serialize(format="turtle")     # bytes of Turtle
 ```
 
 `query` returns a `QuerySolutions` for SELECT, a `bool` for ASK and a `QueryTriples` for
@@ -1009,9 +1091,19 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
   protocol's `default-graph-uri` and `named-graph-uri`.
 * `include_inferred=True` adds the reasoner's inferences to the default graph.
 * `prefixes` declares prefixes, `base_iri` sets the base, and `timeout` is in seconds.
+* `max_rows`, `max_memory_bytes` and `max_rows_produced` are budgets. A query past one
+  raises `BudgetExceededError`.
+* `cancel` takes a `CancelToken`, and `at` reads a past state (see below).
 
-A row is `None` at an unbound variable. `row.get("name", default)` returns the default
-instead.
+`update` takes the same `timeout`, budgets and `cancel`. A row is `None` at an unbound
+variable, and `row.get("name", default)` returns the default instead.
+`QuerySolutions.serialize` must come before the rows are iterated, and it consumes them.
+
+`sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
+quads come before the input has been read to the end. A syntax error is raised by the
+iteration, after the quads that came before it. `Dataset.load` from a file object streams
+the same way into one transaction. Loads from a path or from bytes go through the
+engine's bulk loader instead.
 
 ### Terms
 
@@ -1053,6 +1145,8 @@ with ds.transaction() as tx:                       # commits at the end of the b
     tx.add(quad)
     tx.remove(other)
     tx.quads_for_pattern(alice)                    # sees the transaction's own changes
+    tx.update("DELETE WHERE { ?s <http://ex.org/old> ?o }")
+    tx.query("SELECT ?s WHERE { ?s ?p ?o }")       # also sees them
 ```
 
 `graph_name=None` matches every graph, and `DefaultGraph()` matches only the default
@@ -1063,36 +1157,124 @@ not the open transaction. A write on the dataset from the thread that holds the
 transaction raises `ConflictError` instead of waiting for itself. Writes from other
 threads wait.
 
-A blank node read from the dataset has a label like `_:b1f` that names the stored node,
-so it works in later patterns, removals and bindings. Any other label, such as
-`BlankNode("x")`, names a new node in each write. The same label within one `extend` or
-transaction names one node. pyoxigraph keeps a label's node across writes. A blank node
-that a query makes, such as with `BNODE()`, has a label like `_:q0`. It is not stored,
-so a later pattern finds nothing for it and a query binding takes it for a new node.
+An update in a transaction that fails after it began to change data may have done part
+of its work. The transaction is then aborted. Later writes raise `InvalidInputError`, and
+`commit()` rolls it back and raises. A SPARQL syntax error changes nothing, so it does
+not abort the transaction.
 
-### Output, maintenance, reasoning and validation
+A blank node read from the dataset has a label like `_:b1f` that names the stored node.
+It names that node in later patterns, removals, bindings and writes. Any other label,
+such as `BlankNode("x")`, names a new node in each write. The same label within one
+`extend` or transaction names one node. pyoxigraph keeps a label's node across writes. A
+blank node that a query makes, such as with `BNODE()`, has a label like `_:q0`. It is not
+stored, so a later pattern finds nothing for it and a query binding takes it for a new
+node.
+
+### History, snapshots and clones
 
 ```python
-data = ds.dump(format="nq")                        # bytes of every graph
-ds.dump("out.ttl.zst")                             # Turtle of the default graph, zstd
-ds.dump("g.nt", from_graph="http://ex.org/g")
-ds.compact(); ds.backup("backups/")
-
-ds.reason("owl-rl")                                # rdfs, rdfs-simple, owl-rl, or rules="…"
-ds.ask("ASK { ?x a <http://ex.org/Animal> }", include_inferred=True)
-ds.clear_inferences()
-
-report = ds.validate_shacl(shapes_turtle)          # or shapes_graph="http://ex.org/shapes"
-for r in report.results:
-    print(r.focus_node, r.path, r.message)
-result = ds.validate_shex(shexc, "{FOCUS a ex:Person}@ex:PersonShape")
-print(result.conforms, [(r.node, r.conformant) for r in result.results])
+ds.head_commit                                     # Commit(seq, kind, inserted, deleted, quads, timestamp)
+ds.commits(10)                                     # the latest ten, newest first
+ds.create_snapshot("before-cleanup", note="…")     # keeps the head readable under a name
+ds.query(q, at="snapshot:before-cleanup")          # also at=42, "commit:42" or "time:<RFC 3339>"
+ds.set_retention(keep_commits=100, keep_age=86400) # keep recent states readable
+ds.history()                                       # the readable ranges, retention and snapshots
+ds.clone_to("copy-db", at="snapshot:before-cleanup")
 ```
 
-`parse` and `serialize` work without a dataset, and `RdfFormat` names the formats. Every
-`format` argument also takes a name, extension or media type, such as `"ttl"` or
-`"application/n-quads"`. `sparkles.FEATURES` lists the cargo features of the build.
-Without `reasoning`, `shacl` or `shex`, the matching methods raise `UnsupportedError`.
+A past state is readable while a snapshot or the retention window holds it. Reading one
+that is gone raises `NotFoundError`. An in-memory dataset keeps the states its snapshots
+and window hold. `clone_to` writes a new database directory with its own dataset id and
+can leave graphs out with `exclude_graphs`.
+
+### Search indexes and write-time validation
+
+```python
+ds.enable_text({"predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]})
+ds.query("""PREFIX text: <http://jena.apache.org/text#>
+            SELECT ?s WHERE { ?s text:query 'fox' }""")
+ds.create_vector_index("emb", "http://ex.org/embedding", 384, options={"metric": "cosine"})
+ds.vector_index("emb", wait=True)                  # the status once the build is done
+
+ds.set_write_validation({"mode": "reject", "shapes": {"inline": shapes_turtle}})
+ds.add(quad_that_breaks_the_shapes)                # raises WriteRejectedError
+ds.write_validation()                              # the configuration and its status
+ds.set_write_validation(None)                      # removes it
+```
+
+The configurations and statuses are dicts in the server's JSON shape: `text.json` for
+the text index ([API](API.md#full-text-search)), the vector index configuration, and
+`validation.json` with the shapes or ShEx schema given inline
+([API](API.md#write-time-validation)). A ShEx configuration has `"language": "shex"`,
+a `schema` and a `shapeMap`. Opening a database directory installs the write-time
+validation its `validation.json` sets up, as the server does. When the configuration
+cannot be loaded, the package warns and writes stay refused. `text_status`,
+`rebuild_text`, `disable_text`, `drop_vector_index`, `rebuild_vector_index` and
+`vector_indexes` complete the administration.
+
+### Query builder
+
+`sparkles.querybuilder` has `SelectBuilder`, `AskBuilder`, `ConstructBuilder`,
+`DescribeBuilder`, `UpdateBuilder` and `WhereBuilder`, the bindings of the Rust builder.
+Each method returns a new builder, so a partly built query serves as a template.
+
+```python
+from sparkles.querybuilder import SelectBuilder, WhereBuilder
+
+by_name = (SelectBuilder()
+    .select("?age")
+    .where_("?p", "foaf:name", "?name")
+    .optional(WhereBuilder().where_("?p", "foaf:age", "?age")))
+ds.query(by_name.set_var("?name", Literal(user_input)).build())
+```
+
+A `str` argument is SPARQL term syntax, such as `"?x"`, `"<http://ex.org/a>"`,
+`"foaf:name"` or a property path in predicate position. Terms, numbers and booleans are
+values, which are always escaped, so `set_var` with a term makes a prepared query.
+Expressions are SPARQL text. `build()` checks the text with the SPARQL parser, and
+`str(builder)` returns it unchecked.
+
+### rdflib
+
+The wheel registers an rdflib store plugin, `Sparkles`, which keeps rdflib's triples in
+a Sparkles dataset:
+
+```python
+import rdflib
+
+g = rdflib.Graph("Sparkles", identifier="http://ex.org/g")
+g.open("mydb", create=True)                        # or leave it in memory
+g.parse("data.ttl")                                # one commit for the whole parse
+g.query("SELECT ?s WHERE { ?s ?p ?o }")            # runs in Sparkles' engine
+g.close()
+
+ds = rdflib.Dataset("Sparkles")                    # rdflib's default graph is Sparkles'
+store = sparkles.rdflib.SparklesStore(dataset=sparkles_dataset, autocommit=False)
+```
+
+`Graph`, `ConjunctiveGraph` and `Dataset` work on it. The store is context-aware,
+formula-aware and graph-aware. rdflib's default graph is the dataset's default graph,
+and a context named by an IRI is that named graph. A context named by a blank node, such
+as a `Graph` made without an identifier, is the named graph
+`urn:x-sparkles:rdflib:graph:<label>`, so that SPARQL can name it. N3 formulae are named
+graphs under `urn:x-sparkles:rdflib:formula:`, and their triples are left out of the
+union of the contexts. Blank nodes keep their rdflib labels for the life of the store
+object. Graphs added empty are listed until the store is closed, because Sparkles keeps
+no empty graphs. IRIs must be absolute, while rdflib also takes relative ones.
+
+SPARQL queries and updates run in Sparkles' engine, with `initNs` and `initBindings`,
+and not in rdflib's evaluator. A prepared query, an update with `initBindings`, and an
+update of a graph other than the default graph fall back to rdflib's evaluator over the
+store. With `autocommit=True`, the default, every write is committed. Writes are
+gathered and committed together before the next read or query through the store,
+`commit()` or `close()`, so a parse is one commit. Another handle on the same dataset
+sees them after that. With `autocommit=False`, writes go into a transaction that reads
+and queries through the store see, and `commit()` or `rollback()` ends it. `close()`
+without `commit_pending_transaction=True` rolls it back.
+
+On 100,000 triples, compared with rdflib's in-memory store on the same machine, a parse
+into the plugin takes about as long, iterating every triple takes about four times as
+long, and a SPARQL join with grouping runs about 40 times faster.
 
 ### Errors and threads
 
@@ -1106,16 +1288,20 @@ built-in exception Python code expects:
 | `UnsupportedError` | `NotImplementedError` | a feature the engine or the build lacks |
 | `QueryTimeoutError` | `TimeoutError` | a query past its `timeout` |
 | `StorageError`, `DatasetLockedError` | `OSError` | corruption, a full disk, a directory that another process or `Dataset` holds |
+| `NotFoundError` | `LookupError` | a missing graph or snapshot, and a past state that is no longer kept |
 | `ConflictError` | | write conflicts, and a write that would wait for its own thread's transaction |
 | `BudgetExceededError` | | a request past a budget, with `kind`, `limit` and `requested` |
+| `CancelledError` | | a request cancelled through its `CancelToken` |
 
 I/O failures raise the built-in `OSError` subclasses, such as `FileNotFoundError`. The
-other classes are `CancelledError`, `NotFoundError`, `PermissionDeniedError`,
-`ServiceError` and `WriteRejectedError`.
+other classes are `PermissionDeniedError`, `ServiceError` and `WriteRejectedError`.
 
 Queries, updates, loads, dumps, reasoning and validation release the GIL, so other
-Python threads keep running and several threads can query one dataset at once. A running
-query cannot be interrupted with Ctrl-C, so give long queries a `timeout`.
+Python threads keep running and several threads can query one dataset at once. Ctrl-C
+stops a running query or update and raises `KeyboardInterrupt`. On the main thread a
+request runs on a helper thread while the main thread waits and handles signals, which
+adds a few microseconds to each request. A `CancelToken` passed as `cancel=` stops the
+requests it was given from any thread.
 
 ## Deploying on NixOS
 

@@ -6,13 +6,16 @@
   import { auth } from '$lib/auth.svelte';
   import { fmtBytes, fmtDuration, fmtInt, fmtTime } from '$lib/format';
   import { fmtSeconds, hitRatio, requestRows, type RequestRow } from '$lib/metrics';
+  import { poll } from '$lib/poll';
   import Icon from '$components/Icon.svelte';
   import TaskList from '$components/TaskList.svelte';
 
   /** Delta or write-ahead log size past which the Readiness panel offers compaction. */
   const COMPACT_DELTA_QUADS = 1_000_000;
   const COMPACT_WAL_BYTES = 256 * 1024 * 1024;
-  const STATUS_POLL_MS = 5000;
+  const STATUS_POLL_MS = 10_000;
+  const INFO_POLL_MS = 30_000;
+  const INFO_MAX_POLL_MS = 300_000;
 
   let info = $state<api.ServerInfo | null>(null);
   let error = $state<string | null>(null);
@@ -28,13 +31,22 @@
   let busy = $state<Record<string, boolean>>({});
   let taskRefresh = $state(0);
 
-  async function load() {
+  let infoJson = '';
+
+  /** Loads the server document; true when something besides the uptime changed. */
+  async function load(): Promise<boolean> {
     try {
-      info = await api.serverInfo();
+      const next = await api.serverInfo();
+      info = next;
       fetchedAt = Date.now();
       error = null;
+      const json = JSON.stringify({ ...next, uptimeSeconds: 0 });
+      const changed = json !== infoJson;
+      infoJson = json;
+      return changed;
     } catch (e) {
       error = api.errorMessage(e);
+      return false;
     }
   }
 
@@ -64,23 +76,17 @@
   }
 
   onMount(() => {
-    load();
-    loadStatus();
+    // the uptime ticks locally, with no request
     const tick = setInterval(() => (now = Date.now()), 1000);
-    const poll = setInterval(load, 15000);
-    // readiness and metrics only while the tab is visible
-    const statusPoll = setInterval(() => {
-      if (document.visibilityState === 'visible') loadStatus();
-    }, STATUS_POLL_MS);
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') loadStatus();
-    };
-    document.addEventListener('visibilitychange', onVisible);
+    // while the page is visible: the server document (its dataset sizes change with other
+    // clients' writes) backs off while it does not change; readiness and metrics are
+    // what this page watches, so they follow at a steady pace
+    const infoPoller = poll(load, { interval: INFO_POLL_MS, maxIdle: INFO_MAX_POLL_MS });
+    const statusPoller = poll(loadStatus, { interval: STATUS_POLL_MS });
     return () => {
       clearInterval(tick);
-      clearInterval(poll);
-      clearInterval(statusPoll);
-      document.removeEventListener('visibilitychange', onVisible);
+      infoPoller.stop();
+      statusPoller.stop();
     };
   });
 

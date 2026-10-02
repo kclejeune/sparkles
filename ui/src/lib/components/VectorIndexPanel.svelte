@@ -9,6 +9,7 @@
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import { fmtBytes, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
+  import { poll } from '$lib/poll';
   import { displayIri, sparqlIri, type PrefixMap } from '$lib/rdf';
   import { load as loadStored, save as saveStored } from '$lib/storage';
   import { LatestRun } from '$lib/supersede';
@@ -95,13 +96,22 @@
   const indexes = $derived(status?.indexes ?? []);
   const building = $derived(indexes.some((i) => i.state === 'building'));
 
+  let panel = $state<HTMLElement>();
+
   onMount(() => {
-    const t = setInterval(() => {
-      now = Date.now();
-      // follow a build
-      if (building) void load();
-    }, 1500);
-    return () => clearInterval(t);
+    // relative times only: no request
+    const t = setInterval(() => (now = Date.now()), 1500);
+    // follow a build while the panel is on screen
+    const p = poll(load, {
+      interval: 1500,
+      when: () => building,
+      target: () => panel,
+      immediate: false,
+    });
+    return () => {
+      clearInterval(t);
+      p.stop();
+    };
   });
 
   const stateClass = (s: api.VectorIndexState) =>
@@ -293,7 +303,7 @@
   }
 </script>
 
-<section class="panel" aria-labelledby="vector-indexes">
+<section class="panel" aria-labelledby="vector-indexes" bind:this={panel}>
   <div class="panel-head">
     <h2 id="vector-indexes">Vector indexes</h2>
     {#if status}<span class="faint">{indexes.length}</span>{/if}

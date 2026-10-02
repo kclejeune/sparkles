@@ -10,6 +10,7 @@
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
   import { baselineBadge, checkLine, fallbackText, firstResult } from '$lib/write-validation';
+  import { poll } from '$lib/poll';
   import Icon from './Icon.svelte';
 
   let {
@@ -51,13 +52,34 @@
     void load();
   });
 
+  let panel = $state<HTMLElement>();
+
   onMount(() => {
-    // other clients write too: follow the counters while the page is open
-    const t = setInterval(() => {
-      now = Date.now();
-      if (loaded?.kind === 'on' && document.visibilityState === 'visible') void load();
-    }, 10_000);
-    return () => clearInterval(t);
+    // relative times only: no request
+    const t = setInterval(() => (now = Date.now()), 10_000);
+    // other clients write too: follow the counters while the panel is on screen, less and
+    // less often while they do not move
+    let last = '';
+    const p = poll(
+      async () => {
+        await load();
+        const counters = JSON.stringify(loaded?.kind === 'on' ? loaded.v.status : null);
+        const changed = last !== '' && counters !== last;
+        last = counters;
+        return changed;
+      },
+      {
+        interval: 10_000,
+        maxIdle: 120_000,
+        when: () => loaded?.kind === 'on',
+        target: () => panel,
+        immediate: false,
+      },
+    );
+    return () => {
+      clearInterval(t);
+      p.stop();
+    };
   });
 
   const v = $derived(loaded?.kind === 'on' ? loaded.v : null);
@@ -76,7 +98,7 @@
   );
 </script>
 
-<section class="panel">
+<section class="panel" bind:this={panel}>
   <div class="panel-head">
     <h2>Write-time validation</h2>
     <span class="spacer"></span>

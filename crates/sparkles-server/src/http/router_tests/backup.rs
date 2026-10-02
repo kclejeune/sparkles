@@ -34,12 +34,14 @@ async fn backup_routes_are_registered() {
         ("POST", "/$/backup-policies/nightly/retention"),
         ("GET", "/$/backup-policies/nightly/runs"),
     ] {
+        // a JSON body: `POST /$/backups/{ds}` without one is Fuseki's N-Quads dump
         let r = send(
             &s.app,
             Request::builder()
                 .method(method)
                 .uri(path)
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await;

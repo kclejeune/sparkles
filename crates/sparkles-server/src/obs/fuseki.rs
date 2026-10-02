@@ -126,7 +126,8 @@ impl Metrics {
         ok: bool,
         read_only: bool,
     ) {
-        if !self.enabled || !self.fuseki_names || dataset.is_none() {
+        // counted whether or not the Fuseki names are rendered: `/$/stats` reports them
+        if !self.enabled || dataset.is_none() {
             return;
         }
         let Some(i) = endpoint(route, op, read_only) else {
@@ -135,6 +136,28 @@ impl Metrics {
         let (_, ds) = self.series(dataset);
         let c = if ok { &ds.fuseki.good } else { &ds.fuseki.bad };
         c[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The requests of each Fuseki endpoint of a dataset that has had any, for Fuseki's
+    /// `/$/stats`: (endpoint name, operation, description, good, bad). Empty for a
+    /// dataset without its own series (metrics off, or past `--metrics-max-datasets`).
+    pub fn fuseki_endpoint_counts(
+        &self,
+        dataset: &str,
+    ) -> Vec<(&'static str, &'static str, &'static str, u64, u64)> {
+        let Some(m) = self.datasets.read().get(dataset).cloned() else {
+            return Vec::new();
+        };
+        ENDPOINTS
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let good = m.fuseki.good[i].load(Ordering::Relaxed);
+                let bad = m.fuseki.bad[i].load(Ordering::Relaxed);
+                (e.name, e.operation, e.description, good, bad)
+            })
+            .filter(|(.., g, b)| g + b > 0)
+            .collect()
     }
 }
 

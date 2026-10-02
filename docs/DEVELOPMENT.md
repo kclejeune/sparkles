@@ -55,6 +55,7 @@ mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
 mise run ui:e2e:mock  # UI end-to-end tests against the mock backend
 mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels, with maturin
+mise run py:sdist     # the Python source distribution into target/wheels
 mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
 mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
 mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
@@ -92,6 +93,7 @@ mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, w
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
+mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```
 
 `crates/sparkles/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache Jena
@@ -102,6 +104,18 @@ at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
 and 20/20 for SHACL. `crates/sparkles/tests/w3c-known-failures.txt` lists known failures
 and is empty.
+
+`mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
+it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
+`testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program
+uses Jena's `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`
+and `UpdateExecHTTP` with every query send mode, result format and RDF syntax Jena has,
+gzip in both directions, uploads, direct naming and SHACL. It also makes the admin calls
+Fuseki's clients make, such as creating datasets from forms and assemblers, backups,
+compaction, tasks, statistics, offline datasets and the validators. It prints a line per
+check and exits with the number of failures. Jena and a JDK come from nixpkgs unless
+`JENA_HOME` and `JAVA` name them, `SPARKLES_BIN` picks another server binary, and `PORT`
+another port. The task is not part of `mise run ci`.
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
@@ -142,6 +156,38 @@ into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as
 `mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run
 compiles the crate and the engine for the Python build, and later runs take seconds.
+
+`mise run py:sdist` writes the source distribution to `target/wheels` with
+`scripts/py-sdist.py`. `maturin sdist` copies the crate and its path dependencies but not
+the vendored spargebra that the crate's `[patch.crates-io]` names, so the script adds it
+to the archive and points the patch at it. `mise run py:wheel-test -- <wheel or sdist>
+<python>...` installs a package into a fresh virtual environment for each interpreter
+and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
+
+#### Release workflow
+
+`.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
+`py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
+and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64, and
+the source distribution. The arm64 Linux wheels build on GitHub's arm64 runners, so
+their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
+runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
+wheels are tested in an Alpine container, and the sdist job builds a wheel from the
+sdist before testing it. Every package is uploaded as an artifact.
+
+The publish job sends the artifacts to PyPI with trusted publishing, and as committed it
+never runs. It needs a `py-v<version>` tag that matches the crate's version, the
+repository variable `PYPI_PUBLISH` set to `true`, and a `pypi` environment that PyPI
+trusts for the `sparkles-rdf` project. No token is stored. To publish, register the
+workflow as a trusted publisher on PyPI, create the `pypi` environment, preferably with
+required reviewers, set the variable, and push the tag.
+
+The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
+`quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
+`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
+way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
+in Alpine. The macOS, Windows and aarch64 wheels are built only by the workflow.
+`actionlint` checks the workflow file.
 
 `mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
 port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
@@ -352,6 +398,8 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
     * on Linux, a NixOS VM test of the module behind nginx;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
       in nixpkgs' headless Chromium, inside the build sandbox on 127.0.0.1;
+    * on Linux, `jena-clients`, which runs the Jena client tests against `sparkles-cli`
+      with nixpkgs' `apache-jena` and JDK, inside the build sandbox;
   * `nixosModules.default` (see [Deploying on NixOS](USAGE.md#deploying-on-nixos)).
 
 ```sh

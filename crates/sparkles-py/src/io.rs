@@ -13,7 +13,7 @@ use sparkles::codec::Codec;
 use sparkles::io::{Source, SourceData};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 // ----------------------------------------------------------------------- formats ----
@@ -218,6 +218,173 @@ pub fn source_from_py(
     Ok(src)
 }
 
+/// Whether `input` is a file object rather than `str` or bytes.
+pub fn is_file_object(input: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(input.cast::<PyString>().is_err()
+        && input.cast::<PyBytes>().is_err()
+        && input.hasattr("read")?)
+}
+
+/// A Python file object as a `Read`: each read takes the GIL to call `read`. A text-mode
+/// file's `str` is encoded as UTF-8.
+pub struct PyFileReader {
+    obj: Py<PyAny>,
+    pending: Vec<u8>,
+    pos: usize,
+}
+
+impl PyFileReader {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        PyFileReader {
+            obj,
+            pending: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for PyFileReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.pending.len() {
+            let chunk = Python::attach(|py| -> PyResult<Vec<u8>> {
+                let data = self
+                    .obj
+                    .bind(py)
+                    .call_method1("read", (buf.len().max(1 << 16),))?;
+                if let Ok(s) = data.cast::<PyString>() {
+                    return Ok(s.to_str()?.as_bytes().to_vec());
+                }
+                if let Ok(b) = data.cast::<PyBytes>() {
+                    return Ok(b.as_bytes().to_vec());
+                }
+                if data.is_none() {
+                    return Ok(Vec::new());
+                }
+                data.extract::<Vec<u8>>()
+            })
+            .map_err(std::io::Error::other)?;
+            self.pending = chunk;
+            self.pos = 0;
+            if self.pending.is_empty() {
+                return Ok(0);
+            }
+        }
+        let n = buf.len().min(self.pending.len() - self.pos);
+        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+type StreamParser = oxrdfio::ReaderQuadParser<sparkles::nesting::Guarded<Box<dyn Read + Send>>>;
+
+/// Quads parsed as they are read: from a file, bytes or a Python file object, through
+/// its codec.
+pub struct QuadStream {
+    parser: StreamParser,
+    name: String,
+}
+
+impl QuadStream {
+    /// The prefixes the document has declared so far.
+    pub fn prefixes(&self) -> BTreeMap<String, String> {
+        self.parser
+            .prefixes()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+}
+
+impl Iterator for QuadStream {
+    type Item = sparkles::Result<Quad>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let r = self.parser.next()?;
+        Some(r.map_err(|e| match e {
+            oxrdfio::RdfParseError::Io(io) => sparkles::codec::io_error(io),
+            e => sparkles::Error::RdfParse(format!("{}: {e}", self.name)),
+        }))
+    }
+}
+
+/// A streaming parse of `input` (str, bytes or a file object) or `path`, with the
+/// arguments of `parse` and `Dataset.load`.
+#[allow(clippy::too_many_arguments)]
+pub fn quad_stream(
+    py: Python<'_>,
+    input: Option<&Bound<'_, PyAny>>,
+    format: Option<&Bound<'_, PyAny>>,
+    path: Option<PathBuf>,
+    base_iri: Option<String>,
+    graph: Option<NamedNode>,
+    compression: Option<&str>,
+    lenient: bool,
+) -> PyResult<QuadStream> {
+    let input = input.filter(|i| !i.is_none());
+    let explicit = codec_from_py(py, compression)?;
+    let (reader, format, base, graph, name): (Box<dyn Read + Send>, _, _, _, String) = match input {
+        Some(i) if path.is_none() && is_file_object(i)? => {
+            let Some(f) = format_from_py(format)? else {
+                return Err(PyValueError::new_err(
+                    "format is required when reading from input",
+                ));
+            };
+            let mut r = PyFileReader::new(i.clone().unbind());
+            let name = "<file object>".to_string();
+            let (codec, head) = py
+                .detach(|| -> sparkles::Result<_> {
+                    let (sniffed, head) = sparkles::io::sniff_codec(&mut r, None, &name)?;
+                    let codec = match explicit {
+                        Some(c) => Codec::detect(Some(c), &head, None)?.0,
+                        None => sniffed,
+                    };
+                    Ok((codec, head))
+                })
+                .py(py)?;
+            let r = codec
+                .reader_send(std::io::Cursor::new(head).chain(r), None)
+                .py(py)?;
+            (r, f, base_iri, graph, name)
+        }
+        _ => {
+            let src = source_from_py(
+                py,
+                input,
+                format,
+                path,
+                base_iri,
+                graph,
+                compression,
+                lenient,
+            )?;
+            let codec = src.codec().py(py)?;
+            let raw: Box<dyn Read + Send> = match src.data {
+                SourceData::File(p) => Box::new(std::fs::File::open(p)?),
+                SourceData::Bytes(b) => Box::new(std::io::Cursor::new(b)),
+            };
+            let r = codec.reader_send(raw, None).py(py)?;
+            (r, src.format, src.base, src.graph, src.name)
+        }
+    };
+    let mut parser = oxrdfio::RdfParser::from_format(format);
+    if let Some(b) = base {
+        parser = parser
+            .with_base_iri(b)
+            .map_err(|e| invalid(py, e.to_string()))?;
+    }
+    if let Some(g) = graph {
+        parser = parser.with_default_graph(GraphName::NamedNode(g));
+    }
+    if lenient {
+        parser = parser.lenient();
+    }
+    let guarded = sparkles::nesting::Guarded::rdf(reader, format, &name);
+    Ok(QuadStream {
+        parser: parser.for_reader(guarded),
+        name,
+    })
+}
+
 /// The bytes of a `str`, `bytes`-like or file object (read whole).
 fn input_bytes(i: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(s) = i.cast::<PyString>() {
@@ -380,18 +547,27 @@ pub fn serialize_quads(
 /// Parse RDF without a dataset: an iterator of `Quad` (triples are in the default
 /// graph).
 #[pyfunction]
-#[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, lenient = false))]
+#[pyo3(signature = (input = None, format = None, *, path = None, base_iri = None, compression = None, lenient = false))]
 pub fn parse(
     py: Python<'_>,
     input: Option<&Bound<'_, PyAny>>,
     format: Option<&Bound<'_, PyAny>>,
     path: Option<PathBuf>,
     base_iri: Option<String>,
+    compression: Option<&str>,
     lenient: bool,
 ) -> PyResult<PyQuadIterator> {
-    let src = source_from_py(py, input, format, path, base_iri, None, None, lenient)?;
-    let (quads, _) = py.detach(|| sparkles::io::parse_to_vec(&src)).py(py)?;
-    Ok(PyQuadIterator::from_vec(quads))
+    let stream = quad_stream(
+        py,
+        input,
+        format,
+        path,
+        base_iri,
+        None,
+        compression,
+        lenient,
+    )?;
+    Ok(PyQuadIterator::from_stream(Box::new(stream)))
 }
 
 /// Serialize triples or quads; returns bytes when `output` is `None`.

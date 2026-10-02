@@ -236,7 +236,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
     match r {
         "/{ds}/sparql" | "/{ds}/query" | "/{ds}/queries/{name}" => Op::Query,
         "/{ds}/update" => Op::Update,
-        "/{ds}/data" | "/{ds}/get" => Op::Gsp,
+        "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,
@@ -1411,6 +1411,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     #[cfg(feature = "backup")]
     crate::backup::metrics::render(st, &mut o);
     crate::geo::metrics(st, &mut o);
+    crate::compaction::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(

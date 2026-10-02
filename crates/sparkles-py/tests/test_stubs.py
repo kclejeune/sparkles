@@ -16,6 +16,10 @@ pytest.importorskip("mypy")
 
 def test_stubtest(tmp_path: Path) -> None:
     env = dict(os.environ, MYPY_CACHE_DIR=str(tmp_path / "mypy-cache"))
+    # runtime names the stubs leave out on purpose: the unpickling helper, and the
+    # module's generated __all__
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("sparkles._sparkles._literal\nsparkles._sparkles.__all__\n")
     # the package directory the tests import (the build in target/py or an installation)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(Path(sparkles.__file__).parent.parent), env.get("PYTHONPATH", "")]
@@ -26,8 +30,8 @@ def test_stubtest(tmp_path: Path) -> None:
             "-m",
             "mypy.stubtest",
             "sparkles",
-            # runtime names the stubs leave out on purpose: the unpickling helper
-            "--ignore-missing-stub",
+            "--allowlist",
+            str(allowlist),
         ],
         capture_output=True,
         text=True,

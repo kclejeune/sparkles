@@ -224,7 +224,15 @@ pub fn write_solutions(
     };
     let ser = QueryResultsSerializer::from_format(f);
     if r.kind == QueryKind::Ask {
-        ser.serialize_boolean_to_writer(w, r.boolean).map_err(io)?;
+        // CSV and TSV have no boolean form: Jena writes a column `_askResult`, and its
+        // clients read nothing else
+        match fmt {
+            SolutionsFormat::Csv => write!(w, "_askResult\r\n{}\r\n", r.boolean).map_err(io)?,
+            SolutionsFormat::Tsv => write!(w, "?_askResult\n{}\n", r.boolean).map_err(io)?,
+            _ => {
+                ser.serialize_boolean_to_writer(w, r.boolean).map_err(io)?;
+            }
+        }
         return Ok(());
     }
     let vars: Vec<Variable> = r
