@@ -25,7 +25,9 @@
 # Env: WARMUP (default 3), RUNS (default 20), DELTA (default 10000; 0 runs only the
 # round without pending delta quads), SPARKLES (binary, default target/release/sparkles),
 # PORT (default 3937), LANG_SEL (shacl or shex, as --lang), LABEL (a suffix for the
-# result files, to keep runs of different binaries apart).
+# result files, to keep runs of different binaries apart), TIMEOUT (the validation
+# budget per write in seconds, default 60; a full validation of 10M triples takes
+# longer than the configuration's default of 10).
 set -euo pipefail
 
 LANG_SEL=${LANG_SEL:-shacl}
@@ -45,6 +47,7 @@ WORK=${2:-/tmp/sparkles-bench-$LANG_SEL-write}
 WARMUP=${WARMUP:-3}
 RUNS=${RUNS:-20}
 DELTA=${DELTA:-10000}
+TIMEOUT=${TIMEOUT:-60}
 PORT=${PORT:-3937}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
@@ -150,9 +153,9 @@ validation_on() { # validation_on <db> <mode>
   if [ "$LANG_SEL" = shex ]; then
     local schema=$SHEX/bench.shex
     [ "$2" = reject ] && schema=$SHEX/bench-write.shex
-    "$SPARKLES" validation --loc "$1" --mode "$2" --schema "$schema" --shape-map "$SHEX_MAP"
+    "$SPARKLES" validation --loc "$1" --mode "$2" --timeout "$TIMEOUT" --schema "$schema" --shape-map "$SHEX_MAP"
   else
-    "$SPARKLES" validation --loc "$1" --mode "$2" --shapes "shapes-$2.ttl"
+    "$SPARKLES" validation --loc "$1" --mode "$2" --timeout "$TIMEOUT" --shapes "shapes-$2.ttl"
   fi
 }
 

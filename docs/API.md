@@ -2245,9 +2245,12 @@ in these cases, and `fallback` names the reason:
 | `sparql`, `recursive` | Some shapes are validated in full on every write, because they have SHACL-SPARQL constraints or refer to themselves. The other shapes stay incremental. |
 
 ShEx works the same way on the associations of the shape map. A node is affected when a
-changed triple is an arc its shape reads, or an arc a reference from it reaches. ShEx
-falls back for `baseline`, `bulk`, `budget`, and `sparql` for a map with a SPARQL
-selector. ShEx has no grandfather mode.
+changed triple is an arc its shape reads, or an arc a reference from it reaches. With a
+recursive reference such as `foaf:knows @ex:Person *`, every node that reaches the changed
+one over `foaf:knows` is affected, so on a large connected graph such writes are
+validated in full. ShEx falls back for `baseline`, `bulk`, `budget` (more than 50,000
+affected nodes), and `sparql` for a map with a SPARQL selector. ShEx has no grandfather
+mode.
 
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
 `sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …] [--grandfather]`.

@@ -1700,8 +1700,15 @@ it, and moves the counts by the difference.
   select their node in both, and `{FOCUS p o}` and `{s p FOCUS}` selectors are checked
   against the state's arcs.
 * The fallbacks are those of C10 that apply: an unknown state, `reject` on a head that
-  does not conform, bulk writes, more than 50,000 affected nodes or 100,000 visited, and
-  SPARQL selectors, which the guard refuses anyway.
+  does not conform, bulk writes, more than 50,000 affected nodes, and SPARQL selectors,
+  which the guard refuses anyway.
+* A recursive reference over a large connected graph makes every node that reaches the
+  changed one affected. With `foaf:knows @ex:Person *` in `bench:shex-write`, a new
+  `foaf:knows` arc between two people reaches more than 50,000 of 100,000 people, so that
+  write is validated in full. Propagating only typings that change would avoid this, but
+  it needs the engine's typing of both states and was not built.
+* At 1.05M triples, the benchmark's other write took 8 to 12 ms with `warn` and
+  `reject`, against 2.1 to 2.7 s before.
 * A property test checks the counts and the listed associations against full
   validations, over recursive, inverse and negated references with and without a
   `CLOSED` shape.

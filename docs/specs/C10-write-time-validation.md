@@ -1167,9 +1167,11 @@ SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standa
   (23,550 writes) passed, with every fallback reason hit. CI runs a smaller set. A16 is
   a unit test that checks one focus node and the incremental strategy.
 - **Cost.** `bench:shacl-write` gained a write that touches a person, which the shapes
-  read through a sequence path and `sh:class`. At 1.05M triples on a loaded machine,
-  `warn` and `reject` writes took 12 to 37 ms, as many as with validation off, where they
-  took 1.3 to 4.4 s before.
+  read through a sequence path and `sh:class`. It also gained `TIMEOUT`, because a full
+  validation of 10.5M triples can exceed the default budget of 10 s. On a machine busy
+  with other builds, `warn` and `reject` writes took 12 to 37 ms at 1.05M triples, about
+  as long as with validation off, against 1.3 to 4.4 s before. At 10.5M triples they took
+  9 to 20 ms, against 9.8 to 14.8 s before.
 
 **Not built.** The `sparkles_validation_focus_nodes` histogram was not added. Summaries
 carry `focusNodes` instead. The panel has no configuration form, and the query page shows

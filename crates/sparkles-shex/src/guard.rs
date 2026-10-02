@@ -185,10 +185,9 @@ pub struct ShexValidationStatus {
 
 mod incremental;
 
-/// Affected nodes past which a write is validated in full.
+/// Affected nodes past which a write is validated in full (the walk that finds them
+/// stops there).
 const MAX_FOCUS: usize = 50_000;
-/// Nodes the walk from the changed triples may visit before a write is validated in full.
-const MAX_VISIT: usize = 100_000;
 
 /// The exact counts of the result map of a commit.
 #[derive(Clone, Copy, Debug)]
@@ -414,9 +413,9 @@ impl ShexGuard {
             &c.view,
             [post.as_ref().map(|s| &s.1), pre.as_ref().map(|s| &s.1)],
             &changes,
-            MAX_VISIT,
+            MAX_FOCUS,
         )?;
-        let Some(affected) = affected.filter(|a| a.len() <= MAX_FOCUS) else {
+        let Some(affected) = affected else {
             return self.full(c, "budget");
         };
         let nodes: Vec<(Id, oxrdf::Term)> = affected
