@@ -11,6 +11,7 @@
   import Icon from '$components/Icon.svelte';
   import PoliciesTab from '$components/PoliciesTab.svelte';
   import RepositoriesTab from '$components/RepositoriesTab.svelte';
+  import { followTasks } from '$lib/tasks.svelte';
 
   type Tab = 'backups' | 'repositories' | 'policies' | 'activity';
 
@@ -94,14 +95,14 @@
 
   onMount(() => {
     void auth.ensure().then(loadRepositories);
-    api.serverInfo().then(
+    api.cachedServerInfo().then(
       (s) => (readOnly = s?.readOnly === true),
       () => {},
     );
-    const t = setInterval(() => {
-      if (document.visibilityState === 'visible') void loadRepositories();
-    }, 30_000);
-    return () => clearInterval(t);
+    // Repositories, policies and backups change through this page or through backup
+    // tasks (scheduled policy runs included), so there is no timer of their own: the
+    // page reloads when a backup task finishes, which the shared task poller reports.
+    return followTasks(reload, b.isBackupTask);
   });
 
   const reachableCount = $derived(repositories.filter(b.reachable).length);
@@ -181,7 +182,7 @@
           onstarted={() => kick++}
         />
       {:else}
-        <ActivityTab {admin} {repositories} refreshKey={kick} ontaskdone={reload} />
+        <ActivityTab {admin} {repositories} refreshKey={kick} />
       {/if}
     </div>
   {/if}

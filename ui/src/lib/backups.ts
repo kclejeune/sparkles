@@ -2,6 +2,7 @@
 // `/$/backup-policies` and task cancellation (docs/API.md, "Backup repositories").
 
 import { getTask, json, request, type Task } from './api';
+import { whenVisible } from './poll';
 
 const enc = encodeURIComponent;
 
@@ -459,7 +460,8 @@ export async function cancelTask(id: string): Promise<void> {
 }
 
 /**
- * Polls a task until it is no longer queued or running, reporting every state seen.
+ * Polls a task until it is no longer queued or running, reporting every state seen (and
+ * pausing while the page is hidden).
  * Resolves with the final task; rejects when `signal` aborts.
  */
 export async function followTask(
@@ -484,5 +486,7 @@ export async function followTask(
         { once: true },
       );
     });
+    // no polling while the page is hidden; the next state comes when it is shown again
+    await whenVisible(opts.signal);
   }
 }

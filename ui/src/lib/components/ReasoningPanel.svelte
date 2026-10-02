@@ -4,6 +4,7 @@
   import { toasts } from '$lib/app.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
   import type { PrefixMap } from '$lib/rdf';
+  import { poll } from '$lib/poll';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import Icon from './Icon.svelte';
 
@@ -67,13 +68,31 @@
     void loadStatus();
   });
 
+  let panel = $state<HTMLElement>();
+
   onMount(() => {
-    const t = setInterval(() => {
-      now = Date.now();
-      // follow a planned automatic run
-      if (status?.auto.scheduledAt || (status?.auto.enabled && status.stale)) void loadStatus();
-    }, 2000);
-    return () => clearInterval(t);
+    // the countdown to a planned run ticks locally, with no request
+    const t = setInterval(() => (now = Date.now()), 1000);
+    // follow a planned automatic run while the panel is on screen; a stale dataset with
+    // automatic runs on but none planned yet is checked less and less often
+    const p = poll(
+      async () => {
+        await loadStatus();
+        return !!status?.auto.scheduledAt;
+      },
+      {
+        interval: 2000,
+        idle: 5000,
+        maxIdle: 60_000,
+        when: () => !!(status?.auto.scheduledAt || (status?.auto.enabled && status.stale)),
+        target: () => panel,
+        immediate: false,
+      },
+    );
+    return () => {
+      clearInterval(t);
+      p.stop();
+    };
   });
 
   const r = $derived(info?.reasoning ?? null);
@@ -123,7 +142,7 @@
   }
 </script>
 
-<section class="panel">
+<section class="panel" bind:this={panel}>
   <div class="panel-head">
     <h2>Reasoning</h2>
     <span class="spacer"></span>

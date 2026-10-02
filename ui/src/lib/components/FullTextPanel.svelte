@@ -7,6 +7,7 @@
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
   import { parsePredicateList, TEXT_PREDICATES } from '$lib/textsearch';
+  import { poll } from '$lib/poll';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
 
@@ -71,13 +72,22 @@
   const status = $derived(loaded?.kind === 'enabled' ? loaded.status : null);
   const behind = $derived(!!status && status.seq !== status.storeSeq);
 
+  let panel = $state<HTMLElement>();
+
   onMount(() => {
-    const t = setInterval(() => {
-      now = Date.now();
-      // follow an index that is being rebuilt
-      if (status && (status.state !== 'ready' || behind)) void load();
-    }, 2000);
-    return () => clearInterval(t);
+    // relative times only: no request
+    const t = setInterval(() => (now = Date.now()), 2000);
+    // follow an index that is being rebuilt, while the panel is on screen
+    const p = poll(load, {
+      interval: 2000,
+      when: () => !!status && (status.state !== 'ready' || behind),
+      target: () => panel,
+      immediate: false,
+    });
+    return () => {
+      clearInterval(t);
+      p.stop();
+    };
   });
 
   const stateClass = (s: api.TextState) =>
@@ -168,7 +178,7 @@
   const searchHref = $derived(`${resolve('/explore')}?ds=${encodeURIComponent(name)}&tab=search`);
 </script>
 
-<section class="panel">
+<section class="panel" bind:this={panel}>
   <div class="panel-head">
     <h2>Full-text search</h2>
     <span class="spacer"></span>

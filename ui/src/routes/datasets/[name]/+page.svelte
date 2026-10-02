@@ -105,7 +105,7 @@
   // read-only servers disable the write actions
   let readOnly = $state(false);
   $effect(() => {
-    api.serverInfo().then(
+    api.cachedServerInfo().then(
       (s) => (readOnly = s?.readOnly === true),
       () => {},
     );

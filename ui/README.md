@@ -91,6 +91,30 @@ pnpm build     # writes build/ (index.html + /ui/_app/… assets)
 pnpm preview   # serves build/ at http://localhost:4173/ui/ with the same proxy
 ```
 
+## Background requests
+
+Every periodic refresh goes through `poll()` in `src/lib/poll.ts`, so the whole UI follows
+one policy. A poller runs only while the page is visible. When the page is hidden it stops
+requesting anything, and when the page is shown again it refreshes at once if a run fell
+due in the meantime. A panel that passes its element polls only while that element is on
+screen, so the panels far down the dataset page stay quiet until the user scrolls to them.
+
+The UI polls only data that can change without it: task progress, index builds, planned
+reasoning runs, write-validation counters, readiness and metrics, the dataset list and the
+connection status. Data that changes only through the UI, such as repositories and
+policies, is reloaded after the user's own actions and when a task finishes. Pollers run
+fast while something is in progress and back off while nothing changes. The task list
+polls every second while a task runs and slows down to once a minute when none does.
+
+Each endpoint has one poller. All task lists and the pages that wait for tasks share the
+one in `src/lib/tasks.svelte.ts`, and the pages that need only the settled parts of
+`/$/server` share one cached request. The clocks that update relative times ("2 min ago")
+run locally and make no requests.
+
+A request that gets 401 reloads the caller before it opens the sign-in page. The sign-in
+page then sees an expired session as signed out, and does not send the user straight back
+to the page that got the 401.
+
 ## Formatting in the browser
 
 In the query editor and the shapes editor, Format runs the formatter in the browser when
@@ -185,6 +209,8 @@ src/
   lib/sparql-lang.ts       CodeMirror SPARQL tokenizer, highlighting, completion, error-line decoration
   lib/explore.ts           SPARQL used by Explore; the schema browser's model
   lib/commits.ts           commit and receipt formatting, history paging
+  lib/poll.ts              the polling helper: visible pages only, on-screen panels, backoff
+  lib/tasks.svelte.ts      the one shared poller of /$/tasks, and task-finished callbacks
   lib/backups.ts           typed client for backup repositories, backups, policies, task cancel
   lib/backups-format.ts    dedup ratios, retention sentences, name templates, globs, presets
   lib/textsearch.ts        text:query building and escaping, hits, error hints
