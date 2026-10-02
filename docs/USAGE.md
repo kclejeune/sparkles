@@ -219,6 +219,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
+| `--geo-crs FILE` | | Projected CRSs to support beyond the built-in ones, as a JSON file that maps CRS IRIs to proj4 definitions. A global flag, also read from `SPARKLES_GEO_CRS`. A file that cannot be read stops the command ([API](API.md#crss-from-proj4-definitions)). |
 | `--log-format text\|json` | `text` | Log format on stderr. A global flag. `RUST_LOG` filters as usual. |
 | `--no-access-log` | | No per-request log lines. |
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
@@ -396,7 +397,8 @@ commands and servers record digests too. See [API: Commits](API.md#commits).
 given options. It then builds the index and prints its status to stderr. When the index
 is already enabled, opening the database starts the build, and the command reports the
 status after it. The command exits 2 when the binary was built without the `geo`
-feature.
+feature. Give it the same `--geo-crs` file as the server, or literals in those CRSs are
+left out of the index and the server rebuilds it when it opens the database.
 
 The other commands are:
 

@@ -851,15 +851,23 @@ stalls on the shared machine.
 
 The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021) has 206 queries
 over the 30 requirements of GeoSPARQL 1.0 and a 338-triple dataset. It was run with
-`scripts/geosparql-benchmark.sh` on 2026-10-01, using the benchmark at commit `879e0746`
-and a release build of `sparkles-server` at commit `70e4c45`. The build had its default
-features and the spatial index enabled.
+`scripts/geosparql-benchmark.sh` on 2026-10-02, using the benchmark at commit `879e0746`
+and a release build of `sparkles-server` at commit `bbcbdf3` with its default features.
+
+Each requirement ran against the configuration of its conformance class. The queries of
+R25 to R30 test the RDFS entailment and query rewrite extensions, so they ran against a
+database with `infer --profile rdfs --vocab geosparql` and `"queryRewrite": true`. The
+other requirements test the asserted data, so they ran against the same data with the
+spatial index and neither extension. Entailment and rewrite add answers to those queries,
+which the benchmark does not expect, and with every query against the extended database
+Sparkles scored 147.
 
 An answer counts as correct when it matches one of the expected result files. Solutions
 are compared as multisets, and numbers within a relative 1e-6. Geometry literals are
-compared by their coordinates, rounded to 6 decimals. The comparison ignores ring starts
-and directions, line directions, vertices on straight runs and member order. Requirement
-R17 has no query.
+compared by their coordinates, rounded to 6 decimals. GML and KML literals are first
+converted to GeoJSON by the server's `POST /$/geo/convert`. The comparison ignores ring
+starts and directions, line directions, vertices on straight runs and member order.
+Requirement R17 has no query.
 
 | Requirement | Correct | Queries |
 |---|---:|---:|
@@ -880,20 +888,34 @@ R17 has no query.
 | R15 GML literal | 1 | 1 |
 | R16 empty GML literal | 0 | 2 |
 | R18 `asGML` | 1 | 1 |
-| R19 query functions | 6 | 28 |
-| R20 `getSRID` | 1 | 2 |
-| R21 `relate` | 1 | 4 |
-| R22 Simple Features functions | 8 | 32 |
-| R23 Egenhofer functions | 8 | 32 |
-| R24 RCC8 functions | 8 | 32 |
-| R25 RDFS entailment: basic graph patterns | 0 | 3 |
-| R26 RDFS entailment: WKT geometry types | 0 | 2 |
-| R27 RDFS entailment: GML geometry types | 0 | 1 |
-| R28 query rewrite: Simple Features | 0 | 8 |
-| R29 query rewrite: Egenhofer | 0 | 8 |
-| R30 query rewrite: RCC8 | 0 | 8 |
-| **Total** | **74** | **206** |
+| R19 query functions | 22 | 28 |
+| R20 `getSRID` | 2 | 2 |
+| R21 `relate` | 4 | 4 |
+| R22 Simple Features functions | 32 | 32 |
+| R23 Egenhofer functions | 32 | 32 |
+| R24 RCC8 functions | 32 | 32 |
+| R25 RDFS entailment: basic graph patterns | 3 | 3 |
+| R26 RDFS entailment: WKT geometry types | 2 | 2 |
+| R27 RDFS entailment: GML geometry types | 1 | 1 |
+| R28 query rewrite: Simple Features | 6 | 8 |
+| R29 query rewrite: Egenhofer | 5 | 8 |
+| R30 query rewrite: RCC8 | 4 | 8 |
+| **Total** | **187** | **206** |
 
-The mean of the per-requirement scores is 57.6% over the 29 requirements with queries.
-Of the 77 queries that use only WKT literals and no RDFS entailment or query rewrite, 72
-are answered as expected.
+The mean of the per-requirement scores is 88.5% over the 29 requirements with queries.
+GeoSPARQL Fuseki 3.17 published 177 of 206. On the Phase 1 build of 2026-10-01 Sparkles
+scored 74. Most of the gain comes from GML literals, which 72 of the 96 R22 to R24
+queries use, and from running the extension requirements against a configured database.
+
+The 19 queries that fail disagree with choices Sparkles made on purpose.
+
+* R13 and R16 (4 queries) expect two empty geometries to be `sfEquals`. In Sparkles an
+  empty geometry is only disjoint, as in Jena.
+* Four R19 queries expect distances that are neither geodesic nor haversine, and two
+  expect a 10-metre buffer to be 10 degrees wide.
+* Nine R28 to R30 queries expect relations that DE-9IM and the standard's tables do not
+  give. They count a region as an RCC8 tangential proper part of itself, count a region
+  strictly inside another as `ehCoveredBy` it, leave a feature's own geometries and the points inside
+  it out of `sfIntersects`, and leave the EPSG:4326 point at latitude 31.95, longitude -88.38 out
+  of the geometries disjoint from feature B.
+

@@ -651,6 +651,21 @@ implementation landed.
     reduced by `scripts/basemap.mjs` (`ui/src/lib/basemap/README.md`).
   - The GeoSPARQL vocabulary axioms behind `--vocab geosparql` are written by hand from
     the standard. No OGC files are vendored.
+- **Phase 3** (2026-10-02): geometry types from literals, variable `spatial:` arguments,
+  the cell grid for spatial tests, GML and KML literals, and CRSs from proj4 definitions.
+  Built from the spec and the Sparkles code. Fluree was not consulted.
+  - The GML and KML readers and writers are written from the GML 3.2 Simple Features
+    profile and KML 2.2. They read XML with `quick-xml` 0.37 (MIT), which the RDF/XML
+    parser already used. The GML class hierarchy follows the substitution groups of the
+    GML 3.2 schemas, and no schema file is vendored. The tests use the examples printed in
+    the GeoSPARQL 1.1 standard (OGC 22-047r1).
+  - The cell grid takes only the idea of QLever's grid approximation of regions.
+  - **Dependencies:** `proj4rs` 0.2.0 (MIT OR Apache-2.0), with its default features off,
+    behind the `geo-proj4` feature that the server's `geo` feature turns on. Its only new
+    dependency is `thiserror` 2. `crs-definitions` 0.5.0 (CC0-1.0, derived from the EPSG
+    dataset) is linked only by the opt-in `geo-epsg` feature, because the EPSG terms of
+    use restrict redistribution. Sparkles has no `deny.toml`. The license check is
+    `scripts/third-party-licenses.py`, and both licenses are permissive.
 
 ## ShEx validation
 
