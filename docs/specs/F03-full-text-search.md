@@ -693,5 +693,38 @@ disk. With the lazy commit, a 1,000-triple insert takes 28.4 ms with text search
 24–26 ms with it off and 46.2 ms with a commit per write. A top-10 `text:query` takes about
 15 ms.
 
-**Not built.** `/{ds}/text` with snippets, `highlight:`, stemming, the Sparkles query
-grammar, online rebuilds with a journal, `text` on dataset creation, and all of Phase 3.
+**Query syntax, limits and search cost (2026-10-02).** The full-text benchmark
+(`scripts/bench-text.sh`) compared Sparkles with Fuseki and jena-text and found three
+problems, which this change fixed.
+
+- *Query syntax.* Tantivy's query parser found nothing for a single word with a trailing
+  `*`, so `al*` and `+ada +lov*` returned no rows and no error. Instead of the small grammar
+  that Phase 2 planned, Sparkles now parses Lucene's classic query syntax itself
+  (`text/lucene.rs`) and applies Lucene's rules for combining clauses. Words, phrases,
+  slops, prefixes, wildcards, fuzzy words, regular expressions, ranges, boosts and the
+  boolean operators all work. On the benchmark data, 67 query strings that cover these
+  forms matched the same literals as in Jena, and both engines refused 5 malformed ones.
+  A sloppy phrase uses Lucene's semantics,
+  which accept the words in either order, so it has its own Tantivy query. A fuzzy word
+  expands to at most 50 terms, as Lucene's `FuzzyQuery` does. Forms that would find
+  nothing or that Sparkles cannot reproduce give `400`. These are field names, a query
+  with only excluded words or with no word left after analysis, and a few Lucene regular
+  expression operators. The phrase prefix `"quick bro"*` stays a Sparkles extension, which
+  Jena reads as the phrase or any document.
+- *Limits above `maxHits`.* A search with an explicit limit above `maxHits` fetched
+  `maxHits + 1` hits, treated them as all hits and returned them without an error. Such a
+  limit now counts as no limit, so more than `maxHits` hits give `507`.
+- *Cost per hit.* Resolving each hit loaded its stored document, which cost a doc store
+  block decompression per hit. Index format 2 keeps `s`, `p`, `o` and `g` in columns
+  (fast fields) and stores nothing, so the Phase 3 item that planned fast fields for `s`
+  and `g` is done. A search reads only the columns its outputs need, decodes each distinct
+  term once in sorted order, and caches the term ids per segment for the store generation.
+  The planner drops a score or literal output that the query uses nowhere else, so a
+  `COUNT` or a subject join reads no literal. A search without a limit collects its hits
+  without a top-k heap. On 1.05M triples, counting the 4,937 hits of a common word went from
+  about 22 ms to about 5 ms per HTTP request, and joining them with a structural pattern
+  from about 30 ms to about 9 ms. The `docstoreCompression` setting is still accepted, but
+  it no longer changes the index size.
+
+**Not built.** `/{ds}/text` with snippets, `highlight:`, stemming, online rebuilds with a
+journal, `text` on dataset creation, and the rest of Phase 3.

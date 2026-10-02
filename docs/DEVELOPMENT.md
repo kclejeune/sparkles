@@ -153,7 +153,8 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 
   The query words are ones that the Lucene standard analyzer, the Tantivy tokenizer in
   Sparkles and QLever split and lowercase the same way. A prefix query is left out because
-  Sparkles finds nothing for a single word followed by `*`. The script writes
+  QLever returns a row for each matching word, so a name with two matching words counts
+  twice. Sparkles and Jena both take `al*`. The script writes
   `results/text-summary.md` in the work directory. `DATA` reuses a dataset that
   `scripts/bench.sh` generated. `PORT_BASE` moves the three servers to the ports after
   it, and its default is 3940.

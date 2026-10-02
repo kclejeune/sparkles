@@ -273,9 +273,8 @@ add text-join set \
 add conjunction set \
   "SELECT ?s ?lit WHERE { (?s ?score ?lit) text:query (foaf:name \"ada AND lovelace\" $ALL) }" \
   "SELECT ?s ?lit WHERE { $(qtext 'ada lovelace' foaf:name) }"
-# There is no prefix query. Sparkles' query syntax has a prefix only at the end of a phrase
-# of two or more words ("ada lov"*), and a single-word al* finds nothing. jena-text and
-# QLever take al*, but QLever returns a row per matching word, so "Alan Allen" counts twice.
+# There is no prefix query. All three engines take al*, but QLever returns a row per
+# matching word, so "Alan Allen" counts twice.
 
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
 qfile() { if [ "$1" = qlever ]; then echo "queries/$2.ql.rq"; else echo "queries/$2.tq.rq"; fi; }
