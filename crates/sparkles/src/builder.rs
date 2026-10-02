@@ -319,6 +319,8 @@ impl Builder {
 
         // ---- 2. vocabulary merge -------------------------------------------------
         self.interrupted()?;
+        // the merge reads every batch's vocabulary and writes its map at once
+        crate::disk::ensure_open_files(2 * batches.len() as u64 + 256)?;
         let terms = self.merge_vocab(&batches)?;
         self.report(&format!("vocabulary: {terms} terms"));
 

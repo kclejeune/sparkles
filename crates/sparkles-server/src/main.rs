@@ -1747,6 +1747,8 @@ fn open_for_write(loc: &std::path::Path, opts: StoreOptions, no_validate: bool) 
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // bulk loads merge a file per batch, and a server holds the files of every dataset
+    sparkles::disk::raise_open_file_limit();
     // progress logging for long-running commands, quiet output for query tools
     let default_filter = match cli.cmd {
         Cmd::Serve { .. } | Cmd::Load { .. } | Cmd::Compact { .. } => {
