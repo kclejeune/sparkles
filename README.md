@@ -48,6 +48,8 @@ running queries.
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
 * Durable commit ids, and point-in-time reads by commit (`?at=commit:N`), time or named
   snapshot ([API](docs/API.md#point-in-time-reads-and-snapshots)).
+* Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
+  writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
 * Parallel bulk loading with external sort.
 * N-Quads dumps, and incremental, deduplicated backups to a file system or S3

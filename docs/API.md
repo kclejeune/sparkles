@@ -814,6 +814,43 @@ Query parameters beyond the standard protocol:
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
 
+### Entity tags and conditional requests
+
+Graph Store `GET` and `HEAD` responses carry an `ETag` that names the commit the response
+was read at and its serialization:
+
+```
+ETag: W/"3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa:42:ttl"
+```
+
+The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`. The tag is weak because
+the bytes of one commit's serialization can change without a commit. A compaction
+reorders the output, and a prefix change rewrites Turtle, while the data stays the same.
+The tag covers the whole dataset, so every commit changes the tag of every graph. A read
+with `at` gets the tag of the commit it read. Responses whose format was negotiated add
+`Vary: Accept`. Query responses get no tag, because `NOW()`, `RAND()` and `SERVICE` can
+change a result without a commit.
+
+| Header | Methods | Effect |
+|---|---|---|
+| `If-None-Match` | `GET`, `HEAD` | `304 Not Modified` when a listed tag equals the response's tag, or for `*`. Tags compare by the weak comparison. |
+| `If-Match` | `GET`, `HEAD` | `412` unless the value is `*` or a listed tag names the commit the response reads. |
+| `If-Match` | `PUT`, `POST`, `DELETE` | `412` unless the target exists and a listed tag names the current head. `*` only needs the target to exist. |
+| `If-None-Match` | `PUT`, `POST`, `DELETE` | `412` when the value is `*` and the target exists, or when a listed tag names the current head. |
+
+A write's preconditions are checked while the dataset's writer lock is held, so no other
+commit can come between the check and the write. Of several writers that send the same
+tag, one succeeds and the others get `412` with `code: "precondition-failed"`. A tag
+matches in any serialization, so a Turtle `GET` can be followed by a `PUT` of N-Triples.
+The default graph and the whole dataset always exist, and a named graph exists while it
+holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
+is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
+
+RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
+matches. Sparkles compares the commit a tag names instead. Its tags identify the data
+exactly, even though they cannot promise identical bytes, and that is what a concurrency
+check needs.
+
 ## Commits
 
 The design and its rationale are in [CI Durable commit identity](specs/CI-commit-identity.md).
@@ -855,8 +892,34 @@ type Commit = {
   generation: string;                   // index generation it was made in
   bulk: boolean;                        // made by rebuilding the index
   exact: boolean;                       // false: a bulk commit that also deleted
+  message?: string;                     // the writer's commit message
+  digest?: string;                      // change digest (hex SHA-256), when enabled
 };
 ```
+
+**Commit messages.** A write can carry a message in the `Sparkles-Commit-Message` request
+header. Updates, Graph Store `PUT`, `POST` and `DELETE`, and uploads accept it. The message
+is stored with the commit and appears as `message` in receipts, in `/$/commits` and in
+`sparkles log`. It must be UTF-8 text of at most 1024 bytes with no control characters,
+and surrounding whitespace is trimmed. A header that is empty after trimming sets no
+message. Clients that can only send ASCII headers, such as browsers, can send an RFC 8187
+extended value like `UTF-8''r%C3%A9%C3%A9crit`. A message that breaks these rules gets
+`400`, and nothing is written. A write with no net effect creates no commit and drops its
+message.
+
+The message is written and synced before the commit becomes durable, so every
+acknowledged commit keeps its message. Messages and digests live in `annotations.bin` in
+the database directory. Backups include the file, and clones start without it.
+
+**Change digests.** A dataset can record a SHA-256 digest of each commit's net changes,
+returned as `digest`. It is off by default. `--commit-digests` on any command that opens
+a database turns it on, and the database keeps the setting. The digest covers the dataset
+id, the seq, the parent's digest, the timestamp, the kind, and the deleted and inserted
+quads as sorted canonical N-Quads lines. Blank nodes appear with the store's internal
+labels, so equal digests from different databases mean nothing. Commits made by
+rebuilding the index, such as large loads, get no digest. The commit after one without a
+digest chains from 32 zero bytes. The exact input is defined in
+[CI Outcome](specs/CI-commit-identity.md#outcome).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -2813,6 +2876,8 @@ statuses are:
 * `405` for an update sent with GET
 * `408` for a timeout
 * `409` for a conflict
+* `412` for a failed `If-Match` or `If-None-Match`, with `{code: "precondition-failed"}`
+  (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests))
 * `413` for a body over its ceiling, or a compressed body over `--max-decompressed-mb`
 * `415` for an unsupported content type or `Content-Encoding`
 * `429` for a request over a rate limit

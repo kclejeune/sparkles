@@ -37,6 +37,9 @@ pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
             header::CONTENT_TYPE,
             header::ACCEPT,
             crate::obs::X_REQUEST_ID.clone(),
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::HeaderName::from_static("sparkles-commit-message"),
         ])
         .allow_methods([
             Method::GET,

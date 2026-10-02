@@ -175,6 +175,22 @@ sparkles geo-index  --loc db                  # spatial index: --predicate, --fe
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
 ```
 
+`sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
+commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the
+message travels in the `Sparkles-Commit-Message` header, and each file that `load` sends
+becomes its own commit with the same message. A message is at most 1024 bytes of UTF-8
+with no control characters.
+
+```sh
+sparkles update --loc db --message 'Fix the labels of ex:alice' 'DELETE … INSERT …'
+sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly import' data.ttl
+sparkles log    --loc db                      # the message follows each commit's columns
+```
+
+The global flag `--commit-digests` makes a command record a change digest with every
+commit of the databases it opens. A database keeps the setting once it is on, so later
+commands and servers record digests too. See [API: Commits](API.md#commits).
+
 `sparkles geo-index` enables the spatial index if it is off, with the defaults or the
 given options. It then builds the index and prints its status to stderr. When the index
 is already enabled, opening the database starts the build, and the command reports the

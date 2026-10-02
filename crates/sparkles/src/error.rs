@@ -57,6 +57,10 @@ pub enum Error {
     /// than the store keeps, or grow an in-memory store past its size limit.
     #[error("{0}")]
     StorageFull(String),
+    /// A write's precondition ([`WriteOptions::precondition`](crate::guard::WriteOptions))
+    /// did not hold; nothing was written.
+    #[error("{0}")]
+    PreconditionFailed(String),
 }
 
 /// Which budget a request exceeded.

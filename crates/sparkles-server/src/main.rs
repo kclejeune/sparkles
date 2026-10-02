@@ -80,6 +80,10 @@ struct Cli {
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
+    /// Record a change digest with every commit of the databases this command opens
+    /// (a database keeps the setting once it is on)
+    #[arg(long, global = true)]
+    commit_digests: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -677,6 +681,9 @@ enum Cmd {
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
         lenient: bool,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -737,6 +744,9 @@ enum Cmd {
         #[arg(long)]
         update: Option<PathBuf>,
         text: Option<String>,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -968,6 +978,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
         max_prefixes: cli.max_prefixes,
+        commit_digests: cli.commit_digests,
         ..Default::default()
     }
 }
@@ -1086,6 +1097,7 @@ fn print_log(
     };
     let head = all.last().map_or(0, |c| c.seq);
     let first = all.first().map_or(0, |c| c.seq);
+    let notes = sparkles::annotations::read(loc)?;
     let pick: Vec<_> = if let Some(at) = at {
         let seq = match at {
             "head" => head,
@@ -1117,20 +1129,31 @@ fn print_log(
             "head": head,
             "firstRetained": first,
             "complete": true,
-            "commits": pick,
+            "commits": pick
+                .iter()
+                .map(|c| sparkles::commit::AnnotatedCommit {
+                    commit: c,
+                    annotation: notes.get(&c.seq),
+                })
+                .collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
     println!("dataset {id}  head {head}");
     println!(
-        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation",
+        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation  message",
         "seq", "timestamp", "kind", "+inserted", "-deleted", "quads"
     );
     for c in pick {
         let approx = if c.exact { "" } else { "~" };
-        println!(
-            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {}",
+        let message = notes
+            .get(&c.seq)
+            .and_then(|a| a.message.as_deref())
+            .map(|m| format!("  {m}"))
+            .unwrap_or_default();
+        let line = format!(
+            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
             c.timestamp(),
             c.kind.name(),
@@ -1139,6 +1162,7 @@ fn print_log(
             c.quads,
             c.generation_name()
         );
+        println!("{}", line.trim_end());
     }
     Ok(())
 }
@@ -1646,10 +1670,16 @@ fn run() -> Result<()> {
             files,
             compression,
             lenient,
+            message,
             server,
             dataset,
             insecure_http,
         } => {
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
@@ -1662,6 +1692,7 @@ fn run() -> Result<()> {
                     ds,
                     graph.as_deref(),
                     &files,
+                    message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -1688,7 +1719,11 @@ fn run() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
-            let r = store.load_as(&sources, sparkles::commit::CommitKind::Load)?;
+            let wopts = sparkles::guard::WriteOptions {
+                message,
+                ..Default::default()
+            };
+            let r = store.load_with(&sources, sparkles::commit::CommitKind::Load, &wopts)?;
             let after = store.snapshot().len();
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
@@ -1801,6 +1836,7 @@ fn run() -> Result<()> {
             loc,
             update,
             text,
+            message,
             server,
             dataset,
             insecure_http,
@@ -1811,10 +1847,21 @@ fn run() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no update given"),
             };
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 #[cfg(feature = "auth")]
-                return remote::client::update(server.as_deref(), insecure_http, ds, &u);
+                return remote::client::update(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    &u,
+                    message.as_deref(),
+                );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             };
@@ -1824,6 +1871,10 @@ fn run() -> Result<()> {
                 prefixes: store.prefixes().into_iter().collect(),
                 allow_service: true,
                 outbound,
+                write: sparkles::guard::WriteOptions {
+                    message,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;

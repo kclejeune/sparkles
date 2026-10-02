@@ -19,6 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// A dataset id (a version 4 UUID), named here for crates that do not depend on `uuid`.
+pub type DatasetId = uuid::Uuid;
+
 /// What produced a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommitKind {
@@ -171,6 +174,16 @@ impl Serialize for CommitInfo {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut m = s.serialize_map(None)?;
+        self.serialize_fields(&mut m)?;
+        m.end()
+    }
+}
+
+impl CommitInfo {
+    fn serialize_fields<M: serde::ser::SerializeMap>(
+        &self,
+        m: &mut M,
+    ) -> std::result::Result<(), M::Error> {
         m.serialize_entry("seq", &self.seq)?;
         m.serialize_entry("parent", &self.parent())?;
         m.serialize_entry("ref", &self.reference())?;
@@ -185,24 +198,66 @@ impl Serialize for CommitInfo {
         if self.reconstructed {
             m.serialize_entry("reconstructed", &true)?;
         }
+        Ok(())
+    }
+}
+
+/// A commit with its annotation, serialized as the commit's members plus `message` and
+/// `digest` (hex) when it has them.
+#[derive(Clone, Copy, Debug)]
+pub struct AnnotatedCommit<'a> {
+    pub commit: &'a CommitInfo,
+    pub annotation: Option<&'a crate::annotations::Annotation>,
+}
+
+impl Serialize for AnnotatedCommit<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        self.commit.serialize_fields(&mut m)?;
+        if let Some(a) = self.annotation {
+            if let Some(msg) = &a.message {
+                m.serialize_entry("message", msg.as_ref())?;
+            }
+            if let Some(d) = a.digest_hex() {
+                m.serialize_entry("digest", &d)?;
+            }
+        }
         m.end()
     }
 }
 
 /// The outcome of a write: the new commit, or the unchanged head when the write had no
 /// net effect.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Receipt {
     pub dataset_id: uuid::Uuid,
     pub committed: bool,
     pub commit: CommitInfo,
     /// what a write guard found (write-time validation), when one ran
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::guard::serialize_summary"
-    )]
     pub validation: Option<std::sync::Arc<crate::guard::ValidationSummary>>,
+    /// the commit's message and change digest (serialized inside `commit`)
+    pub annotation: crate::annotations::Annotation,
+}
+
+impl Serialize for Receipt {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("datasetId", &self.dataset_id)?;
+        m.serialize_entry("committed", &self.committed)?;
+        m.serialize_entry(
+            "commit",
+            &AnnotatedCommit {
+                commit: &self.commit,
+                annotation: Some(&self.annotation),
+            },
+        )?;
+        if let Some(v) = &self.validation {
+            m.serialize_entry("validation", v.as_ref())?;
+        }
+        m.end()
+    }
 }
 
 /// A page of the commit catalog.
@@ -435,6 +490,7 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
         Err(e) => return Err(e.into()),
     }
     crate::history::reidentify_file(root, old_id, new_id)?;
+    crate::annotations::reidentify(root, old_id, new_id)?;
     // dataset.json last: its id is what the other files are checked against
     ds.id = new_id;
     ds.origin = "restore".to_string();

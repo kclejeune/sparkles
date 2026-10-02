@@ -347,7 +347,12 @@ pub(super) fn commit_list_extras(
     let list = commits
         .iter()
         .map(|c| {
-            let mut j = serde_json::to_value(c).unwrap_or(J::Null);
+            let note = ds.store.annotation(c.seq);
+            let commit = sparkles::commit::AnnotatedCommit {
+                commit: c,
+                annotation: note.as_ref(),
+            };
+            let mut j = serde_json::to_value(commit).unwrap_or(J::Null);
             j["reconstructable"] = json!(inside(c.seq));
             let names: Vec<&str> = pins
                 .iter()
