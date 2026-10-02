@@ -2,6 +2,7 @@
 
 pub mod aggext;
 pub mod cache;
+pub mod catalog;
 pub mod charsets;
 pub mod ctx;
 pub mod depth;
@@ -9,6 +10,7 @@ pub mod exec;
 mod exists;
 pub mod expr;
 mod exprcache;
+mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;

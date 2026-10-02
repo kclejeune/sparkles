@@ -1,6 +1,7 @@
 //! Compiled SPARQL expressions and the function library (ARQ `expr` + `function`).
 
 use super::ctx::{Ctx, TermKind};
+use super::fnlib;
 use super::table::{Table, VarId};
 use super::value::{EvalResult, Num, NumOp, TypeError, Value, arith, compare, equals};
 use crate::id::Id;
@@ -13,6 +14,7 @@ use spargebra::algebra::{Expression, Function, GraphPattern};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt::Write as _;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Pattern of an `EXISTS` / `NOT EXISTS`, evaluated by substitution (with memoization).
@@ -828,7 +830,7 @@ fn round_half_up_double(d: f64) -> f64 {
 fn call(f: &Func, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
     match f {
         Func::Builtin(f) => builtin(f, args, row, ctx),
-        Func::Cast(dt) => cast(dt, arg(args, 0, row, ctx)?.into_owned()),
+        Func::Cast(dt) => cast(dt, arg(args, 0, row, ctx)?.into_owned(), ctx),
         Func::Ext(iri) => extension(iri, args, row, ctx),
     }
 }
@@ -1269,12 +1271,65 @@ pub fn is_cast(iri: &str) -> bool {
                 | "long"
                 | "short"
                 | "byte"
+                | "nonPositiveInteger"
+                | "negativeInteger"
+                | "nonNegativeInteger"
+                | "positiveInteger"
+                | "unsignedLong"
+                | "unsignedInt"
+                | "unsignedShort"
+                | "unsignedByte"
+                | "anyURI"
+                | "gYear"
+                | "gYearMonth"
+                | "gMonth"
+                | "gMonthDay"
+                | "gDay"
         )
     })
 }
 
+/// The range of an integer type derived from `xsd:integer` (XSD 1.1 §3.4.13–3.4.25),
+/// as inclusive `i128` bounds.
+fn integer_range(local: &str) -> Option<(i128, i128)> {
+    Some(match local {
+        "long" => (i64::MIN.into(), i64::MAX.into()),
+        "int" => (i32::MIN.into(), i32::MAX.into()),
+        "short" => (i16::MIN.into(), i16::MAX.into()),
+        "byte" => (i8::MIN.into(), i8::MAX.into()),
+        "nonPositiveInteger" => (i128::MIN, 0),
+        "negativeInteger" => (i128::MIN, -1),
+        "nonNegativeInteger" => (0, i128::MAX),
+        "positiveInteger" => (1, i128::MAX),
+        "unsignedLong" => (0, u64::MAX.into()),
+        "unsignedInt" => (0, u32::MAX.into()),
+        "unsignedShort" => (0, u16::MAX.into()),
+        "unsignedByte" => (0, u8::MAX.into()),
+        _ => return None,
+    })
+}
+
+/// A cast to `xsd:gYear`, `gYearMonth`, `gMonth`, `gMonthDay` or `gDay` (`T`): from a
+/// dateTime or a date, from the type itself, or from a string. The value is kept as a
+/// literal of the type.
+fn gregorian_cast<T>(v: &Value, lex: &str, from_str: bool, dt: &NamedNode) -> EvalResult<Val>
+where
+    T: FromStr + std::fmt::Display + TryFrom<DateTime> + TryFrom<Date>,
+{
+    let t: T = match v {
+        Value::DateTime(d) => T::try_from(*d).map_err(|_| TypeError)?,
+        Value::Date(d) => T::try_from(*d).map_err(|_| TypeError)?,
+        _ if from_str => T::from_str(lex.trim()).map_err(|_| TypeError)?,
+        _ => return Err(TypeError),
+    };
+    Ok(Val::V(Value::Other {
+        lex: t.to_string().into(),
+        dt: dt.as_str().into(),
+    }))
+}
+
 /// XSD casts (SPARQL 17.5).
-pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
+pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     let local = dt.as_str().strip_prefix(XSD).ok_or(TypeError)?;
     if let Value::BNode(_) = v {
         return Err(TypeError);
@@ -1306,7 +1361,9 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
             _ if from_str => return parsed(xsd::BOOLEAN),
             _ => return Err(TypeError),
         },
-        "integer" | "int" | "long" | "short" | "byte" => {
+        "integer" | "int" | "long" | "short" | "byte" | "nonPositiveInteger"
+        | "negativeInteger" | "nonNegativeInteger" | "positiveInteger" | "unsignedLong"
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
             let r = match (&v, num) {
                 (Value::Bool(x), _) => Value::Integer((*x as i64).into()),
                 (_, Some(Num::Integer(i))) => Value::Integer(i),
@@ -1325,15 +1382,37 @@ pub fn cast(dt: &NamedNode, v: Value) -> EvalResult<Val> {
                 },
                 _ => return Err(TypeError),
             };
-            if local == "integer" {
-                Val::V(r)
-            } else {
-                Val::V(Value::from_literal(&Literal::new_typed_literal(
-                    r.lexical()?.to_string(),
-                    dt.clone(),
-                )))
+            match integer_range(local) {
+                None => Val::V(r),
+                Some((lo, hi)) => {
+                    // the derived type's range, and the literal keeps its datatype
+                    let Value::Integer(i) = r else {
+                        return Err(TypeError);
+                    };
+                    if !(lo..=hi).contains(&i128::from(i64::from(i))) {
+                        return Err(TypeError);
+                    }
+                    let lit = Literal::new_typed_literal(i.to_string(), dt.clone());
+                    Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
+                }
             }
         }
+        "anyURI" => match &v {
+            Value::Str(x) => Val::V(Value::Other {
+                lex: x.trim().into(),
+                dt: dt.as_str().into(),
+            }),
+            Value::Other { lex, dt: d } if &**d == dt.as_str() => Val::V(Value::Other {
+                lex: lex.clone(),
+                dt: d.clone(),
+            }),
+            _ => return Err(TypeError),
+        },
+        "gYear" => return gregorian_cast::<GYear>(&v, &lex, from_str, dt),
+        "gYearMonth" => return gregorian_cast::<GYearMonth>(&v, &lex, from_str, dt),
+        "gMonth" => return gregorian_cast::<GMonth>(&v, &lex, from_str, dt),
+        "gMonthDay" => return gregorian_cast::<GMonthDay>(&v, &lex, from_str, dt),
+        "gDay" => return gregorian_cast::<GDay>(&v, &lex, from_str, dt),
         "decimal" => match (&v, num) {
             (Value::Bool(x), _) => Val::V(Value::Decimal((*x as i64).into())),
             (_, Some(Num::Integer(i))) => Val::V(Value::Decimal(i.into())),
@@ -1447,8 +1526,69 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
         };
     }
     let fb = |f: Function| builtin(&f, args, row, ctx);
+    // an xsd:integer argument (a precision, an index)
+    let int = |i: usize| -> EvalResult<i64> {
+        match Num::of(&*a(i)?)? {
+            Num::Integer(n) => Ok(i64::from(n)),
+            _ => Err(TypeError),
+        }
+    };
+    // the timezone argument of the adjust functions: absent, a dayTimeDuration, or ""
+    let tz = |i: usize| -> EvalResult<fnlib::TzArg> {
+        if args.len() <= i {
+            return Ok(fnlib::TzArg::Implicit);
+        }
+        Ok(match &*a(i)? {
+            Value::DayTime(d) => fnlib::TzArg::Offset(*d),
+            Value::Duration(d) => {
+                fnlib::TzArg::Offset(DayTimeDuration::try_from(*d).map_err(|_| TypeError)?)
+            }
+            Value::Str(x) if x.is_empty() => fnlib::TzArg::Remove,
+            _ => return Err(TypeError),
+        })
+    };
+    let v = |x: Value| Ok(Val::V(x));
     if let Some(l) = iri.strip_prefix(FN) {
+        if let Some(part) = l.strip_suffix("-from-duration") {
+            return v(fnlib::duration_part(&*a(0)?, part)?);
+        }
+        if let Some(kind) = l
+            .strip_prefix("adjust-")
+            .and_then(|k| k.strip_suffix("-to-timezone"))
+        {
+            return v(fnlib::adjust(&*a(0)?, tz(1)?, Some(kind))?);
+        }
         return match l {
+            "round" if args.len() == 2 => v(fnlib::round(Num::of(&*a(0)?)?, int(1)?, false)?),
+            "round-half-to-even" => {
+                let p = if args.len() > 1 { int(1)? } else { 0 };
+                v(fnlib::round(Num::of(&*a(0)?)?, p, true)?)
+            }
+            "numeric-mod" => v(fnlib::numeric_mod(Num::of(&*a(0)?)?, Num::of(&*a(1)?)?)?),
+            "numeric-integer-divide" => v(fnlib::numeric_integer_divide(
+                Num::of(&*a(0)?)?,
+                Num::of(&*a(1)?)?,
+            )?),
+            "dateTime" => v(fnlib::date_time(&*a(0)?, &*a(1)?)?),
+            "timezone-from-date" | "timezone-from-time" => fb(Function::Timezone),
+            // ARQ's names for the date and dateTime accessors
+            "years-from-date" | "years-from-dateTime" => fb(Function::Year),
+            "months-from-date" | "months-from-dateTime" => fb(Function::Month),
+            "days-from-date" | "days-from-dateTime" => fb(Function::Day),
+            "implicit-timezone" => v(Value::DayTime(DayTimeDuration::default())),
+            "normalize-unicode" => {
+                let x = a(0)?;
+                let form = if args.len() > 1 {
+                    Some(a(1)?.string_arg()?.0.to_string())
+                } else {
+                    None
+                };
+                Ok(s(fnlib::normalize_unicode(
+                    x.string_arg()?.0,
+                    form.as_deref(),
+                )?))
+            }
+            "error" => Err(TypeError),
             "string-length" => fb(Function::StrLen),
             "substring" => fb(Function::SubStr),
             "upper-case" => fb(Function::UCase),
@@ -1525,6 +1665,51 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
     }
     if let Some(l) = iri.strip_prefix(AFN) {
         return match l {
+            "strlen" => fb(Function::StrLen),
+            "substr" | "substring" => {
+                let x = a(0)?;
+                let end = if args.len() > 2 { Some(int(2)?) } else { None };
+                Ok(s(fnlib::java_substring(x.string_arg()?.0, int(1)?, end)?))
+            }
+            "sha1sum" => {
+                use sha1::Digest;
+                Ok(s(hex(&sha1::Sha1::digest(a(0)?.lexical()?.as_bytes()))))
+            }
+            "uuid" => fb(Function::Uuid),
+            "struuid" => fb(Function::StrUuid),
+            "evenInteger" => match Num::of(&*a(0)?)? {
+                Num::Integer(n) => Ok(b(i64::from(n) % 2 == 0)),
+                _ => Err(TypeError),
+            },
+            "langeq" => {
+                let x = a(0)?;
+                let tag = match &*x {
+                    Value::Lang(_, t) | Value::LangDir(_, t, _) => t.to_string(),
+                    v if v.is_literal() => String::new(),
+                    _ => return Err(TypeError),
+                };
+                let range = a(1)?;
+                Ok(b(lang_matches(&tag, range.as_str().ok_or(TypeError)?)))
+            }
+            "date" => {
+                let x = a(0)?;
+                let lex = x.as_str().ok_or(TypeError)?;
+                let b = lex.as_bytes();
+                let shape = b.len() == 10
+                    && b[4] == b'-'
+                    && b[7] == b'-'
+                    && b.iter()
+                        .enumerate()
+                        .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+                if !shape {
+                    return Err(TypeError);
+                }
+                DateTime::from_str(&format!("{lex}T00:00:00Z"))
+                    .map(|d| Val::V(Value::DateTime(d)))
+                    .map_err(|_| TypeError)
+            }
+            "timezone" => v(Value::DayTime(DayTimeDuration::default())),
+            "adjust-to-timezone" => v(fnlib::adjust(&*a(0)?, tz(1)?, None)?),
             "localname" | "namespace" => {
                 let Value::Iri(i) = a(0)?.into_owned() else {
                     return Err(TypeError);
@@ -1569,7 +1754,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
         };
     }
     if let Some(Ok(v)) = is_cast(iri).then(|| a(0)) {
-        return cast(&NamedNode::new_unchecked(iri), v.into_owned());
+        return cast(&NamedNode::new_unchecked(iri), v.into_owned(), ctx);
     }
     Err(TypeError)
 }

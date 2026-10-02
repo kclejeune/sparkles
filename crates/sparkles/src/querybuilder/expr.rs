@@ -522,6 +522,30 @@ pub fn max(e: impl IntoExpr) -> Expr {
 pub fn sample(e: impl IntoExpr) -> Expr {
     agg("SAMPLE", e)
 }
+/// Jena ARQ's `MEDIAN(e)`
+pub fn median(e: impl IntoExpr) -> Expr {
+    agg("MEDIAN", e)
+}
+/// Jena ARQ's `MODE(e)`
+pub fn mode(e: impl IntoExpr) -> Expr {
+    agg("MODE", e)
+}
+/// Jena ARQ's `STDEV(e)`, the sample standard deviation
+pub fn stdev(e: impl IntoExpr) -> Expr {
+    agg("STDEV", e)
+}
+/// Jena ARQ's `STDEV_POP(e)`, the population standard deviation
+pub fn stdev_pop(e: impl IntoExpr) -> Expr {
+    agg("STDEV_POP", e)
+}
+/// Jena ARQ's `VARIANCE(e)`, the sample variance
+pub fn variance(e: impl IntoExpr) -> Expr {
+    agg("VARIANCE", e)
+}
+/// Jena ARQ's `VAR_POP(e)`, the population variance
+pub fn var_pop(e: impl IntoExpr) -> Expr {
+    agg("VAR_POP", e)
+}
 /// `GROUP_CONCAT(e)`; `separator` adds `; SEPARATOR = "…"` (escaped).
 pub fn group_concat(e: impl IntoExpr, separator: Option<&str>) -> Expr {
     Expr(E::Aggregate {

@@ -19,6 +19,11 @@ use std::mem::take;
 use std::str::Chars;
 use std::str::FromStr;
 
+/// The IRI of the ARQ aggregate `local` (`median`, `stdev`, …).
+fn arq_aggregate(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{ARQ_AGGREGATE_NAMESPACE}{local}"))
+}
+
 /// A SPARQL parser
 ///
 /// ```
@@ -2447,6 +2452,10 @@ parser! {
             i("GROUP_CONCAT") _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: true } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ";" _ i("SEPARATOR") _ "=" _ s:String() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: Some(s) }, expr, distinct: false } } /
             i("GROUP_CONCAT") _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::GroupConcat { separator: None }, expr, distinct: false } } /
+            name:ArqAggregateKeyword() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            name:ArqAggregateKeyword() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
+            i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true } } /
+            i("AGG") &[' ' | '\t' | '\n' | '\r' | '#' | '<'] _ name:iri() _ "(" _ expr:Expression() _ ")" { AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: false } } /
             name:iri() _ "(" _ i("DISTINCT") _ expr:Expression() _ ")" {?
                 if state.custom_aggregate_functions.contains(&name) {
                     Ok(AggregateExpression::FunctionCall { name: AggregateFunction::Custom(name), expr, distinct: true })
@@ -2461,6 +2470,17 @@ parser! {
                     Err("This custom function is a regular function and not an aggregate function")
                 }
             }
+
+        // ARQ's aggregate keywords (ARQ_AGGREGATE_KEYWORDS), as the IRIs they stand for
+        rule ArqAggregateKeyword() -> NamedNode =
+            i("MEDIAN") { arq_aggregate("median") } /
+            i("MODE") { arq_aggregate("mode") } /
+            i("STDEV_SAMP") { arq_aggregate("stdev_samp") } /
+            i("STDEV_POP") { arq_aggregate("stdev_pop") } /
+            i("STDEV") { arq_aggregate("stdev") } /
+            i("VARIANCE") { arq_aggregate("variance") } /
+            i("VAR_SAMP") { arq_aggregate("var_samp") } /
+            i("VAR_POP") { arq_aggregate("var_pop") }
 
         rule iriOrFunction() -> Expression =
             i: iri() _ a: ArgList() {?

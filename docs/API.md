@@ -808,6 +808,7 @@ must not exist or must be empty. `SRC` must be a database that no server has ope
 | Method     | Path                  | Description |
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol, with a `query=` parameter, an `application/sparql-query` body, or a form. Supports `default-graph-uri` / `named-graph-uri`. |
+| GET/HEAD   | `/{ds}/sparql`, `/{ds}/query` | Without a query, the dataset's SPARQL 1.1 Service Description in RDF. See [Service description](#service-description). |
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. A GET with neither returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
@@ -845,6 +846,135 @@ Query parameters beyond the standard protocol:
   --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
+
+### Service description
+
+A `GET` or `HEAD` of `/{ds}/sparql` or `/{ds}/query` without `query` or `update` returns
+the dataset's [SPARQL 1.1 Service Description](https://www.w3.org/TR/sparql11-service-description/)
+when it asks for RDF. Turtle is the default, for a request without `Accept` or with
+`*/*`. `Accept` or `format=` selects N-Triples, JSON-LD, RDF/XML, TriG or N-Quads. A
+request that accepts only result formats, such as `application/sparql-results+json`,
+still gets `400 missing 'query' parameter`. Fuseki answers these requests with `404`.
+`/{ds}` itself stays a Graph Store read of the whole dataset.
+
+The description has two `sd:Service` resources. The query service is the requested URL
+and lists `sd:SPARQL10Query`, `sd:SPARQL11Query` and `sd:SPARQLQuery` (SPARQL 1.2), the
+result formats and the RDF formats of CONSTRUCT and DESCRIBE. The update service is
+`/{ds}/update`, with `sd:SPARQL11Update`, `sd:SPARQLUpdate` and the input formats of
+`LOAD`. A read-only server (`serve --read-only`) describes no update service. The base URL
+is the auth configuration's `server.public_url`, or else the request's `Host` and
+`X-Forwarded-Proto`.
+
+Both services list the following.
+
+* `sd:feature sd:UnionDefaultGraph` when the store's default graph is the union of its
+  graphs (`--union-default-graph`), and `sd:BasicFederatedQuery` when SERVICE is enabled
+  and the caller has the `federate` permission. Sparkles does not advertise
+  `sd:EmptyGraphs`, because `CREATE GRAPH` keeps no empty graph, as in TDB2. It does not
+  advertise `sd:DereferencesURIs` either, because `FROM` and `USING` name graphs of the
+  dataset and are never fetched.
+* Every extension function (`sd:extensionFunction`), aggregate (`sd:extensionAggregate`)
+  and property function (`sd:propertyFeature`) of the build, listed in
+  [Extension functions and aggregates](#extension-functions-and-aggregates). The
+  SPARQL built-ins and the XSD casts are part of the language and not listed.
+* `sd:defaultEntailmentRegime`. It is `ent:Simple` without materialized inferences.
+  With them it is `ent:RDFS` for the `rdfs` profile, and `ent:OWL-RDF-Based` with
+  `sd:defaultSupportedEntailmentProfile` OWL 2 RL for `owl-rl`. An `rdfs:comment` says that
+  the inferences are materialized into `urn:x-sparkles:inferred` and not recomputed while
+  a query runs.
+* `sd:defaultDataset`, an `sd:Dataset` with its default graph and up to 1000 named
+  graphs. Its `rdfs:seeAlso` links the dataset's VoID description,
+  `/$/schema/{ds}?format=turtle` (see [Schema discovery](#schema-discovery)).
+
+Only a caller that may query the dataset gets a description, as for a query. Named graphs
+the caller may not read are left out. The `void:triples` counts of the graphs are given
+only to callers that see every graph. The default graph has no count when it is the union
+of all graphs or includes materialized inferences.
+
+```sh
+curl -H 'Accept: text/turtle' http://localhost:3030/ds/sparql
+```
+
+### Extension functions and aggregates
+
+Besides the SPARQL 1.1 and 1.2 built-ins, Sparkles implements these functions. The
+prefixes are `fn:` for `http://www.w3.org/2005/xpath-functions#`, `math:` for
+`http://www.w3.org/2005/xpath-functions/math#`, `afn:` for Jena ARQ's
+`http://jena.apache.org/ARQ/function#` and `spk:` for `urn:x-sparkles:`.
+
+* `fn:` string functions are `string-length`, `substring`, `upper-case`, `lower-case`,
+  `contains`, `starts-with`, `ends-with`, `substring-before`, `substring-after`,
+  `concat`, `string-join`, `normalize-space`, `normalize-unicode`, `matches`, `replace`
+  and `encode-for-uri`.
+* `fn:` numeric functions are `abs`, `ceiling`, `floor`, `round` (with an optional
+  precision), `round-half-to-even`, `numeric-mod` and `numeric-integer-divide`. The
+  boolean ones are `not` and `boolean`, and `fn:error` is always an error.
+* `fn:` date and time functions are the `year-`, `month-`, `day-`, `hours-`, `minutes-`,
+  `seconds-` and `timezone-from-dateTime`, `-from-date` and `-from-time` accessors,
+  `years-`, `months-`, `days-`, `hours-`, `minutes-` and `seconds-from-duration`,
+  `dateTime`, `adjust-dateTime-to-timezone`, `adjust-date-to-timezone`,
+  `adjust-time-to-timezone` and `implicit-timezone`. ARQ's `years-from-date`,
+  `days-from-dateTime` and the like are accepted as well. The implicit timezone is UTC, as
+  in ARQ, and an empty string as the timezone argument of an adjust function removes the
+  timezone.
+* `math:` has `pi`, `e`, `sqrt`, `exp`, `exp10`, `log`, `log10`, `pow`, `sin`, `cos`,
+  `tan`, `asin`, `acos`, `atan` and `atan2`.
+* `afn:` has `localname`, `namespace`, `now`, `sqrt`, `pi`, `e`, `min`, `max`,
+  `strjoin`, `bnode`, `strlen`, `substr` and `substring` (zero-based, as Java's
+  `String.substring`), `sha1sum`, `uuid`, `struuid`, `evenInteger`, `langeq`, `date`,
+  `timezone` and `adjust-to-timezone`.
+* `spk:` has the vector functions `cosine`, `dot`, `euclidean` and `dimension` (see
+  [Vector similarity](#vector-similarity)). The `geof:` and `spatialF:` functions are in
+  [GeoSPARQL](#geosparql).
+* The XSD casts cover `xsd:string`, `boolean`, `decimal`, `float`, `double`, `integer`
+  and its derived types (`long`, `int`, `short`, `byte`, `nonPositiveInteger`,
+  `negativeInteger`, `nonNegativeInteger`, `positiveInteger`, `unsignedLong`,
+  `unsignedInt`, `unsignedShort` and `unsignedByte`), `dateTime`, `date`, `time`,
+  `duration`, `dayTimeDuration`, `yearMonthDuration`, `anyURI`, `gYear`, `gYearMonth`,
+  `gMonth`, `gMonthDay` and `gDay`. A cast to a derived integer type checks the type's
+  range and keeps the datatype, so `xsd:byte("12")` is `"12"^^xsd:byte` and
+  `xsd:byte(300)` is an error.
+
+Jena ARQ's statistical aggregates work with the same results as ARQ. They are
+`MEDIAN`, `MODE`, `STDEV` (the same as `STDEV_SAMP`), `STDEV_POP`, `VARIANCE` (the same as
+`VAR_SAMP`) and `VAR_POP`. Each takes `DISTINCT` and is written as a keyword, as in ARQ,
+or by its IRI in `http://jena.apache.org/ARQ/function/aggregate#` (`agg:median`,
+`agg:stdev_pop`, …). The variance and deviation aggregates also have IRIs in `afn:`
+(`afn:stdev`), as in ARQ. ARQ's explicit form `AGG <iri>(DISTINCT? expr)` calls any of
+them, or a GeoSPARQL aggregate, by IRI.
+
+```sparql
+SELECT ?dept (MEDIAN(?salary) AS ?median) (STDEV(?salary) AS ?sd)
+       (VAR_POP(DISTINCT ?salary) AS ?var)
+WHERE { ?p ex:dept ?dept ; ex:salary ?salary }
+GROUP BY ?dept
+```
+
+* `MEDIAN` and `MODE` convert every value to a double and return an `xsd:decimal`.
+  `MEDIAN` is the middle value of the sorted values, or the mean of the two middle ones.
+  `MODE` is the most frequent value. Among equally frequent values it is the one that
+  reached that count first in row order. Over no rows both are `0`.
+* The variance and deviation aggregates return an `xsd:double`. They use ARQ's sums
+  shifted by the first value, so the rounding matches ARQ for rows in the same order.
+  The sample forms of a single value are an error, and over no rows all four are
+  unbound.
+* A value that is not a number, or an expression error in any row, makes the aggregate
+  unbound.
+* A GROUP BY on at most one key computes the variance and deviation aggregates of a
+  variable incrementally, as it does `SUM` and `AVG`. `MEDIAN`, `MODE` and the `DISTINCT` forms
+  collect each group's values first.
+
+The formatter, the editor and the query builder (`expr::median`, `expr::stdev` and the
+others) know these aggregates.
+
+Some of ARQ's library is not supported. These are `afn:sprintf`, `afn:print`,
+`afn:collation`, `fn:collation-key`, `fn:format-number`, `fn:apply`,
+`afn:system-timezone`, `afn:nowtz`, `afn:version`, `afn:wait`, `afn:execTime`,
+`afn:eval` and `afn:context`, `AGG` with more than one argument, `FOLD`, `cdt:` literals,
+`LET`, the `apf:` and `list:` property functions and JavaScript functions. ARQ parses
+`GROUP_CONCAT(… ; ORDER BY …)` only to fail with "not implemented", and SPARQL 1.2 has no
+such form, so Sparkles does not accept it. An unknown function is an error, so its
+`BIND` leaves the variable unbound.
 
 ### Blank nodes
 

@@ -93,6 +93,16 @@ pub fn restrict(
     opts.write.graphs = opts.graphs.clone();
 }
 
+/// The external base URL the auth configuration sets (`server.public_url`), if any.
+pub fn public_url(st: &AppState) -> Option<String> {
+    #[cfg(feature = "auth")]
+    if let Some(a) = &st.auth {
+        return a.policy().public_url.clone();
+    }
+    let _ = st;
+    None
+}
+
 /// The `auth` member of `/$/server`.
 pub fn server_json(st: &AppState) -> J {
     match &st.auth {

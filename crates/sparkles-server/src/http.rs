@@ -32,6 +32,7 @@ mod format;
 pub(crate) mod history;
 mod inline;
 mod schema;
+mod sd;
 mod shex;
 mod stream;
 mod validation;
@@ -855,6 +856,10 @@ async fn query_endpoint(
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut params = Params::from_query(&uri);
+    // a GET without a query that asks for RDF: the service description
+    if let Some(format) = sd::requested(&method, &params, &headers) {
+        return sd::describe(st, ds, p, headers, uri.path().to_string(), format).await;
+    }
     let ct = content_type(&headers);
     let query = match (method.clone(), ct.as_str()) {
         (Method::POST, "application/sparql-query") => String::from_utf8_lossy(&body).into_owned(),

@@ -30,6 +30,52 @@ const SQUARE_METRE: Unit = Unit {
     factor: 1.0,
 };
 
+/// The `geof:` functions besides the topological relations ([`Relation`]), by local
+/// name.
+pub const FUNCTIONS: &[&str] = &[
+    "relate",
+    "distance",
+    "metricDistance",
+    "buffer",
+    "metricBuffer",
+    "convexHull",
+    "boundingCircle",
+    "concaveHull",
+    "isSimple",
+    "envelope",
+    "boundary",
+    "centroid",
+    "intersection",
+    "union",
+    "difference",
+    "symDifference",
+    "getSRID",
+    "transform",
+    "asWKT",
+    "asGeoJSON",
+    "area",
+    "metricArea",
+    "length",
+    "metricLength",
+    "perimeter",
+    "metricPerimeter",
+    "dimension",
+    "coordinateDimension",
+    "spatialDimension",
+    "is3D",
+    "isMeasured",
+    "isEmpty",
+    "geometryType",
+    "numGeometries",
+    "geometryN",
+    "minX",
+    "minY",
+    "maxX",
+    "maxY",
+    "minZ",
+    "maxZ",
+];
+
 /// Evaluate the GeoSPARQL function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     if iri.starts_with(super::vocab::SPATIALF) {

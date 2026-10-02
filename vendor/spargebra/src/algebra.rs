@@ -1462,6 +1462,32 @@ pub enum AggregateFunction {
     Custom(NamedNode),
 }
 
+/// The namespace of Jena ARQ's aggregate library. ARQ's aggregate keywords (`MEDIAN`,
+/// `STDEV`, …) parse to custom aggregates with an IRI in this namespace.
+pub const ARQ_AGGREGATE_NAMESPACE: &str = "http://jena.apache.org/ARQ/function/aggregate#";
+
+/// ARQ's aggregate keywords, longest first where one is a prefix of another, with the
+/// local names of their IRIs in [`ARQ_AGGREGATE_NAMESPACE`].
+pub const ARQ_AGGREGATE_KEYWORDS: [(&str, &str); 8] = [
+    ("MEDIAN", "median"),
+    ("MODE", "mode"),
+    ("STDEV_SAMP", "stdev_samp"),
+    ("STDEV_POP", "stdev_pop"),
+    ("STDEV", "stdev"),
+    ("VARIANCE", "variance"),
+    ("VAR_SAMP", "var_samp"),
+    ("VAR_POP", "var_pop"),
+];
+
+/// The ARQ keyword of a custom aggregate IRI, if it has one.
+fn arq_aggregate_keyword(iri: &NamedNode) -> Option<&'static str> {
+    let local = iri.as_str().strip_prefix(ARQ_AGGREGATE_NAMESPACE)?;
+    ARQ_AGGREGATE_KEYWORDS
+        .iter()
+        .find(|(_, l)| *l == local)
+        .map(|(k, _)| *k)
+}
+
 impl AggregateFunction {
     /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
     pub(crate) fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
@@ -1488,7 +1514,10 @@ impl fmt::Display for AggregateFunction {
             Self::Max => f.write_str("MAX"),
             Self::GroupConcat { .. } => f.write_str("GROUP_CONCAT"),
             Self::Sample => f.write_str("SAMPLE"),
-            Self::Custom(iri) => iri.fmt(f),
+            Self::Custom(iri) => match arq_aggregate_keyword(iri) {
+                Some(keyword) => f.write_str(keyword),
+                None => iri.fmt(f),
+            },
         }
     }
 }

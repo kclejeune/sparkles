@@ -734,3 +734,53 @@ async fn dry_runs_need_the_write_permission() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(head(&s.state, "graphs"), start);
 }
+
+/// The service description of `/graphs/sparql` for `user`, as N-Triples.
+async fn service_description(app: &Router, user: &str) -> (StatusCode, String) {
+    let r = call(
+        app,
+        "GET",
+        "/graphs/sparql",
+        &[
+            ("authorization", &b(user)),
+            ("accept", "application/n-triples"),
+        ],
+        "",
+    )
+    .await;
+    (r.status, r.text())
+}
+
+#[tokio::test]
+async fn the_service_description_follows_the_grants() {
+    let s = server();
+    let name = |g: &str| format!("<http://www.w3.org/ns/sparql-service-description#name> <{g}>");
+    let triples = "<http://rdfs.org/ns/void#triples>";
+    // every graph, with counts
+    let (st, full) = service_description(&s.app, "gfull").await;
+    assert_eq!(st, StatusCode::OK, "{full}");
+    for g in ["http://ex/a/1", "http://ex/a/2", "http://ex/b/1"] {
+        assert!(full.contains(&name(g)), "{full}");
+    }
+    assert!(full.contains(&format!("{triples} \"3\"")), "{full}");
+    // only the readable graphs, and no counts
+    let (st, part) = service_description(&s.app, "gra").await;
+    assert_eq!(st, StatusCode::OK, "{part}");
+    assert!(part.contains(&name("http://ex/a/1")) && part.contains(&name("http://ex/a/2")));
+    assert!(
+        !part.contains("http://ex/b/1") && !part.contains(triples),
+        "{part}"
+    );
+    // a caller that may not query the dataset gets no description
+    let (st, _) = service_description(&s.app, "gep").await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let r = call(
+        &s.app,
+        "GET",
+        "/graphs/sparql",
+        &[("accept", "text/turtle")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}

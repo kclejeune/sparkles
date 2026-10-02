@@ -71,6 +71,7 @@ export const KEYWORDS = [
   'ALL',
   'INTO',
   'TO',
+  'AGG',
 ];
 
 export const FUNCTIONS = [
@@ -134,6 +135,15 @@ export const FUNCTIONS = [
   'SAMPLE',
   'GROUP_CONCAT',
   'SEPARATOR',
+  // Jena ARQ's aggregates
+  'MEDIAN',
+  'MODE',
+  'STDEV',
+  'STDEV_SAMP',
+  'STDEV_POP',
+  'VARIANCE',
+  'VAR_SAMP',
+  'VAR_POP',
   'TRIPLE',
   'SUBJECT',
   'PREDICATE',

@@ -271,6 +271,18 @@ pub fn builtin_or_call(p: &mut Parser<'_>) -> Option<Completed> {
             super::pattern::group_graph_pattern(p);
             Some(m.complete(p))
         }
+        Some(Kw::Agg) => {
+            // ARQ's `AGG <iri>(…)`
+            let m = p.start(NodeKind::Aggregate);
+            p.bump_as(T::Kw(Kw::Agg));
+            if !term::is_iri(p.current()) {
+                p.error("expected an IRI");
+                return None;
+            }
+            term::iri(p);
+            aggregate_args(p, Kw::Agg);
+            Some(m.complete(p))
+        }
         Some(kw) if kw.is_aggregate() => {
             let m = p.start(NodeKind::Aggregate);
             p.bump_as(T::Kw(kw));

@@ -3171,8 +3171,9 @@ fn group(
 }
 
 /// Whether `group` can run incrementally: at most one key variable, and aggregates that
-/// are `COUNT(*)` or COUNT / SUM / AVG / MIN / MAX / SAMPLE of an input column, without
-/// DISTINCT. The planner uses this to name the operator in EXPLAIN.
+/// are `COUNT(*)` or COUNT / SUM / AVG / MIN / MAX / SAMPLE or one of ARQ's variance and
+/// deviation aggregates of an input column, without DISTINCT. The planner uses this to
+/// name the operator in EXPLAIN.
 pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarId]) -> bool {
     keys.len() <= 1
         && keys.iter().all(|k| input.contains(k))
@@ -3182,7 +3183,7 @@ pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarI
                     None => matches!(a.func, AggregateFunction::Count),
                     Some(Expr::Var(v)) => {
                         input.contains(v)
-                            && matches!(
+                            && (matches!(
                                 a.func,
                                 AggregateFunction::Count
                                     | AggregateFunction::Sum
@@ -3190,11 +3191,20 @@ pub fn incremental_group_ok(keys: &[VarId], aggs: &[(VarId, Agg)], input: &[VarI
                                     | AggregateFunction::Min
                                     | AggregateFunction::Max
                                     | AggregateFunction::Sample
-                            )
+                            ) || stat_aggregate(&a.func).is_some())
                     }
                     _ => false,
                 }
         })
+}
+
+/// The ARQ variance or deviation aggregate a custom aggregate is, if it is one.
+fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::Arq> {
+    match func {
+        AggregateFunction::Custom(iri) => super::aggext::Arq::of(iri.as_str())
+            .filter(|a| matches!(a, super::aggext::Arq::Stat { .. })),
+        _ => None,
+    }
 }
 
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
@@ -3212,10 +3222,15 @@ enum AggState {
     /// MIN / MAX: the best id and its value
     Best(Option<Id>, Option<Value>),
     Sample(Option<Id>),
+    /// ARQ's variance and deviation aggregates
+    Stat(super::aggext::Arq, super::aggext::StatAcc),
 }
 
 impl AggState {
     fn new(agg: &Agg) -> AggState {
+        if let Some(arq) = stat_aggregate(&agg.func) {
+            return AggState::Stat(arq, Default::default());
+        }
         match agg.func {
             AggregateFunction::Sum | AggregateFunction::Avg => AggState::Sum {
                 int: 0,
@@ -3289,6 +3304,7 @@ impl AggState {
                     *x = id.filter(|id| !id.is_undef());
                 }
             }
+            AggState::Stat(_, acc) => acc.add(ctx, id),
         }
     }
 
@@ -3318,6 +3334,7 @@ impl AggState {
             }
             AggState::Best(best, _) => best.unwrap_or(Id::UNDEF),
             AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
+            AggState::Stat(arq, acc) => acc.finish(ctx, arq),
         }
     }
 }

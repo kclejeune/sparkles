@@ -2340,6 +2340,7 @@ dependencies = [
  "geo",
  "geo-index",
  "geographiclib-rs",
+ "icu_normalizer",
  "imbl",
  "ipnet",
  "levenshtein_automata",
