@@ -263,11 +263,23 @@ fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
         let first = (0..recs).find(|&i| wal_full[i * 33] == 3).unwrap();
         ((first + 1) * 33) as u64
     };
-    // commit 2's terms lost entirely, or the last one torn half-way
-    for cut in [ends[2], ends[3], ends[4] - 2] {
+    // commit 2's terms lost entirely, or the last one torn half-way, or zeros where
+    // they were (the file's length reached the disk, its data did not)
+    for (cut, zeros) in [
+        (ends[2], false),
+        (ends[3], false),
+        (ends[4] - 2, false),
+        (ends[2], true),
+    ] {
         std::fs::write(&wal_path, &wal_full).unwrap();
-        std::fs::write(&vocab, &vocab_full).unwrap();
-        truncate(&vocab, cut);
+        if zeros {
+            let mut v = vocab_full.clone();
+            v[cut as usize..].fill(0);
+            std::fs::write(&vocab, &v).unwrap();
+        } else {
+            std::fs::write(&vocab, &vocab_full).unwrap();
+            truncate(&vocab, cut);
+        }
         {
             let s = Store::open(&root, StoreOptions::default()).unwrap();
             assert_eq!(s.head_commit().seq, 1, "cut at {cut}");

@@ -32,7 +32,7 @@ use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
 use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_REC};
-use crate::vocab::FC_BLOCK;
+use crate::vocab::{FC_BLOCK, delta_entries};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -530,22 +530,6 @@ fn id_problem(
         },
         _ => None,
     }
-}
-
-/// The complete entries of a delta vocabulary file (`u32` length, key), and where they
-/// end.
-fn delta_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
-    let mut pos = 0;
-    let mut keys = Vec::new();
-    while pos + 4 <= buf.len() {
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        if pos + 4 + len > buf.len() {
-            break;
-        }
-        keys.push(&buf[pos + 4..pos + 4 + len]);
-        pos += 4 + len;
-    }
-    (keys, pos)
 }
 
 /// splitmix64 finalizer

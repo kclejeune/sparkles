@@ -381,6 +381,24 @@ impl AppendVocab {
     }
 }
 
+/// The complete entries of a delta vocabulary file (`u32` length, key), and where they
+/// end. An entry cut short ends them, as does a tail of zero bytes: no key is empty, and
+/// a crash can leave zeros where the file's length reached the disk before its data
+/// (on file systems that do not order the two). Either is a torn tail.
+pub(crate) fn delta_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
+    let mut pos = 0;
+    let mut keys = Vec::new();
+    while pos + 4 <= buf.len() {
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        if pos + 4 + len > buf.len() || (len == 0 && buf[pos..].iter().all(|&b| b == 0)) {
+            break;
+        }
+        keys.push(&buf[pos + 4..pos + 4 + len]);
+        pos += 4 + len;
+    }
+    (keys, pos)
+}
+
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
 ///
 /// Readers and the single writer share it through an `RwLock`; ids only ever grow, so a
@@ -414,14 +432,8 @@ impl DeltaVocab {
         if path.exists() {
             let mut buf = Vec::new();
             File::open(path)?.read_to_end(&mut buf)?;
-            let mut pos = 0;
-            while pos + 4 <= buf.len() {
-                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                if pos + 4 + len > buf.len() {
-                    break;
-                }
-                v.insert(&buf[pos + 4..pos + 4 + len]);
-                pos += 4 + len;
+            for key in delta_entries(&buf).0 {
+                v.insert(key);
             }
         }
         Ok(DeltaVocab {
@@ -435,14 +447,9 @@ impl DeltaVocab {
         if path.exists() {
             let mut buf = Vec::new();
             File::open(path)?.read_to_end(&mut buf)?;
-            let mut pos = 0;
-            while pos + 4 <= buf.len() {
-                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                if pos + 4 + len > buf.len() {
-                    break; // torn write at the tail — ignore
-                }
-                v.insert(&buf[pos + 4..pos + 4 + len]);
-                pos += 4 + len;
+            let (keys, pos) = delta_entries(&buf);
+            for key in keys {
+                v.insert(key);
             }
             // truncate a torn tail so future appends are well-formed
             if pos != buf.len() {
@@ -567,6 +574,29 @@ mod tests {
         let v = DeltaVocab::open(&path).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v.get(1).unwrap(), b"<http://x/b>");
+    }
+
+    #[test]
+    fn a_tail_of_zeros_is_torn_but_an_empty_entry_before_data_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dvocab.bin");
+        let entry = |k: &[u8]| [&(k.len() as u32).to_le_bytes()[..], k].concat();
+        let good = [entry(b"<http://x/a>"), entry(b"<http://x/b>")].concat();
+        // the length of a crash's appends reached the disk, their data did not
+        std::fs::write(&path, [&good[..], &[0u8; 23][..]].concat()).unwrap();
+        let v = DeltaVocab::open(&path).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+        assert_eq!(v.insert(b"<http://x/c>").unwrap(), 2);
+        v.sync().unwrap();
+        drop(v);
+        assert_eq!(DeltaVocab::open(&path).unwrap().len(), 3);
+        // zeros followed by data are entries, as they always were read
+        let odd = [&good[..], &entry(b"")[..], &entry(b"<http://x/d>")[..]].concat();
+        std::fs::write(&path, &odd).unwrap();
+        assert_eq!(DeltaVocab::open_read_only(&path).unwrap().len(), 4);
+        assert_eq!(DeltaVocab::open(&path).unwrap().len(), 4);
+        assert_eq!(std::fs::read(&path).unwrap(), odd);
     }
 
     #[test]
