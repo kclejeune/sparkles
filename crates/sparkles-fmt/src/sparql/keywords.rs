@@ -154,6 +154,17 @@ keywords! {
     Avg => "AVG",
     Sample => "SAMPLE",
     GroupConcat => "GROUP_CONCAT",
+    // Jena ARQ's aggregates
+    Median => "MEDIAN",
+    Mode => "MODE",
+    Stdev => "STDEV",
+    StdevSamp => "STDEV_SAMP",
+    StdevPop => "STDEV_POP",
+    Variance => "VARIANCE",
+    VarSamp => "VAR_SAMP",
+    VarPop => "VAR_POP",
+    // ARQ's `AGG <iri>(…)`, a custom aggregate by its IRI
+    Agg => "AGG",
 }
 
 impl Kw {
@@ -177,7 +188,8 @@ impl Kw {
         self >= Kw::Str
     }
 
-    /// Whether this is an aggregate (`COUNT` … `GROUP_CONCAT`).
+    /// Whether this is an aggregate (`COUNT` … `GROUP_CONCAT`, and ARQ's `MEDIAN` …
+    /// `VAR_POP` and `AGG`).
     pub fn is_aggregate(self) -> bool {
         self >= Kw::Count
     }

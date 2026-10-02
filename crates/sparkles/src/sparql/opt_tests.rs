@@ -403,6 +403,9 @@ fn incremental_grouping_matches_the_generic_aggregates() {
         "SELECT (SUM(?a) AS ?s) (AVG(?a) AS ?m) (COUNT(*) AS ?n) (MIN(?a) AS ?lo) WHERE { ?p ex:age ?a FILTER(?a > 1000) }",
         "SELECT ?a (COUNT(?p) AS ?n) (MAX(?p) AS ?m) WHERE { ?p ex:age ?a } GROUP BY ?a",
         "SELECT ?o (AVG(?a) AS ?avg) WHERE { ?p ex:org ?o OPTIONAL { ?p ex:age ?a } } GROUP BY ?o HAVING (COUNT(?a) > 400)",
+        "SELECT ?o (STDEV(?a) AS ?sd) (VAR_POP(?a) AS ?v) (COUNT(*) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a FILTER(isNumeric(?a)) } GROUP BY ?o",
+        "SELECT ?o (STDEV_POP(?b) AS ?sd) (VARIANCE(?b) AS ?v) WHERE { ?p ex:org ?o OPTIONAL { ?p ex:big ?b } } GROUP BY ?o",
+        "SELECT (STDEV_SAMP(?a) AS ?sd) (VAR_SAMP(?a) AS ?v) WHERE { ?p ex:age ?a FILTER(?a > 1000) }",
     ] {
         same_answer(&s, q, "desc:[incremental]");
     }
@@ -424,6 +427,8 @@ fn incremental_grouping_matches_the_generic_aggregates() {
         "SELECT ?o (COUNT(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o (SUM(?a * 2) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o (GROUP_CONCAT(?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
+        "SELECT ?o (MEDIAN(?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
+        "SELECT ?o (STDEV(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
         "SELECT ?o ?a (COUNT(*) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o ?a",
     ] {
         let r = run(&s, q, Optimizations::ALL);

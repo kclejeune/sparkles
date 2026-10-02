@@ -68,6 +68,23 @@ The changes, all in `src/parser.rs` unless noted:
   `Aggregate` rule's custom `DISTINCT` form (registered with
   `with_custom_aggregate_function`) could never match and the query was a syntax error.
 
+- **Jena ARQ's aggregate keywords.** The `Aggregate` rule accepts the keywords of ARQ's
+  syntax extension, `MEDIAN`, `MODE`, `STDEV`, `STDEV_SAMP`, `STDEV_POP`, `VARIANCE`,
+  `VAR_SAMP` and `VAR_POP`, case-insensitively and with an optional `DISTINCT`, as in
+  ARQ's grammar (`jena-arq/Grammar/main.jj`). Each parses to
+  `AggregateFunction::Custom` with an IRI in ARQ's aggregate namespace,
+  `http://jena.apache.org/ARQ/function/aggregate#` (`ARQ_AGGREGATE_NAMESPACE` and
+  `ARQ_AGGREGATE_KEYWORDS` in `src/algebra.rs`), so `MEDIAN(?x)` is
+  `Custom(<…aggregate#median>)` whether or not that IRI is registered. ARQ's explicit form
+  `AGG iri(DISTINCT? expr)` is a custom aggregate call with any IRI. `AGG` must be followed
+  by whitespace, a comment or `<`, so that a prefixed name such as `agg:f` is still a
+  prefixed name. ARQ's `ArgList` allows several arguments after `AGG iri`, and here there
+  is one, as for every other aggregate. In `src/algebra.rs`, the SPARQL serialization of
+  such a custom aggregate writes the keyword (`MEDIAN(?x)`) rather than the IRI, because
+  ARQ reads `MEDIAN` and `MODE` only as keywords. ARQ's `GROUP_CONCAT(… ; ORDER BY …)` is
+  not added, because ARQ parses it only to fail with "not implemented" and SPARQL 1.2 does
+  not have it.
+
 - **A nesting limit.** `SparqlParser::parse_query` and `parse_update` first scan the text
   once, without recursion (`src/nesting.rs`, called from `too_deep`). They refuse a text
   whose brackets nest deeper than `nesting::MAX_NESTING` (256) or whose algebra could

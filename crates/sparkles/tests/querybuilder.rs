@@ -620,6 +620,32 @@ fn exec_group_by_having_aggregates() {
     );
     assert_eq!(rows.iter().filter(|r| r.get("one").is_some()).count(), 2);
 
+    // Jena ARQ's statistical aggregates
+    let stats = people()
+        .select("?dept")
+        .select_expr(expr::median(var("salary")), "?med")
+        .select_expr(expr::mode(var("salary")), "?mode")
+        .select_expr(expr::stdev_pop(var("salary")), "?sd")
+        .select_expr(expr::var_pop(var("salary")).distinct(), "?vp")
+        .select_expr(expr::stdev(var("salary")), "?sds")
+        .select_expr(expr::variance(var("salary")), "?var")
+        .where_("?p", "ex:dept", "?dept")
+        .where_("?p", "ex:salary", "?salary")
+        .group_by("?dept")
+        .order_by("?dept");
+    assert!(stats.build().unwrap().contains("VAR_POP(DISTINCT ?salary)"));
+    let rows = stats.execute(&ds).unwrap();
+    let num = |v: &str| -> Vec<f64> {
+        col(&rows, v)
+            .iter()
+            .map(|x| x.parse::<f64>().unwrap())
+            .collect()
+    };
+    assert_eq!(num("med"), [90.0, 80.0]);
+    assert_eq!(num("sd"), [10.0, 10.0]);
+    assert_eq!(num("vp"), [100.0, 100.0]);
+    assert_eq!(num("var"), [200.0, 200.0]);
+
     let rows = q
         .clone()
         .having(expr::gt(expr::sum(var("salary")), 170))

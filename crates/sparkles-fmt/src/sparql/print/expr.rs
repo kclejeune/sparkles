@@ -12,6 +12,7 @@
 use super::{Ctx, node};
 use crate::doc::DocId;
 use crate::lex::TokenKind;
+use crate::sparql::keywords::Kw;
 use crate::syntax::NodeKind;
 use crate::tree::{Element, NodeId, TokenId};
 use crate::{OperatorPosition, trivia};
@@ -287,9 +288,23 @@ pub fn arg(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     cx.concat(parts)
 }
 
-/// `Aggregate`: as a call, `COUNT(DISTINCT ?x)`, `GROUP_CONCAT(?n; SEPARATOR = ", ")`.
+/// `Aggregate`: as a call, `COUNT(DISTINCT ?x)`, `GROUP_CONCAT(?n; SEPARATOR = ", ")`,
+/// and ARQ's `AGG ex:agg(?x)` with a space after `AGG`.
 pub fn aggregate(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
-    call(cx, n)
+    let children = cx.children(n);
+    let agg = matches!(children.first(), Some(&Element::Token(t))
+        if cx.tree.token_kind(t) == TokenKind::Kw(Kw::Agg));
+    if !agg {
+        return call(cx, n);
+    }
+    let mut parts = Vec::with_capacity(children.len() + 1);
+    for (i, e) in children.into_iter().enumerate() {
+        if i == 1 {
+            parts.push(cx.space());
+        }
+        parts.push(element(cx, e));
+    }
+    cx.concat(parts)
 }
 
 /// `InList`: `?x IN (1, 2)`, `?x NOT IN (…)`.
@@ -441,6 +456,13 @@ mod tests {
         assert_eq!(
             filter("(group_concat(?n;separator=\", \") != ex:agg(distinct ?n))"),
             "  FILTER(GROUP_CONCAT(?n; SEPARATOR = \", \") != ex:agg(DISTINCT ?n))"
+        );
+        // Jena ARQ's aggregates
+        assert_eq!(
+            filter(
+                "(median(distinct ?x) > stdev_samp(?y) + agg  <http://e/a>(?z) + Agg ex:b(DISTINCT ?w))"
+            ),
+            "  FILTER(MEDIAN(DISTINCT ?x) > STDEV_SAMP(?y) + AGG <http://e/a>(?z) + AGG ex:b(DISTINCT ?w))"
         );
         assert_eq!(
             filter("(haslangdir(?x) || STRLANGDIR(\"a\", \"en\", \"ltr\") = triple(?s,?p,?o))"),
