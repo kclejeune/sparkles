@@ -366,10 +366,23 @@ fn run_op(
                     GraphName::DefaultGraph => Some(Id::DEFAULT_GRAPH),
                     GraphName::NamedNode(n) => view.lookup_term(&Term::NamedNode(n.clone())),
                 };
-                if let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g)
-                    && txn.delete([s, p, o, g])?
-                {
-                    stats.deleted += 1;
+                if let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) {
+                    if txn.delete([s, p, o, g])? {
+                        stats.deleted += 1;
+                    }
+                } else {
+                    // a quad of terms the store lacks deletes nothing, but protections are
+                    // checked all the same, so that a refusal does not tell which exist
+                    let graph = match &q.graph_name {
+                        GraphName::DefaultGraph => None,
+                        GraphName::NamedNode(n) => Some(Term::NamedNode(n.clone())),
+                    };
+                    let u = |x: Option<Id>| x.unwrap_or(Id::UNDEF);
+                    txn.check_requested(
+                        [u(s), u(p), u(o), u(g)],
+                        q.predicate.as_str(),
+                        graph.as_ref(),
+                    )?;
                 }
             }
         }
@@ -379,7 +392,8 @@ fn run_op(
             using,
             pattern,
         } => {
-            let snap = Arc::new(txn.view());
+            // the WHERE clause reads what the graph view's protections leave visible
+            let snap = txn.read_view()?;
             let mut ctx = req.ctx(snap);
             if let Some(QueryDataset { default, named }) = using {
                 ctx.dataset.default = Some(
@@ -604,7 +618,7 @@ fn run_op(
                     .collect(),
                 // with a graph view: the graphs it sees, each of which must be writable
                 GraphTarget::NamedGraphs | GraphTarget::AllGraphs
-                    if let Some(a) = req.opts.graphs.as_ref().filter(|a| !a.reads_all()) =>
+                    if let Some(a) = req.opts.graphs.as_ref().filter(|a| !a.read.is_all()) =>
                 {
                     let mut v = a.visible_named(&view)?.to_vec();
                     if matches!(graph, GraphTarget::AllGraphs) && a.read.default_graph() {
@@ -622,9 +636,11 @@ fn run_op(
                     v
                 }
             };
+            // only the quads the view sees: protected ones it hides stay
+            let read = txn.read_view()?;
             for g in graphs {
                 req.check()?;
-                for k in view.scan_keys(Perm::Gspo, &[g.0])? {
+                for k in read.scan_keys(Perm::Gspo, &[g.0])? {
                     if txn.delete(Perm::Gspo.to_quad(&k))? {
                         stats.deleted += 1;
                     }

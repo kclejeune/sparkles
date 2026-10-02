@@ -4636,8 +4636,12 @@ fails the request with `507 Insufficient Storage` and a body like this:
 * `dataset-bytes` is the storage quota of a persistent dataset (see
   [Storage quotas](#storage-quotas)). A write that would take the dataset over its quota
   fails with this budget before anything is committed.
+* `hidden-quads` (`[protection_limits] max_hidden_quads`, default 5,000,000) is the
+  number of quads one caller's protections may hide at one commit (see
+  [Protections of triples](#protections-of-triples)).
 
-`limit` and `requested` are in bytes, or in rows for `rows` and `rows-produced`. The
+`limit` and `requested` are in bytes, in rows for `rows` and `rows-produced`, and in
+quads for `hidden-quads`. The
 response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
 `meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
 query's peak memory estimate and the rows its operators produced.
@@ -4958,7 +4962,7 @@ of `-1`, statistics notes reduced to `[from statistics]`, and no operator counte
 because those come from statistics of every graph.
 
 Routes that report on the whole dataset answer `403` with
-`"… covers every graph of /wiki, and your access is limited to some graphs"`. These are
+`"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
 `/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
 `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes
@@ -5011,6 +5015,147 @@ Fuseki applies graph access control to read-only datasets only. Sparkles grants 
 on graphs too. Fuseki's levels intersect, while Sparkles grants form a union, so a grant
 names the endpoints it allows rather than the ones it removes.
 
+### Protections of triples
+
+The design is in [C12b Protections of triples](specs/C12b-triple-access-control.md).
+
+A protection names some triples of a dataset that only some callers may read or write.
+It matches triples by predicate, by the class of their subject, by graph, or by a SPARQL
+pattern with the caller bound. A protected triple is hidden from every caller whose grants
+do not lift the protection.
+
+```toml
+[[protections]]
+name = "salaries"                       # grants lift it by this name
+dataset = "hr"                          # a dataset name or * pattern
+predicates = ["http://example.org/salary", "http://example.org/pay/*"]
+
+[[protections]]
+name = "patients"
+dataset = "clinic"
+classes = ["http://example.org/Patient"]   # and its subclasses
+graphs = ["urn:x-arq:DefaultGraph", "http://example.org/records/*"]
+
+[[protections]]
+name = "own-documents"
+dataset = "docs"
+classes = ["http://example.org/Document"]
+pattern = "?s ex:owner ?user"
+prefixes = { ex = "http://example.org/" }
+
+[[roles.hr.grants]]
+dataset = "hr"
+level = "write"                         # reads and writes salaries
+lifts = ["salaries"]
+
+[[roles.doctors.grants]]
+dataset = "clinic"
+level = "read"                          # reads patients, writes none
+lifts = ["patients"]
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The name grants lift it by. |
+| `dataset` | A dataset name or `*` pattern. |
+| `predicates` | Predicate IRIs, and IRI patterns with `*`. Absent: every predicate. |
+| `classes` | Subject classes. A subject is an instance when the dataset holds `rdf:type` for the class in any graph. Absent: every subject. |
+| `subclasses` | Whether instances of subclasses count, through `rdfs:subClassOf` in any graph. Default `true`. |
+| `graphs` | The graphs it applies in, written as in grants. Absent: every graph. |
+| `pattern` | A SPARQL group graph pattern that lets a matched triple through (see below). |
+| `prefixes` | Prefixes for the pattern. |
+| `hide_inferences` | Whether callers it hides triples from lose the inferred graph. Default `true`. |
+
+A protection covers a triple when all of its fields match. A grant lifts the protections
+listed in its `lifts`, in the graphs it covers, through the endpoints it applies to, at
+its level. A `read` grant lets its holder read the triples, and a `write` grant lets it
+read and write them. Entries of `datasets` lift nothing. `admin` on the dataset, and
+`server-admin`, lift every protection.
+
+A caller sees a triple when its graph is in the caller's view and every protection that
+covers it is lifted in that graph or passed by its pattern. Several protections that
+cover one triple must all be passed, so a salary of a patient stays hidden from a caller
+who may read salaries but not patients. Neither protections nor grants depend on their
+order.
+
+#### Patterns
+
+A pattern uses `?s` (or `?this`), `?p` and `?o` for the triple, and these variables for
+the caller:
+
+| Variable | Value |
+|---|---|
+| `?user` | The caller's name as a string: the user, the OIDC or proxy account, the owner of a minted token, or a static token's name. Anonymous callers have none. |
+| `?role` | Each role the caller holds. |
+| `?group` | Each group of an OIDC or proxy identity. |
+
+The pattern lets a covered triple through when it has a solution whose `?s`, `?p` and
+`?o` equal the triple's, for those of the three it uses. A pattern that uses none of them
+lets every covered triple through or none. A pattern that uses a caller variable the
+caller lacks matches nothing. It is matched against every graph of the dataset merged
+into the default graph, and `GRAPH` reaches the named graphs.
+
+A pattern is only as safe as the writes of the triples it reads. With
+`?s ex:project ?p . ?p ex:member ?user`, anyone who may add `ex:member` triples can let
+themselves in, so protect those triples for writing as well.
+
+#### What a protected caller sees
+
+Every read path sees the visible triples only: queries of every form, `EXISTS`, paths,
+aggregates and counts answered from index statistics, `DESCRIBE`, the Graph Store and
+exports, full-text, vector, hybrid and spatial search, `/{ds}/explain`, RDFS on read,
+schema reports, VoID, drafted shapes, stored queries, the MCP tools and the dataset's
+`quads` count. `ASK` of a hidden triple answers like a missing one, and a Graph Store
+`GET ?graph=` of a graph whose every triple is hidden answers `404`.
+
+A caller with protections in force is limited, as in
+[Graph-level access control](#graph-level-access-control): plans have no estimates, the
+whole-dataset routes refuse it, the validation endpoints refuse it, and `whoami` lists
+the dataset under `restricted` with `triples: true`. It never names the protections.
+
+`/{ds}/diff` compares the two states as the caller sees them, so a triple that became
+hidden counts as removed. The change feed `/{ds}/changes` filters each change when the
+protections match by predicate and graph only. With a protection by class or pattern it
+answers `403`, since it would need the caller's view of every commit.
+
+While a protection with `hide_inferences` is in force, the caller does not read the
+inferred graph `urn:x-sparkles:inferred`, whose materialized inferences can restate the
+hidden triples in other words.
+
+#### Writes of a protected caller
+
+Each triple a write asks to insert or delete is checked against the protections at the
+state the write starts from and at the state it would leave, before anything is
+committed. The check uses the triples asked for, not the ones that exist, so a delete of a
+protected triple fails the same way whether or not it exists. A refused write changes
+nothing and answers `403 {"error":"write access to the triple <s> <p> <o> required"}`.
+
+* A caller cannot create a protected triple, so a caller without `patients` cannot type a
+  subject `ex:Patient`, and cannot add `rdfs:subClassOf` links below a protected class or
+  remove them.
+* `WHERE` clauses read the visible triples, so `DELETE WHERE` never removes a hidden one.
+* `CLEAR`, `DROP` and Graph Store `PUT` remove the triples the caller sees and keep the
+  hidden ones. Replacing the whole dataset is refused.
+* Dry runs are refused like the writes they preview.
+
+#### Limits
+
+```toml
+[protection_limits]
+max_hidden_quads = 5000000   # quads one caller's protections may hide at one commit
+max_pattern_rows = 1000000   # solutions of one pattern
+```
+
+The quads a caller's protections hide are worked out once per commit, kept with the
+commit, and shared by callers with the same protections, lifts and (for patterns) the
+same attributes. Past a limit, requests fail with `507` and a budget error of kind
+`hidden-quads` or `rows`.
+
+Class and pattern protections depend on data. A caller that knows an IRI can tell that it
+is protected, because the IRI's triples are missing and writes to it are refused. The
+protections hide triples, not IRIs: an IRI that is the object of a visible triple stays
+visible there.
+
 ### CSRF and CORS
 
 With auth, the server refuses unsafe requests, and any request that needs `write`,
@@ -5043,8 +5188,8 @@ type Whoami = {
   tokenId?: string;       // token principals
   server: ("metrics" | "federate" | "server-admin")[];
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
-  // datasets where the caller's grants cover only some graphs or endpoints
-  restricted: Record<string, { graphs: boolean; endpoints?: string[] }>;
+  // datasets where the caller's grants cover only some graphs, endpoints or triples
+  restricted: Record<string, { graphs: boolean; triples?: true; endpoints?: string[] }>;
   canMintTokens: boolean;  // false for static tokens and the provider's access tokens
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };

@@ -154,6 +154,7 @@ fn view(names: &[&str]) -> Arc<GraphAccess> {
     Arc::new(GraphAccess {
         read: r.clone(),
         write: r,
+        triples: None,
     })
 }
 
@@ -467,6 +468,7 @@ fn writer() -> QueryOptions {
         graphs: Some(Arc::new(GraphAccess {
             read: Graphs::Only(GraphRule::new(["default", "http://ex/a/*"], &[INFERRED])),
             write: Graphs::Only(GraphRule::new(["http://ex/a/1"], &[INFERRED])),
+            triples: None,
         })),
         ..Default::default()
     }

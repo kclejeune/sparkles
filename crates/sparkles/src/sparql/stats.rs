@@ -128,7 +128,14 @@ pub struct CountCache {
     /// the named graphs each read rule of a graph view sees (see
     /// [`crate::access::GraphAccess::visible_named`])
     views: Mutex<FxHashMap<String, VisibleGraphs>>,
+    /// the masked snapshots of triple-level views, by view key (see
+    /// [`crate::access::GraphAccess::masked`])
+    masks: Mutex<FxHashMap<String, MaskSlot>>,
 }
+
+/// Where the masked snapshot of one view is built once: a second request waits for the
+/// first, and builds it again only if the first failed.
+pub(crate) type MaskSlot = Arc<Mutex<Option<Arc<Snapshot>>>>;
 
 impl CountCache {
     /// Entries kept before the cache starts over.
@@ -176,6 +183,21 @@ impl CountCache {
     /// The visible named graphs of a graph view's read rule, by the rule's key.
     pub(crate) fn view(&self, k: &str) -> Option<VisibleGraphs> {
         self.views.lock().get(k).cloned()
+    }
+
+    /// The slot of a view's masked snapshot, by the view's key.
+    pub(crate) fn mask_slot(&self, k: &str) -> MaskSlot {
+        let mut m = self.masks.lock();
+        if let Some(s) = m.get(k) {
+            return s.clone();
+        }
+        // a few views at a time in practice; a burst of distinct ones starts over
+        if m.len() >= 64 {
+            m.clear();
+        }
+        let s = MaskSlot::default();
+        m.insert(k.to_string(), s.clone());
+        s
     }
 
     pub(crate) fn put_view(&self, k: String, v: VisibleGraphs) {

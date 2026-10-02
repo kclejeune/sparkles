@@ -1296,6 +1296,86 @@ mod auth {
         assert_eq!(tool_error(&r), "forbidden");
     }
 
+    /// MCP tools under protections of triples (C12 Phase 2): queries, listings and
+    /// updates see and write what the caller's protections leave.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_follow_triple_protections() {
+        use crate::http::router_tests::auth::triples::{DATA, users};
+        let s = authed(&["--mcp-allow-update"], &[], &users());
+        let ds = s.state.attach("hr", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let text = |r: &J| {
+            r["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let q = json!({"dataset": "hr", "query": "SELECT ?s ?v { ?s <http://ex/salary> ?v }"});
+        let r = tool(
+            &s.app,
+            "sparql_query",
+            q.clone(),
+            &[("authorization", &b("thr"))],
+        )
+        .await;
+        assert!(text(&r).contains("alice"), "{r}");
+        let r = tool(
+            &s.app,
+            "sparql_query",
+            q,
+            &[("authorization", &b("tstaff"))],
+        )
+        .await;
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(!text(&r).contains("alice"), "{r}");
+        let r = tool(
+            &s.app,
+            "describe_resource",
+            json!({"dataset": "hr", "iri": "http://ex/alice"}),
+            &[("authorization", &b("tstaff"))],
+        )
+        .await;
+        assert!(!r.to_string().contains("salary"), "{r}");
+        let r = tool(
+            &s.app,
+            "list_datasets",
+            json!({}),
+            &[("authorization", &b("tstaff"))],
+        )
+        .await;
+        let d = r["structuredContent"]["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "hr")
+            .unwrap()
+            .clone();
+        assert_eq!(d["quads"], 3, "{d}");
+        let up = |u: &str| json!({"dataset": "hr", "update": u});
+        let r = tool(
+            &s.app,
+            "sparql_update",
+            up("INSERT DATA { <http://ex/x> <http://ex/salary> 1 }"),
+            &[("authorization", &b("tstaff"))],
+        )
+        .await;
+        assert_eq!(tool_error(&r), "forbidden");
+        let r = tool(
+            &s.app,
+            "sparql_update",
+            up("INSERT DATA { <http://ex/x> <http://ex/salary> 1 }"),
+            &[("authorization", &b("thr"))],
+        )
+        .await;
+        assert_eq!(r["structuredContent"]["committed"], true, "{r}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn service_needs_federate() {
         let s = authed(&["--mcp-allow-service"], &[], "");

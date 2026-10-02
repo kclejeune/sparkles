@@ -59,7 +59,7 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     let Some(query) = scoped(snap, spec, &sh.fields, parsed.query) else {
         return Ok(Table::empty(vars.to_vec()));
     };
-    let out = Outputs::new(spec, vars, resolved, &sh.ids);
+    let out = Outputs::new(spec, vars, resolved, &sh.ids, snap.mask.is_some());
     let max = sh.config.max_hits;
     // A limit within maxHits keeps that many of the best hits. Without a limit, or with
     // one above maxHits, every hit is returned, and more than maxHits is an error.
@@ -334,6 +334,7 @@ impl<'a> Outputs<'a> {
         vars: &'a [VarId],
         resolved: &Resolved,
         ids: &'a IdCache,
+        masked: bool,
     ) -> Outputs<'a> {
         let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
         let cs = match spec.subject {
@@ -349,11 +350,13 @@ impl<'a> Outputs<'a> {
         );
         let crank = col(spec.rank);
         let hash = !resolved.uncertain.is_empty();
+        // a view that hides triples checks every hit's quad against its mask
+        let all = hash || masked;
         let need = Need {
-            s: cs.is_some() || spec.dedup || hash,
-            p: cprop.is_some() || spec.dedup || hash,
-            o: clit.is_some() || spec.dedup || hash,
-            g: cg_out.is_some() || cgv.is_some() || hash,
+            s: cs.is_some() || spec.dedup || all,
+            p: cprop.is_some() || spec.dedup || all,
+            o: clit.is_some() || spec.dedup || all,
+            g: cg_out.is_some() || cgv.is_some() || all,
             hash,
         };
         Outputs {
@@ -410,6 +413,13 @@ impl<'a> Outputs<'a> {
                 continue;
             }
             if uncertain && !snap.contains(&[s, p, o, g])? {
+                continue;
+            }
+            if snap
+                .mask
+                .as_ref()
+                .is_some_and(|m| m.hides(&[s.0, p.0, o.0, g.0]))
+            {
                 continue;
             }
             if self.spec.dedup && !seen.insert((s, p, o)) {

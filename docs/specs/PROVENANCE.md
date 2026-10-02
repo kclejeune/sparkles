@@ -208,6 +208,37 @@ implementation landed.
   - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
     vocabulary.
 
+## Protections of triples
+
+- **Spec:** [`C12b-triple-access-control.md`](C12b-triple-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C12, C15, C16 and F06;
+  - the source and readme of Apache Jena's `jena-permissions` module (Apache-2.0) at
+    the `jena-5.6.0` release, the last before it was retired: `SecurityEvaluator`,
+    `SecuredGraph` and the query rewriter `OpRewriter`;
+  - AllegroGraph's security filters documentation (fetched 2026-10-02) and MarkLogic's
+    element-level security documentation (protected paths and protected path sets,
+    found 2026-10-02);
+  - W3C Solid Web Access Control and Access Control Policy, the W3C ODRL Information
+    Model 2.2, OASIS XACML 3.0, SPARQL 1.1 and RDF Schema, cited from working knowledge.
+
+  Fluree was not consulted, including its policy language, source, documentation and
+  design notes.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access::triples`, the snapshot's mask, the write transaction's checks
+  and the query, update, schema, diff and change-feed modules. The server part is in the
+  `auth` module of `sparkles-server` and the Graph Store and listing handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §12):
+  - checking each triple during evaluation, as `jena-permissions` does;
+  - rewriting queries with filters;
+  - turning off the fast paths for protected callers;
+  - allow and disallow filters attached to each grant;
+  - lists of readers in the protection;
+  - inference per caller;
+  - exact per-commit masks for the change feed;
+  - hiding IRIs as well as triples.
+
 ## Write previews
 
 - **Spec:** [`C15-write-previews.md`](C15-write-previews.md), written on 2026-10-02

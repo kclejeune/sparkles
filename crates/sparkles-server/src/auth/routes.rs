@@ -1017,7 +1017,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             {
                 count(Denied::Forbidden);
                 let msg = format!(
-                    "{} covers every graph of /{ds}, and your access is limited to some graphs",
+                    "{} covers every graph of /{ds}, and your access is limited to some graphs or triples",
                     route.replace("{ds}", &ds)
                 );
                 return finish(forbidden(&p, &msg));

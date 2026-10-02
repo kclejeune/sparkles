@@ -223,6 +223,7 @@ fn graph_views_limit_the_draft() {
     o.schema.graphs = Some(std::sync::Arc::new(sparkles::access::GraphAccess {
         read: only_default.clone(),
         write: only_default,
+        triples: None,
     }));
     let view = draft_shapes(&s.snapshot(), &o).unwrap();
     assert!(!view.shacl.contains("secret"), "{}", view.shacl);

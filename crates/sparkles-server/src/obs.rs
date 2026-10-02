@@ -613,6 +613,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::ValidationWork => 5,
         BudgetKind::RowsProduced => 6,
         BudgetKind::DatasetBytes => 7,
+        BudgetKind::HiddenQuads => 8,
     }
 }
 
