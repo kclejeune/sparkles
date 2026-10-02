@@ -360,6 +360,12 @@ pub fn rules_digest(profile: &Profile, extras: &Extras) -> u64 {
     fnv(&[extras.geo_default_geometry as u8], h)
 }
 
+/// A run that removes more than one explicit triple in this many (of 10,000 or more)
+/// runs in full: the search for other proofs of their consequences then costs more than
+/// deriving everything again (measured on the benchmark data: removing 10% of 100,000 triples
+/// took longer incrementally, removing 1% of 1,000,000 took a quarter of a full run).
+const LARGE_DELETION: u64 = 20;
+
 /// What an incremental run asks for.
 #[derive(Clone, Copy, Default)]
 pub struct Incremental<'a> {
@@ -468,8 +474,9 @@ pub fn materialize_incremental(
 /// Take the writer lock, with the changes since `inc.since` up to the state it locks.
 ///
 /// The commit diff takes the writer lock itself, so the changes are read before. A commit
-/// that lands in between makes them stale: the lock is released and they are read again,
-/// up to three times.
+/// that lands in between makes them stale. A closure kept in memory then gives the
+/// changes from its deltas, under the lock; otherwise the lock is released and they are
+/// read again, up to three times.
 fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
@@ -485,6 +492,9 @@ fn lock_with_changes<'s>(
         let raw = maintain::changes(store, since, &live, inc.cache);
         let txn = store.write_as(sparkles::commit::CommitKind::Reason);
         if txn.base().commit == live.commit {
+            return (txn, Some(raw));
+        }
+        if let Some(raw) = maintain::kept_changes(store, since, txn.base(), inc.cache) {
             return (txn, Some(raw));
         }
     }
@@ -725,6 +735,16 @@ fn update_closure(
             if let Some(why) = engine::incremental_blocker(&r, &terms) {
                 return Err(Fallback(why).into());
             }
+        }
+    }
+    if let Ok(r) = &raw {
+        let removed = r.base_removed() as u64;
+        let explicit = snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0])? + removed;
+        if explicit >= 10_000 && removed * LARGE_DELETION > explicit {
+            return Err(Fallback(format!(
+                "{removed} of {explicit} explicit triples were removed, more than a full run handles faster"
+            ))
+            .into());
         }
     }
     progress(opts, 0.0, "reading the previous closure");

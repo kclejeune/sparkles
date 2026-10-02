@@ -128,7 +128,7 @@ pub struct Dataset {
 pub use crate::write_validation::Validation;
 
 /// Default of `serve --reason-cache-triples`.
-pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 20_000_000;
+pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 10_000_000;
 
 /// Install a store's write-time validation from its `validation.json`. A configuration
 /// that cannot be loaded leaves the dataset refusing writes (the store fails closed).

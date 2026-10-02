@@ -436,6 +436,44 @@ fn compaction_restarts_and_bulk_loads() {
 }
 
 #[test]
+fn large_deletions_run_in_full() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: String = (0..12_000)
+        .map(|i| format!("<{EX}i{i}> <{RDF}type> <{EX}C{}> .\n", i % 7))
+        .collect();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let p = Profile::RdfsSimple;
+    let cache = Cache::default();
+    let r = run(&s, &p, None, Some(&cache));
+    let since = r.receipt.unwrap().commit.seq;
+    let del: Vec<Triple> = (0..700)
+        .map(|i| t(&format!("ex:i{i}"), "rdf:type", &format!("ex:C{}", i % 7)))
+        .collect();
+    change(&s, &[], &del);
+    let r = run(&s, &p, Some(since), Some(&cache));
+    assert_eq!(r.method, Method::Full);
+    assert!(
+        r.fallback
+            .as_deref()
+            .unwrap()
+            .starts_with("700 of 12000 explicit"),
+        "{:?}",
+        r.fallback
+    );
+    // fewer go incrementally
+    let since = r.receipt.unwrap().commit.seq;
+    change(&s, &[], &[t("ex:i800", "rdf:type", "ex:C2")]);
+    let r = run(&s, &p, Some(since), Some(&cache));
+    assert_eq!(r.method, Method::Incremental, "{:?}", r.fallback);
+    check(&s, &p, &r, "one deletion");
+}
+
+#[test]
 fn fallbacks() {
     let s = Store::in_memory(StoreOptions::default());
     ttl(&s, "ex:B rdfs:subClassOf ex:A . ex:x a ex:B .");

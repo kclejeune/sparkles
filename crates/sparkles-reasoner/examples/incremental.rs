@@ -138,6 +138,17 @@ fn main() {
         r.millis,
         r.changes.map(|c| c.source)
     );
+    let rss = |what: &str| {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        if let Some(l) = status.lines().find(|l| l.starts_with("VmRSS")) {
+            println!("{what}: {l}");
+        }
+    };
+    rss("closure kept");
+    cache.clear();
+    rss("closure dropped");
+    let r = run(&s, &profile, Some(since), Some(&cache));
+    since = r.receipt.unwrap().commit.seq;
     let mut round = 0;
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     println!("change           memory ms  store ms  full ms  removed  derived  checked");

@@ -34,7 +34,7 @@ pub struct Cache {
 }
 
 /// Default of [`Cache::new`]'s limit.
-pub const DEFAULT_CACHE_TRIPLES: usize = 20_000_000;
+pub const DEFAULT_CACHE_TRIPLES: usize = 10_000_000;
 
 impl Default for Cache {
     fn default() -> Cache {
@@ -130,7 +130,23 @@ pub(crate) fn changes(
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
-    let kept = cache.and_then(|c| {
+    match kept_changes(store, since, snap, cache) {
+        Some(r) => r,
+        None => Err(format!(
+            "commit {since} cannot be compared with the head: {e:#}"
+        )),
+    }
+}
+
+/// The changes from `since` to `snap` from the deltas of the closure kept for `since`,
+/// when it is kept and `snap` is of the same generation. This takes no lock.
+pub(crate) fn kept_changes(
+    store: &Store,
+    since: u64,
+    snap: &Arc<Snapshot>,
+    cache: Option<&Cache>,
+) -> Option<Result<RawChanges, String>> {
+    let old = cache.and_then(|c| {
         let k = c.kept.lock();
         k.as_ref()
             .filter(|k| {
@@ -139,13 +155,8 @@ pub(crate) fn changes(
                     && Arc::ptr_eq(&k.snap.generation, &snap.generation)
             })
             .map(|k| k.snap.clone())
-    });
-    match kept {
-        Some(old) => delta_changes(&old, snap).map_err(|e| e.to_string()),
-        None => Err(format!(
-            "commit {since} cannot be compared with the head: {e:#}"
-        )),
-    }
+    })?;
+    Some(delta_changes(&old, snap).map_err(|e| e.to_string()))
 }
 
 /// Find the closure of the materialization at commit `since`, for an update with the
@@ -287,6 +298,16 @@ pub(crate) enum RawChanges {
 }
 
 impl RawChanges {
+    /// Triples removed from the default graph.
+    pub(crate) fn base_removed(&self) -> usize {
+        match self {
+            RawChanges::Ids(c) => c.base_removed.len(),
+            RawChanges::Quads { base, .. } => {
+                base.iter().filter(|(op, _)| *op == DiffOp::Remove).count()
+            }
+        }
+    }
+
     fn resolve(self, terms: &Terms) -> Changes {
         match self {
             RawChanges::Ids(c) => c,
