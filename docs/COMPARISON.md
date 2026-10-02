@@ -68,7 +68,7 @@ time, and this comparison draws on its public documentation.
 
 | Area | Fluree | Sparkles |
 |---|---|---|
-| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. No cross-commit history queries, diffs, branches or merges. |
+| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. Diffs between any two readable commits. No history queries across commits, branches or merges. |
 | Security | Access policies stored in the ledger, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | Per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers. No policy language, signed requests or encryption at rest. |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher with Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, an MCP server | SPARQL, the Rust API and an MCP server over stdio and HTTP. JSON-LD is an RDF format only. |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), vector search (`spk:vectorSearch`) with an HNSW index or exactly, and GeoSPARQL with a spatial index. Vector indexes have no quantization. |

@@ -7,6 +7,7 @@
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { receiptSummary } from '$lib/commits';
+  import { normalizeAt, validAt } from '$lib/history';
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny } from '$lib/fmt-wasm';
   import { formatFailure } from '$lib/fmt-view';
@@ -19,6 +20,7 @@
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import FullTextPanel from '$components/FullTextPanel.svelte';
   import HistoryPanel from '$components/HistoryPanel.svelte';
+  import SnapshotsPanel from '$components/SnapshotsPanel.svelte';
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
   import ShexPanel from '$components/ShexPanel.svelte';
@@ -33,6 +35,9 @@
 
   let stats = $state<api.DatasetStats | null>(null);
   let statsError = $state<api.ApiError | Error | null>(null);
+  /** The state the figures describe (`at=`): empty for the head. */
+  let statsAt = $state('');
+  const statsAtOk = $derived(validAt(statsAt));
   let loading = $state(false);
   let taskKick = $state(0);
   /** Bumped after anything that may have changed the dataset (panels reload). */
@@ -49,7 +54,8 @@
   async function loadStats() {
     loading = true;
     try {
-      stats = await api.datasetStats(name);
+      const at = statsAtOk ? (normalizeAt(statsAt) ?? undefined) : undefined;
+      stats = await api.datasetStats(name, at);
       statsError = null;
     } catch (e) {
       statsError = e as Error;
@@ -65,6 +71,7 @@
     const ds = name;
     untrack(() => {
       stats = null;
+      statsAt = '';
       void app.loadPrefixes(ds);
       void loadStats();
     });
@@ -483,6 +490,41 @@ ex:PersonShape a sh:NodeShape ;
   {/if}
 
   {#if stats}
+    <!-- the state the figures describe -->
+    <form
+      class="stats-at row"
+      onsubmit={(e) => {
+        e.preventDefault();
+        void loadStats();
+      }}
+    >
+      <label
+        title="Show the figures of a past state: a commit number, commit:N, time:<RFC 3339> or snapshot:NAME"
+      >
+        <span class="faint">State at</span>
+        <input
+          class="input sm mono"
+          class:invalid={!statsAtOk}
+          placeholder="head"
+          size="12"
+          bind:value={statsAt}
+        />
+      </label>
+      <button class="btn sm" disabled={!statsAtOk || loading}>Show</button>
+      {#if stats.at}
+        <span class="badge past" title="These figures describe a past state ({stats.at})"
+          >commit {stats.commit}</span
+        >
+        <button
+          type="button"
+          class="btn ghost sm"
+          onclick={() => {
+            statsAt = '';
+            void loadStats();
+          }}>Back to head</button
+        >
+      {/if}
+    </form>
     <!-- headline numbers -->
     <dl class="figures panel">
       <div>
@@ -626,6 +668,14 @@ ex:PersonShape a sh:NodeShape ;
 
         <!-- commit history -->
         <HistoryPanel {name} {info} refreshKey={refreshKick} />
+
+        <!-- named snapshots and retention -->
+        <SnapshotsPanel
+          {name}
+          canEdit={auth.can(name, 'admin') && !readOnly}
+          refreshKey={refreshKick}
+          onchange={() => refreshKick++}
+        />
 
         <!-- SHACL validation -->
         <section class="panel">
@@ -1470,5 +1520,23 @@ ex:PersonShape a sh:NodeShape ;
     .figures > div:nth-last-child(-n + 2) {
       border-bottom: 0;
     }
+  }
+  .stats-at {
+    gap: 8px;
+    margin: 0 0 8px;
+    font-size: var(--fs-sm);
+    flex-wrap: wrap;
+  }
+  .stats-at label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .stats-at input.invalid {
+    border-color: var(--danger);
+  }
+  .badge.past {
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: var(--warn);
   }
 </style>

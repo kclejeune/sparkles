@@ -1,7 +1,7 @@
 //! Point-in-time reads (`?at=`) and the named snapshot and history endpoints.
 
 use super::*;
-use sparkles::history::{At, HistoryOptions, NamedSnapshot, Resolved, Retention};
+use sparkles::history::{At, HistoryOptions, NamedSnapshot, Resolved, Retention, Schedule};
 use sparkles::store::Snapshot;
 
 pub(super) const SPARKLES_AT: &str = "sparkles-at";
@@ -131,6 +131,7 @@ fn snapshot_json(s: &NamedSnapshot) -> J {
         "seq": s.seq,
         "commit": s.commit,
         "created": sparkles::commit::rfc3339_ms(s.created_ms),
+        "expires": s.expires_ms.map(sparkles::commit::rfc3339_ms),
         "note": s.note,
         "generation": s.generation,
         "reconstructable": s.reconstructable,
@@ -154,6 +155,7 @@ fn history_json(name: &str, ds: &Dataset, h: &sparkles::history::HistoryStatus) 
             "heldBy": g.held_by.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "retention": retention_json(h.retention),
+        "schedules": ds.store.schedules().iter().map(schedule_json).collect::<Vec<_>>(),
         "snapshots": h.snapshots,
         "cache": {
             "entries": h.cache_entries,
@@ -169,11 +171,43 @@ fn retention_json(r: Retention) -> J {
     json!({
         "keepCommits": r.keep_commits,
         "keepAge": r.keep_age_ms.map(|ms| format!("{}s", ms / 1000)),
+        "maxBytes": r.max_bytes,
     })
 }
 
+fn schedule_json(s: &Schedule) -> J {
+    json!({
+        "prefix": s.prefix,
+        "every": format!("{}s", s.every_ms / 1000),
+        "keepLast": s.keep_last,
+    })
+}
+
+/// A size in bytes: a number, or a string with a binary suffix (`512MiB`, `10GiB`,
+/// `K`, `M`, `G`, `T`).
+pub(crate) fn parse_size(v: &J) -> Option<u64> {
+    match v {
+        J::Number(n) => n.as_u64(),
+        J::String(s) => {
+            let s = s.trim();
+            let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let n: u64 = s[..digits].parse().ok()?;
+            let shift = match s[digits..].trim().to_ascii_lowercase().as_str() {
+                "" | "b" => 0,
+                "k" | "kib" => 10,
+                "m" | "mib" => 20,
+                "g" | "gib" => 30,
+                "t" | "tib" => 40,
+                _ => return None,
+            };
+            n.checked_mul(1 << shift)
+        }
+        _ => None,
+    }
+}
+
 /// `"7d"`, `"12h"`, `"30m"`, `"90s"`, `"2w"`, or a number of seconds.
-fn parse_age(v: &J) -> Option<u64> {
+pub(crate) fn parse_age(v: &J) -> Option<u64> {
     match v {
         J::Number(n) => n.as_u64().map(|s| s * 1000),
         J::String(s) => {
@@ -220,9 +254,11 @@ pub(super) async fn create_snapshot(
         "application/json" => {
             let j: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
-            for k in ["name", "at", "note"] {
-                if let Some(v) = j.get(k).and_then(J::as_str) {
-                    params.0.push((k.to_string(), v.to_string()));
+            for k in ["name", "at", "note", "expires"] {
+                match j.get(k) {
+                    Some(J::String(v)) => params.0.push((k.to_string(), v.clone())),
+                    Some(J::Number(n)) => params.0.push((k.to_string(), n.to_string())),
+                    _ => {}
                 }
             }
         }
@@ -234,8 +270,31 @@ pub(super) async fn create_snapshot(
         .to_string();
     let at = at_param(&params)?.unwrap_or(At::Head);
     let note = params.get("note").map(str::to_string);
+    // an RFC 3339 instant, or a duration from now
+    let expires = match params.get("expires") {
+        None => None,
+        Some(e) => Some(
+            match format!("time:{e}").parse::<At>() {
+                Ok(At::Time(ms)) => Some(ms),
+                _ => None,
+            }
+            .or_else(|| {
+                parse_age(&J::String(e.to_string()))
+                    .or_else(|| e.parse::<u64>().ok().map(|s| s * 1000))
+                    .map(|ms| now_ms() + ms as i64)
+            })
+            .ok_or_else(|| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "expires must be an RFC 3339 time or a duration like 90s, 30m, 12h, 7d, 2w",
+                )
+            })?,
+        ),
+    };
     blocking(move || {
-        let (snap, created) = ds.store.create_snapshot(&snap_name, &at, note)?;
+        let (snap, created) = ds
+            .store
+            .create_snapshot_with(&snap_name, &at, note, expires)?;
         let status = if created {
             StatusCode::CREATED
         } else {
@@ -325,15 +384,74 @@ pub(super) async fn put_history(
             )
         })?),
     };
+    let max_bytes = match j.get("maxBytes") {
+        None | Some(J::Null) => None,
+        Some(v) => Some(parse_size(v).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "maxBytes must be a number of bytes or a size like 512MiB, 10GiB",
+            )
+        })?),
+    };
     let r = Retention {
         keep_commits,
         keep_age_ms,
+        max_bytes,
+    };
+    // `schedules` replaces the pin schedules when present
+    let schedules = match j.get("schedules") {
+        None => None,
+        Some(J::Null) => Some(Vec::new()),
+        Some(J::Array(a)) => Some(
+            a.iter()
+                .map(schedule_param)
+                .collect::<ApiResult<Vec<_>>>()?,
+        ),
+        Some(_) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "schedules must be an array or null",
+            ));
+        }
     };
     blocking(move || {
+        if let Some(s) = schedules {
+            ds.store.set_schedules(s)?;
+        }
         let h = ds.store.set_retention(r)?;
         Ok(Json(history_json(&ds.name, &ds, &h)))
     })
     .await
+}
+
+/// The wall clock in milliseconds since the epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A schedule of a `PUT /$/history/{ds}` body.
+fn schedule_param(s: &J) -> ApiResult<Schedule> {
+    let bad = || {
+        err(
+            StatusCode::BAD_REQUEST,
+            r#"a schedule is {"prefix": string, "every": duration, "keepLast": number}"#,
+        )
+    };
+    Ok(Schedule {
+        prefix: s
+            .get("prefix")
+            .and_then(J::as_str)
+            .ok_or_else(bad)?
+            .to_string(),
+        every_ms: s.get("every").and_then(parse_age).ok_or_else(bad)?,
+        keep_last: s
+            .get("keepLast")
+            .and_then(J::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(bad)?,
+    })
 }
 
 /// `reconstructable` ranges and per-commit flags for the commit listing.
@@ -370,4 +488,191 @@ pub(super) fn commit_list_extras(
         ranges(&h.reconstructable),
         list,
     )
+}
+
+/// Run [`Store::history_tick`](sparkles::store::Store::history_tick) on every dataset
+/// every `every`: pin expiry, scheduled pins, and collection of history that aged out.
+pub(crate) fn spawn_tick(st: Arc<AppState>, every: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let all: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+            for ds in all {
+                let name = ds.name.clone();
+                match tokio::task::spawn_blocking(move || ds.store.history_tick()).await {
+                    Ok(Ok(r)) => {
+                        for n in &r.created {
+                            tracing::info!("dataset {name}: scheduled snapshot {n}");
+                        }
+                        for n in r.expired.iter().chain(&r.rotated) {
+                            tracing::info!("dataset {name}: removed snapshot {n}");
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("dataset {name}: history upkeep failed: {e}"),
+                    Err(e) => tracing::warn!("dataset {name}: history upkeep panicked: {e}"),
+                }
+            }
+        }
+    });
+}
+
+/// History metrics in the Prometheus text format: retained bytes, named snapshots,
+/// cache hits and misses, and materializations with their time.
+pub(crate) fn metrics(st: &AppState, out: &mut String) {
+    use std::fmt::Write;
+    let datasets: Vec<Arc<Dataset>> = st.datasets.read().values().cloned().collect();
+    if datasets.is_empty() {
+        return;
+    }
+    // by dataset label: datasets beyond the label cap are summed under one
+    let mut all: std::collections::BTreeMap<String, [f64; 7]> = Default::default();
+    for ds in datasets {
+        let h = ds.store.history();
+        let e = all
+            .entry(st.metrics.dataset_label(Some(&ds.name)))
+            .or_default();
+        let v = [
+            h.bytes as f64,
+            h.snapshots as f64,
+            h.cache_entries as f64,
+            h.hits as f64,
+            h.misses as f64,
+            h.materializations as f64,
+            h.materialize_seconds,
+        ];
+        for (x, y) in e.iter_mut().zip(v) {
+            *x += y;
+        }
+    }
+    let label = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    let families: [(&str, &str, &str); 7] = [
+        (
+            "sparkles_history_bytes",
+            "gauge",
+            "Disk used by retained past generations.",
+        ),
+        ("sparkles_history_snapshots", "gauge", "Named snapshots."),
+        (
+            "sparkles_history_cache_entries",
+            "gauge",
+            "Past states held in memory.",
+        ),
+        (
+            "sparkles_history_cache_hits_total",
+            "counter",
+            "Past-state reads served from memory.",
+        ),
+        (
+            "sparkles_history_cache_misses_total",
+            "counter",
+            "Past-state reads that had to be materialized.",
+        ),
+        (
+            "sparkles_history_materialize_seconds_count",
+            "counter",
+            "Past states materialized by replaying a write-ahead log.",
+        ),
+        (
+            "sparkles_history_materialize_seconds_sum",
+            "counter",
+            "Time spent materializing past states.",
+        ),
+    ];
+    for (i, (name, kind, help)) in families.into_iter().enumerate() {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        for (ds, v) in &all {
+            let _ = writeln!(out, "{name}{{dataset=\"{}\"}} {}", label(ds), v[i]);
+        }
+    }
+}
+
+/// The instant of an `Accept-Datetime` request header (RFC 7089 §2.1.1), in
+/// milliseconds. `None` without the header; `400` for a malformed one.
+pub(super) fn accept_datetime(headers: &HeaderMap) -> ApiResult<Option<i64>> {
+    let Some(v) = headers.get("accept-datetime") else {
+        return Ok(None);
+    };
+    let t = v
+        .to_str()
+        .ok()
+        .and_then(|s| httpdate::parse_http_date(s.trim()).ok())
+        .ok_or_else(|| {
+            code_err(
+                StatusCode::BAD_REQUEST,
+                "invalid-accept-datetime",
+                "Accept-Datetime must be an HTTP date, like Wed, 30 Sep 2026 14:03:11 GMT",
+            )
+        })?;
+    let ms = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    // an HTTP date has whole seconds: the state as of the end of that second
+    Ok(Some(ms + 999))
+}
+
+/// TimeGate negotiation (RFC 7089 §4.1.2, a 200-style one where the original resource is
+/// its own TimeGate): the readable commit that best matches instant `ms`, the last one
+/// at or before it, clamped to the oldest readable commit.
+pub(super) fn negotiate_datetime(ds: &Dataset, ms: i64) -> sparkles::Result<At> {
+    let h = ds.store.history();
+    let wanted = match ds.store.resolve(&At::Time(ms)) {
+        Ok(r) => r.commit.seq,
+        // before the first commit the catalog has
+        Err(sparkles::Error::NotFound(_)) => 0,
+        Err(e) => return Err(e),
+    };
+    let readable = &h.reconstructable;
+    let seq = readable
+        .iter()
+        .rev()
+        .find_map(|&(a, b)| (a <= wanted).then_some(wanted.min(b)))
+        .or_else(|| readable.first().map(|r| r.0))
+        .unwrap_or(h.head);
+    Ok(At::Commit(seq))
+}
+
+/// The headers of a memento chosen by `Accept-Datetime`: `Memento-Datetime`,
+/// `Content-Location` (the URI of the memento itself, with `at`), `Vary` and a `Link` to
+/// the original resource, which is also the TimeGate.
+pub(super) fn memento_headers(mut resp: Response, r: &Resolved, uri: &Uri) -> Response {
+    let h = resp.headers_mut();
+    let t = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(r.commit.timestamp_ms.max(0) as u64);
+    if let Ok(v) = header::HeaderValue::from_str(&httpdate::fmt_http_date(t)) {
+        h.insert("memento-datetime", v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(&r.at.to_string()) {
+        h.insert(SPARKLES_AT, v);
+    }
+    h.insert(SPARKLES_HEAD, r.head.into());
+    let path = uri.path();
+    let query = uri.query().unwrap_or("");
+    let sep = if query.is_empty() { "" } else { "&" };
+    let memento = format!("{path}?{query}{sep}at=commit:{}", r.commit.seq);
+    if let Ok(v) = header::HeaderValue::from_str(&memento) {
+        h.insert(header::CONTENT_LOCATION, v);
+    }
+    let original = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    if let Ok(v) =
+        header::HeaderValue::from_str(&format!("<{original}>; rel=\"original timegate\""))
+    {
+        h.insert(header::LINK, v);
+    }
+    h.append(
+        header::VARY,
+        header::HeaderValue::from_static("accept-datetime"),
+    );
+    resp
 }

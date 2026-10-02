@@ -90,6 +90,7 @@ pub const FAIL_BEFORE_RENAME: &str = "fail-before-rename";
 /// Setting `cancel` stops the clone before the rename with `sparkles::Error::Cancelled`,
 /// leaving nothing behind.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clone_into(
     store: &Store,
     name: &str,
@@ -99,6 +100,24 @@ pub fn clone_into(
     inferences: Inferences,
     progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
+) -> Result<CloneReport> {
+    clone_into_at(
+        store, name, reasoning, tmp, dst, inferences, progress, cancel, None,
+    )
+}
+
+/// [`clone_into`] of the state at `at` (the head when `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn clone_into_at(
+    store: &Store,
+    name: &str,
+    reasoning: Option<ReasoningInfo>,
+    tmp: &Path,
+    dst: &Path,
+    inferences: Inferences,
+    progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
+    at: Option<sparkles::history::At>,
 ) -> Result<CloneReport> {
     if tmp.exists() {
         bail!("{} already exists", tmp.display());
@@ -114,6 +133,7 @@ pub fn clone_into(
         },
         cancel: cancel.clone(),
         progress,
+        at,
     };
     let report = store.clone_to(tmp, &opts)?;
     let mut guard = RemoveDir(Some(tmp.to_path_buf()));

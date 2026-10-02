@@ -46,8 +46,9 @@ running queries.
 **Storage and engine**
 * MVCC snapshots with a single writer and a crash-safe WAL. Compaction writes immutable
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
-* Durable commit ids, and point-in-time reads by commit (`?at=commit:N`), time or named
-  snapshot ([API](docs/API.md#point-in-time-reads-and-snapshots)).
+* Durable commit ids, point-in-time reads by commit (`?at=commit:N`), time or named
+  snapshot, and diffs between any two readable commits
+  ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
   writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
@@ -117,7 +118,7 @@ running queries.
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The reference Java stack. It has ARQ, TDB2 on B+trees, Fuseki, on-the-fly inference, jena-text and GeoSPARQL. | Sparkles has the same protocols, endpoints, admin API and CLI model, on sorted columnar indexes. It is 1.8–580× faster at 10.5M triples. Reasoning is materialized only, and there are no ARQ extensions, RDF Patch or ontology API. |
 | [QLever](https://github.com/ad-freiburg/qlever) | A C++ engine for billions of triples, with lazy, streaming execution. | Sparkles uses the same index and execution architecture and adds exact term identity, MVCC updates, the Graph Store Protocol, reasoning and SHACL. It wins 19 of 20 queries at 10.5M triples and ties the other. It has been measured only up to 10.5M triples, and it materializes intermediate results. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | A Rust database and toolkit on RocksDB, with Python and WebAssembly packages. | Sparkles uses Oxigraph's parsers, SPARQL parser and datatypes, with its own storage and planner. It is 1.5–465× faster at 10.5M triples and fsyncs its writes. It adds reasoning, validation, search, authentication and a UI, but has Rust bindings only. |
-| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads and snapshots, but no branches, history queries, policy language or clustering. It is faster on most queries and slower on a few single-pattern scans. |
+| [Fluree](https://github.com/fluree/db) | A versioned, permissioned ledger with clustering, licensed under BUSL-1.1. JSON-LD is its main interface. | Sparkles passes the W3C SPARQL suites in full and is compatible with Fuseki. It has point-in-time reads, snapshots and diffs, but no branches, history queries, policy language or clustering. It is faster on most queries and slower on a few single-pattern scans. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the feature gaps per engine, the places
 where Sparkles departs from Jena and QLever on purpose, and the optimizations it adopted
@@ -205,7 +206,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `serve` | Run the SPARQL server with the web UI. |
 | `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
 | `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics or the commit history, and verify a database. |
-| `snapshot` | Manage named snapshots and history retention for point-in-time reads. |
+| `snapshot`, `diff` | Manage named snapshots, pin schedules and history retention for point-in-time reads, and show the quads added and removed between two commits. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |
 | `shacl`, `shex`, `validation` | Validate with SHACL or ShEx, and configure write-time guards. |

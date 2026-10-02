@@ -762,6 +762,7 @@ the original. Parameters come from the query string, a form body or a JSON body:
 |---|---|---|
 | `name` | yes | Name of the new dataset. |
 | `inferences` | no, default `copy` | `copy` copies the inferred graph and the reasoning status. `drop` copies neither. |
+| `at` | no, default the head | A past state to copy, with the selectors of [point-in-time reads](#point-in-time-reads-and-snapshots). Its commit becomes `forkedFrom.seq`. |
 
 The copy has every quad of every graph, including blank-node graph names and triple
 terms. It keeps the same blank-node ids (`_:b<hex>` labels) and the prefixes, and gets a
@@ -798,7 +799,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 };
 ```
 
-`sparkles clone --loc SRC --to DST [--inferences copy|drop]` does the same offline. `DST`
+`sparkles clone --loc SRC --to DST [--inferences copy|drop] [--at SEL]` does the same offline. `DST`
 must not exist or must be empty. `SRC` must be a database that no server has open.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
@@ -964,15 +965,18 @@ lists commits without taking the database lock, so it works next to a running se
 
 The design and its rationale are in [F06 Named snapshots and point-in-time queries](specs/F06-snapshots-and-point-in-time.md).
 
-Every commit since the dataset's last compaction or bulk commit can be read at no extra
-cost. Its state is the current index generation plus a prefix of its write-ahead log.
-Older commits stay readable while a **named snapshot** or the **retention window** keeps
-the generation that holds them. Compaction and bulk commits then keep that generation
-instead of deleting it. Only persistent datasets have history.
+Every commit since a persistent dataset's last compaction or bulk commit can be read at no
+extra cost. Its state is the current index generation plus a prefix of its write-ahead
+log. Older commits stay readable while a **named snapshot** or the **retention window**
+keeps the generation that holds them. Compaction and bulk commits then keep that
+generation instead of deleting it. An in-memory dataset keeps past states only for its
+named snapshots and its retention window. It holds them in memory, where they share most
+of their structure with the live state.
 
 **Selector.** The `at` parameter, in the query string or a form body, selects the state
-to read. `/{ds}/sparql`, `/{ds}/query`, `/{ds}?query=`, `/{ds}/explain` and Graph Store
-`GET`/`HEAD` accept it.
+to read. `/{ds}/sparql`, `/{ds}/query`, `/{ds}?query=`, `/{ds}/explain`, Graph Store
+`GET`/`HEAD`, `/{ds}/shacl`, `/$/stats/{ds}` and `/$/schema/{ds}…` accept it, and so do
+clones and dumps (see below).
 
 | `at` | State |
 |---|---|
@@ -989,6 +993,20 @@ freshness of inferences (`Sparkles-Inferences`) is reported for the live state o
 works at any commit, and a past commit is always searched exactly. Writes with `at`, even `at=head`, are refused with `400` and
 `code: "at-on-write"`.
 
+A Graph Store `GET` with `at` gets the entity tag of the commit it read (see
+[Entity tags and conditional requests](#entity-tags-and-conditional-requests)), so
+`If-None-Match` revalidates it with `304`.
+
+**Accept-Datetime.** A Graph Store `GET` or `HEAD` without `at` acts as its own Memento
+TimeGate (RFC 7089, 200-style negotiation). With an `Accept-Datetime` header, such as
+`Accept-Datetime: Wed, 30 Sep 2026 14:03:11 GMT`, the response is the last readable
+commit at or before the end of that second. A time before the oldest
+readable commit gets that commit, as RFC 7089 asks, where `at=time:` answers `404`. The
+response carries `Memento-Datetime`, `Content-Location` with the memento's own URL
+(`…&at=commit:42`), `Link: <…>; rel="original timegate"` and `Vary: accept-datetime`.
+Every other Graph Store `GET` sends `Vary: accept-datetime` too. A malformed header is
+`400` with `code: "invalid-accept-datetime"`.
+
 Errors carry a `code`. A malformed selector is `400 invalid-at`. A commit beyond the
 head, an unknown snapshot or a time before history is a `404`. A commit whose data is no
 longer kept is `410 history-gone`, and the body lists the readable ranges:
@@ -999,29 +1017,81 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
-In-memory datasets return `501 history-unsupported`. Materializing a past state is bounded
-by `--history-cache-mb` (default 1024, `507` beyond it) and by the request timeout. Results
-are cached, and one materialization runs at a time.
+Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
+beyond it) and by the request timeout. Results are cached, and one materialization runs
+at a time.
+
+### Diffs between commits
+
+`GET /{ds}/diff?from=SEL&to=SEL` returns the net change between two readable states. The
+added quads are those `to` has and `from` lacks, and the removed quads are the reverse.
+Both parameters take
+the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
+`?to=commit:42` shows what commit 42 changed. The two may come in either order.
+`graph=IRI` or `default` limits the diff to one graph.
+
+| Format | How to ask | Body |
+|---|---|---|
+| JSON (default) | `Accept: application/json` or `format=json` | Counts, and the quads with `quads=true`. |
+| Diff lines | `Accept: text/x-sparkles-diff` or `format=diff` | One N-Quads line per change, marked `+ ` or `- `. |
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:1", "commit": { "seq": 1, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "added": 2, "removed": 1, "method": "log", "logChanges": 3, "compared": 0,
+  "quads": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+               "object": "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>", "graph": null }, … ] }
+```
+
+```
+- <urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
++ <urn:c> <urn:p> "three" .
++ <urn:b> <urn:p> "2"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .
+```
+
+Removals come first, then additions, each ordered by graph, subject, predicate and
+object. `limit=N` caps the quads listed, not the counts. The headers
+`Sparkles-Diff-From`, `Sparkles-Diff-To`, `Sparkles-Diff-Added` and
+`Sparkles-Diff-Removed` carry the commits and counts in either format. A large body is
+streamed, and `--max-export-mb` caps it. The change set counts against the rows budget
+(`--max-rows`), and a diff beyond it fails with `507` and `budget: "rows"`. A diff
+between two `commit:` selectors never changes, so it gets a weak entity tag and answers
+`If-None-Match` with `304`.
+
+`method` says how the diff was computed. Every change a write-ahead log records took
+effect, so the net change is the symmetric difference of the changes between the two
+commits. Within the retained generations Sparkles reads only those log records,
+compactions included, and its memory grows with the quads that changed. That is
+`"log"`. A bulk commit has no log records, and a collected generation leaves a gap. Those
+stretches are compared state against state with a sorted merge, which reads both states
+in full. That is `"compare"`, and in-memory datasets always use it.
+
+### Named snapshots and retention
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note? }`, as JSON, a form or the query string. Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
-| PUT | `/$/history/{ds}` | Sets the retention window `{ keepCommits?: number \| null, keepAge?: "7d" \| seconds \| null }` and returns `HistoryStatus`. |
+| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules? }`. `schedules` replaces the pin schedules when it is present. |
 
 ```ts
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
-  created: string; note: string | null; generation: string | null; reconstructable: boolean };
+  created: string; expires: string | null; note: string | null;
+  generation: string | null; reconstructable: boolean };
+type Retention = { keepCommits: number | null;      // the last N commits
+  keepAge: string | null;                            // "7d", or seconds
+  maxBytes: number | null };                         // a number, or "10GiB" in a PUT
+type Schedule = { prefix: string; every: string; keepLast: number };
 type HistoryStatus = { dataset: string; datasetId: string; head: number;
   oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
   bytes: number;   // disk of kept non-current generations
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
                  current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
-  retention: { keepCommits: number | null; keepAge: string | null };
-  snapshots: number;
+  retention: Retention; schedules: Schedule[]; snapshots: number;
   cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
 ```
 
@@ -1031,12 +1101,48 @@ Removing a generation first renames it to `gen-NNNN.deleting`, so an interrupted
 is finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable` and
 `reconstructable`, plus `reconstructable` and `snapshots` on each commit.
 
-The CLI has `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT]`,
-`snapshot list|history --loc DB [--format json]`, `snapshot delete --loc DB NAME`,
-`snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--off]`,
-`sparkles query --loc DB --at SEL …` and `sparkles dump --loc DB --at SEL`. These commands
-open the database, so stop a server that holds it or use the HTTP API. The Rust API has
-`Store::snapshot_at`, `create_snapshot`, `set_retention` and `history`.
+`maxBytes` caps the disk used by generations that only the retention window keeps. When
+the kept generations together exceed it, the oldest window-only generations are removed
+first. Pins and backups in progress always keep their generations.
+
+A **schedule** pins the head every `every` (at least a minute) as `PREFIX` followed by the
+UTC time, for example `daily-20261002T140311Z`. It skips a pin when its newest one
+already holds the head, and keeps only its newest `keepLast` pins. A server runs the
+history upkeep every minute. The upkeep removes pins past their expiry, makes the pins
+that schedules call for, and removes the history that has aged out of the window. A
+read-only server does not run it.
+
+**Past states elsewhere.** `/$/stats/{ds}?at=` describes a past state, and every stats
+response carries `commit`, `at` and a `history` summary. `/$/schema/{ds}?at=` discovers
+the schema of a past state, and its cursors stay valid because a past state never
+changes. `/{ds}/shacl?at=` validates a past state. `POST /$/datasets/{ds}/clone` takes
+`at` in its JSON or form body and records the commit as `forkedFrom.seq`.
+`POST /$/backup/{ds}?at=` dumps a past state and names the file after its commit. A
+selector that cannot be read fails before a clone or dump task starts.
+
+**Metrics.** `/$/metrics` reports `sparkles_history_bytes`, `sparkles_history_snapshots`
+and `sparkles_history_cache_entries` per dataset. It also reports the counters
+`sparkles_history_cache_hits_total`, `sparkles_history_cache_misses_total`,
+`sparkles_history_materialize_seconds_count` and
+`sparkles_history_materialize_seconds_sum`.
+
+**CLI.** The history commands are these:
+
+* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d]`
+* `sparkles snapshot list|history --loc DB [--format json]`
+* `sparkles snapshot delete --loc DB NAME`
+* `sparkles snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--max-bytes 10GiB] [--off]`
+* `sparkles snapshot schedule --loc DB --prefix daily- --every 1d [--keep-last 7]`, or
+  `--remove PREFIX`, or no options to list the schedules
+* `sparkles snapshot gc --loc DB`, which runs the history upkeep once
+* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count]`
+* `sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL` and
+  `sparkles clone --loc DB --to DIR --at SEL`
+
+These commands open the database, so stop a server that holds it or use the HTTP API.
+`sparkles log` reads without the lock and marks with `*` the commits a point-in-time read
+can see. The Rust API has `Store::snapshot_at`, `diff`, `create_snapshot_with`,
+`set_retention`, `set_schedules`, `history_tick` and `history`.
 
 ## Backup repositories
 

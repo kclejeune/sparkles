@@ -21,6 +21,9 @@ class AppState {
   /** A query another page wants opened in a new Query tab. */
   pendingQuery = $state<{ query: string; title?: string } | null>(null);
 
+  /** The state the Query page reads (`at=`): empty for the head. */
+  queryAt = $state('');
+
   setDataset(name: string | null) {
     this.current = name;
     saveRaw('sparkles.dataset', name);

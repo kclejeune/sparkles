@@ -110,6 +110,10 @@ enum SnapshotCmd {
         at: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// Remove the pin after this duration (90s, 30m, 12h, 7d, 2w) or at this RFC 3339
+        /// time (a running server's history upkeep, or the next `snapshot gc`)
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// List named snapshots
     List {
@@ -141,9 +145,36 @@ enum SnapshotCmd {
         keep_commits: Option<u64>,
         #[arg(long)]
         keep_age: Option<String>,
+        /// At most this much disk for generations only the window keeps (512MiB, 10GiB)
+        #[arg(long)]
+        max_bytes: Option<String>,
         /// turn retention off
-        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age"])]
+        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age", "max_bytes"])]
         off: bool,
+    },
+    /// Pin the head on a schedule as PREFIX<UTC time> and keep the newest few; without
+    /// --every, list the schedules (or remove one with --remove)
+    Schedule {
+        #[arg(long)]
+        loc: PathBuf,
+        /// the names' prefix, such as daily-
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        prefix: Option<String>,
+        /// how often (30m, 12h, 1d, 1w)
+        #[arg(long, requires = "prefix")]
+        every: Option<String>,
+        /// how many of the schedule's snapshots to keep
+        #[arg(long, default_value_t = 7)]
+        keep_last: u32,
+        /// remove the schedule with this prefix (its snapshots stay)
+        #[arg(long)]
+        remove: Option<String>,
+    },
+    /// Drop expired pins, make the pins schedules call for, and collect the history
+    /// nothing keeps any more (a running server does this every minute)
+    Gc {
+        #[arg(long)]
+        loc: PathBuf,
     },
 }
 
@@ -173,10 +204,23 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             name,
             at,
             note,
+            expires,
         } => {
             let store = Store::open(&loc, opts)?;
             let at: At = at.as_deref().unwrap_or("head").parse()?;
-            let (s, created) = store.create_snapshot(&name, &at, note)?;
+            let expires = match expires {
+                None => None,
+                Some(e) => Some(match format!("time:{e}").parse::<At>() {
+                    Ok(At::Time(ms)) => ms,
+                    _ => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as i64;
+                        now + parse_duration_ms(&e)? as i64
+                    }
+                }),
+            };
+            let (s, created) = store.create_snapshot_with(&name, &at, note, expires)?;
             println!(
                 "{} → commit {}{}",
                 s.name,
@@ -237,6 +281,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             loc,
             keep_commits,
             keep_age,
+            max_bytes,
             off,
         } => {
             let store = Store::open(&loc, opts)?;
@@ -246,11 +291,141 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                 Retention {
                     keep_commits,
                     keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                    max_bytes: max_bytes
+                        .map(|b| {
+                            http::history::parse_size(&serde_json::Value::String(b.clone()))
+                                .with_context(|| format!("invalid size {b:?}: use 512MiB, 10GiB"))
+                        })
+                        .transpose()?,
                 }
             };
             print_history(&store.set_retention(r)?, "text")?;
         }
+        SnapshotCmd::Schedule {
+            loc,
+            prefix,
+            every,
+            keep_last,
+            remove,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let mut all = store.schedules();
+            if let Some(p) = remove {
+                let before = all.len();
+                all.retain(|s| s.prefix != p);
+                if all.len() == before {
+                    bail!("no schedule with the prefix {p:?}");
+                }
+                store.set_schedules(all.clone())?;
+            } else if let (Some(prefix), Some(every)) = (prefix, every) {
+                all.retain(|s| s.prefix != prefix);
+                all.push(sparkles::history::Schedule {
+                    prefix,
+                    every_ms: parse_duration_ms(&every)?,
+                    keep_last,
+                });
+                store.set_schedules(all.clone())?;
+            }
+            for s in &all {
+                println!(
+                    "{}<time>  every {}s  keep {}",
+                    s.prefix,
+                    s.every_ms / 1000,
+                    s.keep_last
+                );
+            }
+        }
+        SnapshotCmd::Gc { loc } => {
+            let store = Store::open(&loc, opts)?;
+            let t = store.history_tick()?;
+            for n in &t.created {
+                println!("created {n}");
+            }
+            for n in t.expired.iter().chain(&t.rotated) {
+                println!("removed {n}");
+            }
+            print_history(&store.history(), "text")?;
+        }
     }
+    Ok(())
+}
+
+fn diff_cmd(
+    loc: &std::path::Path,
+    from: &str,
+    to: &str,
+    graph: Option<&str>,
+    format: &str,
+    opts: StoreOptions,
+) -> Result<()> {
+    use sparkles::store::{DiffOp, DiffOptions};
+    if !matches!(format, "diff" | "json" | "count") {
+        bail!("unknown format {format:?}: use diff, json or count");
+    }
+    let store = Store::open(loc, opts)?;
+    let graph = match graph {
+        None => None,
+        Some("default") => Some(oxrdf::GraphName::DefaultGraph),
+        Some(g) => Some(oxrdf::GraphName::NamedNode(
+            oxrdf::NamedNode::new(g).with_context(|| format!("invalid graph IRI {g:?}"))?,
+        )),
+    };
+    let t = Instant::now();
+    let d = store.diff(
+        &from.parse()?,
+        &to.parse()?,
+        &DiffOptions {
+            graph,
+            ..Default::default()
+        },
+    )?;
+    eprintln!(
+        "commit {} → commit {}: +{} −{} ({}, {:.1} ms)",
+        d.from.commit.seq,
+        d.to.commit.seq,
+        d.added,
+        d.removed,
+        d.method.as_str(),
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    match format {
+        "count" => writeln!(out, "+{} -{}", d.added, d.removed)?,
+        "json" => {
+            let quads: Vec<serde_json::Value> = d
+                .iter()
+                .map(|(op, q)| {
+                    serde_json::json!({
+                        "op": op.sign().to_string(),
+                        "subject": q.subject.to_string(),
+                        "predicate": q.predicate.to_string(),
+                        "object": q.object.to_string(),
+                        "graph": match &q.graph_name {
+                            oxrdf::GraphName::DefaultGraph => serde_json::Value::Null,
+                            g => g.to_string().into(),
+                        },
+                    })
+                })
+                .collect();
+            let j = serde_json::json!({
+                "from": { "selector": d.from.at.to_string(), "commit": d.from.commit },
+                "to": { "selector": d.to.at.to_string(), "commit": d.to.commit },
+                "added": d.added,
+                "removed": d.removed,
+                "method": d.method.as_str(),
+                "quads": quads,
+            });
+            serde_json::to_writer_pretty(&mut out, &j)?;
+            writeln!(out)?;
+        }
+        _ => {
+            for (op, q) in d.iter() {
+                let sign = if op == DiffOp::Add { '+' } else { '-' };
+                writeln!(out, "{sign} {}", sparkles::annotations::nquads_line(&q))?;
+            }
+        }
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -303,10 +478,16 @@ fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<(
         match (r.keep_commits, r.keep_age_ms) {
             (None, None) => "off".to_string(),
             (c, a) => format!(
-                "{}{}",
+                "{}{}{}",
                 c.map(|c| format!("last {c} commits ")).unwrap_or_default(),
-                a.map(|a| format!("last {}s", a / 1000)).unwrap_or_default()
-            ),
+                a.map(|a| format!("last {}s ", a / 1000))
+                    .unwrap_or_default(),
+                r.max_bytes
+                    .map(|b| format!("at most {} MiB", b >> 20))
+                    .unwrap_or_default()
+            )
+            .trim_end()
+            .to_string(),
         }
     );
     Ok(())
@@ -846,6 +1027,9 @@ enum Cmd {
         /// `copy` the materialized inferences and reasoning status, or `drop` them
         #[arg(long, default_value = "copy")]
         inferences: String,
+        /// clone a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
     },
     /// Print database statistics
     Stats {
@@ -867,6 +1051,21 @@ enum Cmd {
         /// Metadata only: no block decoding, no per-key vocabulary or checksum pass
         #[arg(long)]
         quick: bool,
+    },
+    /// The quads added and removed between two commits (N, commit:N, time:<RFC 3339>,
+    /// snapshot:NAME, head)
+    Diff {
+        #[arg(long)]
+        loc: PathBuf,
+        from: String,
+        #[arg(default_value = "head")]
+        to: String,
+        /// only this graph (an IRI, or `default`)
+        #[arg(long)]
+        graph: Option<String>,
+        /// diff (lines marked + and -), json, or count
+        #[arg(long, default_value = "diff")]
+        format: String,
     },
     /// List the database's commits (works while a server holds the database)
     Log {
@@ -1125,6 +1324,9 @@ fn print_log(
     let head = all.last().map_or(0, |c| c.seq);
     let first = all.first().map_or(0, |c| c.seq);
     let notes = sparkles::annotations::read(loc)?;
+    // commits a point-in-time read can still see
+    let readable = sparkles::history::reconstructable_offline(loc, id).unwrap_or_default();
+    let readable_at = |s: u64| readable.iter().any(|&(a, b)| a <= s && s <= b);
     let pick: Vec<_> = if let Some(at) = at {
         let seq = match at {
             "head" => head,
@@ -1156,6 +1358,10 @@ fn print_log(
             "head": head,
             "firstRetained": first,
             "complete": true,
+            "reconstructable": readable
+                .iter()
+                .map(|(a, b)| serde_json::json!({ "from": a, "to": b }))
+                .collect::<Vec<_>>(),
             "commits": pick
                 .iter()
                 .map(|c| sparkles::commit::AnnotatedCommit {
@@ -1167,9 +1373,9 @@ fn print_log(
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
-    println!("dataset {id}  head {head}");
+    println!("dataset {id}  head {head}  (* readable with --at)");
     println!(
-        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation  message",
+        "{:>7}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation  message",
         "seq", "timestamp", "kind", "+inserted", "-deleted", "quads"
     );
     for c in pick {
@@ -1180,8 +1386,9 @@ fn print_log(
             .map(|m| format!("  {m}"))
             .unwrap_or_default();
         let line = format!(
-            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
+            "{:>6}{}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
+            if readable_at(c.seq) { "*" } else { " " },
             c.timestamp(),
             c.kind.name(),
             format!("{}{approx}", c.inserted),
@@ -1664,6 +1871,10 @@ fn run() -> Result<()> {
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
                 }
+                // pin expiry, scheduled pins, and history that ages out of the window
+                if !st.read_only {
+                    http::history::spawn_tick(st.clone(), Duration::from_secs(60));
+                }
                 if let Some(rl) = &st.rate_limit {
                     ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));
                     #[cfg(unix)]
@@ -2054,6 +2265,13 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Diff {
+            loc,
+            from,
+            to,
+            graph,
+            format,
+        } => diff_cmd(&loc, &from, &to, graph.as_deref(), &format, opts),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
@@ -2098,7 +2316,9 @@ fn run() -> Result<()> {
             loc,
             to,
             inferences,
+            at,
         } => {
+            let at: Option<sparkles::history::At> = at.as_deref().map(str::parse).transpose()?;
             let inferences = clone::Inferences::parse(&inferences).with_context(|| {
                 format!("--inferences must be copy or drop, not '{inferences}'")
             })?;
@@ -2112,7 +2332,7 @@ fn run() -> Result<()> {
             let t = Instant::now();
             let mut tmp = to.as_os_str().to_owned();
             tmp.push(format!(".clone-tmp-{}", std::process::id()));
-            let r = clone::clone_into(
+            let r = clone::clone_into_at(
                 &store,
                 &loc.display().to_string(),
                 state::read_reasoning_file(&loc),
@@ -2121,6 +2341,7 @@ fn run() -> Result<()> {
                 inferences,
                 None,
                 None,
+                at,
             )?;
             eprintln!(
                 "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",
