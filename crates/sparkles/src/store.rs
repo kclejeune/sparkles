@@ -2192,7 +2192,10 @@ impl Store {
         let w = {
             // counted while it waits, so a long holder of the lock can give way
             let _waiting = Waiting::new(&self.writers_waiting);
-            if o.cancel.is_none() && o.deadline.is_none() {
+            if o.no_wait {
+                o.check()?;
+                self.writer.try_lock().ok_or(Error::WriterBusy)?
+            } else if o.cancel.is_none() && o.deadline.is_none() {
                 self.writer.lock()
             } else {
                 loop {
@@ -4235,6 +4238,12 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         Source::from_bytes(TTL.as_bytes().to_vec(), RdfFormat::Turtle, None)
     }
 
+    /// `<http://ex.org/s> <http://ex.org/p> <http://ex.org/o>` in the default graph.
+    fn quad(s: &str, p: &str, o: &str) -> Quad {
+        let n = |x: &str| NamedNode::new_unchecked(format!("http://ex.org/{x}"));
+        Quad::new(n(s), n(p), n(o), GraphName::DefaultGraph)
+    }
+
     #[test]
     fn commits_keep_the_disk_reserve_and_the_memory_limit() {
         let many = |n: usize| {
@@ -4293,6 +4302,77 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert!(t.delete(Perm::Spo.to_quad(&k)).unwrap());
         t.commit().unwrap();
         assert_eq!(mem.snapshot().len(), 9);
+    }
+
+    #[test]
+    fn a_write_that_will_not_wait_fails_while_the_writer_lock_is_held() {
+        use crate::guard::WriteOptions;
+        let store = Store::in_memory(Default::default());
+        let now = WriteOptions {
+            no_wait: true,
+            ..Default::default()
+        };
+        let held = store.write();
+        let e = store
+            .try_write_with(CommitKind::Update, now.clone())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(e, Error::WriterBusy), "{e}");
+        drop(held);
+        let mut t = store.try_write_with(CommitKind::Update, now).unwrap();
+        let q = t
+            .encode_quad(&quad("x", "p", "y"), &mut Default::default())
+            .unwrap();
+        assert!(t.insert(q).unwrap());
+        assert!(t.commit().unwrap().committed);
+    }
+
+    /// Commits sync the delta vocabulary only when they added terms to it; terms of
+    /// every kind of commit are there after a reopen.
+    #[test]
+    fn delta_terms_survive_reopen_whether_or_not_a_commit_added_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, Default::default()).unwrap();
+        store.load(&[src()]).unwrap();
+        let commit = |store: &Store, s: &str, o: &str, insert: bool| {
+            let mut t = store.write();
+            let q = t
+                .encode_quad(&quad(s, "p", o), &mut Default::default())
+                .unwrap();
+            if insert {
+                assert!(t.insert(q).unwrap());
+            } else {
+                assert!(t.delete(q).unwrap());
+            }
+            t.commit().unwrap();
+        };
+        // new terms, then the same terms again (nothing new to sync), then new ones
+        commit(&store, "n1", "o1", true);
+        commit(&store, "n1", "o1", false);
+        commit(&store, "n1", "o1", true);
+        commit(&store, "n2", "o2", true);
+        let head = store.head_commit().seq;
+        drop(store);
+        let store = Store::open(&root, Default::default()).unwrap();
+        assert_eq!(store.head_commit().seq, head);
+        let snap = store.snapshot();
+        let mut found = Vec::new();
+        snap.for_each_quad(|q| {
+            if let Some(t) = snap.quad_to_terms(q) {
+                found.push(t.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+        for s in ["n1", "n2"] {
+            assert!(
+                found
+                    .iter()
+                    .any(|t| t.contains(&format!("http://ex.org/{s}>"))),
+                "{s} after reopen: {found:?}"
+            );
+        }
     }
 
     #[test]

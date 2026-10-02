@@ -103,6 +103,9 @@ pub struct WriteOptions {
     pub message: Option<Arc<str>>,
     /// checked once the writer lock is held, before anything is written
     pub precondition: Option<Precondition>,
+    /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
+    /// when another write holds the writer lock
+    pub no_wait: bool,
 }
 
 /// A check of the committed state that a write depends on (an HTTP `If-Match`, say).

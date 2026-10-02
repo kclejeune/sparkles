@@ -69,6 +69,35 @@ pub fn update_as(
     super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
 }
 
+/// Whether `u` parses as an update that only inserts or deletes data (`INSERT DATA`,
+/// `DELETE DATA`): no pattern to evaluate, no LOAD, no graph management. Such an update
+/// does a bounded amount of work for its size.
+pub fn data_only(u: &str, opts: &QueryOptions) -> bool {
+    let mut p = super::aggext::register(SparqlParser::new());
+    if let Some(b) = &opts.base_iri {
+        match p.with_base_iri(b) {
+            Ok(q) => p = q,
+            Err(_) => return false,
+        }
+    }
+    for (k, v) in &opts.prefixes {
+        match p.with_prefix(k, v) {
+            Ok(q) => p = q,
+            Err(_) => return false,
+        }
+    }
+    p.parse_update(u).is_ok_and(|parsed| {
+        !parsed.operations.is_empty()
+            && parsed.operations.iter().all(|op| {
+                matches!(
+                    op,
+                    GraphUpdateOperation::InsertData { .. }
+                        | GraphUpdateOperation::DeleteData { .. }
+                )
+            })
+    })
+}
+
 fn run_update(
     store: &Store,
     parsed: &spargebra::Update,
@@ -650,5 +679,29 @@ fn read_error(url: &str, e: Error) -> Error {
     match e {
         Error::Io(e) => Error::invalid(format!("LOAD {url}: {e}")),
         e => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_only_updates() {
+        let o = QueryOptions::default();
+        assert!(data_only("INSERT DATA { <urn:a> <urn:p> 1 }", &o));
+        assert!(data_only(
+            "PREFIX ex: <urn:> DELETE DATA { ex:a ex:p 1 } ; INSERT DATA { GRAPH ex:g { ex:a ex:p 2 } }",
+            &o
+        ));
+        assert!(!data_only("DELETE WHERE { ?s ?p ?o }", &o));
+        assert!(!data_only(
+            "INSERT { <urn:a> <urn:p> ?o } WHERE { ?s <urn:q> ?o }",
+            &o
+        ));
+        assert!(!data_only("LOAD <http://example.org/data.ttl>", &o));
+        assert!(!data_only("CLEAR ALL", &o));
+        assert!(!data_only("INSERT DATA { <urn:a> <urn:p> ", &o));
+        assert!(!data_only("", &o));
     }
 }

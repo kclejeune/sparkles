@@ -61,6 +61,10 @@ pub enum Error {
     /// did not hold; nothing was written.
     #[error("{0}")]
     PreconditionFailed(String),
+    /// A write asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
+    /// found the writer lock taken; nothing was written.
+    #[error("another write is in progress")]
+    WriterBusy,
 }
 
 /// Which budget a request exceeded.

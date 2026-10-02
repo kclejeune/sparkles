@@ -131,6 +131,7 @@ impl Tools<'_> {
             report_limit: None,
             message: message.clone(),
             precondition: None,
+            no_wait: false,
         };
         let stats =
             sparkles::sparql::update::update_as(&ds.store, &a.update, &opts, CommitKind::Update)
