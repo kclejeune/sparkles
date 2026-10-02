@@ -21,6 +21,11 @@
 # standalone full validation time is what `sparkles validation` reports when it turns
 # validation on. The delta quads are foaf:name triples of untyped subjects: no new
 # results, but every foaf:name scan merges them.
+# MODES (default "off warn reject") picks the modes timed; `grandfather` is `reject` with
+# `--grandfather` over the shapes or schema of `warn`, which the data does not conform to,
+# so a write passes when it adds no result. EXTRA=1 (SHACL) adds two shapes that are
+# validated incrementally since C10 Phase 3: a SHACL-SPARQL constraint anchored at the
+# person, and a shape whose focus nodes are given by sh:targetWhere.
 # Results go to WORKDIR/results/{shacl,shex}-write[-LABEL].{json,md}.
 # Env: WARMUP (default 3), RUNS (default 20), DELTA (default 10000; 0 runs only the
 # round without pending delta quads), SPARKLES (binary, default target/release/sparkles),
@@ -48,6 +53,8 @@ WARMUP=${WARMUP:-3}
 RUNS=${RUNS:-20}
 DELTA=${DELTA:-10000}
 TIMEOUT=${TIMEOUT:-60}
+MODES=${MODES:-off warn reject}
+EXTRA=${EXTRA:-0}
 PORT=${PORT:-3937}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
@@ -143,6 +150,23 @@ ex:OrgShape a sh:NodeShape ; sh:targetClass ex:Organization ;
   sh:property [ sh:path ex:city ; sh:in ( "Kyoto" "Paris" "Berlin" "Boston" "Zurich" "Toronto" "Freiburg" "London" ) ] ;
   sh:property [ sh:path ex:founded ; sh:datatype xsd:date ] .
 EOF
+if [ "$EXTRA" = 1 ]; then
+  cat >> shapes-warn.ttl << 'EOF'
+
+ex:KnownPersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:sparql [ sh:select """
+    PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+    SELECT $this ?value WHERE {
+      $this foaf:knows ?value .
+      FILTER NOT EXISTS { ?value foaf:name ?n }
+    }""" ] .
+
+ex:SeniorShape a sh:NodeShape ;
+  sh:targetWhere [ sh:class ex:Person ;
+    sh:property [ sh:path foaf:age ; sh:minInclusive 60 ; sh:minCount 1 ] ] ;
+  sh:property [ sh:path ex:salary ; sh:minCount 1 ] .
+EOF
+fi
 # the same shapes at severity sh:Warning: below the `reject` threshold (violation)
 sed -e 's/a sh:NodeShape ;/a sh:NodeShape ; sh:severity sh:Warning ;/' \
   -e 's/\[ sh:path/[ sh:severity sh:Warning ; sh:path/' shapes-warn.ttl > shapes-reject.ttl
@@ -150,12 +174,19 @@ sed -e 's/a sh:NodeShape ;/a sh:NodeShape ; sh:severity sh:Warning ;/' \
 SHEX=$ROOT/crates/sparkles-shex/examples
 SHEX_MAP=$(grep -v '^#' "$SHEX/bench.smap")
 validation_on() { # validation_on <db> <mode>
+  local mode=$2 flags=()
+  if [ "$mode" = grandfather ]; then
+    mode=reject
+    flags=(--grandfather)
+  fi
   if [ "$LANG_SEL" = shex ]; then
     local schema=$SHEX/bench.shex
     [ "$2" = reject ] && schema=$SHEX/bench-write.shex
-    "$SPARKLES" validation --loc "$1" --mode "$2" --timeout "$TIMEOUT" --schema "$schema" --shape-map "$SHEX_MAP"
+    "$SPARKLES" validation --loc "$1" --mode "$mode" "${flags[@]}" --timeout "$TIMEOUT" --schema "$schema" --shape-map "$SHEX_MAP"
   else
-    "$SPARKLES" validation --loc "$1" --mode "$2" --timeout "$TIMEOUT" --shapes "shapes-$2.ttl"
+    local shapes="shapes-warn.ttl"
+    [ "$2" = reject ] && shapes="shapes-reject.ttl"
+    "$SPARKLES" validation --loc "$1" --mode "$mode" "${flags[@]}" --timeout "$TIMEOUT" --shapes "$shapes"
   fi
 }
 
@@ -184,7 +215,7 @@ for delta in "${DELTAS[@]}"; do
   fi
   echo
   echo "== pending delta $delta: $("$SPARKLES" stats --loc "$db" | grep 'delta +/-' | tr -s ' ')"
-  for mode in off warn reject; do
+  for mode in $MODES; do
     if [ "$mode" = off ]; then
       "$SPARKLES" validation --loc "$db" --off > /dev/null
     else
@@ -201,7 +232,7 @@ for delta in "${DELTAS[@]}"; do
       case "$mode" in
         off) [ -z "$hdr" ] ;;
         warn) [[ "$hdr" == *"status=warned"* ]] ;;
-        reject) [[ "$hdr" == *"status=passed"* ]] ;;
+        reject | grandfather) [[ "$hdr" == *"status=passed"* ]] ;;
       esac || {
         echo "unexpected validation status for $mode" >&2
         exit 1
@@ -227,15 +258,15 @@ writes = [w for w in ("plain", "person") if any(f"/{w}/" in c for c in res)]
 ms = lambda r: f'{r["mean"] * 1e3:.2f} ± {r["stddev"] * 1e3:.2f}' if r.get("stddev") is not None else f'{r["mean"] * 1e3:.2f}'
 title = {"shacl": "SHACL", "shex": "ShEx"}[lang]
 out = [f"{title}: 1-triple INSERT DATA latency (ms, mean ± sd) over {triples} triples ({people} people)", "",
-       "| write | pending delta | off | warn | reject | full validation (warn / reject) | reject ≤ full + 10 ms |",
-       "|---|---:|---:|---:|---:|---:|:---:|"]
+       "| write | pending delta | off | warn | reject | grandfather | full validation (warn / reject) | reject ≤ full + 10 ms |",
+       "|---|---:|---:|---:|---:|---:|---:|:---:|"]
 for w in writes:
     for d in deltas:
         cell = lambda m: ms(res[f"{m}/{w}/delta={d}"]) if f"{m}/{w}/delta={d}" in res else "–"
         fw, fr = full.get(f"{d}-warn", "?"), full.get(f"{d}-reject", "?")
         rj = res.get(f"reject/{w}/delta={d}")
         ok = "yes" if rj and fr.isdigit() and rj["mean"] * 1e3 <= int(fr) + 10 else "no"
-        out.append(f"| {w} | {d} | {cell('off')} | {cell('warn')} | {cell('reject')} | {fw} / {fr} ms | {ok} |")
+        out.append(f"| {w} | {d} | {cell('off')} | {cell('warn')} | {cell('reject')} | {cell('grandfather')} | {fw} / {fr} ms | {ok} |")
 open(dest, "w").write("\n".join(out) + "\n")
 print("\n".join(out))
 EOF

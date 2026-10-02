@@ -1328,6 +1328,8 @@ export type Commit = {
   exact: boolean;
   /** Rebuilt from a write-ahead log record without commit metadata. */
   reconstructed?: boolean;
+  /** The write skipped the dataset's write-time validation (a bypass). */
+  unvalidated?: boolean;
   /** A point-in-time read (`at`) can still see this commit; absent on older servers. */
   reconstructable?: boolean;
   /** Named snapshots that pin this commit. */

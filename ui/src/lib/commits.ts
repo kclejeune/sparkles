@@ -55,6 +55,12 @@ export function commitFlags(c: Commit): CommitFlag[] {
       label: 'reconstructed',
       title: 'Rebuilt from a write-ahead log record without commit metadata',
     });
+  if (c.unvalidated)
+    out.push({
+      label: 'unvalidated',
+      warn: true,
+      title: "The write skipped the dataset's write-time validation",
+    });
   return out;
 }
 
