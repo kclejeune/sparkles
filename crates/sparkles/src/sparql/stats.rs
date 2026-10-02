@@ -114,6 +114,9 @@ impl Counts {
     }
 }
 
+/// The named graphs a graph view reads, and whether they are all the snapshot has.
+pub(crate) type VisibleGraphs = (Arc<Vec<crate::id::Id>>, bool);
+
 /// Counts already worked out, kept with a generation (the part that depends only on the
 /// base) or with a snapshot (the final answers), and the FILTER selectivities and key
 /// probes measured on a snapshot (see [`super::sample`] and [`super::keyprobe`]).
@@ -124,7 +127,7 @@ pub struct CountCache {
     probed: Mutex<FxHashMap<String, Option<super::keyprobe::Measure>>>,
     /// the named graphs each read rule of a graph view sees (see
     /// [`crate::access::GraphAccess::visible_named`])
-    views: Mutex<FxHashMap<String, (Arc<Vec<crate::id::Id>>, bool)>>,
+    views: Mutex<FxHashMap<String, VisibleGraphs>>,
 }
 
 impl CountCache {
@@ -171,11 +174,11 @@ impl CountCache {
     }
 
     /// The visible named graphs of a graph view's read rule, by the rule's key.
-    pub(crate) fn view(&self, k: &str) -> Option<(Arc<Vec<crate::id::Id>>, bool)> {
+    pub(crate) fn view(&self, k: &str) -> Option<VisibleGraphs> {
         self.views.lock().get(k).cloned()
     }
 
-    pub(crate) fn put_view(&self, k: String, v: (Arc<Vec<crate::id::Id>>, bool)) {
+    pub(crate) fn put_view(&self, k: String, v: VisibleGraphs) {
         let mut m = self.views.lock();
         if m.len() >= Self::ENTRIES {
             m.clear();
