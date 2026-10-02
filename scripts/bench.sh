@@ -43,6 +43,9 @@
 # flags (e.g. "--no-access-log --no-metrics"), for comparing configurations.
 # PORT_BASE (default 3931) is the first of the five server ports; the memory probe uses
 # PORT_BASE + 30. KEEP_SCRATCH=1 keeps the store copies of the updates and mixed modes.
+# The query and update latency runs pin hyperfine and its curl processes to one CPU (see
+# client_cpu in scripts/bench-lib.sh); CLIENT_CPU=N picks the CPU and CLIENT_CPU=none
+# turns pinning off.
 set -euo pipefail
 
 N=${1:-100000}
@@ -234,7 +237,7 @@ suite() {
     echo "== $n"
     qcmd() { q "${URL[$1]}" "$n"; }
     mapfile -d '' ARGS < <(engine_args qcmd)
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
+    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
       "${ARGS[@]}" --export-json "$RES/$n.new.json"
     merge "$RES/$n.new.json" "$RES/$n.json"
   done
@@ -263,7 +266,7 @@ suite() {
     ARGS+=(--prepare "$(upd "$e" queries/_delete.ru)" --command-name "${NAME[$e]}" "$(upd "$e" queries/_update.ru)")
   done
   if [ ${#ARGS[@]} -gt 0 ]; then
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
+    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure \
       "${ARGS[@]}" --export-json "$RES/update-latency.new.json"
     merge "$RES/update-latency.new.json" "$RES/update-latency.json"
   fi

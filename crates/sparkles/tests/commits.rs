@@ -208,6 +208,118 @@ fn an_unknown_wal_record_before_the_last_commit_is_not_a_torn_tail() {
     assert_eq!(std::fs::read(&path).unwrap(), good);
 }
 
+fn ask(s: &Store, q: &str) -> bool {
+    sparkles::sparql::query(s.snapshot(), q, &QueryOptions::default())
+        .unwrap()
+        .boolean
+}
+
+/// The lengths of the complete entries of a delta vocabulary file, in order.
+fn delta_entry_ends(path: &Path) -> Vec<u64> {
+    let buf = std::fs::read(path).unwrap();
+    let (mut pos, mut ends) = (0usize, Vec::new());
+    while pos + 4 <= buf.len() {
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + len;
+        ends.push(pos as u64);
+    }
+    ends
+}
+
+fn truncate(path: &Path, len: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+}
+
+/// A commit's new terms and its WAL records are synced at the same time, so a crash can
+/// leave the commit record on disk without the terms it names. That commit was never
+/// acknowledged: open drops it like any torn tail.
+#[test]
+fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> \"one\" }");
+        upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
+    }
+    let wal_path = wal(&root);
+    let vocab = wal_path.with_file_name("delta.vocab");
+    let wal_full = std::fs::read(&wal_path).unwrap();
+    let vocab_full = std::fs::read(&vocab).unwrap();
+    // urn:a, urn:p, "one" for commit 1, then urn:b and "two" for commit 2
+    let ends = delta_entry_ends(&vocab);
+    assert_eq!(ends.len(), 5);
+    let wal_one = {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 2);
+        drop(s);
+        // the WAL of commit 1 alone: up to its commit record
+        let recs = wal_full.len() / 33;
+        let first = (0..recs).find(|&i| wal_full[i * 33] == 3).unwrap();
+        ((first + 1) * 33) as u64
+    };
+    // commit 2's terms lost entirely, or the last one torn half-way, or zeros where
+    // they were (the file's length reached the disk, its data did not)
+    for (cut, zeros) in [
+        (ends[2], false),
+        (ends[3], false),
+        (ends[4] - 2, false),
+        (ends[2], true),
+    ] {
+        std::fs::write(&wal_path, &wal_full).unwrap();
+        if zeros {
+            let mut v = vocab_full.clone();
+            v[cut as usize..].fill(0);
+            std::fs::write(&vocab, &v).unwrap();
+        } else {
+            std::fs::write(&vocab, &vocab_full).unwrap();
+            truncate(&vocab, cut);
+        }
+        {
+            let s = Store::open(&root, StoreOptions::default()).unwrap();
+            assert_eq!(s.head_commit().seq, 1, "cut at {cut}");
+            assert!(ask(&s, "ASK { <urn:a> <urn:p> \"one\" }"));
+            assert!(!ask(&s, "ASK { <urn:b> ?p ?o }"));
+            assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_one);
+            // the next commit takes the number the lost one had
+            let r = upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
+            assert_eq!(r.commit.seq, 2);
+        }
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 2);
+        assert!(ask(&s, "ASK { <urn:b> <urn:p> \"two\" }"));
+    }
+    // the terms on disk without the WAL records: the commit is simply not there, and
+    // the terms are used again when the triple is inserted again
+    std::fs::write(&wal_path, &wal_full).unwrap();
+    std::fs::write(&vocab, &vocab_full).unwrap();
+    truncate(&wal_path, wal_one);
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 1);
+        assert!(!ask(&s, "ASK { <urn:b> ?p ?o }"));
+        assert_eq!(
+            upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }")
+                .commit
+                .seq,
+            2
+        );
+    }
+    assert_eq!(std::fs::read(&vocab).unwrap(), vocab_full);
+    // terms missing for a commit before the last one cannot come from a crash: open
+    // refuses the database and leaves its files alone
+    std::fs::write(&wal_path, &wal_full).unwrap();
+    truncate(&vocab, ends[1]);
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(e.to_string().contains("delta.vocab"), "{e}");
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_full);
+}
+
 #[test]
 fn compaction_keeps_the_head_and_bulk_writes_are_commits() {
     let dir = tempfile::tempdir().unwrap();

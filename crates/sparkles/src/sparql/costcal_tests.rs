@@ -22,6 +22,8 @@
 //! `SPARKLES_CAL_MODES` limits the modes that run, `SPARKLES_CAL_RUNS` sets the timed
 //! runs (default 7) after one warm-up, and `SPARKLES_CAL_DISABLE` switches off
 //! optimizations by name, as `SPARKLES_DISABLE_OPTIMIZATIONS` does for the server.
+//! `SPARKLES_CAL_MERGE_ROW_COST` replaces the planner's cost of a merge join per input
+//! row, for comparing the plans of two values.
 //!
 //! The server allocates with mimalloc, and test binaries with the system allocator. Run
 //! them with mimalloc preloaded (`LD_PRELOAD=…/libmimalloc.so`) to time what the server

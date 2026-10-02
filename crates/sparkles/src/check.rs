@@ -32,7 +32,7 @@ use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
 use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_REC};
-use crate::vocab::FC_BLOCK;
+use crate::vocab::{FC_BLOCK, delta_entries};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -530,22 +530,6 @@ fn id_problem(
         },
         _ => None,
     }
-}
-
-/// The complete entries of a delta vocabulary file (`u32` length, key), and where they
-/// end.
-fn delta_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
-    let mut pos = 0;
-    let mut keys = Vec::new();
-    while pos + 4 <= buf.len() {
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        if pos + 4 + len > buf.len() {
-            break;
-        }
-        keys.push(&buf[pos + 4..pos + 4 + len]);
-        pos += 4 + len;
-    }
-    (keys, pos)
 }
 
 /// splitmix64 finalizer
@@ -1167,8 +1151,9 @@ impl Checker<'_> {
                 return;
             }
         };
-        // a writer syncs new delta terms before the WAL records that use them: counted
-        // again now, the delta vocabulary covers every WAL record just read
+        // a writer syncs a commit's new delta terms together with its WAL records, so
+        // after a crash only the last commit can name terms that delta.vocab lacks (a
+        // torn tail). Counted again now, it covers every commit before that.
         let dvocab_len = match std::fs::read(dir.join("delta.vocab")) {
             Ok(b) => Some(delta_entries(&b).0.len() as u64),
             Err(_) => self.dvocab_len,
@@ -1190,6 +1175,10 @@ impl Checker<'_> {
         let mut seen_v2 = false;
         let mut torn = false;
         let mut ids_checked = 0u64;
+        // the id problems of the current transaction, reported when its commit record
+        // shows whether it is torn; and whether one is a delta id beyond delta.vocab
+        let mut txn_issues: Vec<Issue> = Vec::new();
+        let mut txn_missing_terms = false;
         for (i, rec) in recs.iter().enumerate() {
             let at = (i * WAL_REC) as u64;
             let q: [Id; 4] = std::array::from_fn(|j| {
@@ -1203,7 +1192,9 @@ impl Checker<'_> {
                     for (pos, id) in q.iter().enumerate() {
                         ids_checked += 1;
                         if let Some(p) = id_problem(*id, pos, self.vocab_len, dvocab_len) {
-                            run.add(
+                            txn_missing_terms |= id.tag() == Tag::Delta
+                                && dvocab_len.is_some_and(|n| id.payload() >= n);
+                            txn_issues.push(
                                 Issue::error(format!("record {i}: {p}"))
                                     .file(&file)
                                     .offset(at)
@@ -1219,6 +1210,27 @@ impl Checker<'_> {
                     let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
                     let is_last = Some(i) == last_commit;
+                    let issues = std::mem::take(&mut txn_issues);
+                    let missing_terms = std::mem::take(&mut txn_missing_terms);
+                    if is_last && missing_terms && matches!(meta, Some(Ok(_))) {
+                        run.add(
+                            Issue::warning(format!(
+                                "the final transaction ({n} from offset {}) names delta terms that delta.vocab lacks: they did not reach the disk before a crash, so it is treated as torn and truncated on open",
+                                txn_start * WAL_REC
+                            ))
+                            .file(&file)
+                            .offset(at)
+                            .row(i as u64),
+                        );
+                        torn = true;
+                        break;
+                    }
+                    // a torn final transaction is truncated whole, whatever ids it names
+                    if !(is_last && matches!(meta, Some(Err(())))) {
+                        for issue in issues {
+                            run.add(issue);
+                        }
+                    }
                     match meta {
                         Some(Err(())) if is_last => {
                             run.add(
@@ -1310,6 +1322,15 @@ impl Checker<'_> {
                     );
                     torn = true;
                     break;
+                }
+            }
+        }
+        // records after the last commit are truncated on open: the terms they name may
+        // not have reached delta.vocab, and other problems are reported as before
+        if !torn {
+            for issue in txn_issues {
+                if !issue.message.contains("beyond the delta vocabulary") {
+                    run.add(issue);
                 }
             }
         }
