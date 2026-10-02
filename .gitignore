@@ -4,3 +4,7 @@
 .playwright-mcp/
 /result
 /result-*
+# Python bytecode and tool caches (crates/sparkles-py)
+__pycache__/
+.pytest_cache/
+.mypy_cache/
