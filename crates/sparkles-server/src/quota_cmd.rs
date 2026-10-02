@@ -3,7 +3,7 @@
 
 use anyhow::{Result, bail};
 use clap::Args;
-use serde_json::{Value as J, json};
+use serde_json::Value as J;
 use sparkles::store::{Store, StoreOptions};
 use std::path::PathBuf;
 
@@ -57,6 +57,7 @@ fn local(loc: &std::path::Path, a: &QuotaArgs, opts: StoreOptions) -> Result<J> 
 #[cfg(feature = "auth")]
 fn remote(a: &QuotaArgs) -> Result<J> {
     use crate::remote::{JsonBody, Remote};
+    use serde_json::json;
     let Some(ds) = a.dataset.as_deref() else {
         bail!("--dataset NAME is required with --server");
     };

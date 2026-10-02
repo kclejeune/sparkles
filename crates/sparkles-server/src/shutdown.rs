@@ -136,14 +136,20 @@ mod tests {
             body.to_string(),
         );
         std::thread::spawn(move || {
-            reqwest::blocking::Client::new()
-                .post(format!("{url}{path}"))
-                .header("content-type", ct)
-                .body(body)
-                .timeout(Duration::from_secs(60))
-                .send()
-                .ok()
-                .map(|r| r.status().as_u16())
+            use std::io::{Read, Write};
+            let addr = url.trim_start_matches("http://");
+            let mut s = std::net::TcpStream::connect(addr).ok()?;
+            s.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {ct}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).ok()?;
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).ok()?;
+            let head = String::from_utf8_lossy(&out);
+            head.strip_prefix("HTTP/1.1 ")?.get(..3)?.parse().ok()
         })
     }
 
