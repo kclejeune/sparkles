@@ -162,12 +162,93 @@ fn filter_str(ctx: &Ctx, filter: &[Expr]) -> String {
 }
 
 fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
-    let (scan, spec, filter) = probe_leaf(probe)?;
+    let offer = offer(drive, probe, ctx)?;
+    Some(offer.build(drive.clone(), probe))
+}
+
+/// The index join of `drive` into the pattern `probe`, or `drive` back when none is
+/// offered.
+pub(super) fn index_join(
+    drive: Node,
+    probe: &Node,
+    ctx: &Ctx,
+) -> std::result::Result<Node, Box<Node>> {
+    match offer(&drive, probe, ctx) {
+        Some(offer) => Ok(offer.build(drive, probe)),
+        None => Err(Box::new(drive)),
+    }
+}
+
+/// What the join ordering needs to know about a pattern to cost probing it: the
+/// variable it is read sorted on, its rows in the permutation, and its rows per key.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ProbeSide {
+    pub key: VarId,
+    rows: f64,
+    per_key: f64,
+}
+
+/// The pattern under `probe` as the probed side of an index join, if it can be one.
+pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
+    let (scan, spec, _) = probe_leaf(probe)?;
     let &key = probe.sorted.first()?;
-    if spec.cols.first() != Some(&(spec.prefix.len(), key))
-        || spec.graph_col == spec.prefix.len()
-        || !drive.vars.contains(&key)
-    {
+    if spec.cols.first() != Some(&(spec.prefix.len(), key)) || spec.graph_col == spec.prefix.len() {
+        return None;
+    }
+    Some(ProbeSide {
+        key,
+        rows: ctx.snap.estimate(spec.perm, &spec.prefix) as f64,
+        per_key: scan.est / scan.d(key),
+    })
+}
+
+impl ProbeSide {
+    /// The estimated cost of probing the pattern for `keys_in` distinct keys and of
+    /// scanning it whole.
+    pub(super) fn costs(&self, keys_in: f64) -> (f64, f64) {
+        probe_costs(keys_in, self.rows, self.per_key)
+    }
+}
+
+/// Whether probing at `probe_cost` is worth offering against scanning at `scan_cost`.
+pub(super) fn offered(probe_cost: f64, scan_cost: f64) -> bool {
+    probe_cost < PROBE_SHARE * scan_cost || forced()
+}
+
+/// The cost of an index join whose input costs `drive_cost` for `drive_est` rows and
+/// whose pattern costs `probe_cost` for `probe_est` rows, where probing reads `ratio` of
+/// what scanning the pattern would, with `est` output rows.
+pub(super) fn join_cost(
+    drive_cost: f64,
+    drive_est: f64,
+    probe_cost: f64,
+    probe_est: f64,
+    ratio: f64,
+    est: f64,
+) -> f64 {
+    if forced() {
+        drive_cost + 1.0
+    } else {
+        drive_cost + drive_est + (probe_cost + probe_est) * ratio + est
+    }
+}
+
+/// An index join worth offering, before its input is moved into it.
+struct Offer<'p> {
+    spec: &'p ScanSpec,
+    filter: Vec<Expr>,
+    key: VarId,
+    est: f64,
+    cost: f64,
+    sorted: Vec<VarId>,
+    desc: String,
+}
+
+fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
+    let (scan, spec, filter) = probe_leaf(probe)?;
+    let side = probe_side(probe, ctx)?;
+    let key = side.key;
+    if !drive.vars.contains(&key) {
         return None;
     }
     if !drive.certain.contains(&key) {
@@ -177,12 +258,9 @@ fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
         );
         return None;
     }
-    let rows = ctx.snap.estimate(spec.perm, &spec.prefix) as f64;
     let keys_in = drive.d(key).min(drive.est).max(1.0);
-    let per_key = scan.est / scan.d(key);
-    let (probe_cost, scan_cost) = probe_costs(keys_in, rows, per_key);
-    let force = forced();
-    if probe_cost >= PROBE_SHARE * scan_cost && !force {
+    let (probe_cost, scan_cost) = side.costs(keys_in);
+    if !offered(probe_cost, scan_cost) {
         tracing::debug!(
             "index join on {} into {} not offered: probing ~{probe_cost:.0} of scanning ~{scan_cost:.0}",
             var_str(ctx, key),
@@ -198,16 +276,6 @@ fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
             .filter(|v| **v != key && drive.vars.contains(v)),
     );
     let est = super::plan::join_est(drive, probe, &keys);
-    let mut vars = drive.vars.clone();
-    let mut certain = drive.certain.clone();
-    for &v in &probe.vars {
-        if !vars.contains(&v) {
-            vars.push(v);
-        }
-        if !certain.contains(&v) {
-            certain.push(v);
-        }
-    }
     // the input's order is kept, except where a shared variable unbound in the input
     // takes the pattern's value
     let sorted = drive
@@ -216,12 +284,14 @@ fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
         .take_while(|v| !keys[1..].contains(v))
         .copied()
         .collect();
-    let ratio = probe_cost / scan_cost;
-    let cost = if force {
-        drive.cost + 1.0
-    } else {
-        drive.cost + drive.est + (probe.cost + probe.est) * ratio + est
-    };
+    let cost = join_cost(
+        drive.cost,
+        drive.est,
+        probe.cost,
+        probe.est,
+        probe_cost / scan_cost,
+        est,
+    );
     let base = scan.desc.split(" | ").next().unwrap_or_default();
     let desc = if filter.is_empty() {
         format!("on {} | {base}", var_str(ctx, key))
@@ -232,25 +302,49 @@ fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
             filter_str(ctx, &filter)
         )
     };
-    let star = star_pattern(spec, key);
-    Some(Node {
-        kind: Kind::IndexJoin(Box::new(IndexJoinSpec {
-            key,
-            probes: vec![Probe {
-                scan: spec.clone(),
-                filter,
-                star,
-            }],
-        })),
-        children: vec![drive.clone()],
-        vars,
-        certain,
-        sorted,
+    Some(Offer {
+        spec,
+        filter,
+        key,
         est,
         cost,
-        dist: super::plan::merge_dist(drive, probe, est),
+        sorted,
         desc,
     })
+}
+
+impl Offer<'_> {
+    fn build(self, drive: Node, probe: &Node) -> Node {
+        let mut vars = drive.vars.clone();
+        let mut certain = drive.certain.clone();
+        for &v in &probe.vars {
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+            if !certain.contains(&v) {
+                certain.push(v);
+            }
+        }
+        let dist = super::plan::merge_dist(&drive, probe, self.est);
+        Node {
+            kind: Kind::IndexJoin(Box::new(IndexJoinSpec {
+                key: self.key,
+                probes: vec![Probe {
+                    scan: self.spec.clone(),
+                    filter: self.filter,
+                    star: star_pattern(self.spec, self.key),
+                }],
+            })),
+            children: vec![drive],
+            vars,
+            certain,
+            sorted: self.sorted,
+            est: self.est,
+            cost: self.cost,
+            dist,
+            desc: self.desc,
+        }
+    }
 }
 
 /// The scan as a star pattern: the key is its subject, the predicate a constant, the

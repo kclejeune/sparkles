@@ -85,10 +85,14 @@ pub struct Optimizations {
     /// quads in graphs the query does not read, instead of being used only when neither
     /// exists
     pub delta_statistics: bool,
+    /// join ordering runs the dynamic program on cost summaries, over subsets connected
+    /// by shared variables, and drops partial plans dearer than a greedy plan; off: the
+    /// program builds every candidate plan tree for every split
+    pub pruned_join_order: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 18] = [
+    pub const NAMES: [&str; 19] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -107,6 +111,7 @@ impl Optimizations {
         "anti_join",
         "topk_first_key",
         "delta_statistics",
+        "pruned_join_order",
     ];
 
     /// Everything on.
@@ -129,6 +134,7 @@ impl Optimizations {
         anti_join: true,
         topk_first_key: true,
         delta_statistics: true,
+        pruned_join_order: true,
     };
 
     /// Everything off: the generic operators only.
@@ -151,6 +157,7 @@ impl Optimizations {
         anti_join: false,
         topk_first_key: false,
         delta_statistics: false,
+        pruned_join_order: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -173,6 +180,7 @@ impl Optimizations {
             "anti_join" => &mut self.anti_join,
             "topk_first_key" => &mut self.topk_first_key,
             "delta_statistics" => &mut self.delta_statistics,
+            "pruned_join_order" => &mut self.pruned_join_order,
             _ => return None,
         })
     }

@@ -185,8 +185,10 @@ authentication.
   version. A scan merges the delta into the blocks it changes. It finds the base rows
   between two delta keys by binary search, and only those blocks have every column
   decoded.
-* **Columnar execution and planning.** Execution is column-major. The planner is a DP over
-  interesting sort orders with a greedy fallback, and merge joins run on sorted scans.
+* **Columnar execution and planning.** Execution is column-major. The planner orders joins
+  with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
+  sort order, and merge joins run on sorted scans. Groups too large for the program are
+  planned in rounds or greedily, as described under join ordering on cost summaries below.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
 * **Result cache.** Executed subtrees are cached under a canonical plan key and the
   snapshot version, so updates invalidate entries without extra work. Results with
@@ -311,3 +313,20 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
   every row passes the graph filter (one pass over the graph column), so default-graph
   queries avoid row-by-row filtering.
+* **Join ordering on cost summaries** (`pruned_join_order`). The dynamic program runs on
+  small summaries of plans, which hold the cost, the estimated rows, the sort variable and
+  the distinct-value estimates that later joins read. The plan tree is built once, for the
+  chosen joins only. A greedy plan is made first, and a partial plan that costs more than
+  it is dropped, because it cannot be part of a cheaper plan. A plan sorted on a variable
+  that no later join reads is dropped when another plan of the same patterns has the same
+  estimates at no more cost. Only subsets whose patterns share variables are planned. Up to
+  ten patterns, the result is the exhaustive program's plan or one of equal cost, except in
+  rare cases where a dropped plan is the one that a later filter would have favored. Every
+  WatDiv and `scripts/bench.sh` query plans at the same cost as before, and a star of nine
+  patterns (WatDiv S1) plans in about a millisecond instead of 400 ms. A group whose
+  subsets have too many splits to enumerate in about a millisecond is planned in rounds.
+  Each round plans the subsets up to the size that fits, and the cheapest plan of that
+  size becomes one input of the next round. That plan never costs more than the greedy
+  one. Groups of more than 16 patterns keep the greedy plan, which costs each pair of
+  plans once. Switched off, the program builds every candidate plan tree for every split
+  of up to 12 patterns, and larger groups are planned greedily.
