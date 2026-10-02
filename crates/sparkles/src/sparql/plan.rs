@@ -34,7 +34,7 @@ pub enum ActiveGraph {
     Var(VarId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GraphFilter {
     /// no restriction (graph is an output column or the prefix)
     All,
@@ -284,8 +284,8 @@ pub enum Kind {
         spec: ScanSpec,
         key: VarId,
         counts: Vec<VarId>,
-        /// answered from the index statistics' per-class counts (exact for this snapshot)
-        metadata: bool,
+        /// the counts per key from the index statistics (exact for this snapshot)
+        metadata: Option<Arc<super::stats::Counts>>,
     },
     /// `COUNT(*)` over a join of two scans on one variable: both children are scans
     /// sorted on it, read as (key, run length) pairs; the count is Σ left × right
@@ -441,7 +441,9 @@ impl Node {
                 metadata: Some(_), ..
             } => "CountDistinctFromMetadata",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
-            Kind::GroupCountScan { metadata: true, .. } => "GroupCountFromMetadata",
+            Kind::GroupCountScan {
+                metadata: Some(_), ..
+            } => "GroupCountFromMetadata",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
             Kind::CountJoinRuns { .. } => "CountJoinFromRuns",
             Kind::CountJoin { .. } => "CountJoin",
@@ -2941,27 +2943,19 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         && let Some(spec) = reorder_scan(spec, *k)
     {
         let var = aggs[0].0;
-        let metadata = ctx
-            .opt
-            .metadata_counts
-            .then(|| distinct_count_exact(&spec, ctx))
-            .flatten();
+        let counted = distinct_count_exact(&spec, child.est, ctx);
         let desc = format!(
             "{} distinct ?{}{}",
             retarget_desc(&child.desc, &spec),
             ctx.var_name(*k),
-            if metadata.is_some() {
-                " [from statistics]"
-            } else {
-                ""
-            }
+            counted.as_ref().map_or(String::new(), |c| c.note())
         );
-        let cost = if metadata.is_some() { 1.0 } else { child.est };
+        let cost = if counted.is_some() { 1.0 } else { child.est };
         let mut n = Node::leaf(
             Kind::CountDistinctScan {
                 spec,
                 var,
-                metadata,
+                metadata: counted.map(|c| c.total()),
             },
             vec![var],
             1.0,
@@ -3045,12 +3039,12 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             retarget_desc(&child.desc, &spec),
             ctx.var_name(key)
         );
-        let metadata = ctx.opt.metadata_counts && class_counts_exact(&spec, key, ctx);
-        let desc = if metadata {
-            format!("{desc} [from statistics]")
-        } else {
-            desc
+        let metadata = group_counts_exact(&spec, key, child.est, ctx);
+        let desc = match &metadata {
+            Some(c) => format!("{desc}{}", c.note()),
+            None => desc,
         };
+        let n_metadata = metadata.is_some();
         let mut n = Node::leaf(
             Kind::GroupCountScan {
                 spec,
@@ -3062,7 +3056,7 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             est,
             desc,
         );
-        n.cost = child.est;
+        n.cost = if n_metadata { 1.0 } else { child.est };
         n.sorted = vec![key];
         return n;
     }
@@ -3155,49 +3149,96 @@ fn key_run_scans(join: &Node, k: VarId, ctx: &Ctx) -> Option<Vec<Node>> {
         .collect()
 }
 
-/// Whether the per-class subject counts in the index statistics are exactly the answer
-/// of `GROUP BY ?class` + COUNT over `?s rdf:type ?class`: the snapshot has no delta,
-/// every quad is in the default graph (so a class's rows are its distinct subjects), and
-/// the scan reads the default graph without further constraints.
-fn class_counts_exact(spec: &ScanSpec, key: VarId, ctx: &Ctx) -> bool {
-    let snap = &ctx.snap;
-    let stats = &snap.generation.stats;
-    spec.perm == Perm::Pos
-        && spec.eqs.is_empty()
-        && spec.cols.first() == Some(&(1, key))
-        && spec.cols[1..].iter().all(|&(c, _)| c == 2)
-        && snap.delta.is_empty()
-        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
-        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0)
-        && snap
-            .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
-            .is_some_and(|t| spec.prefix == [t.0])
-}
-
-/// The number of distinct values of a scan's first free column, when the index
-/// statistics hold it exactly: a scan of the whole index or of one predicate without
-/// repeated variables, a snapshot without a delta, and every quad in the default graph,
-/// which the scan reads (the statistics count over all graphs). The statistics hold the
-/// distinct subjects, predicates and objects of the index, and the distinct subjects
-/// and objects of each predicate.
-fn distinct_count_exact(spec: &ScanSpec, ctx: &Ctx) -> Option<u64> {
-    let snap = &ctx.snap;
-    let stats = &snap.generation.stats;
-    let exact = spec.eqs.is_empty()
-        && snap.delta.is_empty()
-        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
-        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0);
-    if !exact || spec.cols.first()?.0 != spec.prefix.len() {
+/// The answer of `GROUP BY ?k` with counts over a single scan from the index
+/// statistics, corrected for the snapshot's delta and for graphs the scan does not read:
+/// the instances of each class (`?s rdf:type ?k`, distinct subjects per class when the
+/// scan reads one graph or drops a triple's repeats across graphs), or the quads of each
+/// predicate (`?s ?k ?o` over one graph). `est` is the scan's size, which the correction
+/// must not exceed in work.
+fn group_counts_exact(
+    spec: &ScanSpec,
+    key: VarId,
+    est: f64,
+    ctx: &Ctx,
+) -> Option<Arc<super::stats::Counts>> {
+    use super::stats::{CountKey, Measure};
+    if !ctx.opt.metadata_counts
+        || !spec.eqs.is_empty()
+        || spec.cols.iter().any(|&(c, _)| c == spec.graph_col)
+    {
         return None;
     }
-    match (spec.perm, spec.prefix.as_slice()) {
-        (Perm::Spo | Perm::Sop, []) => Some(stats.distinct_subjects),
-        (Perm::Pso | Perm::Pos, []) => Some(stats.distinct_predicates),
-        (Perm::Osp | Perm::Ops, []) => Some(stats.distinct_objects),
-        (Perm::Pso, [p]) => stats.predicate(*p).map(|ps| ps.distinct_subjects),
-        (Perm::Pos, [p]) => stats.predicate(*p).map(|ps| ps.distinct_objects),
-        _ => None,
+    let rdf_type = ctx
+        .snap
+        .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
+        .map(|t| t.0);
+    let classes = spec.perm == Perm::Pos
+        && spec.cols.first() == Some(&(1, key))
+        && spec.cols[1..].iter().all(|&(c, _)| c == 2)
+        && rdf_type.is_some_and(|t| spec.prefix == [t])
+        && (spec.dedup || !spec.graph.multi());
+    let predicates = matches!(spec.perm, Perm::Pso | Perm::Pos)
+        && spec.prefix.is_empty()
+        && spec.cols.first() == Some(&(0, key))
+        && !spec.dedup
+        && !spec.graph.multi();
+    let measure = match (classes, predicates) {
+        (true, _) => Measure::Distinct(3),
+        (_, true) => Measure::Rows,
+        _ => return None,
+    };
+    let k = CountKey {
+        perm: spec.perm,
+        prefix: spec.prefix.clone(),
+        grouped: true,
+        measure,
+        graphs: spec.graph.clone(),
+    };
+    statistics(&k, rdf_type, est, ctx)
+}
+
+/// The number of distinct values of a scan's first free column from the index
+/// statistics, corrected for the snapshot's delta and for graphs the scan does not read:
+/// a scan of the whole index or of one predicate without repeated variables. The
+/// statistics hold the distinct subjects, predicates and objects of the index, and the
+/// distinct subjects and objects of each predicate. `est` is the scan's size, which the
+/// correction must not exceed in work.
+fn distinct_count_exact(spec: &ScanSpec, est: f64, ctx: &Ctx) -> Option<Arc<super::stats::Counts>> {
+    if !ctx.opt.metadata_counts
+        || !spec.eqs.is_empty()
+        || spec.prefix.len() > 1
+        || spec.cols.first()?.0 != spec.prefix.len()
+    {
+        return None;
     }
+    let k = super::stats::CountKey {
+        perm: spec.perm,
+        prefix: spec.prefix.clone(),
+        grouped: false,
+        measure: super::stats::Measure::Distinct(spec.prefix.len() + 1),
+        graphs: spec.graph.clone(),
+    };
+    statistics(&k, None, est, ctx)
+}
+
+/// [`super::stats::exact_counts`] for the planner: errors (cancellation, a block that
+/// cannot be read) leave the scan to the generic operators, which report them.
+fn statistics(
+    k: &super::stats::CountKey,
+    rdf_type: Option<u64>,
+    est: f64,
+    ctx: &Ctx,
+) -> Option<Arc<super::stats::Counts>> {
+    super::stats::exact_counts(
+        &ctx.snap,
+        k,
+        rdf_type,
+        est.max(0.0) as u64,
+        ctx.opt.delta_statistics,
+        &|| ctx.check(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.

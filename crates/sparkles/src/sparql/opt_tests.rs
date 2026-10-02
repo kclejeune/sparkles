@@ -5,18 +5,18 @@ use super::*;
 use crate::io::{RdfFormat, Source};
 use crate::store::{Store, StoreOptions};
 
-const PREFIXES: &str = "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+pub(super) const PREFIXES: &str = "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
-fn load(s: &Store, text: &str, format: RdfFormat) {
+pub(super) fn load(s: &Store, text: &str, format: RdfFormat) {
     s.load(&[Source::from_bytes(text.as_bytes().to_vec(), format, None)])
         .unwrap();
 }
 
-fn update(s: &Store, text: &str) {
+pub(super) fn update(s: &Store, text: &str) {
     super::update::update(s, &format!("{PREFIXES}{text}"), &QueryOptions::default()).unwrap();
 }
 
-fn run(s: &Store, text: &str, opt: Optimizations) -> QueryResult {
+pub(super) fn run(s: &Store, text: &str, opt: Optimizations) -> QueryResult {
     let opts = QueryOptions {
         optimizations: Some(opt),
         no_cache: true,
@@ -27,7 +27,7 @@ fn run(s: &Store, text: &str, opt: Optimizations) -> QueryResult {
 }
 
 /// Solutions as exact RDF terms, sorted (a multiset).
-fn solutions(r: &QueryResult) -> Vec<String> {
+pub(super) fn solutions(r: &QueryResult) -> Vec<String> {
     let mut v: Vec<String> = r
         .rows()
         .into_iter()
@@ -42,17 +42,17 @@ fn solutions(r: &QueryResult) -> Vec<String> {
     v
 }
 
-fn has_op(p: &PlanInfo, op: &str) -> bool {
+pub(super) fn has_op(p: &PlanInfo, op: &str) -> bool {
     p.operator == op || p.children.iter().any(|c| has_op(c, op))
 }
 
-fn has_desc(p: &PlanInfo, needle: &str) -> bool {
+pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
     p.description.contains(needle) || p.children.iter().any(|c| has_desc(c, needle))
 }
 
 /// Run `text` with every optimization and with none; the answers must be equal and the
 /// optimized plan must contain `op` (an operator name, or `desc:` + description text).
-fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
+pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     let fast = run(s, text, Optimizations::ALL);
     let slow = run(s, text, Optimizations::NONE);
     let (a, b) = (solutions(&fast), solutions(&slow));
@@ -71,7 +71,7 @@ fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
 }
 
 /// Rows of `text` with every optimization and with none, without checking the plan.
-fn same_rows(s: &Store, text: &str) -> Vec<String> {
+pub(super) fn same_rows(s: &Store, text: &str) -> Vec<String> {
     let a = solutions(&run(s, text, Optimizations::ALL));
     assert_eq!(a, solutions(&run(s, text, Optimizations::NONE)), "{text}");
     a
@@ -472,126 +472,6 @@ fn count_joins_from_key_runs() {
     );
     update(&s, "DELETE DATA { ex:a3 ex:knows ex:a4 }");
     same_answer(&s, two_hop, "CountJoinFromRuns");
-}
-
-// ---------------------------------------------------------- metadata counts ------
-
-#[test]
-fn class_counts_from_statistics_only_when_exact() {
-    let s = Store::in_memory(StoreOptions::default());
-    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
-    for i in 0..5000 {
-        ttl.push_str(&format!("ex:s{i} a ex:C{} .\n", i % 13));
-        if i % 4 == 0 {
-            ttl.push_str(&format!("ex:s{i} a ex:Extra .\n"));
-        }
-    }
-    load(&s, &ttl, RdfFormat::Turtle);
-    let q = "SELECT ?t (COUNT(?s) AS ?c) WHERE { ?s a ?t } GROUP BY ?t ORDER BY DESC(?c) ?t";
-    let before = same_answer(&s, q, "GroupCountFromMetadata");
-    same_answer(
-        &s,
-        "SELECT ?t (COUNT(*) AS ?c) WHERE { ?s rdf:type ?t } GROUP BY ?t",
-        "GroupCountFromMetadata",
-    );
-    // a delta makes the statistics stale: the index runs are counted instead
-    update(&s, "INSERT DATA { ex:new a ex:C1 }");
-    let r = run(&s, q, Optimizations::ALL);
-    assert!(!has_op(&r.plan, "GroupCountFromMetadata"));
-    assert!(has_op(&r.plan, "GroupCountFromIndex"));
-    let after = same_rows(&s, q);
-    assert_ne!(before, after);
-    // after compaction they are exact again
-    s.compact().unwrap();
-    assert_eq!(same_answer(&s, q, "GroupCountFromMetadata"), after);
-    // named graphs: a subject typed in two graphs has two rows in a union
-    update(
-        &s,
-        "INSERT DATA { GRAPH ex:g { ex:s1 a ex:C1 . ex:t a ex:C2 } }",
-    );
-    s.compact().unwrap();
-    let r = run(&s, q, Optimizations::ALL);
-    assert!(!has_op(&r.plan, "GroupCountFromMetadata"));
-    same_rows(&s, q);
-    same_rows(
-        &s,
-        "SELECT ?t (COUNT(?s) AS ?c) WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s a ?t } } GROUP BY ?t",
-    );
-}
-
-#[test]
-fn distinct_counts_from_statistics_only_when_exact() {
-    let s = Store::in_memory(StoreOptions::default());
-    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
-    for i in 0..3000 {
-        // repeated objects, objects shared between predicates, literals, a self-loop
-        ttl.push_str(&format!(
-            "ex:s{} ex:knows ex:s{} .\n",
-            i % 700,
-            (i * 7) % 900
-        ));
-        ttl.push_str(&format!("ex:s{i} ex:name \"n{}\" .\n", i % 1100));
-        if i % 9 == 0 {
-            ttl.push_str(&format!("ex:s{i} ex:likes ex:s{i} .\n"));
-        }
-    }
-    load(&s, &ttl, RdfFormat::Turtle);
-    s.compact().unwrap();
-    let queries = [
-        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }",
-        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:knows ?o }",
-        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:name ?o }",
-        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o }",
-        "SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }",
-        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ?p ?o }",
-    ];
-    let mut before = Vec::new();
-    for q in queries {
-        before.push(same_answer(&s, q, "CountDistinctFromMetadata"));
-    }
-    // a predicate that is not in the data, and repeated variables, are counted from runs
-    for q in [
-        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:none ?o }",
-        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:likes ?s }",
-        "SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ex:knows ex:s7 }",
-    ] {
-        let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
-        same_rows(&s, q);
-    }
-    // a delta makes the statistics stale: the runs are counted instead
-    update(
-        &s,
-        "INSERT DATA { ex:new ex:knows ex:other . ex:new ex:name \"n1\" } ; DELETE DATA { ex:s0 ex:knows ex:s0 }",
-    );
-    let mut after = Vec::new();
-    for q in queries {
-        let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
-        assert!(has_op(&r.plan, "CountDistinctFromIndex"), "{q}");
-        after.push(same_rows(&s, q));
-    }
-    assert_ne!(before, after);
-    // after compaction they are exact again
-    s.compact().unwrap();
-    for (q, a) in queries.iter().zip(&after) {
-        assert_eq!(&same_answer(&s, q, "CountDistinctFromMetadata"), a);
-    }
-    // named graphs: the statistics count terms of every graph
-    update(
-        &s,
-        "INSERT DATA { GRAPH ex:g { ex:s1 ex:knows ex:elsewhere . ex:t ex:name \"other\" } }",
-    );
-    s.compact().unwrap();
-    for q in queries {
-        let r = run(&s, q, Optimizations::ALL);
-        assert!(!has_op(&r.plan, "CountDistinctFromMetadata"), "{q}");
-        same_rows(&s, q);
-    }
-    same_rows(
-        &s,
-        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { GRAPH <urn:x-arq:UnionGraph> { ?s ex:knows ?o } }",
-    );
 }
 
 // ---------------------------------------------------------------- anti-join ------

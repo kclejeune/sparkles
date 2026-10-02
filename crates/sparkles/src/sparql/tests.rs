@@ -1052,9 +1052,11 @@ fn count_distinct_from_index() {
                 s,
                 &format!("SELECT (COUNT(DISTINCT {v}) AS ?c) WHERE {{ {pattern} }}"),
             );
-            // a graph variable keeps the general plan (the scan is not the group's input)
+            // a graph variable keeps the general plan (the scan is not the group's input);
+            // the others count runs or read the statistics
             assert_eq!(
-                has_op(&r.plan, "CountDistinctFromIndex"),
+                has_op(&r.plan, "CountDistinctFromIndex")
+                    || has_op(&r.plan, "CountDistinctFromMetadata"),
                 !pattern.contains("?g"),
                 "{pattern} {v}"
             );

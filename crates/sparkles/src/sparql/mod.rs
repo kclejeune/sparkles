@@ -15,6 +15,7 @@ pub mod indexjoin;
 mod keyfilter;
 pub mod plan;
 pub mod results;
+pub mod stats;
 pub mod table;
 pub mod textpf;
 pub mod update;
@@ -706,5 +707,7 @@ mod exprcache_tests;
 mod indexjoin_tests;
 #[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod stats_tests;
 #[cfg(test)]
 mod tests;

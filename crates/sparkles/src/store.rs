@@ -54,6 +54,8 @@ pub struct Generation {
     pub vectors: crate::vector::GenerationVectors,
     /// the spatial index's geometry column and base tree for this generation
     pub geo: crate::geo::GenerationGeo,
+    /// counts from the statistics without the quads of graphs a query does not read
+    pub counts: crate::sparql::stats::CountCache,
 }
 
 impl Generation {
@@ -70,6 +72,7 @@ impl Generation {
             _tmp: None,
             vectors: Default::default(),
             geo: Default::default(),
+            counts: Default::default(),
         }
     }
 
@@ -119,6 +122,7 @@ impl Generation {
             _tmp: None,
             vectors: Default::default(),
             geo: Default::default(),
+            counts: Default::default(),
         })
     }
 
@@ -149,7 +153,11 @@ impl Delta {
     pub fn is_empty(&self) -> bool {
         self.ins[0].is_empty() && self.del[0].is_empty()
     }
-    fn range<'a>(set: &'a OrdSet<Key>, prefix: &[u64]) -> impl Iterator<Item = &'a Key> + 'a {
+    /// The keys of `set` that start with `prefix`, in order.
+    pub(crate) fn range<'a>(
+        set: &'a OrdSet<Key>,
+        prefix: &[u64],
+    ) -> impl Iterator<Item = &'a Key> + 'a {
         Self::key_range(set, pad(prefix, 0), pad(prefix, u64::MAX))
     }
     fn key_range(set: &OrdSet<Key>, lo: Key, hi: Key) -> impl Iterator<Item = &Key> + '_ {
@@ -183,6 +191,9 @@ pub struct Snapshot {
         Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
     /// a past state (see [`Store::snapshot_at`]), not the live one
     pub historical: bool,
+    /// exact counts from the statistics corrected for this snapshot's delta, worked out
+    /// once per snapshot
+    pub counts: Arc<crate::sparql::stats::CountCache>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -848,6 +859,7 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
+                counts: Default::default(),
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1055,6 +1067,7 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
+                counts: Default::default(),
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1345,6 +1358,7 @@ impl Store {
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: true,
         });
         h.cache.insert(0, ((owner, seq), snap.clone(), bytes));
@@ -2417,6 +2431,7 @@ impl Store {
                         union_default_graph: self.opts.union_default_graph,
                         geo_op_vertices: self.opts.geo_op_vertices,
                         delta_stats: Default::default(),
+                        counts: Default::default(),
                         historical: false,
                     })
                 };
@@ -2496,6 +2511,7 @@ impl Store {
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         };
         if bulk.is_some() {
@@ -2991,6 +3007,7 @@ impl WriteTxn<'_> {
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         }
     }
@@ -3338,6 +3355,7 @@ impl WriteTxn<'_> {
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         };
         self.store.maintain_text(&mut snap, &self.log);
@@ -3684,6 +3702,7 @@ pub(crate) fn replay_wal(
         union_default_graph: false,
         geo_op_vertices: StoreOptions::default().geo_op_vertices,
         delta_stats: Default::default(),
+        counts: Default::default(),
         historical: false,
     };
     let mut quads = out.base_quads;
