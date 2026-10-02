@@ -445,6 +445,9 @@ instances of C with counts, and renders anonymous class expressions. It also add
 schema diff between two snapshots, which needs point-in-time queries
 ([F06](F06-snapshots-and-point-in-time.md)), and incremental maintenance from the delta.
 
+**Phase 4** drafts SHACL shapes and ShEx schemas from the data, with a support threshold
+per constraint. It was designed after Phases 1 and 2 had shipped, and §11 describes it.
+
 ## 7. Acceptance examples
 
 All requests go to dataset `t`, and `ex:` is `http://ex.org/`. The JSON shown is an
@@ -601,6 +604,211 @@ removed, `maxPerSubject = 1`, and no field anywhere changes its name or meaning.
 - The Apache Jena convention of `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`, as
   Sparkles' SHACL endpoint already implements it.
 - Fluree was not consulted. No Fluree code, documentation or product pages were read.
+
+## 11. Phase 4: shapes drafted from the data
+
+This section was written on 2026-10-02, after Phases 1 and 2 had shipped. It turns part
+of the §1 non-goal around: the report itself still states no constraints, but a separate
+request can now draft them.
+
+### 11.1 Summary
+
+A dataset that already holds data needs shapes before write-time validation
+([C10](C10-write-time-validation.md)) can guard it. Writing them by hand means reading the
+schema report, guessing which observations are rules, and then finding out by trial
+which guesses the data breaks. The report has the counts per predicate, but shapes are
+per class, and the report does not say which predicates the instances of a class use.
+
+Phase 4 computes per-class property profiles, the first item of Phase 3, and drafts one
+SHACL node shape and one ShEx shape per class from them. Every constraint carries a
+support threshold. A constraint is drafted only when the share of the instances it
+applies to that satisfy it reaches the threshold, and the draft reports how many
+instances each constraint would exclude.
+
+**Goals**
+
+1. A draft at support 1.0 validates the current data with no results, in SHACL and in
+   ShEx. The tests check this on data with several types per node, subclasses, mixed
+   datatypes, ill-formed literals, language tags and closed shapes.
+2. Below 1.0, each drafted constraint states how many instances it applies to, how many
+   satisfy it and how many it excludes. The best candidate that missed the threshold is
+   listed too, with the same numbers.
+3. The draft reads the same selection as the report (§4.1) and the caller's graph view
+   ([C12](C12-graph-access-control.md) §5.4).
+4. It is available as `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes`, an
+   MCP tool, and an action of the UI's schema browser that opens the draft in the shapes
+   editor or installs it as a write-time guard in `warn` mode.
+
+**Non-goals.** The drafter does not sample, learn weights or guess beyond the counts.
+It drafts no `sh:or` of datatypes, no inverse or sequence paths, no `sh:pattern`, length
+or range constraints, and no `sh:node` references between class shapes. A draft is
+text for a person to review. Nothing is enforced until someone installs it.
+
+### 11.2 Basis
+
+- **W3C SHACL** defines the drafted vocabulary: `sh:targetClass`, `sh:property`,
+  `sh:path`, `sh:minCount`, `sh:maxCount`, `sh:nodeKind`, `sh:datatype`, `sh:class`,
+  `sh:in`, `sh:languageIn`, `sh:uniqueLang`, `sh:closed` and `sh:ignoredProperties`. Two
+  of its rules matter for exactness. The targets of `sh:targetClass C` are the SHACL
+  instances of `C`, the nodes with an `rdf:type` whose class is `C` or reaches `C` over
+  `rdfs:subClassOf` in the data graph. `sh:class` tests membership the same way. Value
+  constraints such as `sh:datatype` fail a focus node when any one of its values fails,
+  and `sh:datatype` also fails ill-formed literals.
+- **ShEx 2.1** defines triple constraints with cardinalities, node constraints (node
+  kinds, datatypes, value sets with language tags), `EXTRA`, `CLOSED` and query shape
+  maps. ShEx applies no RDFS, so `rdf:type` arcs are matched as they are.
+- **Shape extraction from knowledge graphs** gives the approach. QSE (Rabbani,
+  Lissandrini and Hose, "Extraction of Validating Shapes from Very Large Knowledge
+  Graphs", PVLDB 2023) builds an entity-to-types map, counts property and object-type
+  pairs per class in one pass, and prunes constraints by support and confidence. sheXer
+  (Fernández-Álvarez, Labra Gayo and Gayo-Avello, "Automatic extraction of shapes using
+  sheXer", Knowledge-Based Systems 2022) keeps a constraint when the share of instances
+  that comply with it reaches a trust threshold, and reports exact cardinalities or
+  `+`/`*`. ABSTAT (Spahiu, Porrini, Palmonari, Rula and Maurino, 2016) summarizes data as
+  minimal type patterns with cardinality statistics. These are cited from working
+  knowledge. No code of theirs was used.
+
+### 11.3 Semantics
+
+**Instances.** For a class `C` in the selection, the instances are its SHACL instances
+there: the subjects with an `rdf:type T` where `T` is `C` or reaches `C` over
+`rdfs:subClassOf` in the same selection. `I(C)` is their number. This differs from the
+report's `observed.instances`, which counts direct types only (§4.2). Classes in the
+`rdf:`, `rdfs:`, `owl:`, `xsd:` and `sh:` namespaces get no shape unless the request
+names them.
+
+**Profiles.** For each class `C` and predicate `p` other than `rdf:type`, the profile
+counts, over the instances of `C`:
+
+- `W(C,p)`, the instances with at least one value of `p`;
+- how many instances have `n` distinct values, for each `n`;
+- per instance, whether all its values are IRIs, blank nodes or literals, whether they
+  are all well-formed literals of one datatype, which classes all of them belong to, and
+  their language tags and distinct values (capped, see §11.5).
+
+**Applicability and support.** The support `s` is a number in (0, 1]. `sh:minCount`
+applies to all `I(C)` instances. Every other constraint applies to the `W(C,p)`
+instances that have a value, because an instance without one satisfies it whatever it
+says. Counting those instances would let any constraint on a rare property pass. A
+constraint is drafted when `satisfied ≥ s × applicable`, and `excluded` is
+`applicable − satisfied`.
+
+| Constraint | Candidate | Drafted when |
+|---|---|---|
+| `sh:minCount k` | the largest `k ≥ 1` such that enough instances have `k` or more values | always, if such a `k` exists |
+| `sh:maxCount k` | the smallest `k` such that enough instances with values have at most `k` | `k` ≤ `maxCount` (default 1) |
+| `sh:nodeKind` | the most specific of the six node kinds that covers all the values of enough instances | always, except `sh:Literal` next to a drafted `sh:datatype` |
+| `sh:datatype D` | the datatype with the most instances whose values are all well-formed literals of `D` | always |
+| `sh:class K` | the class, outside the built-in namespaces, with the most instances whose values are all instances of `K`; ties go to the class with fewer instances | always |
+| `sh:in (v…)` | values in descending order of use; the shortest prefix that covers all the values of enough instances | at most `maxIn` values (default 10), each used by at least two instances; IRIs and literals only; never for `xsd:boolean` |
+| `sh:languageIn` | language tags chosen the same way; an untagged value never satisfies it | some value has a tag |
+| `sh:uniqueLang true` | instances with no two values in one language | some instance has two tagged values |
+| `sh:closed true` | a property shape for every predicate an instance uses, with `sh:ignoredProperties (rdf:type)` | `closed=true` |
+
+At support 1.0 every drafted constraint holds for every instance it applies to, so the
+data conforms. The tests also check the converse below 1.0. For each drafted constraint,
+`excluded` equals the number of distinct focus nodes that a validation of the draft
+reports for that constraint's path and component.
+
+**ShEx.** The ShEx draft carries the same decisions:
+
+| SHACL | ShEx |
+|---|---|
+| node shape with `sh:targetClass C` | shape `<…CShape>`, and `{FOCUS rdf:type <C>}@<…CShape>` in the shape map |
+| `sh:minCount`, `sh:maxCount` | the cardinality `{min,max}`, with `*` for no maximum |
+| `sh:nodeKind` | `IRI`, `BNODE`, `LITERAL`, `NONLITERAL`, or `(IRI OR LITERAL)` and `(BNODE OR LITERAL)` |
+| `sh:datatype` | the datatype |
+| `sh:in`, `sh:languageIn` | a value set, `[v…]` or `[@en @de]` |
+| `sh:class K` | `EXTRA rdf:type { rdf:type [K S…] + }`, where `S…` are the subclasses of `K` in the selection |
+| `sh:closed` | `CLOSED`, with `rdf:type . *` |
+| `sh:uniqueLang` | none (left out) |
+
+A query shape map selects the direct instances of each class, which are a subset of the
+SHACL targets. ShEx applies no RDFS, so the class test lists the subclasses explicitly.
+The ShEx draft therefore conforms at support 1.0 as well.
+
+**Graphs and reasoning.** The selection is chosen as in §4.1, except that `reasoning`
+defaults to `false`. That matches the default `includeInferences: false` of write-time
+validation, so a draft installed as a guard validates the graphs it was drafted from.
+
+### 11.4 User-visible behavior
+
+`GET /$/schema/{ds}/shapes` takes these parameters, all optional:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `graph` | `default` | As in §2.1. |
+| `reasoning` | `false` | Whether `default` and `union` include the inferred graph. |
+| `support` | `1` | The threshold, a number in (0, 1]. |
+| `class` | every class with instances outside the built-in namespaces | Draft only these classes (repeatable, IRIs). |
+| `minInstances` | `1` | Skip classes with fewer instances. |
+| `maxIn` | `10` | The largest `sh:in` list. `0` drafts none. |
+| `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
+| `closed` | `false` | Draft closed shapes. |
+| `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
+| `format` | `json` | `json`, `turtle` (SHACL) or `shexc` (ShEx). `Accept: text/turtle` and `text/shex` also select them. |
+| `timeout` | the server's query timeout | As in §2.1. |
+
+The JSON document holds the options, the snapshot, one entry per shape with its
+instances and property shapes, each drafted and rejected constraint with its counts, and
+the SHACL Turtle, the ShExC schema and the shape map as text. The Turtle and ShExC texts
+carry the counts as comments. Errors are those of §2.1, and `400` also covers a support
+outside (0, 1].
+
+The CLI is `sparkles schema --draft-shapes [--support S] [--closed] [--max-in N]
+[--max-count N] [--class IRI…] [--min-instances N] [--format turtle|shexc|json]`, with the
+selection flags of `sparkles schema`. The MCP server gains a `draft_shapes` tool with the
+same arguments. The UI's schema browser gains a **Draft shapes** action. It shows the
+draft and its counts, opens it in the dataset page's shapes editor, or installs it with
+`PUT /$/validation/{ds}` in `warn` mode, which needs `admin`.
+
+### 11.5 Design sketch
+
+The drafter is `sparkles::schema::draft`, next to `discover`, and uses the same snapshot
+APIs and graph filters.
+
+1. **Types.** One pass over `POS[rdf:type]` maps each subject to its direct classes. A
+   pass over `PSO[rdfs:subClassOf]` gives the superclass closure, and each subject's
+   classes are closed under it. Class sets are interned, so subjects with the same
+   classes share one entry.
+2. **Literal keys.** For each predicate, a pass over `POS[p]` classifies each distinct
+   object once, reading base-vocabulary keys in sorted batches as §5 does.
+3. **Profiles.** A pass over `PSO[p]` takes each subject's run of distinct objects,
+   summarizes it, and adds the summary to the accumulator of every class of the subject.
+   Distinct values are tracked up to 64 per class and predicate, and sets of values per
+   instance up to 4,096. Past either cap, no `sh:in` is drafted.
+4. **Decisions** follow §11.3 and are rendered as JSON, Turtle and ShExC.
+
+The cost is one pass over `rdf:type` and the two passes per predicate of §5, plus memory
+for the map of typed subjects. The deadline, cancel flag and entry cap of §4.6 apply.
+
+### 11.6 Acceptance examples
+
+- **D1.** On a fixture with several types per node, a subclass with its own instances,
+  mixed datatypes, an ill-formed integer, language tags and a status enumeration, the
+  draft at support 1.0 validates with no results in SHACL, open and closed, and every
+  association of the ShEx draft's shape map conforms.
+- **D2.** With one wrong status among 20 instances, support 0.9 drafts `sh:in` with
+  `excluded: 1`, and SHACL validation of the draft reports `sh:InConstraintComponent`
+  for exactly that node. Support 1.0 drafts no `sh:in` and lists it as rejected.
+- **D3.** A caller limited to some graphs gets a draft of those graphs only.
+- **D4.** `support=0`, `support=1.5` and `maxIn=x` answer `400`, and a graph with no
+  quads answers `404`.
+
+### 11.7 Rejected alternatives
+
+- **SPARQL `GROUP BY` queries per class.** They need a grouping per constraint kind, and
+  the per-instance tests ("all values are integers") need nested aggregates. The ordered
+  index passes of §5 do it in one sweep.
+- **Sampling, as approximate shape extractors do.** The drafts would no longer conform
+  at support 1.0. Exact counts are affordable at the sizes Sparkles has been measured on.
+- **Support over all instances for value constraints.** A constraint on a property that
+  few instances use would always pass.
+- **`sh:or` of datatypes for mixed values, and `sh:node` between class shapes.** They
+  make drafts harder to read, and recursive references make the guard validate in full
+  (C10 §6.2.3). A person can add them while editing the draft.
+- **Writing drafts into a shapes graph of the dataset.** That would be a write to the
+  data. Drafts go through review, and installing one uses the validation configuration.
 
 ## Outcome
 
