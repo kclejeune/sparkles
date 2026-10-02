@@ -657,3 +657,80 @@ dataset = "ds"
         cfg.warnings()
     );
 }
+
+/// A dry run needs the permission of the write it previews (C15 §4.6), and a limited
+/// caller's preview leaves out what covers every graph.
+#[tokio::test]
+async fn dry_runs_need_the_write_permission() {
+    let s = server();
+    let up = |u: &str| format!("PREFIX ex: <http://ex/> {u}");
+    let start = head(&s.state, "graphs");
+    let dry = |user: &'static str, body: String| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/graphs/update?dryRun=true&changes=5",
+                &[
+                    ("authorization", &b(user)),
+                    ("content-type", "application/sparql-update"),
+                ],
+                &body,
+            )
+            .await
+        }
+    };
+    // a reader may not preview a write
+    let r = dry(
+        "gra",
+        up("INSERT DATA { GRAPH <http://ex/a/1> { ex:n ex:p 1 } }"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // nor may a writer preview a write to a graph it cannot write
+    let r = dry(
+        "grad",
+        up("INSERT DATA { GRAPH <http://ex/b/1> { ex:n ex:p 1 } }"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        r.err()["error"],
+        "write access to graph <http://ex/b/1> required"
+    );
+    // a preview of its own graph has the counts of that graph, not the dataset's
+    let r = dry(
+        "grad",
+        up("INSERT DATA { GRAPH <http://ex/a/1> { ex:n ex:p 1 } }"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["dryRun"], true);
+    assert!(j["commit"].get("quads").is_none(), "{j}");
+    assert!(j["commit"].get("inserted").is_none(), "{j}");
+    assert_eq!(
+        j["graphs"],
+        serde_json::json!([{ "graph": "http://ex/a/1", "inserted": 1, "deleted": 0 }])
+    );
+    assert_eq!(j["changes"]["total"], 1);
+    assert!(j["storage"].get("used").is_none(), "{j}");
+    // a whole-dataset clear by a limited caller touches the visible graphs only
+    let r = dry("grad", up("CLEAR GRAPH <http://ex/a/1>")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["graphs"][0]["deleted"], 2);
+    let r = call(
+        &s.app,
+        "PUT",
+        "/graphs/data?graph=http%3A%2F%2Fex%2Fb%2F1&dryRun",
+        &[
+            ("authorization", &b("grad")),
+            ("content-type", "text/turtle"),
+        ],
+        "<http://ex/n> <http://ex/p> 1 .",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(head(&s.state, "graphs"), start);
+}

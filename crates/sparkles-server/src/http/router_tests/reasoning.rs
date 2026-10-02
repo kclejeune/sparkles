@@ -905,3 +905,42 @@ async fn a_waiting_write_supersedes_an_automatic_run() {
     let id = st.tasks.lock()[2].id.clone();
     let _ = st.cancel_task(&id);
 }
+
+/// A dry run of a write to the default graph leaves the inferences fresh, and gives
+/// automatic mode nothing to do (C15 §4.2).
+#[tokio::test]
+async fn dry_runs_leave_inferences_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(
+        dir.path(),
+        Some(AutoReason::new(Duration::ZERO, None)),
+        false,
+    );
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    let before = get_json(&app, "/$/reason/t").await;
+    assert_eq!(before["stale"], false);
+    let r = send(
+        &app,
+        Request::post("/t/update?dryRun=true")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(
+                "INSERT DATA { <http://ex.org/w> a <http://ex.org/C> }",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["wouldCommit"], true);
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        (&s["stale"], &s["commitsSince"]),
+        (&J::Bool(false), &J::from(0))
+    );
+    assert_eq!(s["head"], before["head"]);
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    assert_eq!(st.tasks.lock().len(), 1);
+}

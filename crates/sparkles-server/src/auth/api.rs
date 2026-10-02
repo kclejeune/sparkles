@@ -40,6 +40,7 @@ pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
             header::IF_MATCH,
             header::IF_NONE_MATCH,
             header::HeaderName::from_static("sparkles-commit-message"),
+            header::HeaderName::from_static("sparkles-dry-run"),
             // the Streamable HTTP transport of `/$/mcp`
             header::HeaderName::from_static("mcp-protocol-version"),
             header::HeaderName::from_static("mcp-session-id"),
