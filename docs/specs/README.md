@@ -45,6 +45,9 @@ Numbers are stable. Gaps in the numbering are roadmap items without a spec: a Cy
 frontend and property-graph view, a GraphQL adapter and a Datalog frontend. G01 replaced the narrower geospatial item on that list.
 frontend and property-graph view, tabular imports and a Datalog frontend. G01 replaced
 the narrower geospatial item on that list.
+Numbers are stable. Gaps in the numbering are roadmap items without a spec: Cypher
+writes over the property-graph view, a GraphQL adapter, tabular imports and a Datalog
+frontend. G01 replaced the narrower geospatial item on that list.
 
 ## Specs
 
@@ -70,6 +73,7 @@ there is no code yet.
 | [C13](C13-automatic-compaction.md) | Background compaction triggered by the delta's size, the log's size, age and idle time, with writes continuing during the build | implemented |
 | [C15](C15-write-previews.md) | Dry runs of updates, Graph Store writes, uploads and the MCP write tool, which report the commit, the changes, validation, quota and preconditions and roll back | implemented |
 | [C16](C16-stored-queries.md) | Named queries per dataset with typed parameters bound as terms, versions, runs by name, MCP tools and the UI's saved queries | implemented |
+| [F01](F01-cypher.md) | A read-only openCypher subset compiled to the SPARQL algebra over a property-graph view of RDF, with relationship identity and properties through RDF 1.2 reifiers, `/{ds}/cypher` and `sparkles cypher` | specified |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |

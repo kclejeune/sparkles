@@ -1000,6 +1000,47 @@ implementation landed.
   - Jena's blank-node labels as identities;
   - one commit per `TX … TC` block as the default.
 
+## Cypher read subset over RDF
+
+- **Spec:** [`F01-cypher.md`](F01-cypher.md), written on 2026-10-02 independently from:
+  - openCypher 9 (the Cypher Query Language Reference and grammar) and the openCypher
+    TCK (Apache-2.0), whose feature directories and license were checked on 2026-10-02;
+  - public summaries of ISO/IEC 39075:2024 (GQL) and ISO/IEC 9075-16:2023 (SQL/PGQ),
+    and Deutsch et al., "Graph Pattern Matching in GQL and SQL/PGQ" (SIGMOD 2022);
+  - the Neo4j Cypher manual and the Neo4j Query API documentation;
+  - Amazon Neptune's openCypher compliance page, the Neptune Analytics guide to RDF
+    data, an AWS blog post on RDF and openCypher, Schmidt et al., "openCypher over RDF:
+    Connecting Two Worlds" (ISWC 2024 demo), and Lassila et al., "The OneGraph vision"
+    (Semantic Web, 2023);
+  - the Kùzu documentation of RDF graphs, the neosemantics documentation, Ontotext
+    GraphDB's graph path search documentation, and Stardog community forum answers on
+    its TinkerPop support;
+  - W3C RDF 1.2 Concepts, Turtle 1.2 and SPARQL 1.2 Query drafts, the RDF-star
+    Community Group report (2021), and Hartig, "Reconciliation of RDF* and Property
+    Graphs" (arXiv:1409.3288);
+  - Francis et al., "Cypher: An Evolving Query Language for Property Graphs" (SIGMOD
+    2018), Angles, Thakkar and Tomaszuk, "Mapping RDF Databases to Property Graph
+    Databases" (IEEE Access, 2020), Steer et al., "Cytosm" (GRADES 2017), Thakkar et
+    al., "Gremlinator" (GRADES-NDA 2018), and Zhao et al., "S2CTrans" (2023);
+  - the Sparkles code and specs C01, C02, C08, C09, C11, C12, C16 and F06.
+
+  Fluree was not consulted.
+- **Implementation:** not built. The spec plans no new runtime dependency. The parser is
+  written by hand from the openCypher grammar. The TCK's feature files (Apache-2.0)
+  would be test data, read from a pinned checkout and never linked into a binary.
+- **Rejected** (spec §15):
+  - Gremlin as the property-graph language;
+  - Cypher writes in this spec;
+  - a stored property-graph copy of the data;
+  - a separate Cypher executor;
+  - generating SPARQL text instead of algebra;
+  - one row per value, or an arbitrary value, for multi-valued properties;
+  - `rdf:type` triples as relationships;
+  - unasserted reifications as relationships;
+  - case-insensitive or case-converted names;
+  - Bolt in the first phase;
+  - a parser generated from the ANTLR grammar.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
