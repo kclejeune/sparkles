@@ -604,6 +604,8 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
         BudgetKind::ValidationWork => 5,
+        BudgetKind::RowsProduced => 6,
+        BudgetKind::DatasetBytes => 7,
     }
 }
 
@@ -920,6 +922,8 @@ struct DsGauges {
     delta_deletes: u64,
     wal_bytes: u64,
     disk_bytes: u64,
+    /// storage quotas (0: unlimited)
+    quota_bytes: u64,
     cache_bytes: u64,
     cache_capacity: u64,
     cache_entries: u64,
@@ -950,7 +954,10 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.delta_inserts += snap.delta.inserts() as u64;
         g.delta_deletes += snap.delta.deletes() as u64;
         g.wal_bytes += d.store.wal_bytes();
-        g.disk_bytes += d.store.disk_bytes();
+        // measured at most once a second, like the quota checks of commits
+        let quota = d.store.quota();
+        g.disk_bytes += quota.used_bytes;
+        g.quota_bytes += quota.max_bytes.unwrap_or(0);
         g.cache_bytes += c.bytes();
         g.cache_capacity += opts.cache_bytes;
         g.cache_entries += c.entries() as u64;
@@ -1235,7 +1242,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     }
 
     type Field = fn(&DsGauges) -> u64;
-    let per_dataset: [(&str, &str, &str, Field); 11] = [
+    let per_dataset: [(&str, &str, &str, Field); 12] = [
         (
             "sparkles_dataset_quads",
             "gauge",
@@ -1253,6 +1260,12 @@ pub fn render_prometheus(st: &AppState) -> String {
             "gauge",
             "Size of the database directory.",
             |g| g.disk_bytes,
+        ),
+        (
+            "sparkles_dataset_quota_bytes",
+            "gauge",
+            "Storage quota of the database directory (0: unlimited).",
+            |g| g.quota_bytes,
         ),
         (
             "sparkles_block_cache_bytes",
@@ -1429,6 +1442,7 @@ pub fn metrics_json(st: &AppState) -> J {
                 "deltaDeletes": g.delta_deletes,
                 "walBytes": g.wal_bytes,
                 "diskBytes": g.disk_bytes,
+                "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
                 "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),

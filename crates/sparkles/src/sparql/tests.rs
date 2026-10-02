@@ -1604,3 +1604,95 @@ fn exports_read_through_the_block_cache() {
     assert_eq!(s.cache().bytes(), warm);
     assert_eq!(out, again);
 }
+
+/// The rows of every executed operator in a plan, summed.
+fn plan_rows(p: &PlanInfo) -> u64 {
+    p.actual_rows.max(0) as u64 + p.children.iter().map(plan_rows).sum::<u64>()
+}
+
+#[test]
+fn rows_produced_sums_every_operator_and_is_a_budget() {
+    use crate::error::{BudgetKind, Error};
+    let s = store();
+    let snap = s.snapshot();
+    let text = "SELECT * { ?a ?b ?c . ?d ?e ?f }";
+    let free = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let r = query(snap.clone(), text, &free).unwrap();
+    let n = query(snap.clone(), "SELECT * { ?s ?p ?o }", &free)
+        .unwrap()
+        .len() as u64;
+    // two scans of n rows and their n² cross product
+    assert_eq!(r.len() as u64, n * n);
+    assert_eq!(r.rows_produced, plan_rows(&r.plan));
+    assert!(r.rows_produced >= n * n + 2 * n, "{}", r.rows_produced);
+    // a budget above the largest intermediate result but below the total still fails:
+    // it counts the work of all operators, not one table
+    let limit = n * n + n;
+    let o = QueryOptions {
+        max_rows_produced: Some(limit),
+        no_cache: true,
+        ..Default::default()
+    };
+    match query(snap.clone(), text, &o) {
+        Err(Error::BudgetExceeded(b)) => {
+            assert_eq!((b.kind, b.limit), (BudgetKind::RowsProduced, limit));
+            assert!(b.requested > limit);
+            assert_eq!(BudgetKind::RowsProduced.as_str(), "rows-produced");
+            let msg = Error::BudgetExceeded(b).to_string();
+            assert!(msg.starts_with("query exceeds its work budget"), "{msg}");
+        }
+        r => panic!("{:?}", r.map(|r| r.len())),
+    }
+    // exactly the total fits
+    let o = QueryOptions {
+        max_rows_produced: Some(r.rows_produced),
+        no_cache: true,
+        ..Default::default()
+    };
+    assert_eq!(query(snap.clone(), text, &o).unwrap().len() as u64, n * n);
+    // a cached result counts as produced too
+    let c = cached_store(DATA, RdfFormat::Turtle);
+    q(&c, text);
+    let hit = q(&c, text);
+    assert!(has_cached(&hit.plan));
+    assert!(hit.rows_produced >= n * n, "{}", hit.rows_produced);
+    let o = QueryOptions {
+        max_rows_produced: Some(n * n - 1),
+        ..Default::default()
+    };
+    assert!(matches!(
+        query(c.snapshot(), text, &o),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
+    ));
+}
+
+#[test]
+fn rows_produced_is_shared_by_the_operations_of_an_update() {
+    use crate::error::{BudgetKind, Error};
+    let s = store();
+    let before = s.snapshot().len();
+    let free = QueryOptions::default();
+    let one = "INSERT { ?a <urn:x> ?d } WHERE { ?a a <http://xmlns.com/foaf/0.1/Person> . ?d a <http://xmlns.com/foaf/0.1/Person> }";
+    let undo = "DELETE WHERE { ?a <urn:x> ?d }";
+    let single = update::update(&s, one, &free).unwrap();
+    assert!(single.rows_produced > 0);
+    update::update(&s, undo, &free).unwrap();
+    assert_eq!(s.snapshot().len(), before);
+    // one operation fits the budget, two of them together do not; nothing is written
+    let o = QueryOptions {
+        max_rows_produced: Some(single.rows_produced),
+        ..Default::default()
+    };
+    update::update(&s, one, &o).unwrap();
+    update::update(&s, undo, &free).unwrap();
+    let r = update::update(&s, &format!("{one} ; {one}"), &o);
+    assert!(
+        matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+        "{:?}",
+        r.map(|s| s.inserted)
+    );
+    assert_eq!(s.snapshot().len(), before);
+}

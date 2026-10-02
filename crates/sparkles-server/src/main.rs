@@ -23,6 +23,7 @@ mod mcp;
 mod obs;
 mod otel;
 mod outbound;
+mod quota_cmd;
 mod ratelimit;
 mod reasoning;
 #[cfg(feature = "auth")]
@@ -30,6 +31,7 @@ mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod shex_cmd;
+mod shutdown;
 mod state;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -450,6 +452,10 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
+        /// Budget for the rows all the operators of one query produce together (0:
+        /// unlimited); `max-rows-produced=` lowers it per request
+        #[arg(long, default_value_t = 0)]
+        max_rows_produced: u64,
         /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
         #[arg(long, default_value_t = 4096)]
         vector_memory_mb: u64,
@@ -507,6 +513,15 @@ enum Cmd {
         /// past it is refused with 507 (0: unlimited)
         #[arg(long, default_value_t = 4096)]
         max_mem_dataset_mb: u64,
+        /// Default storage quota of a persistent dataset, in MiB of its directory on
+        /// disk: a write that would take a dataset past it is refused with 507 (0:
+        /// unlimited); PUT /$/quota/{ds} or `sparkles quota` sets one per dataset
+        #[arg(long, default_value_t = 0)]
+        max_dataset_mb: u64,
+        /// On SIGTERM or SIGINT, seconds to let requests in flight finish before they
+        /// are cancelled (a cancelled write commits nothing)
+        #[arg(long, default_value_t = 20.0, value_name = "SECS")]
+        shutdown_grace: f64,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
         /// backups) that run at once; more wait, queued (0: no limit). Backup repository
         /// tasks have their own --backup-max-tasks
@@ -777,6 +792,9 @@ enum Cmd {
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
     Validation(validation_cmd::ValidationArgs),
+    /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
+    /// back to the default (--default)
+    Quota(quota_cmd::QuotaArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -1345,6 +1363,7 @@ fn run() -> Result<()> {
             max_result_mb,
             max_export_mb,
             max_rows,
+            max_rows_produced,
             update_timeout,
             vector_memory_mb,
             allow_unvalidated_writes,
@@ -1361,6 +1380,8 @@ fn run() -> Result<()> {
             min_free_disk_mb,
             max_tasks,
             max_mem_dataset_mb,
+            max_dataset_mb,
+            shutdown_grace,
             auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -1410,6 +1431,11 @@ fn run() -> Result<()> {
             let mut opts = opts;
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
+            // persistent datasets without a quota of their own get this one
+            opts.max_disk_bytes = (max_dataset_mb > 0).then_some(max_dataset_mb << 20);
+            if !(shutdown_grace.is_finite() && shutdown_grace >= 0.0) {
+                bail!("--shutdown-grace expects a number of seconds");
+            }
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
             opts.geo_query_rewrite = !no_geo_rewrite;
@@ -1456,6 +1482,8 @@ fn run() -> Result<()> {
                 max_result_bytes: mib(max_result_mb),
                 max_export_bytes: mib(max_export_mb),
                 max_rows,
+                max_rows_produced: (max_rows_produced > 0).then_some(max_rows_produced),
+                max_dataset_bytes: mib(max_dataset_mb),
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
                 max_decompressed_bytes: mib(max_decompressed_mb),
@@ -1574,6 +1602,8 @@ fn run() -> Result<()> {
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
+            let grace = Duration::from_secs_f64(shutdown_grace);
+            let st_after = st.clone();
             let served = rt.block_on(async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
@@ -1632,30 +1662,50 @@ fn run() -> Result<()> {
                 auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
+                let (draining_tx, draining) = tokio::sync::oneshot::channel();
                 let shutdown = async move {
                     shutdown_signal().await;
                     st2.set_phase(obs::Phase::Draining);
-                    tracing::info!("shutting down: finishing requests in flight");
+                    tracing::info!(
+                        "shutting down: finishing requests in flight (up to {grace:?})"
+                    );
+                    let _ = draining_tx.send(());
                 };
                 // the peer address feeds trusted-proxy checks
                 let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                use std::future::IntoFuture;
                 #[cfg(unix)]
-                if let Some(l) = unix {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                    auth::flush(&st);
-                    return anyhow::Ok(());
+                let drained = match (unix, tcp) {
+                    (Some(l), _) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, Some(l)) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, None) => shutdown::Drained::Finished,
+                };
+                #[cfg(not(unix))]
+                let drained = match tcp {
+                    Some(l) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    None => shutdown::Drained::Finished,
+                };
+                if drained == shutdown::Drained::GraceElapsed {
+                    tracing::warn!(
+                        "shutdown grace of {grace:?} elapsed: cancelling the requests still in flight"
+                    );
                 }
-                if let Some(l) = tcp {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                }
-                auth::flush(&st);
                 anyhow::Ok(())
             });
-            drop(rt);
+            // cancels what still runs (dropping a request's future sets its cancel flag)
+            // and waits a little for it to stop; a write stops before its commit or
+            // finishes it
+            rt.shutdown_timeout(shutdown::CANCEL_WAIT);
+            auth::flush(&st_after);
             // flush spans and metrics of the last requests (bounded)
             otel_guard.shutdown();
             served
@@ -1986,6 +2036,7 @@ fn run() -> Result<()> {
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
+        Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();

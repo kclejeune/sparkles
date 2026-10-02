@@ -203,6 +203,8 @@ const LIMITS = {
   maxResultBytes: 2 ** 30,
   maxExportBytes: 0,
   maxRows: 200_000_000,
+  maxRowsProduced: 0,
+  maxDatasetBytes: 0,
 };
 /** @type {Map<string, any>} */
 const series = new Map();
@@ -304,6 +306,8 @@ function metricsSnapshot() {
           'result-bytes': 0,
           'decompressed-bytes': 0,
           'outbound-bytes': 0,
+          'rows-produced': 0,
+          'dataset-bytes': 0,
         },
         blockCache: {
           bytes: Math.min(2 ** 30, st.quads * 24),

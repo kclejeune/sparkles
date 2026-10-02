@@ -94,6 +94,8 @@ let
     (toString cfg.port)
     "--timeout"
     (toString cfg.queryTimeout)
+    "--shutdown-grace"
+    (toString cfg.shutdownGrace)
   ]
   ++ lib.optionals (cfg.auth.configFile != null) [
     "--auth-config"
@@ -280,6 +282,17 @@ in
       type = types.ints.positive;
       default = 60;
       description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
+    };
+
+    shutdownGrace = mkOption {
+      type = types.ints.unsigned;
+      default = 20;
+      description = ''
+        Seconds that requests in flight get to finish when the service stops
+        (`--shutdown-grace`). Requests still running after that are cancelled, and a
+        cancelled write commits nothing. The unit's `TimeoutStopSec` is this plus 15
+        seconds, which covers the cancellation and the final flush.
+      '';
     };
 
     loadDir = mkOption {
@@ -672,9 +685,9 @@ in
         ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
         Restart = "on-failure";
         RestartSec = 5;
-        # graceful shutdown flushes nothing extra (commits are durable), but give
-        # in-flight requests a moment
-        TimeoutStopSec = 30;
+        # the grace period for requests in flight, then up to 5 s for cancelled ones to
+        # stop and the final flush (commits are durable either way)
+        TimeoutStopSec = cfg.shutdownGrace + 15;
         LimitNOFILE = 65536;
 
         # hardening

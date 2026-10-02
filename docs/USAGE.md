@@ -77,7 +77,9 @@ A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/d
 an in-memory dataset, and `--loc NAME=PATH` serves an existing database.
 
 `/$/ping` is the liveness check and `/$/ready` the readiness check. `/$/ready` returns
-`503` once shutdown starts on SIGINT or SIGTERM. `/$/metrics` serves Prometheus metrics.
+`503` once shutdown starts on SIGINT or SIGTERM. The requests in flight then get
+`--shutdown-grace` seconds to finish, after which the rest are cancelled and commit
+nothing ([API.md](API.md#shutdown)). `/$/metrics` serves Prometheus metrics.
 Every response carries an `X-Request-Id`, and each request is logged once under the
 `sparkles::access` target.
 
@@ -96,12 +98,15 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows in any intermediate result. |
+| `--max-rows-produced N` | `0` | Rows that all the operators of one query produce together; `0` means unlimited. It caps the work of a query independently of the machine's speed. |
 | `--max-query-body-mb N` | `16` | Largest SPARQL query body, which also covers explain and `/shacl` shapes; `0` means unlimited. A larger body gets `413`. |
 | `--max-update-body-mb N` | `256` | Largest SPARQL update body; `0` means unlimited. Bulk data goes through the Graph Store or `/upload`. |
 | `--max-admin-body-mb N` | `16` | Largest `/$/…` or prefix-change body; `0` means unlimited. `/$/auth/*` bodies are capped at 64 KiB. |
 | `--max-upload-mb N` | `4096` | Largest Graph Store write or upload body; `0` means unlimited. The body is streamed to a temporary file and counted after HTTP decompression. |
 | `--min-free-disk-mb N` | `1024` | Free disk space to keep; `0` turns the check off. The server refuses with `507` to spool a request body when the temporary directory's file system would keep less. It refuses to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) when the data directory's file system would keep less. |
 | `--max-mem-dataset-mb N` | `4096` | Largest in-memory dataset; `0` means unlimited. A commit that would grow one past it fails with `507`. |
+| `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
+| `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text and spatial index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
@@ -143,7 +148,9 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 `--map-style-url`, and the compression and schema limits.
 
 A request over budget fails with `507` and a JSON body that names the budget. The
-outbound total is named `outbound-bytes`. A query or write stops as soon as its client
+outbound total is named `outbound-bytes`. A query can lower its own budgets with the
+`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb` parameters, but never
+raise them ([API.md](API.md#budgets)). A query or write stops as soon as its client
 disconnects, and a write then commits nothing. `sparkles query --memory-mb N` applies the
 memory budget on the command line, where there is no limit by default.
 
@@ -173,6 +180,8 @@ sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPAR
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
+sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
+sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 ```
 
 `sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
@@ -202,6 +211,7 @@ The other commands are:
 * `schema`, `shacl` and `shex validate|parse`;
 * `validation`, for write-time validation;
 * `snapshot`, for named snapshots and history retention;
+* `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
   ([below](#backup-repositories));
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
@@ -554,7 +564,8 @@ keeps a multi-call exploration on one snapshot. The server holds the last 4 comm
 per dataset for 10 minutes.
 
 Every call runs under the query timeout, a memory budget (`--query-memory-mb`, default
-2048) and the intermediate-row cap. The timeout is 30 s by default, and `--timeout` is
+2048), the intermediate-row cap and, with `--max-rows-produced`, a cap on the rows all of
+a query's operators produce. The timeout is 30 s by default, and `--timeout` is
 the maximum. At most `--max-concurrent` calls (4) run at a time. SERVICE is off unless
 `--allow-service` is given, because a prompt-injected model could otherwise send data to
 any URL. When allowed, SERVICE follows the
@@ -717,6 +728,10 @@ services.sparkles.backup = {
   maxTasks = 1;
 };
 ```
+
+When the service stops, requests in flight get `shutdownGrace` seconds (default 20) to
+finish before they are cancelled. The unit's `TimeoutStopSec` is `shutdownGrace + 15`,
+which leaves time for the cancelled requests to stop and for the final flush.
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so stop the service before offline work such as `sparkles load` or

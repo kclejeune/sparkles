@@ -27,7 +27,7 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 
 ```ts
 type ReadyInfo = {
-  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM)
+  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM, see Shutdown)
   ready: boolean;
   uptimeSeconds: number;
   datasets: {
@@ -40,8 +40,21 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxRowsProduced: number; maxDatasetBytes: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
+
+### Shutdown
+
+On SIGTERM or SIGINT the server stops accepting connections, and `/$/ready` answers `503`
+with `"status": "draining"`. Requests in flight get `sparkles serve --shutdown-grace`
+seconds to finish (default 20). Requests still running after that are cancelled. A
+cancelled query stops at its next check. A cancelled write stops before its commit and
+commits nothing, while a write that has started to commit finishes the commit. The server
+waits up to 5 seconds for cancelled requests to stop. It then writes what it keeps in
+memory, such as the last-used times of API tokens, and exits. `--shutdown-grace 0`
+cancels the requests in flight at once. Background tasks, such as a compaction, are not
+waited for. Their commits are atomic, so a task cut short by the exit leaves the dataset
+as it was before the task.
 
 ### Request ids and the access log
 
@@ -90,6 +103,7 @@ JSON object per line.
 | `sparkles_result_rows_total` | counter | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
+| `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
 | `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
@@ -194,8 +208,8 @@ type MetricsSnapshot = {
   }[];
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
-    walBytes: number; diskBytes: number; resultRows: number;
-    budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
+    walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    budgetExceeded: Record<BudgetKind, number> | null;
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
@@ -478,6 +492,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
+| GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
+| PUT    | `/$/quota/{ds}`              | *Extension.* Gives a persistent dataset a quota of its own. The JSON body is `{ "maxBytes": number }` or `{ "maxMb": number }`, and `0` means unlimited. Returns `DatasetQuota`. Needs `server-admin`. `400` for an in-memory dataset or a malformed body. |
+| DELETE | `/$/quota/{ds}`              | *Extension.* Removes the dataset's own quota, so `--max-dataset-mb` applies again. Returns `DatasetQuota`. Needs `server-admin`. |
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
@@ -530,10 +547,19 @@ type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[]; // top 100
   classes: { iri: string; instances: number }[];      // top 100 by rdf:type
   diskBytes: number;
+  quota: DatasetQuota | null;   // persistent datasets: the storage quota and its usage
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
+};
+
+type DatasetQuota = {
+  dataset: string;
+  maxBytes: number | null;          // the quota in effect; null when unlimited
+  source: "dataset" | "default";    // set on the dataset, or the server's --max-dataset-mb
+  defaultMaxBytes: number | null;   // --max-dataset-mb; null when unlimited
+  usedBytes: number;                // on-disk bytes of the dataset directory
 };
 
 type Task = {
@@ -2887,6 +2913,7 @@ type SparklesResult = {
     timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
     plan: PlanNode;                        // executed operator tree
     memory: { peakBytes: number };         // peak estimated memory of intermediate results
+    rowsProduced: number;                  // rows produced by all operators, summed
   };
 };
 type Term =
@@ -3115,10 +3142,33 @@ fails the request with `507 Insufficient Storage` and a body like this:
   validation past either limit fails. It never becomes a nonconformant result.
 * `rows` (`--max-rows`, default 200,000,000) is the number of rows of any intermediate
   result.
+* `rows-produced` (`--max-rows-produced`, off by default) is the number of rows that all
+  the operators of a query produce, summed. It measures the work of a query rather than
+  its largest table, so a query that builds many medium-sized results passes the `rows`
+  budget and still fails this one. The WHERE clauses of one update share a single count.
+  It is off by default because the timeout already bounds the work of a query. Turn it on
+  for a limit that does not depend on how fast the machine is or how busy it is.
+* `dataset-bytes` is the storage quota of a persistent dataset (see
+  [Storage quotas](#storage-quotas)). A write that would take the dataset over its quota
+  fails with this budget before anything is committed.
 
-`limit` and `requested` are in bytes, or in rows for `rows`. The response of
-`/{ds}/update` includes `memPeakBytes`. `meta.memory.peakBytes` in
-`application/x-sparkles+json` reports the peak estimate of a query.
+`limit` and `requested` are in bytes, or in rows for `rows` and `rows-produced`. The
+response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
+`meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
+query's peak memory estimate and the rows its operators produced.
+
+**Budgets per request.** A query can ask for lower budgets than the server's with
+`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
+in a form body. An update takes the first three. Each value is a positive whole number,
+in MiB for `memory-mb` and `max-result-mb`. Anything else is a `400`. A value above the
+server's budget is clamped to it, so a request can lower a budget but never raise it. The
+error of a request over its budget reports the budget that applied as `limit`. The time
+budget is the `timeout` parameter, which may ask for more than the default, up to
+`--max-timeout`.
+
+```sh
+curl 'localhost:3030/ds/sparql?memory-mb=256&max-rows-produced=10000000' --data-urlencode 'query=…'
+```
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error, including the
@@ -3134,6 +3184,42 @@ written to a temporary file as they arrive rather than held in memory. A large P
 estimated above the bulk threshold, replaces its graphs in one index rebuild that parses
 the body as a stream. Like every write it is atomic, so a parse error leaves the data as
 it was.
+
+### Storage quotas
+
+A persistent dataset can have a storage quota, a limit on the bytes its directory takes
+on disk. `sparkles serve --max-dataset-mb` sets the default for every persistent dataset,
+and it is off (`0`) by default. `PUT /$/quota/{ds}` gives a dataset a quota of its own,
+which can be higher or lower than the default, or unlimited. `DELETE /$/quota/{ds}`
+removes it. `sparkles quota` does the same on the command line. Changing a quota needs
+`server-admin`, because it limits what the dataset's own admins can store. In-memory
+datasets have `--max-mem-dataset-mb` instead.
+
+The size is everything in the dataset directory: the index generations, the write-ahead
+log, the vocabulary of uncompacted terms, the commit catalog, and the full-text and
+spatial indexes. Older generations kept for named snapshots, the history retention window
+or a running backup count too. The server measures the directory at most once a second
+while a quota is set, and again after every rebuild. Between two measurements, each
+commit adds the bytes it writes to the write-ahead log. `/$/quota/{ds}`, `quota` in
+`/$/stats/{ds}`, the `sparkles_disk_bytes` and `sparkles_dataset_quota_bytes` metrics
+and the UI's dataset page report the usage against the quota.
+
+A write that adds quads is refused with `507` and `"budget": "dataset-bytes"` when it
+would take the dataset over its quota. Nothing is committed. Reads are never affected,
+and neither are writes that only delete, so a dataset over its quota can always shrink.
+Compaction is never refused, because it folds the write-ahead log into a new generation
+and usually makes the dataset smaller. The check works this way for each kind of write:
+
+| Write | How the quota applies |
+|---|---|
+| SPARQL update, small Graph Store write or upload | The commit is checked before its write-ahead log record is written. It is refused when the measured size plus that record exceeds the quota. |
+| Bulk load, large upload or large Graph Store PUT | The new index generation is built, then checked before it is published: the directory with the new generation, less the generation it replaces. A refused build is removed. A PUT that leaves the dataset smaller goes through, even when the dataset is over its quota. |
+| Reasoning run | The inferred triples are a commit like any other. A run whose inferences would pass the quota fails, and the previous inferences stay. |
+| Clone | The clone gets the default quota. A copy larger than that is refused, and no dataset is created. |
+| Restore | A restore is never refused. A dataset restored in place keeps the quota of the dataset it replaces, and a dataset restored under a new name gets the default. A restored dataset over its quota refuses writes that add quads until it is back under. |
+
+The quota is kept in `quota.json` in the dataset directory, so it applies to local
+commands such as `sparkles load --loc` too. Backups leave it out.
 
 ## Authentication and access control
 
@@ -3253,12 +3339,13 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
+| `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
@@ -3681,7 +3768,7 @@ is the equivalent HTTP status:
 | `invalid-shapes`, `invalid-schema` | 400 | Shapes the SHACL validator cannot use. A ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape), or a shape-map label it does not define. |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query`. |
 | `timeout` | 408 | The call's timeout passed. |
-| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
+| `budget-memory`, `budget-rows`, `budget-rows-produced`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |
 | `unknown-commit` | 404 / 410 | `atCommit` is in the future (404) or no longer held (410). |
 | `stale-cursor` | 409 / 400 | A schema cursor whose snapshot is gone (409), or a malformed cursor (400). |

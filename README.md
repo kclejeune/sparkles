@@ -58,8 +58,9 @@ running queries.
 **SPARQL**
 * SPARQL 1.1 Query and Update, and SPARQL 1.2 / RDF 1.2. Sparkles passes the W3C suites
   in full: SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update 157/157 and 1.2 269/269.
-* A cost-based DP planner over columnar operators, a result cache, and memory and row
-  budgets per query. Each result comes with its executed plan ([optimizations](docs/COMPARISON.md#optimizations-adopted-from-qlever)).
+* A cost-based DP planner over columnar operators, a result cache, and memory, row and
+  work budgets per query, which a request can lower. Each result comes with its executed
+  plan ([optimizations](docs/COMPARISON.md#optimizations-adopted-from-qlever)).
 * Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)).
 
 **Server and CLI**
@@ -100,6 +101,8 @@ running queries.
   control, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces
   ([features](docs/FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)).
+* Storage quotas per dataset, and a shutdown that lets requests in flight finish within
+  a grace period ([API](docs/API.md#storage-quotas)).
 * An MCP server for LLM agents. Its tools are read-only and run within query budgets
   ([usage](docs/USAGE.md#mcp-server-llm-agents)).
 

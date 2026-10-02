@@ -240,6 +240,12 @@ pub struct Ctx {
     mem_live: AtomicU64,
     /// highest estimate seen (held tables plus an output under construction)
     mem_peak: AtomicU64,
+    /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
+    /// [`Ctx::produced`].
+    pub max_rows_produced: u64,
+    /// rows produced so far, summed over operators (shared by the WHERE clauses of one
+    /// update)
+    pub rows_produced: Arc<AtomicU64>,
     pub allow_service: bool,
     /// SERVICE fails with [`crate::Error::NotPermitted`] (see
     /// [`QueryOptions::forbid_service`](super::QueryOptions::forbid_service))
@@ -278,6 +284,8 @@ impl Ctx {
             mem_limit: u64::MAX,
             mem_live: AtomicU64::new(0),
             mem_peak: AtomicU64::new(0),
+            max_rows_produced: u64::MAX,
+            rows_produced: Arc::new(AtomicU64::new(0)),
             allow_service: true,
             forbid_service: false,
             outbound: Default::default(),
@@ -328,6 +336,33 @@ impl Ctx {
         Ok(())
     }
 
+    /// An operator finished with `rows` rows: count them as produced, and fail once the
+    /// total passes [`Ctx::max_rows_produced`]. One atomic add per operator.
+    #[inline]
+    pub fn produced(&self, rows: usize) -> Result<()> {
+        let total = self
+            .rows_produced
+            .fetch_add(rows as u64, Ordering::Relaxed)
+            .saturating_add(rows as u64);
+        if total > self.max_rows_produced {
+            return Err(self.produced_exceeded(total));
+        }
+        Ok(())
+    }
+
+    /// The rows produced by all operators so far.
+    pub fn rows_produced(&self) -> u64 {
+        self.rows_produced.load(Ordering::Relaxed)
+    }
+
+    fn produced_exceeded(&self, requested: u64) -> Error {
+        Error::BudgetExceeded(Budget {
+            kind: BudgetKind::RowsProduced,
+            limit: self.max_rows_produced,
+            requested,
+        })
+    }
+
     // --------------------------------------------------------------- memory ------
 
     /// Before an operator produces (or grows its output to) `rows` rows of `width`
@@ -337,6 +372,16 @@ impl Ctx {
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
         self.check_rows(rows)?;
+        if self.max_rows_produced != u64::MAX {
+            // the output will count as produced: fail before it is built
+            let total = self
+                .rows_produced
+                .load(Ordering::Relaxed)
+                .saturating_add(rows as u64);
+            if total > self.max_rows_produced {
+                return Err(self.produced_exceeded(total));
+            }
+        }
         let need = self
             .mem_live
             .load(Ordering::Relaxed)

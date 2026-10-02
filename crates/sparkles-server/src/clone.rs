@@ -120,6 +120,18 @@ pub fn clone_into(
     if cancelled() {
         return Err(sparkles::Error::Cancelled.into());
     }
+    // the clone gets the default storage quota: a copy larger than that is refused
+    if let Some(limit) = store.options().max_disk_bytes {
+        let size = dir_bytes(tmp);
+        if size > limit {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::DatasetBytes,
+                limit,
+                requested: size,
+            })
+            .into());
+        }
+    }
     let origin = OriginFile {
         origin_format: 1,
         cloned_at: crate::state::now(),
@@ -162,6 +174,20 @@ pub fn clone_into(
             .unwrap_or(Path::new(".")),
     )?;
     Ok(report)
+}
+
+/// Bytes of the files under `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// The source's reasoning status for the clone: fresh at the copied snapshot stays

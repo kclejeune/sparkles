@@ -37,6 +37,8 @@ pub struct UpdateStats {
     pub commit: Option<crate::commit::Receipt>,
     /// Peak estimated memory of the WHERE evaluations (the largest of any operation).
     pub mem_peak_bytes: u64,
+    /// Rows produced by the operators of every WHERE evaluation, summed.
+    pub rows_produced: u64,
 }
 
 pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
@@ -91,6 +93,7 @@ fn run_update(
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
         budget: RequestBudget::new(&opts.outbound),
+        produced: Default::default(),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
@@ -108,6 +111,7 @@ fn run_update(
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
+    stats.rows_produced = req.produced.load(std::sync::atomic::Ordering::Relaxed);
     stats.commit = Some(txn.commit()?);
     let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     stats.timing = Timing {
@@ -129,6 +133,8 @@ struct Request<'a> {
     base: Option<oxiri::Iri<String>>,
     /// what the LOADs and SERVICE calls of every operation spend
     budget: Arc<RequestBudget>,
+    /// rows produced by the WHERE evaluations of every operation
+    produced: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Request<'_> {
@@ -164,6 +170,10 @@ impl Request<'_> {
         if let Some(m) = self.opts.max_memory_bytes {
             ctx.mem_limit = m;
         }
+        if let Some(m) = self.opts.max_rows_produced {
+            ctx.max_rows_produced = m;
+        }
+        ctx.rows_produced = self.produced.clone();
         ctx.allow_service = self.opts.allow_service;
         ctx.forbid_service = self.opts.forbid_service;
         ctx.outbound = self.opts.outbound.clone();

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod budgets;
 mod conditional;
 #[cfg(feature = "fmt")]
 mod format;
@@ -96,6 +97,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(text_status).put(text_enable).delete(text_disable),
         )
         .route("/$/text/{ds}/rebuild", post(text_rebuild))
+        .route(
+            "/$/quota/{ds}",
+            get(budgets::get_quota)
+                .put(budgets::put_quota)
+                .delete(budgets::delete_quota),
+        )
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
@@ -711,6 +718,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         timeout: Some(timeout),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
@@ -832,12 +840,15 @@ async fn query_endpoint(
     }
     crate::obs::log_query_text(&query);
     let mut opts = query_options(&st, &ds, &params);
+    // budgets the request asked for, never above the server's
+    let asked = budgets::Overrides::parse(&params)?;
+    asked.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
-    let limit = st.limits.max_result_bytes;
+    let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
@@ -1485,8 +1496,10 @@ async fn update_endpoint(
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         ..Default::default()
     };
+    budgets::Overrides::parse(&params)?.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     // a client that disconnects drops this future: the update stops at its next check
@@ -2624,6 +2637,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             "predicates": predicates,
             "classes": classes,
             "diskBytes": ds.store.disk_bytes(),
+            "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
             "reasoning": reasoning,
             "geo": crate::geo::status_json(&ds),
             "cache": {
@@ -3511,6 +3525,8 @@ async fn shacl() -> ApiResult {
     ))
 }
 
+#[cfg(test)]
+mod budgets_tests;
 #[cfg(test)]
 mod compress_tests;
 #[cfg(test)]

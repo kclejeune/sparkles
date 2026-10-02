@@ -53,6 +53,10 @@ pub struct QueryOptions {
     /// Budget for the estimated memory of intermediate results (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
+    /// Budget for the rows all operators of a query produce together (`None`:
+    /// unlimited); exceeding it fails with [`Error::BudgetExceeded`]. An update's WHERE
+    /// clauses share one count.
+    pub max_rows_produced: Option<u64>,
     pub allow_service: bool,
     /// Refuse SERVICE with [`Error::NotPermitted`] (the caller lacks the permission;
     /// `allow_service: false` means SERVICE is disabled for everyone).
@@ -185,6 +189,8 @@ pub struct QueryResult {
     pub timing: Timing,
     /// Peak estimated memory of intermediate results (see [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
+    /// Rows produced by all operators (see [`QueryOptions::max_rows_produced`]).
+    pub rows_produced: u64,
     pub ctx: Arc<Ctx>,
 }
 
@@ -299,6 +305,9 @@ fn make_ctx(
     }
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
+    }
+    if let Some(m) = opts.max_rows_produced {
+        ctx.max_rows_produced = m;
     }
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;
@@ -489,6 +498,7 @@ fn execute_parsed(
         plan,
         timing: Timing::default(),
         mem_peak_bytes: 0,
+        rows_produced: 0,
         ctx: ctx.clone(),
     };
     match parsed {
@@ -529,6 +539,7 @@ fn execute_parsed(
         total_ms: parse_ms + t1.elapsed().as_secs_f64() * 1000.0,
     };
     result.mem_peak_bytes = ctx.mem_peak();
+    result.rows_produced = ctx.rows_produced();
     Ok(result)
 }
 

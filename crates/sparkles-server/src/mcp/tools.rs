@@ -400,6 +400,7 @@ impl Tools<'_> {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
             max_memory_bytes: self.cfg().query_memory_bytes,
+            max_rows_produced: self.server.state.limits.max_rows_produced,
             allow_service: self.cfg().allow_service,
             outbound: self.server.state.outbound.clone(),
             cancel: Some(self.call.cancel.clone()),
