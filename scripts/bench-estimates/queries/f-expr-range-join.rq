@@ -1,0 +1,1 @@
+PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?p ?a ?n WHERE { ?p foaf:age ?a ; foaf:name ?n FILTER(ABS(?a - 49) < 2) }

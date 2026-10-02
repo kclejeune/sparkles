@@ -120,7 +120,7 @@ impl Tools<'_> {
         if predicates.len() > 20 {
             return Err(ToolError::bad_argument("at most 20 predicates"));
         }
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let preds = predicates
             .iter()
@@ -148,7 +148,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         // the query string and options become literals serialized by oxrdf (escaped),
         // the predicates validated IRIs
@@ -217,7 +223,7 @@ impl Tools<'_> {
         let a: SimilarArgs = parse(args)?;
         let k = bounded("k", a.k, 10, 1, 100)? as usize;
         let metric = a.metric.unwrap_or(Metric::Cosine);
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let Term::NamedNode(pred) = parse_iri(&a.predicate, &prefix_map, false)? else {
             return Err(ToolError::bad_argument("predicate must be an IRI"));
@@ -268,7 +274,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         let fetch = k + usize::from(exclude_self);
         let order = if metric == Metric::Euclidean {

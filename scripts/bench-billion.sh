@@ -406,8 +406,11 @@ step_queries() {
       for n in "${NAMES[@]}"; do
         evict "$e"
         start "$e"
-        r=$(curl -sf --max-time "$TIMEOUT" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
-          --data-urlencode "query@$HERE/queries/$n.rq" "${URL[$e]}" || echo error)
+        # curl prints the time even when the request fails, so a failure replaces it
+        if ! r=$(curl -sf --max-time "$TIMEOUT" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+          --data-urlencode "query@$HERE/queries/$n.rq" "${URL[$e]}"); then
+          r=error
+        fi
         log "cold $e $n: $r"
         setcold "${NAME[$e]}" "$n" "$r"
         stop "$e"

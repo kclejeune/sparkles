@@ -607,6 +607,14 @@ impl BlockCache {
         })
     }
 
+    /// Whether the columns in `mask` of block `b` are decoded in the cache, without
+    /// decoding them or counting a hit or miss.
+    pub fn has_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
+        (0..4).all(|c| {
+            mask & (1 << c) == 0 || self.cache.peek(&(idx.uid, b as u32, c as u8)).is_some()
+        })
+    }
+
     pub fn bytes(&self) -> u64 {
         self.cache.weight()
     }
@@ -729,12 +737,26 @@ impl PermIndex {
         lo_key: &Key,
         hi_key: &Key,
         mask: ColMask,
+        f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
+        self.for_each_key_range_masked(cache, lo_key, hi_key, |_| mask, f)
+    }
+
+    /// [`for_each_key_range_cols`](Self::for_each_key_range_cols) with the columns to
+    /// decode chosen per block (by its number).
+    pub fn for_each_key_range_masked(
+        &self,
+        cache: &BlockCache,
+        lo_key: &Key,
+        hi_key: &Key,
+        mask_of: impl Fn(usize) -> ColMask,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
         let bounds = bound_cols(lo_key, hi_key);
         for b in lo..hi {
             let m = &self.blocks[b];
+            let mask = mask_of(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
             let blk = cache.get_cols(self, b, if whole { mask } else { mask | bounds })?;
             let go_on = if whole {

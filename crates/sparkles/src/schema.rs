@@ -190,6 +190,14 @@ pub struct SchemaOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Fail with [`SchemaError::TooManyEntries`] above this many classes or predicates.
     pub max_entries: usize,
+    /// Also count the distinct subjects, objects and IRI subjects of the whole selection
+    /// ([`SchemaReport::term_totals`], which the VoID export needs). This costs one more
+    /// pass over the SPO and the OSP index.
+    pub term_totals: bool,
+    /// The graphs the caller may read (`None`: every graph). The report covers only
+    /// these, and a hidden graph named by `graph` or `declared_graph` is reported as
+    /// missing.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 impl Default for SchemaOptions {
@@ -203,6 +211,8 @@ impl Default for SchemaOptions {
             deadline: None,
             cancel: None,
             max_entries: DEFAULT_MAX_ENTRIES,
+            term_totals: false,
+            graphs: None,
         }
     }
 }
@@ -279,6 +289,17 @@ pub struct Totals {
     pub anonymous_type_targets: u64,
     /// Distinct blank-node objects of class axioms and of `rdfs:domain` / `rdfs:range`.
     pub anonymous_class_expressions: u64,
+}
+
+/// Distinct terms of the whole selection ([`SchemaOptions::term_totals`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermTotals {
+    /// Distinct subjects of the selected triples.
+    pub distinct_subjects: u64,
+    /// Distinct objects of the selected triples (terms, not values).
+    pub distinct_objects: u64,
+    /// Distinct subjects that are IRIs (VoID's entities).
+    pub entities: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -413,6 +434,11 @@ pub struct SchemaReport {
     pub hierarchy: Hierarchy,
     pub classes: Vec<ClassEntry>,
     pub predicates: Vec<PredicateEntry>,
+    /// Counted only when [`SchemaOptions::term_totals`] asks for it. It is left out of
+    /// the JSON document, so that the document does not depend on which request
+    /// computed a cached report.
+    #[serde(skip)]
+    pub term_totals: Option<TermTotals>,
 }
 
 /// One page of a list, in IRI order.
@@ -540,6 +566,40 @@ fn resolve(
             GraphFilter::Set(vec![g.0])
         }
     })
+}
+
+/// Limit a resolved selection to the graphs a view reads; a hidden graph named by the
+/// selection is reported as missing.
+fn within_view(
+    snap: &Snapshot,
+    f: GraphFilter,
+    sel: &GraphSelection,
+    access: &crate::access::GraphAccess,
+) -> Result<GraphFilter, SchemaError> {
+    let mut visible: Vec<u64> = access
+        .visible_named(snap)
+        .map_err(SchemaError::from)?
+        .iter()
+        .map(|g| g.0)
+        .collect();
+    if access.read.default_graph() {
+        visible.push(Id::DEFAULT_GRAPH.0);
+    }
+    if let GraphSelection::Named(n) = sel
+        && !access.read.allows_iri(n.as_str())
+    {
+        return Err(SchemaError::NoSuchGraph(n.as_str().to_string()));
+    }
+    Ok(GraphFilter::Set(match f {
+        GraphFilter::All => visible,
+        GraphFilter::AllExcept(x) => visible.into_iter().filter(|g| *g != x).collect(),
+        GraphFilter::Set(s) => s
+            .into_iter()
+            .filter(|g| {
+                visible.contains(g) || *g == Id::DEFAULT_GRAPH.0 && access.read.default_graph()
+            })
+            .collect(),
+    }))
 }
 
 /// Deadline and cancellation checks.
@@ -988,6 +1048,13 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     let observed = resolve(snap, &opts.graph, inferred, opts.include_inferred)?;
     let declared_sel = opts.declared_graph.as_ref().unwrap_or(&opts.graph);
     let declared = resolve(snap, declared_sel, inferred, opts.declared_from_inferred)?;
+    let (observed, declared) = match opts.graphs.as_ref().filter(|a| !a.reads_all()) {
+        Some(a) => (
+            within_view(snap, observed, &opts.graph, a)?,
+            within_view(snap, declared, declared_sel, a)?,
+        ),
+        None => (observed, declared),
+    };
     let rdf_type = snap.lookup_iri(RDF_TYPE).map(|i| i.0);
 
     // -- observed: two passes per predicate -------------------------------------------
@@ -1015,6 +1082,13 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
             props.entry(p).or_default().observed = Some(acc.finish());
         }
     }
+    let term_totals = if opts.term_totals {
+        Some(in_phase(term_totals(snap, &observed, &budget), || {
+            "counting distinct subjects and objects".into()
+        })?)
+    } else {
+        None
+    };
     let mut classes: FxHashMap<u64, ClassDecl> = class_instances
         .into_iter()
         .map(|(c, n)| {
@@ -1237,7 +1311,37 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
         hierarchy,
         classes: class_list,
         predicates: pred_list,
+        term_totals,
     })
+}
+
+/// Distinct subjects (one SPO pass, also telling IRIs apart) and distinct objects (one
+/// OSP pass) of the selected graphs.
+fn term_totals(
+    snap: &Snapshot,
+    filter: &GraphFilter,
+    budget: &Budget,
+) -> crate::Result<TermTotals> {
+    let mut t = TermTotals::default();
+    let mut prev: Option<u64> = None;
+    for_each_key(snap, Perm::Spo, &[], budget, |k| {
+        if !filter.accepts(k[3]) || prev == Some(k[0]) {
+            return;
+        }
+        prev = Some(k[0]);
+        t.distinct_subjects += 1;
+        if is_iri(snap, k[0]) {
+            t.entities += 1;
+        }
+    })?;
+    prev = None;
+    for_each_key(snap, Perm::Osp, &[], budget, |k| {
+        if filter.accepts(k[3]) && prev != Some(k[0]) {
+            prev = Some(k[0]);
+            t.distinct_objects += 1;
+        }
+    })?;
+    Ok(t)
 }
 
 /// Roots and cycles of the declared `rdfs:subClassOf` graph (`classes` sorted by IRI).
@@ -1352,6 +1456,9 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<usize> {
     }
     comp
 }
+
+mod void;
+pub use void::{VOID_NS, VoidOptions, description_iri, void_text, void_triples};
 
 #[cfg(test)]
 mod tests;

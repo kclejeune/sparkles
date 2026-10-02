@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["vendor"]
+# crates/sparkles-py is its own workspace (it builds a Python extension; see its Cargo.toml)
+exclude = ["vendor", "crates/sparkles-py"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +34,7 @@ memmap2 = "0.9"
 lz4_flex = "0.14"
 rayon = "1.12"
 regex = "1"
+memchr = "2"
 # stack segments for planning and evaluating deeply nested queries
 stacker = "0.1"
 serde = { version = "1", features = ["derive"] }

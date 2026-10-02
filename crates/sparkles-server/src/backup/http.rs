@@ -914,13 +914,6 @@ async fn create_backup(State(st): St, Path(ds_name): Path<String>, body: Bytes) 
     let text = |k: &str| v[k].as_str().map(str::to_string).filter(|s| !s.is_empty());
     let repo = text("repository").unwrap_or_default();
     writable_repo(&b.registry.config(&repo)?)?;
-    if ds.kind == DbType::Mem {
-        return Err(BackupError::new(
-            Code::BackupUnsupported,
-            "in-memory datasets cannot be backed up yet",
-        )
-        .into());
-    }
     let name =
         text("name").unwrap_or_else(|| layout::default_backup_name(&ds_name, chrono::Utc::now()));
     if !layout::valid_backup_name(&name) {

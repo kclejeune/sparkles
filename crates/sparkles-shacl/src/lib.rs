@@ -29,6 +29,8 @@
 
 mod data;
 pub mod guard;
+pub mod incremental;
+mod localize;
 pub mod path;
 pub mod report;
 pub mod shapes;

@@ -49,6 +49,14 @@ impl JenaFormat {
         })
     }
 
+    pub fn file_extension(self) -> &'static str {
+        match self {
+            JenaFormat::Thrift => "rt",
+            JenaFormat::Protobuf => "rpb",
+            JenaFormat::RdfJson => "rj",
+        }
+    }
+
     pub fn media_type(self) -> &'static str {
         match self {
             JenaFormat::Thrift => "application/rdf+thrift",

@@ -1,0 +1,17 @@
+# max-cardinality-zero: an instance of a restriction with owl:maxCardinality 0 that has
+# a value for the restricted property (OWL 2 RL cls-maxc1).
+#
+# The cardinality is compared by value, so 0 written as xsd:integer counts as well.
+# {TYPE} is replaced by `rdf:type` (closure=none) or `rdf:type/rdfs:subClassOf*`
+# (closure=subclass); the checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?r ?x ?p ?y WHERE {
+  ?r owl:maxCardinality ?n ;
+     owl:onProperty ?p .
+  FILTER(isNumeric(?n) && ?n = 0)
+  ?x {TYPE} ?r .
+  ?x ?p ?y .
+}

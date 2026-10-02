@@ -24,6 +24,7 @@
   const nav = $derived([
     { href: '/query', label: 'Query', icon: 'query' },
     { href: '/explore', label: 'Explore', icon: 'explore' },
+    { href: '/similar', label: 'Similar', icon: 'similar' },
     { href: '/datasets', label: 'Datasets', icon: 'database' },
     ...(backupsVisible ? [{ href: '/backups', label: 'Backups', icon: 'archive' }] : []),
     { href: '/server', label: 'Server', icon: 'server' },
@@ -41,7 +42,7 @@
 
   function linkFor(href: string) {
     const base = resolve(href as '/query');
-    return href === '/explore' && app.current
+    return (href === '/explore' || href === '/similar') && app.current
       ? `${base}?ds=${encodeURIComponent(app.current)}`
       : base;
   }

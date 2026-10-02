@@ -6,7 +6,7 @@
 //! `language` (`"shacl"` or `"shex"`) and is what both guards write; a file without
 //! `language` is SHACL, so format 1 files keep working unchanged.
 
-use super::{GuardLanguage, GuardStatus};
+use super::{GuardLanguage, GuardStatus, SeverityCounts, Strategy, ValidationSummary};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
@@ -31,6 +31,9 @@ pub const FILES: [&str; 4] = [
     SHEX_SCHEMA_SHEXC_FILE,
     SHEX_SCHEMA_SHEXJ_FILE,
 ];
+/// The validation state of the last validated commit (see [`StatusFile`]). Not one of
+/// [`FILES`]: a copy of the database starts with an unknown state.
+pub const STATUS_FILE: &str = "validation-status.json";
 /// The reasoner's graph of materialized inferences.
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
@@ -92,6 +95,26 @@ pub fn now_rfc3339() -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64),
     )
+}
+
+/// How a write is judged against the results the data already has (`baseline` in
+/// `validation.json`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaselinePolicy {
+    /// on the state after the write: any blocking result counts (`reject` can only be
+    /// enabled on data without blocking results)
+    #[default]
+    Strict,
+    /// on the blocking results the write introduces: results the state before the write
+    /// had do not block it
+    Grandfather,
+}
+
+impl BaselinePolicy {
+    pub fn is_strict(&self) -> bool {
+        *self == BaselinePolicy::Strict
+    }
 }
 
 /// The data graph: `"default"`, `"union"`, or a list of graph IRIs.
@@ -205,7 +228,157 @@ pub struct Baseline {
     pub conforms: Option<bool>,
     pub blocking: u64,
     pub total: u64,
+    /// the results by severity
+    pub by_severity: SeverityCounts,
     pub millis: u64,
+}
+
+/// `validation-status.json`: the validation state of a commit, written after the commit
+/// so a restart need not validate the head in full. It is trusted only for the head it
+/// names and the configuration whose `validation.json` hashes to `configHash`, so a
+/// crash before it is written leaves the state unknown, never wrong.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusFile {
+    pub format: u32,
+    pub commit: u64,
+    pub config_hash: String,
+    pub blocking: u64,
+    pub total: u64,
+    pub violations: u64,
+    pub warnings: u64,
+    pub infos: u64,
+    pub millis: u64,
+}
+
+impl StatusFile {
+    /// The state of `b` under the configuration hashing to `config_hash`.
+    pub fn of(b: &Baseline, config_hash: &str) -> StatusFile {
+        StatusFile {
+            format: 1,
+            commit: b.commit,
+            config_hash: config_hash.to_string(),
+            blocking: b.blocking,
+            total: b.total,
+            violations: b.by_severity.violation,
+            warnings: b.by_severity.warning,
+            infos: b.by_severity.info,
+            millis: b.millis,
+        }
+    }
+
+    /// Write it to `root` (replacing the file by a rename; not synced, because a stale
+    /// or missing file only makes the state unknown).
+    pub fn write(&self, root: &Path) -> Result<()> {
+        let tmp = root.join(format!("{STATUS_FILE}.tmp"));
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(self).map_err(std::io::Error::other)?,
+        )?;
+        std::fs::rename(&tmp, root.join(STATUS_FILE))?;
+        Ok(())
+    }
+
+    /// The baseline it records, when it is the state of commit `head` under the
+    /// configuration hashing to `config_hash`.
+    pub fn read(root: &Path, head: u64, config_hash: &str) -> Option<Baseline> {
+        let bytes = std::fs::read(root.join(STATUS_FILE)).ok()?;
+        let f: StatusFile = serde_json::from_slice(&bytes).ok()?;
+        (f.format == 1 && f.commit == head && f.config_hash == config_hash).then_some(Baseline {
+            commit: f.commit,
+            conforms: Some(f.blocking == 0),
+            blocking: f.blocking,
+            total: f.total,
+            by_severity: SeverityCounts {
+                violation: f.violations,
+                warning: f.warnings,
+                info: f.infos,
+            },
+            millis: f.millis,
+        })
+    }
+
+    /// Remove the file of `root` (a missing file is fine).
+    pub fn remove(root: &Path) -> Result<()> {
+        match std::fs::remove_file(root.join(STATUS_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One validated write, as the status shows it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckRecord {
+    /// when the validation finished (RFC 3339)
+    pub time: String,
+    /// the commit kind (`update`, `load`, …)
+    pub kind: &'static str,
+    pub status: GuardStatus,
+    pub strategy: Strategy,
+    pub blocking: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<u64>,
+    pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_nodes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    pub millis: u64,
+    /// the first (highest ranked) result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first: Option<serde_json::Value>,
+}
+
+/// The last validated write and the last rejected ones, for the status.
+#[derive(Debug, Default)]
+pub struct CheckHistory {
+    last: parking_lot::Mutex<Option<CheckRecord>>,
+    rejected: parking_lot::Mutex<std::collections::VecDeque<CheckRecord>>,
+}
+
+/// Rejected writes the status keeps.
+const REJECTED_KEPT: usize = 10;
+
+impl CheckHistory {
+    /// Record a validation (skipped and bypassed writes are not recorded).
+    pub fn record(&self, kind: crate::commit::CommitKind, s: &ValidationSummary) {
+        if matches!(s.status, GuardStatus::Skipped | GuardStatus::Bypassed) {
+            return;
+        }
+        let r = CheckRecord {
+            time: now_rfc3339(),
+            kind: kind.name(),
+            status: s.status,
+            strategy: s.strategy,
+            blocking: s.blocking,
+            introduced: s.introduced,
+            total: s.total,
+            focus_nodes: s.focus_nodes,
+            fallback: s.fallback.clone(),
+            millis: s.millis,
+            first: s.results.first().cloned(),
+        };
+        if s.status == GuardStatus::Rejected {
+            let mut q = self.rejected.lock();
+            if q.len() == REJECTED_KEPT {
+                q.pop_back();
+            }
+            q.push_front(r.clone());
+        }
+        *self.last.lock() = Some(r);
+    }
+
+    /// The last validated write.
+    pub fn last(&self) -> Option<CheckRecord> {
+        self.last.lock().clone()
+    }
+
+    /// The last rejected writes, newest first.
+    pub fn rejected(&self) -> Vec<CheckRecord> {
+        self.rejected.lock().iter().cloned().collect()
+    }
 }
 
 /// A guard's decisions since it was installed.

@@ -115,6 +115,8 @@ impl ErrorContext<'_> {
                     }
                     BudgetKind::OutboundBytes => ("budget-outbound-bytes", "outbound-bytes"),
                     BudgetKind::ValidationWork => ("budget-validation-work", "validation-work"),
+                    BudgetKind::RowsProduced => ("budget-rows-produced", "rows-produced"),
+                    BudgetKind::DatasetBytes => ("budget-dataset-bytes", "dataset-bytes"),
                 };
                 let mut t = ToolError::new(code, 507, b.to_string()).hint(BUDGET_HINT);
                 t.budget = Some(budget);
@@ -134,6 +136,13 @@ impl ErrorContext<'_> {
                 "writes are disabled until the server restarts; reads still work",
             ),
             Error::Unsupported(m) => ToolError::new("unsupported", 501, m),
+            // SERVICE or LOAD without the server permission it needs
+            Error::NotPermitted(m) => ToolError::new("forbidden", 403, m),
+            Error::Rejected(r) => ToolError::new("validation-failed", 422, r.to_string()).hint(
+                "nothing was written: change the update so that the data conforms to the dataset's shapes",
+            ),
+            Error::GuardMissing(m) => ToolError::new("write-failed", 503, m),
+            Error::StorageFull(m) => ToolError::new("storage-full", 507, m),
             Error::Cancelled => ToolError::new("internal", 500, "call cancelled: server shutting down"),
             e => {
                 tracing::error!(request_id = self.request_id, "MCP tool call failed: {e}");

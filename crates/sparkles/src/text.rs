@@ -25,7 +25,15 @@
 use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
+mod highlight;
+#[cfg(feature = "text")]
 mod lazydir;
+#[cfg(feature = "text")]
+mod lucene;
+#[cfg(feature = "text")]
+mod search;
+#[cfg(feature = "text")]
+mod sloppy;
 use serde::{Deserialize, Serialize};
 
 /// Which predicates are indexed.
@@ -101,6 +109,210 @@ pub struct TextConfig {
     /// `lz4` or `none`; changing it rebuilds the index
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docstore_compression: Option<DocstoreCompression>,
+    /// per-language analyzers: a literal whose language tag has one is also indexed
+    /// stemmed, and a search with that language searches the stemmed text
+    #[serde(default, skip_serializing_if = "Languages::is_none")]
+    pub languages: Languages,
+}
+
+/// A language analyzer: Tantivy's Snowball stemmer for the language, after the stop
+/// words of the language are removed (where Tantivy has a list for it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Analyzer {
+    Arabic,
+    Danish,
+    Dutch,
+    English,
+    Finnish,
+    French,
+    German,
+    Greek,
+    Hungarian,
+    Italian,
+    Norwegian,
+    Portuguese,
+    Romanian,
+    Russian,
+    Spanish,
+    Swedish,
+    Tamil,
+    Turkish,
+}
+
+impl Analyzer {
+    /// Every analyzer with the language tag it is used for by default.
+    pub const ALL: [(&'static str, Analyzer); 18] = [
+        ("ar", Analyzer::Arabic),
+        ("da", Analyzer::Danish),
+        ("de", Analyzer::German),
+        ("el", Analyzer::Greek),
+        ("en", Analyzer::English),
+        ("es", Analyzer::Spanish),
+        ("fi", Analyzer::Finnish),
+        ("fr", Analyzer::French),
+        ("hu", Analyzer::Hungarian),
+        ("it", Analyzer::Italian),
+        ("nl", Analyzer::Dutch),
+        ("no", Analyzer::Norwegian),
+        ("pt", Analyzer::Portuguese),
+        ("ro", Analyzer::Romanian),
+        ("ru", Analyzer::Russian),
+        ("sv", Analyzer::Swedish),
+        ("ta", Analyzer::Tamil),
+        ("tr", Analyzer::Turkish),
+    ];
+
+    /// The analyzer of a primary language tag, if there is one (`nb` and `nn` are
+    /// Norwegian too).
+    pub fn for_tag(tag: &str) -> Option<Analyzer> {
+        let tag = match tag {
+            "nb" | "nn" => "no",
+            t => t,
+        };
+        Self::ALL.iter().find(|(t, _)| *t == tag).map(|(_, a)| *a)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Analyzer::Arabic => "arabic",
+            Analyzer::Danish => "danish",
+            Analyzer::Dutch => "dutch",
+            Analyzer::English => "english",
+            Analyzer::Finnish => "finnish",
+            Analyzer::French => "french",
+            Analyzer::German => "german",
+            Analyzer::Greek => "greek",
+            Analyzer::Hungarian => "hungarian",
+            Analyzer::Italian => "italian",
+            Analyzer::Norwegian => "norwegian",
+            Analyzer::Portuguese => "portuguese",
+            Analyzer::Romanian => "romanian",
+            Analyzer::Russian => "russian",
+            Analyzer::Spanish => "spanish",
+            Analyzer::Swedish => "swedish",
+            Analyzer::Tamil => "tamil",
+            Analyzer::Turkish => "turkish",
+        }
+    }
+}
+
+/// The per-language analyzers of an index (`languages` in `text.json`): none, `"all"`
+/// (every language Tantivy has a stemmer for, by its tag), a list of language tags, or
+/// a map from a language tag to an analyzer name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Languages {
+    #[default]
+    None,
+    All,
+    /// primary language tag (lowercase) → analyzer
+    Only(std::collections::BTreeMap<String, Analyzer>),
+}
+
+impl Languages {
+    pub fn is_none(&self) -> bool {
+        match self {
+            Languages::None => true,
+            Languages::All => false,
+            Languages::Only(m) => m.is_empty(),
+        }
+    }
+
+    /// The analyzed languages: each primary tag with its analyzer, by tag.
+    pub fn resolve(&self) -> Vec<(String, Analyzer)> {
+        match self {
+            Languages::None => Vec::new(),
+            Languages::All => {
+                let mut v: Vec<(String, Analyzer)> = Analyzer::ALL
+                    .iter()
+                    .map(|(t, a)| (t.to_string(), *a))
+                    .collect();
+                v.extend(["nb", "nn"].map(|t| (t.to_string(), Analyzer::Norwegian)));
+                v.sort();
+                v
+            }
+            Languages::Only(m) => m.iter().map(|(t, a)| (t.clone(), *a)).collect(),
+        }
+    }
+
+    /// Languages from tags (`all`, or tags each with its default analyzer).
+    pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> std::result::Result<Languages, String> {
+        if tags.iter().any(|t| t.as_ref().eq_ignore_ascii_case("all")) {
+            return Ok(Languages::All);
+        }
+        let mut m = std::collections::BTreeMap::new();
+        for t in tags {
+            let tag = primary_tag(t.as_ref())?;
+            let a = Analyzer::for_tag(&tag).ok_or_else(|| {
+                format!(
+                    "languages: no analyzer for {tag:?}; name one, as in {{\"{tag}\": \"english\"}}"
+                )
+            })?;
+            m.insert(tag, a);
+        }
+        Ok(Languages::Only(m))
+    }
+}
+
+/// A primary language subtag, lowercased: 2 to 8 ASCII letters.
+fn primary_tag(t: &str) -> std::result::Result<String, String> {
+    let tag = t.trim().to_ascii_lowercase();
+    if (2..=8).contains(&tag.len()) && tag.bytes().all(|b| b.is_ascii_lowercase()) {
+        Ok(tag)
+    } else {
+        Err(format!(
+            "languages: {t:?} is not a primary language tag such as \"en\" (2 to 8 letters)"
+        ))
+    }
+}
+
+impl Serialize for Languages {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Languages::None => s.serialize_none(),
+            Languages::All => s.serialize_str("all"),
+            Languages::Only(m) => m.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Languages {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            List(Vec<String>),
+            Map(std::collections::BTreeMap<String, String>),
+        }
+        let err = serde::de::Error::custom;
+        match Option::<Repr>::deserialize(d)? {
+            None => Ok(Languages::None),
+            Some(Repr::Word(w)) if w == "all" => Ok(Languages::All),
+            Some(Repr::Word(w)) => Err(err(format!(
+                "languages: expected \"all\", a list of language tags or a map of tags to analyzers, got {w:?}"
+            ))),
+            Some(Repr::List(v)) => Languages::from_tags(&v).map_err(err),
+            Some(Repr::Map(m)) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (t, a) in m {
+                    let tag = primary_tag(&t).map_err(err)?;
+                    let a = Analyzer::ALL
+                        .iter()
+                        .map(|(_, a)| *a)
+                        .find(|x| x.name() == a.to_ascii_lowercase())
+                        .ok_or_else(|| {
+                            err(format!(
+                                "languages: unknown analyzer {a:?} (one of {})",
+                                Analyzer::ALL.map(|(_, a)| a.name()).join(", ")
+                            ))
+                        })?;
+                    out.insert(tag, a);
+                }
+                Ok(Languages::Only(out))
+            }
+        }
+    }
 }
 
 /// Compression of the full-text index's document store.
@@ -138,7 +350,77 @@ impl Default for TextConfig {
             max_text_bytes: default_max_text_bytes(),
             max_hits: default_max_hits(),
             docstore_compression: None,
+            languages: Languages::None,
         }
+    }
+}
+
+/// Jena's `highlight:` options of `text:query`: the literal output becomes the best
+/// fragments of the literal with the matched words marked.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HighlightOpts {
+    /// fragments kept at most (`m:`, 3)
+    pub max_frags: usize,
+    /// the length of a fragment in characters (`z:`, 128)
+    pub frag_size: usize,
+    /// the marks around a match (`s:` and `e:`, ↦ and ↤)
+    pub start: String,
+    pub end: String,
+    /// between fragments (`f:`, ∣)
+    pub frag_sep: String,
+    /// marks consecutive matches as one (`jh:`, yes)
+    pub join_hi: bool,
+    /// merges adjacent fragments (`jf:`, yes)
+    pub join_frags: bool,
+}
+
+impl Default for HighlightOpts {
+    fn default() -> Self {
+        HighlightOpts {
+            max_frags: 3,
+            frag_size: 128,
+            start: "\u{21a6}".into(),
+            end: "\u{21a4}".into(),
+            frag_sep: "\u{2223}".into(),
+            join_hi: true,
+            join_frags: true,
+        }
+    }
+}
+
+impl HighlightOpts {
+    /// Parse the options after `highlight:`, separated by `|`, such as
+    /// `s:<em> | e:</em> | z:150`.
+    pub fn parse(s: &str) -> std::result::Result<HighlightOpts, String> {
+        let mut o = HighlightOpts::default();
+        for opt in s.split('|').map(str::trim).filter(|o| !o.is_empty()) {
+            let (key, val) = opt
+                .split_once(':')
+                .ok_or_else(|| format!("highlight option {opt:?} is not key:value"))?;
+            let num = |v: &str| {
+                v.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("highlight option {key}: needs a positive number"))
+            };
+            let flag = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" => Ok(true),
+                "n" | "no" | "false" => Ok(false),
+                _ => Err(format!("highlight option {key}: is y or n")),
+            };
+            match key.trim() {
+                "m" => o.max_frags = num(val)?,
+                "z" => o.frag_size = num(val)?,
+                "s" => o.start = val.to_string(),
+                "e" => o.end = val.to_string(),
+                "f" => o.frag_sep = val.to_string(),
+                "jh" => o.join_hi = flag(val)?,
+                "jf" => o.join_frags = flag(val)?,
+                k => return Err(format!("unknown highlight option {k:?}")),
+            }
+        }
+        Ok(o)
     }
 }
 
@@ -265,9 +547,11 @@ pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
 }
 
 #[cfg(feature = "text")]
+pub use imp::TextIndex;
+#[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
-pub use imp::{TextIndex, search};
+pub use search::search;
 
 #[cfg(not(feature = "text"))]
 /// Placeholder: full-text search is not compiled in.
@@ -287,9 +571,6 @@ mod imp {
     use super::lazydir::LazySyncDir;
     use super::*;
     use crate::id::{Id, Tag};
-    use crate::sparql::ctx::Ctx;
-    use crate::sparql::plan::{GraphFilter, PathEnd, TextSpec};
-    use crate::sparql::table::{Table, VarId};
     use crate::store::Snapshot;
     use parking_lot::Mutex;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -298,69 +579,169 @@ mod imp {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
-    use tantivy::collector::TopDocs;
-    use tantivy::query::{
-        BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery,
-    };
     use tantivy::schema::{
-        BytesOptions, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
-        TextOptions, Value,
+        BytesOptions, FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing,
+        TextOptions,
     };
     use tantivy::tokenizer::{
         AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
     };
     use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-    const FORMAT: u32 = 1;
+    /// The index format. Format 2 keeps each document's terms in columns (fast fields),
+    /// where format 1 kept them in the doc store. An index of another format is rebuilt
+    /// on open.
+    const FORMAT: u32 = 2;
     const TOKENIZER: &str = "sparkles_standard";
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub(crate) struct Fields {
         key: Field,
-        s: Field,
-        p: Field,
+        pub(super) s: Field,
+        pub(super) p: Field,
         o: Field,
-        g: Field,
-        lang: Field,
-        text: Field,
+        pub(super) g: Field,
+        pub(super) lang: Field,
+        pub(super) text: Field,
+        /// the stemmed text of each analyzed language (`text_<tag>`), by primary tag
+        stemmed: Vec<(String, Field, Analyzer)>,
     }
 
-    fn schema() -> (Schema, Fields) {
+    impl Fields {
+        /// The stemmed field of a language tag's primary subtag and its analyzer, if it
+        /// has one.
+        fn stemmed_for(&self, tag: &str) -> Option<(Field, Analyzer)> {
+            let primary = tag.split('-').next().unwrap_or(tag);
+            self.stemmed
+                .binary_search_by(|(t, ..)| t.as_str().cmp(primary))
+                .ok()
+                .map(|i| (self.stemmed[i].1, self.stemmed[i].2))
+        }
+
+        /// The field a search with language `lang` searches: the language's stemmed
+        /// text when it has an analyzer, else the standard text (`None`).
+        pub(super) fn text_for(&self, lang: Option<&str>) -> (Field, Option<Analyzer>) {
+            match lang.and_then(|l| self.stemmed_for(l)) {
+                Some((f, a)) => (f, Some(a)),
+                None => (self.text, None),
+            }
+        }
+    }
+
+    fn schema(config: &TextConfig) -> (Schema, Fields) {
         let mut b = Schema::builder();
         let bytes_indexed = BytesOptions::default().set_indexed();
-        let text = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer(TOKENIZER)
-                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-        );
+        let text = |tokenizer: &str| {
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(tokenizer)
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            )
+        };
+        // A hit's terms are read from columns (fast fields), not from stored documents:
+        // a column read costs far less than decompressing a doc store block.
         let fields = Fields {
             key: b.add_bytes_field("key", bytes_indexed.clone()),
-            s: b.add_bytes_field("s", bytes_indexed.set_stored()),
-            p: b.add_text_field("p", STRING | STORED),
-            o: b.add_bytes_field("o", BytesOptions::default().set_stored()),
-            g: b.add_text_field("g", STRING | STORED),
+            s: b.add_bytes_field("s", bytes_indexed.set_fast()),
+            p: b.add_text_field("p", STRING | FAST),
+            o: b.add_bytes_field("o", BytesOptions::default().set_fast()),
+            g: b.add_text_field("g", STRING | FAST),
             lang: b.add_text_field("lang", STRING),
-            text: b.add_text_field("text", text),
+            text: b.add_text_field("text", text(TOKENIZER)),
+            stemmed: config
+                .languages
+                .resolve()
+                .into_iter()
+                .map(|(tag, a)| {
+                    let f = b.add_text_field(&format!("text_{tag}"), text(&tokenizer_name(a)));
+                    (tag, f, a)
+                })
+                .collect(),
         };
         (b.build(), fields)
+    }
+
+    /// The longest token the text field indexes, in bytes.
+    pub(super) const MAX_TOKEN: usize = 40;
+
+    fn tokenizer_name(a: Analyzer) -> String {
+        format!("sparkles_{}", a.name())
     }
 
     fn register_tokenizer(index: &Index) {
         index.tokenizers().register(
             TOKENIZER,
             TextAnalyzer::builder(SimpleTokenizer::default())
-                .filter(RemoveLongFilter::limit(40))
+                .filter(RemoveLongFilter::limit(MAX_TOKEN))
                 .filter(LowerCaser)
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
+        for (_, a) in Analyzer::ALL {
+            index
+                .tokenizers()
+                .register(&tokenizer_name(a), language_analyzer(a));
+        }
+    }
+
+    /// A language's analyzer: the standard tokens, lowercased, without the language's
+    /// stop words, and stemmed. As in Lucene's language analyzers, the stems are not
+    /// ASCII-folded: folding would merge words the language keeps apart, such as
+    /// Swedish `städer` and `stad` or Spanish `año` and `ano`. Removed stop words leave
+    /// gaps in the positions, as in Lucene, so a phrase across one still needs the gap.
+    pub(super) fn language_analyzer(a: Analyzer) -> TextAnalyzer {
+        use tantivy::tokenizer::{Language as L, Stemmer, StopWordFilter};
+        let lang = match a {
+            Analyzer::Arabic => L::Arabic,
+            Analyzer::Danish => L::Danish,
+            Analyzer::Dutch => L::Dutch,
+            Analyzer::English => L::English,
+            Analyzer::Finnish => L::Finnish,
+            Analyzer::French => L::French,
+            Analyzer::German => L::German,
+            Analyzer::Greek => L::Greek,
+            Analyzer::Hungarian => L::Hungarian,
+            Analyzer::Italian => L::Italian,
+            Analyzer::Norwegian => L::Norwegian,
+            Analyzer::Portuguese => L::Portuguese,
+            Analyzer::Romanian => L::Romanian,
+            Analyzer::Russian => L::Russian,
+            Analyzer::Spanish => L::Spanish,
+            Analyzer::Swedish => L::Swedish,
+            Analyzer::Tamil => L::Tamil,
+            Analyzer::Turkish => L::Turkish,
+        };
+        let b = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(MAX_TOKEN))
+            .filter(LowerCaser)
+            .dynamic();
+        let b = match StopWordFilter::new(lang) {
+            Some(stop) => b.filter_dynamic(stop),
+            None => b,
+        };
+        b.filter_dynamic(Stemmer::new(lang)).build()
+    }
+
+    /// A text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
+    /// regular expression term is normalized as the indexed tokens are, but not split or
+    /// stemmed. Terms of the standard text (`None`) are lowercased and ASCII-folded, and
+    /// those of a language only lowercased, as Lucene's analyzers normalize them.
+    pub(super) fn normalizer(analyzer: Option<Analyzer>) -> TextAnalyzer {
+        let b = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+            .filter(LowerCaser)
+            .dynamic();
+        match analyzer {
+            None => b.filter_dynamic(AsciiFoldingFilter).build(),
+            Some(_) => b.build(),
+        }
     }
 
     /// What every view of one index generation shares.
     pub(crate) struct Shared {
-        pub(crate) index: Index,
         pub(crate) fields: Fields,
         pub(crate) config: TextConfig,
+        /// ids of terms the searches of this index have looked up
+        pub(crate) ids: super::search::IdCache,
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -376,7 +757,7 @@ mod imp {
     /// and object keys), which are checked against the snapshot.
     pub(crate) struct Resolved {
         pub(crate) searcher: tantivy::Searcher,
-        uncertain: Arc<FxHashSet<u64>>,
+        pub(super) uncertain: Arc<FxHashSet<u64>>,
     }
 
     /// The views of the commits applied between two seals share a slot, set when the
@@ -475,11 +856,15 @@ mod imp {
     }
 
     /// The hash that stands for a document in [`Resolved::uncertain`].
-    fn doc_hash(s: &[u8], o: &[u8]) -> u64 {
+    pub(super) fn doc_hash(s: &[u8], o: &[u8]) -> u64 {
+        key_hash(s) ^ key_hash(o).rotate_left(32)
+    }
+
+    /// One term's part of [`doc_hash`] (a search hashes each distinct term once).
+    pub(super) fn key_hash(k: &[u8]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
-        s.hash(&mut h);
-        o.hash(&mut h);
+        k.hash(&mut h);
         h.finish()
     }
 
@@ -489,7 +874,7 @@ mod imp {
         d.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn text_err(e: impl std::fmt::Display) -> Error {
+    pub(super) fn text_err(e: impl std::fmt::Display) -> Error {
         Error::Invalid(format!("full-text index: {e}"))
     }
 
@@ -506,7 +891,7 @@ mod imp {
 
     /// A new, empty index (in `dir`, replacing anything there, or in memory).
     fn new_index(dir: Option<&Path>, config: &TextConfig) -> Result<(Index, Fields)> {
-        let (schema, fields) = schema();
+        let (schema, fields) = schema(config);
         let docstore_compression = match DocstoreCompression::effective(config.docstore_compression)
         {
             #[cfg(feature = "zstd")]
@@ -550,12 +935,12 @@ mod imp {
     }
 
     /// Open the index in `<root>/text/` for maintenance without per-commit fsync.
-    fn open_index(root: &Path) -> Result<(Index, Fields, LazySyncDir)> {
+    fn open_index(root: &Path, config: &TextConfig) -> Result<(Index, Fields, LazySyncDir)> {
         let dir = LazySyncDir::open(&root.join("text"), marker(root))?;
         let index = Index::open(dir.clone()).map_err(text_err)?;
         register_tokenizer(&index);
-        let (_, fields) = schema();
-        if index.schema() != schema().0 {
+        let (expected, fields) = schema(config);
+        if index.schema() != expected {
             return Err(text_err("unexpected index schema"));
         }
         Ok((index, fields, dir))
@@ -613,7 +998,7 @@ mod imp {
                     return p;
                 }
             };
-            if index.schema() != schema().0 {
+            if index.schema() != schema(&config).0 {
                 p.open_error = Some("unexpected index schema".into());
                 return p;
             }
@@ -703,9 +1088,9 @@ mod imp {
             .map_err(text_err)?;
         Ok(Live {
             shared: Arc::new(Shared {
-                index,
                 fields,
                 config: config.clone(),
+                ids: Default::default(),
             }),
             writer: Some(writer),
             last: Slot::sealed(reader.searcher(), Default::default()),
@@ -752,7 +1137,7 @@ mod imp {
     }
 
     /// Key bytes of an id for documents (`_` + big-endian id for blank nodes).
-    fn term_key(snap: &Snapshot, id: Id) -> Option<Vec<u8>> {
+    pub(super) fn term_key(snap: &Snapshot, id: Id) -> Option<Vec<u8>> {
         match id.tag() {
             Tag::BNode => {
                 let mut k = vec![b'_'];
@@ -764,7 +1149,7 @@ mod imp {
         }
     }
 
-    fn graph_name(snap: &Snapshot, g: Id) -> Option<String> {
+    pub(super) fn graph_name(snap: &Snapshot, g: Id) -> Option<String> {
         if g == Id::DEFAULT_GRAPH {
             return Some(DEFAULT_GRAPH_IRI.to_string());
         }
@@ -869,6 +1254,10 @@ mod imp {
                 end -= 1;
             }
             d.add_text(f.text, &lex[..end]);
+            // a language with an analyzer: the stemmed text too
+            if let Some((field, _)) = lang.and_then(|t| f.stemmed_for(&t.to_ascii_lowercase())) {
+                d.add_text(field, &lex[..end]);
+            }
             Some(Doc {
                 key,
                 hash,
@@ -909,7 +1298,7 @@ mod imp {
                 })
             };
             let reusable = root.filter(|r| r.join("text").exists()).and_then(|r| {
-                let (index, fields, dir) = open_index(r)
+                let (index, fields, dir) = open_index(r, &config)
                     .inspect_err(|e| tracing::warn!("{e}; rebuilding"))
                     .ok()?;
                 if dir.is_marked()
@@ -1112,7 +1501,8 @@ mod imp {
         ) -> Result<Arc<TextView>> {
             let mut live = self.live.lock();
             let live = &mut *live;
-            let fields = live.shared.fields;
+            let shared = live.shared.clone();
+            let fields = &shared.fields;
             let mut terms = Terms::default();
             let mut changed = false;
             let mut seen = FxHashSet::default();
@@ -1125,7 +1515,7 @@ mod imp {
                     key,
                     hash,
                     doc: Some(doc),
-                }) = terms.document(snap, &fields, &self.config, q)
+                }) = terms.document(snap, fields, &self.config, q)
                 else {
                     continue;
                 };
@@ -1371,7 +1761,7 @@ mod imp {
                         _ => {}
                     }
                     crate::store::sync_dir(root)?;
-                    let (index, fields, dir) = open_index(root)?;
+                    let (index, fields, dir) = open_index(root, &self.config)?;
                     *live = live_of(index, fields, &self.config, Some(dir), snap.commit)?;
                     Some(old)
                 }
@@ -1466,254 +1856,41 @@ mod imp {
         }
     }
 
-    /// Evaluate a `text:query` call against the snapshot's text view.
-    pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
-        let snap = &ctx.snap;
-        if snap.historical {
-            return Err(Error::HistoryUnsupported(format!(
-                "full-text search is only available at the head; this query reads commit {}",
-                snap.commit
-            )));
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn tokens(a: Analyzer, text: &str) -> Vec<(usize, String)> {
+            let mut an = language_analyzer(a);
+            let mut st = an.token_stream(text);
+            let mut out = Vec::new();
+            while let Some(t) = st.next() {
+                out.push((t.position, t.text.clone()));
+            }
+            out
         }
-        let Some(view) = &snap.text else {
-            return Err(Error::invalid(
-                "dataset has no full-text index; enable it with `sparkles text-index` or --text",
-            ));
-        };
-        if view.seq != snap.commit {
-            return Err(unavailable("dataset", "stale", view.seq, snap.commit));
-        }
-        let sh = &view.index;
-        let f = sh.fields;
-        for p in &spec.predicates {
-            if !sh.config.predicates.contains(p) {
-                return Err(Error::invalid(format!(
-                    "text:query: <{p}> is not text-indexed"
-                )));
-            }
-        }
-        let parser = QueryParser::for_index(&sh.index, vec![f.text]);
-        let text = parser
-            .parse_query(&spec.query)
-            .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
-        let mut filters: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        let str_terms = |field: Field, vals: &mut dyn Iterator<Item = String>| -> Box<dyn Query> {
-            Box::new(TermSetQuery::new(
-                vals.map(|v| Term::from_field_text(field, &v)),
-            ))
-        };
-        if !spec.predicates.is_empty() {
-            filters.push((
-                Occur::Must,
-                str_terms(f.p, &mut spec.predicates.iter().cloned()),
-            ));
-        }
-        if let Some(lang) = &spec.lang {
-            filters.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(f.lang, lang),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-        if let PathEnd::Const(s) = &spec.subject {
-            match term_key(snap, *s) {
-                Some(k) => filters.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(
-                        Term::from_field_bytes(f.s, &k),
-                        IndexRecordOption::Basic,
-                    )),
-                )),
-                None => return Ok(Table::empty(vars.to_vec())),
-            }
-        }
-        let default_term = || Term::from_field_text(f.g, DEFAULT_GRAPH_IRI);
-        match &spec.graph {
-            GraphFilter::All => {}
-            GraphFilter::Default => filters.push((
-                Occur::Must,
-                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
-            )),
-            GraphFilter::Named => filters.push((
-                Occur::MustNot,
-                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
-            )),
-            GraphFilter::One(g) => {
-                let names: Vec<String> = graph_name(snap, Id(*g)).into_iter().collect();
-                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
-            }
-            GraphFilter::Set(gs) => {
-                let names: Vec<String> =
-                    gs.iter().filter_map(|g| graph_name(snap, Id(*g))).collect();
-                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
-            }
-        }
-        let query: Box<dyn Query> = if filters.is_empty() {
-            text
-        } else {
-            let mut must = vec![(Occur::Must, text)];
-            let has_positive = filters.iter().any(|(o, _)| *o == Occur::Must);
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for (o, q) in filters {
-                match o {
-                    Occur::Must => clauses.push((Occur::Must, q)),
-                    other => must.push((other, q)),
-                }
-            }
-            if has_positive {
-                must.push((
-                    Occur::Must,
-                    Box::new(ConstScoreQuery::new(
-                        Box::new(BooleanQuery::new(clauses)),
-                        0.0,
-                    )),
-                ));
-            }
-            Box::new(BooleanQuery::new(must))
-        };
-        ctx.check()?;
-        let resolved = view.resolved()?;
-        let max = sh.config.max_hits;
-        let want = spec.limit.unwrap_or(max);
-        // with dedup (a merged default graph) or documents filtered out against the
-        // snapshot, fetch more until enough hits remain
-        let mut fetch = if spec.dedup {
-            want.saturating_mul(2)
-        } else {
-            want
-        }
-        .saturating_add(1)
-        .min(max.saturating_add(1));
-        // columns
-        let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
-        let (cs, cscore, clit, cg_out, cgv, cprop) = (
-            match spec.subject {
-                PathEnd::Var(v) => col(Some(v)),
-                _ => None,
-            },
-            col(spec.score),
-            col(spec.literal),
-            col(spec.graph_out),
-            col(spec.graph_var),
-            col(spec.prop),
-        );
-        let mut stale_hits;
-        let t = loop {
-            let hits = resolved
-                .searcher
-                .search(&query, &TopDocs::with_limit(fetch.max(1)).order_by_score())
-                .map_err(text_err)?;
-            ctx.check()?;
-            if spec.limit.is_none() && hits.len() > max {
-                // more hits than a search may return without a limit
-                return Err(Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Rows,
-                    limit: max as u64,
-                    requested: hits.len() as u64,
-                }));
-            }
-            // the per-query memory budget, before the output is built
-            ctx.check_output(hits.len(), vars.len())?;
-            let complete = hits.len() < fetch || fetch > max;
-            let mut t = Table::new(vars.to_vec());
-            let mut seen: FxHashSet<(Id, Id, Id)> = Default::default();
-            let mut row = vec![Id::UNDEF; vars.len()];
-            stale_hits = 0usize;
-            for (i, (score, addr)) in hits.into_iter().enumerate() {
-                if i % 4096 == 4095 {
-                    ctx.check()?;
-                }
-                if t.len() >= want {
-                    break;
-                }
-                let d: TantivyDocument = resolved.searcher.doc(addr).map_err(text_err)?;
-                let get_bytes = |fld: Field| d.get_first(fld).and_then(|v| v.as_bytes());
-                let get_str = |fld: Field| d.get_first(fld).and_then(|v| v.as_str());
-                let (Some(sk), Some(ok), Some(p), Some(g)) =
-                    (get_bytes(f.s), get_bytes(f.o), get_str(f.p), get_str(f.g))
-                else {
-                    stale_hits += 1;
-                    continue;
-                };
-                // a document the searcher may hold for a quad this snapshot does not
-                // have (whose terms it may not have either)
-                let uncertain = !resolved.uncertain.is_empty()
-                    && resolved.uncertain.contains(&doc_hash(sk, ok));
-                let s_id = match sk.split_first() {
-                    Some((b'_', rest)) if rest.len() == 8 => {
-                        Some(Id::bnode(u64::from_be_bytes(rest.try_into().unwrap())))
-                    }
-                    _ => snap.lookup_key(sk),
-                };
-                let (Some(s_id), Some(o_id), Some(p_id)) =
-                    (s_id, snap.lookup_key(ok), snap.lookup_iri(p))
-                else {
-                    stale_hits += usize::from(!uncertain);
-                    continue;
-                };
-                let g_id = if g == DEFAULT_GRAPH_IRI {
-                    Some(Id::DEFAULT_GRAPH)
-                } else if let Some(label) = g.strip_prefix("_:") {
-                    crate::store::parse_bnode_label(label)
-                } else {
-                    snap.lookup_iri(g)
-                };
-                let Some(g_id) = g_id else {
-                    stale_hits += usize::from(!uncertain);
-                    continue;
-                };
-                if uncertain && !snap.contains(&[s_id, p_id, o_id, g_id])? {
-                    continue;
-                }
-                if spec.dedup && !seen.insert((s_id, p_id, o_id)) {
-                    continue;
-                }
-                row.fill(Id::UNDEF);
-                if let Some(c) = cs {
-                    row[c] = s_id;
-                }
-                if let Some(c) = cscore {
-                    row[c] = ctx.intern_value(&crate::sparql::value::Value::Float(score.into()));
-                }
-                if let Some(c) = clit {
-                    row[c] = o_id;
-                }
-                // the graph slot names the default graph by its IRI (a term, not the
-                // store's default-graph marker)
-                let g_term = if g_id == Id::DEFAULT_GRAPH {
-                    ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                        DEFAULT_GRAPH_IRI,
-                    )))
-                } else {
-                    g_id
-                };
-                if let Some(c) = cg_out {
-                    row[c] = g_term;
-                }
-                if let Some(c) = cgv {
-                    if row[c] != Id::UNDEF && row[c] != g_id {
-                        continue; // ?g used both as GRAPH ?g and as the graph slot
-                    }
-                    row[c] = g_id;
-                }
-                if let Some(c) = cprop {
-                    row[c] = p_id;
-                }
-                t.push_row(&row);
-                ctx.check_rows(t.len())?;
-            }
-            if t.len() >= want || complete {
-                break t;
-            }
-            fetch = fetch.saturating_mul(2).min(max.saturating_add(1));
-        };
-        if stale_hits > 0 {
-            tracing::warn!(
-                "text:query skipped {stale_hits} hits whose terms are not in the snapshot"
+
+        #[test]
+        fn language_analyzers_stem_and_drop_stop_words() {
+            let words =
+                |a, t| -> Vec<String> { tokens(a, t).into_iter().map(|(_, w)| w).collect() };
+            assert_eq!(
+                words(Analyzer::English, "The theories of running foxes"),
+                ["theori", "run", "fox"]
             );
+            // stop words leave gaps in the positions, as in Lucene
+            assert_eq!(
+                tokens(Analyzer::English, "Ada and the fox"),
+                [(0, "ada".to_string()), (3, "fox".to_string())]
+            );
+            assert_eq!(words(Analyzer::French, "Les chevaux"), ["cheval"]);
+            // the German stemmer removes the umlaut itself
+            assert_eq!(words(Analyzer::German, "die Häuser"), ["haus"]);
+            // stems are not folded: Swedish keeps städer (städ) apart from stad
+            assert_eq!(words(Analyzer::Swedish, "städer stad"), ["städ", "stad"]);
+            assert_eq!(words(Analyzer::Spanish, "las canciones"), ["cancion"]);
+            // a language without a stop word list in Tantivy still stems
+            assert_eq!(words(Analyzer::Turkish, "kitaplar"), ["kitap"]);
         }
-        Ok(t)
     }
 }

@@ -210,44 +210,17 @@ fn query_options(params: &Params) -> ApiResult<Options> {
 
 /// The `options` object of a JSON body, over the query string's.
 fn json_options(v: &J, o: &mut Options) -> ApiResult<()> {
-    let Some(obj) = v.as_object() else {
-        return Err(bad_request("`options` must be an object"));
-    };
-    for (name, v) in obj {
-        let key = http_key(name)?;
-        let value = match v {
-            J::Null => continue,
-            J::Bool(b) => Value::Bool(*b),
-            J::Number(n) => match n.as_i64() {
-                Some(i) => Value::Int(i),
-                None => Value::Str(n.to_string()),
-            },
-            J::String(s) => Value::Str(s.clone()),
-            J::Array(groups) => {
-                let groups: Option<Vec<Vec<String>>> = groups
-                    .iter()
-                    .map(|g| {
-                        g.as_array()?
-                            .iter()
-                            .map(|l| l.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .collect();
-                match groups {
-                    Some(g) => Value::Groups(g),
-                    None => {
-                        return Err(bad_option(OptionError {
-                            key: key.into(),
-                            message: "expected an array of arrays of prefix labels".into(),
-                        }));
-                    }
-                }
-            }
-            J::Object(_) => Value::Str(v.to_string()),
-        };
-        options::set(o, key, value).map_err(bad_option)?;
-    }
-    Ok(())
+    crate::fmt::config::json_options(v, o).map_err(|e| match e.option {
+        None => bad_request(e.message),
+        Some(name) => ApiError(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!("{name}: {}", e.message),
+                "code": "bad-request",
+                "option": name,
+            }),
+        ),
+    })
 }
 
 fn json_job(bytes: &[u8], params: &Params, mut opts: Options) -> ApiResult<Job> {

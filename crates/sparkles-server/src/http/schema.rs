@@ -5,19 +5,26 @@
 //! Every page of a listing comes from one report computed at one snapshot. The cursor
 //! carries that snapshot's identity, a hash of the selection parameters and the last IRI
 //! served; the dataset keeps its last report so a listing can be finished after a write.
+//!
+//! The summary is also a VoID description in RDF (`Accept: text/turtle` and the other RDF
+//! syntaxes, or `format=`), followed by the declarations unless `declarations=false`.
 
 use super::{ApiError, ApiResult, INFERRED_GRAPH, Params, St, blocking, dataset, err};
+use crate::auth::Principal;
 use crate::state::{AppState, Dataset, SchemaCacheEntry};
+use axum::Extension;
 use axum::Json;
 use axum::extract::Path;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use oxrdfio::RdfFormat;
 use serde::{Deserialize, Serialize};
 use sparkles::schema::{
-    self, GraphSelection, HasIri, Page, SchemaError, SchemaOptions, SchemaReport,
+    self, GraphSelection, HasIri, Page, SchemaError, SchemaOptions, SchemaReport, VoidOptions,
 };
+use sparkles::sparql::results;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +60,8 @@ struct Request {
     limit: usize,
     cursor: Option<Cursor>,
     timeout: Duration,
+    /// a past state (`at`)
+    at: Option<sparkles::history::At>,
 }
 
 fn bad(msg: impl Into<String>) -> ApiError {
@@ -66,7 +75,7 @@ fn fnv(s: &str) -> u64 {
     })
 }
 
-fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
+fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Request> {
     let params = Params::from_query(uri);
     let graph_param = |k: &str| -> ApiResult<Option<GraphSelection>> {
         params
@@ -110,9 +119,13 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
         .filter(|c| !c.is_empty())
         .map(|c| Cursor::decode(c).ok_or_else(|| bad("malformed cursor")))
         .transpose()?;
+    let at = super::history::at_param(&params)?;
     let declared_name = declared_graph.as_ref().unwrap_or(&graph).name().to_string();
+    // a caller limited to some graphs gets a report of those only
+    let graphs = p.view(&ds.name, crate::auth::Endpoint::Info);
+    let view = graphs.as_ref().map_or(String::new(), |g| g.read_key());
     let selection = fnv(&format!(
-        "{}\n{declared_name}\n{reasoning}\n{declared_all}",
+        "{}\n{declared_name}\n{reasoning}\n{declared_all}\n{view}",
         graph.name()
     ));
     Ok(Request {
@@ -125,11 +138,14 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
             deadline: None,
             cancel: None,
             max_entries: st.schema_max_entries,
+            term_totals: false,
+            graphs,
         },
         selection,
         limit,
         cursor,
         timeout,
+        at,
     })
 }
 
@@ -152,8 +168,28 @@ fn schema_error(e: SchemaError, timeout: Duration) -> ApiError {
 /// The report the request is answered from: the cached one when it matches the cursor
 /// or the current snapshot, otherwise a fresh one (which replaces the cache).
 fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
-    let snap = ds.store.snapshot();
-    let current = schema::snapshot_identity(&snap);
+    let (snap, current) = match &req.at {
+        None => {
+            let snap = ds.store.snapshot();
+            let id = schema::snapshot_identity(&snap);
+            (snap, id)
+        }
+        Some(at) => {
+            let o = sparkles::history::HistoryOptions {
+                cancel: None,
+                deadline: Some(Instant::now() + req.timeout),
+            };
+            let (snap, r) = ds.store.snapshot_at(at, &o)?;
+            // a past state never changes: its identity is its commit (live versions are
+            // small counters, so the high bit keeps the two apart)
+            let id = if r.historical {
+                (1 << 63) | r.commit.seq
+            } else {
+                schema::snapshot_identity(&snap)
+            };
+            (snap, id)
+        }
+    };
     let wanted = match &req.cursor {
         Some(c) if c.h != req.selection => {
             return Err(bad(
@@ -166,6 +202,7 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
     if let Some(e) = ds.schema_cache.lock().as_ref()
         && e.identity == wanted
         && e.selection == req.selection
+        && (e.report.term_totals.is_some() || !req.opts.term_totals)
     {
         return Ok(e.report.clone());
     }
@@ -188,11 +225,14 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
         report.classes.len(),
         report.predicates.len()
     );
-    *ds.schema_cache.lock() = Some(SchemaCacheEntry {
-        identity: current,
-        selection: req.selection,
-        report: report.clone(),
-    });
+    // the cache keeps the report everyone with access to every graph shares
+    if req.opts.graphs.is_none() {
+        *ds.schema_cache.lock() = Some(SchemaCacheEntry {
+            identity: current,
+            selection: req.selection,
+            report: report.clone(),
+        });
+    }
     Ok(report)
 }
 
@@ -229,17 +269,71 @@ fn page<'a, T: HasIri>(
 #[derive(Clone, Copy)]
 enum What {
     Summary,
+    /// the summary as a VoID description, with the declarations or without
+    Void(RdfFormat, bool),
     Classes,
     Predicates,
 }
 
-async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
+/// The RDF syntax a summary request asks for with `format=` or `Accept`; `None` is the
+/// JSON document.
+fn rdf_format(params: &Params, headers: &HeaderMap) -> ApiResult<Option<RdfFormat>> {
+    if let Some(f) = params.get("format") {
+        if f == "json" {
+            return Ok(None);
+        }
+        return results::rdf_format_from_name(f).map(Some).ok_or_else(|| {
+            bad(format!(
+                "unknown format '{f}': json, turtle, ntriples, nquads, trig, rdfxml or jsonld"
+            ))
+        });
+    }
+    const OFFERS: [&str; 7] = [
+        "application/json",
+        "text/turtle",
+        "application/n-triples",
+        "application/ld+json",
+        "application/rdf+xml",
+        "application/trig",
+        "application/n-quads",
+    ];
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*/*");
+    Ok(match super::negotiate(accept, &OFFERS) {
+        None | Some(0) => None,
+        Some(i) => results::rdf_format_from_name(OFFERS[i]),
+    })
+}
+
+async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiResult {
     let ds = dataset(&st, &name)?;
-    let mut req = parse(&st, &ds, &uri)?;
+    let mut req = parse(&st, &ds, &uri, &p)?;
+    // VoID is always complete (no cursor), and reports the distinct subjects and objects
+    // of the selection as well
+    if matches!(what, What::Void(..)) {
+        req.opts.term_totals = true;
+        req.cursor = None;
+    }
     blocking(move || {
         let report = report(&ds, &mut req)?;
         let r = &*report;
         Ok(match what {
+            What::Void(format, declarations) => {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(ds.store.prefixes());
+                let opts = VoidOptions {
+                    dataset: &ds.name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                (
+                    [(header::CONTENT_TYPE, results::rdf_media_type(format))],
+                    schema::void_text(r, &opts, format),
+                )
+                    .into_response()
+            }
             // the summary always starts both lists at the top
             What::Summary => Json(r.summary(
                 &ds.name,
@@ -254,16 +348,48 @@ async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
     .await
 }
 
-pub(super) async fn summary(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult {
-    serve(st, name, uri, What::Summary).await
+pub(super) async fn summary(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    let what = match rdf_format(&params, &headers)? {
+        None => What::Summary,
+        Some(f) => {
+            let declarations = match params.get("declarations") {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(v) => {
+                    return Err(bad(format!(
+                        "declarations must be true or false, not '{v}'"
+                    )));
+                }
+            };
+            What::Void(f, declarations)
+        }
+    };
+    serve(st, name, uri, p, what).await
 }
 
-pub(super) async fn classes(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult<Response> {
-    serve(st, name, uri, What::Classes).await
+pub(super) async fn classes(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Response> {
+    serve(st, name, uri, p, What::Classes).await
 }
 
-pub(super) async fn predicates(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult<Response> {
-    serve(st, name, uri, What::Predicates).await
+pub(super) async fn predicates(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Response> {
+    serve(st, name, uri, p, What::Predicates).await
 }
 
 #[cfg(test)]

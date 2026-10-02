@@ -31,6 +31,57 @@ pub struct DatasetSpec {
     pub union_default: bool,
 }
 
+impl DatasetSpec {
+    /// Limit the dataset of a query on `snap` to the graphs `access` may read: hidden
+    /// graphs leave `FROM` and `FROM NAMED` (as if they did not exist), the default graph
+    /// is empty when it is hidden, and the union of named graphs (the store's union
+    /// default graph, or `urn:x-arq:UnionGraph`) becomes the visible named graphs.
+    pub fn restrict(
+        &mut self,
+        snap: &Snapshot,
+        access: &crate::access::GraphAccess,
+        term: &dyn Fn(Id) -> Option<Term>,
+    ) -> Result<()> {
+        if access.reads_all() {
+            return Ok(());
+        }
+        let (visible, every) = access.visible_named_all(snap)?;
+        let allowed = |g: &Id| {
+            if *g == Id::DEFAULT_GRAPH {
+                access.read.default_graph()
+            } else if visible.binary_search(g).is_ok() {
+                true
+            } else {
+                // a graph without quads (or a query-local term): by its name
+                match g.tag() {
+                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => false,
+                    _ => access.readable(term(*g).as_ref()),
+                }
+            }
+        };
+        let union = || visible.to_vec();
+        self.default = match self.default.take() {
+            // every named graph is visible: the union of them all, with its fast paths
+            None if every && (self.union_default || snap.union_default_graph) => None,
+            _ if self.union_default => Some(union()),
+            None if snap.union_default_graph => Some(union()),
+            // the store's default graph, as before (which keeps its fast paths)
+            None if access.read.default_graph() => None,
+            None => Some(Vec::new()),
+            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+        };
+        if self.default.is_some() {
+            self.union_default = false;
+        }
+        self.named = match self.named.take() {
+            None if every => None,
+            None => Some(union()),
+            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+        };
+        Ok(())
+    }
+}
+
 const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
@@ -81,10 +132,49 @@ pub struct Optimizations {
     /// ORDER BY several keys with LIMIT evaluates the later keys only on the rows that
     /// the first key does not rule out
     pub topk_first_key: bool,
+    /// counts from the index statistics are corrected for the snapshot's delta and for
+    /// quads in graphs the query does not read, instead of being used only when neither
+    /// exists
+    pub delta_statistics: bool,
+    /// join ordering runs the dynamic program on cost summaries, over subsets connected
+    /// by shared variables, and drops partial plans dearer than a greedy plan; off: the
+    /// program builds every candidate plan tree for every split
+    pub pruned_join_order: bool,
+    /// COUNT(*) over a FILTER on one variable of a single scan tests the filter once per
+    /// run of the variable in a permutation sorted on it and sums the run lengths
+    pub count_filter_runs: bool,
+    /// a FILTER over a scan sorted on a variable it tests reads the runs of that
+    /// variable, tests each value once and copies only the rows of the values that pass
+    pub filter_scan_runs: bool,
+    /// those two read only the key ranges of the values whose string starts as a
+    /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
+    pub filter_key_ranges: bool,
+    /// hash joins group the build side's rows by key in one flat array instead of a list
+    /// per key
+    pub flat_hash_join: bool,
+    /// index joins find each key's rows by galloping from the previous key's position
+    /// and keep the current block, instead of a binary search and a scan per cluster
+    pub gallop_index_join: bool,
+    /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
+    /// runs as a merge in the left side's order
+    pub merge_left_join: bool,
+    /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
+    /// of the pattern's rows, whose share that passes is the planner's estimate of the
+    /// share of its input it keeps (instead of 30%)
+    pub sampled_filters: bool,
+    /// joins on a subject variable of patterns with constant predicates are estimated
+    /// from the characteristic sets in the statistics
+    pub characteristic_sets: bool,
+    /// a join of a small input (VALUES, or a pattern of few rows) with a pattern is
+    /// estimated by counting the pattern's rows for a sample of the input's values
+    pub probed_keys: bool,
+    /// index joins that a fused star reads together are costed for the keys of the
+    /// star's input, which a fused star probes in every pattern
+    pub fused_star_costs: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 17] = [
+    pub const NAMES: [&str; 29] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -102,6 +192,18 @@ impl Optimizations {
         "expr_cache",
         "anti_join",
         "topk_first_key",
+        "delta_statistics",
+        "pruned_join_order",
+        "count_filter_runs",
+        "filter_scan_runs",
+        "filter_key_ranges",
+        "flat_hash_join",
+        "gallop_index_join",
+        "merge_left_join",
+        "sampled_filters",
+        "characteristic_sets",
+        "probed_keys",
+        "fused_star_costs",
     ];
 
     /// Everything on.
@@ -123,6 +225,18 @@ impl Optimizations {
         expr_cache: true,
         anti_join: true,
         topk_first_key: true,
+        delta_statistics: true,
+        pruned_join_order: true,
+        count_filter_runs: true,
+        filter_scan_runs: true,
+        filter_key_ranges: true,
+        flat_hash_join: true,
+        gallop_index_join: true,
+        merge_left_join: true,
+        sampled_filters: true,
+        characteristic_sets: true,
+        probed_keys: true,
+        fused_star_costs: true,
     };
 
     /// Everything off: the generic operators only.
@@ -144,6 +258,18 @@ impl Optimizations {
         expr_cache: false,
         anti_join: false,
         topk_first_key: false,
+        delta_statistics: false,
+        pruned_join_order: false,
+        count_filter_runs: false,
+        filter_scan_runs: false,
+        filter_key_ranges: false,
+        flat_hash_join: false,
+        gallop_index_join: false,
+        merge_left_join: false,
+        sampled_filters: false,
+        characteristic_sets: false,
+        probed_keys: false,
+        fused_star_costs: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -165,6 +291,18 @@ impl Optimizations {
             "expr_cache" => &mut self.expr_cache,
             "anti_join" => &mut self.anti_join,
             "topk_first_key" => &mut self.topk_first_key,
+            "delta_statistics" => &mut self.delta_statistics,
+            "pruned_join_order" => &mut self.pruned_join_order,
+            "count_filter_runs" => &mut self.count_filter_runs,
+            "filter_scan_runs" => &mut self.filter_scan_runs,
+            "filter_key_ranges" => &mut self.filter_key_ranges,
+            "flat_hash_join" => &mut self.flat_hash_join,
+            "gallop_index_join" => &mut self.gallop_index_join,
+            "merge_left_join" => &mut self.merge_left_join,
+            "sampled_filters" => &mut self.sampled_filters,
+            "characteristic_sets" => &mut self.characteristic_sets,
+            "probed_keys" => &mut self.probed_keys,
+            "fused_star_costs" => &mut self.fused_star_costs,
             _ => return None,
         })
     }
@@ -217,9 +355,15 @@ pub struct Ctx {
     values: Vec<RwLock<FxHashMap<Id, Value>>>,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
+    /// blank nodes given to the query from outside (initial bindings) that are not
+    /// stored ones: a fresh blank node per label
+    outside_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
     pub dataset: DatasetSpec,
+    /// the request's graph view when it does not read every graph: `dataset` is already
+    /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
     pub now: oxsdatatypes::DateTime,
     pub base_iri: Option<oxiri::Iri<String>>,
     pub var_names: RwLock<Vec<String>>,
@@ -232,6 +376,12 @@ pub struct Ctx {
     mem_live: AtomicU64,
     /// highest estimate seen (held tables plus an output under construction)
     mem_peak: AtomicU64,
+    /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
+    /// [`Ctx::produced`].
+    pub max_rows_produced: u64,
+    /// rows produced so far, summed over operators (shared by the WHERE clauses of one
+    /// update)
+    pub rows_produced: Arc<AtomicU64>,
     pub allow_service: bool,
     /// SERVICE fails with [`crate::Error::NotPermitted`] (see
     /// [`QueryOptions::forbid_service`](super::QueryOptions::forbid_service))
@@ -248,6 +398,13 @@ pub struct Ctx {
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
     warnings: parking_lot::Mutex<Vec<PlanWarning>>,
+    /// FILTER selectivities measured on samples for this query, by conjunct text
+    sampled: parking_lot::Mutex<FxHashMap<String, super::sample::Sampled>>,
+    /// the star predicates registered per subject variable (see [`super::charsets`])
+    pub(super) stars: parking_lot::Mutex<FxHashMap<VarId, super::charsets::StarVar>>,
+    /// the small input of a variable and the patterns probed with its values (see
+    /// [`super::keyprobe`])
+    pub(super) probes: parking_lot::Mutex<FxHashMap<VarId, super::keyprobe::VarProbe>>,
 }
 
 impl Ctx {
@@ -260,9 +417,11 @@ impl Ctx {
                 .collect(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
+            outside_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
+            graphs: None,
             now: oxsdatatypes::DateTime::now(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
@@ -270,6 +429,8 @@ impl Ctx {
             mem_limit: u64::MAX,
             mem_live: AtomicU64::new(0),
             mem_peak: AtomicU64::new(0),
+            max_rows_produced: u64::MAX,
+            rows_produced: Arc::new(AtomicU64::new(0)),
             allow_service: true,
             forbid_service: false,
             outbound: Default::default(),
@@ -278,6 +439,9 @@ impl Ctx {
             opt: Optimizations::default(),
             geo: Default::default(),
             warnings: Default::default(),
+            sampled: Default::default(),
+            stars: Default::default(),
+            probes: Default::default(),
         }
     }
 
@@ -292,6 +456,22 @@ impl Ctx {
     /// The warnings recorded so far.
     pub fn warnings(&self) -> Vec<PlanWarning> {
         self.warnings.lock().clone()
+    }
+
+    /// The selectivity measured on a sample for the FILTER conjunct shown as `text`, if
+    /// one was measured while planning this query.
+    pub(super) fn sampled(&self, text: &str) -> Option<super::sample::Sampled> {
+        let m = self.sampled.lock();
+        if m.is_empty() {
+            return None;
+        }
+        m.get(text).copied()
+    }
+
+    /// Keep the selectivity measured for the conjunct shown as `text` (the first one
+    /// measured stays, so that every plan compared sees the same).
+    pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
+        self.sampled.lock().entry(text).or_insert(s);
     }
 
     #[inline]
@@ -320,6 +500,33 @@ impl Ctx {
         Ok(())
     }
 
+    /// An operator finished with `rows` rows: count them as produced, and fail once the
+    /// total passes [`Ctx::max_rows_produced`]. One atomic add per operator.
+    #[inline]
+    pub fn produced(&self, rows: usize) -> Result<()> {
+        let total = self
+            .rows_produced
+            .fetch_add(rows as u64, Ordering::Relaxed)
+            .saturating_add(rows as u64);
+        if total > self.max_rows_produced {
+            return Err(self.produced_exceeded(total));
+        }
+        Ok(())
+    }
+
+    /// The rows produced by all operators so far.
+    pub fn rows_produced(&self) -> u64 {
+        self.rows_produced.load(Ordering::Relaxed)
+    }
+
+    fn produced_exceeded(&self, requested: u64) -> Error {
+        Error::BudgetExceeded(Budget {
+            kind: BudgetKind::RowsProduced,
+            limit: self.max_rows_produced,
+            requested,
+        })
+    }
+
     // --------------------------------------------------------------- memory ------
 
     /// Before an operator produces (or grows its output to) `rows` rows of `width`
@@ -329,6 +536,16 @@ impl Ctx {
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
         self.check_rows(rows)?;
+        if self.max_rows_produced != u64::MAX {
+            // the output will count as produced: fail before it is built
+            let total = self
+                .rows_produced
+                .load(Ordering::Relaxed)
+                .saturating_add(rows as u64);
+            if total > self.max_rows_produced {
+                return Err(self.produced_exceeded(total));
+            }
+        }
         let need = self
             .mem_live
             .load(Ordering::Relaxed)
@@ -420,18 +637,76 @@ impl Ctx {
 
     // ---------------------------------------------------------------- terms ------
 
-    /// The id of a term: stored id if the term exists in the store, else a local id.
+    /// The id of a term this query decoded from one of its own ids: stored id if the
+    /// term exists in the store, else a local id. A blank node label written by
+    /// [`bnode_for`] maps back to its id, a stored node's or one this query minted.
     pub fn intern_term(&self, t: &Term) -> Id {
-        if let Term::BlankNode(b) = t
-            && let Some(id) = parse_bnode_label(b.as_str())
-        {
-            return id;
+        if let Term::BlankNode(b) = t {
+            return match id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Id::bnode(p),
+                None => self.outside_bnode(b.as_str()),
+            };
         }
         if let Some(id) = id::inline_id(t) {
             return id;
         }
         let key = id::term_key(t);
         self.intern_key(&key)
+    }
+
+    /// The id of a term given to the query from outside, such as an initial binding. A
+    /// blank node, also inside a triple term, names a stored node only by that node's
+    /// label (see [`parse_bnode_label`]). Any other label, a minted node's label from
+    /// an earlier result included, is a new blank node of this query, the same one for
+    /// the same label.
+    pub fn intern_outside_term(&self, t: &Term) -> Id {
+        self.intern_term(&self.map_bnodes(t, &mut |b| {
+            parse_bnode_label(b).unwrap_or_else(|| self.outside_bnode(b))
+        }))
+    }
+
+    /// The id of a term from a SERVICE result. Its blank nodes are the remote endpoint's,
+    /// so every label is a new blank node of this query, the same one for the same label
+    /// within `scope` (one result set).
+    pub fn intern_remote_term(&self, t: &Term, scope: &mut FxHashMap<String, Id>) -> Id {
+        self.intern_term(&self.map_bnodes(t, &mut |b| {
+            if let Some(&id) = scope.get(b) {
+                return id;
+            }
+            let id = self.fresh_bnode();
+            scope.insert(b.to_string(), id);
+            id
+        }))
+    }
+
+    /// `t` with each blank node, also inside triple terms, replaced by the node `f` picks
+    /// for its label.
+    fn map_bnodes(&self, t: &Term, f: &mut dyn FnMut(&str) -> Id) -> Term {
+        match t {
+            Term::BlankNode(b) => Term::BlankNode(bnode_for(f(b.as_str()))),
+            Term::Triple(tr) => {
+                let s = match self.map_bnodes(&tr.subject.clone().into(), f) {
+                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                    _ => unreachable!("a subject stays a subject"),
+                };
+                let o = self.map_bnodes(&tr.object, f);
+                Term::Triple(Box::new(oxrdf::Triple::new(s, tr.predicate.clone(), o)))
+            }
+            t => t.clone(),
+        }
+    }
+
+    /// A blank node of this query for a label from outside it.
+    fn outside_bnode(&self, label: &str) -> Id {
+        if let Some(&id) = self.outside_bnodes.lock().get(label) {
+            return id;
+        }
+        *self
+            .outside_bnodes
+            .lock()
+            .entry(label.to_string())
+            .or_insert_with(|| self.fresh_bnode())
     }
 
     /// Id for a graph name, mapping Jena's special default-graph IRI.

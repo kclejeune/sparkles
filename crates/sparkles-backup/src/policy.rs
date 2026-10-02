@@ -1135,6 +1135,7 @@ mod tests {
             dataset: DatasetRef {
                 name: "ds".into(),
                 id: uuid::Uuid::from_u128(id),
+                kind: "persistent".into(),
             },
             commit: CommitRef {
                 seq: 1,

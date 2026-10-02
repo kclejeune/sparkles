@@ -51,8 +51,12 @@ implementation landed.
   - the SPARQL 1.1 Query §4.2.3 collections syntax, BCP 47 and RFC 4647.
 
   Fluree was not consulted.
-- **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`
-  and `lz4-compression`. That set avoids zstd's C code. Tantivy is behind the optional
+- **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`,
+  `stopwords` and `lz4-compression`. That set avoids zstd's C code. The `stemmer` feature
+  links `rust-stemmers` 1.2.0 (MIT OR BSD-3-Clause), the Snowball stemmers that the
+  per-language analyzers use. The `stopwords` feature adds no crate. Its lists are part of
+  Tantivy's source. The English list is Lucene's, and the others are the Snowball
+  project's (BSD-3-Clause, the license `rust-stemmers` already carries). Tantivy is behind the optional
   `text` feature of `sparkles`, which the server enables by default.
 - **Rejected** (spec §8):
   - a home-grown inverted index;
@@ -66,7 +70,7 @@ implementation landed.
   - a FILTER function as the main interface;
   - external engines (Elasticsearch, SQLite FTS5).
 
-## Vector similarity (exact search)
+## Vector similarity and vector indexes
 
 - **Spec:** [`F04-vector-search.md`](F04-vector-search.md), written independently from
   RDF 1.2 Concepts, SPARQL 1.1 §17.6, RFC 8259, IEEE 754, RFC 8141, the HNSW paper,
@@ -75,12 +79,32 @@ implementation landed.
 - **Implementation:** Phase 1 (exact search), from the spec and Sparkles code only.
   There are no new dependencies. The kernel is our own 8-lane loop, and rayon was
   already in use.
-- **Deferred:** HNSW. The spec recommends USearch 2.26 (Apache-2.0), with hnsw_rs as the
-  pure-Rust alternative.
+- **Configured indexes and HNSW (Phase 1b and 2):** from the spec, the Sparkles code
+  (the spatial index's background builds and mapped files were the model), and the
+  HNSW paper (Malkov and Yashunin, arXiv:1603.09320: Algorithms 1, 2, 4 and 5, the level
+  distribution of §4, and the parameter names M, efConstruction and ef). The graph is our
+  own code. No new dependency: it uses parking_lot, rayon, memmap2 and flate2's CRC-32,
+  which Sparkles already links.
+- **Library choice.** USearch 2.26.2 (Apache-2.0), hnsw_rs 0.3.4 (MIT OR Apache-2.0) and
+  instant-distance 0.6.1 (MIT OR Apache-2.0) were measured in a throwaway harness through
+  their public APIs only, on 100k clustered vectors of dimension 384 and 768 (cosine,
+  M = 16, efConstruction = 128, 1000 queries), next to the graph written for Sparkles.
+  None of their source was copied. At 384 dimensions and ef = 64, recall@10 and median
+  latency were 0.997 and 0.35 ms for USearch (f32 or f16), 0.981 and 0.78 ms for
+  hnsw_rs, 0.999 and 0.37 ms for the Sparkles graph, and instant-distance needed 137 s to
+  build. USearch and hnsw_rs keep their own copy of every vector (USearch f16 added
+  145 MB, hnsw_rs 375 MB), while the Sparkles graph reads the packed vectors and added
+  13 MB. USearch's Rust binding sets `ef` per index rather than per query, needs a C++
+  toolchain and reserved thread slots, and is not unwind-safe. hnsw_rs adds about a
+  dozen crates (env_logger, bincode 1, mmap-rs, rand 0.9 among them). instant-distance
+  fixes `ef` at build time and has no filtered search. At 1M × 384, the Sparkles graph
+  reached recall@10 of 0.929 at ef = 64 (0.29 ms) and USearch f16 0.908 (0.36 ms).
+  USearch built 2.5 times faster and held 1.3 GB against 130 MB. No ANN crate was added.
 - **Rejected** (spec §8):
   - canonicalizing vector literals on load;
   - a new id tag for vectors;
-  - `rdf:JSON`.
+  - `rdf:JSON`;
+  - maintaining the graph on the commit path.
 
 ## Named snapshots and point-in-time reads
 
@@ -159,6 +183,31 @@ implementation landed.
   - deny rules, and `403` for hidden datasets;
   - trusting proxy headers from any peer, or behind a global flag.
 
+## Graph-level access control and endpoint permissions
+
+- **Spec:** [`C12-graph-access-control.md`](C12-graph-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C10, C11, F03, F04 and F06;
+  - Apache Jena Fuseki's "Data Access Control for Fuseki" documentation (Apache-2.0),
+    for `access:AccessControlledDataset`, `access:entry`, `urn:x-arq:DefaultGraph` in
+    entries, and `allowedUsers` at the server, dataset and endpoint levels;
+  - W3C Solid Web Access Control and Access Control Policy, the NIST RBAC model and
+    SPARQL 1.1 Query, Update, Protocol and Graph Store Protocol, cited from working
+    knowledge.
+
+  Fluree was not consulted, including its policy language.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access` and the query, update, store, schema and diff modules. The
+  server part is in the `auth` module of `sparkles-server` and its handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §11):
+  - filtering in the HTTP handlers instead of the engine;
+  - turning off the fast paths or the result cache for restricted principals;
+  - checking writes against the changes that took effect;
+  - making `CLEAR ALL` fail for every restricted principal;
+  - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
+    vocabulary.
+
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on
@@ -211,6 +260,13 @@ implementation landed.
     Its dependencies are MIT, Apache-2.0 or both, including `schemars` 1.2.2 (MIT). The
     published crate carries no `LICENSE` file. The license text is in the upstream
     repository.
+  - **HTTP transport** (2026-10-02): rmcp's `transport-streamable-http-server` feature
+    is on as well, for `/$/mcp`. It adds one crate, `sse-stream` 0.2.6 (MIT OR
+    Apache-2.0), which turns HTTP bodies into SSE streams. `tokio-util` 0.7 (MIT) became
+    a direct dependency of the `mcp` feature, for the token that ends the endpoint's
+    streams at shutdown. It was already in the tree through rmcp. The transport, its
+    session rules and the auth integration follow the C11 spec and the C09 permission
+    model. No other MCP server was consulted.
 - **Rejected** (spec §9):
   - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
   - rmcp `#[tool]` macros with `schemars`-derived schemas;
@@ -586,6 +642,48 @@ implementation landed.
   - SHACL and ShEx guards together in Phase 2;
   - a `peg` grammar;
   - treating budget overruns as nonconformant.
+
+## Python bindings
+
+- **Spec:** [`P01-python-bindings.md`](P01-python-bindings.md), written on 2026-10-02
+  independently from:
+  - the Sparkles code;
+  - the PyO3 0.29 user guide and API documentation, and the maturin 1.x user guide;
+  - PEPs 384, 517, 561, 599, 600 and 639, and the CPython release schedule;
+  - pyoxigraph's documentation (MIT OR Apache-2.0), read for the names and signatures of
+    its store, term, `parse`, `serialize` and `RdfFormat` API. Its source was not read;
+  - rdflib's documentation (BSD-3-Clause), read for `rdflib.term` and
+    `Literal.toPython`.
+
+  Fluree was not consulted.
+- **Implementation, Phase 1** (2026-10-02): from the spec and the Sparkles code. No code
+  was copied from pyoxigraph or rdflib.
+  - `crates/sparkles-py` is a cdylib crate in its own cargo workspace. The term classes,
+    result iterators, transactions and error mapping are written against PyO3's class and
+    function macros. The Python exceptions are defined in `sparkles/_errors.py`.
+  - Transactions run the engine's closure-based `Dataset::transaction` on a worker
+    thread, which owns the writer lock's guard, and receive operations over a channel.
+  - `Dataset::quads` and `QuadIter` were added to `crates/sparkles` for the streaming
+    `quads_for_pattern`. They read the index in batches with the existing
+    `Snapshot::scan_between`.
+  - **Dependencies:** `pyo3` 0.29.3 (MIT OR Apache-2.0) with the `abi3-py310` feature,
+    with `pyo3-ffi`, `pyo3-macros` and `pyo3-macros-backend` 0.29.3 (MIT OR Apache-2.0)
+    linked or expanded into the extension, and `pyo3-build-config` 0.29.3 (MIT OR
+    Apache-2.0), `target-lexicon` 0.13.5 (Apache-2.0 WITH LLVM-exception) and `heck`
+    0.5.0 (MIT OR Apache-2.0) at build time only. None of them is linked into the
+    `sparkles` binary. `crates/sparkles-py/THIRD_PARTY_LICENSES.md` lists the crates the
+    wheel links.
+  - **Build and test tools, not shipped:** maturin 1.15.0 (MIT OR Apache-2.0), pinned in
+    `mise.toml` for `py:build` and taken from nixpkgs in the flake; pytest (MIT), mypy and
+    its `stubtest` (MIT) and rdflib (BSD-3-Clause) for the test suite, from the dev shell
+    or nixpkgs.
+- **Rejected** (spec §2.2 and §11):
+  - a workspace member left out of `default-members`, which would make every workspace
+    lint and test build compile PyO3;
+  - an rdflib `Store` plugin in Phase 1;
+  - a binding-side table that keeps blank-node labels across writes;
+  - holding the store's write transaction in the Python object, which needs its guard on
+    one thread.
 
 ## Development tools (not linked into Sparkles)
 

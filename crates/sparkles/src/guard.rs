@@ -98,6 +98,45 @@ pub struct WriteOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// results carried in a summary (the guard's default if `None`)
     pub report_limit: Option<usize>,
+    /// the message recorded with the commit (see
+    /// [`annotations::validate_message`](crate::annotations::validate_message))
+    pub message: Option<Arc<str>>,
+    /// checked once the writer lock is held, before anything is written
+    pub precondition: Option<Precondition>,
+    /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
+    /// when another write holds the writer lock
+    pub no_wait: bool,
+    /// The graphs the write may change (`None`: every graph). An insert or delete in
+    /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)
+    /// before the quad is looked up.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
+}
+
+/// A check of the committed state that a write depends on (an HTTP `If-Match`, say).
+/// The store runs it with the writer lock held, on the head snapshot, so no other
+/// commit can come between the check and the write. An `Err` (usually
+/// [`Error::PreconditionFailed`](crate::Error::PreconditionFailed)) stops the write
+/// before anything is written.
+#[derive(Clone)]
+pub struct Precondition(pub Arc<PreconditionFn>);
+
+/// The check a [`Precondition`] runs.
+pub type PreconditionFn = dyn Fn(&Snapshot) -> Result<()> + Send + Sync;
+
+impl Precondition {
+    pub fn new(f: impl Fn(&Snapshot) -> Result<()> + Send + Sync + 'static) -> Precondition {
+        Precondition(Arc::new(f))
+    }
+
+    pub fn check(&self, head: &Snapshot) -> Result<()> {
+        (self.0)(head)
+    }
+}
+
+impl std::fmt::Debug for Precondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Precondition")
+    }
 }
 
 impl WriteOptions {
@@ -232,6 +271,17 @@ pub struct ValidationSummary {
     pub results: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shapes_error: Option<String>,
+    /// grandfather mode: the blocking results the write introduced (those the state
+    /// before it did not have), which alone decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<u64>,
+    /// the focus nodes validated (an incremental validation lists the results of these
+    /// alone; the counts are those of the whole state)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_nodes: Option<u64>,
+    /// why the write, or some shape, was validated in full instead of incrementally
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
     /// the same results as a Turtle `sh:ValidationReport`, for rejections
     #[serde(skip)]
     pub report_turtle: Option<String>,
@@ -255,8 +305,17 @@ impl ValidationSummary {
             millis: 0,
             results: Vec::new(),
             shapes_error: None,
+            introduced: None,
+            focus_nodes: None,
+            fallback: None,
             report_turtle: None,
         }
+    }
+
+    /// Whether a ShEx or SHACL summary's results block in its mode: in grandfather mode
+    /// the introduced ones, otherwise any.
+    pub fn blocks(&self) -> bool {
+        self.introduced.unwrap_or(self.blocking) > 0
     }
 
     /// `Sparkles-Validation` header value (an RFC 9651 Dictionary). A ShEx guard's adds
@@ -276,8 +335,12 @@ impl ValidationSummary {
             GuardLanguage::Shacl => "",
             GuardLanguage::Shex => ", lang=shex",
         };
+        let introduced = match self.introduced {
+            Some(n) => format!(", introduced={n}"),
+            None => String::new(),
+        };
         format!(
-            "status={}, mode={}, strategy={}{lang}, blocking={}, total={}, violations={}, warnings={}, infos={}, ms={}",
+            "status={}, mode={}, strategy={}{lang}, blocking={}{introduced}, total={}, violations={}, warnings={}, infos={}, ms={}",
             self.status.name(),
             mode,
             strategy,
@@ -288,17 +351,6 @@ impl ValidationSummary {
             self.by_severity.info,
             self.millis
         )
-    }
-}
-
-/// Serialize an optional shared summary (for [`crate::commit::Receipt`]).
-pub(crate) fn serialize_summary<S: serde::Serializer>(
-    v: &Option<Arc<ValidationSummary>>,
-    s: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    match v {
-        Some(v) => v.as_ref().serialize(s),
-        None => s.serialize_none(),
     }
 }
 
@@ -314,7 +366,12 @@ pub struct Rejection {
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.summary.language == GuardLanguage::Shex {
-            let n = self.summary.blocking;
+            let n = self.summary.introduced.unwrap_or(self.summary.blocking);
+            let new = if self.summary.introduced.is_some() {
+                "new "
+            } else {
+                ""
+            };
             return match &self.summary.shapes_error {
                 Some(e) => write!(
                     f,
@@ -322,7 +379,7 @@ impl std::fmt::Display for Rejection {
                 ),
                 None => write!(
                     f,
-                    "ShEx validation failed: {n} nonconformant association{}; nothing was committed",
+                    "ShEx validation failed: {n} {new}nonconformant association{}; nothing was committed",
                     if n == 1 { "" } else { "s" }
                 ),
             };
@@ -334,9 +391,18 @@ impl std::fmt::Display for Rejection {
             ),
             None => write!(
                 f,
-                "SHACL validation failed: {} blocking result{} (threshold {}); nothing was committed",
-                self.summary.blocking,
-                if self.summary.blocking == 1 { "" } else { "s" },
+                "SHACL validation failed: {} {}blocking result{} (threshold {}); nothing was committed",
+                self.summary.introduced.unwrap_or(self.summary.blocking),
+                if self.summary.introduced.is_some() {
+                    "new "
+                } else {
+                    ""
+                },
+                if self.summary.introduced.unwrap_or(self.summary.blocking) == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 match self.summary.threshold {
                     Severity::Violation => "violation",
                     Severity::Warning => "warning",

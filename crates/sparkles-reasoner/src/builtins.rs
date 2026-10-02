@@ -315,7 +315,7 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             let opt = |i: usize| bi.args.get(i).map(|s| ev.val(*s, b)).filter(|&v| v != 0);
             let (s, p, o) = (opt(0), opt(1), opt(2));
             let c = ev.g.cands(s, p, o, 0, ev.end);
-            !(0..c.len()).any(|i| {
+            !(0..c.len()).filter(|&i| ev.g.alive(c.get(i))).any(|i| {
                 let tr = ev.g.triples[c.get(i) as usize];
                 s.is_none_or(|x| x == tr[0])
                     && p.is_none_or(|x| x == tr[1])
@@ -330,11 +330,24 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         }
         ListForAll => {
             let (s, p) = (a(1), a(2));
-            ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end)
-                .is_some_and(|ms| {
-                    ms.iter()
-                        .all(|&m| ev.g.position(&[s, p, m]).is_some_and(|i| i < ev.end))
-                })
+            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+                return;
+            };
+            if !ms
+                .iter()
+                .all(|&m| ev.g.position(&[s, p, m]).is_some_and(|i| i < ev.end))
+            {
+                return;
+            }
+            if ev.collecting() {
+                // the facts read are part of the instance's body
+                let n = ev.implicit.len();
+                ev.implicit.extend(ms.iter().map(|&m| [s, p, m]));
+                ev.run(k + 1, b, None);
+                ev.implicit.truncate(n);
+                return;
+            }
+            true
         }
         // ---- binders / generators
         Sum | Difference | Product | Quotient => {

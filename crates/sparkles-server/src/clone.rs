@@ -90,6 +90,7 @@ pub const FAIL_BEFORE_RENAME: &str = "fail-before-rename";
 /// Setting `cancel` stops the clone before the rename with `sparkles::Error::Cancelled`,
 /// leaving nothing behind.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clone_into(
     store: &Store,
     name: &str,
@@ -99,6 +100,24 @@ pub fn clone_into(
     inferences: Inferences,
     progress: Option<ProgressFn>,
     cancel: Option<Arc<AtomicBool>>,
+) -> Result<CloneReport> {
+    clone_into_at(
+        store, name, reasoning, tmp, dst, inferences, progress, cancel, None,
+    )
+}
+
+/// [`clone_into`] of the state at `at` (the head when `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn clone_into_at(
+    store: &Store,
+    name: &str,
+    reasoning: Option<ReasoningInfo>,
+    tmp: &Path,
+    dst: &Path,
+    inferences: Inferences,
+    progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
+    at: Option<sparkles::history::At>,
 ) -> Result<CloneReport> {
     if tmp.exists() {
         bail!("{} already exists", tmp.display());
@@ -114,11 +133,24 @@ pub fn clone_into(
         },
         cancel: cancel.clone(),
         progress,
+        at,
     };
     let report = store.clone_to(tmp, &opts)?;
     let mut guard = RemoveDir(Some(tmp.to_path_buf()));
     if cancelled() {
         return Err(sparkles::Error::Cancelled.into());
+    }
+    // the clone gets the default storage quota: a copy larger than that is refused
+    if let Some(limit) = store.options().max_disk_bytes {
+        let size = dir_bytes(tmp);
+        if size > limit {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::DatasetBytes,
+                limit,
+                requested: size,
+            })
+            .into());
+        }
     }
     let origin = OriginFile {
         origin_format: 1,
@@ -162,6 +194,20 @@ pub fn clone_into(
             .unwrap_or(Path::new(".")),
     )?;
     Ok(report)
+}
+
+/// Bytes of the files under `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// The source's reasoning status for the clone: fresh at the copied snapshot stays

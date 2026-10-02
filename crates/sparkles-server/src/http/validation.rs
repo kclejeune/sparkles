@@ -48,6 +48,10 @@ pub(super) fn write_options(
         deadline: deadline.map(|d| std::time::Instant::now() + d),
         cancel: None,
         report_limit,
+        message: super::conditional::commit_message(headers)?,
+        precondition: None,
+        no_wait: false,
+        graphs: None,
     })
 }
 

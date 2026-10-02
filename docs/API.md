@@ -23,11 +23,11 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
-| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. |
+| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
 type ReadyInfo = {
-  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM)
+  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM, see Shutdown)
   ready: boolean;
   uptimeSeconds: number;
   datasets: {
@@ -40,8 +40,21 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxRowsProduced: number; maxDatasetBytes: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
+
+### Shutdown
+
+On SIGTERM or SIGINT the server stops accepting connections, and `/$/ready` answers `503`
+with `"status": "draining"`. Requests in flight get `sparkles serve --shutdown-grace`
+seconds to finish (default 20). Requests still running after that are cancelled. A
+cancelled query stops at its next check. A cancelled write stops before its commit and
+commits nothing, while a write that has started to commit finishes the commit. The server
+waits up to 5 seconds for cancelled requests to stop. It then writes what it keeps in
+memory, such as the last-used times of API tokens, and exits. `--shutdown-grace 0`
+cancels the requests in flight at once. Background tasks, such as a compaction, are not
+waited for. Their commits are atomic, so a task cut short by the exit leaves the dataset
+as it was before the task.
 
 ### Request ids and the access log
 
@@ -56,8 +69,8 @@ of the request carries it.
 `/$/ready` and `/$/metrics` are logged at DEBUG. Each line has these fields:
 
 * `dataset`, or `$none`.
-* `operation`: `query`, `update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin` or
-  `other`.
+* `operation`: `query`, `update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin`,
+  `mcp` or `other`.
 * `status`.
 * `outcome`: `ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`,
   `rate_limited`, `denied` or `rejected`. `rejected` is a write refused by write-time
@@ -90,6 +103,7 @@ JSON object per line.
 | `sparkles_result_rows_total` | counter | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
+| `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
 | `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
@@ -98,6 +112,7 @@ JSON object per line.
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
+| `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
 | `sparkles_geo_rows` | gauge. Rows of the spatial index. | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge. Duration of the last build of the index's base. | `dataset` |
 | `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter. Summed over the spatial operators of queries, in order: rows the index found, exact geometry tests, rows that passed them, and candidates the index could not place. | `dataset` |
@@ -127,6 +142,56 @@ server ignores those headers.
 Backup repositories add the `sparkles_backup_*` families listed under
 [Backup repositories](#backup-metrics).
 
+#### Fuseki metric names
+
+`serve --metrics-fuseki-names` adds the gauges that Fuseki exports, so that dashboards
+built for Fuseki keep working. The Sparkles families stay as they are.
+
+| Name | Type | Labels | Value |
+|------|------|--------|-------|
+| `fuseki_requests` | gauge | `application="fuseki"`, `dataset`, `description`, `endpoint`, `operation` | Finished requests to the endpoint. |
+| `fuseki_requests_good` | gauge | the same | Requests with the `ok` outcome. |
+| `fuseki_requests_bad` | gauge | the same | Requests with any other outcome. |
+| `process_uptime_seconds`, `process_start_time_seconds` | gauge | `application="fuseki"` | The time since the server started, and the start time. |
+| `system_cpu_count` | gauge | `application="fuseki"` | Processors available to the server. |
+
+`dataset` is the dataset path as Fuseki writes it, such as `/ds`. The datasets past
+`--metrics-max-datasets` share `/$other`. Requests that name no existing dataset are not
+counted.
+`endpoint`, `operation` and `description` are Fuseki's names for the dataset's services.
+
+| Request | `endpoint` | `operation` | `description` |
+|---------|------------|-------------|---------------|
+| `/{ds}/sparql`, `/{ds}/query` | `sparql`, `query` | `query` | `SPARQL Query` |
+| `/{ds}/update` | `update` | `update` | `SPARQL Update` |
+| `/{ds}/data` | `data` | `gsp-rw`, or `gsp-r` on a read-only server | `Graph Store Protocol`, or `Graph Store Protocol (Read)` |
+| `/{ds}/get` | `get` | `gsp-r` | `Graph Store Protocol (Read)` |
+| `/{ds}/upload` | `upload` | `upload` | `File Upload` |
+| `/{ds}/shacl` | `shacl` | `SHACL` | `SHACL Validation` |
+| `/{ds}` | empty | `query`, `update`, `gsp-rw` or `gsp-r`, by the request | As above. |
+
+The good and bad counts split `sparkles_requests_total` for the same dataset and route.
+`good` is `outcome="ok"`, and `bad` is the sum of the other outcomes. Fuseki counts a
+request when it starts and its outcome when it ends, while Sparkles counts both when the
+request ends, so `fuseki_requests` always equals good plus bad. An endpoint's series
+appear after its first request, like the Sparkles series. Fuseki lists every configured
+endpoint from the start with zeros.
+
+Fuseki's other meters come from Micrometer's JVM and system binders, and Sparkles has no
+equivalent for them. They are the `jvm_*` memory, garbage collector, thread and class
+loader gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
+`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. `/{ds}/shex`,
+`/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki endpoint, so only
+the Sparkles names count them.
+
+#### Metrics listener
+
+`serve --metrics-addr HOST:PORT` also serves `/$/metrics` on a second address, such as a
+port that only the Prometheus server can reach. That listener serves nothing else. It
+applies the same authentication, `metrics` permission and `Host` check as the main
+listener. The main listener keeps `/$/metrics`, because the UI's Server page reads it.
+Without `--auth-config`, an address that is not loopback needs `--allow-open-network`.
+
 ```ts
 type MetricsSnapshot = {
   formatVersion: 1;
@@ -144,8 +209,8 @@ type MetricsSnapshot = {
   }[];
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
-    walBytes: number; diskBytes: number; resultRows: number;
-    budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
+    walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    budgetExceeded: Record<BudgetKind, number> | null;
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
@@ -259,12 +324,14 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, and `/{ds}` with `update=` or any other write. A form POST to `/{ds}` counts as an update. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format`. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
+An MCP message is charged by its tool and the dataset it names, and other MCP messages
+are not limited (see [HTTP endpoint](#http-endpoint-mcp)).
 
 `SPEC` is `CLASS[@DATASET]=LIMIT`. `LIMIT` is `off` or a comma-separated list of these
 settings:
@@ -428,18 +495,23 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
-| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. See [Schema discovery](#schema-discovery). |
+| GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
+| PUT    | `/$/quota/{ds}`              | *Extension.* Gives a persistent dataset a quota of its own. The JSON body is `{ "maxBytes": number }` or `{ "maxMb": number }`, and `0` means unlimited. Returns `DatasetQuota`. Needs `server-admin`. `400` for an in-memory dataset or a malformed body. |
+| DELETE | `/$/quota/{ds}`              | *Extension.* Removes the dataset's own quota, so `--max-dataset-mb` applies again. Returns `DatasetQuota`. Needs `server-admin`. |
+| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a `Task`. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
+| PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
+| DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, or an N-Quads backup. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results. Returns `{ "cleared": number /* entries */, "bytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
@@ -478,10 +550,19 @@ type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[]; // top 100
   classes: { iri: string; instances: number }[];      // top 100 by rdf:type
   diskBytes: number;
+  quota: DatasetQuota | null;   // persistent datasets: the storage quota and its usage
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
+};
+
+type DatasetQuota = {
+  dataset: string;
+  maxBytes: number | null;          // the quota in effect; null when unlimited
+  source: "dataset" | "default";    // set on the dataset, or the server's --max-dataset-mb
+  defaultMaxBytes: number | null;   // --max-dataset-mb; null when unlimited
+  usedBytes: number;                // on-disk bytes of the dataset directory
 };
 
 type Task = {
@@ -621,13 +702,54 @@ A report is never returned partially.
 The counts come from one ordered pass over the PSO index and one over the POS index per
 predicate, so a report costs about two sequential reads of the selected triples.
 
+**VoID export.** The summary is also served as RDF, as a description in the
+[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with an RDF media type in
+`Accept`, or with the `format` parameter. The media types are `text/turtle`,
+`application/n-triples`, `application/ld+json`, `application/rdf+xml`,
+`application/trig` and `application/n-quads`. The `format` values are `turtle`,
+`ntriples`, `jsonld`, `rdfxml`, `trig` and `nquads`, and `format=json` asks for the JSON
+document, which stays the default. The selection parameters apply as above. `limit` and
+`cursor` do not, because the description is always complete.
+
+```turtle
+<urn:x-sparkles:schema:wiki:42> a void:Dataset ;
+    dcterms:title "wiki" ;
+    dcterms:created "2026-10-02T12:04:00Z"^^xsd:dateTime ;
+    void:triples 5 ;                # distinct triples in the selection
+    void:entities 3 ;               # distinct IRI subjects
+    void:classes 2 ;                # distinct rdf:type objects
+    void:properties 3 ;             # predicates with triples
+    void:distinctSubjects 3 ;
+    void:distinctObjects 4 ;
+    void:classPartition _:c1 , _:c2 ;
+    void:propertyPartition _:p1 , _:p2 , _:p3 .
+_:c1 void:class ex:Person ; void:entities 2 .   # instances
+_:c2 void:class owl:Class ; void:entities 1 .
+_:p1 void:property ex:knows ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+_:p2 void:property rdf:type ; void:triples 3 ; void:distinctSubjects 3 ; void:distinctObjects 2 .
+_:p3 void:property rdfs:label ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+```
+
+The node's IRI is `urn:x-sparkles:schema:<dataset>:<snapshot version>`. Every class with
+instances gets a class partition, and every predicate with triples a property
+partition. The partitions reuse the report's exact counts. `void:entities`,
+`void:distinctSubjects` and `void:distinctObjects` of the whole selection are not part of
+the JSON report. They cost one more pass over the SPO and OSP indexes, which only RDF
+requests make. The declarations follow the description as the triples that assert them:
+`rdf:type`, `rdfs:subClassOf`, `owl:equivalentClass`, `owl:disjointWith`, `rdfs:domain`,
+`rdfs:range`, `rdfs:subPropertyOf`, `owl:inverseOf`, labels, comments and the
+`owl:Ontology` headers. `declarations=false` leaves them out. Labels keep their language
+tags.
+
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json] [--timeout S]
-[--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the `SchemaSummary`
-with every item and `next: null`. `text` prints one line per class and per predicate. The
-command exits with status 2 when the timeout or the entry cap is exceeded. The Rust API is
-`sparkles::schema::discover`.
+[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
+[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
+`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
+predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
+declarations. The command exits with status 2 when the timeout or the entry cap is
+exceeded. The Rust API is `sparkles::schema::discover`, and
+`sparkles::schema::void_text` renders a report as VoID.
 
 ### Clone
 
@@ -641,6 +763,7 @@ the original. Parameters come from the query string, a form body or a JSON body:
 |---|---|---|
 | `name` | yes | Name of the new dataset. |
 | `inferences` | no, default `copy` | `copy` copies the inferred graph and the reasoning status. `drop` copies neither. |
+| `at` | no, default the head | A past state to copy, with the selectors of [point-in-time reads](#point-in-time-reads-and-snapshots). Its commit becomes `forkedFrom.seq`. |
 
 The copy has every quad of every graph, including blank-node graph names and triple
 terms. It keeps the same blank-node ids (`_:b<hex>` labels) and the prefixes, and gets a
@@ -677,7 +800,7 @@ type DatasetOrigin = {            // origin.json in the clone's directory
 };
 ```
 
-`sparkles clone --loc SRC --to DST [--inferences copy|drop]` does the same offline. `DST`
+`sparkles clone --loc SRC --to DST [--inferences copy|drop] [--at SEL]` does the same offline. `DST`
 must not exist or must be empty. `SRC` must be a database that no server has open.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
@@ -723,6 +846,66 @@ Query parameters beyond the standard protocol:
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
 
+### Blank nodes
+
+A stored blank node has a label made of `b` and its id in lowercase hex, such as `_:b1f`.
+The label stays the same from one request to the next. The Rust and Python dataset APIs
+and the MCP `describe_resource` tool accept it back, and so do query bindings, where it
+names the stored node. Only the label exactly as Sparkles writes it names the node, so
+`_:b01f` and `_:B1F` name nothing.
+
+A blank node that a query makes is not stored. `BNODE()` makes one, and so does a blank
+node in a CONSTRUCT template. Its label starts with `q`, such as `_:q0`, and it means
+something only within the result that holds it. When a later request is given such a
+label, it takes it for a new blank node of its own. That node matches no stored node and
+differs from every blank node the later request makes. Blank nodes in the results of a
+SERVICE call belong to the remote endpoint. Within one SERVICE result a label names one
+node, which is never a local stored node.
+
+In the text of a query, a blank node label such as `_:b1f` acts as a variable, as SPARQL
+specifies, so it does not name the stored node with that label. In an update, `INSERT
+DATA` makes a new stored node for each blank node label. `INSERT … WHERE` stores a new
+node for each blank node that the WHERE clause made, for example with
+`BIND(BNODE() AS ?b)`. That node gets a `_:b` label and is the same wherever the
+operation inserts it, inside triple terms too.
+
+### Entity tags and conditional requests
+
+Graph Store `GET` and `HEAD` responses carry an `ETag` that names the commit the response
+was read at and its serialization:
+
+```
+ETag: W/"3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa:42:ttl"
+```
+
+The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`. The tag is weak because
+the bytes of one commit's serialization can change without a commit. A compaction
+reorders the output, and a prefix change rewrites Turtle, while the data stays the same.
+The tag covers the whole dataset, so every commit changes the tag of every graph. A read
+with `at` gets the tag of the commit it read. Responses whose format was negotiated add
+`Vary: Accept`. Query responses get no tag, because `NOW()`, `RAND()` and `SERVICE` can
+change a result without a commit.
+
+| Header | Methods | Effect |
+|---|---|---|
+| `If-None-Match` | `GET`, `HEAD` | `304 Not Modified` when a listed tag equals the response's tag, or for `*`. Tags compare by the weak comparison. |
+| `If-Match` | `GET`, `HEAD` | `412` unless the value is `*` or a listed tag names the commit the response reads. |
+| `If-Match` | `PUT`, `POST`, `DELETE` | `412` unless the target exists and a listed tag names the current head. `*` only needs the target to exist. |
+| `If-None-Match` | `PUT`, `POST`, `DELETE` | `412` when the value is `*` and the target exists, or when a listed tag names the current head. |
+
+A write's preconditions are checked while the dataset's writer lock is held, so no other
+commit can come between the check and the write. Of several writers that send the same
+tag, one succeeds and the others get `412` with `code: "precondition-failed"`. A tag
+matches in any serialization, so a Turtle `GET` can be followed by a `PUT` of N-Triples.
+The default graph and the whole dataset always exist, and a named graph exists while it
+holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
+is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
+
+RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
+matches. Sparkles compares the commit a tag names instead. Its tags identify the data
+exactly, even though they cannot promise identical bytes, and that is what a concurrency
+check needs.
+
 ## Commits
 
 The design and its rationale are in [CI Durable commit identity](specs/CI-commit-identity.md).
@@ -764,8 +947,35 @@ type Commit = {
   generation: string;                   // index generation it was made in
   bulk: boolean;                        // made by rebuilding the index
   exact: boolean;                       // false: a bulk commit that also deleted
+  unvalidated?: true;                   // the write bypassed write-time validation
+  message?: string;                     // the writer's commit message
+  digest?: string;                      // change digest (hex SHA-256), when enabled
 };
 ```
+
+**Commit messages.** A write can carry a message in the `Sparkles-Commit-Message` request
+header. Updates, Graph Store `PUT`, `POST` and `DELETE`, and uploads accept it. The message
+is stored with the commit and appears as `message` in receipts, in `/$/commits` and in
+`sparkles log`. It must be UTF-8 text of at most 1024 bytes with no control characters,
+and surrounding whitespace is trimmed. A header that is empty after trimming sets no
+message. Clients that can only send ASCII headers, such as browsers, can send an RFC 8187
+extended value like `UTF-8''r%C3%A9%C3%A9crit`. A message that breaks these rules gets
+`400`, and nothing is written. A write with no net effect creates no commit and drops its
+message.
+
+The message is written and synced before the commit becomes durable, so every
+acknowledged commit keeps its message. Messages and digests live in `annotations.bin` in
+the database directory. Backups include the file, and clones start without it.
+
+**Change digests.** A dataset can record a SHA-256 digest of each commit's net changes,
+returned as `digest`. It is off by default. `--commit-digests` on any command that opens
+a database turns it on, and the database keeps the setting. The digest covers the dataset
+id, the seq, the parent's digest, the timestamp, the kind, and the deleted and inserted
+quads as sorted canonical N-Quads lines. Blank nodes appear with the store's internal
+labels, so equal digests from different databases mean nothing. Commits made by
+rebuilding the index, such as large loads, get no digest. The commit after one without a
+digest chains from 32 zero bytes. The exact input is defined in
+[CI Outcome](specs/CI-commit-identity.md#outcome).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -780,15 +990,18 @@ lists commits without taking the database lock, so it works next to a running se
 
 The design and its rationale are in [F06 Named snapshots and point-in-time queries](specs/F06-snapshots-and-point-in-time.md).
 
-Every commit since the dataset's last compaction or bulk commit can be read at no extra
-cost. Its state is the current index generation plus a prefix of its write-ahead log.
-Older commits stay readable while a **named snapshot** or the **retention window** keeps
-the generation that holds them. Compaction and bulk commits then keep that generation
-instead of deleting it. Only persistent datasets have history.
+Every commit since a persistent dataset's last compaction or bulk commit can be read at no
+extra cost. Its state is the current index generation plus a prefix of its write-ahead
+log. Older commits stay readable while a **named snapshot** or the **retention window**
+keeps the generation that holds them. Compaction and bulk commits then keep that
+generation instead of deleting it. An in-memory dataset keeps past states only for its
+named snapshots and its retention window. It holds them in memory, where they share most
+of their structure with the live state.
 
 **Selector.** The `at` parameter, in the query string or a form body, selects the state
-to read. `/{ds}/sparql`, `/{ds}/query`, `/{ds}?query=`, `/{ds}/explain` and Graph Store
-`GET`/`HEAD` accept it.
+to read. `/{ds}/sparql`, `/{ds}/query`, `/{ds}?query=`, `/{ds}/explain`, Graph Store
+`GET`/`HEAD`, `/{ds}/shacl`, `/$/stats/{ds}` and `/$/schema/{ds}…` accept it, and so do
+clones and dumps (see below).
 
 | `at` | State |
 |---|---|
@@ -802,8 +1015,22 @@ past state they also add `Memento-Datetime`, the commit's time, and
 `Link: <…>; rel="original"` (RFC 7089). `Sparkles-Commit` is the commit read. The
 freshness of inferences (`Sparkles-Inferences`) is reported for the live state only.
 `text:query` works only at the head and returns `501` at a past commit. Vector search
-works at any commit. Writes with `at`, even `at=head`, are refused with `400` and
+works at any commit, and a past commit is always searched exactly. Writes with `at`, even `at=head`, are refused with `400` and
 `code: "at-on-write"`.
+
+A Graph Store `GET` with `at` gets the entity tag of the commit it read (see
+[Entity tags and conditional requests](#entity-tags-and-conditional-requests)), so
+`If-None-Match` revalidates it with `304`.
+
+**Accept-Datetime.** A Graph Store `GET` or `HEAD` without `at` acts as its own Memento
+TimeGate (RFC 7089, 200-style negotiation). With an `Accept-Datetime` header, such as
+`Accept-Datetime: Wed, 30 Sep 2026 14:03:11 GMT`, the response is the last readable
+commit at or before the end of that second. A time before the oldest
+readable commit gets that commit, as RFC 7089 asks, where `at=time:` answers `404`. The
+response carries `Memento-Datetime`, `Content-Location` with the memento's own URL
+(`…&at=commit:42`), `Link: <…>; rel="original timegate"` and `Vary: accept-datetime`.
+Every other Graph Store `GET` sends `Vary: accept-datetime` too. A malformed header is
+`400` with `code: "invalid-accept-datetime"`.
 
 Errors carry a `code`. A malformed selector is `400 invalid-at`. A commit beyond the
 head, an unknown snapshot or a time before history is a `404`. A commit whose data is no
@@ -815,29 +1042,176 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
-In-memory datasets return `501 history-unsupported`. Materializing a past state is bounded
-by `--history-cache-mb` (default 1024, `507` beyond it) and by the request timeout. Results
-are cached, and one materialization runs at a time.
+Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
+beyond it) and by the request timeout. Results are cached, and one materialization runs
+at a time. A state starts from the nearest known state of its generation in the
+write-ahead log: the generation's base, a cached past state before or after it, or the
+live state. Later states replay the log forward, and earlier ones undo it backward, so a
+read near the head or near a cached commit replays only the commits in between.
+
+### Diffs between commits
+
+`GET /{ds}/diff?from=SEL&to=SEL` returns the net change between two readable states. The
+added quads are those `to` has and `from` lacks, and the removed quads are the reverse.
+Both parameters take
+the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
+`?to=commit:42` shows what commit 42 changed. The two may come in either order.
+`graph=IRI` or `default` limits the diff to one graph.
+
+| Format | How to ask | Body |
+|---|---|---|
+| JSON (default) | `Accept: application/json` or `format=json` | Counts, and the quads with `quads=true`. |
+| Diff lines | `Accept: text/x-sparkles-diff` or `format=diff` | One N-Quads line per change, marked `+ ` or `- `. |
+| RDF Patch | `Accept: application/rdf-patch` (or `text/rdf-patch`) or `format=patch` | A patch that turns the state at `from` into the state at `to`. |
+| RDF Patch, binary | `Accept: application/rdf-patch+thrift` or `format=patch-binary` | The same patch as RDF Thrift rows. |
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:1", "commit": { "seq": 1, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "added": 2, "removed": 1, "method": "log", "logChanges": 3, "compared": 0,
+  "quads": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+               "object": "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>", "graph": null }, … ] }
+```
+
+```
+- <urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
++ <urn:c> <urn:p> "three" .
++ <urn:b> <urn:p> "2"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .
+```
+
+Removals come first, then additions, each ordered by graph, subject, predicate and
+object. `limit=N` caps the quads listed, not the counts. The headers
+`Sparkles-Diff-From`, `Sparkles-Diff-To`, `Sparkles-Diff-Added` and
+`Sparkles-Diff-Removed` carry the commits and counts in either format. A large body is
+streamed, and `--max-export-mb` caps it. The change set counts against the rows budget
+(`--max-rows`), and a diff beyond it fails with `507` and `budget: "rows"`. A diff
+between two `commit:` selectors never changes, so it gets a weak entity tag and answers
+`If-None-Match` with `304`.
+
+`method` says how the diff was computed. Every change a write-ahead log records took
+effect, so the net change is the symmetric difference of the changes between the two
+commits. Within the retained generations Sparkles reads only those log records,
+compactions included, and its memory grows with the quads that changed. That is
+`"log"`. A sparse index of each log says where every 1,024th commit ends, so a diff
+starts reading near its first commit. A bulk commit has no log records, and a collected
+generation leaves a gap. Those stretches are compared state against state with a sorted
+merge, which reads both states in full. That is `"compare"`, and in-memory datasets
+always use it.
+
+**RDF Patch.** The patch formats follow Apache Jena's RDF Patch, which Jena's
+`jena-rdfpatch` module, Fuseki's patch endpoint and RDF Delta read. A patch names the
+two states in its header, deletes with `D` rows and adds with `A` rows inside one
+transaction:
+
+```
+H id <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:4> .
+H prev <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:1> .
+TX .
+D <urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+A <urn:c> <urn:p> "three" .
+A <urn:b> <urn:p> "2"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .
+TC .
+```
+
+`id` is the IRI of the `to` commit and `prev` that of the `from` commit. A commit's IRI is
+`urn:uuid:` with the dataset id, then `#commit:` and its number. A quad in the default
+graph has three terms. Blank nodes are written `<_:label>`, the form Jena's reader keeps
+labels in. The binary form is a sequence of `RDF_Patch_Row` structs of Jena's RDF Thrift
+schema in the Thrift compact protocol. Its literals carry the base direction of
+directional language strings, which Jena's binary reader ignores. A patch always lists
+every change, so `limit` with a patch format is `400`.
+
+### Change feed
+
+`GET /{ds}/changes?after=SEL` lists the commits after a commit, oldest first, each with
+the quads it added and removed relative to its parent. It needs read permission on the
+dataset. `after` takes the selectors of `at` and defaults to the head, so a request
+without it waits for the next commit. Resuming is simple: a client that applied commit
+`n` asks for the commits after `n`. That works from any readable commit, as for diffs.
+
+| Parameter | Meaning |
+|---|---|
+| `after` | The commit to start after (`N`, `commit:N`, `time:…`, `snapshot:NAME`, `head`). |
+| `limit` | The most commits listed, 1 to 1,000 (default 100). |
+| `wait` | Seconds to wait for a commit when there is none after `after`, at most 60 (default 0). |
+| `format` | `json` (default), `patch` or `patch-binary`, in place of `Accept`. |
+
+The JSON body lists the commits with their changes. `next` and the `Sparkles-Changes-Next`
+header name the commit to ask after next, and `Sparkles-Head` carries the head:
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "after": 2, "next": 4, "head": { "seq": 4, … },
+  "commits": [
+    { "commit": { "seq": 3, "message": "…", … }, "added": 0, "removed": 1, "complete": true,
+      "changes": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+                     "object": "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>", "graph": null } ] },
+    … ] }
+```
+
+With `Accept: application/rdf-patch` or `application/rdf-patch+thrift` the body is one
+patch per commit, one after another. Each patch's `id` names its commit and its `prev`
+names the parent, so the patches chain.
+
+A page lists at most `--max-rows` changes, all its commits together. It ends before the
+commit that would pass that, and the next page starts with it. A commit whose changes
+alone pass the budget is listed with its counts and `"complete": false`, without
+`changes`, and a client reads the state at that commit instead. A patch cannot leave
+changes out, so a patch page that would start with such a commit is `507` with
+`code: "changes-too-large"` and the commit's number. A body over `--max-export-mb` is cut
+off as for other streamed bodies.
+
+A commit past the head is `404`. A commit whose state is no longer kept is
+`410 history-gone`, and so is the first commit after a gap in the readable history: its
+changes need the state before it. A page ends where the readable history does, so the
+next request reports the commit that cannot be read.
+
+**Long polling.** With `wait=N`, a request that finds no commit after `after` waits up to
+N seconds for one and then answers, with an empty list if none came. The server wakes
+waiting requests as soon as a commit is published, and ends the wait when it begins to
+shut down.
+
+**Server-sent events.** With `Accept: text/event-stream` the response is an event stream.
+Each commit is a `commit` event whose `id` is the commit's number and whose data is the
+commit's JSON object, or its text patch with `format=patch`. The stream sends the commits
+after `after`, then new commits as they are made, with a comment every 15 seconds to keep
+the connection open. It ends after five minutes and when the server shuts down. A client
+that reconnects sends `Last-Event-ID`, as browsers' `EventSource` does, and the stream
+resumes after that commit. An error ends the stream with an `error` event that carries
+the error's JSON body.
+
+```sh
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
+
+### Named snapshots and retention
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note? }`, as JSON, a form or the query string. Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized (see below). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
-| PUT | `/$/history/{ds}` | Sets the retention window `{ keepCommits?: number \| null, keepAge?: "7d" \| seconds \| null }` and returns `HistoryStatus`. |
+| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog? }`. `schedules` replaces the pin schedules when it is present, and `catalog` replaces the catalog horizon (`null` turns it off). |
 
 ```ts
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
-  created: string; note: string | null; generation: string | null; reconstructable: boolean };
+  created: string; expires: string | null; note: string | null;
+  generation: string | null; reconstructable: boolean;
+  warm: boolean };                                   // kept materialized
+type Retention = { keepCommits: number | null;      // the last N commits
+  keepAge: string | null;                            // "7d", or seconds
+  maxBytes: number | null };                         // a number, or "10GiB" in a PUT
+type Schedule = { prefix: string; every: string; keepLast: number };
 type HistoryStatus = { dataset: string; datasetId: string; head: number;
   oldestReconstructable: number | null; reconstructable: { from: number; to: number }[];
   bytes: number;   // disk of kept non-current generations
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
                  current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
-  retention: { keepCommits: number | null; keepAge: string | null };
-  snapshots: number;
+  retention: Retention; schedules: Schedule[]; snapshots: number;
+  catalog: { keepCommits: number | null; keepAge: string | null;   // the catalog horizon
+             firstRetained: number };                              // the oldest commit listed
   cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
 ```
 
@@ -847,12 +1221,69 @@ Removing a generation first renames it to `gen-NNNN.deleting`, so an interrupted
 is finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable` and
 `reconstructable`, plus `reconstructable` and `snapshots` on each commit.
 
-The CLI has `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT]`,
-`snapshot list|history --loc DB [--format json]`, `snapshot delete --loc DB NAME`,
-`snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--off]`,
-`sparkles query --loc DB --at SEL …` and `sparkles dump --loc DB --at SEL`. These commands
-open the database, so stop a server that holds it or use the HTTP API. The Rust API has
-`Store::snapshot_at`, `create_snapshot`, `set_retention` and `history`.
+`maxBytes` caps the disk used by generations that only the retention window keeps. When
+the kept generations together exceed it, the oldest window-only generations are removed
+first. Pins and backups in progress always keep their generations.
+
+A **warm** pin keeps its state materialized. The state is built when the pin is made and
+by the history upkeep, so it is ready again within a minute of a restart. The history
+cache evicts warm states last, only when they alone pass `--history-cache-mb`, so a read
+at a warm pin costs no replay. A pin at the head needs no warming, and an in-memory
+dataset keeps every pinned state in memory anyway.
+
+The **catalog horizon** bounds the commit catalog. Without one, `/$/commits` and
+`sparkles log` keep every commit's metadata forever, at 64 bytes a commit. With
+`catalog: { keepCommits: 100000, keepAge: "90d" }`, the catalog drops the records, messages
+and digests of commits that are older than both the oldest readable commit and the
+horizon. A commit is kept if either limit keeps it. The history upkeep prunes once at
+least 1,024 records, and an eighth of the catalog, can go. Setting the horizon prunes at
+once, and so does `sparkles snapshot gc`. Commit numbers never repeat, because the head is
+never pruned. A pruned commit answers `410` in `/$/commits/{ds}/{ref}`, and
+`firstRetained` moves up. Pruning writes a new `commits.bin` and `annotations.bin` that
+replace the old files atomically. Backups, restores, `sparkles check` and the dataset
+quota handle the shorter files like any others.
+
+A **schedule** pins the head every `every` (at least a minute) as `PREFIX` followed by the
+UTC time, for example `daily-20261002T140311Z`. It skips a pin when its newest one
+already holds the head, and keeps only its newest `keepLast` pins. A server runs the
+history upkeep every minute. The upkeep removes pins past their expiry, makes the pins
+that schedules call for, and removes the history that has aged out of the window. A
+read-only server does not run it.
+
+**Past states elsewhere.** `/$/stats/{ds}?at=` describes a past state, and every stats
+response carries `commit`, `at` and a `history` summary. `/$/schema/{ds}?at=` discovers
+the schema of a past state, and its cursors stay valid because a past state never
+changes. `/{ds}/shacl?at=` validates a past state. `POST /$/datasets/{ds}/clone` takes
+`at` in its JSON or form body and records the commit as `forkedFrom.seq`.
+`POST /$/backup/{ds}?at=` dumps a past state and names the file after its commit. A
+selector that cannot be read fails before a clone or dump task starts.
+
+**Metrics.** `/$/metrics` reports `sparkles_history_bytes`, `sparkles_history_snapshots`
+and `sparkles_history_cache_entries` per dataset. It also reports the counters
+`sparkles_history_cache_hits_total`, `sparkles_history_cache_misses_total`,
+`sparkles_history_materialize_seconds_count` and
+`sparkles_history_materialize_seconds_sum`.
+
+**CLI.** The history commands are these:
+
+* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d] [--warm]`
+* `sparkles snapshot list|history --loc DB [--format json]`
+* `sparkles snapshot delete --loc DB NAME`
+* `sparkles snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--max-bytes 10GiB] [--off]`
+* `sparkles snapshot schedule --loc DB --prefix daily- --every 1d [--keep-last 7]`, or
+  `--remove PREFIX`, or no options to list the schedules
+* `sparkles snapshot gc --loc DB`, which runs the history upkeep once and prunes the
+  commit catalog
+* `sparkles snapshot catalog --loc DB [--keep-commits N] [--keep-age 90d] [--off]`, which
+  sets the catalog horizon and prunes
+* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count|patch|patch-binary]`
+* `sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL` and
+  `sparkles clone --loc DB --to DIR --at SEL`
+
+These commands open the database, so stop a server that holds it or use the HTTP API.
+`sparkles log` reads without the lock and marks with `*` the commits a point-in-time read
+can see. The Rust API has `Store::snapshot_at`, `diff`, `create_snapshot_with`,
+`set_retention`, `set_schedules`, `history_tick` and `history`.
 
 ## Backup repositories
 
@@ -862,14 +1293,14 @@ The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot
 `sparkles-server`, which is on by default. A **repository** holds deduplicated,
 content-addressed copies of dataset files. It is either a directory (`fs`, a local or
 mounted file system) or a bucket prefix (`s3`, AWS S3 or an S3-compatible service such as
-MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one persistent dataset at one commit,
-described by an immutable manifest.
+MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one dataset at one commit, described
+by an immutable manifest. Persistent and in-memory datasets can both be backed up.
 
 Backups are made, listed, restored and verified per dataset under `/$/backups/{ds}`.
 Repositories are registered and maintained under `/$/repositories`. Lifecycle policies,
 which hold schedules and retention, live under `/$/backup-policies`. The web UI has a
 Backups page for all three. The older `POST /$/backup/{ds}`, which writes an N-Quads dump
-in the data directory, is unchanged.
+in the data directory, is unchanged and works for in-memory datasets too.
 
 **What a backup holds.** A backup contains:
 
@@ -885,8 +1316,30 @@ in the data directory, is unchanged.
 The full-text index is left out and rebuilt when the restored dataset opens
 (`derived.text.rebuildOnRestore`). Older index generations, named snapshots and the
 retention window (`history.json`) are left out too. Point-in-time reads of a restored
-dataset therefore reach back only to the start of the backup's generation. In-memory
-datasets cannot be backed up (`501 backup-unsupported`).
+dataset therefore reach back only to the start of the backup's generation.
+
+**In-memory datasets.** An in-memory dataset has no files to copy, so its backup builds
+them first. The task takes a snapshot of the head commit under the writer lock and writes
+it as a new index generation with the bulk builder, the same way a compaction does. The
+copy goes to a temporary directory under `<data>/tmp`. Next to the generation it holds an
+empty WAL, a commit catalog with only the head commit, and the dataset's id and prefixes.
+It also holds the settings of the full-text and spatial indexes and the write-time
+validation configuration, with the SHACL shapes or the ShEx schema. Vectors are literals
+in the data and need nothing extra. The upload then follows the normal path, and the
+manifest's `dataset.type` is `mem`. The temporary directory is removed when the upload
+ends. A server that stops during such a backup removes the directory at its next start.
+
+Writes continue while the copy is built, but the snapshot keeps the captured state in
+memory until the build ends. The copy needs about as much disk space as a compacted
+generation of the dataset. The build stops with `507 insufficient-storage` when the data
+directory's file system would keep less than `--min-free-disk-mb` free. Every backup
+rebuilds the whole generation. When the dataset has not changed, the index files come
+out the same, and only a few small files are uploaded again. After a write, most pieces
+of the index files differ and are uploaded again.
+
+An in-memory dataset gets a new dataset id each time the server starts. Its backups from
+an earlier run of the server therefore belong to another lineage (`sameLineage: false`),
+and a policy's retention counts them separately (see [Lifecycle policies](#lifecycle-policies)).
 
 **Capture.** A backup pins one commit, the head when the task starts, without blocking
 writers. Under the writer lock it only records the length of the append-only files and
@@ -971,7 +1424,7 @@ has started or been queued. Some also return a `Location`, as noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Breaks a lock (`204`). The action is audited. `404 no-such-lock`, `409 repository-read-only`. |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`. Lists the dataset's backups in every repository, or in `R` only, newest first, with `sameLineage`. A repository that cannot be reached is left out. One found unreachable in the last minute is not tried again. |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. `501 backup-unsupported` means an in-memory dataset. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less. |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. An in-memory dataset is first copied to a temporary generation on disk, as described above. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less, or when the temporary copy of an in-memory dataset would leave the data directory's file system with less. |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary plus the manifest's files, blobs and upload statistics. |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Deletes the backup's manifest (`204`). Its blobs go at the next GC. `409 backup-busy` (with `task`) while a restore or verification of the backup runs on this server. `409 repository-read-only`. |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restores the backup. The body is a `RestoreRequest`. Starts a `backup-restore` task with `Location: /$/datasets/{target}`. See [Restore](#restore). |
@@ -1037,6 +1490,14 @@ turns `false`. A restore also needs `admin` on the target name, or it fails with
 `{backup: BackupSummary, dataset, datasetId, identity: "kept" | "new", forkedFrom?: {id,
 seq}, check: object | null, millis}`.
 
+A backup of an in-memory dataset restores as a new persistent dataset or replaces a
+persistent one, like any other backup. The restored dataset's head has the backup's
+commit number, and its commit history starts at that commit. A restore cannot replace an
+in-memory dataset (`409 not-managed`), because it always produces a database directory.
+To get the data back into memory, create an in-memory dataset and load a dump of the
+restored one into it. While the in-memory source is still running, it holds the dataset
+id, so `identity: "auto"` gives the restored copy a new id with `forkedFrom`.
+
 ### Backup types
 
 ```ts
@@ -1089,7 +1550,7 @@ type TestReport = {
 type BackupSummary = {
   name: string;
   repository: string;        // the repository's name on this server
-  dataset: { name: string; id: string };
+  dataset: { name: string; id: string; type: "persistent" | "mem" };
   commit: { seq: number; timestamp: string; quads: number; ref: string /* commit:<seq> */ };
   created: string; completed: string; millis: number;
   logicalBytes: number;      // the size of its files
@@ -1145,7 +1606,7 @@ type Lock = {
 type PolicyConfig = {
   name: string;
   repository: string;
-  datasets?: string[];       // names or * globs; default ["*"] (in-memory datasets are skipped)
+  datasets?: string[];       // names or * globs, in-memory datasets included; default ["*"]
   schedule: string;          // cron, or "every <duration>"
   timezone?: string;         // IANA name; default UTC
   nameTemplate?: string;     // default "{policy}-{dataset}-{time}"
@@ -1181,7 +1642,8 @@ Timestamps are RFC 3339 in UTC with milliseconds. Sizes are in bytes.
 
 A policy backs up the datasets that match `datasets` into `repository` on a schedule, then
 applies its retention. It backs up one dataset after another. Each is a backup like
-`POST /$/backups/{ds}` and holds a task slot while it runs.
+`POST /$/backups/{ds}` and holds a task slot while it runs. In-memory datasets that match
+are backed up too, each through its temporary copy on disk.
 
 * **Schedules.** A schedule is a cron expression with 5 fields (minute hour day-of-month
   month day-of-week), or 6 fields with seconds first. `@daily`-style macros are not
@@ -1212,6 +1674,11 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   run. Deleting a backup removes its manifest, and GC removes the blobs. With
   `gcAfterRetention`, a run whose retention deleted something starts a `backup-gc` task,
   at most once per 24 h per repository.
+
+  An in-memory dataset gets a new id each time the server starts, so retention treats
+  the backups of each earlier server run as another dataset and keeps `minCount` of
+  them. A policy for such datasets can set `expireAfter` with a `minCount` of 0, or the
+  old backups can be deleted by hand.
 * **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
   its next instant. Instants missed while the server was down are covered by one run
   60 s after startup (`trigger: "catch-up"`). With `catchUp: "none"` they are recorded as
@@ -1226,7 +1693,7 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   admitted the same way. When the queue is full, that GC is not started and is tried again
   after the next run's retention.
 * **Results.** A run is `ok` when every selected dataset was backed up or skipped
-  (`in-memory dataset`, `unchanged`). It is `partial` when some failed, and `failed` when
+  (`unchanged`). It is `partial` when some failed, and `failed` when
   none succeeded. `lastSuccess` and `consecutiveFailures` follow these results. The last
   1000 runs of all policies are kept.
 
@@ -1262,7 +1729,7 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`) |
 | 422 | `incompatible-repository` (a newer repository format, or encryption), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
-| 501 | `backup-unsupported` (an in-memory dataset), `not-implemented` |
+| 501 | `not-implemented` (backup repositories are not enabled on this server) |
 | 502 | `repository-unavailable`: a storage error after retries. The message never includes URL query strings. |
 | 503 | `catalog-lagging` (the commit catalog could not be flushed, so retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`), `cancelled` (a cancelled task) |
 | 507 | `insufficient-storage`. A restore has no room for 1.1 × the backup's size plus the `--min-free-disk-mb` reserve, or a backup into an `fs` repository would leave its file system with less than the reserve. |
@@ -1466,13 +1933,55 @@ SELECT ?s ?score ?label WHERE {
 } ORDER BY DESC(?score)
 ```
 
-* **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
-  subject is optional. A constant subject restricts the search to that subject.
-* **Object.** A query string, or `(predicate* "query" limit "lang:xx")`. A language tag
-  on the query string acts as `lang:`.
-* **Query syntax.** The syntax has terms, `"phrases"` (with `~slop`), `AND`/`OR` (OR by
-  default), `+required`/`-excluded`, parentheses, and phrase prefixes `"quick bro"*`. A
-  literal `:` is written `\:`.
+* **Subject list.** `(?s ?score ?literal ?graph ?predicate ?rank)`. Every slot after the
+  subject is optional. A constant subject restricts the search to that subject. The
+  sixth slot is a Sparkles extension. It binds the hit's rank as an `xsd:integer`, one
+  more than the number of hits with a higher score, so hits with equal scores share a
+  rank. Unused slots can be blank nodes, as in `(?s ?score [] [] [] ?rank)`.
+* **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
+  The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
+  query string acts as `lang:`.
+* **Highlighting.** With a `"highlight:…"` argument, as in Jena, `?literal` becomes the
+  best fragments of the matched literal with the matching words marked. It keeps the
+  literal's language tag. The options follow `highlight:` and are separated by `|`.
+  `m:` is the most fragments kept (3), `z:` the fragment size in characters (128), `s:`
+  and `e:` the marks around a match (↦ and ↤), and `f:` the text between fragments (∣).
+  `jh:n` marks each word of a phrase on its own, and `jf:n` keeps adjacent fragments
+  apart and keeps fragments without a match. For example,
+  `"highlight:s:<em> | e:</em> | z:150"` gives `the quick <em>brown fox</em> jumped`.
+  Fragments follow Lucene's highlighter. A fragment starts after the word that crosses a
+  multiple of the fragment size, the best fragments come first, and a phrase is marked
+  only where it occurs. A literal with no match to mark is returned unchanged. Without
+  `highlight:` the search never reads the text of a literal.
+* **Query syntax.** Query strings use Lucene's classic query syntax, as jena-text does,
+  with OR as the default operator. A query string matches the same literals as in Jena
+  when both analyzers produce the same tokens. These forms are supported:
+  * Words such as `fox` and phrases such as `"brown fox"`. A phrase with a slop, such as
+    `"fox brown"~2`, matches its words within that many moves of each other, in either
+    order.
+  * `+word` and `-word`, `AND` or `&&`, `OR` or `||`, `NOT` or `!`, and parentheses. As in
+    Lucene, a clause after `AND` also makes the clause before it required.
+  * Prefixes such as `al*`, alone or inside a boolean query like `+ada +lov*`, and
+    wildcards such as `a?an` and `*lace`.
+  * Fuzzy words. `roam~` allows two edits, `roam~1` allows one, and `roam~0.8` allows the
+    number of edits Lucene derives from that similarity. As in Lucene, a fuzzy word matches
+    at most the 50 closest terms of the index.
+  * Regular expressions such as `/al(an|len)/`, term ranges such as `[ada TO alan]` and
+    `{ada TO alan}`, and boosts such as `ada^2`. A lone `*` matches every literal of the
+    call's predicates.
+
+  Prefixes, wildcards, fuzzy words, regular expressions and range bounds are lowercased
+  and ASCII-folded like the indexed text, but they are not split into words. A word that
+  the analyzer splits, such as `fei-fei`, becomes an OR of its parts, as in Lucene. Sparkles
+  reads `"quick bro"*` as a phrase whose last word is a prefix, while Jena reads it as the
+  phrase or any document. A literal `:` is written `\:`.
+* **Refused query strings.** A field name such as `name:ada` or `*:*` gives `400`, because
+  the call's predicates select what is searched. A query string whose words are all
+  excluded, such as `-ada`, gives `400`, and so does one in which no word is left after
+  analysis. Jena returns no results for these two. A phrase with a slop that repeats a
+  word, a fractional edit distance such as `ada~1.5`, and the regular expression operators
+  of Lucene that Tantivy reads differently (`@`, `#`, `<`, `>`, `&`, `~`, `^` and `$`) are
+  also refused.
 * **Results.** There is one solution per matching quad, so a subject with two matching
   literals appears twice. `?score` is an `xsd:float`. In a merged default graph (the union
   default graph, or several `FROM`s), identical triples from different graphs count once.
@@ -1481,6 +1990,32 @@ SELECT ?s ?score ?label WHERE {
   before any join.
 * **Analyzer.** Tokens are split on non-alphanumeric characters, lowercased and
   ASCII-folded, so `café` matches `cafe`.
+* **Languages.** An index can also stem the literals of chosen languages, as jena-text
+  does with `text:multilingualSupport`. `languages` in the configuration names them. A
+  literal whose language tag has an analyzer is indexed twice, once as above and once
+  stemmed. A search with `lang:` or a language-tagged query string searches the stemmed
+  text of that language, so `"runs"@en` matches `Running quickly`@en. The analyzer of a
+  language lowercases, removes the language's stop words (where Tantivy has a list for
+  it) and applies Tantivy's Snowball stemmer. It is applied to the query in the same way.
+  As in Lucene, stemmed terms are not folded to ASCII, so Swedish `städer` and `stad`
+  stay apart.
+  * The language of a literal and of a search is its primary subtag, so `en-GB` literals
+    are stemmed as English and `lang:en-gb` searches the English text and keeps only
+    `en-GB` literals.
+  * As in Lucene, prefixes, wildcards, fuzzy words, regular expressions and ranges are
+    not stemmed. They match the stemmed terms, so `runn*` finds `runner` but not
+    `running`, which was indexed as `run`. They are lowercased, and for German the
+    umlauts and ß are replaced as the German stemmer replaces them, so `häu*` finds
+    `Häuser`.
+  * A removed stop word leaves a gap in the positions, as in Lucene. The phrase
+    `"ada and the fox"` matches `Ada and the fox`, and `"ada fox"` does not.
+  * A search without a language searches the unstemmed text, as in Jena. A language
+    without an analyzer in the index is searched unstemmed and filtered by its tag.
+  * The analyzers are `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
+    `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
+    `russian`, `spanish`, `swedish`, `tamil` and `turkish`. Their default tags are `ar`,
+    `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`), `pt`,
+    `ro`, `ru`, `es`, `sv`, `ta` and `tr`.
 * **Consistency.** Indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
@@ -1494,9 +2029,15 @@ SELECT ?s ?score ?label WHERE {
   by a `text.dirty` file next to it, is checksum-verified and caught up from the WAL. The
   WAL also restores what was only staged. The index is rebuilt only if it is damaged or
   older than the WAL.
-* **Errors.** `400` for malformed calls, unparseable query strings, predicates that
-  are not indexed, and datasets without an index. `501` if the server was built without
-  the `text` feature.
+* **Errors.** `400` for malformed calls, unparseable or refused query strings, predicates
+  that are not indexed, and datasets without an index. `507` when a search matches more
+  than `maxHits` literals and has no limit, or a limit above `maxHits`. A limit of at most
+  `maxHits` keeps the best hits instead. `501` if the server was built without the `text`
+  feature.
+* **Cost.** A search reads the terms of its hits from columns of the index and looks each
+  distinct term up in the store's dictionary once. Later searches find the ids of terms
+  looked up before in a cache. A score or literal that the rest of the query never uses is
+  not produced, so a `COUNT` or a join on the subject never reads the literals.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1504,28 +2045,45 @@ SELECT ?s ?score ?label WHERE {
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
 | POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts
 type TextConfig = {
   predicates?: "all" | string[];                         // default "all"
   graphs?: { include?: "all" | string[]; exclude?: string[] };  // graph IRIs; urn:x-arq:DefaultGraph
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
-  maxHits?: number;                                     // default 1000000 hits without a limit (then 507)
+  maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
+  languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
   seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
   epoch: number; diskBytes: number; segments: number;
-  config: TextConfig; formatVersion: 1;
+  config: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
 };
+type TextHits = {
+  dataset: string; commit: number;
+  limited: boolean;                    // as many hits as the limit
+  hits: {
+    s: Term; score: number; p: Term; g: Term;   // Term as in SPARQL JSON results
+    literal: Term;                     // the literal, or with highlighting its fragments
+    snippet?: string;                  // HTML: the fragments, escaped, matches in <mark>
+  }[];
+};
 ```
+
+`languages` is `"all"` for every analyzer under its default tags, a list of tags with
+their default analyzers, such as `["en", "fr"]`, or a map from a primary language tag to
+an analyzer name, such as `{"en": "english", "gl": "portuguese"}`. `--language all` and
+`--language en` set it from the CLI. An index without `languages` keeps the schema and
+configuration it had before languages existed and is not rebuilt.
 
 Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
 in the database directory, in `text.json`, with the index in `text/`. The CLI commands
 are
-`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--rebuild | --status | --disable]`
+`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--language TAG…] [--rebuild | --status | --disable]`
 and `sparkles serve --text NAME[=config.json]`.
 
 ## Vector similarity
@@ -1541,7 +2099,7 @@ matched.
 * **Functions.** `spk:cosine(?a, ?b)`, `spk:dot(?a, ?b)`, `spk:euclidean(?a, ?b)` (L2
   distance) and `spk:dimension(?a)`. They raise a type error on a malformed argument, a
   dimension mismatch, or a zero vector with cosine.
-* **Exact top-k search:**
+* **Top-k search:**
 
   ```sparql
   SELECT ?s ?score WHERE {
@@ -1550,26 +2108,156 @@ matched.
   ```
 
   * The first argument is the embedding predicate.
-  * The query is a vector literal, or an entity whose single vector under that
-    predicate is used.
-  * `k` defaults to 10 (at most 10000). `metric:` is `cosine` (default), `dot` or
-    `euclidean`.
+  * The query is a vector literal, an entity whose single vector under that predicate is
+    used, or a variable that the rest of the group binds to either.
+  * `k` defaults to 10 (at most 10000).
+  * Options are string literals after `k`:
+
+    | Option | Effect |
+    |---|---|
+    | `metric:cosine`, `metric:dot`, `metric:euclidean` | Sets the metric. The default is the index's metric, or cosine without an index. |
+    | `ef:N` | The HNSW search keeps N candidates, and at least k. More candidates raise recall and latency. |
+    | `exact:true` | Searches exactly, even with an index. |
+    | `distinct:subject` | Returns at most one row per subject, its best one. |
+    | `candidates:join` | Ranks only the subjects that the rest of the group binds. |
+
   * Higher scores are better, except for euclidean, where lower is better.
   * The search covers the active graph, and `GRAPH ?g` binds each row's graph. The top
-    k are taken before any join, and ties break by term id.
+    k are taken before any join, unless `candidates:join` is set. Ties break by term id.
   * Only vectors of the query's dimension are compared. If the predicate has vectors
-    but none of that dimension, the result is a `400` naming the dimensions it has.
+    but none of that dimension, the result is a `400` naming the dimensions it has. A
+    predicate with an index accepts only queries of the index's dimension.
   * Rows with the same subject and vector in several graphs of a merged default graph
     count once.
-* **Implementation.** Vectors are packed per predicate and dimension on first use and
-  cached per index generation. Every query overlays its snapshot's uncommitted inserts
-  and deletes, so results always match its data. A process-wide budget caps the packed
-  vectors. `sparkles serve --vector-memory-mb` sets it, and the default is 4096 (4 GiB).
-  Beyond it a search returns `507`. A variable query vector gives `501`.
-* **Status.** `GET /$/vector/{ds}` returns
-  `{ budgetBytes, usedBytes, generation, predicates: [{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }] }`
-  for the predicates packed so far in the current generation. Packing happens on a
-  predicate's first search. `vectors` counts a vector once per graph it is in.
+* **Bound queries.** When the query is a variable, the rest of the group runs first.
+  The search then runs once per distinct value it binds, which can be a vector literal
+  or an entity, and each input row joins with the rows of its own search. More than 1000
+  distinct values give `507`. With `candidates:join`, the search ranks only the subjects
+  bound by the rest of the group. `{ ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb ?q
+  10 "candidates:join") }` returns the 10 best documents, where the plain search returns
+  the documents among the 10 best rows.
+* **Without an index.** Vectors are packed per predicate and dimension on their first
+  search and cached per index generation. Each search scans them exactly. Every query
+  overlays its snapshot's inserts and deletes, so results always match its data. A
+  process-wide budget caps packed vectors and graphs. `--vector-memory-mb` sets it for
+  every command, and the default is 4096 (4 GiB). Beyond it a search returns `507`.
+
+### Vector indexes
+
+A vector index packs one predicate's vectors of one dimension and builds an HNSW graph
+over them (Malkov and Yashunin, arXiv:1603.09320). A search through the graph scores a
+few thousand vectors instead of all of them. The graph only chooses which stored
+vectors are scored. Every score comes from the same kernel as the exact search, so a
+row has the same score on either path, and the paths differ only by the rows the graph
+misses.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `predicate` | required | The embedding predicate. A predicate has at most one index. |
+| `dimension` | required | Vectors of other dimensions are not indexed. |
+| `metric` | `cosine` | The graph's metric, and the default metric of searches. |
+| `model` | none | A label of the embedding model. Sparkles does not interpret it. |
+| `hnsw.m` | 16 | Links per node, and twice as many on the bottom layer. More links raise recall, memory and build time. |
+| `hnsw.efConstruction` | 128 | Candidates kept while a node is inserted. More raise recall and build time. |
+| `hnsw.efSearch` | 128 | Candidates kept by a search. A query can override it with `ef:N`. |
+| `exactThreshold` | 10000 | Searches over at most this many rows are exact. |
+
+With `"hnsw": false` the index keeps only the packed vectors, which are searched
+exactly.
+
+* **Freshness.** The graph covers the generation's base. Every search adds the
+  snapshot's inserted vectors, scored exactly, and leaves out its deleted ones, so new
+  and deleted vectors count at once. Commits do no index work. A compaction or a bulk
+  load starts a new generation, whose index is built in the background. Searches are
+  exact until it is ready.
+* **Exact fallback.** A search skips the graph and scans exactly in these cases:
+  `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
+  is still being built, at most `exactThreshold` rows are in scope, or the active graph
+  holds less than 5 % of the indexed rows. It also falls back when the graph finds fewer
+  than k rows although more exist. The counters of an executed plan name the path
+  (`method`) and the reason (`exactBecause`).
+* **Builds and files.** Creating an index starts a background build, and writes go on
+  meanwhile. The build first publishes the packed vectors, which searches then scan
+  exactly, and then the graph. A persistent store writes the build to
+  `gen-NNNN/vectors/<name>.spkv` and maps it from there, also after a restart. A file
+  that is damaged, or was built for another configuration or generation, is built again.
+  Changing only `efSearch`, `exactThreshold` or `model` keeps the build.
+* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about
+  `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
+  copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
+  would pass the budget leaves the index `over-budget`, and searches then scan exactly
+  within the same budget.
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/$/vector/{ds}` | `{ budgetBytes, usedBytes, generation, indexes, predicates }`. `indexes` holds a `VectorIndexStatus` per index. `predicates` lists the predicates packed without an index, as `{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }`. |
+| GET | `/$/vector/{ds}/{name}` | One `VectorIndexStatus`, or `404`. |
+| PUT | `/$/vector/{ds}/{name}` | Creates (`201`) or replaces (`200`) the index. The body is its configuration, and the response is `{ index, task }`, where the task follows the build. `409` when another index has the predicate. |
+| DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
+| POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
+| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
+
+A `VectorIndexStatus` is
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild? }`.
+`state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
+rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
+`mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
+`files` is `{ bytes, opened }`, where `opened` means the build was read from its file.
+The configuration lives in `vector.json` in the database directory.
+
+The CLI is `sparkles vector`:
+
+```sh
+sparkles vector create  --loc DB --name NAME --predicate IRI --dim D [--metric cosine|dot|euclidean]
+                        [--model LABEL] [--m 16] [--ef-construction 128] [--ef-search 64]
+                        [--exact-threshold 10000] [--no-hnsw]
+sparkles vector drop    --loc DB --name NAME
+sparkles vector rebuild --loc DB --name NAME
+sparkles vector list    --loc DB
+sparkles vector status  --loc DB [--name NAME]
+```
+
+Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
+`rebuild` wait for the build.
+
+### Hybrid text and vector search
+
+`spk:hybridSearch` runs a full-text search and a vector search and fuses their rankings
+by reciprocal rank fusion (Cormack, Clarke and Büttcher, SIGIR 2009). The design is in
+[F04](specs/F04-vector-search.md#outcome).
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>
+SELECT ?s ?score ?textRank ?vectorRank WHERE {
+  (?s ?score ?textRank ?vectorRank) spk:hybridSearch (
+      (rdfs:label "brown fox" 100 "lang:en")
+      (ex:emb "[0.1, -0.2, 0.3]"^^spk:vector 100)
+      10 "rrf:60" "weights:1,0.5") .
+} ORDER BY DESC(?score)
+```
+
+* **Arguments.** The first element is the object list of `text:query`, or a bare query
+  string. The second is the object list of `spk:vectorSearch`. An optional limit follows,
+  1 to 10,000 subjects with 10 by default, and then the options. `rrf:k` sets the
+  constant of the fusion (60 by default). `weights:wt,wv` weights the text and the vector
+  ranking (1 and 1 by default).
+* **Subject list.** `(?s ?score ?textRank ?vectorRank)`. Every slot after the subject is
+  optional. `?score` is the fused score as an `xsd:double`. A rank is unbound when its
+  list does not hold the subject. A constant subject returns that subject's row of the
+  fused ranking.
+* **Rankings.** Each list runs as its own property function would, within the active
+  graph and with its own options, budgets and errors. The text list's limit and the
+  vector list's `k` set how deep each ranking goes, 100 when they are absent. Each
+  ranking keeps one entry per subject, its best hit, or per subject and graph under
+  `GRAPH ?g`. A subject's rank is one more than the number of subjects in that list with
+  a better score, so ties share a rank. For the euclidean metric a lower distance is
+  better.
+* **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
+  hold it. The best `limit` subjects are returned, and ties break by term id.
+* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
+  a vector literal or an entity, and `candidates:join` is refused. Errors follow the two
+  searches, and malformed calls and options give `400`. The call needs the `text`
+  feature and a full-text index.
 
 ## GeoSPARQL
 
@@ -2019,12 +2707,15 @@ the style needs it, comes from the style.
 
 The design and its rationale are in [C08 Inference freshness and diagnostics](specs/C08-inference-freshness.md).
 
-Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally. A
-materialization records the dataset id and the commit it wrote. When it changed nothing,
-it records the head it read instead. Any later commit makes the inferences **stale**,
-including commits that only touch named graphs the reasoner does not read. Compaction and
-restarts do not. A status written by an older version, or recorded for another dataset
-id, has unknown freshness (`stale: null`).
+A materialization of `urn:x-sparkles:inferred` records the dataset id and the commit it
+wrote. When it changed nothing, it records the head it read instead. A later commit that changes the default graph makes
+the inferences **stale**, because the default graph is all the reasoner reads. Commits
+that change only named graphs leave them fresh, and so do changes to the inferred graph
+itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
+Each commit records whether it may have changed the default graph. A commit recorded by
+an older version, or one whose record is no longer kept, counts as a change. A status
+written by an older version, or recorded for another dataset id, has unknown freshness
+(`stale: null`).
 
 ```ts
 type ReasoningStatus = {
@@ -2034,14 +2725,73 @@ type ReasoningStatus = {
   commit: number | null;       // commit the inferences were materialized at; null = unknown
   head: number;                // current head commit
   stale: boolean | null;       // null = unknown
-  commitsSince: number | null; // head − commit; null when unknown or not comparable
+  commitsSince: number | null; // head − commit, counting every commit; null when unknown
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
+  auto: { enabled: boolean;
+          source: "server" | "dataset"; // --auto-reason, or the dataset's own setting
+          debounceSeconds?: number; maxDelaySeconds?: number;
+          scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
+  run?: ReasoningRun;          // how the last run went
+};
+
+type ReasoningRun = {
+  method: "full" | "incremental";
+  fallback?: string;           // why a run that could have been incremental ran in full
+  inferredAdded: number;       // triples the run added to the inferred graph
+  inferredRemoved: number;     // triples the run removed from it
+  changes?: {                  // incremental runs
+    explicitAdded: number;     // default graph triples added since the previous run
+    explicitRemoved: number;   // default graph triples removed since then
+    checked: number;           // derived triples whose other proofs were searched for
+    removed: number;           // derived triples that no longer follow, generalized ones included
+    derived: number;           // derived triples that now follow
+    source: "memory" | "store"; // where the previous closure came from
+  };
 };
 ```
+
+**Incremental runs.** A re-run, an automatic run and `sparkles infer` update the
+previous materialization instead of computing it again when they can. Such a run reads
+the triples added to and removed from the default graph since the recorded commit, from
+the commit diff. It removes the derived triples that lost their last proof and derives
+the consequences of the added triples. The inferred graph it writes is the one a full run would write, and
+the differential tests compare the two for RDFS, OWL 2 RL and Jena rules.
+
+Removals follow the backward/forward algorithm of Motik, Nenov, Piro and Horrocks
+(AAAI 2015). Before a derived triple is removed, a backward search looks for another
+proof of it among the triples that remain, and the triple stays when it has one. DRed,
+which removes every consequence first and derives the survivors again, would remove most
+of an RDFS closure for one `rdf:type` triple, because almost everything follows from
+the class axioms and `rdfs:Resource`. Additions are derived semi-naively from the new
+triples.
+
+The run needs the closure of the previous run, which includes the derived triples that
+are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
+it in memory after a run, up to `serve --reason-cache-triples` triples (10 million by
+default, about 135 bytes each). After a restart, and in `sparkles infer`, the run builds
+it again from the default graph and the inferred graph of the recorded commit. A
+persistent dataset keeps the derived triples that are not valid RDF in its
+`reasoning-generalized.*` files for that purpose. An in-memory dataset without a kept
+closure runs in full.
+
+A run materializes in full, and the status's `run.fallback` says why, when:
+
+- the rules use `noValue`, `now`, `makeTemp`, `makeSkolem`, a head action or a blank node
+  in a head, or a `listForAll` that no `listMember` and triple pattern of the same rule
+  cover. These rules are not monotonic, or they create new blank nodes in every run.
+- the GeoSPARQL default geometries are on, because a feature loses its default geometry
+  when it gets a second one.
+- the rules read RDF lists, as OWL 2 RL does, and a list triple changed or is derived.
+  What list builtins see then depends on the order of derivation.
+- the profile, the rule text or the vocabularies differ from the previous run's.
+- the commit diff no longer reaches the recorded commit. A compaction or a bulk load
+  starts a new generation, and a dataset that keeps no history then loses the older
+  commits.
+- more than one in twenty triples of a default graph of at least 10,000 triples were
+  removed. A full run is faster then.
 
 **Header.** A query or SHACL validation that includes the inferred graph while the
 inferences are not fresh at the snapshot it read carries a `Sparkles-Inferences` header.
@@ -2055,8 +2805,23 @@ profile once a dataset with stale inferences has had no commit for `SECS` second
 writes continue, it runs at the latest after the maximum delay, which defaults to
 12 × `SECS`. The messages of these tasks start with `auto:`. After a failed run, the next
 attempt waits for the next commit. Runs never start for unknown freshness, nor on
-`--read-only` servers. Each run is a full recomputation that holds the dataset's writer
-lock, so updates wait while it runs.
+`--read-only` servers. Each run holds the dataset's writer lock, so updates wait while it
+runs. Runs are incremental when they can be, and then take milliseconds for small
+changes.
+
+A dataset can have its own setting, which takes precedence over the server's.
+`PUT /$/reason/{ds}/auto` with `{"enabled": true}` turns automatic runs on for that
+dataset even without `--auto-reason`, and `{"enabled": false}` turns them off. Without
+`debounceSeconds`, the dataset uses the server's debounce, or 5 seconds when the server
+has none. The maximum delay defaults to 12 × the debounce. The setting is stored in the
+dataset's `reasoning.json`, survives re-runs and restarts, and goes away with
+`DELETE /$/reason/{ds}`. `sparkles infer` keeps it too.
+
+A write that waits for the writer lock supersedes an automatic run that started after
+the debounce. The run is cancelled at its next check, the task ends `cancelled`, and the
+write goes ahead. The next run starts after the next debounce. A run forced by the
+maximum delay is never superseded, so continuous writes cannot postpone it forever. A
+`DELETE /$/tasks/{id}` cancels any reasoning run, and a cancelled run changes nothing.
 
 **Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks taken from
 the OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3). Each check is one
@@ -2068,22 +2833,39 @@ establish OWL consistency.
 |---|---|---|
 | `checks` | all | Comma-separated check ids. |
 | `limit` | 100 (1–10000) | Findings per check. |
-| `reasoning` | `true` if inferences exist | Includes `urn:x-sparkles:inferred`. |
+| `graph` | the default graph | A graph to check, repeatable: `default` or a graph IRI. The checks run over the merge of the graphs given, so an ontology in one graph and its data in another are checked together. |
+| `reasoning` | `true` if inferences exist and the default graph is checked | Includes `urn:x-sparkles:inferred`. The inferences follow from the default graph alone, so a check of named graphs leaves them out unless `reasoning=true` asks for them. |
 | `closure` | `subclass` | `subclass` makes type tests follow `rdfs:subClassOf*`. `none` uses stated types only. |
 | `timeout` | server query timeout | Time budget for the whole report. |
+| `format` | `json` | `json` or `turtle`. Without it, an `Accept: text/turtle` header selects Turtle. |
 
 | Check | Rules | Severity | Query |
 |---|---|---|---|
 | `nothing-member` | `cls-nothing2` (+`cax-sco`) | inconsistency | [nothing-member.rq](../crates/sparkles-reasoner/diagnostics/nothing-member.rq) |
 | `disjoint-classes` | `cax-dw` | inconsistency | [disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/disjoint-classes.rq) |
 | `all-disjoint-classes` | `cax-adc` | inconsistency | [all-disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-classes.rq) |
+| `complement-classes` | `cls-com` (+`cax-sco`) | inconsistency | [complement-classes.rq](../crates/sparkles-reasoner/diagnostics/complement-classes.rq) |
+| `max-cardinality-zero` | `cls-maxc1` (+`cax-sco`) | inconsistency | [max-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-cardinality-zero.rq) |
+| `max-qualified-cardinality-zero` | `cls-maxqc1`, `cls-maxqc2` (+`cax-sco`) | inconsistency | [max-qualified-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-qualified-cardinality-zero.rq) |
 | `same-different` | `eq-diff1` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [same-different.rq](../crates/sparkles-reasoner/diagnostics/same-different.rq) |
+| `all-different` | `eq-diff2`, `eq-diff3` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [all-different.rq](../crates/sparkles-reasoner/diagnostics/all-different.rq) |
 | `functional-literal-conflict` | `prp-fp`, `dt-diff`, `eq-diff1` | inconsistency | [functional-literal-conflict.rq](../crates/sparkles-reasoner/diagnostics/functional-literal-conflict.rq) |
+| `irreflexive-property` | `prp-irp` | inconsistency | [irreflexive-property.rq](../crates/sparkles-reasoner/diagnostics/irreflexive-property.rq) |
+| `asymmetric-property` | `prp-asyp` | inconsistency | [asymmetric-property.rq](../crates/sparkles-reasoner/diagnostics/asymmetric-property.rq) |
+| `disjoint-properties` | `prp-pdw` | inconsistency | [disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/disjoint-properties.rq) |
+| `all-disjoint-properties` | `prp-adp` | inconsistency | [all-disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-properties.rq) |
+| `negative-property-assertion` | `prp-npa1`, `prp-npa2` | inconsistency | [negative-property-assertion.rq](../crates/sparkles-reasoner/diagnostics/negative-property-assertion.rq) |
 | `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
 | `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
 
+A check that implements two rules reports the one that matched in each finding's `rule`.
+For example, `all-different` reports `eq-diff2` for `owl:members` and `eq-diff3` for
+`owl:distinctMembers`. Property assertions are matched as stated. A subproperty or
+inverse assertion counts only when the inferences are included and contain it.
+Cardinality restrictions match the value 0 of any numeric datatype.
+
 There is no unique name assumption. Two IRIs count as different individuals only through
-`owl:differentFrom`. Literal values of a functional property are compared with SPARQL
+`owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL
 `!=`, restricted to numbers, strings, language-tagged strings and booleans, so a pair it
 cannot compare is never reported. With inferences included, each finding is re-checked
 with the same bindings over the asserted data alone. `basis` is `asserted` when the
@@ -2094,7 +2876,8 @@ finding holds there and `uses-inferences` otherwise. With stale inferences, only
 type DiagnosticsReport = {
   diagnosticsFormat: 1;
   dataset: string; commit: number /* snapshot checked */; computedAt: string;
-  scope: { graph: "default";
+  scope: { graph: "default" | "graphs";   // "graphs" when `graph` chose them
+           graphs?: string[];             // the checked graphs, "default" for the default graph
            inferences: { included: boolean; profile?: string; stale?: boolean | null; commitsSince?: number | null };
            closure: "subclass" | "none" };
   status: "violations-found" | "none-found" | "incomplete";
@@ -2111,13 +2894,29 @@ type DiagnosticsReport = {
 `status` is `violations-found` when an inconsistency check has findings. Otherwise it is
 `incomplete` when a check timed out or failed, and `none-found` when none did. Warnings
 never count. A timeout marks the remaining checks `timeout`, and the request does not
-fail with `408`. Errors are `400` for an unknown check id or a bad `limit` or `closure`,
-`404` for an unknown dataset, and `501` without the `reasoning` feature. Diagnostics are
-read-only and also work on `--read-only` servers.
+fail with `408`. Errors are `400` for an unknown check id or a bad `limit`, `closure` or
+`format`, `404` for an unknown dataset, and `501` without the `reasoning` feature.
+Diagnostics are read-only and also work on `--read-only` servers.
+
+The Turtle form describes one `spk:DiagnosticsReport`, where `spk:` is `urn:x-sparkles:`.
+Each finding is an `sh:result` with the SHACL result properties `sh:focusNode`,
+`sh:resultSeverity`, `sh:resultMessage` and `sh:sourceConstraintComponent`. The last one
+names the check, as in `spk:check:disjoint-classes`. The rule, the basis and the evidence
+are `spk:` properties, and evidence with several terms is an RDF list. The report has no
+`sh:conforms`, because finding nothing does not establish consistency.
+
+```turtle
+[] a spk:DiagnosticsReport ; spk:dataset "t" ; spk:status "violations-found" ;
+   sh:result [ a spk:Finding ; sh:focusNode ex:tom ; sh:resultSeverity sh:Violation ;
+               sh:sourceConstraintComponent <urn:x-sparkles:check:disjoint-classes> ;
+               spk:rule "cax-dw" ; spk:basis "asserted" ; spk:classes ( ex:Cat ex:Dog ) ;
+               sh:resultMessage "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog" ] .
+```
 
 In the CLI, `sparkles infer --loc DB --status` prints the status.
-`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json]`
-runs the checks, after materializing when `--profile` or `--rules` is given. It exits
+`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--graph G]… [--closure subclass|none] [--format text|json|turtle]`
+runs the checks, after materializing when `--profile` or `--rules` is given. `--graph`
+works as the `graph` parameter. It exits
 with 0 (`none-found`), 1 (`violations-found`) or 2 (`incomplete` or an error).
 `sparkles stats` shows a `reasoning` line.
 
@@ -2140,9 +2939,10 @@ versions, format 1 without `language`, are still read:
 |---|---|---|---|
 | `language` | `shacl`, `shex` | `shacl` | The shape language. It is always written, and a `PUT` without it means SHACL. |
 | `mode` | `reject`, `warn`, `off` | — | With `reject`, a write that leaves results at or above the threshold is not committed (`422`). With `warn`, the write commits, and the receipt and header report the findings. |
-| `shapes` (SHACL) | `{ "graphs": [iri, …] }` or `{ "inline": "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, or shapes given inline. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. |
+| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph. It never includes the shapes graphs, and includes the inferred graph only with `includeInferences`. |
 | `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block. |
+| `baseline` | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. Results are matched as a multiset: SHACL results by focus node, path, value, source shape, component and constraint, ShEx associations by node and shape. When a write changes a SHACL shapes graph, its results are compared with those the old shapes gave. |
 | `timeoutSeconds`, `reportLimit` | number, 1–10000 | 10, 100 | `timeoutSeconds` is the time budget per write. Exceeding it fails the write with `408`. `reportLimit` is the number of results a report carries. |
 
 **ShEx.** A ShEx configuration names a schema and a query shape map instead of shapes:
@@ -2159,6 +2959,7 @@ versions, format 1 without `language`, are still read:
 | `schema` | `PUT`: `{ "inline": "<schema>", "format"?: "shexc" \| "shexj" \| "shexr", "base"?: iri, "source"?: text }` | The schema text, and the base its relative IRIs resolve against. The text is ShExC, ShExJ, or ShExR in Turtle. Without `format` the language is sniffed, and text that starts with `{` is ShExJ. The schema is copied into the database. Without imports, it is stored verbatim as `validation-schema.shex` (ShExC) or `validation-schema.json` (ShExJ). With imports, the imports are resolved during the `PUT` and the merged schema is written as ShExJ to `validation-schema.json`. The schema's prefixes are then kept in `schema.prefixes` for the shape map. The stored configuration names the copy (`file`, `format`), keeps `base` and `source`, and records the SHA-256 of the text given. A later write never fetches anything. To change the other fields, a `PUT` may send the stored `schema` back, with its `file` and without `inline`. |
 | `shapeMap` | compact string, or the JSON form `[{ "node", "shape" }]` | A query map. It is expanded again on every validated state, so new focus nodes are picked up. Prefixed names use the schema's prefixes unless the map has its own `PREFIX`es. |
 | `threshold` | — | Not accepted. Every nonconformant association blocks. |
+| `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. A ShEx schema changes only through a new configuration, so no write compares two schemas. |
 
 Imports resolve as for `POST /{ds}/shex`. `file:` IRIs and relative IRIs must be inside
 `--load-dir`, and http(s) imports go through the outbound policy. A `PUT` takes no inline
@@ -2168,20 +2969,26 @@ selectors are refused because every validated write would run them.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the baseline of the last commit, counters and warnings. ShEx adds `associations`, the size of the last expanded map. |
+| GET | `/$/validation/{ds}` | `{ language, config, status }`, or `{ config: null }`. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
 | PUT | `/$/validation/{ds}` | Sets the configuration, in either language, and replaces the other language's files. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
 **Writes** are validated once per request, on the final state, before any byte is
 written. This covers updates, Graph Store PUT/POST/DELETE and uploads, and in the CLI
 `load`, `update`, `infer` and bulk loads. A write that touches neither the data graph nor
-the shapes graphs is skipped. ShEx also skips a write when every quad it changes has a
-predicate that no triple constraint and no `{FOCUS p …}` selector mentions, because a
-neighbourhood holds only the arcs of the predicates its shape mentions. It does not skip
-the write when a shape is `CLOSED`. Responses carry
-`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`.
-ShEx adds `lang=shex` after `strategy`. Receipts (`receipt=true`) include a `validation`
-object with its `language`. A rejection is `422 Unprocessable Content`:
+the shapes graphs is skipped. A write is also skipped when no shape reads any predicate
+it changes. For SHACL the predicates read are those of paths, targets, `sh:equals` and
+its siblings, and `rdf:type` and `rdfs:subClassOf` for classes. SHACL needs the state of
+the head to be known for this skip. For ShEx they are the predicates of triple
+constraints and `{FOCUS p …}` selectors, because a neighbourhood holds only the arcs of
+the predicates its shape mentions. A SHACL-SPARQL constraint reads the predicates of its
+query when the query is anchored at the focus node (see below). A closed shape reads
+every predicate, and so does a query with a variable predicate or one that is not
+anchored, so neither language skips writes then. Responses carry
+`Sparkles-Validation: status=passed|warned|rejected|skipped|bypassed, mode=…, strategy=full|incremental|none, blocking=N, total=N, violations=N, warnings=N, infos=N, ms=N`.
+ShEx adds `lang=shex` after `strategy`. In grandfather mode `introduced=N` follows
+`blocking`. Receipts (`receipt=true`) include a `validation` object with its `language`.
+A rejection is `422 Unprocessable Content`:
 
 ```json
 { "error": "SHACL validation failed: 2 blocking results (threshold violation); nothing was committed",
@@ -2208,17 +3015,87 @@ rejection is JSON whatever the `Accept`:
 A rejected write uses no commit number. `?validationLimit=N` bounds the results of one
 request. `?validate=false`, or the header `Sparkles-Validate: off`, skips validation, but
 only on a server started with `--allow-unvalidated-writes`. On other servers it gets
-`403`. The CLI has `--no-validate`. A dataset whose `validation.json` cannot be loaded
-refuses writes with `501` rather than accepting them unvalidated. This happens, for
-example, when a binary built without `shex` opens a ShEx configuration.
+`403`. The CLI has `--no-validate`. A commit made this way is flagged `unvalidated` in
+`/$/commits`, in receipts and in `sparkles log`. The flag is kept in the write-ahead log
+and the commit catalog, so it survives restarts. A library program that opens a validated
+database with `StoreOptions::unvalidated_writes` and installs no guard makes such commits
+too. A dataset whose `validation.json` cannot be loaded refuses writes with `501` rather
+than accepting them unvalidated. This happens, for example, when a binary built without
+`shex` opens a ShEx configuration.
+
+**Incremental validation.** The guard knows the exact result counts of the head. A full
+validation sets them when validation is turned on, and every validated write keeps them
+up to date. They are also written to `validation-status.json` after each validated
+commit, so a restart keeps them. The file is trusted only when it names the head commit
+and the current `validation.json`, so a crash or an unvalidated write leaves the state
+unknown rather than wrong. With the counts known, a write validates only the focus nodes
+whose results it can change. These are the nodes that reach a changed triple through the
+paths and references of the shapes, plus the nodes a changed triple may add to or remove
+from a target. The guard validates them in the states before and after the write and
+moves the counts by the difference. The decision and the counts are those of a full
+validation. The summary then has `strategy: "incremental"` and lists the results of the
+focus nodes it validated. `focusNodes` says how many there were, and `total` and
+`bySeverity` still count the whole state.
+
+A write is validated in full in these cases, and `fallback` names the reason:
+
+| `fallback` | Case |
+|---|---|
+| `baseline` | The state of the head is unknown, for example after a bypassed write. In strict `reject` mode, the head also has blocking results. |
+| `shapes` | The write changed a shapes graph. |
+| `subclass` | The write changed `rdfs:subClassOf`, a shape reads classes, and the classes it changes have more than 100,000 instances. With fewer, those instances are validated incrementally. |
+| `bulk` | The write was a bulk load, which renumbers terms. |
+| `budget` | The write affects more than 50,000 focus nodes, or more than 512 of one shape's focus nodes when that is over a quarter of them. The search for affected nodes may also visit at most 100,000 nodes. |
+| `sparql`, `recursive` | Some shapes are validated in full on every write, because they have a SHACL-SPARQL constraint whose query is not anchored at the focus node, or refer to themselves. The other shapes stay incremental. |
+
+**SHACL-SPARQL and `sh:targetWhere`.** A SHACL-SPARQL constraint or SPARQL-based
+component is validated incrementally when its query is anchored at the focus node. Every
+triple pattern must then connect to `$this`, or to `$value` for an ASK validator, through
+the patterns before it. Constants and variables may sit in between, and paths may have
+any form except a negated property set inside a longer path. `FILTER NOT EXISTS`,
+`OPTIONAL`, `UNION`, `BIND`, aggregates and `GROUP BY` are allowed when their patterns
+are anchored in the same way. A variable bound only in one branch of a `UNION`, or only
+inside an `OPTIONAL`, anchors nothing after it. A query with a subquery, `GRAPH`,
+`SERVICE`, `VALUES` or `MINUS`, or with a pattern that is not anchored, keeps its shape
+validated in full. For example, the uniqueness constraint
+`SELECT $this WHERE { $this ex:key ?k . ?other ex:key ?k . FILTER (?other != $this) }`
+validates the nodes that share a changed key. The `incremental` member of the status
+lists the shapes still validated in full and why. A shape with an `sh:targetWhere`
+target (SHACL 1.2) is incremental when its where shape is. A node's membership then
+depends on what conformance to the where shape reads at the node. When the where shape
+does not narrow the candidates by `sh:class`, `sh:hasValue`, `sh:in` or a required
+property, every edge of the node counts.
+
+ShEx works the same way on the associations of the shape map. A node is affected when a
+changed triple is an arc its shape reads, or an arc a reference from it reaches. The
+guard also keeps the typing of the head in memory for schemas whose references follow
+arcs. With it, a write validates only where typings change. It types the pairs of the
+nodes it touched, reads from the head's typing the other pairs that conformed and those
+that fail whatever they refer to, and goes on to the nodes that refer to a pair whose
+value changed. With a recursive reference such as `foaf:knows @ex:Person *`, a new
+`foaf:knows` arc between two people who conform validates one node. A write that makes a
+person nonconformant validates every person who reaches them, and falls back to a full
+validation past 50,000 nodes. A restart, a compaction or a write the guard did not
+validate leaves the typing unknown until the next full validation, and writes until then
+are validated over every node that reaches a changed one. ShEx falls back for `baseline`,
+`bulk`, `budget` (more than 50,000 affected nodes), and `sparql` for a map with a SPARQL
+selector.
 
 In the CLI, `sparkles validation` sets the configuration. For SHACL it is
-`sparkles validation --loc DB --mode reject|warn (--shapes-graph IRI … | --shapes FILE) [--data-graph …] [--threshold …]`.
+`sparkles validation --loc DB --mode reject|warn [--shapes-graph IRI …] [--shapes FILE] [--data-graph …] [--threshold …] [--grandfather]`,
+with at least one shapes graph or a shapes file.
 For ShEx it is
-`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …]`.
+`sparkles validation --loc DB [--lang shex] --schema FILE [--schema-format shexc|shexj|shexr] --shape-map MAP --mode reject|warn [--data-graph …] [--grandfather]`.
 `--schema` and `--shape-map` imply `--lang shex`, and imports resolve against the schema's
 directory. `--status [--format json]` shows the configuration, and `--off` turns
-validation off.
+validation off. `sparkles serve --validate NAME=CONFIG.json` sets a dataset's
+configuration when the server starts, from a file holding a `PUT` body. In that file,
+shapes or a schema without `inline` text are read from the path in `source`, relative to
+the file. `--validate NAME` validates a dataset with the configuration it has. Either way
+the data is validated in full before the server listens, the result is logged, and the
+state of the head, with the typing a ShEx guard keeps, is known for the writes that
+follow. A configuration file whose `reject` mode the data does not pass stops the server
+from starting.
 
 A write rejected in the CLI exits with status 3, and ShEx lists
 `  <node> @ <shape>: <reason>`. `load`, `update` and `infer` end their summary line with
@@ -2229,8 +3106,10 @@ rejected fails with
 `inferences rejected by SHACL validation: N blocking results (first: <shape> at <node>)`.
 Rejections are logged at INFO under `sparkles::validation`, with the dataset, language,
 kind, counts, and first shape and focus node. The counters, with a `language` label, are
-listed under [Metrics](#metrics). Each validated write runs a full validation of the data
-graph, which takes about 160 ms at 1M triples for SHACL. Skipped writes cost nothing.
+listed under [Metrics](#metrics). A write validated incrementally costs about as much as
+the write itself when it affects few focus nodes. A full validation takes about 160 ms at
+1M triples for SHACL, and writes that fall back to it wait that long. Skipped writes cost
+nothing.
 
 ## SHACL validation
 
@@ -2253,6 +3132,11 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **`timeout=<seconds>`.** Works as for queries, with the server default otherwise. A
   timeout returns `408`.
 * SHACL Core and SHACL-SPARQL are supported. A parse error in the shapes graph is a `400`.
+* **`sh:targetWhere`** (SHACL 1.2 Core) is supported: the focus nodes are the nodes of the
+  data graph, its subjects and objects, that conform to the given shape. When that shape
+  has `sh:class`, `sh:hasValue` or `sh:in`, or a property shape on a predicate or an
+  inverse predicate with `sh:minCount` of at least 1, only the nodes those allow are
+  tested. Otherwise every node of the data graph is.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -2477,6 +3361,9 @@ module takes this endpoint's JSON and answers in the same shape. The UI calls
 load or run. `--format-endpoint authenticated` or `off` therefore does not stop such a UI
 from formatting. It limits only the endpoint.
 
+The MCP server offers the same formatter as its `format` tool, with the same options
+(see [MCP server](#mcp-server)).
+
 **JSON body.** The UI sends `Content-Type: application/json` with this body:
 
 ```ts
@@ -2585,6 +3472,7 @@ type SparklesResult = {
     timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
     plan: PlanNode;                        // executed operator tree
     memory: { peakBytes: number };         // peak estimated memory of intermediate results
+    rowsProduced: number;                  // rows produced by all operators, summed
   };
 };
 type Term =
@@ -2702,9 +3590,10 @@ which is about five times faster than gzip for a slightly larger file. `--compre
 (`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
 the file's extension, and writes uncompressed without one.
 
-**Full-text documents** are stored with zstd (level 3). `"docstoreCompression": "lz4"`
-or `"none"` in the text configuration picks another codec, and changing it rebuilds the
-index. Indexes built before zstd was available keep LZ4 until they are rebuilt.
+**Full-text documents** keep their terms in columns of the index since index format 2, so
+the Tantivy doc store holds no fields and its codec no longer changes the index size. The
+doc store still uses zstd (level 3) by default, and `"docstoreCompression": "lz4"` or
+`"none"` in the text configuration is still accepted. Changing it rebuilds the index.
 
 ## Errors
 
@@ -2719,6 +3608,8 @@ statuses are:
 * `405` for an update sent with GET
 * `408` for a timeout
 * `409` for a conflict
+* `412` for a failed `If-Match` or `If-None-Match`, with `{code: "precondition-failed"}`
+  (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests))
 * `413` for a body over its ceiling, or a compressed body over `--max-decompressed-mb`
 * `415` for an unsupported content type or `Content-Encoding`
 * `429` for a request over a rate limit
@@ -2810,10 +3701,33 @@ fails the request with `507 Insufficient Storage` and a body like this:
   validation past either limit fails. It never becomes a nonconformant result.
 * `rows` (`--max-rows`, default 200,000,000) is the number of rows of any intermediate
   result.
+* `rows-produced` (`--max-rows-produced`, off by default) is the number of rows that all
+  the operators of a query produce, summed. It measures the work of a query rather than
+  its largest table, so a query that builds many medium-sized results passes the `rows`
+  budget and still fails this one. The WHERE clauses of one update share a single count.
+  It is off by default because the timeout already bounds the work of a query. Turn it on
+  for a limit that does not depend on how fast the machine is or how busy it is.
+* `dataset-bytes` is the storage quota of a persistent dataset (see
+  [Storage quotas](#storage-quotas)). A write that would take the dataset over its quota
+  fails with this budget before anything is committed.
 
-`limit` and `requested` are in bytes, or in rows for `rows`. The response of
-`/{ds}/update` includes `memPeakBytes`. `meta.memory.peakBytes` in
-`application/x-sparkles+json` reports the peak estimate of a query.
+`limit` and `requested` are in bytes, or in rows for `rows` and `rows-produced`. The
+response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
+`meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
+query's peak memory estimate and the rows its operators produced.
+
+**Budgets per request.** A query can ask for lower budgets than the server's with
+`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
+in a form body. An update takes the first three. Each value is a positive whole number,
+in MiB for `memory-mb` and `max-result-mb`. Anything else is a `400`. A value above the
+server's budget is clamped to it, so a request can lower a budget but never raise it. The
+error of a request over its budget reports the budget that applied as `limit`. The time
+budget is the `timeout` parameter, which may ask for more than the default, up to
+`--max-timeout`.
+
+```sh
+curl 'localhost:3030/ds/sparql?memory-mb=256&max-rows-produced=10000000' --data-urlencode 'query=…'
+```
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error, including the
@@ -2830,9 +3744,46 @@ estimated above the bulk threshold, replaces its graphs in one index rebuild tha
 the body as a stream. Like every write it is atomic, so a parse error leaves the data as
 it was.
 
+### Storage quotas
+
+A persistent dataset can have a storage quota, a limit on the bytes its directory takes
+on disk. `sparkles serve --max-dataset-mb` sets the default for every persistent dataset,
+and it is off (`0`) by default. `PUT /$/quota/{ds}` gives a dataset a quota of its own,
+which can be higher or lower than the default, or unlimited. `DELETE /$/quota/{ds}`
+removes it. `sparkles quota` does the same on the command line. Changing a quota needs
+`server-admin`, because it limits what the dataset's own admins can store. In-memory
+datasets have `--max-mem-dataset-mb` instead.
+
+The size is everything in the dataset directory: the index generations, the write-ahead
+log, the vocabulary of uncompacted terms, the commit catalog, and the full-text and
+spatial indexes. Older generations kept for named snapshots, the history retention window
+or a running backup count too. The server measures the directory at most once a second
+while a quota is set, and again after every rebuild. Between two measurements, each
+commit adds the bytes it writes to the write-ahead log. `/$/quota/{ds}`, `quota` in
+`/$/stats/{ds}`, the `sparkles_disk_bytes` and `sparkles_dataset_quota_bytes` metrics
+and the UI's dataset page report the usage against the quota.
+
+A write that adds quads is refused with `507` and `"budget": "dataset-bytes"` when it
+would take the dataset over its quota. Nothing is committed. Reads are never affected,
+and neither are writes that only delete, so a dataset over its quota can always shrink.
+Compaction is never refused, because it folds the write-ahead log into a new generation
+and usually makes the dataset smaller. The check works this way for each kind of write:
+
+| Write | How the quota applies |
+|---|---|
+| SPARQL update, small Graph Store write or upload | The commit is checked before its write-ahead log record is written. It is refused when the measured size plus that record exceeds the quota. |
+| Bulk load, large upload or large Graph Store PUT | The new index generation is built, then checked before it is published: the directory with the new generation, less the generation it replaces. A refused build is removed. A PUT that leaves the dataset smaller goes through, even when the dataset is over its quota. |
+| Reasoning run | The inferred triples are a commit like any other. A run whose inferences would pass the quota fails, and the previous inferences stay. |
+| Clone | The clone gets the default quota. A copy larger than that is refused, and no dataset is created. |
+| Restore | A restore is never refused. A dataset restored in place keeps the quota of the dataset it replaces, and a dataset restored under a new name gets the default. A restored dataset over its quota refuses writes that add quads until it is back under. |
+
+The quota is kept in `quota.json` in the dataset directory, so it applies to local
+commands such as `sparkles load --loc` too. Backups leave it out.
+
 ## Authentication and access control
 
-The design and its rationale are in [C09 Authentication and dataset-level access control](specs/C09-dataset-access-control.md).
+The design and its rationale are in [C09 Authentication and dataset-level access control](specs/C09-dataset-access-control.md),
+and graph-level grants are in [C12](specs/C12-graph-access-control.md).
 
 `sparkles serve --auth-config FILE` turns authentication on. Without it there are no
 credentials, and every request may do everything as the local principal. With it the
@@ -2895,7 +3846,7 @@ levels are `read` < `write` < `admin`.
 |---|---|
 | `read` | Queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}` and the dataset's tasks. |
 | `write` | `read`, plus SPARQL Update, Graph Store PUT/POST/DELETE and upload. |
-| `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text index configuration, clearing the result cache, cloning (as the source) and deletion. |
+| `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text and vector index configuration, clearing the result cache, cloning (as the source) and deletion. |
 
 There are three server permissions:
 
@@ -2906,7 +3857,8 @@ There are three server permissions:
   files under it.
 
 A principal's grants are the union of its own grants and its roles' grants. There are no
-deny rules. `--read-only` still applies to everyone, after authorization. `federate` does
+deny rules. A grant can be limited to some graphs or endpoints of a dataset (see
+[Graph-level access control](#graph-level-access-control)). `--read-only` still applies to everyone, after authorization. `federate` does
 not open every URL. `SERVICE` and `LOAD <http…>` also follow the server's outbound
 policy, which allows only public addresses unless `--outbound-allow-private` or
 `--outbound-allow` is set (see
@@ -2948,15 +3900,17 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
+| `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
+| `/$/mcp` | any | Any caller. Each tool call needs `read` on its dataset, and `sparql_update` needs `write`. An anonymous caller that can read no dataset gets `401`. See [HTTP endpoint](#http-endpoint-mcp). |
 | `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |
 | `/$/auth/tokens?owner=…` | DELETE | `server-admin` |
 | `/$/auth/device/{code}`, `…/approve`, `…/deny`, `/$/auth/cli/authorize` | | a web UI session or proxy identity |
@@ -2967,6 +3921,151 @@ otherwise reveal which datasets exist. `metrics` therefore shows the names of al
 datasets, up to `--metrics-max-datasets`, whatever the holder's dataset grants.
 Prometheus scrapes it with a static token (`Authorization: Bearer spk_…`), for example
 through `bearer_token_file` in the scrape config.
+
+### Graph-level access control
+
+The design is in [C12 Graph-level access control and endpoint permissions](specs/C12-graph-access-control.md).
+
+A grant can be limited to some named graphs of a dataset, to some of its endpoints, or to
+both. Limited grants are listed under `grants` for anonymous callers, roles, users and
+static tokens. An entry of `datasets` is a grant without limits.
+
+```toml
+[[users]]
+name = "carol"
+password = "$argon2id$…"
+datasets = { catalog = "read" }
+
+[[users.grants]]
+dataset = "wiki"                                  # a dataset name or * pattern
+level = "read"                                    # read or write, never admin
+graphs = ["urn:x-arq:DefaultGraph", "http://example.org/wiki/public/*"]
+
+[[users.grants]]
+dataset = "wiki"
+level = "write"
+graphs = ["http://example.org/wiki/carol/*"]
+
+[[roles.dashboards.grants]]
+dataset = "metrics-*"
+level = "read"
+endpoints = ["query", "info"]
+```
+
+An entry of `graphs` is `urn:x-arq:DefaultGraph` (or `default`) for the default graph,
+a graph IRI, or an IRI with `*` wildcards. A lone `*` covers every named graph but not the
+default graph. Wildcards never cover blank-node graph names or the graph of materialized
+inferences, `urn:x-sparkles:inferred`, which holds facts derived from every graph. Name
+the inferred graph exactly to grant it. `urn:x-arq:UnionGraph` is refused, because it is
+not a graph.
+
+Grants form a union, as dataset grants do. A principal reads the graphs of all its
+grants that apply, and writes the graphs of those at `write`. One grant without `graphs`
+covers every graph at its level. A `write` grant also gives `read` on its graphs, so a
+principal never writes a graph it cannot read. `admin` covers the whole dataset and is
+granted only under `datasets`.
+
+`endpoints` lists the services a grant applies to:
+
+| Endpoint | Requests |
+|---|---|
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
+| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
+| `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
+| `gsp-rw` | Graph Store reads and writes |
+| `upload` | `/{ds}/upload` |
+| `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
+| `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
+| `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema` and resources count as `info`. |
+
+A request through an endpoint that no grant names gets
+`403 {"error":"the query endpoint of /wiki is not allowed"}`. The dataset stays visible to
+a caller that can reach it through another endpoint.
+
+#### What a limited caller sees
+
+A caller whose grants cover only some graphs sees the dataset through a filtered view.
+Queries, explain, the Graph Store, full-text, vector and spatial search, schema
+discovery, diffs and point-in-time reads all read the view. A hidden graph behaves like
+one that does not exist:
+
+* `FROM` and `FROM NAMED` of a hidden graph add nothing, and `GRAPH ?g` never binds it.
+* `GRAPH <hidden> { … }` matches nothing, and `ASK { GRAPH <hidden> {} }` is false.
+* The default graph is empty when the view does not cover it. With
+  `--union-default-graph`, and for `GRAPH <urn:x-arq:UnionGraph>`, the default graph is
+  the union of the visible named graphs.
+* The inference overlay (`reasoning=true`) adds the inferred graph only when a grant names
+  it.
+* Graph Store `GET ?graph=` of a hidden graph answers `404 no such graph`, exactly as for
+  a missing graph. `GET` without a target returns the quads of the visible graphs.
+* `/$/schema/{ds}` counts the visible graphs, and `graph=` of a hidden graph is `404`.
+* `/{ds}/diff` lists, and counts, the changes of the visible graphs only, as JSON, diff
+  lines or RDF Patch.
+* The change feed `/{ds}/changes` lists every commit, each with its changes in the
+  visible graphs only, in JSON, RDF Patch and server-sent events. A commit that changed
+  only hidden graphs appears with no changes. A commit too large to list has no change
+  counts, and its commit has no quad counts.
+* `spk:hybridSearch` fuses a text and a vector ranking of the visible graphs.
+
+The engine applies the view to every scan, path, count, search and statistic, so counts
+answered from index statistics are exact for the view. Plans shown to a limited caller,
+by `/explain` or in the Sparkles result format, have `estimatedRows` and `estimatedCost`
+of `-1`, statistics notes reduced to `[from statistics]`, and no operator counters,
+because those come from statistics of every graph.
+
+Routes that report on the whole dataset answer `403` with
+`"… covers every graph of /wiki, and your access is limited to some graphs"`. These are
+`/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
+`/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
+`/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes
+to `/{ds}/prefixes`. Other
+responses leave out figures that count every graph:
+
+* `DatasetInfo` counts in `quads` only the quads of the visible graphs, has no index or
+  inference counts, and has `graphs: "limited"`;
+* commits (`/$/commits`, snapshots, diffs, write receipts and MCP's `list_commits`) have
+  no `inserted`, `deleted`, `quads`, `exact` or `digest`;
+* `/$/ready` has no `walBytes` or `deltaQuads` for the dataset;
+* `/$/tasks` leaves out the dataset's tasks.
+
+Commit numbers, entity tags and `Sparkles-Commit` headers are the same for every caller.
+They show that a commit happened, not what it changed. Full-text scores use the term
+statistics of the whole index.
+
+#### Writes of a limited caller
+
+Each quad a write asks to insert or delete must be in a graph the caller writes. The check
+looks at the requested quads before anything is looked up, so the answer does not depend
+on whether a quad or a hidden graph exists. A refused write changes nothing and answers
+`403 {"error":"write access to graph <http://example.org/g> required"}`.
+
+* `INSERT DATA` and `DELETE DATA` check every quad, and templates check their graphs, also
+  those bound by the `WHERE` clause.
+* `CLEAR`, `DROP` and `CREATE` of a named graph, and `LOAD … INTO GRAPH`, check the graph
+  first. `CLEAR ALL`, `CLEAR NAMED` and `DROP ALL` act on the visible graphs, and each of
+  them must be writable. Hidden graphs are left alone.
+* The `WHERE` clause reads the view, after `WITH` and `USING` are applied.
+* Graph Store `PUT`, `POST` and `DELETE` check `?graph=` or `?default` before the body is
+  read. A `POST` of quads without a target checks each quad. `PUT` and `DELETE` without a
+  target are refused, because they replace or clear the whole dataset.
+* Uploads check each quad.
+* A write that the dataset's validation guard rejects answers `422` without the guard's
+  results, which can quote any graph.
+
+#### Mapping Fuseki's configuration
+
+| Fuseki | Sparkles |
+|---|---|
+| `access:entry ("user1" <g1> <g2>)` in the registry of dataset `ds` | `[[users.grants]]` with `dataset = "ds"`, `level = "read"`, `graphs = ["g1", "g2"]` |
+| `<urn:x-arq:DefaultGraph>` in an entry | `"urn:x-arq:DefaultGraph"` in `graphs` |
+| a user without an entry | no grant: the dataset is hidden |
+| `fuseki:allowedUsers` on the dataset | `datasets = { ds = "read" }` (or `write`) |
+| `fuseki:allowedUsers` on an endpoint | a grant with `endpoints = ["query"]`, `["update"]`, `["gsp-r"]` … |
+| `fuseki:allowedUsers "*"` | a role that every user holds, or `[external] default_roles` |
+
+Fuseki applies graph access control to read-only datasets only. Sparkles grants `write`
+on graphs too. Fuseki's levels intersect, while Sparkles grants form a union, so a grant
+names the endpoints it allows rather than the ones it removes.
 
 ### CSRF and CORS
 
@@ -3000,6 +4099,8 @@ type Whoami = {
   tokenId?: string;       // token principals
   server: ("metrics" | "federate" | "server-admin")[];
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
+  // datasets where the caller's grants cover only some graphs or endpoints
+  restricted: Record<string, { graphs: boolean; endpoints?: string[] }>;
   canMintTokens: boolean;
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
@@ -3240,14 +4341,16 @@ device approvals and reloads.
 
 The design and its rationale are in [C11 MCP server](specs/C11-mcp-server.md).
 
-`sparkles mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io) on
-stdin/stdout, as JSON-RPC 2.0 with one message per line. It is not an HTTP endpoint, but
-it exposes the same engine as the server.
+The server speaks the [Model Context Protocol](https://modelcontextprotocol.io) over two
+transports that offer the same tools, resources and prompts. `sparkles mcp` speaks it on
+stdin/stdout, as JSON-RPC 2.0 with one message per line, and runs as the user who starts
+it. `sparkles serve --mcp` serves it over Streamable HTTP at `/$/mcp`, where every call
+runs as the HTTP request's caller (see [HTTP endpoint](#http-endpoint-mcp)).
 
 ```
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
-             [--allow-service] [--timeout SECS] [--query-memory-mb N] [--max-rows N]
-             [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
+             [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
+             [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--schema-max-entries N] [--text]
 ```
 
@@ -3261,6 +4364,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--max-rows N` | `200000000` | Rows of any intermediate result. |
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
 | `--max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
+| `--allow-update` | off | Offers `sparql_update` and opens the databases for writing. Without it the process never writes. |
 | `--allow-service` | off | Allows `SERVICE` in queries. |
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
@@ -3271,16 +4375,18 @@ The process exits 0 when stdin closes and 1 on a startup error. Logs go to stder
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses
 `server/discover`, and each request carries the protocol version and client capabilities
 in its `_meta`. An unknown revision gets `-32022` with `data.supported`. The capabilities
-are `{"tools": {}}`. `server/discover` and `tools/list` are cacheable for an hour
-(`ttlMs: 3600000`, `cacheScope: "public"`), because the tool set is fixed for the life of
-the process. `notifications/cancelled` stops the referenced call, and no response is sent
-for that call. The server's `instructions` describe the workflow
+are `{"tools": {}, "resources": {}, "prompts": {}}`. `server/discover` and `tools/list`
+are cacheable for an hour (`ttlMs: 3600000`), because the tool set is fixed for the life
+of the process. Their `cacheScope` is `public`, except on an HTTP server with
+authentication, where tool listings differ between callers and the scope is `private`.
+`notifications/cancelled` stops the referenced call, and no response is sent for that
+call. The server's `instructions` describe the workflow
 (`list_datasets` → `describe_schema` → `sparql_query`) and say that tool results are
 untrusted data.
 
 ### Tools
 
-Tools appear in this order. All are read-only
+Tools appear in this order. All but `sparql_update` are read-only
 (`annotations: {"readOnlyHint": true, "openWorldHint": false}`). `sparql_query` is
 open-world when SERVICE is allowed. The common arguments are:
 
@@ -3305,6 +4411,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
+| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
+| `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. Listed only when the server allows updates and the caller may write to a dataset (below). |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
@@ -3360,6 +4468,124 @@ last use. Otherwise the call fails with `unknown-commit`, with a message such as
 "commit 57 does not exist …". All internal queries of one call read one snapshot, and
 `describe_schema` cursors are bound to their snapshot.
 
+### The write tool
+
+`sparql_update` is off by default. The operator turns it on with `sparkles mcp
+--allow-update` or `sparkles serve --mcp-allow-update`, and a `--read-only` server never
+offers it. Over HTTP it is listed only for a caller with `write` on some dataset it can
+see, and a call on a dataset the caller may only read fails with `forbidden`. Its
+annotations are `{"readOnlyHint": false, "destructiveHint": true, "idempotentHint":
+false, "openWorldHint": false}`, so hosts that confirm destructive tools ask the user
+first. The change is committed at once and cannot be undone through MCP.
+
+The update runs like one sent to `/{ds}/update`, with the dataset's prefixes
+predeclared. It passes the dataset's [write-time validation](#write-time-validation), and
+a rejected write fails with `validation-failed` and writes nothing. `message` is recorded
+with the commit under the rules of `Sparkles-Commit-Message`. When the call has no
+`message`, an HTTP request's `Sparkles-Commit-Message` header supplies it. `LOAD` is
+refused with `load-disabled`, because it would read files or fetch URLs. A query sent to
+this tool fails with `not-an-update`. The result is the write's receipt, with the
+commit's sequence number, the quads inserted and deleted, and the validation summary when
+a guard ran.
+
+### Resources and prompts
+
+Each dataset the caller may read has two resources:
+
+| URI | `mimeType` | Content |
+|---|---|---|
+| `sparkles://{ds}/schema` | `application/json` | The `describe_schema` summary at the head commit, for the default graph with default reasoning. |
+| `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
+
+`resources/list` returns them sorted by URI, and `resources/templates/list` returns the
+two URI templates. A `resources/read` result may be cached for 30 seconds by the caller
+only (`ttlMs: 30000`, `cacheScope: "private"`). An unknown URI, or a dataset the caller
+cannot read, is `-32602`. Hosts choose resources as context for the model, so the tools
+remain the main interface.
+
+| Prompt | Arguments | Message |
+|---|---|---|
+| `explore_dataset` | `dataset` | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
+| `answer_question` | `dataset`, `question` | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to inspect the schema first, use LIMIT, verify IRIs with `describe_resource`, cite the commit, and treat data as data. |
+
+Both arguments of each prompt are required, and a missing one or a dataset the caller
+cannot read is `-32602`. Prompt text never contains data from the dataset. Only the
+dataset name, its prefixes and the user's question are filled in.
+
+### HTTP endpoint `/$/mcp`
+
+`sparkles serve --mcp` mounts the endpoint. Without the flag, `/$/mcp` is `404`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--mcp` | off | Serves the MCP tools at `/$/mcp`. |
+| `--mcp-allow-update` | off | Offers `sparql_update`. It has no effect, and logs a warning, on a `--read-only` server. |
+| `--mcp-allow-service` | off | Allows `SERVICE` in MCP queries. `--no-service` still wins, and with auth the caller needs `federate`. |
+| `--mcp-dataset PATTERN` | all | The datasets MCP may show, by name or `*` pattern (repeatable). Permissions still apply within them. |
+| `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
+| `--mcp-query-memory-mb N` | `2048` | Memory budget of a call's queries. `--query-memory-mb` caps it. |
+| `--mcp-max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
+| `--mcp-disable-tool NAME` | | Does not offer the tool (repeatable). |
+| `--mcp-max-sessions N` | `256` | Sessions of legacy clients open at once. `0` serves those clients without sessions. |
+
+A call may ask for a `timeoutSeconds` up to the server's `--timeout`, and calls default
+to 30 seconds. The intermediate-row cap is `--max-rows`.
+
+**Transport.** The endpoint follows the Streamable HTTP transport of the MCP
+specification. A client POSTs one JSON-RPC message with `Content-Type: application/json`
+and `Accept: application/json, text/event-stream`.
+
+- A request of revision `2026-07-28` is stateless. It carries `MCP-Protocol-Version`,
+  `Mcp-Method` and, for `tools/call`, `resources/read` and `prompts/get`, `Mcp-Name`. The
+  answer is one `application/json` response. Headers that disagree with the body get
+  `400` with `-32020`. An unknown method gets `404` with `-32601`.
+- A legacy client starts with `initialize` and gets an `Mcp-Session-Id`. It sends that
+  header, and `MCP-Protocol-Version`, with every later message. Answers to its requests
+  come as a short `text/event-stream`. GET with the session id opens the session's
+  server-to-client stream, and DELETE ends the session. An unknown or ended session is
+  `404`. A session closes after 5 minutes without traffic.
+- A notification or response from the client gets `202` with no body.
+- A body that is not JSON gets `400` with `-32700`, and a body over 4 MiB gets `413`.
+  Methods other than POST, GET and DELETE get `405`.
+
+**Who calls.** Every message runs as the request's principal, authenticated as on every
+other route by HTTP Basic, an API token, a web UI session or trusted proxy headers.
+
+- The tools, resources and prompts see only the datasets the principal may read. A
+  dataset it cannot read is reported like one that does not exist (`unknown-dataset`),
+  and `list_datasets` leaves it out.
+- `sparql_update` needs `write` on its dataset. `SERVICE` needs `federate`.
+- An anonymous caller that can read no dataset gets `401` with the server's
+  `WWW-Authenticate` challenges, so a client knows to sign in. Invalid credentials are
+  `401` as on every route.
+- A legacy session belongs to the principal that opened it. The same session id from
+  another caller is `404`. Each message still runs as its own caller.
+
+Clients authenticate with a bearer token in the `Authorization` header. Create one with
+`sparkles auth token create` or `POST /$/auth/tokens`, and scope it to the datasets the
+agent should reach. The endpoint does not publish OAuth protected-resource metadata,
+because the server accepts only its own API tokens and the OIDC provider issues none of
+them. Browser sessions and proxy identities are ambient credentials, so their POSTs need
+the CSRF header as on every other route.
+
+**Limits.** A `tools/call` is charged to the `query` [rate limit](#rate-limiting) of its
+dataset, and a `sparql_update` call to the `update` limit, as the SPARQL endpoints are.
+The client key is the same, so a caller's MCP calls and its SPARQL requests share their
+budgets. A `resources/read` counts as a query. Listings, `initialize`, prompts and
+notifications are not charged. A limited message gets `429` or `503` with `Retry-After`,
+like any other request. The concurrency permits are held until the tool's work ends, even
+when the client has disconnected. Closing the connection of a stateless request cancels
+its tool call.
+
+**Origin and Host.** The endpoint is behind the same checks as every route. A request
+whose `Origin` is not the server's own or an allowed CORS origin (`--cors-origin`, or
+`cors.origins` with auth) gets `403`. Without auth, a `Host` the server does not answer
+to gets `421`, which stops DNS rebinding. Browser clients on an allowed origin can read
+`Mcp-Session-Id`, and send the MCP headers.
+
+The access log records MCP messages with `operation=mcp`. The `sparkles_requests_total`
+and `sparkles_request_duration_seconds` metrics count them under the same label.
+
 ### Errors
 
 A failed call is a result with `isError: true` and one text block
@@ -3374,8 +4600,13 @@ is the equivalent HTTP status:
 | `syntax` | 400 | A SPARQL syntax error, with line and column. The hint lists the predeclared prefixes. Also a shapes graph, ShEx schema or shape map that does not parse. |
 | `invalid-shapes`, `invalid-schema` | 400 | Shapes the SHACL validator cannot use. A ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape), or a shape-map label it does not define. |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query`. |
+| `not-an-update` | 400 | A query sent to `sparql_update`. |
+| `forbidden` | 403 | `sparql_update` on a dataset the caller may only read, or `SERVICE` without `federate`. |
+| `load-disabled` | 403 | `LOAD` in `sparql_update`. |
+| `validation-failed` | 422 | Write-time validation rejected the update. Nothing was written. |
+| `storage-full` | 507 | The write would leave less free disk than the server keeps, or grow an in-memory dataset past its limit. |
 | `timeout` | 408 | The call's timeout passed. |
-| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
+| `budget-memory`, `budget-rows`, `budget-rows-produced`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |
 | `unknown-commit` | 404 / 410 | `atCommit` is in the future (404) or no longer held (410). |
 | `stale-cursor` | 409 / 400 | A schema cursor whose snapshot is gone (409), or a malformed cursor (400). |

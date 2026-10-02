@@ -392,7 +392,7 @@ function createMock({
     const b = {
       name: opts.name,
       repository: repo.config.name,
-      dataset: { name: src.name, id: src.id },
+      dataset: { name: src.name, id: src.id, type: src.type ?? 'persistent' },
       commit: {
         seq: src.seq,
         timestamp: src.timestamp,
@@ -546,6 +546,7 @@ function createMock({
     return {
       name: ds.name,
       id: ds.id,
+      type: ds.type === 'mem' ? 'mem' : 'persistent',
       seq: c.seq,
       timestamp: at == null ? c.timestamp : iso(Math.min(Date.parse(c.timestamp), at - 7 * 60_000)),
       scale: 1500,
@@ -702,12 +703,6 @@ function createMock({
             millis: backup.millis,
           });
         }
-        items.push({
-          dataset: 'scratch',
-          backup: null,
-          result: 'skipped',
-          reason: 'in-memory dataset',
-        });
         const r = policyRun('nightly', run, i === 5 ? 'catch-up' : 'schedule', at, items);
         if (!failed) r.retention = { deleted: i === 1 ? ['nightly-foaf-20260829'] : [] };
         runs.push(r);
@@ -1321,15 +1316,6 @@ function createMock({
       },
       finish: () => {
         for (const ds of selected) {
-          if (ds.type === 'mem') {
-            items.push({
-              dataset: ds.name,
-              backup: null,
-              result: 'skipped',
-              reason: 'in-memory dataset',
-            });
-            continue;
-          }
           const last = [...repo.backups.values()]
             .filter((b) => b.policy === p.name && b.dataset.id === ds.id)
             .sort((a, b) => b.completed.localeCompare(a.completed))[0];
@@ -1855,8 +1841,6 @@ function createMock({
             if (!live) throw err(404, 'no-such-dataset', `No such dataset: ${ds}`);
             const body = await jsonBody(req);
             const repo = getRepo(String(body.repository ?? ''), { write: true });
-            if (live.type === 'mem')
-              throw err(501, 'backup-unsupported', 'in-memory datasets cannot be backed up yet');
             const name = body.name ? String(body.name) : `${ds}-${timeToken(Date.now())}`;
             if (!BACKUP_NAME.test(name))
               throw err(400, 'invalid-name', `invalid backup name “${name}”`);

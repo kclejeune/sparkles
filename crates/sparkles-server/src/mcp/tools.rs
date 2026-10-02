@@ -51,6 +51,9 @@ pub fn run(
         "validate_shacl" => t.validate_shacl(args),
         #[cfg(feature = "shex")]
         "validate_shex" => t.validate_shex(args),
+        #[cfg(feature = "fmt")]
+        "format" => t.format(args),
+        "sparql_update" => t.sparql_update(args),
         _ => Err(ToolError::internal(&call.request_id)),
     }
 }
@@ -355,6 +358,28 @@ impl Tools<'_> {
         self.server.cfg()
     }
 
+    /// [`ToolError`] 403 unless the caller's grants reach the `info` endpoint of `ds`.
+    pub(super) fn info_endpoint(&self, ds: &str) -> Result<(), ToolError> {
+        if self
+            .call
+            .principal
+            .can_at(ds, crate::auth::Endpoint::Info, crate::auth::Level::Read)
+        {
+            Ok(())
+        } else {
+            Err(ToolError::new(
+                "forbidden",
+                403,
+                format!("the info endpoint of /{ds} is not allowed"),
+            ))
+        }
+    }
+
+    /// The dataset the call names, among those its principal may read.
+    pub(super) fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
+        self.server.dataset(&self.call.principal, name)
+    }
+
     pub(super) fn ctx<'n>(
         &'n self,
         prefix_names: &'n [&'n str],
@@ -390,14 +415,28 @@ impl Tools<'_> {
 
     pub(super) fn query_options(
         &self,
+        ds: &str,
+        endpoint: crate::auth::Endpoint,
         reasoning: bool,
         deadline: Instant,
         prefixes: &BTreeMap<String, String>,
     ) -> Result<QueryOptions, Error> {
-        Ok(QueryOptions {
+        // a grant limited to other endpoints does not reach this tool
+        if !self
+            .call
+            .principal
+            .can_at(ds, endpoint, crate::auth::Level::Read)
+        {
+            return Err(Error::NotPermitted(format!(
+                "the {} endpoint of /{ds} is not allowed",
+                endpoint.as_str()
+            )));
+        }
+        let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
             max_memory_bytes: self.cfg().query_memory_bytes,
+            max_rows_produced: self.server.state.limits.max_rows_produced,
             allow_service: self.cfg().allow_service,
             outbound: self.server.state.outbound.clone(),
             cancel: Some(self.call.cancel.clone()),
@@ -408,7 +447,11 @@ impl Tools<'_> {
             },
             prefixes: prefix_vec(prefixes),
             ..Default::default()
-        })
+        };
+        // SERVICE and LOAD are the principal's server permissions, and the graphs its
+        // grants cover, as over HTTP
+        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);
+        Ok(opts)
     }
 
     /// Parse a query, telling SPARQL Update apart from a syntax error.
@@ -438,15 +481,9 @@ impl Tools<'_> {
     fn list_datasets(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let NoArgs {} = parse(args)?;
         let cfg = self.cfg();
-        let updates = self.server.offers("sparql_update");
-        let datasets: Vec<Arc<Dataset>> = self
-            .server
-            .state
-            .datasets
-            .read()
-            .values()
-            .cloned()
-            .collect();
+        let p = &self.call.principal;
+        let updates = self.server.may_update(p);
+        let datasets = self.server.visible(p);
         let list: Vec<Value> = datasets
             .iter()
             .map(|ds| {
@@ -457,14 +494,19 @@ impl Tools<'_> {
                     let f = crate::reasoning::freshness(info, &ds.store, snap.commit);
                     json!({ "profile": info.profile, "stale": f.stale })
                 });
+                // the quads the caller can read
+                let quads = match p.view(&ds.name, crate::auth::Endpoint::Info) {
+                    Some(v) => v.visible_quads(&snap).ok(),
+                    None => Some(snap.len()),
+                };
                 json!({
                     "name": ds.name,
-                    "quads": snap.len(),
+                    "quads": quads,
                     "commit": snap.commit,
                     "modified": modified,
                     "reasoning": reasoning,
                     "textSearch": ds.store.text_enabled(),
-                    "writable": updates && !self.server.state.read_only,
+                    "writable": updates && p.can(&ds.name, crate::auth::Level::Write),
                 })
             })
             .collect();
@@ -495,7 +537,7 @@ impl Tools<'_> {
             1,
             500,
         )? as usize;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -698,8 +740,15 @@ impl Tools<'_> {
         timeout: Duration,
         ctx: &ErrorContext,
     ) -> Result<Arc<SchemaReport>, ToolError> {
+        self.info_endpoint(&ds.name)?;
         let identity = schema::snapshot_identity(snap);
-        if let Some(e) = ds.schema_cache.lock().as_ref()
+        // a caller limited to some graphs gets a report of those, outside the cache
+        let graphs = self
+            .call
+            .principal
+            .view(&ds.name, crate::auth::Endpoint::Info);
+        if graphs.is_none()
+            && let Some(e) = ds.schema_cache.lock().as_ref()
             && e.identity == identity
             && e.selection == selection
         {
@@ -715,13 +764,17 @@ impl Tools<'_> {
             deadline: Some(deadline),
             cancel: Some(self.call.cancel.clone()),
             max_entries: self.server.state.schema_max_entries,
+            term_totals: false,
+            graphs: graphs.clone(),
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
-        *ds.schema_cache.lock() = Some(SchemaCacheEntry {
-            identity,
-            selection,
-            report: report.clone(),
-        });
+        if graphs.is_none() {
+            *ds.schema_cache.lock() = Some(SchemaCacheEntry {
+                identity,
+                selection,
+                report: report.clone(),
+            });
+        }
         Ok(report)
     }
 
@@ -750,7 +803,7 @@ impl Tools<'_> {
         let exact_total = a.exact_total.unwrap_or(true);
         let format = a.format.unwrap_or(Format::Table);
         let timeout = self.timeout(a.timeout_seconds)?;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -778,7 +831,13 @@ impl Tools<'_> {
         }
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &prefix_map)
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &prefix_map,
+            )
             .map_err(|e| ctx.engine(e))?;
         let mut r = sparql::execute_query(snap.clone(), &parsed, &opts, parse_ms)
             .map_err(|e| ctx.engine(e))?;
@@ -832,7 +891,7 @@ impl Tools<'_> {
     fn explain_query(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: ExplainArgs = parse(args)?;
         query_text(&a.query)?;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -842,7 +901,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let opts = self
-            .query_options(reasoning, self.call.arrived + timeout, &prefix_map)
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                self.call.arrived + timeout,
+                &prefix_map,
+            )
             .map_err(|e| ctx.engine(e))?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
@@ -898,7 +963,9 @@ impl Tools<'_> {
                 ),
             }));
         }
-        if !self.cfg().allow_service && has_service(pattern(&parsed)) {
+        let service =
+            self.cfg().allow_service && self.call.principal.has(crate::auth::ServerPerm::Federate);
+        if !service && has_service(pattern(&parsed)) {
             warnings.push(json!({
                 "code": "service-disabled",
                 "message": "SERVICE is disabled for MCP calls.",
@@ -925,7 +992,7 @@ impl Tools<'_> {
         let max_triples = bounded("maxTriples", a.max_triples, 50, 1, 500)? as usize;
         let direction = a.direction.unwrap_or(Direction::Both);
         let lang = a.lang.unwrap_or_else(|| "en".to_string());
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
@@ -936,7 +1003,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         let q = Queries {
             snap: &snap,
@@ -1047,7 +1120,9 @@ impl Tools<'_> {
     fn list_commits(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: ListCommitsArgs = parse(args)?;
         let limit = bounded("limit", a.limit, 10, 1, 100)? as usize;
-        let ds = self.server.dataset(a.dataset.as_deref())?;
+        let ds = self.dataset(a.dataset.as_deref())?;
+        self.info_endpoint(&ds.name)?;
+        let restricted = self.call.principal.restricted(&ds.name);
         let range = a.before.map_or(CommitRange::Latest, CommitRange::Before);
         let head = ds.store.head_commit().seq;
         let page = ds.store.commits(range, limit);
@@ -1060,14 +1135,19 @@ impl Tools<'_> {
             .commits
             .iter()
             .map(|c| {
-                json!({
+                let mut j = json!({
                     "seq": c.seq,
                     "timestamp": c.timestamp(),
                     "kind": c.kind.name(),
                     "inserted": c.inserted,
                     "deleted": c.deleted,
                     "quads": c.quads,
-                })
+                });
+                // the counts cover every graph
+                if restricted {
+                    crate::http::redact_commit_json(&mut j);
+                }
+                j
             })
             .collect();
         Ok(Outcome::Structured(json!({

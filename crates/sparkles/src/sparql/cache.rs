@@ -259,7 +259,7 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
     };
     let _ = write!(s, "({} [{}] {{{}}}", n.operator(), n.desc, names(&n.vars));
     let ok = match &n.kind {
-        Kind::Service { .. } | Kind::VectorSearch(_) => false,
+        Kind::Service { .. } | Kind::VectorSearch(_) | Kind::HybridSearch(_) => false,
         Kind::Values(t) => {
             // include the actual rows (local ids make it uncacheable)
             if t.cols.iter().flatten().any(|id| id.tag() == Tag::Local) {
@@ -280,6 +280,10 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         | Kind::GroupCountScan { spec, .. } => {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
             true
+        }
+        Kind::CountFilterScan { spec, filter, .. } => {
+            let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);
+            filter.iter().all(deterministic)
         }
         Kind::RangeScan(spec, range) => {
             let _ = write!(s, "{:?}{:?}{:?}", spec.prefix, spec.graph, spec.eqs);

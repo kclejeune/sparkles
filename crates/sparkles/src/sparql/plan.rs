@@ -34,7 +34,7 @@ pub enum ActiveGraph {
     Var(VarId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GraphFilter {
     /// no restriction (graph is an output column or the prefix)
     All,
@@ -157,6 +157,8 @@ pub enum VectorQuery {
     Vector(Arc<[f32]>),
     /// an entity whose (single) vector under the predicate is the query
     Entity(Id),
+    /// bound by the rest of the group: a vector literal or an entity per input row
+    Var(VarId),
 }
 
 /// A `spk:vectorSearch` call planned as a leaf (exact top-k similarity search).
@@ -174,6 +176,20 @@ pub struct VectorSpec {
     pub graph_var: Option<VarId>,
     /// merge rows with the same (s, vector) from different graphs (merged default graph)
     pub dedup: bool,
+    /// `exact:true` and `ef:N`
+    pub mode: crate::vector::SearchMode,
+    /// `distinct:subject`: at most one row (the best) per subject
+    pub distinct_subject: bool,
+    /// `candidates:join`: only subjects the rest of the group binds
+    pub candidates: bool,
+}
+
+impl VectorSpec {
+    /// Whether the search reads the rest of its group (child 0): a variable query or
+    /// `candidates:join`.
+    pub fn needs_input(&self) -> bool {
+        self.candidates || matches!(self.query, VectorQuery::Var(_))
+    }
 }
 
 /// A `text:query` call planned as a leaf (full-text search).
@@ -191,12 +207,16 @@ pub struct TextSpec {
     /// the call's graph slot
     pub graph_out: Option<VarId>,
     pub prop: Option<VarId>,
+    /// the hit's rank: 1 + the number of hits with a higher score
+    pub rank: Option<VarId>,
     /// graph scope of the active graph
     pub graph: GraphFilter,
     /// `GRAPH ?g { … }` around the call: bound from each hit's graph
     pub graph_var: Option<VarId>,
     /// merge hits of the same (s, p, o) from different graphs (merged default graph)
     pub dedup: bool,
+    /// `highlight:` options: the literal output is the highlighted fragments
+    pub highlight: Option<crate::text::HighlightOpts>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -284,8 +304,8 @@ pub enum Kind {
         spec: ScanSpec,
         key: VarId,
         counts: Vec<VarId>,
-        /// answered from the index statistics' per-class counts (exact for this snapshot)
-        metadata: bool,
+        /// the counts per key from the index statistics (exact for this snapshot)
+        metadata: Option<Arc<super::stats::Counts>>,
     },
     /// `COUNT(*)` over a join of two scans on one variable: both children are scans
     /// sorted on it, read as (key, run length) pairs; the count is Σ left × right
@@ -302,6 +322,17 @@ pub enum Kind {
         var: VarId,
         /// the count read from the index statistics (exact for this snapshot)
         metadata: Option<u64>,
+    },
+    /// `COUNT(*)` over a FILTER on one variable of a single scan: the scan is read as
+    /// runs of a permutation sorted on the variable, the filter is tested once per run
+    /// and the lengths of the runs that pass are summed
+    CountFilterScan {
+        spec: ScanSpec,
+        key: VarId,
+        filter: Vec<Expr>,
+        var: VarId,
+        /// `COUNT(DISTINCT ?key)`: the number of runs that pass
+        distinct: bool,
     },
     /// decompose the triple term in `t` into `parts` (RDF 1.2)
     Unpack {
@@ -323,6 +354,8 @@ pub enum Kind {
     TextSearch(Box<TextSpec>),
     /// exact vector similarity search (`spk:vectorSearch`)
     VectorSearch(Box<VectorSpec>),
+    /// a text and a vector ranking fused (`spk:hybridSearch`)
+    HybridSearch(Box<super::hybrid::HybridSpec>),
     /// scan of a spatially indexed predicate restricted by spatial filters on its object
     SpatialScan(Box<super::geopf::SpatialScanSpec>),
     /// a `spatial:` property function
@@ -441,7 +474,10 @@ impl Node {
                 metadata: Some(_), ..
             } => "CountDistinctFromMetadata",
             Kind::CountDistinctScan { .. } => "CountDistinctFromIndex",
-            Kind::GroupCountScan { metadata: true, .. } => "GroupCountFromMetadata",
+            Kind::CountFilterScan { .. } => "CountFilterFromRuns",
+            Kind::GroupCountScan {
+                metadata: Some(_), ..
+            } => "GroupCountFromMetadata",
             Kind::GroupCountScan { .. } => "GroupCountFromIndex",
             Kind::CountJoinRuns { .. } => "CountJoinFromRuns",
             Kind::CountJoin { .. } => "CountJoin",
@@ -450,6 +486,7 @@ impl Node {
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
+            Kind::HybridSearch(_) => "HybridSearch",
             Kind::SpatialScan(_) => "SpatialScan",
             Kind::SpatialPf(_) => "SpatialPf",
             Kind::IndexJoin(j) if j.probes.len() > 1 => "StarJoin",
@@ -491,7 +528,7 @@ struct PathItem {
     graph: ActiveGraph,
 }
 
-const FILTER_SELECTIVITY: f64 = 0.3;
+pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
 const DP_LIMIT: usize = 12;
 
 pub struct Planner<'a> {
@@ -500,6 +537,11 @@ pub struct Planner<'a> {
     bnode_scope: u32,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
+    /// the whole query being planned, if known: a search output it mentions nowhere else
+    /// is left out (see [`Planner::used_elsewhere`])
+    pub source: Option<&'a spargebra::Query>,
+    /// the source's SSE form, or `None` when every variable counts as used
+    source_sse: std::cell::OnceCell<Option<String>>,
 }
 
 /// `<<( s p o )>>` with variables: the triple term bound to `t` is decomposed into
@@ -517,7 +559,37 @@ impl<'a> Planner<'a> {
             subst: FxHashMap::default(),
             bnode_scope: 0,
             unpacks: Default::default(),
+            source: None,
+            source_sse: Default::default(),
         }
+    }
+
+    /// Whether the variable or blank node `t`, which a property function call binds,
+    /// occurs in the query anywhere but that call. Every occurrence in the algebra's SSE
+    /// form counts, so the answer errs towards "used" (a string that happens to contain
+    /// the name counts too). Without the source query, and with `COUNT(DISTINCT *)`,
+    /// which depends on every variable, everything is used.
+    fn used_elsewhere(&self, t: &TermPattern) -> bool {
+        let sse = self.source_sse.get_or_init(|| {
+            let sse = self.source?.to_sse();
+            (!sse.contains("(count distinct)")).then_some(sse)
+        });
+        let Some(sse) = sse else {
+            return true;
+        };
+        let name = match t {
+            TermPattern::Variable(v) => format!("?{}", v.as_str()),
+            TermPattern::BlankNode(b) => format!("_:{}", b.as_str()),
+            _ => return true,
+        };
+        let mentions = sse
+            .match_indices(&name)
+            .filter(|(i, _)| {
+                !sse[i + name.len()..]
+                    .starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '\u{b7}')
+            })
+            .count();
+        mentions != 1
     }
 
     pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
@@ -865,6 +937,15 @@ impl<'a> Planner<'a> {
                     crate::vector::VECTOR_SEARCH,
                     "spk:vectorSearch",
                 )?;
+                let (hcalls, mut patterns) = super::textpf::take_calls(
+                    &patterns,
+                    super::hybrid::HYBRID_SEARCH,
+                    "spk:hybridSearch",
+                )?;
+                let hcalls = hcalls
+                    .into_iter()
+                    .map(|(s, o)| Ok((s, super::hybrid::take_lists(&mut patterns, o)?)))
+                    .collect::<Result<Vec<_>>>()?;
                 let (rcalls, patterns) =
                     super::georewrite::take_rewrite_triples(patterns, self.ctx)?;
                 let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
@@ -876,6 +957,11 @@ impl<'a> Planner<'a> {
                 }
                 for (subjects, args) in vcalls {
                     items.push(Item::Node(self.vector_leaf(subjects, args, g)?));
+                }
+                for (subjects, args) in hcalls {
+                    items.push(Item::Node(super::hybrid::hybrid_leaf(
+                        self, subjects, args, g,
+                    )?));
                 }
                 for c in scalls {
                     items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
@@ -1002,7 +1088,7 @@ impl<'a> Planner<'a> {
 
     /// A `spk:vectorSearch` call as a search leaf:
     /// `(?s ?score ?vector) spk:vectorSearch (predicate query [k] ["metric:…"])`.
-    fn vector_leaf(
+    pub(super) fn vector_leaf(
         &self,
         subjects: Vec<TermPattern>,
         args: Vec<TermPattern>,
@@ -1042,26 +1128,21 @@ impl<'a> Planner<'a> {
             Some(TermPattern::Literal(_)) => {
                 return Err(bad("the query must be an spk:vector literal or an entity"));
             }
-            Some(t @ (TermPattern::NamedNode(_) | TermPattern::BlankNode(_))) => {
-                match self.term_pattern(&t) {
-                    PT::C(id) => VectorQuery::Entity(id),
-                    // a blank node in a pattern is a variable
-                    PT::V(_) => {
-                        return Err(Error::unsupported(
-                            "spk:vectorSearch: a variable query vector is not supported yet",
-                        ));
-                    }
-                }
-            }
-            Some(TermPattern::Variable(_)) => {
-                return Err(Error::unsupported(
-                    "spk:vectorSearch: a variable query vector is not supported yet",
-                ));
-            }
+            Some(
+                t @ (TermPattern::NamedNode(_)
+                | TermPattern::BlankNode(_)
+                | TermPattern::Variable(_)),
+            ) => match self.term_pattern(&t) {
+                PT::C(id) => VectorQuery::Entity(id),
+                // a variable (or a blank node, which is one in a pattern)
+                PT::V(v) => VectorQuery::Var(v),
+            },
             _ => return Err(shape()),
         };
         let mut k = 10;
-        let mut metric = Metric::Cosine;
+        let mut metric = None;
+        let mut mode = vector::SearchMode::default();
+        let (mut distinct_subject, mut candidates) = (false, false);
         for a in args {
             let TermPattern::Literal(l) = a else {
                 return Err(shape());
@@ -1069,9 +1150,21 @@ impl<'a> Planner<'a> {
             if l.datatype() == oxrdf::vocab::xsd::STRING {
                 match l.value().split_once(':') {
                     Some(("metric", m)) => {
-                        metric = Metric::parse(m)
-                            .ok_or_else(|| bad(&format!("unknown metric {m:?}")))?;
+                        metric = Some(
+                            Metric::parse(m)
+                                .ok_or_else(|| bad(&format!("unknown metric {m:?}")))?,
+                        );
                     }
+                    Some(("exact", "true")) => mode.exact = true,
+                    Some(("exact", "false")) => mode.exact = false,
+                    Some(("ef", n)) => {
+                        let ef = n.parse::<usize>().map_err(|_| {
+                            bad(&format!("ef must be a positive integer, got {n:?}"))
+                        })?;
+                        mode.ef = Some(vector::SearchMode::validate_ef(ef)?);
+                    }
+                    Some(("distinct", "subject")) => distinct_subject = true,
+                    Some(("candidates", "join")) => candidates = true,
                     _ => return Err(bad(&format!("unknown option {:?}", l.value()))),
                 }
             } else {
@@ -1114,6 +1207,20 @@ impl<'a> Planner<'a> {
             vars.push(gv);
         }
         let dedup = graph_var.is_none() && graph.multi();
+        // the metric of the predicate's configured index, else cosine
+        let metric = metric.unwrap_or_else(|| {
+            pred.and_then(|p| {
+                self.ctx
+                    .snap
+                    .generation
+                    .vectors
+                    .configured_for(&self.ctx.snap, p.0)
+            })
+            .map_or(Metric::Cosine, |(_, c)| c.metric)
+        });
+        if candidates && !matches!(subject, PathEnd::Var(_)) {
+            return Err(bad("candidates:join needs a variable subject"));
+        }
         let desc = format!(
             "{} ← {} {} k={}{}",
             vars.iter()
@@ -1126,7 +1233,15 @@ impl<'a> Planner<'a> {
             match &query {
                 VectorQuery::Vector(v) => format!(" dim={}", v.len()),
                 VectorQuery::Entity(e) => format!(" like {}", self.pt_str(&PT::C(*e))),
-            }
+                VectorQuery::Var(v) => format!(" like ?{}", self.ctx.var_name(*v)),
+            } + if mode.exact { " exact" } else { "" }
+                + &mode.ef.map_or(String::new(), |e| format!(" ef={e}"))
+                + if distinct_subject {
+                    " distinct:subject"
+                } else {
+                    ""
+                }
+                + if candidates { " candidates:join" } else { "" }
         );
         let spec = VectorSpec {
             pred,
@@ -1139,14 +1254,63 @@ impl<'a> Planner<'a> {
             graph,
             graph_var,
             dedup,
+            mode,
+            distinct_subject,
+            candidates,
         };
         let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
         n.cost = k as f64 * 16.0;
         Ok(n)
     }
 
+    /// A search that reads the rest of its group (`left`): a variable query bound there,
+    /// or `candidates:join` over the subjects bound there.
+    fn attach_vector(&self, left: Node, search: Node) -> Result<Node> {
+        let Kind::VectorSearch(spec) = &search.kind else {
+            unreachable!("only vector searches depend on their group");
+        };
+        let bad = |m: String| Error::invalid(format!("spk:vectorSearch: {m}"));
+        if let VectorQuery::Var(v) = spec.query
+            && !left.vars.contains(&v)
+        {
+            return Err(bad(format!(
+                "the query variable ?{} is not bound by the rest of the group",
+                self.ctx.var_name(v)
+            )));
+        }
+        if spec.candidates
+            && let PathEnd::Var(s) = spec.subject
+            && !left.vars.contains(&s)
+        {
+            return Err(bad(format!(
+                "candidates:join needs ?{} bound by the rest of the group",
+                self.ctx.var_name(s)
+            )));
+        }
+        let mut vars = left.vars.clone();
+        for v in &search.vars {
+            if !vars.contains(v) {
+                vars.push(*v);
+            }
+        }
+        let mut certain = left.certain.clone();
+        certain.extend(search.vars.iter().copied());
+        let est = (left.est * spec.k as f64).max(1.0);
+        Ok(Node {
+            dist: vars.iter().map(|&v| (v, est)).collect(),
+            cost: left.cost + est * 16.0,
+            vars,
+            certain,
+            sorted: Vec::new(),
+            est,
+            desc: search.desc,
+            kind: search.kind,
+            children: vec![left],
+        })
+    }
+
     /// A `text:query` call as a search leaf.
-    fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
+    pub(super) fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
         let slot = |t: &Option<TermPattern>| -> Option<VarId> {
             match t.as_ref().map(|t| self.term_pattern(t)) {
                 Some(PT::V(v)) => Some(v),
@@ -1157,14 +1321,19 @@ impl<'a> Planner<'a> {
             PT::V(v) => PathEnd::Var(v),
             PT::C(id) => PathEnd::Const(id),
         };
-        let (score, literal, graph_out, prop) = (
-            slot(&c.score),
-            slot(&c.literal),
+        // a score or literal the rest of the query never reads is not produced, and the
+        // search then reads no literal
+        let output =
+            |t: &Option<TermPattern>| t.as_ref().filter(|t| self.used_elsewhere(t)).cloned();
+        let (score, literal, graph_out, prop, rank) = (
+            slot(&output(&c.score)),
+            slot(&output(&c.literal)),
             slot(&c.graph),
             slot(&c.prop),
+            slot(&output(&c.rank)),
         );
         let Some((graph, graph_var)) = self.graph_filter(g) else {
-            let mut vars: Vec<VarId> = [score, literal, graph_out, prop]
+            let mut vars: Vec<VarId> = [score, literal, graph_out, prop, rank]
                 .into_iter()
                 .flatten()
                 .collect();
@@ -1187,6 +1356,7 @@ impl<'a> Planner<'a> {
             graph_out,
             graph_var,
             prop,
+            rank,
         ]
         .into_iter()
         .flatten()
@@ -1196,7 +1366,7 @@ impl<'a> Planner<'a> {
             }
         }
         let desc = format!(
-            "{} ← {:?}{}{}{}",
+            "{} ← {:?}{}{}{}{}",
             vars.iter()
                 .map(|v| format!("?{}", self.ctx.var_name(*v)))
                 .collect::<Vec<_>>()
@@ -1219,6 +1389,11 @@ impl<'a> Planner<'a> {
                 .map(|l| format!(" lang={l}"))
                 .unwrap_or_default(),
             c.limit.map(|l| format!(" limit {l}")).unwrap_or_default(),
+            // the options are part of the description, and so of the result cache key
+            match (&c.highlight, literal) {
+                (Some(h), Some(_)) => format!(" highlight {h:?}"),
+                _ => String::new(),
+            },
         );
         let spec = TextSpec {
             query: c.query,
@@ -1234,9 +1409,11 @@ impl<'a> Planner<'a> {
             literal,
             graph_out,
             prop,
+            rank,
             graph,
             graph_var,
             dedup,
+            highlight: c.highlight.filter(|_| literal.is_some()),
         };
         let est = spec.limit.unwrap_or(1000) as f64;
         let mut n = Node::leaf(Kind::TextSearch(Box::new(spec)), vars, est, desc);
@@ -1357,20 +1534,29 @@ impl<'a> Planner<'a> {
 
     pub(super) fn graph_filter(&self, g: &ActiveGraph) -> Option<(GraphFilter, Option<VarId>)> {
         let ds = &self.ctx.dataset;
+        let set_of = |set: &[Id]| {
+            let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
         Some(match g {
+            // an empty default graph (a dataset of named graphs only) matches nothing
             ActiveGraph::Default => match &ds.default {
+                Some(set) if set.is_empty() => return None,
                 Some(set) if set.len() == 1 => (GraphFilter::One(set[0].0), None),
-                Some(set) => {
-                    let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
-                    s.sort_unstable();
-                    (GraphFilter::Set(s), None)
-                }
+                Some(set) => (GraphFilter::Set(set_of(set)), None),
                 None if ds.union_default || self.ctx.snap.union_default_graph => {
                     (GraphFilter::Named, None)
                 }
                 None => (GraphFilter::Default, None),
             },
-            ActiveGraph::Union => (GraphFilter::Named, None),
+            // the union graph of a graph view is the union of the named graphs it sees
+            ActiveGraph::Union => match (&self.ctx.graphs, &ds.named) {
+                (Some(_), Some(set)) if set.is_empty() => return None,
+                (Some(_), Some(set)) => (GraphFilter::Set(set_of(set)), None),
+                _ => (GraphFilter::Named, None),
+            },
             ActiveGraph::Named(id) => {
                 if id.tag() == Tag::Local {
                     return None;
@@ -1385,11 +1571,8 @@ impl<'a> Planner<'a> {
             ActiveGraph::Var(v) => match self.subst.get(v) {
                 Some(id) => return self.graph_filter(&ActiveGraph::Named(*id)),
                 None => match &ds.named {
-                    Some(set) => {
-                        let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
-                        s.sort_unstable();
-                        (GraphFilter::Set(s), Some(*v))
-                    }
+                    Some(set) if set.is_empty() => return None,
+                    Some(set) => (GraphFilter::Set(set_of(set)), Some(*v)),
                     None => (GraphFilter::Named, Some(*v)),
                 },
             },
@@ -1537,9 +1720,13 @@ impl<'a> Planner<'a> {
                 _ => None,
             };
             let quads = snap.len().max(1) as f64;
+            // a pattern with one free subject, predicate or object column has a value of it
+            // per triple
+            let free_spo = cols.iter().filter(|(kc, _)| order[*kc] != G).count();
             for &(kc, v) in &cols {
                 let comp = order[kc];
                 let d = match (comp, pstat.as_ref()) {
+                    (S | P | O, _) if free_spo == 1 => est,
                     (S, Some(ps)) if pstat.is_some() => {
                         ps.distinct_subjects as f64 * est / ps.count.max(1) as f64
                     }
@@ -1674,8 +1861,29 @@ impl<'a> Planner<'a> {
         for t in &triples {
             leaves.push(self.scan_options(t)?);
         }
+        if self.ctx.opt.sampled_filters && !filters.is_empty() {
+            super::sample::prepare(self.ctx, &leaves, &filters);
+        }
+        if self.ctx.opt.characteristic_sets {
+            let stars: Vec<(VarId, u64, Option<u64>)> = triples
+                .iter()
+                .filter_map(|t| match (t.t[0], t.t[1], t.t[2]) {
+                    (PT::V(v), PT::C(p), PT::V(_)) => Some((v, p.0, None)),
+                    (PT::V(v), PT::C(p), PT::C(o)) => Some((v, p.0, Some(o.0))),
+                    _ => None,
+                })
+                .collect();
+            super::charsets::register(self.ctx, &stars);
+        }
+        // searches that read the rest of the group are attached to it at the end
+        let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
+            .into_iter()
+            .partition(|n| matches!(&n.kind, Kind::VectorSearch(s) if s.needs_input()));
         for n in nodes {
             leaves.push(vec![n]);
+        }
+        if self.ctx.opt.probed_keys && leaves.len() > 1 {
+            super::keyprobe::prepare(self.ctx, &leaves);
         }
         let mut result = if leaves.is_empty() {
             Node::unit()
@@ -1713,6 +1921,17 @@ impl<'a> Planner<'a> {
         while let Some(i) = unpacks.iter().position(|u| result.vars.contains(&u.t)) {
             let u = unpacks.remove(i);
             result = self.unpack(result, u);
+            let (now, later): (Vec<Expr>, Vec<Expr>) =
+                std::mem::take(&mut filters).into_iter().partition(|f| {
+                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
+                });
+            filters = later;
+            if !now.is_empty() {
+                result = filter(result, now, self.ctx);
+            }
+        }
+        for d in dependent {
+            result = self.attach_vector(result, d)?;
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {
                     !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
@@ -1788,6 +2007,11 @@ impl<'a> Planner<'a> {
                     .unwrap();
                 *filters = rest;
                 best
+            } else if self.ctx.opt.pruned_join_order {
+                match super::joinorder::order(self, items, filters)? {
+                    Ok(plan) => plan,
+                    Err(items) => self.dp(items, filters)?,
+                }
             } else if items.len() <= DP_LIMIT {
                 self.dp(items, filters)?
             } else {
@@ -1808,7 +2032,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
-    fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Node {
+    pub(super) fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Node {
         let (now, later): (Vec<Expr>, Vec<Expr>) =
             std::mem::take(filters).into_iter().partition(|f| {
                 !f.has_exists() && {
@@ -1889,7 +2113,11 @@ impl<'a> Planner<'a> {
                         }
                     }
                 }
-                table.insert(mask, best.into_values().collect());
+                // in order of the sort variable, so that ties break the same way in every
+                // run and in the join ordering on cost summaries
+                let mut best: Vec<(Option<VarId>, (Node, u64))> = best.into_iter().collect();
+                best.sort_unstable_by_key(|(k, _)| *k);
+                table.insert(mask, best.into_iter().map(|(_, c)| c).collect());
             }
         }
         let full = (1u32 << n) - 1;
@@ -1911,7 +2139,7 @@ impl<'a> Planner<'a> {
         Ok(best)
     }
 
-    fn apply_dp_filters(
+    pub(super) fn apply_dp_filters(
         &self,
         n: Node,
         applied: u64,
@@ -2147,11 +2375,57 @@ impl<'a> Planner<'a> {
 // node constructors (with estimates)
 // ------------------------------------------------------------------------------
 
-pub(super) fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
+/// How a join on one variable was estimated, when not from the distinct values on
+/// either side.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum JoinModel {
+    /// from characteristic sets: the shares of the product of the inputs' rows and of the
+    /// product of their distinct values that the join keeps (see [`super::charsets`])
+    Star { rr: f64, rd: f64 },
+    /// from probing the values of a small input; `a_src` tells whether the first input
+    /// holds it (see [`super::keyprobe`])
+    Probe {
+        m: super::keyprobe::Measure,
+        a_src: bool,
+    },
+}
+
+impl JoinModel {
+    /// The estimated rows of the join of inputs of `a_est` and `b_est` rows.
+    pub(super) fn est(&self, a_est: f64, b_est: f64) -> f64 {
+        match self {
+            JoinModel::Star { rr, .. } => star_est(a_est, b_est, *rr),
+            JoinModel::Probe { m, a_src: true } => super::keyprobe::est(a_est, b_est, m),
+            JoinModel::Probe { m, a_src: false } => super::keyprobe::est(b_est, a_est, m),
+        }
+    }
+
+    /// The distinct values of the join variable after the join, from the inputs' `da`
+    /// and `db`.
+    pub(super) fn distinct(&self, da: f64, db: f64) -> f64 {
+        match self {
+            JoinModel::Star { rd, .. } => super::charsets::distinct(da, db, *rd),
+            JoinModel::Probe { m, a_src: true } => super::keyprobe::distinct(da, db, m),
+            JoinModel::Probe { m, a_src: false } => super::keyprobe::distinct(db, da, m),
+        }
+    }
+}
+
+/// The distinct-value estimates of the join of `a` and `b` into `est` rows; `model` is
+/// the join variable with how the join was estimated, when not from distinct values.
+pub(super) fn merge_dist(
+    a: &Node,
+    b: &Node,
+    est: f64,
+    model: Option<(VarId, JoinModel)>,
+) -> FxHashMap<VarId, f64> {
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
         let x = match (a.vars.contains(v), b.vars.contains(v)) {
-            (true, true) => a.d(*v).min(b.d(*v)),
+            (true, true) => match model {
+                Some((s, m)) if s == *v => m.distinct(a.d(*v), b.d(*v)),
+                _ => a.d(*v).min(b.d(*v)),
+            },
             (true, false) => a.d(*v),
             _ => b.d(*v),
         };
@@ -2168,16 +2442,145 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
         .iter()
         .map(|v| a.d(*v).max(b.d(*v)))
         .fold(1.0f64, f64::max);
-    // QLever correction factor
-    (a.est * b.est / denom * 0.7).max(if a.est > 0.0 && b.est > 0.0 { 1.0 } else { 0.0 })
+    join_est_from(a.est, b.est, denom)
 }
 
-fn sort_cost(n: f64) -> f64 {
+/// The estimated rows of joining `a` and `b` on `keys`, and, when the join is on one
+/// variable and estimated from characteristic sets or probed values, the variable with
+/// how it was estimated. The sets come first, since they hold how the predicates of a
+/// star occur together where probes see only the small input and one pattern, unless the
+/// small input is a subset of values the sets know nothing of (see
+/// [`super::keyprobe::first`]).
+pub(super) fn join_est_with(
+    a: &Node,
+    b: &Node,
+    keys: &[VarId],
+    ctx: &Ctx,
+) -> (f64, Option<(VarId, JoinModel)>) {
+    let [v] = keys else {
+        return (join_est(a, b, keys), None);
+    };
+    let probe = || {
+        if !ctx.opt.probed_keys {
+            return None;
+        }
+        let (sa, sb) = (
+            super::keyprobe::side(ctx, a, *v)?,
+            super::keyprobe::side(ctx, b, *v)?,
+        );
+        super::keyprobe::applies(ctx, *v, sa, sb).map(|(m, a_src)| JoinModel::Probe { m, a_src })
+    };
+    let star = || {
+        if !ctx.opt.characteristic_sets {
+            return None;
+        }
+        let (mut qa, mut qb) = (Vec::new(), Vec::new());
+        super::charsets::of_node(ctx, a, &mut qa);
+        super::charsets::of_node(ctx, b, &mut qb);
+        let (qa, qb) = (
+            super::charsets::mask_of(&qa, *v),
+            super::charsets::mask_of(&qb, *v),
+        );
+        super::charsets::factor(ctx, *v, qa, qb).map(|(rr, rd)| JoinModel::Star { rr, rd })
+    };
+    let model = if ctx.opt.probed_keys && super::keyprobe::first(ctx, *v) {
+        probe().or_else(star)
+    } else {
+        star().or_else(probe)
+    };
+    match model {
+        Some(m) => (m.est(a.est, b.est), Some((*v, m))),
+        None => (join_est(a, b, keys), None),
+    }
+}
+
+/// The estimated rows of joining `a_est` and `b_est` rows that keeps the share `rr` of
+/// their product (see [`super::charsets`]).
+pub(super) fn star_est(a_est: f64, b_est: f64, rr: f64) -> f64 {
+    (a_est * b_est * rr).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
+}
+
+/// The estimated rows of joining `a_est` and `b_est` rows where the join variables take
+/// at most `denom` distinct values on either side.
+pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
+    // QLever correction factor
+    (a_est * b_est / denom * 0.7).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
+}
+
+/// A hash join builds a table of the smaller input, keyed on the join variables, and
+/// probes it with each row of the larger one. With a list allocated per key, inserting a
+/// row takes 40 to 100 ns, about as long as scanning 48 rows.
+const HASH_BUILD_COST: f64 = 48.0;
+/// Inserting a row into the flat table takes 10 to 15 ns on one thread while the table
+/// fits in the CPU caches, and 3 to 7 ns for a million rows built in partitions in
+/// parallel, where a scan reads a row in 2.2 ns and the lists took 18 to 62 ns (measured
+/// on generated tables by `costcal_tests::cal_tables`). A probe takes about 1.2 ns, in
+/// parallel pieces of the larger input, and is counted as one row.
+const FLAT_HASH_BUILD_COST: f64 = 8.0;
+
+/// A merge join's cost per input row, besides its output rows. Timed alone on generated
+/// tables (`costcal_tests::cal_tables`), a merge join takes 0.6 to 8 ns per input row
+/// where a scan reads a row in 0.8 to 2.2 ns: little for rows it skips, several times
+/// more for rows that match, most of it building the output. Hash joins of the same
+/// inputs are underpriced as much (at 100k rows a side both took 3 to 5 times their
+/// cost), so raising this alone turns merges into hash joins that run slower: across
+/// the bench queries at 1.05M and 10.5M triples and WatDiv, run alternately pinned to
+/// the performance cores, 2 made the plans 8% slower on geometric mean (32 queries more
+/// than 10% slower than their fastest plan, against 17 with 1), 1.5 2%, and 0.75 was
+/// within noise of 1.
+const MERGE_ROW_COST: f64 = 1.0;
+
+/// [`MERGE_ROW_COST`], which the calibration tests can override with
+/// `SPARKLES_CAL_MERGE_ROW_COST`.
+#[inline]
+pub(super) fn merge_row_cost() -> f64 {
+    #[cfg(test)]
+    {
+        static COST: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *COST.get_or_init(|| {
+            std::env::var("SPARKLES_CAL_MERGE_ROW_COST")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(MERGE_ROW_COST)
+        })
+    }
+    #[cfg(not(test))]
+    MERGE_ROW_COST
+}
+
+/// What the join costs depend on besides the inputs: whether index joins are offered and
+/// what inserting a row into a hash table costs.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Costing {
+    pub index_joins: bool,
+    pub hash_build: f64,
+}
+
+impl Costing {
+    pub fn of(ctx: &Ctx) -> Costing {
+        Costing {
+            index_joins: ctx.opt.batched_join,
+            hash_build: if ctx.opt.flat_hash_join {
+                FLAT_HASH_BUILD_COST
+            } else {
+                HASH_BUILD_COST
+            },
+        }
+    }
+}
+
+/// The cost of hash joining inputs of `a_est` and `b_est` rows, at `build` per row of the
+/// smaller one, besides the inputs and the output rows.
+pub(super) fn hash_base(build: f64, a_est: f64, b_est: f64) -> f64 {
+    build * a_est.min(b_est) + a_est.max(b_est)
+}
+
+pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
 
-fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64) -> Node {
-    let est = join_est(&a, &b, &keys);
+fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
+    let (est, star) = join_est_with(&a, &b, &keys, ctx);
     let mut vars = a.vars.clone();
     for v in &b.vars {
         if !vars.contains(v) {
@@ -2203,12 +2606,12 @@ fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64) 
         JoinAlgo::Cross => a.sorted.clone(),
     };
     let base = match algo {
-        JoinAlgo::Merge => a.est + b.est,
-        JoinAlgo::Hash => 2.0 * a.est.min(b.est) + a.est.max(b.est),
+        JoinAlgo::Merge => (a.est + b.est) * merge_row_cost(),
+        JoinAlgo::Hash => hash_base(Costing::of(ctx).hash_build, a.est, b.est),
         JoinAlgo::Cross => a.est * b.est,
     };
-    let cost = a.cost + b.cost + base + est + extra_cost;
-    let dist = merge_dist(&a, &b, est);
+    let cost = a.cost + b.cost + base + est;
+    let dist = merge_dist(&a, &b, est, star);
     let desc = format!(
         "on {}",
         if keys.is_empty() {
@@ -2257,28 +2660,51 @@ fn join_candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
         .collect();
     for &v in &certain_both {
         let (sa, sb) = (a.sorted.first() == Some(&v), b.sorted.first() == Some(&v));
-        let extra =
-            if sa { 0.0 } else { sort_cost(a.est) } + if sb { 0.0 } else { sort_cost(b.est) };
-        if sa && sb || extra < (a.est + b.est) * 4.0 {
-            let (x, y) = (sort_node(a.clone(), v), sort_node(b.clone(), v));
-            let mut k = vec![v];
-            k.extend(keys.iter().filter(|x| **x != v));
-            let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0);
-            j.desc = format!("on ?{}", ctx.var_name(v));
-            out.push(j);
+        if merge_offered(a.est, sa, b.est, sb) {
+            out.push(merge_join(a.clone(), b.clone(), v, &keys, ctx));
         }
     }
-    let mut h = mk_join(a.clone(), b.clone(), JoinAlgo::Hash, keys.clone(), 0.0);
-    h.desc = format!(
+    out.push(hash_join(a.clone(), b.clone(), keys, ctx));
+    out.extend(super::indexjoin::candidates(a, b, ctx));
+    out
+}
+
+/// Whether a merge join is worth offering for inputs of `a_est` and `b_est` rows, which
+/// are sorted on the key or not.
+pub(super) fn merge_offered(a_est: f64, a_sorted: bool, b_est: f64, b_sorted: bool) -> bool {
+    let extra = if a_sorted { 0.0 } else { sort_cost(a_est) }
+        + if b_sorted { 0.0 } else { sort_cost(b_est) };
+    merge_worth(extra, a_est, b_est, a_sorted && b_sorted)
+}
+
+/// Whether a merge join is worth offering when sorting its inputs costs `extra`.
+pub(super) fn merge_worth(extra: f64, a_est: f64, b_est: f64, both_sorted: bool) -> bool {
+    both_sorted || extra < (a_est + b_est) * 4.0
+}
+
+/// The merge join of `a` and `b` on `v`, sorting either input that is not sorted on it;
+/// `keys` are all the variables they share.
+pub(super) fn merge_join(a: Node, b: Node, v: VarId, keys: &[VarId], ctx: &Ctx) -> Node {
+    let (x, y) = (sort_node(a, v), sort_node(b, v));
+    let mut k = vec![v];
+    k.extend(keys.iter().filter(|x| **x != v));
+    let mut j = mk_join(x, y, JoinAlgo::Merge, k, ctx);
+    j.desc = format!("on ?{}", ctx.var_name(v));
+    j
+}
+
+/// The hash join of `a` and `b` on the variables they share (`keys`).
+pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
+    let desc = format!(
         "on {}",
         keys.iter()
             .map(|v| format!("?{}", ctx.var_name(*v)))
             .collect::<Vec<_>>()
             .join(" ")
     );
-    out.push(h);
-    out.extend(super::indexjoin::candidates(a, b, ctx));
-    out
+    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, ctx);
+    h.desc = desc;
+    h
 }
 
 /// Best single join of two plans (used outside the DP).
@@ -2295,7 +2721,7 @@ pub fn join(a: Node, b: Node, ctx: &Ctx) -> Node {
         return a;
     }
     if !a.vars.iter().any(|v| b.vars.contains(v)) {
-        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), 0.0);
+        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), ctx);
         j.desc = "cross product".into();
         return j;
     }
@@ -2328,14 +2754,31 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
                 .join(" ")
         ),
     };
-    let dist = merge_dist(&l, &r, est);
+    let dist = merge_dist(&l, &r, est, None);
+    // both sides sorted on the one variable they share, which both always bind: a merge
+    // that keeps the left side's order (the executor checks the order of the rows)
+    let merge = ctx.opt.merge_left_join
+        && matches!(&keys[..], [k] if l.sorted.first() == Some(k)
+            && r.sorted.first() == Some(k)
+            && l.certain.contains(k)
+            && r.certain.contains(k));
+    let (sorted, base) = if merge {
+        (l.sorted.clone(), (l.est + r.est) * merge_row_cost())
+    } else if ctx.opt.merge_left_join {
+        (
+            Vec::new(),
+            hash_base(Costing::of(ctx).hash_build, l.est, r.est),
+        )
+    } else {
+        (Vec::new(), 2.0 * r.est + l.est)
+    };
     Node {
         kind: Kind::LeftJoin { expr },
         vars,
         certain: l.certain.clone(),
-        sorted: Vec::new(),
+        sorted,
         est,
-        cost: l.cost + r.cost + 2.0 * r.est + l.est + est,
+        cost: l.cost + r.cost + base + est,
         dist,
         desc,
         children: vec![l, r],
@@ -2383,12 +2826,14 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
     if exprs.is_empty() {
         return n;
     }
-    let desc = exprs
-        .iter()
-        .map(|e| e.display(ctx))
-        .collect::<Vec<_>>()
-        .join(" && ");
-    let sel = FILTER_SELECTIVITY.powi(exprs.len() as i32);
+    let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
+    let sampled: Vec<Option<super::sample::Sampled>> =
+        texts.iter().map(|t| ctx.sampled(t)).collect();
+    let sel = super::sample::combine(sampled.iter().map(|s| s.map(|s| s.sel)));
+    let mut desc = texts.join(" && ");
+    if let Some(note) = super::sample::note(&sampled) {
+        desc = format!("{desc} {note}");
+    }
     // a conjunct evaluated once per distinct value sorts its input column, unless the
     // input is sorted on it already (an index scan can be read in that order instead).
     // Costed whether or not the expression cache is on, so that switching it off does
@@ -2941,33 +3386,71 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         && let Some(spec) = reorder_scan(spec, *k)
     {
         let var = aggs[0].0;
-        let metadata = ctx
-            .opt
-            .metadata_counts
-            .then(|| distinct_count_exact(&spec, ctx))
-            .flatten();
+        let counted = distinct_count_exact(&spec, child.est, ctx);
         let desc = format!(
             "{} distinct ?{}{}",
             retarget_desc(&child.desc, &spec),
             ctx.var_name(*k),
-            if metadata.is_some() {
-                " [from statistics]"
-            } else {
-                ""
-            }
+            counted.as_ref().map_or(String::new(), |c| c.note())
         );
-        let cost = if metadata.is_some() { 1.0 } else { child.est };
+        let cost = if counted.is_some() { 1.0 } else { child.est };
         let mut n = Node::leaf(
             Kind::CountDistinctScan {
                 spec,
                 var,
-                metadata,
+                metadata: counted.map(|c| c.total()),
             },
             vec![var],
             1.0,
             desc,
         );
         n.cost = cost;
+        return n;
+    }
+    // COUNT(*) over a FILTER that reads one variable of a single scan: the filter is
+    // tested once per run of the variable's values, without materializing the rows
+    if keys.is_empty()
+        && ctx.opt.count_filter_runs
+        && aggs.len() == 1
+        && matches!(aggs[0].1.func, AggregateFunction::Count)
+        && let Kind::Filter(filter) = &child.kind
+        && let Kind::Scan(spec) = &child.children[0].kind
+        && let Ok(Some(k)) = super::exprcache::input(&filter.iter().collect::<Vec<_>>())
+        && child.children[0].vars.contains(&k)
+        && match (&aggs[0].1.expr, aggs[0].1.distinct) {
+            (None, false) => true,
+            // every variable of a scan is bound on every row
+            (Some(Expr::Var(x)), false) => child.children[0].vars.contains(x),
+            (Some(Expr::Var(x)), true) => *x == k,
+            _ => false,
+        }
+        && let Some(spec) = reorder_scan(spec, k)
+    {
+        let scan = &child.children[0];
+        let var = aggs[0].0;
+        let desc = format!(
+            "{} filter {}{}",
+            retarget_desc(&scan.desc, &spec),
+            child.desc,
+            if aggs[0].1.distinct {
+                format!(" distinct ?{}", ctx.var_name(k))
+            } else {
+                String::new()
+            }
+        );
+        let mut n = Node::leaf(
+            Kind::CountFilterScan {
+                spec,
+                key: k,
+                filter: filter.clone(),
+                var,
+                distinct: aggs[0].1.distinct,
+            },
+            vec![var],
+            1.0,
+            desc,
+        );
+        n.cost = scan.est;
         return n;
     }
     // COUNT(*) over a join of two scans on one variable: per-key run lengths
@@ -3045,12 +3528,12 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             retarget_desc(&child.desc, &spec),
             ctx.var_name(key)
         );
-        let metadata = ctx.opt.metadata_counts && class_counts_exact(&spec, key, ctx);
-        let desc = if metadata {
-            format!("{desc} [from statistics]")
-        } else {
-            desc
+        let metadata = group_counts_exact(&spec, key, child.est, ctx);
+        let desc = match &metadata {
+            Some(c) => format!("{desc}{}", c.note()),
+            None => desc,
         };
+        let n_metadata = metadata.is_some();
         let mut n = Node::leaf(
             Kind::GroupCountScan {
                 spec,
@@ -3062,7 +3545,7 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             est,
             desc,
         );
-        n.cost = child.est;
+        n.cost = if n_metadata { 1.0 } else { child.est };
         n.sorted = vec![key];
         return n;
     }
@@ -3155,49 +3638,96 @@ fn key_run_scans(join: &Node, k: VarId, ctx: &Ctx) -> Option<Vec<Node>> {
         .collect()
 }
 
-/// Whether the per-class subject counts in the index statistics are exactly the answer
-/// of `GROUP BY ?class` + COUNT over `?s rdf:type ?class`: the snapshot has no delta,
-/// every quad is in the default graph (so a class's rows are its distinct subjects), and
-/// the scan reads the default graph without further constraints.
-fn class_counts_exact(spec: &ScanSpec, key: VarId, ctx: &Ctx) -> bool {
-    let snap = &ctx.snap;
-    let stats = &snap.generation.stats;
-    spec.perm == Perm::Pos
-        && spec.eqs.is_empty()
-        && spec.cols.first() == Some(&(1, key))
-        && spec.cols[1..].iter().all(|&(c, _)| c == 2)
-        && snap.delta.is_empty()
-        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
-        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0)
-        && snap
-            .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
-            .is_some_and(|t| spec.prefix == [t.0])
-}
-
-/// The number of distinct values of a scan's first free column, when the index
-/// statistics hold it exactly: a scan of the whole index or of one predicate without
-/// repeated variables, a snapshot without a delta, and every quad in the default graph,
-/// which the scan reads (the statistics count over all graphs). The statistics hold the
-/// distinct subjects, predicates and objects of the index, and the distinct subjects
-/// and objects of each predicate.
-fn distinct_count_exact(spec: &ScanSpec, ctx: &Ctx) -> Option<u64> {
-    let snap = &ctx.snap;
-    let stats = &snap.generation.stats;
-    let exact = spec.eqs.is_empty()
-        && snap.delta.is_empty()
-        && spec.graph.accepts(Id::DEFAULT_GRAPH.0)
-        && stats.graphs.iter().all(|&(g, _)| g == Id::DEFAULT_GRAPH.0);
-    if !exact || spec.cols.first()?.0 != spec.prefix.len() {
+/// The answer of `GROUP BY ?k` with counts over a single scan from the index
+/// statistics, corrected for the snapshot's delta and for graphs the scan does not read:
+/// the instances of each class (`?s rdf:type ?k`, distinct subjects per class when the
+/// scan reads one graph or drops a triple's repeats across graphs), or the quads of each
+/// predicate (`?s ?k ?o` over one graph). `est` is the scan's size, which the correction
+/// must not exceed in work.
+fn group_counts_exact(
+    spec: &ScanSpec,
+    key: VarId,
+    est: f64,
+    ctx: &Ctx,
+) -> Option<Arc<super::stats::Counts>> {
+    use super::stats::{CountKey, Measure};
+    if !ctx.opt.metadata_counts
+        || !spec.eqs.is_empty()
+        || spec.cols.iter().any(|&(c, _)| c == spec.graph_col)
+    {
         return None;
     }
-    match (spec.perm, spec.prefix.as_slice()) {
-        (Perm::Spo | Perm::Sop, []) => Some(stats.distinct_subjects),
-        (Perm::Pso | Perm::Pos, []) => Some(stats.distinct_predicates),
-        (Perm::Osp | Perm::Ops, []) => Some(stats.distinct_objects),
-        (Perm::Pso, [p]) => stats.predicate(*p).map(|ps| ps.distinct_subjects),
-        (Perm::Pos, [p]) => stats.predicate(*p).map(|ps| ps.distinct_objects),
-        _ => None,
+    let rdf_type = ctx
+        .snap
+        .lookup_iri(oxrdf::vocab::rdf::TYPE.as_str())
+        .map(|t| t.0);
+    let classes = spec.perm == Perm::Pos
+        && spec.cols.first() == Some(&(1, key))
+        && spec.cols[1..].iter().all(|&(c, _)| c == 2)
+        && rdf_type.is_some_and(|t| spec.prefix == [t])
+        && (spec.dedup || !spec.graph.multi());
+    let predicates = matches!(spec.perm, Perm::Pso | Perm::Pos)
+        && spec.prefix.is_empty()
+        && spec.cols.first() == Some(&(0, key))
+        && !spec.dedup
+        && !spec.graph.multi();
+    let measure = match (classes, predicates) {
+        (true, _) => Measure::Distinct(3),
+        (_, true) => Measure::Rows,
+        _ => return None,
+    };
+    let k = CountKey {
+        perm: spec.perm,
+        prefix: spec.prefix.clone(),
+        grouped: true,
+        measure,
+        graphs: spec.graph.clone(),
+    };
+    statistics(&k, rdf_type, est, ctx)
+}
+
+/// The number of distinct values of a scan's first free column from the index
+/// statistics, corrected for the snapshot's delta and for graphs the scan does not read:
+/// a scan of the whole index or of one predicate without repeated variables. The
+/// statistics hold the distinct subjects, predicates and objects of the index, and the
+/// distinct subjects and objects of each predicate. `est` is the scan's size, which the
+/// correction must not exceed in work.
+fn distinct_count_exact(spec: &ScanSpec, est: f64, ctx: &Ctx) -> Option<Arc<super::stats::Counts>> {
+    if !ctx.opt.metadata_counts
+        || !spec.eqs.is_empty()
+        || spec.prefix.len() > 1
+        || spec.cols.first()?.0 != spec.prefix.len()
+    {
+        return None;
     }
+    let k = super::stats::CountKey {
+        perm: spec.perm,
+        prefix: spec.prefix.clone(),
+        grouped: false,
+        measure: super::stats::Measure::Distinct(spec.prefix.len() + 1),
+        graphs: spec.graph.clone(),
+    };
+    statistics(&k, None, est, ctx)
+}
+
+/// [`super::stats::exact_counts`] for the planner: errors (cancellation, a block that
+/// cannot be read) leave the scan to the generic operators, which report them.
+fn statistics(
+    k: &super::stats::CountKey,
+    rdf_type: Option<u64>,
+    est: f64,
+    ctx: &Ctx,
+) -> Option<Arc<super::stats::Counts>> {
+    super::stats::exact_counts(
+        &ctx.snap,
+        k,
+        rdf_type,
+        est.max(0.0) as u64,
+        ctx.opt.delta_statistics,
+        &|| ctx.check(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// A scan description (`PSO ?s <p> ?o`) naming the permutation of a re-targeted scan.

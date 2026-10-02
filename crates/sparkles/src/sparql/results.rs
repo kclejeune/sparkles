@@ -367,6 +367,7 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             "timing": r.timing,
             "plan": r.plan,
             "memory": { "peakBytes": r.mem_peak_bytes },
+            "rowsProduced": r.rows_produced,
         }),
     );
     J::Object(out)

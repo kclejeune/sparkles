@@ -62,6 +62,15 @@ details and lists what the numbers do not cover.
   * Queries are SPARQL protocol POSTs with TSV results. Each query gets 2 warm-ups and
     10 runs at 1M, and 1 warm-up and 5 runs at 10M.
   * Times are mean ± σ in ms and include a few ms of `curl` process overhead.
+  * The client runs on one CPU. Starting a `curl` process takes 3 to 10 ms of CPU, more
+    than most of the queries, and when the scheduler placed each process on whichever
+    core was idle, that start-up time changed from run to run and in streaks. On an
+    idle hybrid machine, one request against the same server took either 3.3 or 10 ms,
+    whichever engine served it, and even a trivial single-threaded HTTP server showed
+    the same two modes. `scripts/bench.sh` therefore pins hyperfine and its `curl`
+    processes to one performance core (`CLIENT_CPU` picks another). The servers are not
+    pinned. Runs before 2026-10-02 did not pin the client, so their small-query times
+    include some of this noise.
   * Loads: 1 run each.
   * Answers are checked before timing. `scripts/bench-answers.py` fetches every
     engine's answer to every query as SPARQL JSON and fingerprints it by:
@@ -387,6 +396,13 @@ commits take 0.55–0.65 s as well. Later reads at the same commit reuse the cac
 snapshot. After a server restart, the first read at the base of the sealed generation
 takes 89–93 ms, because it opens that generation's files. The first read at
 base + 100,000 takes 605 ms again.
+
+These figures predate the sparse WAL index. A read now starts from the nearest known
+state, so a read near the head or near a cached commit replays only the commits in
+between. At a smaller scale (1M triples and 50,000 commits), the first read in the middle
+went from 213 ms to 67 ms, and a read 100 commits before the head from 486 ms to 2.7 ms
+([F06 Outcome](specs/F06-snapshots-and-point-in-time.md#replay-speedups-rdf-patch-and-the-change-feed)).
+The 10.5M run has not been repeated.
 
 ### Backup repositories (10.5M triples)
 

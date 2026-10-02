@@ -37,6 +37,15 @@ pub fn cors_layer(st: &AppState, expose: Vec<HeaderName>) -> CorsLayer {
             header::CONTENT_TYPE,
             header::ACCEPT,
             crate::obs::X_REQUEST_ID.clone(),
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::HeaderName::from_static("sparkles-commit-message"),
+            // the Streamable HTTP transport of `/$/mcp`
+            header::HeaderName::from_static("mcp-protocol-version"),
+            header::HeaderName::from_static("mcp-session-id"),
+            header::HeaderName::from_static("mcp-method"),
+            header::HeaderName::from_static("mcp-name"),
+            header::HeaderName::from_static("last-event-id"),
         ])
         .allow_methods([
             Method::GET,
@@ -67,11 +76,20 @@ pub fn cors_allowed(st: &AppState, origin: &str) -> bool {
 }
 
 /// Outbound requests and local files are server capabilities: SERVICE and
-/// `LOAD <http…>` need `federate`, `LOAD <file:…>` needs `server-admin`.
-pub fn restrict(opts: &mut sparkles::sparql::QueryOptions, p: &Principal) {
+/// `LOAD <http…>` need `federate`, `LOAD <file:…>` needs `server-admin`. The graphs
+/// the request reads and writes are those the principal's grants on `ds` cover through
+/// endpoint `e`.
+pub fn restrict(
+    opts: &mut sparkles::sparql::QueryOptions,
+    p: &Principal,
+    ds: &str,
+    e: super::Endpoint,
+) {
     opts.forbid_service = !p.has(ServerPerm::Federate);
     opts.forbid_remote_load = !p.has(ServerPerm::Federate);
     opts.forbid_file_load = !p.has(ServerPerm::ServerAdmin);
+    opts.graphs = p.view(ds, e);
+    opts.write.graphs = opts.graphs.clone();
 }
 
 /// The `auth` member of `/$/server`.
@@ -236,6 +254,8 @@ pub async fn whoami(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let mut datasets = Map::new();
+    // datasets where grants cover only some graphs or endpoints (never the patterns)
+    let mut restricted = Map::new();
     for name in st.datasets.read().keys() {
         let lvl = if p.is_local() {
             Some(Level::Admin)
@@ -244,6 +264,13 @@ pub async fn whoami(
         };
         if let Some(l) = lvl {
             datasets.insert(name.clone(), l.as_str().into());
+            if let Some((graphs, endpoints)) = p.limits(name) {
+                let mut r = json!({ "graphs": graphs });
+                if let Some(es) = endpoints {
+                    r["endpoints"] = json!(es.iter().map(|e| e.as_str()).collect::<Vec<_>>());
+                }
+                restricted.insert(name.clone(), r);
+            }
         }
     }
     let mut principal = json!({ "kind": p.kind.as_str() });
@@ -258,6 +285,7 @@ pub async fn whoami(
         "method": p.scheme.as_str(),
         "server": server,
         "datasets": datasets,
+        "restricted": restricted,
         "canMintTokens": false,
         "logout": false,
     });

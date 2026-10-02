@@ -5,7 +5,6 @@
 
 use super::{ApiResult, Params, St, err};
 use crate::auth::{Level, Principal};
-use crate::obs::Op;
 use crate::state::{AppState, Dataset};
 use axum::Json;
 use axum::Router;
@@ -131,35 +130,27 @@ pub(super) fn offline_response(name: &str) -> Response {
 
 // ------------------------------------------------------------------- stats ------
 
-/// The Fuseki endpoint name and operation of a Sparkles operation.
-fn endpoint_of(op: Op) -> Option<(&'static str, &'static str, &'static str)> {
-    Some(match op {
-        Op::Query => ("sparql", "query", "SPARQL Query"),
-        Op::Update => ("update", "update", "SPARQL Update"),
-        Op::Gsp => ("data", "gsp-rw", "Graph Store Protocol"),
-        Op::Upload => ("upload", "upload", "File Upload"),
-        Op::Shacl => ("shacl", "SHACL", "SHACL Validation"),
-        Op::Shex => ("shex", "shex", "ShEx Validation"),
-        Op::Explain => ("explain", "explain", "Query plan"),
-        Op::Admin | Op::Other => return None,
-    })
-}
-
 /// A dataset's entry of Fuseki's `/$/stats`: `Requests`, `RequestsGood`, `RequestsBad`
-/// and the same per endpoint.
+/// and the same per endpoint that has had a request. Endpoints are keyed by name, the
+/// dataset URL itself as `_1`, `_2`, …, and a name with two operations (`data`) once
+/// per operation.
 pub(super) fn fuseki_stats(st: &AppState, ds: &Dataset) -> J {
-    let (mut all, mut good, mut bad) = (0u64, 0u64, 0u64);
+    let (mut good, mut bad) = (0u64, 0u64);
     let mut endpoints = Map::new();
-    let counts = st.metrics.request_counts(&ds.name);
-    for (op, g, b) in &counts {
-        let Some((name, operation, description)) = endpoint_of(*op) else {
-            continue;
-        };
-        all += g + b;
+    let mut unnamed = 0;
+    for (name, operation, description, g, b) in st.metrics.fuseki_endpoint_counts(&ds.name) {
         good += g;
         bad += b;
+        let key = if name.is_empty() {
+            unnamed += 1;
+            format!("_{unnamed}")
+        } else if endpoints.contains_key(name) {
+            format!("{name}_{operation}")
+        } else {
+            name.to_string()
+        };
         endpoints.insert(
-            name.into(),
+            key,
             json!({
                 "Requests": g + b,
                 "RequestsGood": g,
@@ -170,7 +161,7 @@ pub(super) fn fuseki_stats(st: &AppState, ds: &Dataset) -> J {
         );
     }
     json!({
-        "Requests": all,
+        "Requests": good + bad,
         "RequestsGood": good,
         "RequestsBad": bad,
         "endpoints": endpoints,

@@ -44,6 +44,22 @@
     }
   }
 
+  let savingAuto = $state(false);
+  /** Turn the dataset's own automatic re-runs on or off, or (null) follow the server. */
+  async function setAuto(enabled: boolean | null) {
+    savingAuto = true;
+    try {
+      status =
+        enabled == null
+          ? await api.clearAutoReasoning(name)
+          : await api.setAutoReasoning(name, enabled);
+    } catch (e) {
+      toasts.error('Could not change automatic re-runs', e);
+    } finally {
+      savingAuto = false;
+    }
+  }
+
   $effect(() => {
     // reload when the dataset or its recorded reasoning changes
     void name;
@@ -159,6 +175,26 @@
             Auto re-run: on ({status.auto.debounceSeconds ?? 0} s after the last update){#if nextRunIn != null},
               next run in {nextRunIn} s{/if}
           </span>
+        {/if}
+        {#if status && !readOnly}
+          <button
+            class="btn"
+            disabled={savingAuto}
+            onclick={() => setAuto(!status?.auto.enabled)}
+            title="This dataset's own setting; it takes precedence over the server's --auto-reason"
+          >
+            {status.auto.enabled ? 'Turn auto re-run off' : 'Turn auto re-run on'}
+          </button>
+          {#if status.auto.source === 'dataset'}
+            <button
+              class="btn"
+              disabled={savingAuto}
+              onclick={() => setAuto(null)}
+              title="Follow the server's --auto-reason again"
+            >
+              Use server setting
+            </button>
+          {/if}
         {/if}
         {#if status?.warnings.length}
           <span class="faint">Warnings: {status.warnings.join('; ')}</span>

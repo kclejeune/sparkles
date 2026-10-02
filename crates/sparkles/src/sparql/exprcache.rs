@@ -23,6 +23,7 @@
 //! to the query's memory budget while they are built.
 
 use super::ctx::Ctx;
+use super::exec::PAR_MIN_LEN;
 use super::expr::{Expr, Func, needs_values};
 use super::table::{Table, VarId};
 use crate::error::Result;
@@ -143,7 +144,7 @@ pub fn impurity(e: &Expr) -> Option<&'static str> {
 
 /// The input of expressions that can be evaluated per value: `Ok(Some(v))` for one
 /// variable, `Ok(None)` for none; otherwise why not.
-fn input(exprs: &[&Expr]) -> std::result::Result<Option<VarId>, String> {
+pub(super) fn input(exprs: &[&Expr]) -> std::result::Result<Option<VarId>, String> {
     if let Some(why) = exprs.iter().find_map(|e| impurity(e)) {
         return Err(format!("{why} is evaluated per row"));
     }
@@ -190,6 +191,7 @@ impl<T> PerValue<T> {
         match &self.slot {
             Some(s) => s
                 .par_iter()
+                .with_min_len(PAR_MIN_LEN)
                 .map(|&j| self.vals[j as usize].clone())
                 .collect(),
             None => vec![self.vals[0].clone(); n],
@@ -338,7 +340,10 @@ fn distinct(
             .enumerate()
             .map(|(j, id)| (*id, j as u32))
             .collect();
-        col.par_iter().map(|id| at[id]).collect()
+        col.par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|id| at[id])
+            .collect()
     } else if runs {
         // `uniq` lists the runs in column order
         let mut j = 0u32;
@@ -353,6 +358,7 @@ fn distinct(
             .collect()
     } else {
         col.par_iter()
+            .with_min_len(PAR_MIN_LEN)
             .map(|id| uniq.binary_search(id).unwrap() as u32)
             .collect()
     };
@@ -445,6 +451,7 @@ pub fn filter(
             None => hit.rows(t.len()),
             Some(mut k) => {
                 k.par_iter_mut()
+                    .with_min_len(PAR_MIN_LEN)
                     .enumerate()
                     .for_each(|(i, k)| *k = *k && *hit.get(i));
                 k
@@ -454,11 +461,30 @@ pub fn filter(
     Ok(keep.map(|k| (k, rest.into_iter().cloned().collect())))
 }
 
+/// Outcome of FILTER conjuncts over `v` (and no other variable) for each of the sorted
+/// distinct ids `uniq`, an error failing the filter; also whether they were tested on
+/// vocabulary keys.
+pub(super) fn filter_values(
+    ctx: &Ctx,
+    uniq: &[Id],
+    v: VarId,
+    exprs: &[Expr],
+) -> Result<(Vec<bool>, bool)> {
+    if let Some(kf) = super::keyfilter::KeyFilter::new(exprs, v) {
+        return Ok((key_filter_mask(ctx, &kf, uniq, v, exprs)?, true));
+    }
+    let mut values = Table::new(vec![v]);
+    values.len = uniq.len();
+    values.cols[0] = uniq.to_vec();
+    values.sorted = vec![v];
+    Ok((super::exec::filter_mask(ctx, &values, exprs)?, false))
+}
+
 /// Outcome of a key filter for sorted distinct ids: base-vocabulary terms are tested on
 /// their keys straight from the front-coded blocks (in parallel, each block visited once),
 /// update-added terms on their delta keys, and everything else (inline literals, blank
 /// nodes, unbound) by the general evaluator.
-fn key_filter_mask(
+pub(super) fn key_filter_mask(
     ctx: &Ctx,
     kf: &super::keyfilter::KeyFilter,
     uniq: &[Id],
@@ -471,19 +497,24 @@ fn key_filter_mask(
     let lo = uniq.partition_point(|id| id.tag() < Tag::Vocab);
     let hi = lo + uniq[lo..].partition_point(|id| id.tag() == Tag::Vocab);
     ctx.check()?;
+    // a copy of the filter per task: threads sharing a regular expression contend for
+    // its match caches
     hit[lo..hi]
         .par_chunks_mut(4096)
         .zip(uniq[lo..hi].par_chunks(4096))
-        .for_each(|(h, ids)| {
-            let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
-            let mut j = 0;
-            vocab.get_sorted(&payloads, |p, k| {
-                while payloads[j] != p {
-                    j += 1;
-                }
-                h[j] = kf.test(k);
-            });
-        });
+        .for_each_init(
+            || kf.clone(),
+            |kf, (h, ids)| {
+                let payloads: Vec<u64> = ids.iter().map(|id| id.payload()).collect();
+                let mut j = 0;
+                vocab.get_sorted(&payloads, |p, k| {
+                    while payloads[j] != p {
+                        j += 1;
+                    }
+                    h[j] = kf.test(k);
+                });
+            },
+        );
     let mut rest = Table::new(vec![v]);
     let mut rest_at = Vec::new();
     for (i, id) in uniq.iter().enumerate().filter(|(i, _)| *i < lo || *i >= hi) {

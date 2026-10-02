@@ -4,9 +4,12 @@
 >
 > **Phases:** Phase 1 shipped. It covers the store's write guard, full SHACL validation of
 > every write's post-state, `/$/validation/{ds}`, `sparkles validation`, metrics, logs and
-> `bench:shacl-write`. Phase 2 was not built: incremental validation, the persisted
-> baseline, grandfather mode and the UI panel. ShEx later became a second guard language
-> ([G02](G02-shex.md)).
+> `bench:shacl-write`. Phase 2 shipped in most parts: the predicate relevance filter,
+> incremental validation with its fallbacks, the persisted baseline, grandfather mode and
+> a status panel on the dataset page. Phase 3 shipped: localizable SHACL-SPARQL,
+> `sh:targetWhere`, the refinement of F3, the `unvalidated` catalog flag,
+> `serve --validate` and mixed shapes sources. ShEx later became a second guard language
+> ([G02](G02-shex.md)), and its guard is incremental too.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -1120,14 +1123,136 @@ SHACL suite (98/98 Core, 20/20 SPARQL) stayed green.
   - The ShEx guard also skips writes whose predicates no shape reads. That relevance skip
     is finer than SHACL's, which works per graph.
 
-**Cost.** Every validated write runs a full validation of the data graph. For SHACL that
-takes about 160 ms at 1M triples ([docs/API.md](../API.md#write-time-validation)).
-Skipped writes are free. The standalone validator's numbers are in
+**Cost at Phase 1.** Every validated write ran a full validation of the data graph. For
+SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standalone
+validator's numbers are in
 [BENCHMARKS: Other measurements](../BENCHMARKS.md#other-measurements).
 
-**Not built.** None of Phase 2 was built: the predicate relevance filter, incremental
-focus-node validation with its fallbacks (§6.2), the persisted baseline, grandfather
-mode, and the validation panel on the dataset page. The UI's Validate panel runs
-on-demand checks only. Phase 3 has not started. It covers localizable SHACL-SPARQL,
-`sh:targetWhere`, the `unvalidated` catalog flag, `serve --validate` and mixed shapes
-sources. The open questions of §10 keep their Phase 1 defaults.
+**Phase 2 shipped on 2026-10-02.**
+
+- **Exact counts instead of a conforming baseline.** The guard keeps the result counts
+  of the head by severity. A full validation sets them, and every validated write moves
+  them by the results of the affected focus nodes, validated in the states before and
+  after the write. Counts, `blocking` and the decision therefore equal those of a full
+  validation whether or not the head conforms. The summary lists the results of the
+  focus nodes it validated, gains `focusNodes` and `fallback`, and gains `introduced` in
+  grandfather mode. F1 applies in strict `reject` mode only, because `warn` stays exact
+  on a head that does not conform.
+- **Affected focus nodes (§6.2.2).** Dependencies come from the shapes as designed,
+  with inverses pushed down to predicates. Target reads are dependencies at the focus
+  node, so the target delta needs no separate rule. A node of `sh:targetNode` that a
+  write adds to the store is matched by its term in the state before the write.
+- **Fallbacks (§6.2.3).** F1 to F7 are built. F2 also covers bulk loads from sources,
+  which may change the shapes graph. F4 and F5 validate only the shapes concerned in
+  full, and their counts before the write are remembered per shape. F6 also covers the
+  bulk path of a transaction (`Changes::Rebuilt`), because the rebuilt generation
+  renumbers terms. The F7 share rule applies only once a shape has more than 512
+  affected focus nodes. Each fallback sets `fallback` in the summary and counts in
+  `sparkles_validation_fallbacks_total{reason}`.
+- **The relevance filter (§6.2.1)** skips a write when no shape reads any predicate it
+  changes and the state of the head is known.
+- **The persisted baseline (§5.4)** is `validation-status.json`, with the counts by
+  severity. It is written after the commit without an fsync, because only a file that
+  names the head and the current `validation.json` is trusted. Clones and backups do not
+  copy it.
+- **Grandfather mode (§6.2.5)** is `"baseline": "grandfather"` in the configuration and
+  `--grandfather` in the CLI. A shapes change compares with the results the old shapes
+  gave.
+- **UI.** The dataset page has a Write-time validation panel with the mode, the result
+  counts of the head, the shapes validated in full, the last validated write, the
+  counters and the last ten rejected writes. `GET /$/validation/{ds}` gained
+  `lastCheck`, `recentRejections` and, for SHACL, `incremental`.
+- **Tests.** A15 runs random shapes over every path form and the core components,
+  including SHACL-SPARQL and recursive shapes, with random data and writes in `warn`,
+  strict `reject` and grandfather `reject`. Each write's decision and counts are checked
+  against full validations of the states before and after it, and every new result must
+  be listed. At landing, 180 scenarios with 23,550 writes in all passed. They hit every
+  fallback reason except `shapes` and `bulk`, which unit tests cover. CI runs a smaller
+  set. A16 is a unit test that checks one focus node and the incremental strategy.
+- **Cost.** `bench:shacl-write` gained a write that touches a person, which the shapes
+  read through a sequence path and `sh:class`. It also gained `TIMEOUT`, because a full
+  validation of 10.5M triples can exceed the default budget of 10 s. On a machine busy
+  with other builds, `warn` and `reject` writes took 12 to 37 ms at 1.05M triples, about
+  as long as with validation off, against 1.3 to 4.4 s before. At 10.5M triples they took
+  9 to 20 ms, against 9.8 to 14.8 s before.
+
+**Not built in Phase 2.** The `sparkles_validation_focus_nodes` histogram was not added.
+Summaries carry `focusNodes` instead. The panel has no configuration form, and the query
+page shows a `422` as an error rather than a results table. The open questions of §10
+keep their Phase 1 defaults.
+
+**Phase 3 shipped on 2026-10-02.**
+
+- **Localizable SHACL-SPARQL (§6.3).** A constraint or SPARQL-based component is
+  localized when every triple pattern of its query connects to `$this`, or to `$value`
+  for an ASK validator, which the shape's path reaches. Each pattern reached at a node
+  over a path π reads its predicate there, as a dependency `(π, p, out)` or
+  `(π, p, in)`, and extends the path to its other end. Every edge a solution matches is
+  reached from the focus node over edges of the same solution, so the soundness sketch of
+  §6.2.2 carries over in the state the solution belongs to. The design asked for no
+  closures in query paths. The implementation accepts them, because shape paths already
+  take closures through the same reverse evaluation. `FILTER NOT EXISTS`, `OPTIONAL`,
+  `UNION`, `BIND`, aggregates and `GROUP BY` are localized when their patterns are
+  anchored by the enclosing ones. A variable bound in only one branch of a `UNION`, or
+  only inside an `OPTIONAL`, anchors nothing after it, because a solution may leave it
+  unbound. A variable predicate reads every predicate at its node and reaches no path,
+  so patterns may continue from its object only through another anchor. Subqueries,
+  `GRAPH`, `SERVICE`, `VALUES`, `MINUS`, triple terms and negated property sets inside a
+  longer path keep F4. The SPARQL uniqueness constraint of §6.3 now validates the holders
+  of the changed key.
+- **`sh:targetWhere`.** The SHACL 1.2 Core Working Draft of 18 September 2026, §3.1.3.6,
+  defines the target as the nodes of the data graph that conform to the given shape. Its
+  note says an engine may have to test every node. Sparkles parses the target, and both
+  the on-demand validator and the guard support it. Candidates are narrowed when the
+  where shape has `sh:class`, `sh:hasValue`, `sh:in`, or a predicate or inverse predicate
+  property with `sh:minCount` of at least 1, directly or through `sh:node`,
+  `sh:property` and `sh:and`. Otherwise every subject and object of the data graph is
+  tested. Membership reads what conformance to the where shape reads at the focus node,
+  so the target delta of §6.2.2 needs no new rule. Without narrowing, being a node of the
+  data graph also reads every edge of the node. A where shape that is recursive or has a
+  query that is not anchored makes its shape fall back like any other. The draft's node
+  expressions for `sh:targetNode` were left out, because their vocabulary is in a
+  separate, less settled draft.
+- **F3 refined.** A changed `(s, rdfs:subClassOf, o)` is replaced by changed `rdf:type`
+  edges of the instances of `s` and of its subclasses, in both states. Those instances are
+  the only nodes whose class membership the change can alter. The fallback remains when
+  there are more than `max_visit` (100,000) of them.
+- **The `unvalidated` flag.** A commit whose guard check was bypassed carries
+  `unvalidated: true` in `/$/commits`, receipts and `sparkles log` (`[unvalidated]`). So
+  does a write of a library store opened with `unvalidated_writes` on a database that
+  requires validation, which is how `--no-validate` works. Such a write is now reported as
+  `bypassed` like the HTTP bypass. The flag is bit 0 of byte 27 of the WAL commit record
+  and is covered by its CRC. In the catalog it takes bit 4 of the flags byte, because bit
+  3 had gone to the default-graph flag after this spec was written. `commit.json` gains an
+  `unvalidated` member. Older records read as validated.
+- **`serve --validate NAME[=CONFIG.json]`.** With a file, the dataset's configuration is
+  set at startup as by `PUT /$/validation/{ds}`. Shapes or a schema without inline text
+  are read from the path in `source`, relative to the file. With `NAME` alone, the
+  dataset is validated with the configuration it has. Either way the data is validated
+  in full before the server listens, which also makes the state of the head known after a
+  restart without `validation-status.json`. A file whose `reject` mode the data does not
+  pass stops the start. A dataset validated by `NAME` alone that does not pass is
+  reported and keeps its configuration.
+- **Mixed shapes sources.** `shapes` may name graphs and a file together, and the CLI
+  takes `--shapes` with `--shapes-graph`. The file's triples, with fresh blank nodes,
+  are merged with the graphs. A write to a shapes graph merges the file's shapes again.
+- **Grandfather mode for ShEx** shipped with this phase ([G02](G02-shex.md#outcome)).
+- **Tests.** A15 gained random `sh:targetWhere` targets with and without narrowing, nine
+  query forms of SHACL-SPARQL constraints, seven anchored and two not, and an ASK
+  component on random paths. It also counts the writes that change `rdfs:subClassOf` and
+  stay incremental. At landing, 600 scenarios with 32,880 writes passed in warn, strict
+  reject and grandfather reject. The sweep also exposed a flaw of the generator: a shape
+  with two qualified value shapes is not well formed, and the two parses of such a shape
+  could disagree. The generator now gives a shape at most one. Unit tests cover the
+  uniqueness constraint, the specification's example of `sh:targetWhere`, a subclass
+  change, mixed sources across a restart, the flag through a catalog rebuilt from the
+  WAL, and `serve --validate`. The W3C suites stayed at 98/98 and 20/20.
+- **Cost.** `bench:shacl-write` gained `EXTRA=1`, which adds a SHACL-SPARQL constraint on
+  every person (each person they know must have a name) and a shape whose focus nodes
+  are the people of 60 and over, by `sh:targetWhere`. It also gained `MODES`, whose
+  `grandfather` mode is `reject --grandfather` over the shapes the data does not conform
+  to. At 1.05M triples, on a machine with a load average near 30 from other builds, every
+  timed write was validated incrementally. The person write took 16 to 19 ms in `warn`,
+  `reject` and grandfather `reject`, against 18 ms with validation off. The write no
+  shape reads took 13 to 19 ms. Validating the SHACL-SPARQL shape alone in full takes
+  about 0.8 s, which every write paid before this phase, twice in grandfather mode.

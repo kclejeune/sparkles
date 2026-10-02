@@ -1,6 +1,6 @@
 //! The route table and the authorization middleware.
 
-use super::{Level, Principal, Scheme, ServerPerm};
+use super::{Endpoint, Level, Principal, Scheme, ServerPerm};
 use crate::state::AppState;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
@@ -59,6 +59,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
+    ("/$/reason/{ds}/auto", &["PUT", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
     ("/$/tasks", &["GET"]),
     // DELETE (cancel) checks admin on the task's dataset in the handler
@@ -73,12 +74,18 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
+    ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
+    ("/$/vector/{ds}/{name}/recall", &["POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
     ("/$/format", &["POST"]),
+    // MCP (`serve --mcp`): every message is checked against the caller's datasets
+    ("/$/mcp", &["*"]),
     // backup repositories (feature `backup`)
     ("/$/repositories", &["GET", "POST"]),
     ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
@@ -119,6 +126,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/get", &["GET", "HEAD"]),
     ("/{ds}/upload", &["POST"]),
     ("/{ds}/explain", &["GET", "POST"]),
+    ("/{ds}/text", &["GET", "POST"]),
+    ("/{ds}/diff", &["GET"]),
+    ("/{ds}/changes", &["GET"]),
     ("/{ds}/shacl", &["POST"]),
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
@@ -185,6 +195,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/validate/langtag" => Caller,
         // reads no dataset; `--format-endpoint authenticated|off` is the handler's
         "/$/format" => Caller,
+        // each tool call reads or writes the datasets its caller may (`mcp::http`)
+        "/$/mcp" => Caller,
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
@@ -202,9 +214,13 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/commits/{ds}"
         | "/$/commits/{ds}/{reference}"
         | "/$/vector/{ds}"
+        | "/$/vector/{ds}/{name}/recall"
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
+        | "/{ds}/text"
+        | "/{ds}/diff"
+        | "/{ds}/changes"
         | "/{ds}/get"
         | "/{ds}/shacl"
         | "/{ds}/shex"
@@ -212,10 +228,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
+        | "/$/vector/{ds}/{name}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/validation/{ds}"
+        | "/$/quota/{ds}"
         | "/{ds}/prefixes"
             if get =>
         {
@@ -223,11 +241,16 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         }
         // prefixes are dataset content; snapshots and history retention pin storage
         "/{ds}/prefixes" => Dataset(Write),
+        // a storage quota is the operator's limit on a dataset, not its admins'
+        "/$/quota/{ds}" => Server(ServerPerm::ServerAdmin),
         "/$/reason/{ds}"
+        | "/$/reason/{ds}/auto"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
         | "/$/geo/{ds}/rebuild"
+        | "/$/vector/{ds}/{name}"
+        | "/$/vector/{ds}/{name}/rebuild"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
         | "/$/backup/{ds}"
@@ -280,6 +303,71 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         }
         _ => return None,
     })
+}
+
+/// The endpoint of a request that needs a level on a dataset, for grants limited to some
+/// endpoints; `None` for routes that need `admin`, which only unlimited grants give.
+pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<Endpoint> {
+    let get = matches!(*method, Method::GET | Method::HEAD);
+    Some(match route {
+        "/{ds}/sparql" | "/{ds}/query" | "/{ds}/explain" | "/{ds}/text" | "/{ds}/geo" => {
+            Endpoint::Query
+        }
+        "/{ds}/update" => Endpoint::Update,
+        "/{ds}/get" => Endpoint::GspR,
+        "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
+        "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
+        "/{ds}/upload" => Endpoint::Upload,
+        "/{ds}/shacl" => Endpoint::Shacl,
+        "/{ds}/shex" => Endpoint::Shex,
+        "/{ds}/diff" | "/{ds}/changes" => Endpoint::Diff,
+        "/{ds}" => {
+            let ct = media_type(headers);
+            if has_param(uri, "update") || ct == "application/sparql-update" {
+                Endpoint::Update
+            } else if has_param(uri, "query")
+                || ct == "application/sparql-query"
+                // the body may hold `update=`: `dataset_root` re-checks
+                || (*method == Method::POST && ct == "application/x-www-form-urlencoded")
+            {
+                Endpoint::Query
+            } else if get || *method == Method::OPTIONS {
+                Endpoint::GspR
+            } else {
+                Endpoint::GspRw
+            }
+        }
+        r if r.contains("{ds}") => match need(route, method, uri, headers) {
+            Some(Need::Dataset(Level::Read | Level::Write)) => Endpoint::Info,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Routes that read or change the whole dataset at once (statistics, index status,
+/// reasoning diagnostics, backups, validation, prefix changes), which a caller limited to
+/// some graphs may not use.
+pub fn whole_dataset(route: &str, method: &Method) -> bool {
+    let get = matches!(*method, Method::GET | Method::HEAD);
+    match route {
+        "/$/stats/{ds}"
+        | "/$/reason/{ds}/diagnostics"
+        | "/$/vector/{ds}"
+        | "/$/vector/{ds}/{name}/recall"
+        | "/{ds}/shacl"
+        | "/{ds}/shex" => true,
+        "/$/reason/{ds}"
+        | "/$/text/{ds}"
+        | "/$/geo/{ds}"
+        | "/$/vector/{ds}/{name}"
+        | "/$/backups/{ds}"
+        | "/$/backups/{ds}/{repo}/{backup}"
+        | "/$/history/{ds}"
+        | "/$/quota/{ds}" => get,
+        "/{ds}/prefixes" => !get,
+        _ => false,
+    }
 }
 
 /// The origin of `public_url`, or else the request's own (`X-Forwarded-Proto` or either
@@ -552,33 +640,50 @@ pub fn dataset_denial(
     headers: &HeaderMap,
     ds: &str,
     lvl: Level,
+    e: Endpoint,
 ) -> Option<Response> {
     let have = p.level(ds);
-    if have.is_some_and(|h| h >= lvl) {
+    if p.level_at(ds, e).is_some_and(|h| h >= lvl) {
         return None;
     }
     if p.is_anonymous() {
-        #[cfg(feature = "auth")]
-        let (realm, basic) = match &st.auth {
-            Some(a) => {
-                let policy = a.policy();
-                (policy.realm.clone(), policy.has_users())
-            }
-            None => ("sparkles".to_string(), false),
-        };
-        #[cfg(not(feature = "auth"))]
-        let (realm, basic) = ("sparkles".to_string(), false);
-        let r = unauthorized(&realm, headers, "authentication required", None, basic);
-        return Some(with_report(r, report_of(p, Some(Denied::Unauthenticated))));
+        return Some(authentication_required(st, p, headers));
     }
     if have.is_none() || st.get(ds).is_none() {
         let r = json_error(StatusCode::NOT_FOUND, &format!("no such dataset: /{ds}"));
         return Some(with_report(r, report_of(p, Some(Denied::Hidden))));
     }
-    Some(forbidden(
-        p,
-        &format!("{} access to /{ds} required", lvl.as_str()),
-    ))
+    Some(forbidden(p, &denial_message(ds, lvl, e, have)))
+}
+
+/// The 403 of a caller below `lvl` on `ds` through endpoint `e`: the endpoint is named
+/// when another endpoint would have given the level.
+fn denial_message(ds: &str, lvl: Level, e: Endpoint, have: Option<Level>) -> String {
+    if have.is_some_and(|h| h >= lvl) {
+        format!("the {} endpoint of /{ds} is not allowed", e.as_str())
+    } else {
+        format!("{} access to /{ds} required", lvl.as_str())
+    }
+}
+
+/// The `401` with the server's challenges, for an anonymous caller that must sign in
+/// (the MCP endpoint, when anonymous callers can read no dataset).
+pub fn authentication_required(st: &AppState, p: &Principal, headers: &HeaderMap) -> Response {
+    #[cfg(feature = "auth")]
+    let (realm, basic) = match &st.auth {
+        Some(a) => {
+            let policy = a.policy();
+            (policy.realm.clone(), policy.has_users())
+        }
+        None => ("sparkles".to_string(), false),
+    };
+    #[cfg(not(feature = "auth"))]
+    let (realm, basic) = {
+        let _ = st;
+        ("sparkles".to_string(), false)
+    };
+    let r = unauthorized(&realm, headers, "authentication required", None, basic);
+    with_report(r, report_of(p, Some(Denied::Unauthenticated)))
 }
 
 /// The `{ds}` segment of the request path.
@@ -845,7 +950,13 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         Need::Dataset(lvl) => {
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
             let have = p.level(&ds);
-            if have.is_none_or(|h| h < lvl) {
+            // through the route's endpoint, for grants limited to some endpoints
+            let e = endpoint(&route, &method, req.uri(), req.headers());
+            let through = match e {
+                Some(e) => p.level_at(&ds, e),
+                None => have,
+            };
+            if through.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
                     return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
                 }
@@ -856,7 +967,23 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     return finish(deny(Denied::Hidden, r, &p));
                 }
                 count(Denied::Forbidden);
-                let msg = format!("{} access to /{ds} required", lvl.as_str());
+                let msg = match e {
+                    Some(e) => denial_message(&ds, lvl, e, have),
+                    None => format!("{} access to /{ds} required", lvl.as_str()),
+                };
+                return finish(forbidden(&p, &msg));
+            }
+            // routes that report on, or change, every graph at once refuse a caller whose
+            // grants cover only some graphs
+            if let Some(e) = e
+                && whole_dataset(&route, &method)
+                && p.view(&ds, e).is_some()
+            {
+                count(Denied::Forbidden);
+                let msg = format!(
+                    "{} covers every graph of /{ds}, and your access is limited to some graphs",
+                    route.replace("{ds}", &ds)
+                );
                 return finish(forbidden(&p, &msg));
             }
         }
@@ -928,6 +1055,15 @@ mod tests {
         for route in ["/{ds}/shacl", "/{ds}/shex"] {
             let n = need(route, &Method::POST, &"/ds/x".parse().unwrap(), &h(&[]));
             assert_eq!(n, Some(Need::Dataset(Level::Read)), "{route}");
+        }
+    }
+
+    #[test]
+    fn a_quota_is_read_by_readers_and_set_by_server_admins() {
+        let n = |m: Method| need("/$/quota/{ds}", &m, &"/x".parse().unwrap(), &h(&[]));
+        assert_eq!(n(Method::GET), Some(Need::Dataset(Level::Read)));
+        for m in [Method::PUT, Method::DELETE] {
+            assert_eq!(n(m), Some(Need::Server(ServerPerm::ServerAdmin)));
         }
     }
 

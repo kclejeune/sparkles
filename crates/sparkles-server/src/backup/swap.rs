@@ -164,6 +164,14 @@ pub(crate) fn replace_with(
     };
     // closing the store releases its `sparkles.lock`
     drop(old);
+    // the storage quota is the operator's, not the backup's: the restored dataset keeps
+    // the one it replaces
+    let quota = root.join(sparkles::store::QUOTA_FILE);
+    if quota.exists()
+        && let Err(e) = std::fs::copy(&quota, restored.join(sparkles::store::QUOTA_FILE))
+    {
+        tracing::warn!(target: "sparkles::backup", "keeping the storage quota of /{name}: {e}");
+    }
     let databases = root
         .parent()
         .map(Path::to_path_buf)
@@ -290,11 +298,14 @@ mod tests {
         let st = state(dir.path());
         let ds = st.create("ds", DbType::Persistent).unwrap();
         update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        ds.store.set_quota(Some(1 << 30)).unwrap();
         drop(ds);
         let tmp = dir.path().join("databases").join(".restore-ds-7");
         let id = restored(&tmp, 3);
         let ds = replace_in_place(&st, "ds", &tmp, "7", true).unwrap();
         assert_eq!(ds.store.dataset_id(), id);
+        // the restored dataset keeps the storage quota of the one it replaced
+        assert_eq!(ds.store.quota().max_bytes, Some(1 << 30));
         assert_eq!(st.get("ds").unwrap().store.snapshot().len(), 3);
         assert!(st.restoring.lock().is_empty());
         let db = dir.path().join("databases");

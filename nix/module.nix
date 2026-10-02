@@ -94,6 +94,8 @@ let
     (toString cfg.port)
     "--timeout"
     (toString cfg.queryTimeout)
+    "--shutdown-grace"
+    (toString cfg.shutdownGrace)
   ]
   ++ lib.optionals (cfg.auth.configFile != null) [
     "--auth-config"
@@ -131,10 +133,23 @@ let
   )
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
+  ++ lib.optional cfg.mcp.enable "--mcp"
+  ++ lib.optional (cfg.mcp.enable && cfg.mcp.allowUpdate) "--mcp-allow-update"
+  ++ lib.optionals cfg.mcp.enable (
+    lib.concatMap (d: [
+      "--mcp-dataset"
+      d
+    ]) cfg.mcp.datasets
+  )
   ++ lib.optional cfg.otel.enable "--otel"
   ++ lib.optional cfg.otel.logs "--otel-logs"
   ++ lib.optional cfg.otel.queryText "--otel-query-text"
   ++ lib.optional cfg.otel.planSpans "--otel-plan-spans"
+  ++ lib.optional cfg.metrics.fusekiNames "--metrics-fuseki-names"
+  ++ lib.optionals (cfg.metrics.listenAddress != null) [
+    "--metrics-addr"
+    cfg.metrics.listenAddress
+  ]
   ++ lib.optionals (rateLimits != null) [
     "--rate-limit-config"
     rateLimitsFile
@@ -277,6 +292,17 @@ in
       description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
     };
 
+    shutdownGrace = mkOption {
+      type = types.ints.unsigned;
+      default = 20;
+      description = ''
+        Seconds that requests in flight get to finish when the service stops
+        (`--shutdown-grace`). Requests still running after that are cancelled, and a
+        cancelled write commits nothing. The unit's `TimeoutStopSec` is this plus 15
+        seconds, which covers the cancellation and the final flush.
+      '';
+    };
+
     loadDir = mkOption {
       type = types.nullOr types.path;
       default = null;
@@ -300,6 +326,34 @@ in
       type = types.bool;
       default = true;
       description = "Allow federated `SERVICE` queries to other endpoints.";
+    };
+
+    mcp = {
+      enable = mkEnableOption ''
+        the Model Context Protocol endpoint `/$/mcp` for LLM agents (`--mcp`). Each call
+        runs as the request's caller and sees only the datasets it may read'';
+
+      allowUpdate = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Offer the `sparql_update` tool at `/$/mcp` (`--mcp-allow-update`) to callers that
+          may write to a dataset. It has no effect with {option}`readOnly`.
+        '';
+      };
+
+      datasets = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "wiki"
+          "public-*"
+        ];
+        description = ''
+          The datasets the MCP tools may see, by name or `*` pattern (`--mcp-dataset`).
+          Empty (the default): all of them. Permissions still apply within them.
+        '';
+      };
     };
 
     cacheMb = mkOption {
@@ -397,6 +451,21 @@ in
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
       description = "`RUST_LOG` filter for the service.";
+    };
+
+    metrics = {
+      fusekiNames = mkEnableOption "Fuseki's Prometheus metric names on `/$/metrics`, next to the Sparkles names";
+
+      listenAddress = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9464";
+        description = ''
+          Also serve `/$/metrics` on this `HOST:PORT`, with the same authentication as the
+          main listener. Without {option}`auth.configFile`, an address that is not
+          loopback needs {option}`allowOpenNetwork`. The firewall is not opened for it.
+        '';
+      };
     };
 
     otel = {
@@ -652,9 +721,9 @@ in
         ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
         Restart = "on-failure";
         RestartSec = 5;
-        # graceful shutdown flushes nothing extra (commits are durable), but give
-        # in-flight requests a moment
-        TimeoutStopSec = 30;
+        # the grace period for requests in flight, then up to 5 s for cancelled ones to
+        # stop and the final flush (commits are durable either way)
+        TimeoutStopSec = cfg.shutdownGrace + 15;
         LimitNOFILE = 65536;
 
         # hardening

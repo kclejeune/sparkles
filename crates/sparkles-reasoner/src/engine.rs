@@ -373,10 +373,39 @@ fn slot_bound(s: Slot, bound: &[bool]) -> bool {
 /// Greedy join order: builtins as soon as their inputs are bound, then the atom with
 /// the smallest estimated number of matches. `g = None` plans without statistics.
 pub(crate) fn plan(rule: &CRule, ranges: &[(u32, u32)], g: Option<&Graph>) -> Option<Vec<Step>> {
+    plan_with(rule, ranges, g, None, &[])
+}
+
+/// [`plan`] with the variables `prebound` bound before the first step, and atom `first`
+/// (if any) as the first step.
+pub(crate) fn plan_with(
+    rule: &CRule,
+    ranges: &[(u32, u32)],
+    g: Option<&Graph>,
+    first: Option<usize>,
+    prebound: &[usize],
+) -> Option<Vec<Step>> {
     let mut bound = vec![false; rule.nvars];
+    for &v in prebound {
+        bound[v] = true;
+    }
     let mut steps = Vec::with_capacity(rule.atoms.len() + rule.builtins.len());
     let mut atoms_left: Vec<usize> = (0..rule.atoms.len()).collect();
     let mut bi_left: Vec<usize> = (0..rule.builtins.len()).collect();
+    if let Some(d) = first {
+        atoms_left.retain(|&i| i != d);
+        let a = &rule.atoms[d];
+        for s in [a.s, a.p, a.o] {
+            if let Slot::Var(v) = s {
+                bound[v] = true;
+            }
+        }
+        steps.push(Step::Atom {
+            atom: d,
+            lo: ranges[d].0,
+            hi: ranges[d].1,
+        });
+    }
     loop {
         // place builtins whose inputs are bound
         let mut progress = true;
@@ -469,7 +498,15 @@ fn estimate(a: &Atom, bound: &[bool], (lo, hi): (u32, u32), g: Option<&Graph>) -
 
 /// Which optional graph indexes a plan uses: (by subject, by object).
 fn index_needs(rule: &CRule, steps: &[Step]) -> (bool, bool) {
+    index_needs_with(rule, steps, &[])
+}
+
+/// [`index_needs`] of a plan that starts with the variables `prebound` bound.
+pub(crate) fn index_needs_with(rule: &CRule, steps: &[Step], prebound: &[usize]) -> (bool, bool) {
     let mut bound = vec![false; rule.nvars];
+    for &v in prebound {
+        bound[v] = true;
+    }
     let (mut need_s, mut need_o) = (false, false);
     for st in steps {
         match *st {
@@ -500,6 +537,24 @@ fn index_needs(rule: &CRule, steps: &[Step]) -> (bool, bool) {
 
 // ================================================================ evaluation ===
 
+/// Receives the body of a rule instance: the rows its atoms matched and the facts its
+/// builtins read (`listForAll`). Returns false to stop the evaluation.
+pub(crate) type Sink<'s> = dyn FnMut(&[u32], &[Triple]) -> bool + 's;
+
+/// What an evaluation emits.
+pub(crate) enum Mode<'s> {
+    /// heads not in the graph yet (forward chaining)
+    New,
+    /// heads in the graph (the consequences of deleted facts)
+    Existing,
+    /// the instances whose head number `head` is `target`
+    Instances {
+        head: usize,
+        target: Triple,
+        sink: &'s mut Sink<'s>,
+    },
+}
+
 pub(crate) struct Eval<'a> {
     pub g: &'a Graph,
     pub terms: &'a Terms,
@@ -512,9 +567,51 @@ pub(crate) struct Eval<'a> {
     pub out: Vec<Triple>,
     pub max_out: usize,
     ticks: u32,
+    pub mode: Mode<'a>,
+    /// rows matched by the atoms of the current partial instance ([`Mode::Instances`])
+    trail: Vec<u32>,
+    /// facts read by builtins of the current partial instance ([`Mode::Instances`])
+    pub implicit: Vec<Triple>,
+    stop: bool,
 }
 
 impl<'a> Eval<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        g: &'a Graph,
+        terms: &'a Terms,
+        rule: &'a CRule,
+        steps: &'a [Step],
+        end: u32,
+        abort: &'a AtomicBool,
+        cancel: Option<&'a AtomicBool>,
+        max_out: usize,
+        mode: Mode<'a>,
+    ) -> Eval<'a> {
+        Eval {
+            g,
+            terms,
+            rule,
+            steps,
+            end,
+            abort,
+            cancel,
+            out: Vec::new(),
+            max_out,
+            ticks: 0,
+            mode,
+            trail: Vec::new(),
+            implicit: Vec::new(),
+            stop: false,
+        }
+    }
+
+    /// Whether the evaluation reports rule instances (and so tracks their bodies).
+    #[inline]
+    pub fn collecting(&self) -> bool {
+        matches!(self.mode, Mode::Instances { .. })
+    }
+
     #[inline]
     pub fn val(&self, s: Slot, b: &[u64]) -> u64 {
         match s {
@@ -533,6 +630,9 @@ impl<'a> Eval<'a> {
     }
 
     fn aborted(&mut self) -> bool {
+        if self.stop {
+            return true;
+        }
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks & 0x3FF == 0
             && (self.abort.load(Ordering::Relaxed)
@@ -561,18 +661,29 @@ impl<'a> Eval<'a> {
                     }
                 };
                 let (as_, ap, ao) = (a.s, a.p, a.o);
+                let collecting = self.collecting();
                 for j in 0..cands.len() {
                     if self.aborted() {
                         return;
                     }
-                    let t = self.g.triples[cands.get(j) as usize];
+                    let row = cands.get(j);
+                    if !self.g.alive(row) {
+                        continue;
+                    }
+                    let t = self.g.triples[row as usize];
                     let mut newly = [usize::MAX; 3];
                     let mut n = 0;
                     let ok = unify(as_, t[0], b, &mut newly, &mut n)
                         && unify(ap, t[1], b, &mut newly, &mut n)
                         && unify(ao, t[2], b, &mut newly, &mut n);
                     if ok {
-                        self.run(k + 1, b, None);
+                        if collecting {
+                            self.trail.push(row);
+                            self.run(k + 1, b, None);
+                            self.trail.pop();
+                        } else {
+                            self.run(k + 1, b, None);
+                        }
                     }
                     for &v in &newly[..n] {
                         b[v] = 0;
@@ -604,11 +715,33 @@ impl<'a> Eval<'a> {
     }
 
     fn emit(&mut self, b: &[u64]) {
-        for h in &self.rule.head {
+        let rule = self.rule;
+        if let Mode::Instances { head, target, .. } = &self.mode {
+            if let Some(CHead::Triple(s, p, o)) = rule.head.get(*head) {
+                let t = [self.val(*s, b), self.val(*p, b), self.val(*o, b)];
+                if t == *target {
+                    let Eval {
+                        mode,
+                        trail,
+                        implicit,
+                        stop,
+                        ..
+                    } = self;
+                    if let Mode::Instances { sink, .. } = mode
+                        && !sink(trail, implicit)
+                    {
+                        *stop = true;
+                    }
+                }
+            }
+            return;
+        }
+        let existing = matches!(self.mode, Mode::Existing);
+        for h in &rule.head {
             match h {
                 CHead::Triple(s, p, o) => {
                     let t = [self.val(*s, b), self.val(*p, b), self.val(*o, b)];
-                    if self.g.position(&t).is_none() {
+                    if self.g.position(&t).is_some() == existing {
                         self.out.push(t);
                     }
                 }
@@ -655,11 +788,15 @@ pub(crate) struct Outcome {
 const CHUNK: usize = 2048;
 
 /// Run the rules to a fixpoint. Derived triples are appended to `g`.
+///
+/// With `start`, the rows before it are already closed under the rules and the rows from
+/// it on are new: evaluation is semi-naive from the first iteration.
 pub(crate) fn run(
     g: &mut Graph,
     rules: &[CRule],
     terms: &Terms,
     limits: &Limits,
+    start: Option<u32>,
 ) -> anyhow::Result<Outcome> {
     let base_len = g.len();
     let abort = AtomicBool::new(false);
@@ -670,7 +807,7 @@ pub(crate) fn run(
             .is_some_and(|c| c.load(Ordering::Relaxed))
     };
     let mut iteration = 0usize;
-    let (mut ds, mut de) = (0u32, base_len);
+    let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
     loop {
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
@@ -703,7 +840,7 @@ pub(crate) fn run(
             })
         };
         for (ri, r) in rules.iter().enumerate() {
-            if iteration == 0 {
+            if iteration == 0 && start.is_none() {
                 // naive evaluation over the base data (old = ∅)
                 let ranges = vec![(0, de); r.atoms.len()];
                 if empty(r, &ranges, g) {
@@ -781,18 +918,17 @@ pub(crate) fn run(
             .par_iter()
             .map(|(ri, steps, first)| {
                 let r = &rules[*ri];
-                let mut ev = Eval {
-                    g: gr,
+                let mut ev = Eval::new(
+                    gr,
                     terms,
-                    rule: r,
+                    r,
                     steps,
-                    end: de,
-                    abort: &abort,
-                    cancel: limits.cancel.as_deref(),
-                    out: Vec::new(),
+                    de,
+                    &abort,
+                    limits.cancel.as_deref(),
                     max_out,
-                    ticks: 0,
-                };
+                    Mode::New,
+                );
                 let mut b = vec![0u64; r.nvars];
                 ev.run(0, &mut b, *first);
                 let total = produced.fetch_add(ev.out.len(), Ordering::Relaxed) + ev.out.len();
@@ -854,5 +990,90 @@ pub(crate) fn run(
     }
     Ok(Outcome {
         iterations: iteration,
+    })
+}
+
+// ============================================================== incremental ====
+
+/// Why a rule keeps a materialization from being maintained incrementally, if it does.
+///
+/// Incremental maintenance needs rules whose instances depend on the facts their atoms
+/// match and on nothing else that can change: `noValue` is negation, `now` gives another
+/// value in each run, `makeTemp` / `makeSkolem` and blank node constants create fresh
+/// blank nodes in each run, head actions derive facts from lists their body never
+/// matches, and a `listForAll` reads facts that no atom of the rule matches unless a
+/// `listMember` and an atom over the same list cover them (as in `cls-int1`).
+pub(crate) fn incremental_blocker(r: &CRule, terms: &Terms) -> Option<String> {
+    use crate::builtins::BuiltinKind as B;
+    for b in &r.builtins {
+        let why = match b.kind {
+            B::NoValue => "noValue is not monotonic",
+            B::Now => "now gives a new value in each run",
+            B::MakeTemp | B::MakeSkolem => "it creates blank nodes",
+            B::ListForAll if !list_for_all_covered(r, b) => {
+                "its listForAll reads facts that no atom of the rule matches"
+            }
+            _ => continue,
+        };
+        return Some(format!("rule '{}': {why}", r.name));
+    }
+    for h in &r.head {
+        match h {
+            CHead::Action(..) => {
+                return Some(format!(
+                    "rule '{}': head actions derive facts from lists",
+                    r.name
+                ));
+            }
+            CHead::Triple(s, p, o) => {
+                let bnode = [s, p, o].into_iter().any(|x| match x {
+                    Slot::Const(c) => {
+                        sparkles::id::Id(*c).tag() == sparkles::id::Tag::Local
+                            && terms.kind(*c) == crate::terms::Kind::BNode
+                    }
+                    _ => false,
+                });
+                if bnode {
+                    return Some(format!(
+                        "rule '{}': a blank node in the head is a new blank node in each run",
+                        r.name
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `listForAll(?l, ?y, P)` is covered when the rule also has `listMember(?l, ?m)` and
+/// the atom `(?y P ?m)`: every fact it reads is then matched by that atom in some
+/// instance.
+fn list_for_all_covered(r: &CRule, b: &CBuiltin) -> bool {
+    let &[l @ Slot::Var(_), y, p] = &b.args[..] else {
+        return false;
+    };
+    r.builtins.iter().any(|m| {
+        m.kind == crate::builtins::BuiltinKind::ListMember
+            && m.args[0] == l
+            && matches!(m.args[1], Slot::Var(_))
+            && r.atoms
+                .iter()
+                .any(|a| a.s == y && a.p == p && a.o == m.args[1])
+    })
+}
+
+/// Whether a rule reads RDF lists through builtins.
+pub(crate) fn reads_lists(r: &CRule) -> bool {
+    use crate::builtins::BuiltinKind as B;
+    r.builtins.iter().any(|b| {
+        matches!(
+            b.kind,
+            B::ListMember
+                | B::ListContains
+                | B::ListNotContains
+                | B::ListLength
+                | B::ListEntry
+                | B::ListForAll
+        )
     })
 }

@@ -1201,6 +1201,12 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         names(&run(s, q).unwrap_or_else(|e| panic!("{q}: {e}")))
     }
 
+    /// An index join in the plan tests a spatial filter on the rows it reads.
+    fn filtered_probe(p: &PlanInfo) -> bool {
+        (p.operator == "IndexJoin" && p.description.contains("geosparql/sf"))
+            || p.children.iter().any(filtered_probe)
+    }
+
     fn find<'a>(p: &'a PlanInfo, op: &str) -> Option<&'a PlanInfo> {
         if p.operator == op {
             return Some(p);
@@ -1474,7 +1480,12 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         let slow = run_on(snap, q, false);
         assert_eq!(names(&fast), names(&slow), "{q}");
         assert!(find(&slow.plan, "SpatialScan").is_none(), "{q}");
-        assert!(find(&slow.plan, "Filter").is_some(), "{q}");
+        // the filter is tested row by row, in a FILTER or on the rows an index join reads
+        assert!(
+            find(&slow.plan, "Filter").is_some() || filtered_probe(&slow.plan),
+            "{q}: {:#?}",
+            slow.plan
+        );
         assert!(
             find(&fast.plan, "SpatialScan").is_some(),
             "{q}: not pushed: {:#?}",
@@ -1878,9 +1889,11 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
             geo_op_vertices: 9,
             ..Default::default()
         });
-        let ctx = super::super::make_ctx(s.snapshot(), &QueryOptions::default(), None, None);
+        let ctx =
+            super::super::make_ctx(s.snapshot(), &QueryOptions::default(), None, None).unwrap();
         assert_eq!(ctx.geo.op_vertices(), 9);
-        let ctx = super::super::make_ctx(store().snapshot(), &QueryOptions::default(), None, None);
+        let ctx = super::super::make_ctx(store().snapshot(), &QueryOptions::default(), None, None)
+            .unwrap();
         assert_eq!(ctx.geo.op_vertices(), 2_000_000);
         // a union of two 5-point polygons is over a limit of 9 vertices: unbound
         let q = format!("SELECT ?u {{ BIND(geof:union({GA}, {GC}) AS ?u) }}");

@@ -6,6 +6,7 @@
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { receiptSummary } from '$lib/commits';
+  import { atLabel, normalizeAt, validAt } from '$lib/history';
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
@@ -87,6 +88,21 @@
   const prefixes = $derived(app.prefixes(outcome?.ds ?? ds));
   const kind = $derived(queryKind(active.query));
   const reasoningInfo = $derived(app.datasets.find((d) => d.name === ds)?.reasoning ?? null);
+  /** The `at` field: a past state to read, or empty for the head. */
+  const atOk = $derived(validAt(app.queryAt));
+  /** Named snapshots of the dataset, offered in the `at` field. */
+  let snapshotNames = $state<string[]>([]);
+  $effect(() => {
+    const name = ds;
+    snapshotNames = [];
+    if (!name) return;
+    api
+      .snapshots(name)
+      .then((l) => {
+        if (ds === name) snapshotNames = l.snapshots.map((s) => s.ref);
+      })
+      .catch(() => {});
+  });
   /** `reasoning=` for a dataset: only sent when it has materialized inferences. */
   const reasoningFor = (name: string | null | undefined) =>
     app.datasets.find((d) => d.name === name)?.reasoning ? inferences : undefined;
@@ -209,6 +225,17 @@
     const text = withPrefixes(tab, original, dsName);
     if (tabId === activeId) editor?.showError(undefined);
     const k = queryKind(text) ?? 'SELECT';
+    let at: string | undefined;
+    try {
+      at = normalizeAt(app.queryAt) ?? undefined;
+    } catch (e) {
+      toasts.push('error', 'Invalid At', (e as Error).message);
+      return;
+    }
+    if (k === 'UPDATE' && at) {
+      toasts.push('error', 'Updates always apply to the head', 'Clear the At field to run one.');
+      return;
+    }
     const controller = new AbortController();
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
@@ -255,6 +282,7 @@
         const result = await api.query(dsName, text, {
           send: limit,
           reasoning,
+          at,
           signal: controller.signal,
         });
         const elapsed = performance.now() - started;
@@ -643,6 +671,32 @@
         <span>Use inferences</span>
       </label>
     {/if}
+    <label
+      class="at"
+      title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
+    >
+      <span class="faint">At</span>
+      <input
+        class="input sm mono"
+        class:invalid={!atOk}
+        placeholder="head"
+        list="at-options"
+        size="12"
+        aria-invalid={!atOk}
+        bind:value={app.queryAt}
+      />
+      <datalist id="at-options">
+        {#each snapshotNames as s (s)}<option value={s}></option>{/each}
+      </datalist>
+      {#if app.queryAt}
+        <button
+          class="btn ghost icon sm"
+          aria-label="Read the head"
+          title="Read the head"
+          onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
+        >
+      {/if}
+    </label>
     <label class="limit" title="Maximum rows the server sends to the browser (send=)">
       <span class="faint">Show</span>
       <select class="select sm" bind:value={limit}>
@@ -805,7 +859,15 @@
             >
           {/if}
           <span class="spacer"></span>
-          {#if outcome.result?.meta.commit != null && outcome.view !== 'explain'}
+          {#if outcome.result?.at?.historical && outcome.view !== 'explain'}
+            {@const at = outcome.result.at}
+            <span
+              class="badge commit past"
+              title="A past state of {outcome.ds}, read with at={at.selector}{at.datetime
+                ? ` (${at.datetime})`
+                : ''}">{atLabel(at)}</span
+            >
+          {:else if outcome.result?.meta.commit != null && outcome.view !== 'explain'}
             <span
               class="badge commit"
               title="The result was read at commit {outcome.result.meta
@@ -1198,11 +1260,22 @@
   .target {
     font-size: var(--fs-sm);
   }
-  .limit {
+  .limit,
+  .at {
     display: flex;
     align-items: center;
     gap: 6px;
     font-size: var(--fs-sm);
+  }
+  .at input {
+    width: 9.5em;
+  }
+  .at input.invalid {
+    border-color: var(--danger);
+  }
+  .badge.past {
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: var(--warn);
   }
   .inf {
     cursor: pointer;

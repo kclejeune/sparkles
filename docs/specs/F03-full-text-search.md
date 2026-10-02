@@ -6,8 +6,11 @@
 > documents kept current in the commit path, catch-up or rebuild at open,
 > `sparkles text-index` and `/$/text/{ds}`. Two Phase 2 items shipped with it:
 > `PUT`/`DELETE /$/text/{ds}` and the UI (an index admin panel and ranked search in
-> Explore). Snippets, highlighting, stemming, the Sparkles query grammar and the Phase 3
-> items are not built.
+> Explore). Later, Lucene's query syntax replaced the planned Sparkles grammar, and
+> highlighting with snippets and stemming per language shipped. Of Phase 3, the fast
+> fields shipped with index format 2, and hybrid retrieval with vector search shipped as
+> `spk:hybridSearch` ([F04](F04-vector-search.md#outcome)). Online rebuilds, `text` on
+> dataset creation and the other Phase 3 items are not built.
 >
 > **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
@@ -693,5 +696,105 @@ disk. With the lazy commit, a 1,000-triple insert takes 28.4 ms with text search
 24–26 ms with it off and 46.2 ms with a commit per write. A top-10 `text:query` takes about
 15 ms.
 
-**Not built.** `/{ds}/text` with snippets, `highlight:`, stemming, the Sparkles query
-grammar, online rebuilds with a journal, `text` on dataset creation, and all of Phase 3.
+**Query syntax, limits and search cost (2026-10-02).** The full-text benchmark
+(`scripts/bench-text.sh`) compared Sparkles with Fuseki and jena-text and found three
+problems, which this change fixed.
+
+- *Query syntax.* Tantivy's query parser found nothing for a single word with a trailing
+  `*`, so `al*` and `+ada +lov*` returned no rows and no error. Instead of the small grammar
+  that Phase 2 planned, Sparkles now parses Lucene's classic query syntax itself
+  (`text/lucene.rs`) and applies Lucene's rules for combining clauses. Words, phrases,
+  slops, prefixes, wildcards, fuzzy words, regular expressions, ranges, boosts and the
+  boolean operators all work. On the benchmark data, 67 query strings that cover these
+  forms matched the same literals as in Jena, and both engines refused 5 malformed ones.
+  A sloppy phrase uses Lucene's semantics,
+  which accept the words in either order, so it has its own Tantivy query. A fuzzy word
+  expands to at most 50 terms, as Lucene's `FuzzyQuery` does. Forms that would find
+  nothing or that Sparkles cannot reproduce give `400`. These are field names, a query
+  with only excluded words or with no word left after analysis, and a few Lucene regular
+  expression operators. The phrase prefix `"quick bro"*` stays a Sparkles extension, which
+  Jena reads as the phrase or any document.
+- *Limits above `maxHits`.* A search with an explicit limit above `maxHits` fetched
+  `maxHits + 1` hits, treated them as all hits and returned them without an error. Such a
+  limit now counts as no limit, so more than `maxHits` hits give `507`.
+- *Cost per hit.* Resolving each hit loaded its stored document, which cost a doc store
+  block decompression per hit. Index format 2 keeps `s`, `p`, `o` and `g` in columns
+  (fast fields) and stores nothing, so the Phase 3 item that planned fast fields for `s`
+  and `g` is done. A search reads only the columns its outputs need, decodes each distinct
+  term once in sorted order, and caches the term ids per segment for the store generation.
+  The planner drops a score or literal output that the query uses nowhere else, so a
+  `COUNT` or a subject join reads no literal. A search without a limit collects its hits
+  without a top-k heap. On 1.05M triples, counting the 4,937 hits of a common word went from
+  about 20 ms to about 2 ms per HTTP request, and joining them with a structural pattern
+  went from about 20 ms to about 3 ms. These are medians of 40 requests on a busy machine,
+  with the id cache warm. Without the cache, each distinct term costs a dictionary lookup
+  of about half a microsecond. The `docstoreCompression` setting is still accepted, but it
+  no longer changes the index size.
+
+**Highlighting (2026-10-02).** Jena's `highlight:` argument works, with Jena's options
+and defaults (`m:`, `z:`, `s:`, `e:`, `f:`, `jh:` and `jf:`). Sparkles does not use
+Tantivy's `SnippetGenerator`, because it returns a single fragment and does not see the
+terms of prefix, wildcard and fuzzy queries. `text/highlight.rs` follows Lucene's
+`Highlighter` with a `SimpleFragmenter` instead. It cuts fragments at the same tokens,
+scores them by their distinct query words, keeps the best, merges adjacent ones, and marks
+a phrase only where it occurs. The query parser records what each word that is not
+excluded matches, including the terms a fuzzy word expanded to. The literal's text comes
+from the store's dictionary, so the index stores no text, and a search without
+`highlight:` reads none. On the benchmark data, 14 highlighted queries returned the same
+literals as Jena, fragments and marks included. One difference is deliberate. Jena drops
+the language tag of a highlighted literal unless its index has a language field, while
+Sparkles always keeps it. `GET /{ds}/text` from §2.2 returns ranked hits with HTML
+snippets, escaped by Sparkles with the matches in `<mark>`. The full-text benchmark has a
+sixth query for highlighting, on which Fuseki also runs.
+
+**Stemming per language (2026-10-02).** Phase 2 planned stemmed fields per language. They
+follow jena-text's `text:multilingualSupport` with a `text:langField`, where a tagged
+literal is indexed a second time with its language's analyzer and a search with
+`lang:xx` searches that field.
+
+- *Configuration.* `languages` in `text.json` is `"all"`, a list of primary language
+  tags, or a map from a tag to an analyzer name. `sparkles text-index --language`
+  sets it. Each language gets a field `text_<tag>`, and the schema depends on the
+  configuration. An index without languages keeps its schema and its configuration
+  hash, so it is not rebuilt and no format change was needed. A change of languages
+  changes the hash and rebuilds the index on open, as other configuration changes do.
+- *Analyzers.* Tantivy's Snowball stemmers (the `stemmer` feature, `rust-stemmers`) and
+  its stop word lists (the `stopwords` feature, which adds no crate) cover 18 languages.
+  An analyzer lowercases, drops stop words and stems. Its stems are not folded to ASCII,
+  as in Lucene. A first version folded them like the standard text, and the comparison
+  below showed that folding merged words Lucene keeps apart, such as Swedish `städer`
+  and `stad`. Removed stop words leave gaps in the positions, so phrases match as in
+  Lucene.
+- *Queries.* `lang:` and a tagged query string choose the field by the primary subtag,
+  so `en-GB` literals are stemmed as English. Jena matches the tag exactly. The query
+  parser of the Lucene syntax analyzes words with the field's analyzer and searches the
+  field's terms. Prefixes, wildcards, fuzzy words, regular expressions and range bounds
+  are lowercased but not stemmed, as Lucene's `QueryParser` normalizes multi-term
+  queries. German ones also lose umlauts and ß, as Lucene's German normalization and
+  the Snowball German stems do. Highlighting uses the same analyzer, so stemmed matches
+  are marked.
+- *Comparison with Jena.* A corpus of 2,700 literals in nine languages (English, French,
+  German, Spanish, Italian, Portuguese, Dutch, Russian and Swedish), with inflected forms
+  and stop words, was loaded into Sparkles and into Fuseki 5.1.0 with jena-text
+  configured the same way. Of 1,590 stemmed queries (words, conjunctions, stop words,
+  prefixes, fuzzy words, wildcards and phrases), 1,235 matched the same literals. German,
+  Dutch, Russian and Swedish, where Lucene also uses Snowball, agreed on 662 of 671. The
+  rest differ by Lucene's Dutch stem dictionary and by `ё` in Russian stems. English
+  agreed on 172 of 191, because Lucene uses the original Porter stemmer and Tantivy the
+  Snowball English stemmer (`relativity` is `rel` in one and `relat` in the other).
+  French, Spanish, Italian and Portuguese agreed on 401 of 728, because Lucene uses light
+  stemmers for them that merge fewer forms than Snowball does. A query of stop words only
+  gives `400` in Sparkles, and Jena then returns every literal of the language.
+- *Benchmark.* `scripts/bench-text.sh` indexes the English titles stemmed in both engines
+  and has a seventh query, `"+theories +42"` with `lang:en`. On 210,509 triples Sparkles
+  and Jena returned the same 10 literals, and every other query kept its answer.
+
+**Rank output.** `text:query` has a sixth subject slot after Jena's five, the hit's rank
+in the score order. It is one more than the number of hits with a higher score, so equal
+scores share a rank. The rank exists for `spk:hybridSearch`
+([F04](F04-vector-search.md#outcome)), which fuses a text ranking with a vector ranking,
+and is not produced when the query does not use it.
+
+**Not built.** Online rebuilds with a journal, `text` on dataset creation, analyzers other
+than Tantivy's (Lucene's Porter and light stemmers, CJK segmentation), and the rest of
+Phase 3 apart from hybrid retrieval.

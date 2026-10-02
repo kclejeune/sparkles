@@ -37,6 +37,8 @@ pub struct UpdateStats {
     pub commit: Option<crate::commit::Receipt>,
     /// Peak estimated memory of the WHERE evaluations (the largest of any operation).
     pub mem_peak_bytes: u64,
+    /// Rows produced by the operators of every WHERE evaluation, summed.
+    pub rows_produced: u64,
 }
 
 pub fn update(store: &Store, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
@@ -104,6 +106,35 @@ fn protocol_dataset(u: &mut spargebra::Update, opts: &QueryOptions) -> Result<()
     Ok(())
 }
 
+/// Whether `u` parses as an update that only inserts or deletes data (`INSERT DATA`,
+/// `DELETE DATA`): no pattern to evaluate, no LOAD, no graph management. Such an update
+/// does a bounded amount of work for its size.
+pub fn data_only(u: &str, opts: &QueryOptions) -> bool {
+    let mut p = super::aggext::register(SparqlParser::new());
+    if let Some(b) = &opts.base_iri {
+        match p.with_base_iri(b) {
+            Ok(q) => p = q,
+            Err(_) => return false,
+        }
+    }
+    for (k, v) in &opts.prefixes {
+        match p.with_prefix(k, v) {
+            Ok(q) => p = q,
+            Err(_) => return false,
+        }
+    }
+    p.parse_update(u).is_ok_and(|parsed| {
+        !parsed.operations.is_empty()
+            && parsed.operations.iter().all(|op| {
+                matches!(
+                    op,
+                    GraphUpdateOperation::InsertData { .. }
+                        | GraphUpdateOperation::DeleteData { .. }
+                )
+            })
+    })
+}
+
 fn run_update(
     store: &Store,
     parsed: &spargebra::Update,
@@ -128,10 +159,20 @@ fn run_update(
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
         budget: RequestBudget::new(&opts.outbound),
+        produced: Default::default(),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
+    // graphs named by constants are checked before the writer lock is taken
+    if let Some(access) = opts.graphs.as_ref() {
+        for op in &parsed.operations {
+            check_constant_graphs(access, op)?;
+        }
+    }
     let mut wopts = opts.write.clone();
+    if wopts.graphs.is_none() {
+        wopts.graphs = opts.graphs.clone();
+    }
     if wopts.cancel.is_none() {
         wopts.cancel = opts.cancel.clone();
     }
@@ -145,6 +186,7 @@ fn run_update(
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
+    stats.rows_produced = req.produced.load(std::sync::atomic::Ordering::Relaxed);
     stats.commit = Some(txn.commit()?);
     let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
     stats.timing = Timing {
@@ -166,6 +208,8 @@ struct Request<'a> {
     base: Option<oxiri::Iri<String>>,
     /// what the LOADs and SERVICE calls of every operation spend
     budget: Arc<RequestBudget>,
+    /// rows produced by the WHERE evaluations of every operation
+    produced: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Request<'_> {
@@ -201,6 +245,10 @@ impl Request<'_> {
         if let Some(m) = self.opts.max_memory_bytes {
             ctx.mem_limit = m;
         }
+        if let Some(m) = self.opts.max_rows_produced {
+            ctx.max_rows_produced = m;
+        }
+        ctx.rows_produced = self.produced.clone();
         ctx.allow_service = self.opts.allow_service;
         ctx.forbid_service = self.opts.forbid_service;
         ctx.outbound = self.opts.outbound.clone();
@@ -285,8 +333,19 @@ fn run_op(
                         .collect()
                 });
             }
+            // the WHERE clause reads the request's graph view only
+            super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
             let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;
+            // a graph a template takes from a variable is checked for every solution,
+            // before anything else of the quad is looked up
+            let access = req.opts.graphs.clone();
+            let check = |g: Option<Id>| -> Result<()> {
+                match (&access, g) {
+                    (Some(a), Some(g)) => check_graph_id(a, &ctx, g),
+                    _ => Ok(()),
+                }
+            };
             stats.mem_peak_bytes = stats.mem_peak_bytes.max(ctx.mem_peak());
             let map = table.var_map(ctx.nvars());
             let get = |ctx: &Ctx, name: &str, i: usize| -> Option<Id> {
@@ -294,14 +353,25 @@ fn run_op(
                 let id = table.cols[c][i];
                 (!id.is_undef()).then_some(id)
             };
+            // A blank node the WHERE clause minted (BNODE(), a SERVICE result) is not in
+            // the store: inserting it makes a new stored node, the same one wherever the
+            // operation inserts it, and never one that exists already.
+            let mut minted = Minted::default();
             // resolve query-local ids into store ids
-            let to_store = |txn: &mut WriteTxn<'_>, ctx: &Ctx, id: Id| -> Result<Option<Id>> {
+            let to_store = |txn: &mut WriteTxn<'_>,
+                            minted: &mut Minted,
+                            ctx: &Ctx,
+                            id: Id|
+             -> Result<Option<Id>> {
                 Ok(match id.tag() {
                     Tag::Local => match ctx.term(id) {
-                        Some(t) => Some(txn.intern(&t)?),
+                        Some(t) => {
+                            let t = minted.stored(txn, &t);
+                            Some(txn.intern(&t)?)
+                        }
                         None => None,
                     },
-                    Tag::BNode if id.payload() & Id::LOCAL_BNODE_BIT != 0 => None,
+                    Tag::BNode => Some(minted.id(txn, id)),
                     _ => Some(id),
                 })
             };
@@ -330,6 +400,9 @@ fn run_op(
                             }
                         }
                     };
+                    if let GraphNamePattern::Variable(v) = &q.graph_name {
+                        check(get(&ctx, v.as_str(), i))?;
+                    }
                     let s = gt(&q.subject);
                     let p = named_pat(&ctx, &q.predicate, |n| get(&ctx, n, i), true);
                     let o = gt(&q.object);
@@ -340,10 +413,13 @@ fn run_op(
                 }
                 let mut bnodes: FxHashMap<String, Id> = FxHashMap::default();
                 for q in insert {
+                    if let GraphNamePattern::Variable(v) = &q.graph_name {
+                        check(get(&ctx, v.as_str(), i))?;
+                    }
                     let mut tp = |txn: &mut WriteTxn<'_>, t: &TermPattern| -> Result<Option<Id>> {
                         Ok(match t {
                             TermPattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                                Some(id) => to_store(txn, &ctx, id)?,
+                                Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                                 None => None,
                             },
                             TermPattern::BlankNode(b) => Some(bnode(txn, &mut bnodes, b)),
@@ -368,7 +444,10 @@ fn run_op(
                                     &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
                                     &mut bn,
                                 ) {
-                                    Some(term) => Some(txn.intern(&term)?),
+                                    Some(term) => {
+                                        let term = minted.stored(txn, &term);
+                                        Some(txn.intern(&term)?)
+                                    }
                                     None => None,
                                 }
                             }
@@ -381,7 +460,7 @@ fn run_op(
                             Some(txn.intern(&Term::NamedNode(n.clone()))?)
                         }
                         NamedNodePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                            Some(id) => to_store(txn, &ctx, id)?,
+                            Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                             None => None,
                         },
                     };
@@ -391,7 +470,7 @@ fn run_op(
                             Some(txn.intern(&Term::NamedNode(n.clone()))?)
                         }
                         GraphNamePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                            Some(id) => to_store(txn, &ctx, id)?,
+                            Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                             None => None,
                         },
                     };
@@ -457,6 +536,19 @@ fn run_op(
                     .lookup_term(&Term::NamedNode(n.clone()))
                     .into_iter()
                     .collect(),
+                // with a graph view: the graphs it sees, each of which must be writable
+                GraphTarget::NamedGraphs | GraphTarget::AllGraphs
+                    if let Some(a) = req.opts.graphs.as_ref().filter(|a| !a.reads_all()) =>
+                {
+                    let mut v = a.visible_named(&view)?.to_vec();
+                    if matches!(graph, GraphTarget::AllGraphs) && a.read.default_graph() {
+                        v.push(Id::DEFAULT_GRAPH);
+                    }
+                    for g in &v {
+                        a.check_write(&view, *g)?;
+                    }
+                    v
+                }
                 GraphTarget::NamedGraphs => view.graph_ids()?,
                 GraphTarget::AllGraphs => {
                     let mut v = view.graph_ids()?;
@@ -476,6 +568,92 @@ fn run_op(
         GraphUpdateOperation::Create { .. } => {}
     }
     let _ = store;
+    Ok(())
+}
+
+/// [`Error::NotPermitted`] unless graph `g` (an id of the WHERE clause's context) may
+/// be written.
+fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+    if g == Id::DEFAULT_GRAPH {
+        return if access.writable(None) {
+            Ok(())
+        } else {
+            Err(crate::access::GraphAccess::refused(None))
+        };
+    }
+    let t = match g.tag() {
+        Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
+        _ => ctx.term(g),
+    };
+    if access.writable(t.as_ref()) {
+        Ok(())
+    } else {
+        Err(crate::access::GraphAccess::refused(t.as_ref()))
+    }
+}
+
+/// The graphs an operation names by constants, checked against the request's graph view
+/// before anything is read or written: data quads, template graphs, and the targets of
+/// `LOAD … INTO`, `CLEAR`, `DROP` and `CREATE`.
+fn check_constant_graphs(
+    access: &crate::access::GraphAccess,
+    op: &GraphUpdateOperation,
+) -> Result<()> {
+    let check = |g: Option<&NamedNode>| -> Result<()> {
+        let t = g.map(|n| Term::NamedNode(n.clone()));
+        if access.writable(t.as_ref()) {
+            Ok(())
+        } else {
+            Err(crate::access::GraphAccess::refused(t.as_ref()))
+        }
+    };
+    fn name(g: &GraphName) -> Option<&NamedNode> {
+        match g {
+            GraphName::NamedNode(n) => Some(n),
+            GraphName::DefaultGraph => None,
+        }
+    }
+    match op {
+        GraphUpdateOperation::InsertData { data } => {
+            for q in data {
+                check(name(&q.graph_name))?;
+            }
+        }
+        GraphUpdateOperation::DeleteData { data } => {
+            for q in data {
+                check(name(&q.graph_name))?;
+            }
+        }
+        GraphUpdateOperation::DeleteInsert { delete, insert, .. } => {
+            let pat = |g: &GraphNamePattern| -> Result<()> {
+                match g {
+                    GraphNamePattern::NamedNode(n) => check(Some(n)),
+                    GraphNamePattern::DefaultGraph => check(None),
+                    GraphNamePattern::Variable(_) => Ok(()),
+                }
+            };
+            for q in delete {
+                pat(&q.graph_name)?;
+            }
+            for q in insert {
+                pat(&q.graph_name)?;
+            }
+        }
+        GraphUpdateOperation::Load { destination, .. } => {
+            if let GraphName::NamedNode(n) = destination {
+                check(Some(n))?;
+            }
+        }
+        GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
+            match graph {
+                GraphTarget::NamedNode(n) => check(Some(n))?,
+                GraphTarget::DefaultGraph => check(None)?,
+                // the graphs of the view, checked when the operation runs
+                GraphTarget::NamedGraphs | GraphTarget::AllGraphs => {}
+            }
+        }
+        GraphUpdateOperation::Create { graph, .. } => check(Some(graph))?,
+    }
     Ok(())
 }
 
@@ -521,6 +699,45 @@ fn graph_pat(
         }
         GraphNamePattern::NamedNode(n) => Some(ctx.intern_term(&Term::NamedNode(n.clone()))),
         GraphNamePattern::Variable(v) => get(v.as_str()),
+    }
+}
+
+/// The stored blank nodes that the minted blank nodes of one operation's solutions
+/// become when inserted.
+#[derive(Default)]
+struct Minted(FxHashMap<u64, Id>);
+
+impl Minted {
+    /// The stored id of a blank node id: itself for a stored node, else (a node the
+    /// WHERE clause minted) a new stored node, the same one for the same minted node.
+    fn id(&mut self, txn: &mut WriteTxn<'_>, id: Id) -> Id {
+        if id.payload() & Id::LOCAL_BNODE_BIT == 0 {
+            return id;
+        }
+        *self
+            .0
+            .entry(id.payload())
+            .or_insert_with(|| txn.new_bnode())
+    }
+
+    /// `t` with the minted blank nodes inside its triple terms replaced by stored ones.
+    fn stored(&mut self, txn: &mut WriteTxn<'_>, t: &Term) -> Term {
+        match t {
+            Term::BlankNode(b) => match crate::id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Term::BlankNode(crate::store::bnode_for(self.id(txn, Id::bnode(p)))),
+                None => t.clone(),
+            },
+            Term::Triple(tr) => {
+                let s = match self.stored(txn, &tr.subject.clone().into()) {
+                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                    _ => unreachable!("a subject stays a subject"),
+                };
+                let o = self.stored(txn, &tr.object);
+                Term::Triple(Box::new(oxrdf::Triple::new(s, tr.predicate.clone(), o)))
+            }
+            t => t.clone(),
+        }
     }
 }
 
@@ -677,6 +894,30 @@ fn read_error(url: &str, e: Error) -> Error {
     match e {
         Error::Io(e) => Error::invalid(format!("LOAD {url}: {e}")),
         e => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_only_updates() {
+        let o = QueryOptions::default();
+        assert!(data_only("INSERT DATA { <urn:a> <urn:p> 1 }", &o));
+        assert!(data_only(
+            "PREFIX ex: <urn:> DELETE DATA { ex:a ex:p 1 } ; INSERT DATA { GRAPH ex:g { ex:a ex:p 2 } }",
+            &o
+        ));
+        assert!(!data_only("DELETE WHERE { ?s ?p ?o }", &o));
+        assert!(!data_only(
+            "INSERT { <urn:a> <urn:p> ?o } WHERE { ?s <urn:q> ?o }",
+            &o
+        ));
+        assert!(!data_only("LOAD <http://example.org/data.ttl>", &o));
+        assert!(!data_only("CLEAR ALL", &o));
+        assert!(!data_only("INSERT DATA { <urn:a> <urn:p> ", &o));
+        assert!(!data_only("", &o));
     }
 }
 

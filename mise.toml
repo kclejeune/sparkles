@@ -126,12 +126,16 @@ run = "prek run --all-files"
 [tasks.fmt]
 description = "Format Rust and UI code"
 depends = ["ui:fmt"]
-run = "cargo fmt --all"
+# crates/sparkles-py is its own workspace, outside `--all`
+run = ["cargo fmt --all", "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml"]
 
 [tasks."fmt:check"]
 description = "Check formatting (CI)"
 depends = ["ui:fmt:check"]
-run = "cargo fmt --all --check"
+run = [
+  "cargo fmt --all --check",
+  "cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check",
+]
 
 [tasks."fmt:jsonld-compare"]
 description = "Compare the JSON-LD formatter's golden outputs with oxfmt (Prettier's JSON conventions) and show the differences; not part of ci"
@@ -193,8 +197,35 @@ description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectio
 run = "scripts/test-jena-clients.sh"
 
 [tasks.ci]
-description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust and UI tests, third-party license notices up to date"
-depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "licenses:check"]
+description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust, UI and Python binding tests, third-party license notices up to date"
+depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "py:lint", "py:test", "licenses:check"]
+
+# ------------------------------------------------------------------- Python bindings ----
+# crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
+# in the root target directory, so it reuses the workspace's compiled dependencies.
+
+[tasks."py:build"]
+description = "Build the Python bindings' release wheel (abi3, CPython 3.10+) with maturin into target/wheels; extra args go to `maturin build`"
+tools = { "github:PyO3/maturin" = "1.15.0" }
+run = "maturin build --release --locked --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --out target/wheels"
+
+[tasks."py:test"]
+description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
+run = "scripts/py-test.sh"
+
+[tasks."py:lint"]
+description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
+run = [
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
+]
+
+[tasks."py:lock"]
+description = "Refresh crates/sparkles-py/Cargo.lock from the root Cargo.lock, after the workspace's dependencies change"
+run = [
+  "cp Cargo.lock crates/sparkles-py/Cargo.lock",
+  "cargo metadata --manifest-path crates/sparkles-py/Cargo.toml --format-version 1 > /dev/null",
+]
 
 # -------------------------------------------------------------------------- build / run ----
 
@@ -257,7 +288,7 @@ run = ["cargo clean", "rm -rf ui/build ui/.svelte-kit"]
 # ---------------------------------------------------------------------------- benchmarks ----
 
 [tasks.bench]
-description = "Sparkles vs Jena/Fuseki vs QLever vs Fluree (hyperfine over HTTP; results merge per engine)"
+description = "Sparkles vs Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP: load, queries, memory, updates, mixed load and cold starts (results merge per engine)"
 depends = ["build"]
 usage = '''
 arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
@@ -268,12 +299,84 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--skip-queries" help="reuse per-query results; re-run updates / throughput / memory"
 flag "--answers-only" help="only re-check answers across engines and rebuild the summary"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to (re-)measure; others' results are kept"
-flag "--queries <list>" help="only these queries (default: all 20)"
+flag "--queries <list>" help="only these queries (default: all 28)"
+flag "--mode <mode>" default="default" help="default (load and queries), updates (queries after a churn of commits, into results-updates/), mixed (readers and a writer at once) or cold (a restart with evicted page cache per query)"
+flag "--churn <n>" default="5000" help="updates mode: single-triple commits before the queries"
+flag "--mixed-seconds <s>" default="30" help="mixed mode: seconds per engine"
+flag "--write-rate <n>" default="0" help="mixed mode: commits per second (0: as fast as the engine answers)"
+flag "--cold-runs <n>" default="3" help="cold mode: restarts per query"
+flag "--port-base <port>" default="3931" help="the first of the five server ports"
 '''
 run = '''
 RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
 SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
-ANSWERS_ONLY="${usage_answers_only:+1}" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+ANSWERS_ONLY="${usage_answers_only:+1}" MODE="$usage_mode" CHURN="$usage_churn" \
+MIXED_SECONDS="$usage_mixed_seconds" WRITE_RATE="$usage_write_rate" COLD_RUNS="$usage_cold_runs" \
+PORT_BASE="$usage_port_base" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:text"]
+description = "Full-text search: Sparkles text:query vs Fuseki with jena-text vs QLever text search (hyperfine over HTTP)"
+depends = ["build"]
+usage = '''
+arg "[people]" default="100000" help="dataset size in people (~10.5 triples each)"
+arg "[workdir]" default="target/bench-text" help="data, stores, text indexes and results/ (text-summary.md)"
+flag "--runs <n>" default="10" help="measured runs per query"
+flag "--warmup <n>" default="2" help="warm-up runs per query"
+flag "--skip-load" help="reuse the stores and text indexes from a previous run in the same workdir"
+flag "--answers-only" help="only check answers across engines and rebuild the summary"
+flag "--engines <list>" default="sparkles jena qlever" help="engines to (re-)measure; others' results are kept"
+flag "--queries <list>" help="only these queries (default: all 6)"
+flag "--data <file>" help="reuse a generated dataset, e.g. target/bench/data.nt"
+flag "--port-base <n>" default="3940" help="the servers listen on the three ports after it"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" ENGINES="$usage_engines" QUERIES="${usage_queries:-}" \
+SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
+DATA="${usage_data:+$(realpath "$usage_data")}" PORT_BASE="$usage_port_base" \
+scripts/bench-text.sh "$usage_people" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:vector"]
+description = "Vector search: build time, memory, recall@10 and latency of the HNSW index against the exact search, over HTTP (hyperfine and a keep-alive client)"
+depends = ["build"]
+usage = '''
+arg "[n]" default="100000" help="vectors to generate and load"
+arg "[dim]" default="384" help="their dimension"
+arg "[workdir]" default="target/bench-vector" help="data, store and results/ (summary.md), per size"
+flag "--queries <n>" default="1000" help="query vectors (recall and client latency)"
+flag "--efs <list>" default="16 32 64 128 256" help="efSearch values to measure"
+flag "--runs <n>" default="20" help="hyperfine runs per mode"
+flag "--warmup <n>" default="3" help="hyperfine warm-up runs per mode"
+flag "--m <n>" default="16" help="HNSW links per node"
+flag "--ef-construction <n>" default="128" help="HNSW candidates while building"
+flag "--skip-load" help="reuse the store and index of an earlier run in the same workdir"
+flag "--port <n>" default="4800" help="the server's port"
+'''
+run = '''
+QUERIES="$usage_queries" EFS="$usage_efs" RUNS="$usage_runs" WARMUP="$usage_warmup" M="$usage_m" \
+EFC="$usage_ef_construction" SKIP_LOAD="${usage_skip_load:+1}" PORT="$usage_port" \
+scripts/bench-vector.sh "$usage_n" "$usage_dim" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:watdiv"]
+description = "WatDiv basic testing (20 templates: linear, star, snowflake, complex): the five engines of bench, answers checked first"
+depends = ["build"]
+usage = '''
+arg "[scale]" default="100" help="WatDiv scale factor (1 is about 112k triples, 100 about 11.0M)"
+arg "[workdir]" default="target/bench-watdiv" help="generator, data, queries, indexes and results/ (summary.md)"
+flag "--runs <n>" default="10" help="measured runs per query instance"
+flag "--warmup <n>" default="2" help="warm-up runs per query instance"
+flag "--instances <n>" default="5" help="query instances per template (fixed seed)"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--answers-only" help="only re-check answers across engines and rebuild the summary"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to (re-)measure; others' results are kept"
+flag "--queries <list>" help="only these templates or instances (L1 S3-2 …)"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" INSTANCES="$usage_instances" ENGINES="$usage_engines" \
+QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
+scripts/bench-watdiv.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
 '''
 
 [tasks."bench:billion"]

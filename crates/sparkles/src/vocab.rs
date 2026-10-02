@@ -381,13 +381,40 @@ impl AppendVocab {
     }
 }
 
+/// The complete entries of a delta vocabulary file (`u32` length, key), and where they
+/// end. An entry cut short ends them, as does a tail of zero bytes: no key is empty, and
+/// a crash can leave zeros where the file's length reached the disk before its data
+/// (on file systems that do not order the two). Either is a torn tail.
+pub(crate) fn delta_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
+    let mut pos = 0;
+    let mut keys = Vec::new();
+    while pos + 4 <= buf.len() {
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        if pos + 4 + len > buf.len() || (len == 0 && buf[pos..].iter().all(|&b| b == 0)) {
+            break;
+        }
+        keys.push(&buf[pos + 4..pos + 4 + len]);
+        pos += 4 + len;
+    }
+    (keys, pos)
+}
+
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
 ///
 /// Readers and the single writer share it through an `RwLock`; ids only ever grow, so a
 /// reader's snapshot remains valid while the writer appends.
 pub struct DeltaVocab {
     inner: RwLock<AppendVocab>,
-    file: Option<parking_lot::Mutex<BufWriter<File>>>,
+    file: Option<parking_lot::Mutex<DeltaFile>>,
+}
+
+/// The append handle of a delta vocabulary file.
+struct DeltaFile {
+    w: BufWriter<File>,
+    /// entries were appended since the last [`DeltaVocab::sync`]
+    unsynced: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 impl DeltaVocab {
@@ -405,14 +432,8 @@ impl DeltaVocab {
         if path.exists() {
             let mut buf = Vec::new();
             File::open(path)?.read_to_end(&mut buf)?;
-            let mut pos = 0;
-            while pos + 4 <= buf.len() {
-                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                if pos + 4 + len > buf.len() {
-                    break;
-                }
-                v.insert(&buf[pos + 4..pos + 4 + len]);
-                pos += 4 + len;
+            for key in delta_entries(&buf).0 {
+                v.insert(key);
             }
         }
         Ok(DeltaVocab {
@@ -426,14 +447,9 @@ impl DeltaVocab {
         if path.exists() {
             let mut buf = Vec::new();
             File::open(path)?.read_to_end(&mut buf)?;
-            let mut pos = 0;
-            while pos + 4 <= buf.len() {
-                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-                if pos + 4 + len > buf.len() {
-                    break; // torn write at the tail — ignore
-                }
-                v.insert(&buf[pos + 4..pos + 4 + len]);
-                pos += 4 + len;
+            let (keys, pos) = delta_entries(&buf);
+            for key in keys {
+                v.insert(key);
             }
             // truncate a torn tail so future appends are well-formed
             if pos != buf.len() {
@@ -446,7 +462,12 @@ impl DeltaVocab {
         let f = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(DeltaVocab {
             inner: RwLock::new(v),
-            file: Some(parking_lot::Mutex::new(BufWriter::new(f))),
+            file: Some(parking_lot::Mutex::new(DeltaFile {
+                w: BufWriter::new(f),
+                unsynced: false,
+                #[cfg(test)]
+                fail_next_sync: false,
+            })),
         })
     }
 
@@ -471,19 +492,47 @@ impl DeltaVocab {
         let (id, new) = self.inner.write().insert(key);
         if new && let Some(f) = &self.file {
             let mut f = f.lock();
-            f.write_all(&(key.len() as u32).to_le_bytes())?;
-            f.write_all(key)?;
+            f.unsynced = true;
+            f.w.write_all(&(key.len() as u32).to_le_bytes())?;
+            f.w.write_all(key)?;
         }
         Ok(id)
     }
 
+    /// Make every inserted entry durable. Without new entries since the last sync this
+    /// does nothing: an `fdatasync` of a file with nothing to write still costs a device
+    /// cache flush on some file systems, and every commit calls this.
     pub fn sync(&self) -> Result<()> {
         if let Some(f) = &self.file {
             let mut f = f.lock();
-            f.flush()?;
-            f.get_ref().sync_data()?;
+            if !f.unsynced {
+                return Ok(());
+            }
+            f.w.flush()?;
+            #[cfg(test)]
+            if f.fail_next_sync {
+                f.fail_next_sync = false;
+                return Err(std::io::Error::other("injected sync failure").into());
+            }
+            f.w.get_ref().sync_data()?;
+            f.unsynced = false;
         }
         Ok(())
+    }
+
+    /// Whether entries were inserted since the last [`sync`](Self::sync), that is,
+    /// whether the next one writes and syncs anything.
+    pub fn needs_sync(&self) -> bool {
+        self.file.as_ref().is_some_and(|f| f.lock().unsynced)
+    }
+
+    /// Make the next [`sync`](Self::sync) with new entries fail after writing them to
+    /// the file, as a failed `fdatasync` would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync(&self) {
+        if let Some(f) = &self.file {
+            f.lock().fail_next_sync = true;
+        }
     }
 
     /// Write buffered entries to the file (without `fsync`) and return its length in
@@ -493,8 +542,8 @@ impl DeltaVocab {
         match &self.file {
             Some(f) => {
                 let mut f = f.lock();
-                f.flush()?;
-                Ok(f.get_ref().metadata()?.len())
+                f.w.flush()?;
+                Ok(f.w.get_ref().metadata()?.len())
             }
             None => Ok(0),
         }
@@ -504,6 +553,51 @@ impl DeltaVocab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_sync_only_when_entries_were_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dvocab.bin");
+        let unsynced = |v: &DeltaVocab| v.file.as_ref().unwrap().lock().unsynced;
+        let v = DeltaVocab::open(&path).unwrap();
+        assert!(!unsynced(&v));
+        assert_eq!(v.insert(b"<http://x/a>").unwrap(), 0);
+        assert!(unsynced(&v));
+        v.sync().unwrap();
+        assert!(!unsynced(&v));
+        // a key it already has appends nothing
+        assert_eq!(v.insert(b"<http://x/a>").unwrap(), 0);
+        assert!(!unsynced(&v));
+        assert_eq!(v.insert(b"<http://x/b>").unwrap(), 1);
+        v.sync().unwrap();
+        drop(v);
+        let v = DeltaVocab::open(&path).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(1).unwrap(), b"<http://x/b>");
+    }
+
+    #[test]
+    fn a_tail_of_zeros_is_torn_but_an_empty_entry_before_data_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dvocab.bin");
+        let entry = |k: &[u8]| [&(k.len() as u32).to_le_bytes()[..], k].concat();
+        let good = [entry(b"<http://x/a>"), entry(b"<http://x/b>")].concat();
+        // the length of a crash's appends reached the disk, their data did not
+        std::fs::write(&path, [&good[..], &[0u8; 23][..]].concat()).unwrap();
+        let v = DeltaVocab::open(&path).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+        assert_eq!(v.insert(b"<http://x/c>").unwrap(), 2);
+        v.sync().unwrap();
+        drop(v);
+        assert_eq!(DeltaVocab::open(&path).unwrap().len(), 3);
+        // zeros followed by data are entries, as they always were read
+        let odd = [&good[..], &entry(b"")[..], &entry(b"<http://x/d>")[..]].concat();
+        std::fs::write(&path, &odd).unwrap();
+        assert_eq!(DeltaVocab::open_read_only(&path).unwrap().len(), 4);
+        assert_eq!(DeltaVocab::open(&path).unwrap().len(), 4);
+        assert_eq!(std::fs::read(&path).unwrap(), odd);
+    }
 
     #[test]
     fn get_sorted_matches_get() {

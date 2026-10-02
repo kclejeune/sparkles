@@ -109,6 +109,7 @@
         <dt>Dataset</dt>
         <dd>
           <span class="mono">{s.dataset.name}</span>
+          {#if b.fromMemory(s)}<span class="badge">in-memory</span>{/if}
           <span class="faint mono small" title="Dataset id">{s.dataset.id}</span>
         </dd>
         <dt>Commit</dt>

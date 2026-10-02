@@ -10,16 +10,22 @@ use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Block, O, P, Perm, S, pad};
+use crate::index::{Block, Key, O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use spargebra::algebra::AggregateFunction;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 const PAR_THRESHOLD: usize = 16_384;
+
+/// Parallel iterators over rows hand out pieces of at least this many rows, so a small
+/// input is processed on the calling thread: waking the pool for it would cost more
+/// than the work, and a short request would wait for threads on idle cores to wake.
+pub(super) const PAR_MIN_LEN: usize = 4096;
 
 /// Map `f` over rows `0..n` (in parallel when `par`) in chunks, checking cancellation and
 /// the deadline between chunks: one clock read per chunk rather than per row, while an
@@ -66,6 +72,28 @@ pub struct PlanInfo {
     /// notes about the plan (root only)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<super::ctx::PlanWarning>,
+}
+
+impl PlanInfo {
+    /// Remove what the plan tells about graphs a graph view does not read: estimates
+    /// (from statistics of every graph), the quads of unread graphs that statistics
+    /// notes count, and operator counters (a spatial index counts candidates of every
+    /// graph). Actual rows and times describe the view and stay.
+    pub fn redact(&mut self) {
+        self.estimated_rows = -1.0;
+        self.estimated_cost = -1.0;
+        self.counters = None;
+        const NOTE: &str = " [from statistics";
+        if let Some(i) = self.description.find(NOTE)
+            && let Some(end) = self.description[i..].find(']')
+        {
+            self.description
+                .replace_range(i..i + end + 1, " [from statistics]");
+        }
+        for c in &mut self.children {
+            c.redact();
+        }
+    }
 }
 
 fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
@@ -124,6 +152,7 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         let start = Instant::now();
         if let Some(t) = results.get(k, ctx)? {
+            ctx.produced(t.len())?;
             let mut info = describe(ctx, n);
             info.actual_rows = t.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -187,13 +216,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             key: _,
             counts,
             metadata,
-        } => {
-            if *metadata {
-                class_counts(ctx, &n.vars, counts.len())
-            } else {
-                group_count_scan(ctx, spec, &n.vars, counts.len())?
-            }
-        }
+        } => match metadata {
+            Some(c) => metadata_counts(c, &n.vars, counts.len()),
+            None => group_count_scan(ctx, spec, &n.vars, counts.len())?,
+        },
         Kind::CountJoinRuns { var } => {
             let mut sides = Vec::with_capacity(2);
             for c in &n.children {
@@ -232,7 +258,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
-        Kind::Join { algo, keys } => {
+        Kind::Join { algo, .. } => {
             let l = child(0, &mut infos)?;
             if l.is_empty() {
                 infos.push(describe(ctx, &n.children[1]));
@@ -241,8 +267,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 let r = child(1, &mut infos)?;
                 match algo {
                     JoinAlgo::Cross => cross(ctx, &l, &r)?,
-                    JoinAlgo::Merge => join_tables(ctx, &l, &r, keys, true)?,
-                    JoinAlgo::Hash => join_tables(ctx, &l, &r, keys, false)?,
+                    JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
+                    JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
                 }
             }
         }
@@ -255,6 +281,19 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 Some(c) => *c,
                 None => count_distinct_scan(ctx, spec)?,
             };
+            let mut t = Table::new(vec![*var]);
+            t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
+            t
+        }
+        Kind::CountFilterScan {
+            spec,
+            key,
+            filter,
+            var,
+            distinct,
+        } => {
+            let (c, why) = count_filter_scan(ctx, spec, *key, filter, *distinct)?;
+            note = Some(why);
             let mut t = Table::new(vec![*var]);
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
@@ -290,7 +329,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
-            left_join(ctx, &l, &r, expr.as_ref())?
+            left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
         Kind::Minus => {
             let l = child(0, &mut infos)?;
@@ -306,9 +345,30 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             out
         }
         Kind::Filter(es) => {
-            let mut t = child(0, &mut infos)?;
-            expr_report = apply_filter(ctx, &mut t, es)?;
+            let runs = match &n.children[0].kind {
+                Kind::Scan(spec) if ctx.opt.filter_scan_runs => {
+                    filter_scan_runs(ctx, spec, &n.children[0], es)?
+                }
+                _ => None,
+            };
+            let (mut t, rest, runs_note) = match runs {
+                Some(r) => {
+                    let mut info = describe(ctx, &n.children[0]);
+                    info.actual_rows = r.read as i64;
+                    infos.push(info);
+                    held.add(r.table.mem_bytes())?;
+                    (r.table, r.rest, Some(r.note))
+                }
+                None => (child(0, &mut infos)?, es.clone(), None),
+            };
+            expr_report = apply_filter(ctx, &mut t, &rest)?;
             (note, counters) = super::exists::explain(ctx, es);
+            if let Some(r) = runs_note {
+                note = Some(match note {
+                    Some(n) => format!("{r} {n}"),
+                    None => r,
+                });
+            }
             t
         }
         Kind::Extend(v, e) => {
@@ -367,7 +427,20 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
-        Kind::VectorSearch(spec) => vector_search(ctx, spec, &n.vars)?,
+        Kind::VectorSearch(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            let (t, c) = vector_search(ctx, spec, input, &n.vars)?;
+            counters = Some(c);
+            t
+        }
+        Kind::HybridSearch(spec) => {
+            let (t, c) = super::hybrid::search(ctx, spec, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::SpatialScan(spec) => {
             let (t, c) = spatial_scan(ctx, spec, &n.vars)?;
             counters = Some(c);
@@ -422,7 +495,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 ..
             }
     ) {
-        if !table.sorted.is_empty() && table.sorted != n.sorted {
+        // the planner's order holds when the rows are sorted on it, perhaps on more
+        if table.sorted.starts_with(&n.sorted) {
+            table.sorted.truncate(n.sorted.len());
+        } else {
             table.sorted.clear();
         }
     } else {
@@ -436,6 +512,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     // the inputs are gone (or became the output): only the output is alive now
     drop(held);
     ctx.check_output(table.len(), table.width())?;
+    ctx.produced(table.len())?;
     let info = PlanInfo {
         operator: n.operator().to_string(),
         description: match note {
@@ -514,21 +591,20 @@ fn block_passes(spec: &ScanSpec, b: &Block, s: usize, e: usize) -> bool {
                 .all(|&g| spec.graph.accepts(g)))
 }
 
-/// Per-class subject counts from the index statistics (admitted by the planner only when
-/// they are exact), in class id order like the index runs.
-fn class_counts(ctx: &Ctx, vars: &[VarId], naggs: usize) -> Table {
-    let mut classes = ctx.snap.generation.stats.classes.clone();
-    classes.sort_unstable();
+/// Counts per key from the index statistics (exact for the snapshot), in key order like
+/// the index runs.
+fn metadata_counts(c: &super::stats::Counts, vars: &[VarId], naggs: usize) -> Table {
     let mut t = Table::new(vars.to_vec());
-    t.cols[0] = classes.iter().map(|&(c, _)| Id(c)).collect();
-    let cnt: Vec<Id> = classes
+    t.cols[0] = c.counts.iter().map(|&(k, _)| Id(k)).collect();
+    let cnt: Vec<Id> = c
+        .counts
         .iter()
         .map(|&(_, n)| Id::from_i64(n as i64).unwrap_or(Id::UNDEF))
         .collect();
     for a in 0..naggs {
         t.cols[1 + a] = cnt.clone();
     }
-    t.len = classes.len();
+    t.len = c.counts.len();
     t
 }
 
@@ -576,9 +652,461 @@ fn run_end(col: &[Id], i: usize) -> usize {
     }
 }
 
+/// Key columns read for the runs of a scan's first free column: that column and the
+/// columns of the graph filter and repeated-variable checks, or every variable column
+/// when duplicates across graphs are dropped (rows are compared on all of them).
+fn run_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
+    let all = scan_mask(ctx, spec);
+    if spec.dedup || all == crate::index::ALL_COLS {
+        return all;
+    }
+    let mut m: crate::index::ColMask = 1 << spec.cols[0].0;
+    if !matches!(spec.graph, GraphFilter::All) {
+        m |= 1 << spec.graph_col;
+    }
+    for &(a, b) in &spec.eqs {
+        m |= (1 << a) | (1 << b);
+    }
+    m
+}
+
+/// COUNT over a FILTER on the first free key column of a scan: the filter is tested
+/// once per distinct value of the column (on vocabulary keys when it can be), and the
+/// rows of the values that pass are counted from the runs, or the values themselves for
+/// `COUNT(DISTINCT)`. Also returns the EXPLAIN note.
+fn count_filter_scan(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    key: VarId,
+    filter: &[Expr],
+    distinct: bool,
+) -> Result<(u64, String)> {
+    let kf = super::keyfilter::KeyFilter::new(filter, key);
+    if let Some(kf) = &kf
+        && let Some(c) = par_count_on_keys(ctx, spec, kf, &key_ranges(ctx, spec, Some(kf)))?
+    {
+        // the other values: inline literals and blank nodes
+        let ids: Vec<Id> = c.other.iter().map(|r| r.0).collect();
+        let (hit, _) = super::exprcache::filter_values(ctx, &ids, key, filter)?;
+        let (mut rows, mut passed) = (c.rows, c.passed);
+        for (h, (_, n)) in hit.iter().zip(&c.other) {
+            if *h {
+                rows += n;
+                passed += 1;
+            }
+        }
+        let tested = c.tested + ids.len() as u64;
+        let n = if distinct { passed } else { rows };
+        return Ok((
+            n,
+            format!(
+                "[{tested} values{} tested on vocabulary keys, {passed} passed]",
+                ranges_note(c.ranges)
+            ),
+        ));
+    }
+    let (keys, counts) = key_runs(ctx, spec)?;
+    ctx.check()?;
+    let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, filter)?;
+    let passed = hit.iter().filter(|h| **h).count();
+    let n = if distinct {
+        passed as u64
+    } else {
+        hit.iter()
+            .zip(&counts)
+            .filter(|(h, _)| **h)
+            .map(|(_, c)| *c)
+            .sum()
+    };
+    let note = format!(
+        "[{} values tested{}, {passed} passed]",
+        keys.len(),
+        if on_keys { " on vocabulary keys" } else { "" }
+    );
+    Ok((n, note))
+}
+
+/// Rows of an index block read by one parallel task of the filters on runs.
+const PIECE: usize = 8192;
+
+/// All keys of a scan.
+fn whole_range(spec: &ScanSpec) -> (Key, Key) {
+    (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX))
+}
+
+/// Key ranges of a scan that hold every row whose first free column can pass a key
+/// filter: when the filter fixes the start of the string (`STRSTARTS`, `REGEX("^…")`),
+/// the base-vocabulary ids of the keys with that start, and every id outside the base
+/// vocabulary (inline values, terms added by updates), which are tested as usual.
+/// Otherwise the whole scan.
+fn key_ranges(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    kf: Option<&super::keyfilter::KeyFilter>,
+) -> Vec<(Key, Key)> {
+    let c = spec.prefix.len();
+    let Some(prefixes) = kf.and_then(|k| k.key_prefixes()) else {
+        return vec![whole_range(spec)];
+    };
+    if !ctx.opt.filter_key_ranges || spec.cols.first().map(|x| x.0) != Some(c) || c >= 4 {
+        return vec![whole_range(spec)];
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    let at = |v: u64, fill: u64| {
+        let mut k = pad(&spec.prefix, fill);
+        k[c] = v;
+        k
+    };
+    // ids sort by tag first: the base vocabulary is one block of ids
+    let mut ranges = vec![(at(0, 0), at(Id::vocab(0).0 - 1, u64::MAX))];
+    for p in prefixes {
+        let (a, b) = vocab.prefix_range(&p);
+        if a < b {
+            ranges.push((at(Id::vocab(a).0, 0), at(Id::vocab(b - 1).0, u64::MAX)));
+        }
+    }
+    ranges.push((at(Id::vocab(vocab.len()).0, 0), at(u64::MAX, u64::MAX)));
+    ranges
+}
+
+/// EXPLAIN text for a read restricted to key ranges.
+fn ranges_note(n: usize) -> String {
+    if n > 1 {
+        format!(" in {n} key ranges")
+    } else {
+        String::new()
+    }
+}
+
+/// What the index blocks of a scan contribute to a count on vocabulary keys.
+#[derive(Default)]
+struct KeyCount {
+    /// rows of the vocabulary values that passed
+    rows: u64,
+    /// distinct vocabulary values tested, and those that passed
+    tested: u64,
+    passed: u64,
+    /// the block's first and last vocabulary value and whether it passed (a run that
+    /// continues into the next block is tested in both)
+    first: Option<(u64, bool)>,
+    last: Option<(u64, bool)>,
+    /// the runs of the other values (inline literals, blank nodes), in order
+    other: Vec<(Id, u64)>,
+    /// key ranges read
+    ranges: usize,
+}
+
+/// The rows of a scan whose first free key column passes a key filter, counted per
+/// index block in parallel: each block's runs of vocabulary ids are tested on their keys
+/// as the front-coded vocabulary blocks are decoded, without collecting the runs of the
+/// whole scan. The runs of other ids are returned for the general evaluator. `None`
+/// when the blocks cannot be read in parallel (see [`par_key_runs`]).
+fn par_count_on_keys(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    kf: &super::keyfilter::KeyFilter,
+    ranges: &[(Key, Key)],
+) -> Result<Option<KeyCount>> {
+    if spec.dedup {
+        return Ok(None);
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            // threads sharing a regular expression contend for its match caches
+            let kf = kf.clone();
+            let mut out = KeyCount::default();
+            let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+            block_runs(spec, b, s, e, |k, n| {
+                if Id(k).tag() == crate::id::Tag::Vocab {
+                    ids.push(Id(k).payload());
+                    counts.push(n);
+                } else {
+                    out.other.push((Id(k), n));
+                }
+            });
+            let mut pass = vec![false; ids.len()];
+            let mut j = 0;
+            vocab.get_sorted(&ids, |p, key| {
+                while ids[j] != p {
+                    j += 1;
+                }
+                pass[j] = kf.test(key);
+            });
+            for (h, n) in pass.iter().zip(&counts) {
+                if *h {
+                    out.rows += n;
+                    out.passed += 1;
+                }
+            }
+            out.tested = ids.len() as u64;
+            let raw = |i: usize| Id::vocab(ids[i]).0;
+            if !ids.is_empty() {
+                out.first = Some((raw(0), pass[0]));
+                out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
+            }
+            ctx.check()?;
+            Ok(out)
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let mut all = KeyCount {
+        ranges: ranges.len(),
+        ..Default::default()
+    };
+    let mut last: Option<(u64, bool)> = None;
+    for p in parts {
+        all.rows += p.rows;
+        all.tested += p.tested;
+        all.passed += p.passed;
+        // a value whose run continues from the block before was tested twice
+        if let (Some((a, passed)), Some((b, _))) = (last, p.first)
+            && a == b
+        {
+            all.tested -= 1;
+            all.passed -= passed as u64;
+        }
+        if p.last.is_some() {
+            last = p.last;
+        }
+        for (id, n) in p.other {
+            match all.other.last_mut() {
+                Some((x, m)) if *x == id => *m += n,
+                _ => all.other.push((id, n)),
+            }
+        }
+    }
+    ctx.check_output(all.other.len(), 2)?;
+    Ok(Some(all))
+}
+
+/// The runs of the first free key column in rows `[s, e)` of an index block that pass
+/// the scan's graph filter and repeated-variable checks: `f(id, rows)` per run, in
+/// order (the first and last may continue in the neighbouring blocks).
+fn block_runs(spec: &ScanSpec, b: &Block, s: usize, e: usize, mut f: impl FnMut(u64, u64)) {
+    let kc = spec.cols[0].0;
+    if block_passes(spec, b, s, e) {
+        let col = &b.cols[kc][s..e];
+        let mut i = 0;
+        while i < col.len() {
+            let run = run_len(&col[i..], col[i]);
+            f(col[i], run as u64);
+            i += run;
+        }
+        return;
+    }
+    let mut cur: Option<(u64, u64)> = None;
+    for i in s..e {
+        let k = b.key(i);
+        if !spec.graph.accepts(k[spec.graph_col]) || spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
+            continue;
+        }
+        match &mut cur {
+            Some((v, n)) if *v == k[kc] => *n += 1,
+            _ => {
+                if let Some((v, n)) = cur {
+                    f(v, n);
+                }
+                cur = Some((k[kc], 1));
+            }
+        }
+    }
+    if let Some((v, n)) = cur {
+        f(v, n);
+    }
+}
+
+/// A scan filtered on its first free key column by [`filter_scan_runs`].
+struct FilteredScan {
+    /// the rows whose value passed, in scan order
+    table: Table,
+    /// conjuncts that read other variables, still to be applied
+    rest: Vec<Expr>,
+    /// rows of the scan, passed or not
+    read: u64,
+    note: String,
+}
+
+/// A FILTER over a scan sorted on a variable it tests: the conjuncts that read only that
+/// variable are tested once per run of its values (on vocabulary keys when they can be),
+/// and only the rows of the values that pass are copied out of the index blocks, in
+/// parallel. `None` when no conjunct reads only the sort variable, when union-graph dedup
+/// compares neighbouring rows, or when the delta has keys in the scan's range.
+fn filter_scan_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    scan: &Node,
+    exprs: &[Expr],
+) -> Result<Option<FilteredScan>> {
+    let Some(&(kc, key)) = spec.cols.first() else {
+        return Ok(None);
+    };
+    if spec.dedup || exprs.is_empty() {
+        return Ok(None);
+    }
+    let (on_key, rest): (Vec<Expr>, Vec<Expr>) = exprs
+        .iter()
+        .cloned()
+        .partition(|e| super::exprcache::input(&[e]) == Ok(Some(key)));
+    if on_key.is_empty() {
+        return Ok(None);
+    }
+    let kf = super::keyfilter::KeyFilter::new(&on_key, key);
+    let ranges = key_ranges(ctx, spec, kf.as_ref());
+    let Some((keys, counts)) = par_key_runs(ctx, spec, &ranges)? else {
+        return Ok(None);
+    };
+    let read: u64 = counts.iter().sum();
+    let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, &on_key)?;
+    drop(counts);
+    let passed = hit.iter().filter(|h| **h).count();
+    let width = spec.cols.len();
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        &ranges,
+        scan_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
+            if s >= e {
+                return Ok(cols);
+            }
+            let col = &b.cols[kc];
+            // the block's values among the runs, and whether any of them passed
+            let j0 = keys.partition_point(|k| k.0 < col[s]);
+            let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
+            if !hit[j0..j1].iter().any(|h| *h) {
+                return Ok(cols);
+            }
+            let mut j = j0;
+            if block_passes(spec, b, s, e) {
+                let mut i = s;
+                while i < e {
+                    let run = run_len(&col[i..e], col[i]);
+                    while keys[j].0 < col[i] {
+                        j += 1;
+                    }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
+                        }
+                    }
+                    i += run;
+                }
+            } else {
+                for i in s..e {
+                    let k = b.key(i);
+                    if !spec.graph.accepts(k[spec.graph_col])
+                        || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                    {
+                        continue;
+                    }
+                    while keys[j].0 < k[kc] {
+                        j += 1;
+                    }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].push(Id(k[kc]));
+                        }
+                    }
+                }
+            }
+            ctx.check()?;
+            Ok(cols)
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let rows: usize = parts.iter().map(|p| p[0].len()).sum();
+    ctx.check_output(rows, width)?;
+    let mut table = Table::new(scan.vars.clone());
+    for c in &mut table.cols {
+        c.reserve_exact(rows);
+    }
+    for p in parts {
+        for (c, part) in p.into_iter().enumerate() {
+            table.cols[c].extend(part);
+        }
+    }
+    table.len = rows;
+    table.sorted = scan.sorted.clone();
+    let note = format!(
+        "[runs of ?{}: {} values{} tested{}, {passed} passed]",
+        ctx.var_name(key),
+        keys.len(),
+        ranges_note(ranges.len()),
+        if on_keys { " on vocabulary keys" } else { "" }
+    );
+    Ok(Some(FilteredScan {
+        table,
+        rest,
+        read,
+        note,
+    }))
+}
+
+/// [`key_runs`] with the index blocks read in parallel, when the snapshot's delta has no
+/// key in the scan's range and rows need no comparison with their neighbours (no
+/// union-graph dedup); `None` otherwise.
+fn par_key_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    ranges: &[(Key, Key)],
+) -> Result<Option<(Vec<Id>, Vec<u64>)>> {
+    if spec.dedup {
+        return Ok(None);
+    }
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut keys: Vec<Id> = Vec::new();
+            let mut counts: Vec<u64> = Vec::new();
+            block_runs(spec, b, s, e, |k, n| {
+                keys.push(Id(k));
+                counts.push(n);
+            });
+            ctx.check()?;
+            Ok((keys, counts))
+        },
+    )?;
+    let Some(parts) = parts else {
+        return Ok(None);
+    };
+    let total: usize = parts.iter().map(|p| p.0.len()).sum();
+    // a key and a count per run
+    ctx.check_output(total, 2)?;
+    let (mut keys, mut counts) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    for (k, c) in parts {
+        // a run that continues from the block before
+        let skip = match (keys.last(), k.first()) {
+            (Some(a), Some(b)) if a == b => {
+                *counts.last_mut().unwrap() += c[0];
+                1
+            }
+            _ => 0,
+        };
+        keys.extend_from_slice(&k[skip..]);
+        counts.extend_from_slice(&c[skip..]);
+    }
+    Ok(Some((keys, counts)))
+}
+
 /// The distinct values of a scan's first free key column with the number of rows of each,
 /// in key order.
 fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
+    if let Some(runs) = par_key_runs(ctx, spec, &[whole_range(spec)])? {
+        return Ok(runs);
+    }
     let kc = spec.cols[0].0;
     let kcs: Vec<usize> = spec.cols.iter().map(|(k, _)| *k).collect();
     let mut keys: Vec<Id> = Vec::new();
@@ -596,7 +1124,7 @@ fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
     let mut last: Option<[u64; 4]> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if !spec.graph.accepts(k[spec.graph_col])
                     || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
@@ -657,7 +1185,7 @@ fn count_distinct_scan(ctx: &Ctx, spec: &ScanSpec) -> Result<u64> {
     let mut last: Option<u64> = None;
     let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     ctx.snap
-        .scan_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |chunk| {
+        .scan_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |chunk| {
             let mut row = |k: &[u64; 4]| {
                 if spec.graph.accepts(k[spec.graph_col])
                     && spec.eqs.iter().all(|&(a, b)| k[a] == k[b])
@@ -712,6 +1240,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
     ctx.check()?;
     let start = Instant::now();
     let finish = |t: Table, children: Vec<PlanInfo>, complete: bool| {
+        ctx.produced(t.len())?;
         let mut info = describe(ctx, n);
         info.children = children;
         info.actual_rows = t.len() as i64;
@@ -1288,6 +1817,160 @@ fn gallop(col: &[Id], from: usize, target: Id) -> usize {
     lo.min(hi) + col[lo.min(hi)..hi].partition_point(|x| *x < target)
 }
 
+/// The rows of a hash join's build side grouped by key. Within a partition, `map` finds
+/// the span of `rows` that holds a key's rows in row order (the key is the id of a single
+/// key column, or a hash of several). A partition is laid out by counting each key's rows
+/// and then placing every row, so the build allocates a few arrays instead of a list per
+/// key. A build side of [`PART_MIN`] rows or more is split by bits of a hash of the key
+/// into partitions of about [`PART_ROWS`] rows, whose tables stay in the CPU caches while
+/// they are built, in parallel.
+struct KeyGroups {
+    /// the partition of a key is its mixed hash shifted right by this (64: one)
+    shift: u32,
+    parts: Vec<KeyPart>,
+}
+
+struct KeyPart {
+    map: FxHashMap<u64, (u32, u32)>,
+    rows: Vec<u32>,
+}
+
+/// Rows per partition of a hash join's build side: a partition's table of about 24 bytes
+/// per row fits in the per-core cache.
+const PART_ROWS: usize = 8192;
+
+/// Build sides with fewer rows have one partition, built on one thread: their table fits
+/// in the caches anyway, and handing pieces to other threads costs more than it saves.
+const PART_MIN: usize = 1 << 16;
+
+/// Probe rows per parallel piece of a hash join.
+const PROBE_PIECE: usize = 1 << 15;
+
+impl KeyGroups {
+    fn build(ctx: &Ctx, t: &Table, cols: &[usize]) -> Result<KeyGroups> {
+        let n = t.len();
+        let keys: Vec<u64> = map_rows(ctx, n, n >= PART_MIN, |i| Self::key_of(t, cols, i))?;
+        let bits = if n < PART_MIN {
+            0
+        } else {
+            (n / PART_ROWS).next_power_of_two().trailing_zeros().min(12)
+        };
+        let shift = 64 - bits;
+        if bits == 0 {
+            let part = KeyPart::build(&keys, (0..n as u32).collect());
+            return Ok(KeyGroups {
+                shift,
+                parts: vec![part],
+            });
+        }
+        // the rows of each partition, in row order (a counting sort on the partition)
+        let part_of = |k: u64| (mix(k) >> shift) as usize;
+        let mut count = vec![0u32; 1 << bits];
+        for &k in &keys {
+            count[part_of(k)] += 1;
+        }
+        let mut at: Vec<u32> = Vec::with_capacity(count.len() + 1);
+        let mut sum = 0u32;
+        at.push(0);
+        for c in &count {
+            sum += c;
+            at.push(sum);
+        }
+        let mut next = at.clone();
+        let mut order = vec![0u32; n];
+        for (i, &k) in keys.iter().enumerate() {
+            let p = &mut next[part_of(k)];
+            order[*p as usize] = i as u32;
+            *p += 1;
+        }
+        ctx.check()?;
+        let parts = (0..count.len())
+            .into_par_iter()
+            .map(|p| KeyPart::build(&keys, order[at[p] as usize..at[p + 1] as usize].to_vec()))
+            .collect();
+        Ok(KeyGroups { shift, parts })
+    }
+
+    /// The table key of row `i` of `t` on the key columns `cols`.
+    #[inline]
+    fn key_of(t: &Table, cols: &[usize], i: usize) -> u64 {
+        match cols {
+            [c] => t.cols[*c][i].0,
+            _ => {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                for &c in cols {
+                    t.cols[c][i].0.hash(&mut h);
+                }
+                h.finish()
+            }
+        }
+    }
+
+    /// The build rows of key `k`, in row order (none for a key not in the table).
+    #[inline]
+    fn rows(&self, k: u64) -> &[u32] {
+        let part = if self.shift == 64 {
+            &self.parts[0]
+        } else {
+            &self.parts[(mix(k) >> self.shift) as usize]
+        };
+        match part.map.get(&k) {
+            Some(&(s, e)) => &part.rows[s as usize..e as usize],
+            None => &[],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.map.len()).sum()
+    }
+}
+
+impl KeyPart {
+    /// The groups of the rows `rows` (in row order) of the keys `keys`.
+    fn build(keys: &[u64], rows: Vec<u32>) -> KeyPart {
+        // each key's number while counting, then the span of its rows
+        let mut map: FxHashMap<u64, (u32, u32)> = FxHashMap::default();
+        map.reserve(rows.len().min(PART_MIN));
+        let mut group: Vec<u32> = Vec::with_capacity(rows.len());
+        let mut count: Vec<u32> = Vec::new();
+        for &i in &rows {
+            let next = count.len() as u32;
+            let g = map.entry(keys[i as usize]).or_insert((next, 0)).0;
+            if g == next {
+                count.push(0);
+            }
+            count[g as usize] += 1;
+            group.push(g);
+        }
+        // `start[g]`: where the rows of key `g` begin
+        let mut start: Vec<u32> = Vec::with_capacity(count.len());
+        let mut at = 0u32;
+        for c in &count {
+            start.push(at);
+            at += c;
+        }
+        for v in map.values_mut() {
+            let g = v.0 as usize;
+            *v = (start[g], start[g] + count[g]);
+        }
+        let mut placed = vec![0u32; rows.len()];
+        for (&i, &g) in rows.iter().zip(&group) {
+            let p = &mut start[g as usize];
+            placed[*p as usize] = i;
+            *p += 1;
+        }
+        KeyPart { map, rows: placed }
+    }
+}
+
+/// A hash of an id for choosing its partition, unlike the hash tables' own hash (whose
+/// high bits pick the slots' tags).
+#[inline]
+fn mix(k: u64) -> u64 {
+    (k ^ (k >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 /// Pairs of compatible rows (inner join).
 fn join_pairs(
     ctx: &Ctx,
@@ -1295,6 +1978,7 @@ fn join_pairs(
     r: &Table,
     lay: &JoinLayout,
     merge: bool,
+    note: &mut Option<String>,
 ) -> Result<Vec<(u32, u32)>> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     // a pair per output row now, the materialized row later
@@ -1401,7 +2085,68 @@ fn join_pairs(
             pairs.push((i as u32, j as u32));
         }
     };
-    if bcols.len() == 1 {
+    if ctx.opt.flat_hash_join {
+        let groups = KeyGroups::build(ctx, bt, &bcols)?;
+        let single = bcols.len() == 1;
+        // with several key columns the table is keyed by a hash of them, so a key's
+        // rows can include rows of other keys with the same hash
+        let same = |bi: usize, pi: usize| {
+            single
+                || bcols
+                    .iter()
+                    .zip(&pcols)
+                    .all(|(&b, &p)| bt.cols[b][bi] == pt.cols[p][pi])
+        };
+        // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
+        // of all pieces for the output limits
+        let total = AtomicUsize::new(0);
+        let pcol = single.then(|| &pt.cols[pcols[0]]);
+        let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
+            let mut out = Vec::new();
+            let mut counted = 0;
+            for pi in s..e {
+                if (pi - s) % 4096 == 4095 {
+                    let n = out.len() - counted;
+                    counted = out.len();
+                    let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
+                    ctx.check()?;
+                    ctx.check_output(all, w)?;
+                }
+                let k = match pcol {
+                    Some(c) => c[pi].0,
+                    None => KeyGroups::key_of(pt, &pcols, pi),
+                };
+                let m = groups.rows(k);
+                if m.len() > 1024 {
+                    let all = total.load(AtomicOrdering::Relaxed);
+                    ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;
+                }
+                for &bi in m {
+                    if same(bi as usize, pi) {
+                        emit(bi as usize, pi, &mut out);
+                    }
+                }
+            }
+            total.fetch_add(out.len() - counted, AtomicOrdering::Relaxed);
+            Ok(out)
+        };
+        let n = pt.len();
+        if n < 2 * PROBE_PIECE {
+            pairs = piece(0, n)?;
+        } else {
+            let parts: Vec<Vec<(u32, u32)>> = (0..n.div_ceil(PROBE_PIECE))
+                .into_par_iter()
+                .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
+                .collect::<Result<_>>()?;
+            ctx.check_output(parts.iter().map(Vec::len).sum(), w)?;
+            pairs = parts.concat();
+        }
+        *note = Some(format!(
+            "[flat hash table: {} keys in {} parts]",
+            groups.len(),
+            groups.parts.len()
+        ));
+    } else if bcols.len() == 1 {
         let mut map: FxHashMap<Id, Vec<u32>> = FxHashMap::default();
         for (i, v) in bt.cols[bcols[0]].iter().enumerate() {
             map.entry(*v).or_default().push(i as u32);
@@ -1474,7 +2219,7 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
             return Ok(n);
         }
     }
-    Ok(join_pairs(ctx, l, r, &lay, merge)?.len() as u64)
+    Ok(join_pairs(ctx, l, r, &lay, merge, &mut None)?.len() as u64)
 }
 
 /// Decompose RDF 1.2 triple terms: rows whose `t` is not a triple term, or whose
@@ -1530,41 +2275,114 @@ fn unpack(
     Ok(out)
 }
 
-fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {
+pub(super) fn join_tables(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    _keys: &[VarId],
+    merge: bool,
+) -> Result<Table> {
+    join_noted(ctx, l, r, merge, &mut None)
+}
+
+/// The join of two tables, with a note on how the rows were matched.
+fn join_noted(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    merge: bool,
+    note: &mut Option<String>,
+) -> Result<Table> {
     let lay = layout(l, r);
-    let pairs = join_pairs(ctx, l, r, &lay, merge)?;
+    let pairs = join_pairs(ctx, l, r, &lay, merge, note)?;
     ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
-    Ok(materialize(l, r, &lay, &pairs))
+    let mut t = materialize(l, r, &lay, &pairs);
+    t.sorted = kept_order(l, r, &lay, &pairs);
+    Ok(t)
+}
+
+/// The sort order that joined rows keep from an input. A hash join emits its pairs in
+/// the order of the side it probes, so that side's sort variables stay sorted, up to the
+/// first one shared with the other side where the side holds unbound values (the other
+/// side fills them).
+fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> Vec<VarId> {
+    let (t, left) = if pairs.windows(2).all(|w| w[0].0 <= w[1].0) {
+        (l, true)
+    } else if pairs.windows(2).all(|w| w[0].1 <= w[1].1) {
+        (r, false)
+    } else {
+        return Vec::new();
+    };
+    t.sorted
+        .iter()
+        .take_while(|v| {
+            let Some(c) = t.col_of(**v) else {
+                return false;
+            };
+            let shared = lay
+                .shared
+                .iter()
+                .any(|&(lc, rc)| if left { lc == c } else { rc == c });
+            !shared || !has_undef(t, c)
+        })
+        .copied()
+        .collect()
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
     let lay = layout(l, r);
     ctx.check_output(l.len().saturating_mul(r.len()), lay.vars.len() + 1)?;
-    let pairs = join_pairs(ctx, l, r, &lay, false)?;
+    let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
     Ok(materialize(l, r, &lay, &pairs))
 }
 
-fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Table> {
+/// Whether `t` is sorted on its column `c` first.
+fn sorted_on(t: &Table, c: usize) -> bool {
+    t.sorted.first().is_some_and(|v| t.col_of(*v) == Some(c))
+}
+
+/// Which rows of `joined` pass the OPTIONAL's FILTER `e`.
+fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Vec<bool> {
+    let map = joined.var_map(ctx.nvars());
+    (0..joined.len())
+        .map(|i| {
+            ebv(
+                e,
+                &Row {
+                    table: joined,
+                    i,
+                    map: &map,
+                    dec: None,
+                },
+                ctx,
+            )
+            .unwrap_or(false)
+        })
+        .collect()
+}
+
+pub(super) fn left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    expr: Option<&Expr>,
+    note: &mut Option<String>,
+) -> Result<Table> {
     let lay = layout(l, r);
-    let mut pairs = join_pairs(ctx, l, r, &lay, false)?;
+    if ctx.opt.merge_left_join
+        && let [(lc, rc)] = lay.shared[..]
+        && sorted_on(l, lc)
+        && sorted_on(r, rc)
+        && !has_undef(l, lc)
+        && !has_undef(r, rc)
+    {
+        *note = Some(format!("[merge on ?{}]", ctx.var_name(l.vars[lc])));
+        return merge_left_join(ctx, l, r, &lay, (lc, rc), expr);
+    }
+    let mut pairs = join_pairs(ctx, l, r, &lay, false, note)?;
     let mut joined = materialize(l, r, &lay, &pairs);
     if let Some(e) = expr {
-        let map = joined.var_map(ctx.nvars());
-        let keep: Vec<bool> = (0..joined.len())
-            .map(|i| {
-                ebv(
-                    e,
-                    &Row {
-                        table: &joined,
-                        i,
-                        map: &map,
-                        dec: None,
-                    },
-                    ctx,
-                )
-                .unwrap_or(false)
-            })
-            .collect();
+        let keep = left_filter(ctx, &joined, e);
         joined.filter_rows(&keep);
         let mut k = keep.iter();
         pairs.retain(|_| *k.next().unwrap());
@@ -1584,6 +2402,156 @@ fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Tab
         joined.len += missing.len();
     }
     Ok(joined)
+}
+
+/// A right row index standing for no row: the left row is kept with the right side's
+/// variables unbound.
+const NO_ROW: u32 = u32::MAX;
+
+/// OPTIONAL by a merge on the key columns `(lc, rc)`, which both sides are sorted on and
+/// neither leaves unbound. The output keeps the left side's rows in order, each one with
+/// its matches or alone, so it is sorted like the left side.
+fn merge_left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    lay: &JoinLayout,
+    (lc, rc): (usize, usize),
+    expr: Option<&Expr>,
+) -> Result<Table> {
+    let (a, b) = (&l.cols[lc], &r.cols[rc]);
+    // `first[i]`: the first right row whose key is at least left row i's
+    let mut first = vec![b.len() as u32; a.len()];
+    let (mut i, mut j) = (0, 0);
+    if b.len() > 8 * a.len() {
+        // gallop over a much larger right side
+        for (i, &x) in a.iter().enumerate() {
+            if j < b.len() && b[j] < x {
+                j = gallop(b, j, x);
+            }
+            first[i] = j as u32;
+        }
+    } else {
+        // branch-free zipper: each step advances the side with the smaller id (the left
+        // one on equal ids, which may repeat), and the left row's position is final once
+        // it advances
+        while i < a.len() && j < b.len() {
+            if (i + j) % 65536 == 0 {
+                ctx.check()?;
+            }
+            let (x, y) = (a[i], b[j]);
+            first[i] = j as u32;
+            i += (x <= y) as usize;
+            j += (x > y) as usize;
+        }
+    }
+    // each left row with the right rows of its key, or with none
+    let w = lay.vars.len() + 1;
+    let mut li: Vec<u32> = Vec::with_capacity(a.len());
+    let mut rj: Vec<u32> = Vec::with_capacity(a.len());
+    let mut run = (usize::MAX, 0);
+    for (i, (&x, &s)) in a.iter().zip(&first).enumerate() {
+        if i % 65536 == 65535 {
+            ctx.check()?;
+            ctx.check_output(li.len(), w)?;
+        }
+        let s = s as usize;
+        if s < b.len() && b[s] == x {
+            if run.0 != s {
+                run = (s, run_end(b, s));
+            }
+            let e = run.1;
+            if e - s > 1024 {
+                ctx.check_output(li.len().saturating_add(e - s), w)?;
+            }
+            li.extend(std::iter::repeat_n(i as u32, e - s));
+            rj.extend(s as u32..e as u32);
+        } else {
+            li.push(i as u32);
+            rj.push(NO_ROW);
+        }
+    }
+    drop(first);
+    if let Some(e) = expr {
+        // the FILTER is tested on the matched rows; a left row none of whose matches
+        // pass is kept alone
+        let matched: Vec<(u32, u32)> = li
+            .iter()
+            .zip(&rj)
+            .filter(|(_, j)| **j != NO_ROW)
+            .map(|(&i, &j)| (i, j))
+            .collect();
+        let joined = materialize(l, r, lay, &matched);
+        let mut keep = left_filter(ctx, &joined, e).into_iter();
+        drop(joined);
+        let (mut li2, mut rj2) = (Vec::with_capacity(li.len()), Vec::with_capacity(li.len()));
+        let mut k = 0;
+        while k < li.len() {
+            let i = li[k];
+            let mut e = k;
+            let mut any = false;
+            while e < li.len() && li[e] == i {
+                if rj[e] != NO_ROW && keep.next().unwrap_or(false) {
+                    li2.push(i);
+                    rj2.push(rj[e]);
+                    any = true;
+                }
+                e += 1;
+            }
+            if !any {
+                li2.push(i);
+                rj2.push(NO_ROW);
+            }
+            k = e;
+        }
+        (li, rj) = (li2, rj2);
+    }
+    ctx.check_output(li.len(), w)?;
+    let mut t = materialize_left(l, r, lay, &li, &rj);
+    t.sorted = l.sorted.clone();
+    Ok(t)
+}
+
+/// The rows of a left join from left row indices and right row indices (`NO_ROW` for
+/// none). The left side's unbound shared variables take the right row's values.
+fn materialize_left(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Table {
+    // every left row once, in order: the left columns are copied whole
+    let whole = li.len() == l.len() && li.iter().enumerate().all(|(n, &i)| n == i as usize);
+    let mut cols: Vec<Vec<Id>> = Vec::with_capacity(lay.vars.len());
+    for (lc, col) in l.cols.iter().enumerate() {
+        let fill = lay.shared.iter().find(|(x, _)| *x == lc).map(|(_, rc)| *rc);
+        let fill = fill.filter(|_| has_undef(l, lc));
+        cols.push(match fill {
+            None if whole => col.clone(),
+            None => li.iter().map(|&i| col[i as usize]).collect(),
+            Some(rc) => li
+                .iter()
+                .zip(rj)
+                .map(|(&i, &j)| {
+                    let v = col[i as usize];
+                    if v.is_undef() && j != NO_ROW {
+                        r.cols[rc][j as usize]
+                    } else {
+                        v
+                    }
+                })
+                .collect(),
+        });
+    }
+    for &rc in &lay.right_only {
+        let col = &r.cols[rc];
+        cols.push(
+            rj.iter()
+                .map(|&j| col.get(j as usize).copied().unwrap_or(Id::UNDEF))
+                .collect(),
+        );
+    }
+    Table {
+        vars: lay.vars.clone(),
+        cols,
+        len: li.len(),
+        sorted: Vec::new(),
+    }
 }
 
 fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {
@@ -1683,7 +2651,13 @@ fn anti_join(
     let _held = ctx.charge((b.len() * 16) as u64)?;
     let set: FxHashSet<Id> = b.iter().copied().collect();
     ctx.check()?;
-    Ok((a.par_iter().map(|id| !set.contains(id)).collect(), "hash"))
+    Ok((
+        a.par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|id| !set.contains(id))
+            .collect(),
+        "hash",
+    ))
 }
 
 // ------------------------------------------------------------ expressions ------
@@ -1856,6 +2830,7 @@ fn topk_candidates(ctx: &Ctx, t: &Table, keys: &[(Expr, bool)], k: usize) -> Opt
     let sign = if *asc { -1.0 } else { 1.0 };
     let f: Vec<f64> = col
         .par_iter()
+        .with_min_len(PAR_MIN_LEN)
         .map(|&id| approx(id).map(|d| d * sign))
         .collect::<Option<Vec<f64>>>()?;
     let mut sorted = f.clone();
@@ -2923,7 +3898,6 @@ use crate::geo::knn::spatial_knn;
 #[cfg(feature = "geo")]
 use crate::geo::rewrite::spatial_relate;
 
-#[cfg(not(feature = "geo"))]
 type Counters = serde_json::Map<String, serde_json::Value>;
 
 #[cfg(not(feature = "geo"))]
@@ -2969,83 +3943,258 @@ fn spatial_relate(
     Err(crate::geo::not_built())
 }
 
-fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> Result<Table> {
+/// The vector of entity `e` under `pred` in the active graph (`None`: it has none).
+fn entity_vector(
+    ctx: &Ctx,
+    spec: &super::plan::VectorSpec,
+    pred: Id,
+    e: Id,
+) -> Result<Option<Vec<f32>>> {
+    let mut found: Vec<Id> = Vec::new();
+    for k in ctx.snap.scan_keys(Perm::Pso, &[pred.0, e.0])? {
+        if spec.graph.accepts(k[3]) && !found.contains(&Id(k[2])) {
+            found.push(Id(k[2]));
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [o] => ctx
+            .snap
+            .key(*o)
+            .and_then(|k| crate::vector::from_key(&k))
+            .map(Some)
+            .ok_or_else(|| Error::invalid("the entity's vector is not a valid spk:vector")),
+        many => Err(Error::invalid(format!(
+            "entity {} has {} vectors for the predicate; pass a vector literal",
+            ctx.term(e).map_or("?".into(), |t| t.to_string()),
+            many.len()
+        ))),
+    }
+}
+
+/// Distinct query vectors a variable query may bind.
+const MAX_QUERY_VECTORS: usize = 1000;
+
+/// Top-k vector search (`spk:vectorSearch`). With `input` (a variable query or
+/// `candidates:join`), the search runs once per distinct query and joins with the input
+/// rows; else it is a leaf.
+pub(super) fn vector_search(
+    ctx: &Ctx,
+    spec: &super::plan::VectorSpec,
+    input: Option<Table>,
+    vars: &[VarId],
+) -> Result<(Table, Counters)> {
     use super::plan::VectorQuery;
     use crate::vector;
     let mut t = Table::new(vars.to_vec());
+    let mut counters = Counters::new();
     let Some(pred) = spec.pred else {
-        return Ok(t);
+        return Ok((t, counters));
     };
     let graph = |g: u64| spec.graph.accepts(g);
-    let query: Vec<f32> = match &spec.query {
-        VectorQuery::Vector(v) => v.to_vec(),
-        VectorQuery::Entity(e) => {
-            // the entity's vectors under the predicate, in the active graph
-            let mut found: Vec<Id> = Vec::new();
-            for k in ctx.snap.scan_keys(Perm::Pso, &[pred.0, e.0])? {
-                if graph(k[3]) && !found.contains(&Id(k[2])) {
-                    found.push(Id(k[2]));
+    // (query, the input rows it serves) per search
+    let input_rows = |rows: &mut dyn Iterator<Item = usize>| rows.collect::<Vec<usize>>();
+    let mut runs: Vec<(Option<Vec<f32>>, Vec<usize>)> = Vec::new();
+    match (&spec.query, &input) {
+        (VectorQuery::Vector(v), None) => runs.push((Some(v.to_vec()), Vec::new())),
+        (VectorQuery::Entity(e), None) => {
+            runs.push((entity_vector(ctx, spec, pred, *e)?, Vec::new()))
+        }
+        (VectorQuery::Vector(v), Some(inp)) => {
+            runs.push((Some(v.to_vec()), input_rows(&mut (0..inp.len()))))
+        }
+        (VectorQuery::Entity(e), Some(inp)) => runs.push((
+            entity_vector(ctx, spec, pred, *e)?,
+            input_rows(&mut (0..inp.len())),
+        )),
+        (VectorQuery::Var(qv), Some(inp)) => {
+            let col = inp
+                .col_of(*qv)
+                .ok_or_else(|| Error::invalid("spk:vectorSearch: the query variable is unbound"))?;
+            let mut by_value: rustc_hash::FxHashMap<Id, Vec<usize>> = Default::default();
+            let mut order: Vec<Id> = Vec::new();
+            for r in 0..inp.len() {
+                let id = inp.get(r, col);
+                if id == Id::UNDEF {
+                    continue;
                 }
+                by_value
+                    .entry(id)
+                    .or_insert_with(|| {
+                        order.push(id);
+                        Vec::new()
+                    })
+                    .push(r);
             }
-            match found.as_slice() {
-                [] => return Ok(t),
-                [o] => ctx
-                    .snap
-                    .key(*o)
-                    .and_then(|k| vector::from_key(&k))
-                    .ok_or_else(|| {
-                        Error::invalid("the entity's vector is not a valid spk:vector")
-                    })?,
-                many => {
-                    return Err(Error::invalid(format!(
-                        "entity {} has {} vectors for the predicate; pass a vector literal",
-                        ctx.term(*e).map_or("?".into(), |t| t.to_string()),
-                        many.len()
-                    )));
-                }
+            if order.len() > MAX_QUERY_VECTORS {
+                return Err(Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::Rows,
+                    limit: MAX_QUERY_VECTORS as u64,
+                    requested: order.len() as u64,
+                }));
+            }
+            for id in order {
+                ctx.check()?;
+                let v = match ctx.term(id) {
+                    Some(oxrdf::Term::Literal(l)) => {
+                        match (l.datatype().as_str() == vector::DATATYPE)
+                            .then(|| vector::parse(l.value()).ok())
+                            .flatten()
+                        {
+                            Some(v) => Some(v),
+                            // a literal that is not a vector matches nothing
+                            None => continue,
+                        }
+                    }
+                    _ => entity_vector(ctx, spec, pred, id)?,
+                };
+                runs.push((v, by_value.remove(&id).unwrap_or_default()));
             }
         }
-    };
-    let q = vector::Search {
-        pred: pred.0,
-        query: &query,
-        k: spec.k,
-        metric: spec.metric,
-        graph: &graph,
-        dedup: spec.dedup,
-    };
-    let hits = vector::search(&ctx.snap, &q, &|| ctx.check())?;
-    ctx.check_output(hits.len(), vars.len())?;
+        (VectorQuery::Var(_), None) => {
+            return Err(Error::invalid(
+                "spk:vectorSearch: the query variable is not bound by the rest of the group",
+            ));
+        }
+    }
     let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
     let cs = match spec.subject {
         PathEnd::Var(v) => col(Some(v)),
         _ => None,
     };
     let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    // where each input column goes
+    let in_map: Vec<(usize, usize)> = input
+        .as_ref()
+        .map(|inp| {
+            inp.vars
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| vars.iter().position(|x| x == v).map(|o| (i, o)))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut row = vec![Id::UNDEF; vars.len()];
-    for h in hits {
-        if let PathEnd::Const(s) = spec.subject
-            && s.0 != h.s
-        {
+    let mut info_all: Option<vector::SearchInfo> = None;
+    let mut searches = 0u64;
+    for (query, rows) in runs {
+        let Some(query) = query else { continue };
+        if input.is_some() && rows.is_empty() {
             continue;
         }
-        row.fill(Id::UNDEF);
-        if let Some(c) = cs {
-            row[c] = Id(h.s);
+        // candidates:join: the subjects of the input rows
+        let subjects: Option<Vec<u64>> = match (&input, spec.candidates, &spec.subject) {
+            (Some(inp), true, PathEnd::Var(sv)) => {
+                let sv = *sv;
+                let c = inp.col_of(sv).expect("planned with the subject bound");
+                let mut s: Vec<u64> = rows
+                    .iter()
+                    .map(|&r| inp.get(r, c).0)
+                    .filter(|&x| x != Id::UNDEF.0)
+                    .collect();
+                s.sort_unstable();
+                s.dedup();
+                Some(s)
+            }
+            _ => None,
+        };
+        let q = vector::Search {
+            pred: pred.0,
+            query: &query,
+            k: spec.k,
+            metric: spec.metric,
+            graph: &graph,
+            dedup: spec.dedup,
+            distinct_subject: spec.distinct_subject,
+            subjects: subjects.as_deref(),
+            mode: spec.mode,
+        };
+        let (hits, info) = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+        searches += 1;
+        match &mut info_all {
+            None => info_all = Some(info),
+            Some(a) => {
+                a.scored += info.scored;
+                if a.method != info.method {
+                    a.method = "mixed";
+                }
+            }
         }
-        if let Some(c) = cscore {
-            row[c] = Id::from_f64(h.score as f64)
+        let fill = |row: &mut Vec<Id>, h: &vector::Hit| -> bool {
+            let mut set = |c: Option<usize>, id: Id| -> bool {
+                match c {
+                    Some(c) if row[c] != Id::UNDEF && row[c] != id => false,
+                    Some(c) => {
+                        row[c] = id;
+                        true
+                    }
+                    None => true,
+                }
+            };
+            let score = Id::from_f64(h.score as f64)
                 .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+            set(cs, Id(h.s)) && set(cscore, score) && set(cvec, Id(h.o)) && set(cg, Id(h.g))
+        };
+        match &input {
+            None => {
+                ctx.check_output(t.len() + hits.len(), vars.len())?;
+                for h in &hits {
+                    if let PathEnd::Const(s) = spec.subject
+                        && s.0 != h.s
+                    {
+                        continue;
+                    }
+                    row.fill(Id::UNDEF);
+                    if fill(&mut row, h) {
+                        t.push_row(&row);
+                    }
+                }
+            }
+            Some(inp) => {
+                ctx.check_output(
+                    t.len() + rows.len() * hits.len().min(rows.len().max(1)),
+                    vars.len(),
+                )?;
+                for &r in &rows {
+                    for h in &hits {
+                        if let PathEnd::Const(s) = spec.subject
+                            && s.0 != h.s
+                        {
+                            continue;
+                        }
+                        row.fill(Id::UNDEF);
+                        for &(i, o) in &in_map {
+                            row[o] = inp.get(r, i);
+                        }
+                        if fill(&mut row, h) {
+                            t.push_row(&row);
+                        }
+                    }
+                    ctx.check_rows(t.len())?;
+                }
+            }
         }
-        if let Some(c) = cvec {
-            row[c] = Id(h.o);
-        }
-        if let Some(c) = cg {
-            row[c] = Id(h.g);
-        }
-        t.push_row(&row);
     }
-    Ok(t)
+    if let Some(i) = info_all {
+        counters.insert("method".into(), i.method.into());
+        if let Some(r) = i.reason {
+            counters.insert("exactBecause".into(), r.into());
+        }
+        if let Some(n) = i.index {
+            counters.insert("index".into(), n.into());
+        }
+        if i.ef > 0 {
+            counters.insert("ef".into(), i.ef.into());
+        }
+        counters.insert("rows".into(), i.rows.into());
+        counters.insert("scored".into(), i.scored.into());
+        counters.insert("overlayInserts".into(), i.inserted.into());
+        counters.insert("overlayDeletes".into(), i.deleted.into());
+    }
+    if input.is_some() {
+        counters.insert("searches".into(), searches.into());
+    }
+    Ok((t, counters))
 }
 
 // ---------------------------------------------------------------- service ------
@@ -3136,6 +4285,8 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
+    // the endpoint's blank nodes are its own: new ones here, one per label of the result
+    let mut bnodes = FxHashMap::default();
     let failed = |e: sparesults::QueryResultsParseError| match e {
         // a spent budget, or the body's own words (timeout, size, connection)
         sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
@@ -3152,7 +4303,7 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
                     .iter()
                     .map(|v| {
                         sol.get(ctx.var_name(*v).as_str())
-                            .map_or(Id::UNDEF, |term| ctx.intern_term(term))
+                            .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
                     })
                     .collect();
                 t.push_row(&row);

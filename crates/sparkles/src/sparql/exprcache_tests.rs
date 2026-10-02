@@ -59,14 +59,22 @@ fn counter(p: &PlanInfo, name: &str) -> u64 {
 /// Same solutions with and without the cache (in order when the query orders them);
 /// whether the cache evaluated some expression per value.
 fn check(snap: &Arc<crate::store::Snapshot>, q: &str) -> bool {
-    let on = run_on(snap.clone(), q, Optimizations::ALL);
+    // filters on the runs of a sorted scan test values once without the cache: off here,
+    // so that the cache is what runs
+    let runs_off = Optimizations::ALL
+        .disable("filter_scan_runs,count_filter_runs")
+        .unwrap();
+    let on = run_on(snap.clone(), q, runs_off);
     let off = run_on(snap.clone(), q, without());
-    let (mut a, mut b) = (show(&on), show(&off));
+    let all = run_on(snap.clone(), q, Optimizations::ALL);
+    let (mut a, mut b, mut c) = (show(&on), show(&off), show(&all));
     if !q.contains("ORDER BY") {
         a.sort();
         b.sort();
+        c.sort();
     }
     assert_eq!(a, b, "{q}");
+    assert_eq!(a, c, "{q}");
     let mut n = Vec::new();
     notes(&off.plan, &mut n);
     assert!(n.is_empty(), "{q}: cache ran while off: {n:?}");

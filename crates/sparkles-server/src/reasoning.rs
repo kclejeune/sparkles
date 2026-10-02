@@ -3,10 +3,13 @@
 //!
 //! A materialization records the commit (`seq`) it wrote, or the unchanged head it read
 //! when it changed nothing, together with the dataset id. The inferences are fresh while
-//! the head is still that commit; every later commit makes them stale (conservatively:
-//! also commits that touch only named graphs the reasoner does not read).
+//! no later commit changed the default graph, which is all the reasoner reads. Commits
+//! to named graphs, the inferred graph included, leave them fresh; `commitsSince` still
+//! counts every commit.
 
 use crate::state::{AppState, Dataset, ReasoningInfo};
+#[cfg(feature = "reasoning")]
+use crate::state::{RunChanges, RunInfo};
 use axum::http::HeaderValue;
 use parking_lot::Mutex;
 use serde_json::{Value as J, json};
@@ -14,6 +17,8 @@ use sparkles::store::Store;
 use std::collections::HashMap;
 #[cfg(feature = "reasoning")]
 use std::sync::Arc;
+#[cfg(feature = "reasoning")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Response header on reads that include stale (or unknown-freshness) inferences.
@@ -59,6 +64,15 @@ pub fn freshness(info: &ReasoningInfo, store: &Store, at: u64) -> Freshness {
         },
         std::cmp::Ordering::Greater => {
             let n = at - commit;
+            // the reasoner reads the default graph alone: commits to named graphs,
+            // the inferred graph included, leave the inferences fresh
+            if !store.default_graph_changed(commit, at) {
+                return Freshness {
+                    stale: Some(false),
+                    commits_since: Some(n),
+                    reason: None,
+                };
+            }
             Freshness {
                 stale: Some(true),
                 commits_since: Some(n),
@@ -97,14 +111,30 @@ pub fn status_json(st: &AppState, ds: &Dataset) -> J {
     let Some(info) = ds.reasoning.read().clone() else {
         return J::Null;
     };
-    let mut auto = json!({ "enabled": false });
-    if let Some(a) = st.auto_reason.as_ref().filter(|_| !st.read_only) {
-        auto = json!({ "enabled": true, "debounceSeconds": a.debounce.as_secs_f64() });
-        if let Some(at) = a.scheduled(&ds.name) {
-            auto["scheduledAt"] = at.into();
-        }
+    status_value(&info, &ds.store, auto_json(st, &ds.name, &info))
+}
+
+/// `ReasoningStatus.auto`: the effective setting, where it comes from, and the next
+/// planned run.
+pub fn auto_json(st: &AppState, name: &str, info: &ReasoningInfo) -> J {
+    let source = if info.auto.is_some() {
+        "dataset"
+    } else {
+        "server"
+    };
+    let Some(t) = auto_timing(st, info) else {
+        return json!({ "enabled": false, "source": source });
+    };
+    let mut auto = json!({
+        "enabled": true,
+        "source": source,
+        "debounceSeconds": t.debounce.as_secs_f64(),
+        "maxDelaySeconds": t.max_delay.as_secs_f64(),
+    });
+    if let Some(at) = st.auto_reason.as_ref().and_then(|a| a.scheduled(name, t)) {
+        auto["scheduledAt"] = at.into();
     }
-    status_value(&info, &ds.store, auto)
+    auto
 }
 
 /// `ReasoningStatus` of a recorded status at the store's head.
@@ -124,6 +154,9 @@ pub fn status_value(info: &ReasoningInfo, store: &Store, auto: J) -> J {
     });
     if let Some(r) = f.reason {
         j["staleReason"] = r.into();
+    }
+    if let Some(run) = &info.run {
+        j["run"] = serde_json::to_value(run).unwrap_or(J::Null);
     }
     if !info.vocabularies.is_empty() {
         j["vocabularies"] = info.vocabularies.clone().into();
@@ -147,6 +180,17 @@ fn profile_text(info: &ReasoningInfo) -> String {
     s
 }
 
+/// "up to date", noting the later commits that left the default graph unchanged.
+pub fn up_to_date(commits_since: Option<u64>) -> String {
+    match commits_since {
+        Some(n) if n > 0 => format!(
+            "up to date; {n} later commit{} left the default graph unchanged",
+            if n == 1 { "" } else { "s" }
+        ),
+        _ => "up to date".to_string(),
+    }
+}
+
 /// One line for the CLI: `owl-rl, 1234 inferred at commit 40 (STALE: 3 commits since)`.
 pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
     let f = freshness(info, store, store.head_commit().seq);
@@ -155,7 +199,7 @@ pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
         None => format!("at {}", info.at),
     };
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE: {n} commit{} since", if n == 1 { "" } else { "s" })
         }
@@ -216,6 +260,61 @@ pub fn recorded(
         warnings: report.warnings.clone(),
         millis: Some(report.millis),
         inherited_stale: false,
+        auto: None,
+        run: Some(run_info(report)),
+    }
+}
+
+/// How a run materialized, for the status.
+#[cfg(feature = "reasoning")]
+pub fn run_info(report: &sparkles_reasoner::ReasonReport) -> RunInfo {
+    RunInfo {
+        method: report.method.as_str().to_string(),
+        fallback: report.fallback.clone(),
+        inferred_added: report.inferred_added,
+        inferred_removed: report.inferred_removed,
+        changes: report.changes.as_ref().map(|c| RunChanges {
+            explicit_added: c.base_added,
+            explicit_removed: c.base_removed,
+            checked: c.checked,
+            removed: c.removed,
+            derived: c.derived,
+            source: c.source.clone(),
+        }),
+    }
+}
+
+/// The commit of the recorded materialization that a run can update incrementally: the
+/// status's own commit, when the status belongs to this dataset.
+#[cfg(feature = "reasoning")]
+pub fn incremental_since(info: Option<&ReasoningInfo>, store: &Store) -> Option<u64> {
+    let info = info?;
+    if info.inherited_stale
+        || info.position_source.as_deref() != Some("commit")
+        || info.dataset_id.as_deref() != Some(store.dataset_id().to_string().as_str())
+    {
+        return None;
+    }
+    info.commit
+}
+
+/// One line on how a run went: `incremental: 3 explicit triples added, 1 removed; …`.
+#[cfg(feature = "reasoning")]
+pub fn run_text(report: &sparkles_reasoner::ReasonReport) -> String {
+    let graph = format!(
+        "inferred graph +{} -{}",
+        report.inferred_added, report.inferred_removed
+    );
+    match (&report.changes, &report.fallback) {
+        (Some(c), _) => format!(
+            "incremental: {} explicit triples added, {} removed; {} derived triples removed, {} added; {graph}",
+            c.base_added, c.base_removed, c.removed, c.derived
+        ),
+        (None, Some(why)) => format!(
+            "full, {} iterations, because {why}; {graph}",
+            report.iterations
+        ),
+        (None, None) => format!("full, {} iterations; {graph}", report.iterations),
     }
 }
 
@@ -240,31 +339,99 @@ pub fn recorded_extras(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner
     )?)
 }
 
+/// What started a reasoning run.
+#[cfg(feature = "reasoning")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// `POST /$/reason/{ds}`
+    Request,
+    /// the automatic run loop; a superseded run stops as soon as a write transaction
+    /// waits for the writer lock it holds
+    Auto { superseded_by_writes: bool },
+}
+
 /// Start a `reason` task: materialize, then record the status (data first, then the
-/// status file, so a crash in between reads as stale).
+/// status file, so a crash in between reads as stale). The task can be cancelled.
+///
+/// With `incremental`, the run updates the recorded materialization when it can (see
+/// [`sparkles_reasoner::materialize_incremental`]), with the closure the dataset keeps
+/// in memory or, after a restart, the one saved with it.
 #[cfg(feature = "reasoning")]
 pub fn start_reason(
     st: &Arc<AppState>,
     ds: Arc<Dataset>,
     profile: sparkles_reasoner::Profile,
     extras: sparkles_reasoner::Extras,
-    auto: bool,
+    trigger: Trigger,
+    incremental: bool,
 ) -> crate::state::Task {
     let st2 = st.clone();
     let name = ds.name.clone();
+    let auto = matches!(trigger, Trigger::Auto { .. });
+    let yields = trigger
+        == Trigger::Auto {
+            superseded_by_writes: true,
+        };
     let prefix = if auto { "auto: " } else { "" };
-    st.start_task("reason", &name, move |h| {
+    st.start_task_opts(st.next_task_id(), "reason", &name, None, true, move |h| {
         let h2 = h.clone();
-        let progress: sparkles_reasoner::ProgressFn =
-            Arc::new(move |p, msg: &str| h2.progress(p, &format!("{prefix}{msg}")));
+        // the reasoner reports progress only once it holds the writer lock
+        let locked = Arc::new(AtomicBool::new(false));
+        let locked2 = locked.clone();
+        let progress: sparkles_reasoner::ProgressFn = Arc::new(move |p, msg: &str| {
+            locked2.store(true, Ordering::Relaxed);
+            h2.progress(p, &format!("{prefix}{msg}"));
+        });
         h.progress(0.05, &format!("{prefix}loading triples"));
+        let cancel = h.cancel_flag();
         let opts = sparkles_reasoner::ReasonOptions {
             progress: Some(progress),
+            cancel: Some(cancel.clone()),
             ..Default::default()
         };
-        let report = match sparkles_reasoner::materialize_with(&ds.store, &profile, &extras, &opts)
-        {
+        let superseded = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let result = std::thread::scope(|s| {
+            if yields {
+                // a newer write waiting for the lock supersedes this run
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        // before that, the waiting writer may be this run itself
+                        if locked.load(Ordering::Relaxed) && ds.store.writers_waiting() > 0 {
+                            superseded.store(true, Ordering::Relaxed);
+                            cancel.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                });
+            }
+            let since = if incremental {
+                incremental_since(ds.reasoning.read().as_ref(), &ds.store)
+            } else {
+                None
+            };
+            ds.closure.set_max_triples(st2.reason_cache_triples);
+            let inc = sparkles_reasoner::Incremental {
+                since,
+                cache: Some(&ds.closure),
+            };
+            let r = sparkles_reasoner::materialize_incremental(
+                &ds.store, &profile, &extras, inc, &opts,
+            );
+            done.store(true, Ordering::Relaxed);
+            r
+        });
+        let report = match result {
             Ok(r) => r,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                let why = if superseded.load(Ordering::Relaxed) {
+                    "auto: superseded by a write"
+                } else {
+                    "reasoning cancelled"
+                };
+                return Err(anyhow::Error::new(sparkles::Error::Cancelled).context(why));
+            }
             Err(e) => {
                 let e = match rejection_text(&e) {
                     Some(text) => anyhow::anyhow!("{prefix}{text}"),
@@ -274,13 +441,21 @@ pub fn start_reason(
                 return Err(e);
             }
         };
-        ds.set_reasoning(Some(recorded(&profile, &extras, &report, &ds.store)))?;
+        let mut info = recorded(&profile, &extras, &report, &ds.store);
+        // a run keeps the dataset's automatic re-run setting
+        info.auto = ds.reasoning.read().as_ref().and_then(|i| i.auto.clone());
+        ds.set_reasoning(Some(info))?;
         st2.save_registry()?;
+        let mut detail = serde_json::to_value(run_info(&report)).unwrap_or(J::Null);
+        detail["inferred"] = report.inferred.into();
+        detail["millis"] = report.millis.into();
+        detail["iterations"] = report.iterations.into();
+        h.set_detail(detail);
         Ok(format!(
-            "{prefix}{} inferred triples in {} ms ({} iterations){}",
+            "{prefix}{} inferred triples in {} ms ({}){}",
             report.inferred,
             report.millis,
-            report.iterations,
+            run_text(&report),
             if report.warnings.is_empty() {
                 String::new()
             } else {
@@ -335,13 +510,56 @@ fn reason_running(st: &AppState, name: &str) -> bool {
 
 // -------------------------------------------------------------- auto mode ------
 
-/// `serve --auto-reason SECS [--auto-reason-max-delay SECS]`: re-materialize stale
-/// inferences once the head has not changed for `debounce`, or `max_delay` after they
-/// became stale when writes never pause that long.
+/// Automatic re-materialization: stale inferences are re-materialized once the head has
+/// not changed for the debounce, or the maximum delay after they became stale when
+/// writes never pause that long. `serve --auto-reason SECS [--auto-reason-max-delay
+/// SECS]` sets the server-wide timing; a dataset's own setting (`PUT
+/// /$/reason/{ds}/auto`) takes precedence over it.
 pub struct AutoReason {
+    /// the server-wide setting; `None` runs only datasets that enable it themselves
+    pub server: Option<AutoTiming>,
+    pending: Mutex<HashMap<String, Pending>>,
+}
+
+/// When automatic runs start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoTiming {
     pub debounce: Duration,
     pub max_delay: Duration,
-    pending: Mutex<HashMap<String, Pending>>,
+}
+
+/// The debounce of a dataset that enables automatic runs without one, on a server
+/// without `--auto-reason`.
+pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// The automatic run timing that applies to a dataset, if automatic runs are on for it:
+/// its own setting, else the server's. Never on a read-only server, or without the
+/// automatic run loop.
+pub fn auto_timing(st: &AppState, info: &ReasoningInfo) -> Option<AutoTiming> {
+    if st.read_only {
+        return None;
+    }
+    let auto = st.auto_reason.as_ref()?;
+    let Some(own) = &info.auto else {
+        return auto.server;
+    };
+    if !own.enabled {
+        return None;
+    }
+    let secs = |s: Option<f64>| s.map(Duration::from_secs_f64);
+    let debounce = secs(own.debounce_seconds)
+        .or(auto.server.map(|t| t.debounce))
+        .unwrap_or(DEFAULT_DEBOUNCE);
+    let max_delay = match (secs(own.max_delay_seconds), auto.server) {
+        (Some(m), _) => m,
+        // the server's maximum delay goes with the server's debounce
+        (None, Some(s)) if own.debounce_seconds.is_none() => s.max_delay,
+        (None, _) => debounce * 12,
+    };
+    Some(AutoTiming {
+        debounce,
+        max_delay,
+    })
 }
 
 struct Pending {
@@ -357,22 +575,33 @@ struct Pending {
 }
 
 impl AutoReason {
+    /// The server-wide setting of `--auto-reason`.
     pub fn new(debounce: Duration, max_delay: Option<Duration>) -> AutoReason {
         AutoReason {
-            debounce,
-            max_delay: max_delay.unwrap_or(debounce * 12),
+            server: Some(AutoTiming {
+                debounce,
+                max_delay: max_delay.unwrap_or(debounce * 12),
+            }),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// No server-wide setting: only datasets that enable automatic runs get them.
+    pub fn per_dataset() -> AutoReason {
+        AutoReason {
+            server: None,
             pending: Mutex::new(HashMap::new()),
         }
     }
 
     /// RFC 3339 time of the next planned run of a dataset, if one is planned.
-    fn scheduled(&self, name: &str) -> Option<String> {
+    fn scheduled(&self, name: &str, t: AutoTiming) -> Option<String> {
         let p = self.pending.lock();
         let p = p.get(name)?;
         if p.task.is_some() || p.failed == Some(p.head) {
             return None;
         }
-        let due = (p.changed + self.debounce).min(p.since + self.max_delay);
+        let due = (p.changed + t.debounce).min(p.since + t.max_delay);
         let wait = due.saturating_duration_since(Instant::now());
         let at = std::time::SystemTime::now() + wait;
         let ms = at
@@ -396,6 +625,10 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
     pending.retain(|n, _| datasets.iter().any(|d| &d.name == n));
     for ds in datasets {
         let info = ds.reasoning.read().clone();
+        let Some(timing) = info.as_ref().and_then(|i| auto_timing(st, i)) else {
+            pending.remove(&ds.name);
+            continue;
+        };
         let head = ds.store.head_commit().seq;
         let stale = info.as_ref().map(|i| freshness(i, &ds.store, head).stale);
         // never guess: only runs for inferences known to be stale
@@ -422,8 +655,10 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
                 .find(|t| t.id == id)
                 .map(|t| t.state.clone());
             match state.as_deref() {
-                Some("running") => continue,
+                Some("running" | "queued") => continue,
                 Some("failed") => p.failed = Some(at),
+                // superseded by a write (or cancelled): the stale period goes on
+                Some("cancelled") => {}
                 // stale again after a run: a new stale period
                 _ => p.since = now,
             }
@@ -432,9 +667,11 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
         if p.failed == Some(head) || reason_running(st, &ds.name) {
             continue;
         }
-        let due = now.duration_since(p.changed) >= auto.debounce
-            || now.duration_since(p.since) >= auto.max_delay;
-        if !due {
+        let quiet = now.duration_since(p.changed) >= timing.debounce;
+        // a run forced by the maximum delay is not superseded, or it would never finish
+        // while writes go on
+        let forced = !quiet && now.duration_since(p.since) >= timing.max_delay;
+        if !quiet && !forced {
             continue;
         }
         let run = info
@@ -450,7 +687,10 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
             None => continue,
         };
         tracing::info!("auto-reason /{}: re-running {}", ds.name, profile.name());
-        let task = start_reason(st, ds.clone(), profile, extras, true);
+        let trigger = Trigger::Auto {
+            superseded_by_writes: !forced,
+        };
+        let task = start_reason(st, ds.clone(), profile, extras, trigger, true);
         p.task = Some((task.id, head));
         p.since = now;
     }

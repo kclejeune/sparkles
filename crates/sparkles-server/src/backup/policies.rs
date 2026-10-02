@@ -15,7 +15,7 @@ use super::BackupState;
 use super::http::error_response;
 use super::registry::{PolicyEntry, Registry};
 use super::scheduler::{Clock, SystemClock};
-use crate::state::{AppState, DbType, Task, TaskHandle, write_file_atomic};
+use crate::state::{AppState, Task, TaskHandle, write_file_atomic};
 use anyhow::Context as _;
 use axum::Json;
 use axum::Router;
@@ -59,8 +59,6 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatasetInfo {
     pub name: String,
-    /// `mem` datasets are skipped (reported)
-    pub in_memory: bool,
     pub id: Uuid,
     /// the head commit
     pub head: u64,
@@ -121,7 +119,6 @@ impl Engine for ServerEngine {
             .values()
             .map(|d| DatasetInfo {
                 name: d.name.clone(),
-                in_memory: d.kind == DbType::Mem,
                 id: d.store.dataset_id(),
                 head: d.store.head_commit().seq,
             })
@@ -726,10 +723,6 @@ impl Run<'_> {
                 i as f32 / selected.len() as f32 * 0.9,
                 &format!("dataset {}/{}: {}", i + 1, selected.len(), ds.name),
             );
-            if ds.in_memory {
-                run.datasets.push(skip("in-memory dataset"));
-                continue;
-            }
             let unchanged = previous
                 .iter()
                 .filter(|b| b.dataset.id == ds.id)

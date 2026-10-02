@@ -59,6 +59,10 @@ export type Limits = {
   /** The serialized body of a Graph Store GET; absent on servers that predate it. */
   maxExportBytes?: number;
   maxRows: number;
+  /** Rows all the operators of one query produce; absent on servers that predate it. */
+  maxRowsProduced?: number;
+  /** The default storage quota of a persistent dataset; absent on servers that predate it. */
+  maxDatasetBytes?: number;
 };
 
 export type ServerInfo = {
@@ -117,7 +121,9 @@ export type BudgetKind =
   | 'memory'
   | 'result-bytes'
   | 'decompressed-bytes'
-  | 'outbound-bytes';
+  | 'outbound-bytes'
+  | 'rows-produced'
+  | 'dataset-bytes';
 
 type CacheStats = {
   bytes: number;
@@ -125,6 +131,16 @@ type CacheStats = {
   entries: number;
   hits: number;
   misses: number;
+};
+
+/** `GET /$/quota/{ds}`: a dataset's storage quota and the bytes it uses. */
+export type DatasetQuota = {
+  /** The quota in effect; null when unlimited. */
+  maxBytes: number | null;
+  /** `dataset`: set on the dataset; `default`: the server's `--max-dataset-mb`. */
+  source: 'dataset' | 'default';
+  defaultMaxBytes: number | null;
+  usedBytes: number;
 };
 
 /** `GET /$/metrics?format=json`: the metrics registry as JSON. */
@@ -180,6 +196,8 @@ export type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[];
   classes: { iri: string; instances: number }[];
   diskBytes: number;
+  /** Storage quota of a persistent dataset (null in memory); absent on servers that predate it. */
+  quota?: DatasetQuota | null;
   /** Decoded-block cache. */
   cache: { entries: number; bytes: number; hits: number; misses: number };
   /** Query (sub)result cache; absent on servers that predate it. */
@@ -188,6 +206,16 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
   /** Spatial index status (null: disabled); absent on servers that predate it. */
   geo?: GeoStatus | null;
+  /** The commit the statistics describe; absent on servers that predate it. */
+  commit?: number;
+  /** The selector of a past state (`commit:42`), or null at the head. */
+  at?: string | null;
+  history?: {
+    bytes: number;
+    generations: number;
+    snapshots: number;
+    oldestReconstructable: number | null;
+  };
 };
 
 export type TaskKind =
@@ -198,6 +226,7 @@ export type TaskKind =
   | 'clone'
   | 'text-rebuild'
   | 'geo-index'
+  | 'vector-index'
   | 'backup-create'
   | 'backup-restore'
   | 'backup-verify'
@@ -278,6 +307,8 @@ export type SparklesResult = {
   };
   /** From the `Sparkles-Inferences` header: the result used outdated inferences. */
   inferences?: InferencesNotice;
+  /** From the `Sparkles-At` headers: the state a query with `at` read. */
+  at?: AtInfo;
 };
 
 export type ExplainResult = { algebra: string; plan: PlanNode };
@@ -327,7 +358,9 @@ function budgetOf(body: Record<string, unknown>): Budget | undefined {
     kind !== 'memory' &&
     kind !== 'result-bytes' &&
     kind !== 'decompressed-bytes' &&
-    kind !== 'outbound-bytes'
+    kind !== 'outbound-bytes' &&
+    kind !== 'rows-produced' &&
+    kind !== 'dataset-bytes'
   )
     return undefined;
   return { kind, limit: Number(body.limit ?? 0), requested: Number(body.requested ?? 0) };
@@ -346,6 +379,10 @@ export function budgetHint(b: Budget): string {
       return `The request body is too large once decompressed (limit ${fmtBytes(b.limit)}). Send less data per request.`;
     case 'outbound-bytes':
       return `SERVICE calls and LOADs downloaded too much in total (limit ${fmtBytes(b.limit)}). Fetch less remote data per request.`;
+    case 'rows-produced':
+      return `The query does too much work (limit ${fmtInt(b.limit)} rows produced). Narrow the query or make its patterns more selective.`;
+    case 'dataset-bytes':
+      return `The write would take the dataset over its storage quota (${fmtBytes(b.limit)}). Delete data, compact the dataset, or ask an administrator for a larger quota.`;
   }
 }
 
@@ -542,7 +579,9 @@ export const createDataset = (dbName: string, dbType: DatasetType) =>
 export const deleteDataset = (ds: string) =>
   json<unknown>(`/$/datasets/${enc(ds)}`, { method: 'DELETE' });
 
-export const datasetStats = (ds: string) => json<DatasetStats>(`/$/stats/${enc(ds)}`);
+/** `GET /$/stats/{ds}`, of the state `at` selects when given. */
+export const datasetStats = (ds: string, at?: string) =>
+  json<DatasetStats>(`/$/stats/${enc(ds)}${at ? `?at=${enc(at)}` : ''}`);
 
 export const compact = (ds: string) => json<Task>(`/$/compact/${enc(ds)}`, { method: 'POST' });
 
@@ -735,11 +774,14 @@ export type QueryOptions = {
   reasoning?: boolean;
   /** Bypass the server's result cache. */
   nocache?: boolean;
+  /** Read a past state: `head`, `42`, `commit:42`, `time:<RFC 3339>`, `snapshot:NAME`. */
+  at?: string;
   signal?: AbortSignal;
 };
 
 function queryParams(opts: QueryOptions): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.nocache) p.set('nocache', 'true');
   if (opts.send != null) p.set('send', String(opts.send));
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
@@ -763,6 +805,8 @@ export async function query(
   const body = (await res.json()) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
+  const at = atInfo(res.headers);
+  if (at) body.at = at;
   return normalizeResult(body);
 }
 
@@ -1107,7 +1151,14 @@ export type ReasoningStatus = {
   stale: boolean | null;
   commitsSince: number | null;
   staleReason?: string;
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string };
+  auto: {
+    enabled: boolean;
+    /** `server`: --auto-reason; `dataset`: the dataset's own setting */
+    source?: 'server' | 'dataset';
+    debounceSeconds?: number;
+    maxDelaySeconds?: number;
+    scheduledAt?: string;
+  };
   warnings: string[];
 };
 
@@ -1132,6 +1183,18 @@ export async function reasonStatus(ds: string): Promise<ReasoningStatus | null> 
   return body && 'profile' in body ? body : null;
 }
 
+/** The dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`). */
+export const setAutoReasoning = (ds: string, enabled: boolean) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+
+/** Drop the dataset's own setting: the server's `--auto-reason` applies again. */
+export const clearAutoReasoning = (ds: string) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, { method: 'DELETE' });
+
 /** Re-run the recorded profile (including custom rules). */
 export const rerunReasoning = (ds: string) =>
   json<Task>(`/$/reason/${enc(ds)}`, jsonBody({ rerun: true }));
@@ -1140,8 +1203,17 @@ export const DIAGNOSTIC_CHECKS = [
   'nothing-member',
   'disjoint-classes',
   'all-disjoint-classes',
+  'complement-classes',
+  'max-cardinality-zero',
+  'max-qualified-cardinality-zero',
   'same-different',
+  'all-different',
   'functional-literal-conflict',
+  'irreflexive-property',
+  'asymmetric-property',
+  'disjoint-properties',
+  'all-disjoint-properties',
+  'negative-property-assertion',
   'thing-empty',
   'unsatisfiable-class',
 ] as const;
@@ -1257,6 +1329,14 @@ export type Commit = {
   exact: boolean;
   /** Rebuilt from a write-ahead log record without commit metadata. */
   reconstructed?: boolean;
+  /** The write skipped the dataset's write-time validation (a bypass). */
+  unvalidated?: boolean;
+  /** A point-in-time read (`at`) can still see this commit; absent on older servers. */
+  reconstructable?: boolean;
+  /** Named snapshots that pin this commit. */
+  snapshots?: string[];
+  /** The message recorded with the commit. */
+  message?: string;
 };
 
 /** What a write produced: the new commit, or the unchanged head when nothing changed. */
@@ -1289,6 +1369,9 @@ export type CommitPage = {
   firstRetained: number;
   /** false while the catalog lags the write-ahead log after a write error. */
   complete: boolean;
+  /** Oldest commit a point-in-time read can see; absent on older servers. */
+  oldestReconstructable?: number | null;
+  reconstructable?: { from: number; to: number }[];
   commits: Commit[];
   /** URL of the next (older) page, or null. */
   next: string | null;
@@ -1498,3 +1581,373 @@ export const disableText = (ds: string) =>
 /** Rebuild the index from the current data (`409` while a rebuild runs). */
 export const rebuildText = (ds: string) =>
   json<Task>(`/$/text/${enc(ds)}/rebuild`, { method: 'POST' });
+
+// --- vector indexes ----------------------------------------------------------------
+
+export type VectorMetric = 'cosine' | 'dot' | 'euclidean';
+export type VectorIndexState = 'ready' | 'building' | 'failed' | 'over-budget';
+
+/** The HNSW settings of an index (the defaults are 16, 128 and 128). */
+export type HnswConfig = { m?: number; efConstruction?: number; efSearch?: number };
+
+/** The body of `PUT /$/vector/{ds}/{name}`. */
+export type VectorIndexConfig = {
+  predicate: string;
+  dimension: number;
+  /** Default cosine. */
+  metric?: VectorMetric;
+  /** A label of the embedding model, not interpreted. */
+  model?: string;
+  /** `false` keeps only the packed vectors, which are searched exactly. */
+  hnsw?: HnswConfig | false;
+  /** Searches over at most this many rows are exact; default 10000. */
+  exactThreshold?: number;
+};
+
+export type VectorIndexStatus = {
+  name: string;
+  predicate: string;
+  dimension: number;
+  metric: VectorMetric;
+  model?: string;
+  state: VectorIndexState;
+  /** Build progress (0–1) while building. */
+  progress?: number;
+  message?: string;
+  /** The generation the index was built for. */
+  generation: string;
+  /** Vectors in the generation's base (the packed rows). */
+  rows: number;
+  /** Changes since the base that searches add exactly. */
+  overlay: { inserts: number; deletes: number };
+  skipped: { malformed: number; wrongDimension: number; zeroNorm: number };
+  /** `residency`: `heap` (built in this process) or `mmap` (read in place from the file). */
+  memory: { segmentBytes: number; hnswBytes: number; residency: string };
+  /** Null for an index that is searched exactly. */
+  hnsw: {
+    m: number;
+    efConstruction: number;
+    efSearch: number;
+    nodes: number;
+    layers: number;
+  } | null;
+  exactThreshold: number;
+  /** The index file of a persistent store; `opened`: read from it, not built. */
+  files?: { bytes: number; opened: boolean };
+  lastBuild?: { at: string; ms: number; rows: number };
+};
+
+/** `GET /$/vector/{ds}`. */
+export type VectorStatus = {
+  budgetBytes: number;
+  usedBytes: number;
+  generation: string;
+  indexes: VectorIndexStatus[];
+  /** Predicates packed without an index (on their first search). */
+  predicates: {
+    predicate: string;
+    bytes: number;
+    malformed: number;
+    dimensions: { dimension: number; vectors: number }[];
+  }[];
+};
+
+/** `POST /$/vector/{ds}/{name}/recall`: recall@k of the graph against the exact search. */
+export type VectorRecall = {
+  k: number;
+  samples: number;
+  ef: number;
+  /** 0–1. */
+  recall: number;
+  /** Mean milliseconds per search. */
+  hnswMs: number;
+  exactMs: number;
+};
+
+const vectorPath = (ds: string, name?: string) =>
+  `/$/vector/${enc(ds)}${name == null ? '' : `/${enc(name)}`}`;
+
+/**
+ * The vector indexes and packed predicates of a dataset. Servers that predate vector
+ * indexes answer 404.
+ */
+export const vectorStatus = (ds: string, signal?: AbortSignal) =>
+  json<VectorStatus>(vectorPath(ds), { signal, cache: 'no-store' });
+
+/** Create or replace an index. Its build is the returned task, and `409` means another index has the predicate. */
+export const putVectorIndex = (ds: string, name: string, config: VectorIndexConfig) =>
+  json<{ index: VectorIndexStatus; task: Task }>(vectorPath(ds, name), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+/** Drop an index and its files. */
+export const dropVectorIndex = (ds: string, name: string) =>
+  json<unknown>(vectorPath(ds, name), { method: 'DELETE' });
+
+/** Build an index again from RDF. */
+export const rebuildVectorIndex = (ds: string, name: string) =>
+  json<Task>(`${vectorPath(ds, name)}/rebuild`, { method: 'POST' });
+
+/** Measure recall@k against the exact search, with stored vectors as the queries. */
+export function vectorRecall(
+  ds: string,
+  name: string,
+  opts: { samples?: number; k?: number; ef?: number } = {},
+  signal?: AbortSignal,
+) {
+  const p = new URLSearchParams();
+  if (opts.samples != null) p.set('samples', String(opts.samples));
+  if (opts.k != null) p.set('k', String(opts.k));
+  if (opts.ef != null) p.set('ef', String(opts.ef));
+  const q = p.toString();
+  return json<VectorRecall>(`${vectorPath(ds, name)}/recall${q ? `?${q}` : ''}`, {
+    method: 'POST',
+    signal,
+  });
+}
+
+// --- point-in-time reads, named snapshots and diffs ------------------------------
+
+/** The state a read with `at` saw, from its response headers. */
+export type AtInfo = {
+  /** canonical selector: `head`, `commit:42`, `time:…`, `snapshot:NAME` */
+  selector: string;
+  commit: number | null;
+  head: number | null;
+  /** a past state (the server sent `Memento-Datetime`) */
+  historical: boolean;
+  /** `Memento-Datetime` as an ISO time, for a past state */
+  datetime: string | null;
+};
+
+/** The `Sparkles-At` family of headers, or undefined when the read had no `at`. */
+export function atInfo(h: Headers): AtInfo | undefined {
+  const selector = h.get('Sparkles-At');
+  if (!selector) return undefined;
+  const num = (v: string | null) => (v != null && /^\d+$/.test(v) ? Number(v) : null);
+  const memento = h.get('Memento-Datetime');
+  const t = memento ? new Date(memento) : null;
+  return {
+    selector,
+    commit: num(h.get('Sparkles-Commit')),
+    head: num(h.get('Sparkles-Head')),
+    historical: memento != null,
+    datetime: t && !Number.isNaN(t.getTime()) ? t.toISOString() : null,
+  };
+}
+
+/** A named snapshot: a durable name for a commit that keeps it readable. */
+export type NamedSnapshot = {
+  name: string;
+  /** `snapshot:NAME` */
+  ref: string;
+  seq: number;
+  /** the pinned commit's metadata (null once the catalog no longer has it) */
+  commit: Commit | null;
+  created: string;
+  /** when the pin lapses, or null */
+  expires: string | null;
+  note: string | null;
+  generation: string | null;
+  reconstructable: boolean;
+};
+
+export type SnapshotList = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  snapshots: NamedSnapshot[];
+};
+
+/** `GET /$/snapshots/{ds}`, sorted by commit then name. */
+export const snapshots = (ds: string, signal?: AbortSignal) =>
+  json<SnapshotList>(`/$/snapshots/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/**
+ * `POST /$/snapshots/{ds}`: pin `at` (default the head) as `name`. `expires` is an RFC 3339
+ * time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). Creating a name that
+ * already pins the same commit succeeds again; another commit is a 409.
+ */
+export const createSnapshot = (
+  ds: string,
+  body: { name: string; at?: string; note?: string; expires?: string },
+) => json<NamedSnapshot>(`/$/snapshots/${enc(ds)}`, jsonBody(body));
+
+/** `DELETE /$/snapshots/{ds}/{name}`; the history only it kept is collected. */
+export const deleteSnapshot = (ds: string, name: string) =>
+  json<unknown>(`/$/snapshots/${enc(ds)}/${enc(name)}`, { method: 'DELETE' });
+
+export type Retention = {
+  keepCommits: number | null;
+  /** seconds, as `"86400s"` */
+  keepAge: string | null;
+  maxBytes?: number | null;
+};
+
+export type PinSchedule = { prefix: string; every: string; keepLast: number };
+
+/** `GET /$/history/{ds}`: retained generations, readable commits and retention. */
+export type HistoryStatus = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  oldestReconstructable: number | null;
+  reconstructable: { from: number; to: number }[];
+  bytes: number;
+  generations: {
+    name: string;
+    baseSeq: number;
+    endSeq: number;
+    bytes: number;
+    current: boolean;
+    heldBy: string[];
+  }[];
+  retention: Retention;
+  schedules?: PinSchedule[];
+  snapshots: number;
+};
+
+export const history = (ds: string, signal?: AbortSignal) =>
+  json<HistoryStatus>(`/$/history/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/** `PUT /$/history/{ds}`: the retention window, and the pin schedules when given. */
+export const setHistory = (
+  ds: string,
+  body: {
+    keepCommits?: number | null;
+    keepAge?: string | number | null;
+    maxBytes?: string | number | null;
+    schedules?: PinSchedule[] | null;
+  },
+) =>
+  json<HistoryStatus>(`/$/history/${enc(ds)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+export type DiffQuad = {
+  op: '+' | '-';
+  subject: string;
+  predicate: string;
+  object: string;
+  /** null for the default graph */
+  graph: string | null;
+};
+
+/** `GET /{ds}/diff`: the net change from one state to another. */
+export type Diff = {
+  dataset: string;
+  datasetId: string;
+  from: { selector: string; commit: Commit };
+  to: { selector: string; commit: Commit };
+  added: number;
+  removed: number;
+  /** `log` (read from the write-ahead logs), `compare` (state against state) or `same` */
+  method: 'log' | 'compare' | 'same';
+  /** with `quads`: removals first, then additions */
+  quads?: DiffQuad[];
+};
+
+export type DiffOptions = {
+  /** default: the commit before `to` */
+  from?: string;
+  /** default: the head */
+  to?: string;
+  /** an IRI, or `default` */
+  graph?: string;
+  /** list the changed quads (at most `limit` of them) */
+  quads?: boolean;
+  limit?: number;
+  signal?: AbortSignal;
+};
+
+export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
+  const p = new URLSearchParams();
+  if (opts.from) p.set('from', opts.from);
+  if (opts.to) p.set('to', opts.to);
+  if (opts.graph) p.set('graph', opts.graph);
+  if (opts.quads) p.set('quads', 'true');
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  const qs = p.toString();
+  return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, { signal: opts.signal });
+}
+
+// ------------------------------------------------------ write-time validation ------
+
+export type GuardStatusName = 'passed' | 'warned' | 'rejected' | 'skipped' | 'bypassed';
+
+/** One validated write (`lastCheck`, `recentRejections`). */
+export type ValidationCheck = {
+  time: string;
+  kind: string;
+  status: GuardStatusName;
+  strategy: 'full' | 'incremental' | 'none';
+  blocking: number;
+  /** grandfather mode: the blocking results the write introduced */
+  introduced?: number;
+  total: number;
+  focusNodes?: number;
+  /** why the write, or some shape, was validated in full */
+  fallback?: string;
+  millis: number;
+  /** the first result: a SHACL result or a ShEx result-map entry, as JSON */
+  first?: Record<string, unknown>;
+};
+
+/** The validation state of the head (`null` conforms: unknown). */
+export type ValidationBaseline = {
+  commit: number;
+  conforms: boolean | null;
+  blocking: number;
+  total: number;
+  bySeverity: { violation: number; warning: number; info: number };
+  millis: number;
+};
+
+export type WriteValidationStatus = {
+  mode: 'reject' | 'warn' | 'off';
+  shapeCount: number;
+  /** ShEx: the associations of the shape map at the last validation */
+  associations?: number | null;
+  baseline: ValidationBaseline | null;
+  lastFullMillis: number | null;
+  counters: Record<GuardStatusName, number>;
+  warnings: string[];
+  /** SHACL: how shapes are validated on a write */
+  incremental?: { localShapes: number; fullShapes: { shape: string; reason: string }[] };
+  lastCheck?: ValidationCheck | null;
+  recentRejections?: ValidationCheck[];
+};
+
+export type WriteValidation = {
+  language: 'shacl' | 'shex';
+  config: {
+    mode: 'reject' | 'warn' | 'off';
+    threshold?: 'violation' | 'warning' | 'info';
+    baseline?: 'strict' | 'grandfather';
+    includeInferences?: boolean;
+    dataGraph?: string | string[];
+    shapes?: { graphs?: string[]; file?: string };
+    timeoutSeconds?: number;
+    updated?: string;
+  };
+  status: WriteValidationStatus;
+};
+
+/**
+ * `GET /$/validation/{ds}`: the dataset's write-time validation and its status, or null
+ * when validation is off.
+ */
+export async function writeValidation(
+  ds: string,
+  signal?: AbortSignal,
+): Promise<WriteValidation | null> {
+  const body = await json<WriteValidation | { config: null }>(`/$/validation/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body && body.config ? (body as WriteValidation) : null;
+}

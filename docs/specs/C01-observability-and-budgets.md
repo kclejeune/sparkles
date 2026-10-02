@@ -5,9 +5,12 @@
 > **Phases:** Phase 1 shipped in full. It covers request ids, the access log, Prometheus
 > metrics, readiness, memory and result-size budgets, and cancel on disconnect. Part of
 > Phase 2 shipped with it: the JSON metrics snapshot, the Server page panels,
-> `meta.memory` and `requestId` in error bodies. From Phase 3, OpenTelemetry export with
-> `traceparent` propagation and per-class concurrency caps shipped. The rest of Phases 2
-> and 3 is not built. [Outcome](#outcome) has the details.
+> `meta.memory` and `requestId` in error bodies. Per-request budget overrides, the
+> `rows_produced` work budget, `--shutdown-grace` and per-dataset storage quotas came
+> later. From Phase 3, OpenTelemetry export with `traceparent` propagation, per-class
+> concurrency caps and the `--metrics-addr` listener shipped, and Fuseki's metric names
+> followed as an option. The rest of Phases 2 and 3 is not built. [Outcome](#outcome)
+> has the details.
 >
 > **User docs:** [API: Server](../API.md#server) ·
 > [API: Request ids and the access log](../API.md#request-ids-and-the-access-log) ·
@@ -925,6 +928,44 @@ followed the same day.
 - Some Phase 3 work shipped. OpenTelemetry exports OTLP traces, metrics and logs,
   propagates `traceparent` in and out, and is off by default. Per-class concurrency caps
   in the rate limiter answer `503` with `Retry-After`.
+- Fuseki's metric names arrived on 2026-10-02 behind `--metrics-fuseki-names`. Fuseki
+  exports `fuseki_requests`, `fuseki_requests_good` and `fuseki_requests_bad` as gauges
+  per dataset endpoint, labelled `dataset`, `endpoint`, `operation`, `description` and
+  `application="fuseki"`, and Sparkles renders the same series. Good is the `ok` outcome
+  and bad is any other outcome. Micrometer's uptime and processor gauges are rendered
+  too, and the JVM gauges have no equivalent. The mapping is in
+  [API.md](../API.md#fuseki-metric-names). This settles open question 6. The names are
+  off by default, and Fuseki's source counts every failed request as bad, from a
+  validation error to a cancelled query.
+- `--metrics-addr` arrived the same day. The second listener serves only `/$/metrics`,
+  behind the same authentication and `Host` check. Without auth it may bind a network
+  address only with `--allow-open-network`, because the metrics name every dataset.
+- Per-request overrides cover more budgets than planned. A query takes `memory-mb`,
+  `max-rows`, `max-rows-produced` and `max-result-mb`, and an update takes the first
+  three. Each value is clamped to the server's budget, so a request can only lower it.
+  A malformed value is a `400`. The time budget stays the existing `timeout` parameter,
+  which may ask for more than the default up to `--max-timeout`.
+- `rows_produced` became a budget as well as a measure, with kind `rows-produced`. It is
+  the sum of the rows every operator produces, counted where the executor already checks
+  its output, so it costs one atomic add per operator. The WHERE clauses of one update
+  share a count. `--max-rows-produced` is off by default, because the timeout already
+  bounds the work of a query and the benchmark must not change. Results report
+  `rowsProduced`. No other budget has a per-dataset setting, so this one has none
+  either.
+- `--shutdown-grace` (default 20 s) is a deadline rather than a delay. The server stops
+  accepting at once and waits up to the grace period for requests in flight. Then it
+  shuts the runtime down, which drops the handlers and so sets their cancellation flags,
+  and waits up to 5 s more. A write cancelled this way commits nothing, and one already
+  committing finishes. The NixOS module sets `TimeoutStopSec` to the grace period plus
+  15 s.
+- Per-dataset storage quotas were added beyond this spec, with the budget kind
+  `dataset-bytes` and status `507`. `--max-dataset-mb` is the default, off unless set,
+  and `quota.json` in a dataset's directory overrides it. Changing it needs
+  `server-admin`. The size is the dataset directory on disk, write-ahead log included. It
+  is walked at most once a second while a quota is set and after each rebuild, and small
+  commits add their log bytes in between. Commits that add quads are refused before
+  anything is written. Bulk rebuilds are checked after the build and before they are
+  published. Deletes, compactions, reads and restores are never refused.
 
 **Performance.** With access logging and metrics on, the 20 harness queries at 10.5M
 triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is noise.
@@ -933,10 +974,6 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
 
 **Not built.** These parts were not built:
 
-- per-request budget overrides (`?memory-mb=`);
-- `--shutdown-grace`;
 - bind-before-open startup with the `opening`, `failed` and `degraded` states;
-- opt-in Fuseki-compatible metric names;
-- the `rows_produced` work budget;
 - a server-wide query memory pool;
-- a separate `--metrics-addr` listener.
+- `rows_produced` in the access log and as a metric of its own.

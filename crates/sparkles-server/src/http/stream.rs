@@ -192,6 +192,31 @@ where
     }
 }
 
+/// Serialize a body with `write` on the current thread, whole, under the result-size
+/// `limit`: for results small enough that a thread hand-off would cost more than the
+/// serialization.
+pub fn serialize_now<F>(limit: Option<u64>, write: F) -> ApiResult<Serialized>
+where
+    F: FnOnce(&mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()>,
+{
+    let t0 = Instant::now();
+    // no signal, and a threshold it never passes: the writer only buffers
+    let sw = SwitchWriter {
+        buf: Vec::new(),
+        threshold: usize::MAX,
+        signal: None,
+        tx: None,
+    };
+    let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
+    match write(&mut w).map_err(|e| w.classify(e)) {
+        Ok(()) => Ok(Serialized::Whole {
+            body: w.into_inner().buf,
+            serialize_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        }),
+        Err(e) => Err(ApiError::from(e)),
+    }
+}
+
 /// The receiving end of a [`SwitchWriter`] as a body stream. It keeps answering `None`
 /// after the end, since the compression layer polls once more.
 struct ChunkStream(mpsc::Receiver<Chunk>);

@@ -179,7 +179,7 @@ async fn reject_mode_over_http() {
     );
     let h = r.header("sparkles-validation");
     assert!(
-        h.starts_with("status=rejected, mode=reject, strategy=full, lang=shex, blocking=1,"),
+        h.starts_with("status=rejected, mode=reject, strategy=incremental, lang=shex, blocking=1,"),
         "{h}"
     );
     // there is no Turtle report: still JSON

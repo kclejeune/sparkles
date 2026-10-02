@@ -89,7 +89,18 @@ impl Tools<'_> {
         at_commit: Option<u64>,
     ) -> Result<Target, ToolError> {
         let timeout = self.timeout(timeout_seconds)?;
-        let ds = self.server.dataset(dataset)?;
+        let ds = self.dataset(dataset)?;
+        // validation reads every graph a shape reaches, and its report quotes them
+        if self.call.principal.restricted(&ds.name) {
+            return Err(ToolError::new(
+                "forbidden",
+                403,
+                format!(
+                    "validation covers every graph of /{}, and your access is limited to some graphs",
+                    ds.name
+                ),
+            ));
+        }
         let prefixes = dataset_prefixes(&ds);
         let graph = match graph.map(str::trim) {
             None | Some("default") => GraphParam::Default,
@@ -491,6 +502,7 @@ impl Tools<'_> {
             selector_query: Some(sparkles::sparql::QueryOptions {
                 max_rows: Some(limits.max_rows),
                 max_memory_bytes: self.cfg().query_memory_bytes,
+                max_rows_produced: limits.max_rows_produced,
                 forbid_service: true,
                 ..Default::default()
             }),

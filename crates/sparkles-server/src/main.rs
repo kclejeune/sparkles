@@ -23,6 +23,7 @@ mod mcp;
 mod obs;
 mod otel;
 mod outbound;
+mod quota_cmd;
 mod ratelimit;
 mod reasoning;
 #[cfg(feature = "auth")]
@@ -30,11 +31,13 @@ mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod shex_cmd;
+mod shutdown;
 mod state;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
 mod validation_common;
+mod vector;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -67,6 +70,10 @@ struct Cli {
     /// Memory for materialized past states (point-in-time reads), in MiB
     #[arg(long, global = true, default_value_t = 1024)]
     history_cache_mb: u64,
+    /// Memory for packed vectors and HNSW graphs (`spk:vectorSearch`, vector indexes),
+    /// per index generation, in MiB
+    #[arg(long, global = true, default_value_t = 4096)]
+    vector_memory_mb: u64,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -80,6 +87,10 @@ struct Cli {
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
+    /// Record a change digest with every commit of the databases this command opens
+    /// (a database keeps the setting once it is on)
+    #[arg(long, global = true)]
+    commit_digests: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -99,6 +110,13 @@ enum SnapshotCmd {
         at: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// Remove the pin after this duration (90s, 30m, 12h, 7d, 2w) or at this RFC 3339
+        /// time (a running server's history upkeep, or the next `snapshot gc`)
+        #[arg(long)]
+        expires: Option<String>,
+        /// keep the pinned state materialized in a server's history cache
+        #[arg(long)]
+        warm: bool,
     },
     /// List named snapshots
     List {
@@ -130,7 +148,48 @@ enum SnapshotCmd {
         keep_commits: Option<u64>,
         #[arg(long)]
         keep_age: Option<String>,
+        /// At most this much disk for generations only the window keeps (512MiB, 10GiB)
+        #[arg(long)]
+        max_bytes: Option<String>,
         /// turn retention off
+        #[arg(long, conflicts_with_all = ["keep_commits", "keep_age", "max_bytes"])]
+        off: bool,
+    },
+    /// Pin the head on a schedule as PREFIX<UTC time> and keep the newest few; without
+    /// --every, list the schedules (or remove one with --remove)
+    Schedule {
+        #[arg(long)]
+        loc: PathBuf,
+        /// the names' prefix, such as daily-
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        prefix: Option<String>,
+        /// how often (30m, 12h, 1d, 1w)
+        #[arg(long, requires = "prefix")]
+        every: Option<String>,
+        /// how many of the schedule's snapshots to keep
+        #[arg(long, default_value_t = 7)]
+        keep_last: u32,
+        /// remove the schedule with this prefix (its snapshots stay)
+        #[arg(long)]
+        remove: Option<String>,
+    },
+    /// Drop expired pins, make the pins schedules call for, collect the history nothing
+    /// keeps any more and prune the commit catalog (a running server does this every
+    /// minute)
+    Gc {
+        #[arg(long)]
+        loc: PathBuf,
+    },
+    /// Prune the metadata of commits that can no longer be read: keep the last N
+    /// commits and/or those of a duration (90s, 30m, 12h, 7d), beyond the readable ones
+    Catalog {
+        #[arg(long)]
+        loc: PathBuf,
+        #[arg(long)]
+        keep_commits: Option<u64>,
+        #[arg(long)]
+        keep_age: Option<String>,
+        /// keep every commit's metadata (the default)
         #[arg(long, conflicts_with_all = ["keep_commits", "keep_age"])]
         off: bool,
     },
@@ -162,10 +221,32 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             name,
             at,
             note,
+            expires,
+            warm,
         } => {
             let store = Store::open(&loc, opts)?;
             let at: At = at.as_deref().unwrap_or("head").parse()?;
-            let (s, created) = store.create_snapshot(&name, &at, note)?;
+            let expires = match expires {
+                None => None,
+                Some(e) => Some(match format!("time:{e}").parse::<At>() {
+                    Ok(At::Time(ms)) => ms,
+                    _ => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as i64;
+                        now + parse_duration_ms(&e)? as i64
+                    }
+                }),
+            };
+            let (s, created) = store.create_snapshot_opts(
+                &name,
+                &at,
+                &sparkles::history::SnapshotOptions {
+                    note,
+                    expires_ms: expires,
+                    warm,
+                },
+            )?;
             println!(
                 "{} → commit {}{}",
                 s.name,
@@ -226,6 +307,7 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
             loc,
             keep_commits,
             keep_age,
+            max_bytes,
             off,
         } => {
             let store = Store::open(&loc, opts)?;
@@ -235,11 +317,174 @@ fn snapshot_cmd(cmd: SnapshotCmd, opts: StoreOptions) -> Result<()> {
                 Retention {
                     keep_commits,
                     keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                    max_bytes: max_bytes
+                        .map(|b| {
+                            http::history::parse_size(&serde_json::Value::String(b.clone()))
+                                .with_context(|| format!("invalid size {b:?}: use 512MiB, 10GiB"))
+                        })
+                        .transpose()?,
                 }
             };
             print_history(&store.set_retention(r)?, "text")?;
         }
+        SnapshotCmd::Schedule {
+            loc,
+            prefix,
+            every,
+            keep_last,
+            remove,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let mut all = store.schedules();
+            if let Some(p) = remove {
+                let before = all.len();
+                all.retain(|s| s.prefix != p);
+                if all.len() == before {
+                    bail!("no schedule with the prefix {p:?}");
+                }
+                store.set_schedules(all.clone())?;
+            } else if let (Some(prefix), Some(every)) = (prefix, every) {
+                all.retain(|s| s.prefix != prefix);
+                all.push(sparkles::history::Schedule {
+                    prefix,
+                    every_ms: parse_duration_ms(&every)?,
+                    keep_last,
+                });
+                store.set_schedules(all.clone())?;
+            }
+            for s in &all {
+                println!(
+                    "{}<time>  every {}s  keep {}",
+                    s.prefix,
+                    s.every_ms / 1000,
+                    s.keep_last
+                );
+            }
+        }
+        SnapshotCmd::Gc { loc } => {
+            let store = Store::open(&loc, opts)?;
+            let t = store.history_tick()?;
+            for n in &t.created {
+                println!("created {n}");
+            }
+            for n in t.expired.iter().chain(&t.rotated) {
+                println!("removed {n}");
+            }
+            let pruned = t.pruned + store.prune_commits()?;
+            if pruned > 0 {
+                println!("pruned {pruned} commit records");
+            }
+            print_history(&store.history(), "text")?;
+        }
+        SnapshotCmd::Catalog {
+            loc,
+            keep_commits,
+            keep_age,
+            off,
+        } => {
+            let store = Store::open(&loc, opts)?;
+            let c = if off {
+                sparkles::history::CatalogHorizon::default()
+            } else {
+                sparkles::history::CatalogHorizon {
+                    keep_commits,
+                    keep_age_ms: keep_age.as_deref().map(parse_duration_ms).transpose()?,
+                }
+            };
+            print_history(&store.set_catalog_horizon(c)?, "text")?;
+        }
     }
+    Ok(())
+}
+
+fn diff_cmd(
+    loc: &std::path::Path,
+    from: &str,
+    to: &str,
+    graph: Option<&str>,
+    format: &str,
+    opts: StoreOptions,
+) -> Result<()> {
+    use sparkles::store::{DiffOp, DiffOptions};
+    if !matches!(format, "diff" | "json" | "count" | "patch" | "patch-binary") {
+        bail!("unknown format {format:?}: use diff, json, count, patch or patch-binary");
+    }
+    let store = Store::open(loc, opts)?;
+    let graph = match graph {
+        None => None,
+        Some("default") => Some(oxrdf::GraphName::DefaultGraph),
+        Some(g) => Some(oxrdf::GraphName::NamedNode(
+            oxrdf::NamedNode::new(g).with_context(|| format!("invalid graph IRI {g:?}"))?,
+        )),
+    };
+    let t = Instant::now();
+    let d = store.diff(
+        &from.parse()?,
+        &to.parse()?,
+        &DiffOptions {
+            graph,
+            ..Default::default()
+        },
+    )?;
+    eprintln!(
+        "commit {} → commit {}: +{} −{} ({}, {:.1} ms)",
+        d.from.commit.seq,
+        d.to.commit.seq,
+        d.added,
+        d.removed,
+        d.method.as_str(),
+        t.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    match format {
+        "count" => writeln!(out, "+{} -{}", d.added, d.removed)?,
+        "json" => {
+            let quads: Vec<serde_json::Value> = d
+                .iter()
+                .map(|(op, q)| {
+                    serde_json::json!({
+                        "op": op.sign().to_string(),
+                        "subject": q.subject.to_string(),
+                        "predicate": q.predicate.to_string(),
+                        "object": q.object.to_string(),
+                        "graph": match &q.graph_name {
+                            oxrdf::GraphName::DefaultGraph => serde_json::Value::Null,
+                            g => g.to_string().into(),
+                        },
+                    })
+                })
+                .collect();
+            let j = serde_json::json!({
+                "from": { "selector": d.from.at.to_string(), "commit": d.from.commit },
+                "to": { "selector": d.to.at.to_string(), "commit": d.to.commit },
+                "added": d.added,
+                "removed": d.removed,
+                "method": d.method.as_str(),
+                "quads": quads,
+            });
+            serde_json::to_writer_pretty(&mut out, &j)?;
+            writeln!(out)?;
+        }
+        "patch" | "patch-binary" => {
+            use sparkles::patch::{PatchWriter, commit_iri, write_patch};
+            let id = store.dataset_id();
+            let quads: Vec<(DiffOp, oxrdf::Quad)> = d.iter().collect();
+            let mut w = PatchWriter::new(&mut out, format == "patch-binary");
+            write_patch(
+                &mut w,
+                &commit_iri(id, d.to.commit.seq),
+                Some(&commit_iri(id, d.from.commit.seq)),
+                quads.iter().map(|(op, q)| (*op, q)),
+            )?;
+        }
+        _ => {
+            for (op, q) in d.iter() {
+                let sign = if op == DiffOp::Add { '+' } else { '-' };
+                writeln!(out, "{sign} {}", sparkles::annotations::nquads_line(&q))?;
+            }
+        }
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -254,6 +499,8 @@ fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<(
                 "current": g.current, "heldBy": g.held_by.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
             "retention": h.retention,
+            "catalog": h.catalog,
+            "firstRetained": h.first_commit,
             "snapshots": h.snapshots,
         });
         println!("{}", serde_json::to_string_pretty(&j)?);
@@ -292,9 +539,29 @@ fn print_history(h: &sparkles::history::HistoryStatus, format: &str) -> Result<(
         match (r.keep_commits, r.keep_age_ms) {
             (None, None) => "off".to_string(),
             (c, a) => format!(
-                "{}{}",
+                "{}{}{}",
                 c.map(|c| format!("last {c} commits ")).unwrap_or_default(),
-                a.map(|a| format!("last {}s", a / 1000)).unwrap_or_default()
+                a.map(|a| format!("last {}s ", a / 1000))
+                    .unwrap_or_default(),
+                r.max_bytes
+                    .map(|b| format!("at most {} MiB", b >> 20))
+                    .unwrap_or_default()
+            )
+            .trim_end()
+            .to_string(),
+        }
+    );
+    let c = &h.catalog;
+    println!(
+        "commit catalog: from commit {}, {}",
+        h.first_commit,
+        match (c.keep_commits, c.keep_age_ms) {
+            (None, None) => "keeps every commit".to_string(),
+            (n, a) => format!(
+                "keeps the readable commits{}{}",
+                n.map(|n| format!(" and the last {n}")).unwrap_or_default(),
+                a.map(|a| format!(" and those of the last {}s", a / 1000))
+                    .unwrap_or_default()
             ),
         }
     );
@@ -394,6 +661,11 @@ enum Cmd {
         /// Enable the spatial index (GeoSPARQL) for a dataset: NAME, or NAME=geo.json
         #[arg(long)]
         geo: Vec<String>,
+        /// Set a dataset's write-time validation at startup from NAME=CONFIG.json (the
+        /// body of PUT /$/validation/{ds}), or with NAME alone validate it with the
+        /// configuration it has; the data is validated in full and the result logged
+        #[arg(long, value_name = "NAME[=CONFIG]")]
+        validate: Vec<String>,
         /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
         /// is refused and queries run without the index
         #[arg(long, default_value_t = 4096)]
@@ -428,6 +700,15 @@ enum Cmd {
         /// Datasets with their own metric labels; the others share `$other`
         #[arg(long, default_value_t = 100)]
         metrics_max_datasets: usize,
+        /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
+        /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
+        #[arg(long, conflicts_with = "no_metrics")]
+        metrics_fuseki_names: bool,
+        /// Also serve /$/metrics on this address (HOST:PORT), under the same
+        /// authentication; a non-loopback address without --auth-config needs
+        /// --allow-open-network
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
+        metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
@@ -442,9 +723,10 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
-        /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
-        #[arg(long, default_value_t = 4096)]
-        vector_memory_mb: u64,
+        /// Budget for the rows all the operators of one query produce together (0:
+        /// unlimited); `max-rows-produced=` lowers it per request
+        #[arg(long, default_value_t = 0)]
+        max_rows_produced: u64,
         /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
@@ -459,6 +741,11 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Keep the closure of each dataset's last materialization in memory, up to this
+        /// many triples, so that the next run updates it incrementally (0: keep none; a
+        /// run then reads it back from a persistent dataset)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
+        reason_cache_triples: usize,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -499,6 +786,15 @@ enum Cmd {
         /// past it is refused with 507 (0: unlimited)
         #[arg(long, default_value_t = 4096)]
         max_mem_dataset_mb: u64,
+        /// Default storage quota of a persistent dataset, in MiB of its directory on
+        /// disk: a write that would take a dataset past it is refused with 507 (0:
+        /// unlimited); PUT /$/quota/{ds} or `sparkles quota` sets one per dataset
+        #[arg(long, default_value_t = 0)]
+        max_dataset_mb: u64,
+        /// On SIGTERM or SIGINT, seconds to let requests in flight finish before they
+        /// are cancelled (a cancelled write commits nothing)
+        #[arg(long, default_value_t = 20.0, value_name = "SECS")]
+        shutdown_grace: f64,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
         /// backups) that run at once; more wait, queued (0: no limit). Backup repository
         /// tasks have their own --backup-max-tasks
@@ -587,6 +883,9 @@ enum Cmd {
         #[cfg(feature = "fmt")]
         #[arg(long, default_value_t = 10.0, value_name = "SECS")]
         format_timeout: f64,
+        #[cfg(feature = "mcp")]
+        #[command(flatten)]
+        mcp: mcp::http::ServeArgs,
     },
     /// Authentication: hashes, tokens, configuration checks
     #[cfg(feature = "auth")]
@@ -616,6 +915,10 @@ enum Cmd {
         /// do not index these graphs (IRIs; urn:x-arq:DefaultGraph for the default graph)
         #[arg(long)]
         exclude_graph: Vec<String>,
+        /// also index the literals of this language stemmed, for lang: searches (a
+        /// primary tag such as en, or all)
+        #[arg(long)]
+        language: Vec<String>,
         /// rebuild even if the index is current
         #[arg(long)]
         rebuild: bool,
@@ -626,6 +929,9 @@ enum Cmd {
         #[arg(long)]
         disable: bool,
     },
+    /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
+    /// with --loc, or with --server)
+    Vector(vector::VectorArgs),
     /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
     GeoIndex {
         #[arg(long)]
@@ -673,6 +979,9 @@ enum Cmd {
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
         lenient: bool,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -733,6 +1042,9 @@ enum Cmd {
         #[arg(long)]
         update: Option<PathBuf>,
         text: Option<String>,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -763,6 +1075,9 @@ enum Cmd {
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
     Validation(validation_cmd::ValidationArgs),
+    /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
+    /// back to the default (--default)
+    Quota(quota_cmd::QuotaArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -806,6 +1121,9 @@ enum Cmd {
         /// `copy` the materialized inferences and reasoning status, or `drop` them
         #[arg(long, default_value = "copy")]
         inferences: String,
+        /// clone a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
     },
     /// Print database statistics
     Stats {
@@ -827,6 +1145,22 @@ enum Cmd {
         /// Metadata only: no block decoding, no per-key vocabulary or checksum pass
         #[arg(long)]
         quick: bool,
+    },
+    /// The quads added and removed between two commits (N, commit:N, time:<RFC 3339>,
+    /// snapshot:NAME, head)
+    Diff {
+        #[arg(long)]
+        loc: PathBuf,
+        from: String,
+        #[arg(default_value = "head")]
+        to: String,
+        /// only this graph (an IRI, or `default`)
+        #[arg(long)]
+        graph: Option<String>,
+        /// diff (lines marked + and -), json, count, patch (RDF Patch) or
+        /// patch-binary (RDF Patch in RDF Thrift)
+        #[arg(long, default_value = "diff")]
+        format: String,
     },
     /// List the database's commits (works while a server holds the database)
     Log {
@@ -867,6 +1201,10 @@ enum Cmd {
         /// Remove materialized inferences instead
         #[arg(long)]
         clear: bool,
+        /// Materialize in full instead of updating the previous materialization
+        /// incrementally
+        #[arg(long, conflicts_with = "clear")]
+        full: bool,
         /// Print the reasoning status (are the inferences up to date?)
         #[arg(long, conflicts_with_all = ["clear", "check", "profile", "rules"])]
         status: bool,
@@ -883,10 +1221,14 @@ enum Cmd {
         /// Check the asserted data only, without the materialized inferences
         #[arg(long, requires = "check")]
         no_inferences: bool,
+        /// Check the merge of these graphs instead of the default graph: `default` or a
+        /// graph IRI (repeatable). The inferences are included only with `default`
+        #[arg(long = "graph", value_name = "GRAPH", requires = "check")]
+        graphs: Vec<String>,
         /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
         #[arg(long, default_value = "subclass", requires = "check")]
         closure: String,
-        /// text or json
+        /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout of the checks in seconds
@@ -914,7 +1256,8 @@ enum Cmd {
         /// Declarations to read: `asserted`, or `all` (including inferred ones)
         #[arg(long, default_value = "asserted")]
         declared: String,
-        /// Output format: text or json
+        /// Output format: text, json, void (the VoID description in Turtle) or turtle
+        /// (the VoID description and the declarations in Turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout in seconds
@@ -955,6 +1298,7 @@ enum Cmd {
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
+    sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
@@ -963,8 +1307,22 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
         max_prefixes: cli.max_prefixes,
+        commit_digests: cli.commit_digests,
         ..Default::default()
     }
+}
+
+/// `serve --validate NAME[=CONFIG]`
+#[cfg(any(feature = "shacl", feature = "shex"))]
+fn validate_at_startup(st: &state::AppState, spec: &str) -> Result<()> {
+    let line = write_validation::validate_at_startup(st, spec)?;
+    tracing::info!("{line}");
+    Ok(())
+}
+
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
+fn validate_at_startup(_: &state::AppState, _: &str) -> Result<()> {
+    bail!("built without write-time validation (cargo features \"shacl\" and \"shex\")")
 }
 
 /// `serve --text NAME[=CONFIG]`
@@ -995,16 +1353,18 @@ fn enable_text_for(_: &state::AppState, _: &str) -> Result<()> {
 
 /// `sparkles text-index`
 #[cfg(feature = "text")]
+#[allow(clippy::too_many_arguments)]
 fn text_index(
     loc: &std::path::Path,
     opts: StoreOptions,
     predicates: Vec<String>,
     exclude_graph: Vec<String>,
+    languages: Vec<String>,
     rebuild: bool,
     status: bool,
     disable: bool,
 ) -> Result<()> {
-    use sparkles::text::{PredicateSet, TextConfig};
+    use sparkles::text::{Languages, PredicateSet, TextConfig};
     let store = Store::open(loc, opts)?;
     if disable {
         store.disable_text()?;
@@ -1023,7 +1383,7 @@ fn text_index(
         return Ok(());
     }
     let t = Instant::now();
-    let configured = !predicates.is_empty() || !exclude_graph.is_empty();
+    let configured = !predicates.is_empty() || !exclude_graph.is_empty() || !languages.is_empty();
     let s = match store.text_status() {
         Some(_) if !configured && rebuild => store.rebuild_text()?,
         Some(s) if !configured => s,
@@ -1033,6 +1393,7 @@ fn text_index(
                 cfg.predicates = PredicateSet::Only(predicates);
             }
             cfg.graphs.exclude = exclude_graph;
+            cfg.languages = Languages::from_tags(&languages).map_err(anyhow::Error::msg)?;
             store.enable_text(cfg)?
         }
     };
@@ -1051,9 +1412,11 @@ fn text_index(
 }
 
 #[cfg(not(feature = "text"))]
+#[allow(clippy::too_many_arguments)]
 fn text_index(
     _: &std::path::Path,
     _: StoreOptions,
+    _: Vec<String>,
     _: Vec<String>,
     _: Vec<String>,
     _: bool,
@@ -1081,6 +1444,10 @@ fn print_log(
     };
     let head = all.last().map_or(0, |c| c.seq);
     let first = all.first().map_or(0, |c| c.seq);
+    let notes = sparkles::annotations::read(loc)?;
+    // commits a point-in-time read can still see
+    let readable = sparkles::history::reconstructable_offline(loc, id).unwrap_or_default();
+    let readable_at = |s: u64| readable.iter().any(|&(a, b)| a <= s && s <= b);
     let pick: Vec<_> = if let Some(at) = at {
         let seq = match at {
             "head" => head,
@@ -1112,21 +1479,43 @@ fn print_log(
             "head": head,
             "firstRetained": first,
             "complete": true,
-            "commits": pick,
+            "reconstructable": readable
+                .iter()
+                .map(|(a, b)| serde_json::json!({ "from": a, "to": b }))
+                .collect::<Vec<_>>(),
+            "commits": pick
+                .iter()
+                .map(|c| sparkles::commit::AnnotatedCommit {
+                    commit: c,
+                    annotation: notes.get(&c.seq),
+                })
+                .collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
-    println!("dataset {id}  head {head}");
+    println!("dataset {id}  head {head}  (* readable with --at)");
     println!(
-        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation",
+        "{:>7}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation  message",
         "seq", "timestamp", "kind", "+inserted", "-deleted", "quads"
     );
     for c in pick {
         let approx = if c.exact { "" } else { "~" };
-        println!(
-            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {}",
+        let message = notes
+            .get(&c.seq)
+            .and_then(|a| a.message.as_deref())
+            .map(|m| format!("  {m}"))
+            .unwrap_or_default();
+        // a write that bypassed the dataset's write-time validation
+        let message = if c.unvalidated {
+            format!("  [unvalidated]{message}")
+        } else {
+            message
+        };
+        let line = format!(
+            "{:>6}{}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
+            if readable_at(c.seq) { "*" } else { " " },
             c.timestamp(),
             c.kind.name(),
             format!("{}{approx}", c.inserted),
@@ -1134,6 +1523,7 @@ fn print_log(
             c.quads,
             c.generation_name()
         );
+        println!("{}", line.trim_end());
     }
     Ok(())
 }
@@ -1302,6 +1692,7 @@ fn run() -> Result<()> {
             idle_release_ms,
             text,
             geo,
+            validate,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -1311,15 +1702,18 @@ fn run() -> Result<()> {
             no_access_log,
             no_metrics,
             metrics_max_datasets,
+            metrics_fuseki_names,
+            metrics_addr,
             query_memory_mb,
             max_result_mb,
             max_export_mb,
             max_rows,
+            max_rows_produced,
             update_timeout,
-            vector_memory_mb,
             allow_unvalidated_writes,
             auto_reason,
             auto_reason_max_delay,
+            reason_cache_triples,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -1331,6 +1725,8 @@ fn run() -> Result<()> {
             min_free_disk_mb,
             max_tasks,
             max_mem_dataset_mb,
+            max_dataset_mb,
+            shutdown_grace,
             auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -1350,6 +1746,8 @@ fn run() -> Result<()> {
             format_max_mb,
             #[cfg(feature = "fmt")]
             format_timeout,
+            #[cfg(feature = "mcp")]
+            mcp,
             ..
         } => {
             // an open server on the network, or a bad auth configuration, stops the
@@ -1360,6 +1758,9 @@ fn run() -> Result<()> {
                 auth_config.is_some(),
                 allow_open_network,
             )?;
+            if let Some(addr) = &metrics_addr {
+                exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
@@ -1377,6 +1778,11 @@ fn run() -> Result<()> {
             let mut opts = opts;
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
+            // persistent datasets without a quota of their own get this one
+            opts.max_disk_bytes = (max_dataset_mb > 0).then_some(max_dataset_mb << 20);
+            if !(shutdown_grace.is_finite() && shutdown_grace >= 0.0) {
+                bail!("--shutdown-grace expects a number of seconds");
+            }
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
             opts.geo_query_rewrite = !no_geo_rewrite;
@@ -1413,9 +1819,9 @@ fn run() -> Result<()> {
                 &http_compression_level,
                 &http_compression_algorithms,
             )?;
-            sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
@@ -1423,6 +1829,8 @@ fn run() -> Result<()> {
                 max_result_bytes: mib(max_result_mb),
                 max_export_bytes: mib(max_export_mb),
                 max_rows,
+                max_rows_produced: (max_rows_produced > 0).then_some(max_rows_produced),
+                max_dataset_bytes: mib(max_dataset_mb),
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
                 max_decompressed_bytes: mib(max_decompressed_mb),
@@ -1446,6 +1854,11 @@ fn run() -> Result<()> {
                     ..Default::default()
                 };
             }
+            // after the limits: MCP calls stay within them
+            #[cfg(feature = "mcp")]
+            {
+                st.mcp = mcp.conf(&st)?.map(Arc::new);
+            }
             if let Some(max) = st.limits.max_timeout
                 && (st.default_timeout > max || st.limits.update_timeout.is_some_and(|u| u > max))
             {
@@ -1454,6 +1867,7 @@ fn run() -> Result<()> {
                     max.as_secs_f64()
                 );
             }
+            st.reason_cache_triples = reason_cache_triples;
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
                     bail!("--auto-reason: built without the `reasoning` feature");
@@ -1468,6 +1882,8 @@ fn run() -> Result<()> {
                     Duration::from_secs_f64(secs),
                     max,
                 ));
+            } else if cfg!(feature = "reasoning") {
+                st.auto_reason = Some(reasoning::AutoReason::per_dataset());
             }
             let limit_sources = ratelimit::Sources {
                 file: rate_limit_config,
@@ -1506,12 +1922,13 @@ fn run() -> Result<()> {
             let st = Arc::new(st);
             otel::register_metrics(&st);
             #[cfg(feature = "reasoning")]
-            if st.auto_reason.is_some() {
-                if st.read_only {
+            if st.read_only {
+                if st.auto_reason.is_some() {
                     tracing::warn!("--auto-reason has no effect on a read-only server");
-                } else {
-                    reasoning::spawn_auto_reason(st.clone());
                 }
+            } else {
+                // the loop also serves datasets that enable automatic runs themselves
+                reasoning::spawn_auto_reason(st.clone());
             }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -1530,6 +1947,9 @@ fn run() -> Result<()> {
             for g in geo {
                 geo::enable_for(&st, &g)?;
             }
+            for v in validate {
+                validate_at_startup(&st, &v)?;
+            }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
@@ -1538,7 +1958,13 @@ fn run() -> Result<()> {
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
-            let served = rt.block_on(async move {
+            let grace = Duration::from_secs_f64(shutdown_grace);
+            let st_after = st.clone();
+            // The server runs as a task on a worker thread, not on this thread (which
+            // `block_on` would use): the worker that sees a connection arrive accepts it
+            // and runs its request itself, instead of waking this thread to accept and
+            // then another worker to serve it.
+            let serve = async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
                     None => Some(
@@ -1548,6 +1974,20 @@ fn run() -> Result<()> {
                     ),
                     Some(_) => None,
                 };
+                // the metrics listener ends with the runtime, after the main one
+                if let Some(maddr) = &metrics_addr {
+                    let l = tokio::net::TcpListener::bind(maddr)
+                        .await
+                        .with_context(|| format!("binding --metrics-addr {maddr}"))?;
+                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let service = obs::metrics_router(st.clone())
+                        .into_make_service_with_connect_info::<auth::Peer>();
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(l, service).await {
+                            tracing::error!("metrics listener failed: {e}");
+                        }
+                    });
+                }
                 #[cfg(unix)]
                 let unix = match &unix_socket {
                     Some(path) => Some(bind_unix(path)?),
@@ -1570,6 +2010,10 @@ fn run() -> Result<()> {
                         "  dataset /{name}  →  /{name}/sparql  /{name}/update  /{name}/data"
                     );
                 }
+                // pin expiry, scheduled pins, and history that ages out of the window
+                if !st.read_only {
+                    http::history::spawn_tick(st.clone(), Duration::from_secs(60));
+                }
                 if let Some(rl) = &st.rate_limit {
                     ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));
                     #[cfg(unix)]
@@ -1582,30 +2026,58 @@ fn run() -> Result<()> {
                 auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
+                let (draining_tx, draining) = tokio::sync::oneshot::channel();
                 let shutdown = async move {
                     shutdown_signal().await;
                     st2.set_phase(obs::Phase::Draining);
-                    tracing::info!("shutting down: finishing requests in flight");
+                    // open MCP streams would hold the shutdown up
+                    #[cfg(feature = "mcp")]
+                    if let Some(m) = &st2.mcp {
+                        m.shutdown.cancel();
+                    }
+                    tracing::info!("shutting down: finishing requests in flight (up to {grace:?})");
+                    let _ = draining_tx.send(());
                 };
                 // the peer address feeds trusted-proxy checks
                 let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                use std::future::IntoFuture;
                 #[cfg(unix)]
-                if let Some(l) = unix {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                    auth::flush(&st);
-                    return anyhow::Ok(());
+                let drained = match (unix, tcp) {
+                    (Some(l), _) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, Some(l)) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, None) => shutdown::Drained::Finished,
+                };
+                #[cfg(not(unix))]
+                let drained = match tcp {
+                    Some(l) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    None => shutdown::Drained::Finished,
+                };
+                if drained == shutdown::Drained::GraceElapsed {
+                    tracing::warn!(
+                        "shutdown grace of {grace:?} elapsed: cancelling the requests still in flight"
+                    );
                 }
-                if let Some(l) = tcp {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                }
-                auth::flush(&st);
                 anyhow::Ok(())
+            };
+            let served = rt.block_on(async move {
+                tokio::spawn(serve)
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("the server task failed: {e}")))
             });
-            drop(rt);
+            // cancels what still runs (dropping a request's future sets its cancel flag)
+            // and waits a little for it to stop; a write stops before its commit or
+            // finishes it
+            rt.shutdown_timeout(shutdown::CANCEL_WAIT);
+            auth::flush(&st_after);
             // flush spans and metrics of the last requests (bounded)
             otel_guard.shutdown();
             served
@@ -1623,10 +2095,16 @@ fn run() -> Result<()> {
             files,
             compression,
             lenient,
+            message,
             server,
             dataset,
             insecure_http,
         } => {
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
@@ -1639,6 +2117,7 @@ fn run() -> Result<()> {
                     ds,
                     graph.as_deref(),
                     &files,
+                    message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -1665,7 +2144,11 @@ fn run() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
-            let r = store.load_as(&sources, sparkles::commit::CommitKind::Load)?;
+            let wopts = sparkles::guard::WriteOptions {
+                message,
+                ..Default::default()
+            };
+            let r = store.load_with(&sources, sparkles::commit::CommitKind::Load, &wopts)?;
             let after = store.snapshot().len();
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
@@ -1778,6 +2261,7 @@ fn run() -> Result<()> {
             loc,
             update,
             text,
+            message,
             server,
             dataset,
             insecure_http,
@@ -1788,10 +2272,21 @@ fn run() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no update given"),
             };
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 #[cfg(feature = "auth")]
-                return remote::client::update(server.as_deref(), insecure_http, ds, &u);
+                return remote::client::update(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    &u,
+                    message.as_deref(),
+                );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             };
@@ -1801,6 +2296,10 @@ fn run() -> Result<()> {
                 prefixes: store.prefixes().into_iter().collect(),
                 allow_service: true,
                 outbound,
+                write: sparkles::guard::WriteOptions {
+                    message,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
@@ -1820,6 +2319,7 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
+        Cmd::Vector(a) => vector::cli(a, opts),
         Cmd::GeoIndex {
             loc,
             predicate,
@@ -1848,6 +2348,7 @@ fn run() -> Result<()> {
             loc,
             predicate,
             exclude_graph,
+            language,
             rebuild,
             status,
             disable,
@@ -1856,6 +2357,7 @@ fn run() -> Result<()> {
             opts,
             predicate,
             exclude_graph,
+            language,
             rebuild,
             status,
             disable,
@@ -1907,8 +2409,16 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Diff {
+            loc,
+            from,
+            to,
+            graph,
+            format,
+        } => diff_cmd(&loc, &from, &to, graph.as_deref(), &format, opts),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
+        Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
@@ -1950,7 +2460,9 @@ fn run() -> Result<()> {
             loc,
             to,
             inferences,
+            at,
         } => {
+            let at: Option<sparkles::history::At> = at.as_deref().map(str::parse).transpose()?;
             let inferences = clone::Inferences::parse(&inferences).with_context(|| {
                 format!("--inferences must be copy or drop, not '{inferences}'")
             })?;
@@ -1964,7 +2476,7 @@ fn run() -> Result<()> {
             let t = Instant::now();
             let mut tmp = to.as_os_str().to_owned();
             tmp.push(format!(".clone-tmp-{}", std::process::id()));
-            let r = clone::clone_into(
+            let r = clone::clone_into_at(
                 &store,
                 &loc.display().to_string(),
                 state::read_reasoning_file(&loc),
@@ -1973,6 +2485,7 @@ fn run() -> Result<()> {
                 inferences,
                 None,
                 None,
+                at,
             )?;
             eprintln!(
                 "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",
@@ -2048,11 +2561,13 @@ fn run() -> Result<()> {
             vocab,
             geo_default_geometry,
             clear,
+            full,
             status,
             check,
             checks,
             limit,
             no_inferences,
+            graphs,
             closure,
             format,
             timeout,
@@ -2070,6 +2585,13 @@ fn run() -> Result<()> {
                 eprintln!("error: unknown diagnostics check '{bad}'");
                 std::process::exit(2);
             }
+            let graphs = match diagnostics::parse_graphs(&graphs) {
+                Ok(g) => g,
+                Err(bad) => {
+                    eprintln!("error: --graph must be default or an absolute IRI, not '{bad}'");
+                    std::process::exit(2);
+                }
+            };
             let extras = sparkles_reasoner::Extras::parse(&vocab, geo_default_geometry)?;
             extras.validate()?;
             if check && !(1..=diagnostics::MAX_LIMIT).contains(&limit) {
@@ -2101,23 +2623,31 @@ fn run() -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("unknown profile '{p}'"))?
                     }
                 };
-                let r = sparkles_reasoner::materialize_with(
+                // the previous materialization, updated incrementally when it can be
+                let previous = state::read_reasoning_file(&loc);
+                let since = if full {
+                    None
+                } else {
+                    reasoning::incremental_since(previous.as_ref(), &store)
+                };
+                let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
                     &extras,
+                    sparkles_reasoner::Incremental { since, cache: None },
                     &Default::default(),
                 )?;
-                // lets `sparkles serve` pick the inferences up for this database
-                state::write_reasoning_file(
-                    &loc,
-                    Some(&reasoning::recorded(&profile, &extras, &r, &store)),
-                )?;
+                // lets `sparkles serve` pick the inferences up for this database, with
+                // the database's automatic re-run setting kept
+                let mut info = reasoning::recorded(&profile, &extras, &r, &store);
+                info.auto = previous.and_then(|i| i.auto);
+                state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(
-                    "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",
+                    "{} inferred triples ({} rules, {} ms; {}) → graph <{}>{}",
                     r.inferred,
                     r.rules,
-                    r.iterations,
                     r.millis,
+                    reasoning::run_text(&r),
                     sparkles_reasoner::INFERRED_GRAPH,
                     validation_note(r.receipt.as_ref().and_then(|r| r.validation.as_deref()))
                 );
@@ -2134,10 +2664,13 @@ fn run() -> Result<()> {
                     .snapshot()
                     .lookup_iri(sparkles_reasoner::INFERRED_GRAPH)
                     .is_some();
+            let default_checked =
+                graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH);
             let dopts = DiagnoseOptions {
                 checks,
                 limit,
-                inferences: has_inferred && !no_inferences,
+                inferences: has_inferred && !no_inferences && default_checked,
+                graphs,
                 closure,
                 timeout: timeout.map(Duration::from_secs_f64),
                 prefixes: store.prefixes().into_iter().collect(),
@@ -2156,6 +2689,18 @@ fn run() -> Result<()> {
                 };
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&j)?);
+            } else if format == "turtle" {
+                let inf = &j["scope"]["inferences"];
+                print!(
+                    "{}",
+                    report.to_turtle(&sparkles_reasoner::diagnostics::ReportContext {
+                        dataset: Some(&name),
+                        profile: inf["profile"].as_str(),
+                        stale: inf["stale"].as_bool(),
+                        commits_since: inf["commitsSince"].as_u64(),
+                        prefixes: &dopts.prefixes,
+                    })
+                );
             } else {
                 print_diagnostics(&report, &j);
             }
@@ -2178,10 +2723,13 @@ fn run() -> Result<()> {
         } => {
             use sparkles::index::Perm;
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
-            let json = match format.as_str() {
-                "json" => true,
-                "text" => false,
-                f => bail!("unknown format '{f}' (text or json)"),
+            // `void` is the VoID description, `turtle` the description and the declarations
+            let (json, void) = match format.as_str() {
+                "json" => (true, None),
+                "text" => (false, None),
+                "void" => (false, Some(false)),
+                "turtle" => (false, Some(true)),
+                f => bail!("unknown format '{f}' (text, json, void or turtle)"),
             };
             let declared_from_inferred = match declared.as_str() {
                 "asserted" => false,
@@ -2210,6 +2758,8 @@ fn run() -> Result<()> {
                 deadline: timeout.map(|t| Instant::now() + Duration::from_secs_f64(t)),
                 cancel: None,
                 max_entries,
+                term_totals: void.is_some(),
+                graphs: None,
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -2220,7 +2770,18 @@ fn run() -> Result<()> {
                 Err(e) => return Err(e.into()),
             };
             let mut out = std::io::stdout().lock();
-            if json {
+            if let Some(declarations) = void {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(store.prefixes());
+                let vopts = sparkles::schema::VoidOptions {
+                    dataset: &name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                let turtle = oxrdfio::RdfFormat::Turtle;
+                let text = sparkles::schema::void_text(&report, &vopts, turtle);
+                out.write_all(text.as_bytes())?;
+            } else if json {
                 // every item on one page
                 let summary = report.summary(
                     &name,
@@ -2387,7 +2948,7 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
     );
     println!("head            {head}");
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => reasoning::up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE ({n} commit{} since)", if n == 1 { "" } else { "s" })
         }
@@ -2495,6 +3056,9 @@ fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &
         println!(
             "note: the inferences are not known to be up to date; findings marked (uses inferences) may be outdated"
         );
+    }
+    if !r.graphs.is_empty() {
+        println!("checked graphs: {}", r.graphs.join(", "));
     }
     let n = r.findings.len();
     let checks = r.checks.len();

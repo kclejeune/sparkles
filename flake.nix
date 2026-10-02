@@ -96,6 +96,8 @@
               inherit rustPlatform;
               ui = null;
             };
+            # the Python bindings (crates/sparkles-py) for nixpkgs' python3
+            sparkles-py = pkgs.callPackage ./nix/python.nix { inherit rustPlatform; };
             default = self'.packages.sparkles;
           };
 
@@ -122,13 +124,21 @@
               pkgs.nodejs_24
               pkgs.pnpm_10
               pkgs.hyperfine
-              pkgs.python3
+              # the scripts, and the Python bindings' tests (`mise run py:test`)
+              (pkgs.python3.withPackages (ps: [
+                ps.pytest
+                ps.mypy
+                ps.rdflib
+              ]))
+              pkgs.maturin
               pkgs.mise
             ];
           };
 
           checks = {
             inherit (self'.packages) sparkles sparkles-cli;
+            # the wheel, installed, with the pytest suite as its check phase
+            python-bindings = self'.packages.sparkles-py;
             # THIRD_PARTY_LICENSES-UI.md is the notices file the UI build writes (the build
             # itself fails on a non-permissive license)
             ui-licenses = pkgs.runCommand "sparkles-ui-licenses" { } ''

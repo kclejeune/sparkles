@@ -6,9 +6,10 @@
 > maps and stratified typing, plus `POST /{ds}/shex`, `sparkles shex validate|parse`, the
 > shexTest harness and `bench:shex`. Phase 2 is write-time ShEx validation with
 > `validation.json` format 2, ShExR, `SPARQL """…"""` selectors, the UI's SHACL | ShEx
-> switch and `bench:shex-write`. Two Phase 3 items are also built: the MCP tools
-> `validate_shacl` and `validate_shex`, and the interval matcher, which became the Phase 1
-> matcher.
+> switch and `bench:shex-write`. Three Phase 3 items are also built: the MCP tools
+> `validate_shacl` and `validate_shex`, the interval matcher, which became the Phase 1
+> matcher, and incremental guard validation, which now propagates typing changes. The
+> guard also has a grandfather mode.
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
@@ -1687,6 +1688,97 @@ current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
 [BENCHMARKS.md](../BENCHMARKS.md) publishes no ShEx numbers yet, so the §9 targets are
 unverified.
 
-**Deferred or rejected.** Incremental guard validation, ShExR schemas in named graphs for
-the guard, SHACL and ShEx guards on one dataset, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are
-not built. The guard validates the full post-state on every relevant write.
+**Incremental guard validation** landed on 2026-10-02 with C10 Phase 2. The guard keeps
+the counts of the head's result map, in memory and in `validation-status.json`. A write
+validates the associations of the nodes it can affect, in the states before and after
+it, and moves the counts by the difference.
+* The affected nodes are found per node rather than per pair. They are the endpoints of
+  changed triples whose predicate a triple constraint reads, plus the nodes that reach
+  them backwards over triple constraints whose value expression refers to a shape. This
+  over-approximates the pair dependencies of the design, and needs no typing of the
+  states.
+* The map's associations at those nodes are recomputed in each state. Term selectors
+  select their node in both, and `{FOCUS p o}` and `{s p FOCUS}` selectors are checked
+  against the state's arcs.
+* The fallbacks are those of C10 that apply: an unknown state, `reject` on a head that
+  does not conform, bulk writes, more than 50,000 affected nodes, and SPARQL selectors,
+  which the guard refuses anyway.
+* A recursive reference over a large connected graph makes every node that reaches the
+  changed one affected. With `foaf:knows @ex:Person *` in `bench:shex-write`, a new
+  `foaf:knows` arc between two people reaches more than 50,000 of 100,000 people, so that
+  write is validated in full. Propagating only typings that change avoids this. It was
+  not built with this step and landed later, as described below.
+* At 1.05M triples, the benchmark's other write took 8 to 12 ms with `warn` and
+  `reject`, against 2.1 to 2.7 s before.
+* A property test checks the counts and the listed associations against full
+  validations, over recursive, inverse and negated references with and without a
+  `CLOSED` shape.
+
+**Grandfather mode** landed on 2026-10-02 with C10 Phase 3. It has the semantics of
+SHACL's: `"baseline": "grandfather"` in the configuration, `--grandfather` in the CLI,
+`reject` allowed on data that does not conform, and a write blocked only by the
+nonconformant associations it introduces. Associations are matched by node and shape as a
+multiset, in the state before the write and in the state after it. Summaries gain
+`introduced`, and the new associations are listed first. A full validation in this mode
+also validates the state before the write. A schema changes only through a new
+configuration, and setting one never compares two schemas, so the rule that a shapes
+change compares with the old shapes' results has no ShEx case. The property test runs in
+`warn` and in grandfather `reject`, and checks every decision, count and listing.
+
+**Typing-change propagation** landed on 2026-10-02 too. For schemas whose references
+follow arcs, the guard keeps the typing of the head in memory: every pair the validations
+of the map discovered, with its value. A full validation sets it, and every write moves
+it. It is dropped by a restart, a compaction (the generation's terms are numbered anew),
+a bypassed write and any commit the guard did not judge. With it, a write is validated
+as follows.
+
+1. The region starts with the nodes whose neighbourhood the write changed and the nodes
+   a changed selector arc may select.
+2. The region's pairs, and the map's associations at its nodes, are typed in the state
+   after the write. Every other pair the head's typing has as `true` is read as `true`
+   and not discovered. A pair it has as `false`, or does not have, is discovered and
+   typed.
+3. If a typed pair's value differs from the head's, its node and every node that reaches
+   it backwards over referring constraints join the region, and step 2 runs again.
+4. When no value outside the region changes, the associations of the region's nodes are
+   the only ones whose results the write can change. Their results before the write come
+   from the head's typing, and those after it from the last typing.
+
+The result is exact. Every pair outside the region keeps the head's value, which is a
+fixed point of the state after the write. It is also the greatest one. A pair outside
+the region that the head had as `false` and could turn `true` is read by no pair of the
+region, since those are typed, and it reads only unchanged pairs. Setting it `true`
+would therefore give a larger fixed point of the state before the write, which
+contradicts the head's typing. Negation reads lower strata, which are exact first.
+Joining the whole backward reach of a changed pair at once, rather than one reader per
+round, keeps a change that runs along a chain to one more typing.
+
+On data that mostly does not conform, typing every `false` pair the region reads soon
+reaches most of the graph. The first build did so in `bench:shex-write`'s `warn` mode,
+where the person write took 2.6 s. The typing therefore also records which `false` pairs
+failed in discovery with every reference unknown, such as a person whose age breaks a
+node constraint. Only a change to such a pair's own neighbourhood can make it `true`, so
+outside the region it is read as `false` and not typed again. A person who knows one of
+them is then decided `false` without going further. The design's plan of a
+typing of both states was not needed, because the head's typing stands in for the state
+before. The old walk over every node that reaches a changed one remains for writes when
+the typing is unknown.
+
+With `foaf:knows @ex:Person *`, a new `foaf:knows` arc between two people who conform
+validates one association, where it validated everyone who reaches them, or fell back to
+a full validation beyond 50,000 people. A unit test runs the four cases on a ring of
+people. The property test now runs mostly through this path and passed 20,000 cases with
+the final code, and 50,000 before the `false` pairs were split. shexTest stayed at 99.9 %
+of the validation tests.
+
+At 1.05M triples (152,000 associations), on a machine with a load average near 30 from
+other builds, `bench:shex-write`'s person write took 16 ms in `reject` over the schema
+the data conforms to, 18 ms in `warn` and 28 ms in grandfather `reject` over the schema
+it mostly does not conform to. That write was validated in full before, in 2.1 to 2.7 s.
+With validation off it took 20 ms. The first such write after a restart is still
+validated in full, because the typing is not persisted, unless the server was started
+with `--validate`.
+
+**Deferred or rejected.** ShExR schemas in named graphs for the guard, SHACL and ShEx
+guards on one dataset, a persisted typing, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
+built.

@@ -1,0 +1,55 @@
+# The Python bindings (the `sparkles` Python package, spec docs/specs/P01-python-bindings.md).
+#
+# This crate is its own workspace, excluded from the root one, so that `cargo build`,
+# `cargo clippy --workspace` and `cargo test --workspace` neither compile PyO3 nor need
+# Python. It has its own Cargo.lock, refreshed from the root lock with `mise run py:lock`,
+# and repeats the root's spargebra patch and profiles. Build it with maturin
+# (`mise run py:build`) or test it with `mise run py:test`.
+[package]
+name = "sparkles-py"
+description = "Python bindings for the Sparkles RDF/SPARQL database"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/kclejeune/sparkles"
+publish = false
+
+[lib]
+name = "_sparkles"
+crate-type = ["cdylib"]
+# the tests are the pytest suite; a Rust test binary would have to link libpython
+test = false
+doctest = false
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
+sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
+sparkles-shacl = { path = "../sparkles-shacl", optional = true }
+sparkles-shex = { path = "../sparkles-shex", optional = true }
+oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
+oxrdfio = { version = "0.2", features = ["rdf-12"] }
+anyhow = "1"
+serde_json = "1"
+
+[features]
+default = ["reasoning", "shacl", "shex", "text", "geo"]
+# the same names as the server's features
+reasoning = ["dep:sparkles-reasoner"]
+shacl = ["dep:sparkles-shacl"]
+shex = ["dep:sparkles-shex"]
+text = ["sparkles/text"]
+geo = ["sparkles/geo"]
+
+[workspace]
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# the root workspace's patch (see vendor/spargebra/PATCHED.md)
+[patch.crates-io]
+spargebra = { path = "../../vendor/spargebra" }

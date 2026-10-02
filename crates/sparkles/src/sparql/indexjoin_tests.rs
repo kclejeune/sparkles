@@ -36,7 +36,7 @@ fn update(s: &Store, text: &str) {
 /// Subjects `ex:s0…` of classes `ex:C0…ex:C3`, each with a few values of `ex:p0…ex:p4`
 /// (subjects, integers, `ex:o0…`, strings; `ex:p4` links subjects), in the default
 /// graph, `ex:g1`, `ex:g2` or all three; a few subjects have many values.
-fn random_trig(seed: u64, n: usize) -> String {
+pub(super) fn random_trig(seed: u64, n: usize) -> String {
     let mut next = xorshift(seed);
     let mut t = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..n {
@@ -589,27 +589,38 @@ fn keys_are_read_by_clustered_seeks() {
     load(&s, &t);
     let q = "SELECT * WHERE { VALUES ?s { ex:s00010 ex:s00500 ex:s00011 ex:s25000 ex:s49990 } \
              ?s ex:p0 ?a ; ex:p1 ?b }";
-    let seeks = |snap: &Arc<crate::store::Snapshot>, walk: bool| {
-        let r = forced(snap, q, Optimizations::ALL, Some(walk));
+    let seeks = |snap: &Arc<crate::store::Snapshot>, walk: bool, opt: Optimizations| {
+        let r = forced(snap, q, opt, Some(walk));
         assert_eq!(answer(q, &r), answer(q, &run(snap, q, without())), "{walk}");
         let star = find(&r.plan, "StarJoin").unwrap_or_else(|| panic!("{:#?}", r.plan));
         let c = star.counters.clone().unwrap();
         assert_eq!(c["keys"], 5);
         (r.len(), c["seeks"].as_u64().unwrap())
     };
+    let scans = Optimizations {
+        gallop_index_join: false,
+        ..Optimizations::ALL
+    };
     let snap = s.snapshot();
     assert!(snap.perm(crate::index::Perm::Spo).blocks.len() >= 4);
-    // three subject regions of SPO
-    assert_eq!(seeks(&snap, true), (5, 3));
-    let (n, per_pattern) = seeks(&snap, false);
-    assert_eq!(n, 5);
-    assert!(per_pattern >= 2, "{per_pattern}");
+    // three subject regions of SPO, read by three scans or found by three searches
+    for opt in [scans, Optimizations::ALL] {
+        assert_eq!(seeks(&snap, true, opt), (5, 3));
+        let (n, per_pattern) = seeks(&snap, false, opt);
+        assert_eq!(n, 5);
+        assert!(per_pattern >= 2, "{per_pattern}");
+    }
     // a change between ex:s00011 and ex:s00500 splits their scan
     update(
         &s,
         "INSERT DATA { ex:s00200 ex:p0 1000 . ex:s00500 ex:p1 1000 } ; DELETE DATA { ex:s25000 ex:p0 71 }",
     );
     let snap = s.snapshot();
-    assert_eq!(seeks(&snap, true), (5, 4));
-    seeks(&snap, false);
+    assert_eq!(seeks(&snap, true, scans), (5, 4));
+    seeks(&snap, false, scans);
+    // the galloping reader reads the two ranges with changes (`ex:s00500 ex:p1` and
+    // `ex:s25000 ex:p0`) by scans of their own, then searches for the block of the
+    // range after each
+    assert_eq!(seeks(&snap, true, Optimizations::ALL), (5, 5));
+    seeks(&snap, false, Optimizations::ALL);
 }

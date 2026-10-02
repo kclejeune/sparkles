@@ -19,6 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// A dataset id (a version 4 UUID), named here for crates that do not depend on `uuid`.
+pub type DatasetId = uuid::Uuid;
+
 /// What produced a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommitKind {
@@ -130,6 +133,11 @@ pub struct CommitInfo {
     pub exact: bool,
     /// rebuilt from a WAL record without commit metadata
     pub reconstructed: bool,
+    /// the commit may have changed the default graph (`false` only when it is known to
+    /// have changed named graphs alone)
+    pub default_graph: bool,
+    /// the write skipped the write-time validation the dataset requires (a bypass)
+    pub unvalidated: bool,
 }
 
 impl CommitInfo {
@@ -171,6 +179,16 @@ impl Serialize for CommitInfo {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut m = s.serialize_map(None)?;
+        self.serialize_fields(&mut m)?;
+        m.end()
+    }
+}
+
+impl CommitInfo {
+    fn serialize_fields<M: serde::ser::SerializeMap>(
+        &self,
+        m: &mut M,
+    ) -> std::result::Result<(), M::Error> {
         m.serialize_entry("seq", &self.seq)?;
         m.serialize_entry("parent", &self.parent())?;
         m.serialize_entry("ref", &self.reference())?;
@@ -185,24 +203,69 @@ impl Serialize for CommitInfo {
         if self.reconstructed {
             m.serialize_entry("reconstructed", &true)?;
         }
+        if self.unvalidated {
+            m.serialize_entry("unvalidated", &true)?;
+        }
+        Ok(())
+    }
+}
+
+/// A commit with its annotation, serialized as the commit's members plus `message` and
+/// `digest` (hex) when it has them.
+#[derive(Clone, Copy, Debug)]
+pub struct AnnotatedCommit<'a> {
+    pub commit: &'a CommitInfo,
+    pub annotation: Option<&'a crate::annotations::Annotation>,
+}
+
+impl Serialize for AnnotatedCommit<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        self.commit.serialize_fields(&mut m)?;
+        if let Some(a) = self.annotation {
+            if let Some(msg) = &a.message {
+                m.serialize_entry("message", msg.as_ref())?;
+            }
+            if let Some(d) = a.digest_hex() {
+                m.serialize_entry("digest", &d)?;
+            }
+        }
         m.end()
     }
 }
 
 /// The outcome of a write: the new commit, or the unchanged head when the write had no
 /// net effect.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Receipt {
     pub dataset_id: uuid::Uuid,
     pub committed: bool,
     pub commit: CommitInfo,
     /// what a write guard found (write-time validation), when one ran
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::guard::serialize_summary"
-    )]
     pub validation: Option<std::sync::Arc<crate::guard::ValidationSummary>>,
+    /// the commit's message and change digest (serialized inside `commit`)
+    pub annotation: crate::annotations::Annotation,
+}
+
+impl Serialize for Receipt {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("datasetId", &self.dataset_id)?;
+        m.serialize_entry("committed", &self.committed)?;
+        m.serialize_entry(
+            "commit",
+            &AnnotatedCommit {
+                commit: &self.commit,
+                annotation: Some(&self.annotation),
+            },
+        )?;
+        if let Some(v) = &self.validation {
+            m.serialize_entry("validation", v.as_ref())?;
+        }
+        m.end()
+    }
 }
 
 /// A page of the commit catalog.
@@ -435,6 +498,7 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
         Err(e) => return Err(e.into()),
     }
     crate::history::reidentify_file(root, old_id, new_id)?;
+    crate::annotations::reidentify(root, old_id, new_id)?;
     // dataset.json last: its id is what the other files are checked against
     ds.id = new_id;
     ds.origin = "restore".to_string();
@@ -547,6 +611,15 @@ struct CommitJson {
     exact: bool,
     #[serde(default)]
     reconstructed: bool,
+    /// absent in files written before the flag existed: assume the default graph changed
+    #[serde(default = "yes")]
+    default_graph: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unvalidated: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> Vec<u8> {
@@ -566,6 +639,8 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             bulk: c.bulk,
             exact: c.exact,
             reconstructed: c.reconstructed,
+            default_graph: c.default_graph,
+            unvalidated: c.unvalidated,
         },
     })
     .unwrap()
@@ -596,6 +671,8 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
             bulk: c.bulk,
             exact: c.exact,
             reconstructed: c.reconstructed,
+            default_graph: c.default_graph,
+            unvalidated: c.unvalidated,
         },
         f.origin,
     )))
@@ -623,7 +700,13 @@ fn encode_record(c: &CommitInfo) -> [u8; REC] {
     r[32..40].copy_from_slice(&c.quads.to_le_bytes());
     r[40..44].copy_from_slice(&c.generation.to_le_bytes());
     r[44] = c.kind.code();
-    r[45] = c.exact as u8 | (c.bulk as u8) << 1 | (c.reconstructed as u8) << 2;
+    // bit 3 is set when the default graph is known to be unchanged, so records written
+    // before the flag existed read as "may have changed it"
+    r[45] = c.exact as u8
+        | (c.bulk as u8) << 1
+        | (c.reconstructed as u8) << 2
+        | (!c.default_graph as u8) << 3
+        | (c.unvalidated as u8) << 4;
     let crc = crc32(&[&r[..60]]);
     r[60..64].copy_from_slice(&crc.to_le_bytes());
     r
@@ -646,6 +729,8 @@ pub(crate) fn decode_record(r: &[u8]) -> Option<CommitInfo> {
         exact: r[45] & 1 != 0,
         bulk: r[45] & 2 != 0,
         reconstructed: r[45] & 4 != 0,
+        default_graph: r[45] & 8 == 0,
+        unvalidated: r[45] & 16 != 0,
     })
 }
 
@@ -709,6 +794,9 @@ pub(crate) struct Catalog {
     /// records not yet written to the file after a write error
     pending: Vec<CommitInfo>,
     ring: Option<usize>,
+    /// the newest commit that may have changed the default graph: exact while the
+    /// records reach back to it, otherwise the commit before the first record
+    last_default: u64,
     /// test hook: appends to the file fail
     #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fail_writes: bool,
@@ -723,6 +811,7 @@ impl Catalog {
             records: [root].into(),
             pending: Vec::new(),
             ring: Some(ring.max(1)),
+            last_default: root.seq,
             #[cfg(any(test, feature = "failpoints"))]
             fail_writes: false,
         }
@@ -815,6 +904,11 @@ impl Catalog {
             crate::store::write_synced(path, &buf)?;
         }
         let file = OpenOptions::new().append(true).open(path)?;
+        let last_default = records
+            .iter()
+            .rev()
+            .find(|c| c.default_graph)
+            .map_or(first.saturating_sub(1), |c| c.seq);
         Ok(Catalog {
             path: Some(path.to_path_buf()),
             file: Some(file),
@@ -822,6 +916,7 @@ impl Catalog {
             records: records.into(),
             pending: Vec::new(),
             ring: None,
+            last_default,
             #[cfg(any(test, feature = "failpoints"))]
             fail_writes: false,
         })
@@ -837,6 +932,9 @@ impl Catalog {
     /// Append a commit (called with the writer lock held, after the commit is durable).
     /// A file error is logged and retried with the next append; it never fails the commit.
     pub fn append(&mut self, c: CommitInfo) {
+        if c.default_graph {
+            self.last_default = c.seq;
+        }
         self.records.push_back(c);
         if let Some(ring) = self.ring
             && self.records.len() > ring
@@ -917,6 +1015,18 @@ impl Catalog {
         }
     }
 
+    /// Whether a commit after `after`, up to `at`, may have changed the default graph. A
+    /// commit the catalog no longer holds counts as a change.
+    pub fn default_graph_changed(&self, after: u64, at: u64) -> bool {
+        if self.last_default <= after {
+            return false;
+        }
+        if self.last_default <= at {
+            return true;
+        }
+        (after + 1..=at).any(|s| self.get(s).is_none_or(|c| c.default_graph))
+    }
+
     pub fn get(&self, seq: u64) -> Option<CommitInfo> {
         let i = seq.checked_sub(self.first)?;
         self.records.get(i as usize).copied()
@@ -926,6 +1036,51 @@ impl Catalog {
     pub fn at_time(&self, ms: i64) -> Option<CommitInfo> {
         let i = self.records.partition_point(|c| c.timestamp_ms <= ms);
         i.checked_sub(1).and_then(|i| self.records.get(i).copied())
+    }
+
+    /// The first retained commit made at or after `ms` (timestamps never decrease).
+    pub fn first_at_or_after(&self, ms: i64) -> Option<u64> {
+        let i = self.records.partition_point(|c| c.timestamp_ms < ms);
+        self.records.get(i).map(|c| c.seq)
+    }
+
+    /// Drop the records of the commits before `cutoff` (never the newest one). A
+    /// persistent catalog is rewritten to a new file that replaces the old one
+    /// atomically, so readers without the lock see either. Returns the records dropped.
+    pub fn prune_before(&mut self, cutoff: u64) -> Result<u64> {
+        let last = self.records.back().map_or(self.first, |c| c.seq);
+        let cutoff = cutoff.min(last);
+        if cutoff <= self.first {
+            return Ok(0);
+        }
+        let n = cutoff - self.first;
+        if let Some(path) = self.path.clone() {
+            self.flush_pending();
+            if !self.pending.is_empty() {
+                return Err(Error::Invalid(
+                    "the commit catalog could not be written".into(),
+                ));
+            }
+            let mut f = OpenOptions::new().read(true).open(&path)?;
+            let mut h = [0u8; REC];
+            f.read_exact(&mut h)?;
+            let Some((id, _)) = decode_header(&h) else {
+                return Err(Error::Corrupt(format!(
+                    "{}: the header is damaged",
+                    path.display()
+                )));
+            };
+            let mut buf = Vec::with_capacity((self.records.len() - n as usize + 1) * REC);
+            buf.extend_from_slice(&encode_header(id, cutoff));
+            for c in self.records.iter().skip(n as usize) {
+                buf.extend_from_slice(&encode_record(c));
+            }
+            crate::store::write_atomic(&path, &buf)?;
+            self.file = Some(OpenOptions::new().append(true).open(&path)?);
+        }
+        self.records.drain(..n as usize);
+        self.first = cutoff;
+        Ok(n)
     }
 
     /// The first retained record.
@@ -984,31 +1139,38 @@ fn existing_is_invalid(path: &Path) -> Result<bool> {
 /// Version byte of a WAL commit record carrying commit metadata.
 pub(crate) const WAL_COMMIT_V2: u8 = 2;
 
+/// The flag of byte 27 of a WAL commit record: the write bypassed write-time
+/// validation. Records written before it existed have zero there.
+pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
+
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
-/// node): seq, timestamp, kind, version and a CRC over the transaction's data records
-/// followed by bytes 0..29 of this record.
+/// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
+/// transaction's data records followed by bytes 0..29 of this record.
 pub(crate) fn seal_wal_commit(
     rec: &mut [u8; 33],
     seq: u64,
     ts: i64,
     kind: CommitKind,
+    flags: u8,
     data: &[u8],
 ) {
     rec[9..17].copy_from_slice(&seq.to_le_bytes());
     rec[17..25].copy_from_slice(&ts.to_le_bytes());
     rec[25] = kind.code();
     rec[26] = WAL_COMMIT_V2;
-    rec[27..29].fill(0);
+    rec[27] = flags;
+    rec[28] = 0;
     let crc = crc32(&[data, &rec[..29]]);
     rec[29..33].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// Commit metadata of a WAL commit record: `None` for a legacy record (version 0),
-/// `Some(Err)` for a version-2 record whose CRC does not match.
+/// Commit metadata of a WAL commit record (seq, timestamp, kind and flags): `None` for
+/// a legacy record (version 0), `Some(Err)` for a version-2 record whose CRC does not
+/// match.
 pub(crate) fn open_wal_commit(
     rec: &[u8],
     data: &[u8],
-) -> Option<Result<(u64, i64, CommitKind), ()>> {
+) -> Option<Result<(u64, i64, CommitKind, u8), ()>> {
     if rec[26] != WAL_COMMIT_V2 {
         return None;
     }
@@ -1020,6 +1182,7 @@ pub(crate) fn open_wal_commit(
         u64::from_le_bytes(rec[9..17].try_into().unwrap()),
         i64::from_le_bytes(rec[17..25].try_into().unwrap()),
         CommitKind::from_code(rec[25]),
+        rec[27],
     )))
 }
 
@@ -1049,9 +1212,19 @@ mod tests {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
+            unvalidated: false,
         };
         let mut r = encode_record(&c);
         assert_eq!(decode_record(&r), Some(c));
+        // a record without the flag bit (older versions) may have changed the default graph
+        assert_eq!(r[45] & 8, 0);
+        let named_only = CommitInfo {
+            default_graph: false,
+            unvalidated: false,
+            ..c
+        };
+        assert_eq!(decode_record(&encode_record(&named_only)), Some(named_only));
         r[20] ^= 1;
         assert_eq!(decode_record(&r), None);
         for k in CommitKind::ALL {

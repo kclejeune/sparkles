@@ -2,6 +2,7 @@
 
 pub mod aggext;
 pub mod cache;
+pub mod charsets;
 pub mod ctx;
 pub mod depth;
 pub mod exec;
@@ -11,10 +12,15 @@ mod exprcache;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
+pub mod hybrid;
 pub mod indexjoin;
+mod joinorder;
 mod keyfilter;
+mod keyprobe;
 pub mod plan;
 pub mod results;
+mod sample;
+pub mod stats;
 pub mod table;
 pub mod textpf;
 pub mod update;
@@ -52,6 +58,10 @@ pub struct QueryOptions {
     /// Budget for the estimated memory of intermediate results (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
+    /// Budget for the rows all operators of a query produce together (`None`:
+    /// unlimited); exceeding it fails with [`Error::BudgetExceeded`]. An update's WHERE
+    /// clauses share one count.
+    pub max_rows_produced: Option<u64>,
     pub allow_service: bool,
     /// Refuse SERVICE with [`Error::NotPermitted`] (the caller lacks the permission;
     /// `allow_service: false` means SERVICE is disabled for everyone).
@@ -75,12 +85,16 @@ pub struct QueryOptions {
     pub no_cache: bool,
     /// Pre-bound variables (Jena `QueryExec.substitution`): every occurrence of the
     /// variable is replaced by the term; projected variables report the bound value.
-    /// Blank nodes produced by this store (`_:b…` labels) resolve to their stored node.
+    /// A blank node with a stored node's label (`_:b…`) is that stored node. Any other
+    /// label, such as a node a query minted (`_:q…`), is a new blank node of this query.
     pub initial_bindings: Vec<(String, Term)>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
     /// Executor optimizations in effect (all on by default; see [`Optimizations`]).
     pub optimizations: Option<Optimizations>,
+    /// The graphs the request may read (and, in an update, write); `None` is every
+    /// graph. See [`crate::access`].
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 /// Which files `LOAD <file:…>` may read.
@@ -184,6 +198,8 @@ pub struct QueryResult {
     pub timing: Timing,
     /// Peak estimated memory of intermediate results (see [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
+    /// Rows produced by all operators (see [`QueryOptions::max_rows_produced`]).
+    pub rows_produced: u64,
     pub ctx: Arc<Ctx>,
 }
 
@@ -282,7 +298,7 @@ fn make_ctx(
     opts: &QueryOptions,
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
-) -> Ctx {
+) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
     let mut ctx = Ctx::new(snap);
@@ -298,6 +314,9 @@ fn make_ctx(
     }
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
+    }
+    if let Some(m) = opts.max_rows_produced {
+        ctx.max_rows_produced = m;
     }
     ctx.allow_service = opts.allow_service;
     ctx.forbid_service = opts.forbid_service;
@@ -352,7 +371,25 @@ fn make_ctx(
         ds.default = Some(d);
     }
     ctx.dataset = ds;
-    ctx
+    restrict_ctx(&mut ctx, opts.graphs.as_ref())?;
+    Ok(ctx)
+}
+
+/// Limit a query context's dataset to a graph view that does not read every graph (see
+/// [`DatasetSpec::restrict`]).
+pub(crate) fn restrict_ctx(
+    ctx: &mut Ctx,
+    graphs: Option<&Arc<crate::access::GraphAccess>>,
+) -> Result<()> {
+    let Some(a) = graphs.filter(|a| !a.reads_all()) else {
+        return Ok(());
+    };
+    let mut ds = std::mem::take(&mut ctx.dataset);
+    let snap = ctx.snap.clone();
+    ds.restrict(&snap, a, &|id| ctx.term(id))?;
+    ctx.dataset = ds;
+    ctx.graphs = Some(a.clone());
+    Ok(())
 }
 
 fn split(
@@ -450,13 +487,14 @@ fn execute_parsed(
 ) -> Result<QueryResult> {
     let t1 = Instant::now();
     let (pattern, dataset, base) = split(parsed);
-    let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
+    let ctx = Arc::new(make_ctx(snap, opts, dataset, base)?);
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
+    planner.source = Some(parsed);
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
     for (name, term) in &opts.initial_bindings {
         let v = ctx.var(name.trim_start_matches(['?', '$']));
-        let id = ctx.intern_term(term);
+        let id = ctx.intern_outside_term(term);
         planner.subst.insert(v, id);
         bound.push((v, id));
     }
@@ -478,6 +516,9 @@ fn execute_parsed(
     let t2 = Instant::now();
     let (table, mut plan) = exec::execute(&ctx, &node)?;
     plan.warnings = ctx.warnings();
+    if ctx.graphs.is_some() {
+        plan.redact();
+    }
     let mut result = QueryResult {
         kind,
         vars: Vec::new(),
@@ -487,6 +528,7 @@ fn execute_parsed(
         plan,
         timing: Timing::default(),
         mem_peak_bytes: 0,
+        rows_produced: 0,
         ctx: ctx.clone(),
     };
     match parsed {
@@ -527,6 +569,7 @@ fn execute_parsed(
         total_ms: parse_ms + t1.elapsed().as_secs_f64() * 1000.0,
     };
     result.mem_peak_bytes = ctx.mem_peak();
+    result.rows_produced = ctx.rows_produced();
     Ok(result)
 }
 
@@ -548,11 +591,16 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
     let depth = depth::check_query(&parsed)?;
     depth::with_stack(depth, || {
         let (pattern, dataset, base) = split(&parsed);
-        let ctx = make_ctx(snap, opts, dataset, base);
+        let ctx = make_ctx(snap, opts, dataset, base)?;
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
-        let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
+        let mut planner = Planner::new(&ctx);
+        planner.source = Some(&parsed);
+        let node = planner.plan(pattern, &ActiveGraph::Default, Vec::new())?;
         let mut info = exec::describe(&ctx, &node);
         info.warnings = ctx.warnings();
+        if ctx.graphs.is_some() {
+            info.redact();
+        }
         Ok((parsed.to_sse(), info))
     })
 }
@@ -699,12 +747,30 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
 }
 
 #[cfg(test)]
+mod access_tests;
+#[cfg(test)]
+mod charsets_tests;
+#[cfg(test)]
+mod costcal_tests;
+#[cfg(test)]
 mod exists_tests;
 #[cfg(test)]
 mod exprcache_tests;
 #[cfg(test)]
 mod indexjoin_tests;
 #[cfg(test)]
+mod join_tests;
+#[cfg(test)]
+mod joinorder_tests;
+#[cfg(test)]
+mod keyprobe_tests;
+#[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod sample_tests;
+#[cfg(test)]
+mod stats_tests;
+#[cfg(test)]
+mod strfilter_tests;
 #[cfg(test)]
 mod tests;

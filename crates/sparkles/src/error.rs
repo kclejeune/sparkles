@@ -57,6 +57,14 @@ pub enum Error {
     /// than the store keeps, or grow an in-memory store past its size limit.
     #[error("{0}")]
     StorageFull(String),
+    /// A write's precondition ([`WriteOptions::precondition`](crate::guard::WriteOptions))
+    /// did not hold; nothing was written.
+    #[error("{0}")]
+    PreconditionFailed(String),
+    /// A write asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
+    /// found the writer lock taken; nothing was written.
+    #[error("another write is in progress")]
+    WriterBusy,
 }
 
 /// Which budget a request exceeded.
@@ -77,16 +85,23 @@ pub enum BudgetKind {
     /// the work of one validation: the partitions tried to match a node's neighbourhood
     /// to a shape, or the (node, shape) pairs of a ShEx typing
     ValidationWork,
+    /// rows produced by all the operators of one query (or of one update's WHERE
+    /// clauses), summed
+    RowsProduced,
+    /// on-disk bytes of a persistent dataset (its storage quota)
+    DatasetBytes,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 6] = [
+    pub const ALL: [BudgetKind; 8] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
         BudgetKind::DecompressedBytes,
         BudgetKind::OutboundBytes,
         BudgetKind::ValidationWork,
+        BudgetKind::RowsProduced,
+        BudgetKind::DatasetBytes,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -97,6 +112,8 @@ impl BudgetKind {
             BudgetKind::DecompressedBytes => "decompressed-bytes",
             BudgetKind::OutboundBytes => "outbound-bytes",
             BudgetKind::ValidationWork => "validation-work",
+            BudgetKind::RowsProduced => "rows-produced",
+            BudgetKind::DatasetBytes => "dataset-bytes",
         }
     }
 }
@@ -142,6 +159,17 @@ impl std::fmt::Display for Budget {
                 f,
                 "validation exceeds its work budget of {} (partitions of one match, or typing pairs)",
                 self.limit
+            ),
+            BudgetKind::RowsProduced => write!(
+                f,
+                "query exceeds its work budget: its operators produced {} rows, limit {}",
+                self.requested, self.limit
+            ),
+            BudgetKind::DatasetBytes => write!(
+                f,
+                "the write would grow the dataset to about {} on disk, over its quota of {}",
+                human_bytes(self.requested),
+                human_bytes(self.limit)
             ),
         }
     }

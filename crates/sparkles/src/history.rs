@@ -104,19 +104,146 @@ pub struct NamedSnapshot {
     pub commit: Option<CommitInfo>,
     pub created_ms: i64,
     pub note: Option<String>,
+    /// when the pin lapses (milliseconds since the epoch)
+    pub expires_ms: Option<i64>,
     /// the generation that would serve it now
     pub generation: Option<String>,
     /// false only after external damage (its generation is gone)
     pub reconstructable: bool,
+    /// kept materialized (see [`SnapshotOptions::warm`])
+    pub warm: bool,
+}
+
+/// Options of a named snapshot ([`Store::create_snapshot_opts`](crate::store::Store::create_snapshot_opts)).
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotOptions {
+    pub note: Option<String>,
+    /// when the pin lapses (milliseconds since the epoch)
+    pub expires_ms: Option<i64>,
+    /// Keep the pinned state materialized: it is built when the pin is made and by the
+    /// history upkeep (after a restart, say), and the history cache evicts it only when
+    /// warm states alone pass its budget. An in-memory dataset keeps every pinned state
+    /// in memory anyway.
+    pub warm: bool,
 }
 
 /// The retention window: the states that were the head within the last `keep_commits`
-/// commits or `keep_age_ms` milliseconds stay readable.
+/// commits or `keep_age_ms` milliseconds stay readable. `max_bytes` caps the disk the
+/// generations kept only by the window may use: the oldest go first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Retention {
     pub keep_commits: Option<u64>,
     pub keep_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+impl Retention {
+    /// Whether the window keeps anything.
+    pub fn is_on(&self) -> bool {
+        self.keep_commits.is_some_and(|n| n > 0) || self.keep_age_ms.is_some()
+    }
+}
+
+/// How long the commit catalog keeps the metadata of commits whose state can no longer
+/// be read: the last `keep_commits` commits, and the commits made in the last
+/// `keep_age_ms` milliseconds. Records older than both the readable history and the
+/// horizon are pruned. With neither set, nothing is pruned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogHorizon {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_commits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_age_ms: Option<u64>,
+}
+
+impl CatalogHorizon {
+    /// Whether the catalog is pruned at all.
+    pub fn is_on(&self) -> bool {
+        self.keep_commits.is_some() || self.keep_age_ms.is_some()
+    }
+
+    fn is_off(&self) -> bool {
+        !self.is_on()
+    }
+
+    /// The oldest commit the horizon keeps (`head` is the newest commit, and
+    /// `made_since(ms)` the first commit made at or after `ms`). A commit is kept if
+    /// either limit keeps it; `None` when the horizon is off.
+    pub fn cutoff(
+        &self,
+        head: u64,
+        now_ms: i64,
+        made_since: &dyn Fn(i64) -> Option<u64>,
+    ) -> Option<u64> {
+        let by_count = self
+            .keep_commits
+            .map(|n| head.saturating_sub(n.saturating_sub(1)));
+        let by_age = self.keep_age_ms.map(|age| {
+            made_since(now_ms.saturating_sub(age.min(i64::MAX as u64) as i64)).unwrap_or(head)
+        });
+        match (by_count, by_age) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// A scheduled pin: every `every_ms`, the head is pinned as `<prefix><UTC time>`
+/// (unless the newest such pin already holds it), and only the newest `keep_last` pins
+/// of the prefix are kept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Schedule {
+    pub prefix: String,
+    pub every_ms: u64,
+    pub keep_last: u32,
+}
+
+impl Schedule {
+    /// Check a schedule: a prefix that starts a valid snapshot name (at most 40 bytes),
+    /// an interval of at least a minute, and at least one pin to keep.
+    pub fn validate(&self) -> Result<()> {
+        let p = &self.prefix;
+        if p.len() > 40 || !valid_name(&format!("{p}0")) {
+            return Err(Error::invalid(format!(
+                "invalid schedule prefix {p:?}: letters, digits, '.', '_' and '-', at most 40, starting with a letter or digit"
+            )));
+        }
+        if self.every_ms < 60_000 {
+            return Err(Error::invalid(
+                "a schedule's interval is at least 60 seconds",
+            ));
+        }
+        if self.keep_last == 0 {
+            return Err(Error::invalid("a schedule keeps at least one snapshot"));
+        }
+        Ok(())
+    }
+
+    /// The name of the pin made at `ms`: the prefix and a compact UTC time.
+    pub fn name_at(&self, ms: i64) -> String {
+        let t: String = commit::rfc3339_ms(ms)
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == 'T')
+            .take(15)
+            .collect();
+        format!("{}{t}Z", self.prefix)
+    }
+}
+
+/// What a history tick did ([`Store::history_tick`](crate::store::Store::history_tick)).
+#[derive(Clone, Debug, Default)]
+pub struct TickReport {
+    pub created: Vec<String>,
+    pub expired: Vec<String>,
+    pub rotated: Vec<String>,
+    /// warm pins materialized
+    pub warmed: usize,
+    /// commit records pruned from the catalog
+    pub pruned: u64,
 }
 
 /// Why a generation is kept.
@@ -160,11 +287,17 @@ pub struct HistoryStatus {
     pub bytes: u64,
     pub retention: Retention,
     pub snapshots: usize,
+    /// how long the commit catalog keeps metadata
+    pub catalog: CatalogHorizon,
+    /// the oldest commit whose metadata the catalog keeps
+    pub first_commit: u64,
     pub cache_entries: usize,
     pub cache_bytes: u64,
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,
+    /// time spent materializing past states
+    pub materialize_seconds: f64,
 }
 
 impl HistoryStatus {
@@ -208,6 +341,10 @@ struct HistoryFile {
     retention: Retention,
     #[serde(default)]
     snapshots: Vec<PinFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    schedules: Vec<Schedule>,
+    #[serde(default, skip_serializing_if = "CatalogHorizon::is_off")]
+    catalog: CatalogHorizon,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,6 +354,10 @@ struct PinFile {
     created: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    warm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -224,17 +365,27 @@ pub(crate) struct Pin {
     pub seq: u64,
     pub created_ms: i64,
     pub note: Option<String>,
+    pub expires_ms: Option<i64>,
+    /// kept materialized in the history cache
+    pub warm: bool,
 }
 
-/// Pins and retention from `history.json` (none if the file is missing).
-pub(crate) fn read_file(
-    root: &Path,
-    dataset_id: uuid::Uuid,
-) -> Result<(BTreeMap<String, Pin>, Retention)> {
+/// What `history.json` holds.
+#[derive(Default)]
+pub(crate) struct HistoryConfig {
+    pub pins: BTreeMap<String, Pin>,
+    pub retention: Retention,
+    pub schedules: Vec<Schedule>,
+    pub catalog: CatalogHorizon,
+}
+
+/// Pins, retention, schedules and the catalog horizon from `history.json` (none if the
+/// file is missing).
+pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryConfig> {
     let bytes = match std::fs::read(root.join("history.json")) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((BTreeMap::new(), Retention::default()));
+            return Ok(HistoryConfig::default());
         }
         Err(e) => return Err(e.into()),
     };
@@ -263,11 +414,18 @@ pub(crate) fn read_file(
                     seq: p.seq,
                     created_ms,
                     note: p.note,
+                    expires_ms: p.expires.as_deref().and_then(commit::parse_rfc3339_ms),
+                    warm: p.warm,
                 },
             )
         })
         .collect();
-    Ok((pins, f.retention))
+    Ok(HistoryConfig {
+        pins,
+        retention: f.retention,
+        schedules: f.schedules,
+        catalog: f.catalog,
+    })
 }
 
 /// Write `history.json` durably (before anything relies on it).
@@ -276,6 +434,8 @@ pub(crate) fn write_file(
     dataset_id: uuid::Uuid,
     pins: &BTreeMap<String, Pin>,
     retention: Retention,
+    schedules: &[Schedule],
+    catalog: CatalogHorizon,
 ) -> Result<()> {
     let f = HistoryFile {
         format: 1,
@@ -288,8 +448,12 @@ pub(crate) fn write_file(
                 seq: p.seq,
                 created: commit::rfc3339_ms(p.created_ms),
                 note: p.note.clone(),
+                expires: p.expires_ms.map(commit::rfc3339_ms),
+                warm: p.warm,
             })
             .collect(),
+        schedules: schedules.to_vec(),
+        catalog,
     };
     crate::store::write_atomic(
         &root.join("history.json"),
@@ -303,8 +467,8 @@ pub(crate) fn reidentify_file(root: &Path, old: uuid::Uuid, new: uuid::Uuid) -> 
     if !root.join("history.json").exists() {
         return Ok(());
     }
-    let (pins, retention) = read_file(root, old)?;
-    write_file(root, new, &pins, retention)
+    let c = read_file(root, old)?;
+    write_file(root, new, &c.pins, c.retention, &c.schedules, c.catalog)
 }
 
 // ------------------------------------------------------------ generation table ------
@@ -331,10 +495,25 @@ pub(crate) struct Lease {
     pub label: String,
 }
 
+/// A materialized past state in the history cache.
+pub(crate) struct Cached {
+    /// the generation that served it
+    pub generation: u32,
+    pub seq: u64,
+    pub snap: Arc<Snapshot>,
+    /// the memory its delta is estimated to take
+    pub bytes: u64,
+    /// where its commit ends in the generation's log: a later read of a nearby commit
+    /// starts from this state
+    pub end: crate::store::wal::WalPoint,
+}
+
 /// The in-memory history state of a persistent store.
 pub(crate) struct HistoryState {
     pub pins: BTreeMap<String, Pin>,
     pub retention: Retention,
+    pub schedules: Vec<Schedule>,
+    pub catalog: CatalogHorizon,
     /// backup leases by lease id
     pub leases: BTreeMap<u64, Lease>,
     /// the id of the next lease
@@ -343,11 +522,12 @@ pub(crate) struct HistoryState {
     pub gens: BTreeMap<u32, GenEntry>,
     /// sealed generations open for reading, most recent first
     pub open: Vec<(u32, Arc<Generation>)>,
-    /// materialized past states by (generation, commit), most recent first
-    pub cache: Vec<((u32, u64), Arc<Snapshot>, u64)>,
+    /// materialized past states, most recent first
+    pub cache: Vec<Cached>,
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,
+    pub materialize_nanos: u64,
 }
 
 impl HistoryState {
@@ -355,6 +535,8 @@ impl HistoryState {
         HistoryState {
             pins,
             retention,
+            schedules: Vec::new(),
+            catalog: CatalogHorizon::default(),
             leases: BTreeMap::new(),
             next_lease: 1,
             gens: BTreeMap::new(),
@@ -363,6 +545,7 @@ impl HistoryState {
             hits: 0,
             misses: 0,
             materializations: 0,
+            materialize_nanos: 0,
         }
     }
 
@@ -496,8 +679,22 @@ impl HistoryState {
             .collect();
         let pinned = out.len() - window_only.len();
         let allowed = max_gens.saturating_sub(pinned);
+        let mut dropped = 0;
         if window_only.len() > allowed {
-            for no in &window_only[..window_only.len() - allowed] {
+            dropped = window_only.len() - allowed;
+            for no in &window_only[..dropped] {
+                out.remove(no);
+            }
+        }
+        // and at most `max_bytes` of disk, counting every kept generation
+        if let Some(max) = self.retention.max_bytes {
+            let size = |no: &u32| self.gens.get(no).map_or(0, |g| g.bytes);
+            let mut total: u64 = out.keys().map(size).sum();
+            for no in &window_only[dropped..] {
+                if total <= max {
+                    break;
+                }
+                total -= size(no);
                 out.remove(no);
             }
         }
@@ -512,6 +709,67 @@ impl HistoryState {
             }
         }
         out
+    }
+}
+
+/// The history of an in-memory store: the past states that pins and the retention
+/// window keep, as snapshots. Snapshots share their structure, so a state costs only
+/// the delta changes since the one before it, plus the old index while a compaction's
+/// predecessor is kept.
+#[derive(Default)]
+pub(crate) struct MemHistory {
+    pub pins: BTreeMap<String, (Pin, Arc<Snapshot>)>,
+    pub retention: Retention,
+    /// past states kept by the window, oldest first (never the head)
+    pub window: std::collections::VecDeque<Arc<Snapshot>>,
+    pub schedules: Vec<Schedule>,
+    pub hits: u64,
+}
+
+impl MemHistory {
+    /// The kept state of commit `seq`.
+    pub fn get(&self, seq: u64) -> Option<Arc<Snapshot>> {
+        self.window
+            .iter()
+            .find(|s| s.commit == seq)
+            .or_else(|| self.pins.values().map(|p| &p.1).find(|s| s.commit == seq))
+            .cloned()
+    }
+
+    /// The readable commits, the head included, as ascending disjoint ranges.
+    pub fn reconstructable(&self, head: u64) -> Vec<(u64, u64)> {
+        let mut seqs: Vec<u64> = self
+            .window
+            .iter()
+            .map(|s| s.commit)
+            .chain(self.pins.values().map(|p| p.1.commit))
+            .chain(std::iter::once(head))
+            .collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for s in seqs {
+            match out.last_mut() {
+                Some(last) if s == last.1 + 1 => last.1 = s,
+                _ => out.push((s, s)),
+            }
+        }
+        out
+    }
+
+    /// Drop the window's states that it no longer covers (`ts(s)` gives a commit's
+    /// timestamp).
+    pub fn trim(&mut self, head: u64, now_ms: i64, ts: &dyn Fn(u64) -> Option<i64>) {
+        let r = self.retention;
+        let keep = |s: u64| {
+            let by_count = r.keep_commits.is_some_and(|n| n > 0 && s + n > head);
+            // s was the head until ts(s + 1)
+            let by_age = r.keep_age_ms.is_some_and(|age| {
+                ts(s + 1).is_some_and(|t| t > now_ms.saturating_sub(age as i64))
+            });
+            by_count || by_age
+        };
+        self.window.retain(|s| s.commit < head && keep(s.commit));
     }
 }
 
@@ -573,7 +831,9 @@ pub fn retained_offline(
     dataset_id: uuid::Uuid,
     current: u32,
 ) -> Result<BTreeMap<u32, Vec<Hold>>> {
-    let (pins, retention) = read_file(root, dataset_id)?;
+    let HistoryConfig {
+        pins, retention, ..
+    } = read_file(root, dataset_id)?;
     if pins.is_empty() && retention == Retention::default() {
         return Ok(BTreeMap::new());
     }
@@ -618,6 +878,42 @@ pub fn retained_offline(
     Ok(h.needed(current, head, commit::now_ms(), &ts, max_gens))
 }
 
+/// The readable commits of a database, from its files alone (no lock): the ranges of
+/// the current generation and of the older ones still on disk. A generation that the
+/// next collection would remove still counts.
+pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Vec<(u64, u64)>> {
+    let current = std::fs::read_to_string(root.join("CURRENT"))
+        .map(|s| commit::generation_number(s.trim()))
+        .unwrap_or(0);
+    let recs = commit::read_catalog(&root.join("commits.bin"))?
+        .map(|(_, r)| r)
+        .unwrap_or_default();
+    let head = recs.last().map_or(0, |c| c.seq);
+    let mut h = HistoryState::new(BTreeMap::new(), Retention::default());
+    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+        if no > current {
+            continue;
+        }
+        let end = recs
+            .iter()
+            .rev()
+            .find(|c| c.generation == no)
+            .map_or(base.seq, |c| c.seq.max(base.seq));
+        h.gens.insert(
+            no,
+            GenEntry {
+                dir: root.join(&name),
+                name,
+                base,
+                end,
+                fold_legacy,
+                bytes: 0,
+            },
+        );
+    }
+    Ok(h.reconstructable(current, head))
+}
+
 /// Finish interrupted collections: remove `gen-*.deleting` directories.
 pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
     for e in std::fs::read_dir(root)? {
@@ -659,6 +955,8 @@ mod tests {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
+            unvalidated: false,
         }
     }
 
@@ -733,6 +1031,8 @@ mod tests {
                 seq: 3,
                 created_ms: 0,
                 note: None,
+                expires_ms: None,
+                warm: false,
             },
         );
         h.pins.insert(
@@ -741,6 +1041,8 @@ mod tests {
                 seq: 5,
                 created_ms: 0,
                 note: None,
+                expires_ms: None,
+                warm: false,
             },
         );
         let n = h.needed(3, 12, 0, &ts, 8);
@@ -754,6 +1056,8 @@ mod tests {
                 seq: 9,
                 created_ms: 0,
                 note: None,
+                expires_ms: None,
+                warm: false,
             },
         );
         assert!(h.needed(3, 12, 0, &ts, 8).is_empty());
@@ -771,6 +1075,7 @@ mod tests {
         h.retention = Retention {
             keep_commits: None,
             keep_age_ms: Some(7_500),
+            max_bytes: None,
         };
         // now 12 000, cutoff 4 500: s with ts(s) > 4500 → s ≥ 5, so s from 4 is kept
         assert_eq!(
@@ -787,6 +1092,63 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             [2]
+        );
+        // at most `max_bytes` of kept generations: the oldest window-only ones go first
+        h.gens.get_mut(&1).unwrap().bytes = 100;
+        h.gens.get_mut(&2).unwrap().bytes = 50;
+        let keep = |h: &HistoryState| {
+            h.needed(3, 12, 12_000, &ts, 8)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        h.retention.max_bytes = Some(150);
+        assert_eq!(keep(&h), [1, 2]);
+        h.retention.max_bytes = Some(149);
+        assert_eq!(keep(&h), [2]);
+        h.retention.max_bytes = Some(10);
+        assert!(keep(&h).is_empty());
+        // a pin wins over the byte limit
+        h.pins.insert(
+            "p".into(),
+            Pin {
+                seq: 2,
+                created_ms: 0,
+                note: None,
+                expires_ms: None,
+                warm: false,
+            },
+        );
+        assert_eq!(keep(&h), [1]);
+        h.pins.clear();
+        h.retention.max_bytes = None;
+    }
+
+    #[test]
+    fn the_catalog_horizon_keeps_either_limit() {
+        // commit s was made at 1000·s
+        let made_since = |ms: i64| Some(((ms.max(0) + 999) / 1000) as u64).filter(|s| *s <= 50);
+        let h = |n: Option<u64>, a: Option<u64>| CatalogHorizon {
+            keep_commits: n,
+            keep_age_ms: a,
+        };
+        assert_eq!(h(None, None).cutoff(50, 50_000, &made_since), None);
+        assert_eq!(h(Some(5), None).cutoff(50, 50_000, &made_since), Some(46));
+        assert_eq!(h(Some(500), None).cutoff(50, 50_000, &made_since), Some(0));
+        assert_eq!(
+            h(None, Some(10_000)).cutoff(50, 50_000, &made_since),
+            Some(40)
+        );
+        // nothing made recently: only the head
+        assert_eq!(h(None, Some(10)).cutoff(50, 90_000, &made_since), Some(50));
+        // both: what either keeps
+        assert_eq!(
+            h(Some(5), Some(10_000)).cutoff(50, 50_000, &made_since),
+            Some(40)
+        );
+        assert_eq!(
+            h(Some(20), Some(1_000)).cutoff(50, 50_000, &made_since),
+            Some(31)
         );
     }
 

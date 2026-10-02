@@ -53,6 +53,58 @@ pub struct ReasoningInfo {
     /// copied from a clone source whose inferences were already stale
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_stale: bool,
+    /// this dataset's automatic re-runs; `None` follows the server's `--auto-reason`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoSetting>,
+    /// how the last run materialized
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunInfo>,
+}
+
+/// How a materialization ran: in full or incrementally, and what it changed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunInfo {
+    /// `full` or `incremental`
+    pub method: String,
+    /// why a run that could have updated the previous materialization ran in full
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// triples added to and removed from the inferred graph
+    pub inferred_added: u64,
+    pub inferred_removed: u64,
+    /// incremental runs: what changed since the previous run
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<RunChanges>,
+}
+
+/// What an incremental run found changed and did.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChanges {
+    /// default graph triples added and removed since the previous run
+    pub explicit_added: u64,
+    pub explicit_removed: u64,
+    /// derived triples whose other proofs were searched for
+    pub checked: u64,
+    /// derived triples that no longer follow, and new ones (generalized ones included)
+    pub removed: u64,
+    pub derived: u64,
+    /// `memory` (kept by the server) or `store` (read from the dataset)
+    pub source: String,
+}
+
+/// A dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSetting {
+    pub enabled: bool,
+    /// seconds without a commit before a run; the server's, else 5
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_seconds: Option<f64>,
+    /// seconds after which a run starts even while writes continue; 12 × the debounce
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay_seconds: Option<f64>,
 }
 
 pub struct Dataset {
@@ -71,9 +123,15 @@ pub struct Dataset {
     /// taken offline by `POST /$/datasets/{ds}?state=offline` (Fuseki): its services
     /// answer `503` until `?state=active`; not persisted
     pub offline: AtomicBool,
+    /// the closure of the last materialization, for the next incremental run
+    #[cfg(feature = "reasoning")]
+    pub closure: sparkles_reasoner::Cache,
 }
 
 pub use crate::write_validation::Validation;
+
+/// Default of `serve --reason-cache-triples`.
+pub const DEFAULT_REASON_CACHE_TRIPLES: usize = 10_000_000;
 
 /// Install a store's write-time validation from its `validation.json`. A configuration
 /// that cannot be loaded leaves the dataset refusing writes (the store fails closed).
@@ -286,6 +344,9 @@ pub struct AppState {
     pub gsp_direct_naming: bool,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
+    /// the largest closure a dataset keeps in memory for incremental reasoning, in
+    /// triples (`serve --reason-cache-triples`)
+    pub reason_cache_triples: usize,
     /// dataset names being created by a task (clone), with the task id
     reserved: Mutex<BTreeMap<String, String>>,
     /// datasets being replaced in place (an in-place restore), with the task id: every
@@ -304,6 +365,9 @@ pub struct AppState {
     /// `POST /$/format` (`serve --format-*`)
     #[cfg(feature = "fmt")]
     pub format: FormatConf,
+    /// the MCP endpoint `/$/mcp` (`serve --mcp`); `None`: not mounted
+    #[cfg(feature = "mcp")]
+    pub mcp: Option<Arc<crate::mcp::http::HttpConf>>,
 }
 
 /// Who may use `POST /$/format` (`serve --format-endpoint`).
@@ -436,6 +500,11 @@ pub struct Limits {
     pub max_export_bytes: Option<u64>,
     /// rows of any intermediate result
     pub max_rows: usize,
+    /// rows produced by all the operators of one query, summed
+    pub max_rows_produced: Option<u64>,
+    /// the default storage quota of a persistent dataset (`--max-dataset-mb`; the
+    /// stores enforce it, this copy is for display)
+    pub max_dataset_bytes: Option<u64>,
     /// SPARQL updates without a `timeout` parameter (`None`: no limit, the default)
     pub update_timeout: Option<std::time::Duration>,
     /// decompressed size of a compressed request body or uploaded file
@@ -461,6 +530,8 @@ impl Default for Limits {
             max_result_bytes: Some(1 << 30),
             max_export_bytes: None,
             max_rows: 200_000_000,
+            max_rows_produced: None,
+            max_dataset_bytes: None,
             update_timeout: None,
             max_decompressed_bytes: Some(64 << 30),
             max_query_body_bytes: Some(16 << 20),
@@ -475,8 +546,8 @@ impl Default for Limits {
 
 impl Limits {
     /// `{timeoutSeconds, updateTimeoutSeconds, maxTimeoutSeconds, queryMemoryBytes,
-    /// maxResultBytes, maxExportBytes, maxRows, max…BodyBytes, maxUploadBytes}`; 0 means
-    /// unlimited.
+    /// maxResultBytes, maxExportBytes, maxRows, maxRowsProduced, maxDatasetBytes,
+    /// max…BodyBytes, maxUploadBytes}`; 0 means unlimited.
     pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
         let secs = |t: Option<std::time::Duration>| t.map_or(0.0, |t| t.as_secs_f64());
         serde_json::json!({
@@ -487,6 +558,8 @@ impl Limits {
             "maxResultBytes": self.max_result_bytes.unwrap_or(0),
             "maxExportBytes": self.max_export_bytes.unwrap_or(0),
             "maxRows": self.max_rows,
+            "maxRowsProduced": self.max_rows_produced.unwrap_or(0),
+            "maxDatasetBytes": self.max_dataset_bytes.unwrap_or(0),
             "maxQueryBodyBytes": self.max_query_body_bytes.unwrap_or(0),
             "maxUpdateBodyBytes": self.max_update_body_bytes.unwrap_or(0),
             "maxAdminBodyBytes": self.max_admin_body_bytes.unwrap_or(0),
@@ -542,6 +615,7 @@ impl AppState {
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
+            reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -550,6 +624,8 @@ impl AppState {
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         // clones that were being built when the server stopped are never registered
         for e in std::fs::read_dir(data_dir.join("databases"))?.flatten() {
@@ -600,6 +676,7 @@ impl AppState {
             metrics: crate::obs::Metrics::new(false, 100),
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
+            reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -608,6 +685,8 @@ impl AppState {
             task_queue: TaskQueue::new(DEFAULT_MAX_TASKS),
             #[cfg(feature = "fmt")]
             format: FormatConf::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),
@@ -644,6 +723,8 @@ impl AppState {
             validation: RwLock::new(validation),
             validation_metrics,
             offline: AtomicBool::new(false),
+            #[cfg(feature = "reasoning")]
+            closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
         }))
     }
 

@@ -861,3 +861,57 @@ fn nested_responses_are_refused() {
         .join()
         .unwrap();
 }
+
+/// The blank nodes of a SERVICE result are the endpoint's: a label names one node within
+/// one result, never a local stored node, and not the same node in another result.
+#[test]
+fn service_blank_nodes_are_the_endpoints_own() {
+    let body = r#"{"head":{"vars":["x","o"]},"results":{"bindings":[
+        {"x":{"type":"bnode","value":"b0"},"o":{"type":"literal","value":"1"}},
+        {"x":{"type":"bnode","value":"b0"},"o":{"type":"literal","value":"2"}},
+        {"x":{"type":"bnode","value":"r"},"o":{"type":"literal","value":"3"}}]}}"#;
+    let s = Server::start(move |_| {
+        reply(
+            "200 OK",
+            &[("content-type", "application/sparql-results+json")],
+            body.as_bytes(),
+        )
+    });
+    // the local store's first blank node is _:b0
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[sparkles::io::Source::from_bytes(
+            b"_:a <urn:p> \"local\" .".to_vec(),
+            sparkles::io::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let opts = QueryOptions {
+        allow_service: true,
+        outbound: private_ok(),
+        ..Default::default()
+    };
+    let one = |q: &str| {
+        let q = q.replace("URL", &s.url("/sparql"));
+        let r = sparkles::sparql::query(store.snapshot(), &q, &opts).unwrap();
+        let rows = r.rows();
+        assert_eq!(rows.len(), 1, "{q}");
+        rows[0][0].as_ref().unwrap().to_string()
+    };
+    assert_eq!(one("SELECT ?s { ?s <urn:p> ?v }"), "_:b0");
+    assert_eq!(
+        one("SELECT (COUNT(*) AS ?n) { SERVICE <URL> { ?x ?p ?o } ?x <urn:p> ?v }"),
+        "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+    );
+    assert_eq!(
+        one("SELECT (COUNT(DISTINCT ?x) AS ?n) { SERVICE <URL> { ?x ?p ?o } }"),
+        "\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+    );
+    assert_eq!(
+        one(
+            "SELECT (COUNT(*) AS ?n) { SERVICE <URL> { ?x ?p ?o } SERVICE <URL> { ?y ?q ?o2 } \
+             FILTER(sameTerm(?x, ?y)) }"
+        ),
+        "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+    );
+}

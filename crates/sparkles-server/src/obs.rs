@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Span;
 
+mod fuseki;
+
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Dataset label of requests that name no existing dataset.
@@ -79,11 +81,13 @@ pub enum Op {
     Shex,
     Explain,
     Admin,
+    /// a message to the MCP endpoint (`/$/mcp`)
+    Mcp,
     Other,
 }
 
 impl Op {
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 10] = [
         Op::Query,
         Op::Update,
         Op::Gsp,
@@ -92,6 +96,7 @@ impl Op {
         Op::Shex,
         Op::Explain,
         Op::Admin,
+        Op::Mcp,
         Op::Other,
     ];
 
@@ -105,6 +110,7 @@ impl Op {
             Op::Shex => "shex",
             Op::Explain => "explain",
             Op::Admin => "admin",
+            Op::Mcp => "mcp",
             Op::Other => "other",
         }
     }
@@ -221,6 +227,9 @@ fn quiet(route: Option<&str>) -> bool {
 /// content type (a form body is refined by the handler's report).
 fn route_op(route: Option<&str>, req: &Request) -> Op {
     let Some(r) = route else { return Op::Other };
+    if r == "/$/mcp" {
+        return Op::Mcp;
+    }
     if r.starts_with("/$/") {
         return Op::Admin;
     }
@@ -318,6 +327,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         quiet(route.as_deref()),
     );
     pending.otel = otel;
+    pending.fuseki = fuseki::route(route.as_deref());
     let mut resp = next.run(req).await;
     let mut report = resp
         .extensions_mut()
@@ -360,6 +370,8 @@ struct Pending {
     done: bool,
     auth: Option<crate::auth::AuthReport>,
     otel: crate::otel::Req,
+    /// the Fuseki endpoint of the route, if it has one
+    fuseki: Option<fuseki::Route>,
 }
 
 impl Pending {
@@ -377,6 +389,7 @@ impl Pending {
             done: false,
             auth: None,
             otel: Default::default(),
+            fuseki: None,
         }
     }
 
@@ -397,6 +410,11 @@ impl Pending {
             self.st
                 .metrics
                 .record(dataset.as_deref(), op, outcome, elapsed, report);
+            if let Some(r) = self.fuseki {
+                let ok = outcome == Outcome::Ok;
+                let m = &self.st.metrics;
+                m.record_fuseki(dataset.as_deref(), r, op, ok, self.st.read_only);
+            }
         }
         crate::otel::on_response(
             &self.otel,
@@ -581,6 +599,8 @@ pub struct DsMetrics {
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
     /// candidates, exact tests and matches of spatial operators
     geo_work: [AtomicU64; crate::geo::WORK.len()],
+    /// requests per Fuseki endpoint (`--metrics-fuseki-names`)
+    fuseki: fuseki::Counters,
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -591,11 +611,15 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
         BudgetKind::ValidationWork => 5,
+        BudgetKind::RowsProduced => 6,
+        BudgetKind::DatasetBytes => 7,
     }
 }
 
 pub struct Metrics {
     pub enabled: bool,
+    /// also render Fuseki's metric names (`--metrics-fuseki-names`)
+    pub fuseki_names: bool,
     max_datasets: usize,
     datasets: RwLock<BTreeMap<String, Arc<DsMetrics>>>,
     /// in-flight requests per operation of the matched route (kept even when metrics
@@ -607,6 +631,7 @@ impl Metrics {
     pub fn new(enabled: bool, max_datasets: usize) -> Metrics {
         Metrics {
             enabled,
+            fuseki_names: false,
             max_datasets,
             datasets: RwLock::new(BTreeMap::new()),
             active: Default::default(),
@@ -692,24 +717,6 @@ impl Metrics {
         self.max_datasets
     }
 
-    /// Requests to a dataset per operation, as Fuseki's `/$/stats` counts them: those
-    /// that succeeded and those that failed. Empty for a dataset without its own series
-    /// (metrics off, or past `--metrics-max-datasets`).
-    pub fn request_counts(&self, dataset: &str) -> Vec<(Op, u64, u64)> {
-        let Some(m) = self.datasets.read().get(dataset).cloned() else {
-            return Vec::new();
-        };
-        Op::ALL
-            .iter()
-            .map(|&op| {
-                let o = &m.ops[op.index()].outcomes;
-                let all: u64 = o.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-                let good = o[Outcome::Ok.index()].load(Ordering::Relaxed);
-                (op, good, all - good)
-            })
-            .collect()
-    }
-
     /// Drop a deleted dataset's series (a recreated name starts again at zero).
     pub fn forget(&self, dataset: &str) {
         self.datasets.write().remove(dataset);
@@ -746,6 +753,17 @@ const VALIDATION_STATUS: [&str; 7] = [
 const STRATEGIES: [&str; 2] = ["full", "incremental"];
 /// `severity` label values of `sparkles_validation_results_total`.
 const SEVERITIES: [&str; 3] = ["violation", "warning", "info"];
+/// `reason` label values of `sparkles_validation_fallbacks_total` (why a write, or a
+/// shape, was validated in full instead of incrementally).
+const FALLBACKS: [&str; 7] = [
+    "baseline",
+    "shapes",
+    "subclass",
+    "sparql",
+    "recursive",
+    "bulk",
+    "budget",
+];
 
 /// Write-time validation counters of one dataset, fed by its store's guard observer
 /// (every write path: HTTP, MCP, the reasoner) and read when scraped, like the cache
@@ -764,6 +782,8 @@ struct LanguageCounters {
     /// results found by validated writes, by severity (ShEx: nonconformant associations
     /// count as violations)
     results: [AtomicU64; 3],
+    /// validations that fell back to full validation, by reason
+    fallbacks: [AtomicU64; 7],
 }
 
 impl ValidationMetrics {
@@ -821,6 +841,13 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             Strategy::None => return,
         };
         m.duration[strategy].observe(elapsed);
+        if let Some(i) = s
+            .fallback
+            .as_deref()
+            .and_then(|f| FALLBACKS.iter().position(|r| *r == f))
+        {
+            m.fallbacks[i].fetch_add(1, Ordering::Relaxed);
+        }
         let c = &s.by_severity;
         for (i, n) in [c.violation, c.warning, c.info].into_iter().enumerate() {
             m.results[i].fetch_add(n, Ordering::Relaxed);
@@ -873,6 +900,7 @@ struct ValidationTotals {
     /// cumulative buckets and the sum in nanoseconds, per strategy
     duration: [([u64; 17], u64); 2],
     results: [u64; 3],
+    fallbacks: [u64; 7],
 }
 
 /// Validation counters by dataset label and language, for the language of a dataset's
@@ -912,6 +940,9 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
     for (a, c) in t.results.iter_mut().zip(&m.results) {
         *a += c.load(Ordering::Relaxed);
     }
+    for (a, c) in t.fallbacks.iter_mut().zip(&m.fallbacks) {
+        *a += c.load(Ordering::Relaxed);
+    }
 }
 
 /// Scrape-time state of one dataset label (summed over datasets sharing `$other`).
@@ -922,6 +953,8 @@ struct DsGauges {
     delta_deletes: u64,
     wal_bytes: u64,
     disk_bytes: u64,
+    /// storage quotas (0: unlimited)
+    quota_bytes: u64,
     cache_bytes: u64,
     cache_capacity: u64,
     cache_entries: u64,
@@ -952,7 +985,10 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.delta_inserts += snap.delta.inserts() as u64;
         g.delta_deletes += snap.delta.deletes() as u64;
         g.wal_bytes += d.store.wal_bytes();
-        g.disk_bytes += d.store.disk_bytes();
+        // measured at most once a second, like the quota checks of commits
+        let quota = d.store.quota();
+        g.disk_bytes += quota.used_bytes;
+        g.quota_bytes += quota.max_bytes.unwrap_or(0);
         g.cache_bytes += c.bytes();
         g.cache_capacity += opts.cache_bytes;
         g.cache_entries += c.entries() as u64;
@@ -1235,9 +1271,24 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
+    family(
+        &mut o,
+        "sparkles_validation_fallbacks_total",
+        "counter",
+        "Validated writes that ran a full validation instead of an incremental one (or validated some shapes in full), by reason.",
+    );
+    for ((ds, lang), t) in &validation {
+        let ds = escape_label(ds);
+        for (reason, n) in FALLBACKS.iter().zip(t.fallbacks) {
+            let _ = writeln!(
+                o,
+                "sparkles_validation_fallbacks_total{{dataset=\"{ds}\",language=\"{lang}\",reason=\"{reason}\"}} {n}"
+            );
+        }
+    }
 
     type Field = fn(&DsGauges) -> u64;
-    let per_dataset: [(&str, &str, &str, Field); 11] = [
+    let per_dataset: [(&str, &str, &str, Field); 12] = [
         (
             "sparkles_dataset_quads",
             "gauge",
@@ -1255,6 +1306,12 @@ pub fn render_prometheus(st: &AppState) -> String {
             "gauge",
             "Size of the database directory.",
             |g| g.disk_bytes,
+        ),
+        (
+            "sparkles_dataset_quota_bytes",
+            "gauge",
+            "Storage quota of the database directory (0: unlimited).",
+            |g| g.quota_bytes,
         ),
         (
             "sparkles_block_cache_bytes",
@@ -1346,10 +1403,14 @@ pub fn render_prometheus(st: &AppState) -> String {
             g.rcache_entries
         );
     }
+    if st.metrics.fuseki_names {
+        fuseki::render(&mut o, st, &series);
+    }
     crate::auth::render_metrics(st, &mut o);
     #[cfg(feature = "backup")]
     crate::backup::metrics::render(st, &mut o);
     crate::geo::metrics(st, &mut o);
+    crate::http::history::metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
@@ -1428,6 +1489,7 @@ pub fn metrics_json(st: &AppState) -> J {
                 "deltaDeletes": g.delta_deletes,
                 "walBytes": g.wal_bytes,
                 "diskBytes": g.disk_bytes,
+                "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
                 "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
@@ -1500,6 +1562,23 @@ pub async fn metrics_endpoint(State(st): State<Arc<AppState>>, uri: Uri) -> Resp
         .into_response()
 }
 
+/// The router of `--metrics-addr`: `/$/metrics` alone, behind the same authentication,
+/// `metrics` permission and `Host` check as on the main listener. Its requests are not
+/// counted, as on the main listener.
+pub fn metrics_router(st: Arc<AppState>) -> axum::Router {
+    axum::Router::new()
+        .route("/$/metrics", axum::routing::get(metrics_endpoint))
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            crate::auth::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            st.rate_limit.clone(),
+            crate::ratelimit::admit,
+        ))
+        .with_state(st)
+}
+
 // ------------------------------------------------------------------ readiness ------
 
 /// Lifecycle phase of the server.
@@ -1530,6 +1609,19 @@ impl Phase {
     }
 }
 
+/// [`dataset_ready`] for `p`: without the sizes, which count every graph, when its
+/// grants cover only some of the dataset's graphs.
+fn dataset_ready_for(d: &crate::state::Dataset, p: &crate::auth::Principal) -> J {
+    let mut v = dataset_ready(d);
+    if p.restricted(&d.name)
+        && let Some(m) = v.as_object_mut()
+    {
+        m.remove("walBytes");
+        m.remove("deltaQuads");
+    }
+    v
+}
+
 fn dataset_ready(d: &crate::state::Dataset) -> J {
     let snap = d.store.snapshot();
     let mut v = json!({
@@ -1557,7 +1649,7 @@ fn ready_for(st: &AppState, p: &crate::auth::Principal) -> (bool, J) {
         .read()
         .values()
         .filter(|d| all || p.can(&d.name, crate::auth::Level::Read))
-        .map(|d| dataset_ready(d))
+        .map(|d| dataset_ready_for(d, p))
         .collect();
     let ok = phase == Phase::Ready;
     (
@@ -1601,7 +1693,11 @@ pub async fn ready_endpoint(
 }
 
 /// `GET /$/ready/{ds}`: readiness of the server and one dataset; 404 if unknown.
-pub async fn ready_dataset(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+pub async fn ready_dataset(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    axum::Extension(p): axum::Extension<crate::auth::Principal>,
+) -> Response {
     let Some(d) = st.get(&name) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1615,7 +1711,7 @@ pub async fn ready_dataset(State(st): State<Arc<AppState>>, Path(name): Path<Str
         "status": phase.as_str(),
         "ready": ok,
         "uptimeSeconds": st.started.elapsed().as_secs(),
-        "datasets": [dataset_ready(&d)],
+        "datasets": [dataset_ready_for(&d, &p)],
     });
     ready_response(ok, body)
 }

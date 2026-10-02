@@ -54,11 +54,16 @@ mise run ui:mock      # mock API server for UI work without the Rust backend
 mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
 mise run ui:e2e:mock  # UI end-to-end tests against the mock backend
-mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + licenses:check
+mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels, with maturin
+mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
+mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
+mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
 mise run doc          # API docs of the library crates
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
+mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
+mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
@@ -81,7 +86,7 @@ runs every hook over the whole tree.
 ## Testing
 
 ```sh
-mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, license notices
+mise run ci            # formatting, clippy, all workspace tests, svelte-check, UI unit tests, Python binding tests, license notices
 mise run lint:features # clippy over feature combinations (in ci)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
@@ -115,6 +120,29 @@ code and missing gates. Every combination shares the workspace target directory.
 first run builds the dependencies once per feature set. After that, a change costs a
 minute or two.
 
+### Python bindings
+
+`crates/sparkles-py` builds the `sparkles` Python package
+([USAGE](USAGE.md#python), [spec P01](specs/P01-python-bindings.md)). The crate is its
+own cargo workspace, excluded from the root one, so `cargo build`, `mise run lint` and
+`mise run test` neither compile PyO3 nor need Python. It has its own `Cargo.lock`. When
+the library crates gain a dependency, `py:test`, `py:lint` and `mise run licenses` add it
+to that lock, as cargo does with the root lock, and the changed file is committed with
+the rest. `mise run py:lock` refreshes the lock from the root one, so that both resolve
+the same versions. `py:build`, `licenses:check` and the flake's check use the lock as it
+is and fail while it lacks something the crate needs.
+
+`mise run py:test` (`scripts/py-test.sh`) builds the extension with cargo in the root
+`target` directory, so it reuses the workspace's compiled dependencies. It assembles the
+package in `target/py` and runs `crates/sparkles-py/tests` with pytest. The tests include
+mypy's `stubtest`, which checks the `.pyi` stubs against the compiled module, and rdflib
+interoperability tests. Both skip when mypy or rdflib is missing. The dev shell's
+`python3` has pytest, mypy and rdflib. With another `python3`, the script installs pytest
+into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as in
+`mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
+default features and with none. Both tasks are part of `mise run ci`. The first run
+compiles the crate and the engine for the Python build, and later runs take seconds.
+
 `mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
 port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
 configuration with one user and one API token. It then runs the Playwright tests in
@@ -132,6 +160,88 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 [BENCHMARKS.md](BENCHMARKS.md) has the results and describes how each run was set up.
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
+  It compares Sparkles, Jena/Fuseki, QLever, Fluree and Oxigraph over HTTP. Its
+  `--mode` flag, or the `MODE` variable, chooses what it measures.
+
+  ```sh
+  mise run bench 100000 target/bench                   # load, queries and memory
+  mise run bench 100000 target/bench --mode updates    # the queries after 5,000 commits
+  mise run bench 100000 target/bench --mode mixed      # readers and a writer at once
+  mise run bench 100000 target/bench --mode cold       # a restart with a cold page cache per query
+  ```
+
+  The default mode loads every engine, checks the answers and times each query, a
+  single-triple update and the throughput of 16 concurrent clients. Each load runs under
+  GNU `time`, which records its peak RSS, and the index size is the disk space the store
+  takes. The harness reads each server's RSS 2 seconds after it starts, after every query
+  has run once, and after the run. It also records the peak RSS during the throughput
+  run. While it checks the answers, it resets each server's peak RSS before every query
+  (through `/proc/<pid>/clear_refs`) and records how far the peak rose. For Sparkles it
+  also reads the size of the decoded-block cache from `/$/stats`, so the summary can show
+  the RSS without it. These readings go to `results/mem.json` and the memory tables of
+  `results/summary.md`.
+
+  The `updates` mode measures a store that has taken writes. It copies every engine's
+  store into `scratch/` in the workdir and serves the copies. Then it sends each engine
+  the same 5,000 commits (`--churn`), one request each. About 70% insert new
+  `foaf:knows` edges, types and tags, and the rest delete existing `foaf:knows`,
+  `foaf:name` and `rdf:type` triples. `scripts/bench-writes.py` generates these commits
+  once per workdir from `data.nt` with a fixed seed, so every engine gets the same input
+  and the answers stay comparable. The commit rate and latency go to `churn.json`. The
+  queries, the answer check and the memory readings then run on the changed stores, and
+  all results go to `results-updates/`. The harness never compacts the Sparkles copy,
+  and Sparkles does not compact on its own, so its queries read the base index merged
+  with the delta of the commits.
+
+  The `mixed` mode runs each engine alone on a fresh copy of its store. For 30 seconds
+  (`--mixed-seconds`), 16 clients run `star-join` through `oha` while one writer commits
+  single-triple inserts as fast as the engine answers, or at `--write-rate` commits per
+  second. It reports the reads and writes per second and their latency percentiles.
+  Every request opens a new connection, as the curl requests of the other measurements
+  do, because on a reused connection QLever's answers wait about 40 ms for a delayed TCP
+  acknowledgement.
+
+  The `cold` mode stops each engine before every query and evicts its files from the
+  page cache. Then it starts the engine, records the time until it answers, and times one
+  query. It repeats this 3 times (`--cold-runs`) and keeps the median.
+
+  The copies of the `updates` and `mixed` modes are removed at the end of the run unless
+  `KEEP_SCRATCH=1` is set. The servers listen on five ports from `--port-base` (default
+  3931), so runs with different bases can share a machine. Results merge per engine, so
+  `--engines qlever` measures QLever again and keeps the other engines' numbers.
+
+  On a machine with less memory than the engines can use, set `SERVER_MEM_MAX` (for
+  example `SERVER_MEM_MAX=12G`). Each server then runs in a systemd scope with that memory
+  limit and no swap. An engine that exceeds it is killed on its own, and its remaining
+  queries are reported as errors. Without the limit, an engine that grows past the
+  machine's memory can make the whole machine stop responding.
+* `scripts/bench-text.sh` (`mise run bench:text [people] [workdir]`) compares full-text
+  search on the same generated data. Sparkles and Jena Fuseki both answer `text:query`.
+  Fuseki serves a TDB2 store wrapped in a jena-text dataset with a Lucene index, and QLever
+  answers `ql:contains-word` over a text index built from its literals. Fluree is left out
+  because its documentation offers full-text scoring only in JSON-LD queries, and
+  Oxigraph has no text search.
+
+  The script loads each store without timing it, then times each text index build and
+  records the index size on disk. Sparkles and Jena index `foaf:name`, `ex:title` and
+  `rdfs:label`. QLever indexes every literal, since its text index cannot be limited to
+  predicates, so its queries join the matching literal with the predicate. There are six
+  queries. Two take the top 10 by score, one for a rare word and one for a common word.
+  The third counts all hits of the common word, the fourth joins them with a structural
+  pattern, and the fifth asks for two words that must both occur. The sixth returns the
+  hits of the common word with highlighted literals, which QLever cannot produce, so its
+  form returns plain literals and only the counts are compared. Before timing, the script
+  compares every engine's hit counts and hit sets with `scripts/bench-answers.py`. Scores and their order are never compared,
+  because the engines rank differently. QLever builds its index with explicit scoring,
+  because its BM25 and TF-IDF scoring fail on language-tagged literals in version 0.5.48.
+
+  The query words are ones that the Lucene standard analyzer, the Tantivy tokenizer in
+  Sparkles and QLever split and lowercase the same way. A prefix query is left out because
+  QLever returns a row for each matching word, so a name with two matching words counts
+  twice. Sparkles and Jena both take `al*`. The script writes
+  `results/text-summary.md` in the work directory. `DATA` reuses a dataset that
+  `scripts/bench.sh` generated. `PORT_BASE` moves the three servers to the ports after
+  it, and its default is 3940.
 * `scripts/bench-billion.sh` (`mise run bench:billion [scale]`) runs a comparison on real
   data: English DBpedia, release 2022.12.01 (every English file of its generic, mappings
   and text groups, and the DBpedia ontology), 1.24 billion triples in all. The files, their
@@ -174,6 +284,36 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   literals as values, so latitudes written with different precision that round to the
   same float are one triple there and two in Sparkles and QLever (3 triples at `50m`):
   `count-all` and `predicate-counts` then have no majority answer and are not ranked.
+* `scripts/bench-watdiv.sh` (`mise run bench:watdiv [scale] [workdir]`) runs the five
+  engines of `scripts/bench.sh` on WatDiv, the Waterloo SPARQL Diversity Test Suite. Its
+  20 basic query templates cover linear, star, snowflake and complex query shapes. Scale
+  factor 1 generates about 112,000 triples. The default of 100 generates 11.0 million,
+  of which 10.9 million are distinct. The workdir defaults to `target/bench-watdiv`.
+
+  WatDiv's generator is a C++ program, and its source is not part of this repository.
+  The script builds it with Nix from the WatDiv v0.6 release, which
+  `scripts/bench-watdiv/watdiv.nix` pins by checksum, against the nixpkgs revision in
+  `flake.lock`. The release seeds its random generators from the clock and reads the
+  system word list, so the build patches it to use a fixed seed and a pinned word list.
+  The same scale and seed always produce the same data and the same queries. The seed is
+  `WATDIV_SEED` and defaults to 1. The generator, the data and the queries are cached in
+  the workdir.
+
+  The generator often draws the same query instance more than once. The script keeps the
+  first five distinct instances of each template, and `--instances` changes the count.
+  The three complex templates have no parameters, so each of them has a single instance.
+  The engines load and serve the data exactly as in `scripts/bench.sh`, and every
+  engine's answer to every instance is compared before anything is timed.
+
+  `results/summary.md` gives each template's geometric mean over its instances. It then
+  gives the geometric mean of each category and of all templates. These rows only use
+  the templates that every engine answered correctly, so all engines are measured on the
+  same queries. `results/instances.md` lists every instance with its row count and
+  times. `ENGINES=""` only generates the data and the queries.
+
+  WatDiv may be used freely on the condition that publications cite G. Aluç, O. Hartig,
+  M. T. Özsu and K. Daudjee, "Diversified Stress Testing of RDF Data Management
+  Systems", ISWC 2014.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.
@@ -199,11 +339,15 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
   * `sparkles-cli`: the same binary without the UI, so the build needs no Node.js.
   * `sparkles-ui`: the static UI build.
   * `sparkles-fmt-wasm`: the formatter's WebAssembly module, which `sparkles-ui` builds in.
+  * `sparkles-py`: the Python package for nixpkgs' `python3`, built into an abi3 wheel by
+    maturin. The wheel is in its `dist` output.
 * **Other outputs:**
   * `overlays.default`;
   * a dev shell;
   * `checks`:
     * the packages;
+    * `python-bindings`, which builds `sparkles-py` and runs the pytest suite on the
+      installed package;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
     * on Linux, a NixOS VM test of the module behind nginx;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
@@ -225,6 +369,11 @@ Crates that ship no license file get their license's standard text.
 `scripts/third-party-licenses.py` generates the file from `cargo metadata`, so it changes
 only when `Cargo.lock` does. Ship it with binaries. The Nix packages install it as
 `share/doc/sparkles/THIRD_PARTY_LICENSES.md`.
+
+The script also writes `crates/sparkles-py/THIRD_PARTY_LICENSES.md` for the Python wheel
+from that crate's own lock. It lists the crates the extension module links, which are the
+engine's and PyO3's. maturin puts it in the wheel's `licenses/` directory with the
+project's `LICENSE`, as `pyproject.toml` declares. `licenses:check` checks both files.
 
 [`THIRD_PARTY_LICENSES-UI.md`](../THIRD_PARTY_LICENSES-UI.md) does the same for the npm
 packages whose code or fonts end up in the embedded web UI. These are CodeMirror,

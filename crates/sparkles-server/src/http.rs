@@ -22,10 +22,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod budgets;
+mod changes;
+mod conditional;
+mod diff;
 #[cfg(feature = "fmt")]
 mod format;
 mod fuseki;
-mod history;
+pub(crate) mod history;
+mod inline;
 mod jena_formats;
 mod schema;
 mod shex;
@@ -47,11 +52,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
+        header::HeaderName::from_static("sparkles-diff-from"),
+        header::HeaderName::from_static("sparkles-diff-to"),
+        header::HeaderName::from_static("sparkles-diff-added"),
+        header::HeaderName::from_static("sparkles-diff-removed"),
+        header::HeaderName::from_static(changes::SPARKLES_CHANGES_NEXT),
+        header::CONTENT_LOCATION,
+        header::VARY,
         header::LINK,
+        header::ETAG,
         header::RETRY_AFTER,
         header::HeaderName::from_static("ratelimit"),
         header::HeaderName::from_static("ratelimit-policy"),
         header::HeaderName::from_static("traceresponse"),
+        header::HeaderName::from_static("mcp-session-id"),
     ];
     #[cfg(feature = "fmt")]
     exposed.push(header::HeaderName::from_static(
@@ -87,6 +101,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/reason/{ds}",
             get(reason_status).post(reason).delete(unreason),
         )
+        .route(
+            "/$/reason/{ds}/auto",
+            axum::routing::put(reason_auto_set).delete(reason_auto_clear),
+        )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
@@ -97,6 +115,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(text_status).put(text_enable).delete(text_disable),
         )
         .route("/$/text/{ds}/rebuild", post(text_rebuild))
+        .route(
+            "/$/quota/{ds}",
+            get(budgets::get_quota)
+                .put(budgets::put_quota)
+                .delete(budgets::delete_quota),
+        )
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
@@ -115,9 +139,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/{ds}/explain", get(explain).post(explain))
+        .route("/{ds}/text", get(text_search).post(text_search))
+        .route("/{ds}/diff", get(diff::diff))
+        .route("/{ds}/changes", get(changes::changes))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
-        .route("/$/vector/{ds}", get(vector_status))
         .route("/{ds}/prefixes", any(dataset_prefixes))
         .route(
             "/$/snapshots/{ds}",
@@ -141,12 +167,20 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::geo::routes());
     // Fuseki's admin routes that Sparkles has no route of its own for
     let app = app.merge(fuseki::routes());
+    // vector indexes (`/$/vector`)
+    let app = app.merge(crate::vector::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
     // the formatter, with its own body limit
     #[cfg(feature = "fmt")]
     let app = app.merge(format::routes(&state));
+    // the MCP endpoint (`serve --mcp`)
+    #[cfg(feature = "mcp")]
+    let app = match crate::mcp::http::route(&state) {
+        Some(r) => app.route("/$/mcp", r),
+        None => app,
+    };
     let app = app
         // a dataset being replaced in place answers 503 (inside the auth layer, so a
         // hidden dataset stays a 404)
@@ -408,6 +442,7 @@ impl From<Error> for ApiError {
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
@@ -416,6 +451,7 @@ impl From<Error> for ApiError {
             Error::Rejected(r) => return validation::rejection(&r),
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
             Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
+            Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -641,6 +677,13 @@ enum OutFormat {
 }
 
 impl OutFormat {
+    fn file_extension(self) -> &'static str {
+        match self {
+            OutFormat::Rdf(f) => f.file_extension(),
+            OutFormat::Jena(j) => j.file_extension(),
+        }
+    }
+
     fn media_type(self) -> &'static str {
         match self {
             OutFormat::Rdf(f) => results::rdf_media_type(f),
@@ -798,6 +841,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         timeout: Some(timeout),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
@@ -868,14 +912,28 @@ async fn dataset_root(
                 "use POST for SPARQL Update",
             ));
         }
-        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+        if let Some(denied) = crate::auth::dataset_denial(
+            &st,
+            &p,
+            &headers,
+            &name,
+            Level::Write,
+            crate::auth::Endpoint::Update,
+        ) {
             return Ok(denied);
         }
         return update_endpoint(st, Path(name), p, uri, headers, UpdateBody(body)).await;
     }
     // a form with neither a query nor an update: refused as the write any other POST body
     // would be, and never taken for an RDF payload
-    if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+    if let Some(denied) = crate::auth::dataset_denial(
+        &st,
+        &p,
+        &headers,
+        &name,
+        Level::Write,
+        crate::auth::Endpoint::Update,
+    ) {
         return Ok(denied);
     }
     dataset(&st, &name)?;
@@ -919,12 +977,15 @@ async fn query_endpoint(
     }
     crate::obs::log_query_text(&query);
     let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p);
+    // budgets the request asked for, never above the server's
+    let asked = budgets::Overrides::parse(&params)?;
+    asked.apply(&mut opts);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
-    let limit = st.limits.max_result_bytes;
+    let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let thrift = results_thrift(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
@@ -933,7 +994,11 @@ async fn query_endpoint(
     let with_extra = !opts.default_graph_extra.is_empty();
     let at = history::at_param(&params)?;
     let timeout = opts.timeout;
-    let (r, seq, resolved, t0) = blocking({
+    // a query that was quick last time runs in place (see `inline`); past states are
+    // resolved on the blocking pool, since opening one may read from disk
+    let quick_key = inline::QuickQueries::key(&ds.name, &query);
+    let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    let run = {
         let ds = ds.clone();
         move || {
             let t = std::time::Instant::now();
@@ -944,9 +1009,19 @@ async fn query_endpoint(
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
             Ok((r, seq, resolved, t0))
         }
-    })
-    .await
-    .map_err(|e| with_timeout(e, timeout))?;
+    };
+    let ran = if in_place {
+        inline::run(run).and_then(|r| r)
+    } else {
+        blocking(run).await
+    };
+    if ran.is_err() {
+        // a query that failed (a timeout, say) is not known to be quick any more
+        QUICK.record(quick_key, f64::INFINITY);
+    }
+    let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    let query_ms = r.timing.total_ms;
+    let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let sparkles_doc =
         sfmt == SolutionsFormat::Sparkles && (!is_graph || params_wants_sparkles(&headers));
@@ -1016,16 +1091,22 @@ async fn query_endpoint(
     // weak: the serializer thread must not keep the server state (and its stores' locks)
     // alive after the response
     let (metrics_st, name) = (Arc::downgrade(&st), ds.name.clone());
-    let body = stream::serialize(limit, write, move |end| {
-        if let Some(st) = metrics_st.upgrade() {
-            st.metrics
-                .add_response_bytes(Some(&name), Op::Query, end.bytes);
-        }
-        stream_end_log("query", &end);
-    })
-    .await?;
+    // a small result of a query run in place is serialized in place too
+    let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
+        stream::serialize_now(limit, write)?
+    } else {
+        stream::serialize(limit, write, move |end| {
+            if let Some(st) = metrics_st.upgrade() {
+                st.metrics
+                    .add_response_bytes(Some(&name), Op::Query, end.bytes);
+            }
+            stream_end_log("query", &end);
+        })
+        .await?
+    };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
+            QUICK.record(quick_key, query_ms + serialize_ms);
             let report = RequestReport {
                 response_bytes: Some(body.len() as u64),
                 serialize_ms: Some(serialize_ms),
@@ -1033,7 +1114,10 @@ async fn query_endpoint(
             };
             (axum::body::Body::from(body), report)
         }
-        stream::Serialized::Streamed(body) => (body, report),
+        stream::Serialized::Streamed(body) => {
+            QUICK.record(quick_key, f64::INFINITY);
+            (body, report)
+        }
     };
     let resp = with_commit(
         ([(header::CONTENT_TYPE, ct)], body).into_response(),
@@ -1048,6 +1132,10 @@ async fn query_endpoint(
     };
     Ok(report.attach(resp))
 }
+
+/// Query texts whose last run was quick (see `inline`).
+static QUICK: std::sync::LazyLock<inline::QuickQueries> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
 #[allow(clippy::too_many_arguments)]
@@ -1131,38 +1219,6 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
 }
 
-// ------------------------------------------------------------------- vectors ------
-
-/// `GET /$/vector/{ds}`: the vector memory budget and the predicates whose vectors are
-/// packed in the current generation (packing happens on a predicate's first search).
-async fn vector_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
-    let ds = dataset(&st, &name)?;
-    let snap = ds.store.snapshot();
-    let vectors = &snap.generation.vectors;
-    let predicates: Vec<J> = vectors
-        .status()
-        .into_iter()
-        .map(|p| {
-            let iri = match snap.term(Id(p.predicate)) {
-                Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
-                other => other.map(|t| t.to_string()).unwrap_or_default(),
-            };
-            json!({
-                "predicate": iri,
-                "bytes": p.bytes,
-                "malformed": p.malformed,
-                "dimensions": p.dims.iter().map(|(dim, rows)| json!({ "dimension": dim, "vectors": rows })).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({
-        "budgetBytes": sparkles::vector::budget(),
-        "usedBytes": vectors.used_bytes(),
-        "generation": snap.generation.name,
-        "predicates": predicates,
-    })))
-}
-
 // ---------------------------------------------------------------- full-text ------
 
 #[cfg(feature = "text")]
@@ -1239,6 +1295,151 @@ async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
+/// Marks the engine puts around a match in a snippet, replaced by `<mark>` and `</mark>`
+/// once the text is HTML-escaped (private-use characters).
+#[cfg(feature = "text")]
+const MARK: (char, char) = ('\u{e000}', '\u{e001}');
+
+/// `GET` or `POST /{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=`: the best hits
+/// of a `text:query`, each with its subject, score, literal, predicate and graph, and,
+/// unless `highlight=false`, an HTML snippet of the literal with the matches in `<mark>`.
+#[cfg(feature = "text")]
+async fn text_search(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    method: Method,
+    uri: Uri,
+    QueryBody(body): QueryBody,
+) -> ApiResult {
+    use oxrdf::{Literal, NamedNode, Term};
+    let ds = dataset(&st, &name)?;
+    let mut params = Params::from_query(&uri);
+    if method == Method::POST {
+        params.extend_form(&body);
+    }
+    let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+    let q = params
+        .get("q")
+        .filter(|q| !q.trim().is_empty())
+        .ok_or_else(|| bad("q: required".into()))?
+        .to_string();
+    let limit = match params.get("limit") {
+        None => 20,
+        Some(l) => match l.parse::<usize>() {
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => return Err(bad("limit: between 1 and 1000".into())),
+        },
+    };
+    let iri = |k: &str, v: &str| {
+        NamedNode::new(v)
+            .map(|n| n.to_string())
+            .map_err(|_| bad(format!("{k}: {v:?} is not an IRI")))
+    };
+    // the call's arguments, serialized by oxrdf (escaped)
+    let mut args = params
+        .all("predicate")
+        .iter()
+        .map(|v| iri("predicate", v))
+        .collect::<ApiResult<Vec<String>>>()?;
+    args.push(Literal::new_simple_literal(q.as_str()).to_string());
+    args.push(limit.to_string());
+    if let Some(l) = params.get("lang") {
+        if l.is_empty() || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+            return Err(bad(format!("lang: {l:?} is not a language tag")));
+        }
+        args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
+    }
+    let highlight = params.get("highlight").is_none_or(truthy);
+    if highlight {
+        args.push(
+            Literal::new_simple_literal(format!("highlight:s:{} | e:{} | f:…", MARK.0, MARK.1))
+                .to_string(),
+        );
+    }
+    let call = format!(
+        "(?s ?score ?lit ?g ?p) <http://jena.apache.org/text#query> ({})",
+        args.join(" ")
+    );
+    let pattern = match params.get("graph") {
+        Some(g) => format!("GRAPH {} {{ {call} }}", iri("graph", g)?),
+        None => call,
+    };
+    let query = format!("SELECT ?s ?score ?lit ?g ?p WHERE {{ {pattern} }} ORDER BY DESC(?score)");
+    let mut opts = query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+    blocking(move || {
+        let snap = ds.store.snapshot();
+        let seq = snap.commit;
+        let r = sparkles::sparql::query(snap, &query, &opts)?;
+        let hits: Vec<J> = r
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let get = |i: usize| row.get(i).cloned().flatten();
+                let mut h = serde_json::Map::new();
+                if let Some(s) = get(0) {
+                    h.insert("s".into(), sparkles::sparql::results::term_json(&s));
+                }
+                if let Some(Term::Literal(sc)) = get(1) {
+                    h.insert("score".into(), json!(sc.value().parse::<f64>().ok()));
+                }
+                if let Some(Term::Literal(l)) = get(2) {
+                    let text = l.value();
+                    if highlight {
+                        let mut html = String::with_capacity(text.len() + 16);
+                        for c in text.chars() {
+                            match c {
+                                '&' => html.push_str("&amp;"),
+                                '<' => html.push_str("&lt;"),
+                                '>' => html.push_str("&gt;"),
+                                '"' => html.push_str("&quot;"),
+                                '\'' => html.push_str("&#39;"),
+                                c if c == MARK.0 => html.push_str("<mark>"),
+                                c if c == MARK.1 => html.push_str("</mark>"),
+                                c => html.push(c),
+                            }
+                        }
+                        h.insert("snippet".into(), html.into());
+                    }
+                    let plain: String = text
+                        .chars()
+                        .filter(|c| *c != MARK.0 && *c != MARK.1)
+                        .collect();
+                    let lit = match l.language() {
+                        Some(lang) => Literal::new_language_tagged_literal_unchecked(plain, lang),
+                        None => Literal::new_typed_literal(plain, l.datatype()),
+                    };
+                    h.insert(
+                        "literal".into(),
+                        sparkles::sparql::results::term_json(&Term::Literal(lit)),
+                    );
+                }
+                for (i, k) in [(3, "g"), (4, "p")] {
+                    if let Some(t) = get(i) {
+                        h.insert(k.into(), sparkles::sparql::results::term_json(&t));
+                    }
+                }
+                J::Object(h)
+            })
+            .collect();
+        let resp = Json(json!({
+            "dataset": ds.name,
+            "commit": seq,
+            "limited": hits.len() == limit,
+            "hits": hits,
+        }))
+        .into_response();
+        Ok(with_commit(resp, &ds, seq))
+    })
+    .await
+}
+
+#[cfg(not(feature = "text"))]
+async fn text_search() -> ApiResult {
+    Err(sparkles::text::not_built().into())
+}
+
 #[cfg(not(feature = "text"))]
 async fn text_status() -> ApiResult<Json<J>> {
     Err(sparkles::text::not_built().into())
@@ -1275,24 +1476,47 @@ fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
 
 /// The client asked for a commit receipt: `receipt=true`, or an `Accept` that names the
 /// Sparkles media type (`*/*` does not count).
+/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes).
+#[cfg(feature = "mcp")]
+pub(crate) fn commit_message_header(h: &HeaderMap) -> Result<Option<Arc<str>>, String> {
+    conditional::commit_message(h).map_err(|e| {
+        e.1["error"]
+            .as_str()
+            .unwrap_or("invalid Sparkles-Commit-Message")
+            .to_string()
+    })
+}
+
 fn receipt_wanted(params: &Params, headers: &HeaderMap) -> bool {
     params.get("receipt").is_some_and(truthy) || params_wants_sparkles(headers)
 }
 
 /// A write response: `body` as JSON, plus the receipt members when asked for (as the
 /// Sparkles media type), plus the commit headers.
+/// The response to a write. `restricted`: the caller's grants cover only some graphs,
+/// so the receipt leaves out the commit's quad counts and the guard's validation summary,
+/// which cover every graph.
 fn write_response(
     ds: &Dataset,
     status: StatusCode,
     body: Option<J>,
     receipt: &sparkles::commit::Receipt,
     wanted: bool,
+    restricted: bool,
 ) -> Response {
     crate::otel::commit(receipt);
-    let validation = receipt.validation.clone();
+    let validation = receipt.validation.clone().filter(|_| !restricted);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
-        if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
+        if let (Some(m), Ok(J::Object(mut rm))) =
+            (doc.as_object_mut(), serde_json::to_value(receipt))
+        {
+            if restricted {
+                rm.remove("validation");
+                if let Some(c) = rm.get_mut("commit") {
+                    redact_commit_json(c);
+                }
+            }
             m.insert("dataset".into(), ds.name.clone().into());
             m.extend(rm);
         }
@@ -1319,6 +1543,39 @@ fn write_response(
     )
 }
 
+/// Leave out of a commit's JSON what describes every graph of the dataset: its quad
+/// counts, whether they are exact, whether it touched the default graph, and its change
+/// digest (which could confirm a guess at a hidden change).
+pub(crate) fn redact_commit_json(c: &mut J) {
+    if let Some(m) = c.as_object_mut() {
+        for k in [
+            "inserted",
+            "deleted",
+            "quads",
+            "exact",
+            "digest",
+            "defaultGraph",
+        ] {
+            m.remove(k);
+        }
+    }
+}
+
+/// An error of a write for a caller whose grants cover only some graphs: a refusal by
+/// the write guard without its results, which can quote any graph.
+pub(crate) fn write_error(e: Error, restricted: bool) -> ApiError {
+    match e {
+        Error::Rejected(r) if restricted => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "error": "the write does not conform to the dataset's validation guard; nothing was committed",
+                "head": r.head,
+            }),
+        ),
+        e => e.into(),
+    }
+}
+
 /// Parse `N`, `commit:N` or `head` (resolved by the caller).
 fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
     if s == "head" {
@@ -1331,7 +1588,12 @@ fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
         .map(Some)
 }
 
-async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult<Json<J>> {
+async fn list_commits(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Json<J>> {
     use sparkles::commit::CommitRange;
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -1384,7 +1646,10 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
         }
         _ => None,
     };
-    let (oldest, reconstructable, commits) = history::commit_list_extras(&ds, &page.commits);
+    let (oldest, reconstructable, mut commits) = history::commit_list_extras(&ds, &page.commits);
+    if p.restricted(&ds.name) {
+        commits.iter_mut().for_each(redact_commit_json);
+    }
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
@@ -1401,6 +1666,7 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
 async fn get_commit(
     State(st): St,
     Path((name, reference)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
     let head = ds.store.head_commit();
@@ -1424,10 +1690,19 @@ async fn get_commit(
             format!("commit metadata before {} is no longer retained", seq + 1),
         )
     })?;
+    let note = ds.store.annotation(seq);
+    let commit = sparkles::commit::AnnotatedCommit {
+        commit: &c,
+        annotation: note.as_ref(),
+    };
+    let mut commit = json!(commit);
+    if p.restricted(&ds.name) {
+        redact_commit_json(&mut commit);
+    }
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
-        "commit": c,
+        "commit": commit,
     })))
 }
 
@@ -1468,10 +1743,13 @@ async fn update_endpoint(
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         ..Default::default()
     };
-    crate::auth::restrict(&mut opts, &p);
+    budgets::Overrides::parse(&params)?.apply(&mut opts);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
+    opts.write.graphs = opts.graphs.clone();
     // a client that disconnects drops this future: the update stops at its next check
     // (or while it waits for the writer lock) and commits nothing
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -1479,33 +1757,69 @@ async fn update_endpoint(
     opts.write.cancel = Some(cancel);
     let wanted = receipt_wanted(&params, &headers);
     let timeout = opts.timeout;
-    blocking(move || {
+    let restricted = opts.graphs.is_some();
+    let run = |ds: &Dataset, update: &str, opts: &QueryOptions| {
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
             &ds.store,
-            &update,
-            &opts,
+            update,
+            opts,
             sparkles::commit::CommitKind::Update,
         )?;
         crate::otel::update_done(t0, &stats);
-        let receipt = stats.commit.clone().expect("update receipts");
-        let report = RequestReport {
-            operation: Some(Op::Update),
-            rows: Some(stats.inserted + stats.deleted),
-            mem_peak_bytes: Some(stats.mem_peak_bytes),
-            ..Default::default()
-        };
-        let body = serde_json::to_value(&stats).unwrap();
-        Ok(report.attach(write_response(
-            &ds,
-            StatusCode::OK,
-            Some(body),
-            &receipt,
-            wanted,
-        )))
+        Ok(stats)
+    };
+    // a small update that only inserts or deletes data runs in place (see `inline`),
+    // unless it would wait for another write or for write-time validation
+    if update.len() <= inline::QUICK_UPDATE_BYTES
+        && inline::available()
+        && ds.store.guard().is_none()
+        && sparkles::sparql::update::data_only(&update, &opts)
+    {
+        let mut now = opts.clone();
+        now.write.no_wait = true;
+        match inline::run(|| run(&ds, &update, &now)) {
+            Ok(Err(Error::WriterBusy)) => {}
+            Ok(r) => {
+                return r
+                    .map_err(|e| write_error(e, restricted))
+                    .map(|stats| update_response(&ds, stats, wanted, restricted))
+                    .map_err(|e| with_timeout(e, timeout));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    blocking(move || {
+        let stats = run(&ds, &update, &opts).map_err(|e| write_error(e, restricted))?;
+        Ok(update_response(&ds, stats, wanted, restricted))
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
+}
+
+/// The response to a SPARQL Update: its statistics, and the receipt when `wanted`.
+fn update_response(
+    ds: &Dataset,
+    stats: sparkles::sparql::update::UpdateStats,
+    wanted: bool,
+    restricted: bool,
+) -> Response {
+    let receipt = stats.commit.clone().expect("update receipts");
+    let report = RequestReport {
+        operation: Some(Op::Update),
+        rows: Some(stats.inserted + stats.deleted),
+        mem_peak_bytes: Some(stats.mem_peak_bytes),
+        ..Default::default()
+    };
+    let body = serde_json::to_value(&stats).unwrap();
+    report.attach(write_response(
+        ds,
+        StatusCode::OK,
+        Some(body),
+        &receipt,
+        wanted,
+        restricted,
+    ))
 }
 
 async fn explain(
@@ -1529,7 +1843,7 @@ async fn explain(
         params.get("query").unwrap_or_default().to_string()
     };
     let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
@@ -1929,6 +2243,7 @@ async fn graph_body(
     snap: Arc<sparkles::store::Snapshot>,
     what: Export,
     fmt: OutFormat,
+    view: Option<Arc<sparkles::access::GraphAccess>>,
 ) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
     let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = quads.clone();
@@ -1945,8 +2260,18 @@ async fn graph_body(
         };
         let mut n = 0u64;
         let mut last: Option<[u64; 3]> = None;
+        // the whole dataset through a graph view: the quads of the graphs it reads
+        let mut readable: std::collections::HashMap<u64, bool> = Default::default();
+        let view = view.filter(|v| !v.reads_all());
         let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
             let quad = perm.to_quad(k);
+            if let Some(v) = &view
+                && !*readable
+                    .entry(quad[3].0)
+                    .or_insert_with(|| v.readable_id(&snap, quad[3]))
+            {
+                return Ok(());
+            }
             if let Export::Union = what {
                 let spo = [quad[0].0, quad[1].0, quad[2].0];
                 if quad[3] == Id::DEFAULT_GRAPH || last == Some(spo) {
@@ -2030,7 +2355,14 @@ async fn gsp_on(
 ) -> ApiResult {
     // every write needs write access, whichever route (or fallthrough) led here
     if !matches!(method, Method::GET | Method::HEAD)
-        && let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write)
+        && let Some(denied) = crate::auth::dataset_denial(
+            &st,
+            &p,
+            &headers,
+            &name,
+            Level::Write,
+            crate::auth::Endpoint::GspRw,
+        )
     {
         return Ok(denied);
     }
@@ -2046,6 +2378,38 @@ async fn gsp_on(
             "the union graph is read-only: name a graph, or the default graph",
         ));
     }
+    let reads = matches!(method, Method::GET | Method::HEAD);
+    let view = p.view(
+        &name,
+        if reads {
+            crate::auth::Endpoint::GspR
+        } else {
+            crate::auth::Endpoint::GspRw
+        },
+    );
+    let restricted = view.is_some();
+    // a write to a graph outside the caller's write graphs is refused before the body is
+    // read or the graph looked up
+    if !reads && let Some(v) = &view {
+        let ok = match &target {
+            Target::Default => v.writable(None),
+            Target::Named(iri) => v.writable_iri(iri),
+            // replacing or clearing everything needs every graph; a POST of quads is
+            // checked quad by quad
+            Target::Dataset => method == Method::POST,
+            Target::Union => false,
+        };
+        if !ok {
+            let msg = match &target {
+                Target::Default => format!("write access to the default graph of /{name} required"),
+                Target::Named(iri) => format!("write access to graph <{iri}> of /{name} required"),
+                Target::Dataset | Target::Union => {
+                    format!("write access to every graph of /{name} required")
+                }
+            };
+            return Ok(crate::auth::forbidden(&p, &msg));
+        }
+    }
     match method {
         Method::GET | Method::HEAD => {
             let quads = matches!(target, Target::Dataset);
@@ -2053,10 +2417,43 @@ async fn gsp_on(
             let head = method == Method::HEAD;
             // resolve the graph (or 404) before the response starts
             let at = history::at_param(&params)?;
+            // without `at`, the resource is its own Memento TimeGate (RFC 7089)
+            let datetime = match at {
+                None => history::accept_datetime(&headers)?,
+                Some(_) => None,
+            };
             let opts = query_options(&st, &ds, &params);
+            let hidden = |t: &Target| match (&view, t) {
+                (Some(v), Target::Default) => !v.read.default_graph(),
+                (Some(v), Target::Named(iri)) => !v.read.allows_iri(iri),
+                _ => false,
+            };
+            // a graph the caller cannot read answers like a missing one
+            match &target {
+                Target::Default if hidden(&target) => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "no such graph: <{}>",
+                            sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
+                        ),
+                    ));
+                }
+                Target::Named(iri) if hidden(&target) => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("no such graph: <{iri}>"),
+                    ));
+                }
+                _ => {}
+            }
             let (snap, what, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
+                    let at = match datetime {
+                        Some(ms) => Some(history::negotiate_datetime(&ds, ms)?),
+                        None => at,
+                    };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
                     let what = match &target {
                         Target::Default => Export::Graph(Id::DEFAULT_GRAPH),
@@ -2080,18 +2477,36 @@ async fn gsp_on(
                 operation: Some(Op::Gsp),
                 ..Default::default()
             };
-            let resp = if head {
-                ct.into_response()
-            } else {
-                let (body, whole) = graph_body(st.clone(), ds.clone(), snap, what, fmt).await?;
-                if let Some((bytes, quads)) = whole {
-                    report.response_bytes = Some(bytes);
-                    report.rows = Some(quads);
+            let id = ds.store.dataset_id();
+            let tag = conditional::etag(id, seq, fmt.file_extension());
+            let negotiated = format_param(&params).is_none();
+            let resp = match conditional::check_read(&headers, id, seq, &tag)? {
+                conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
+                conditional::ReadOutcome::Send if head => ct.into_response(),
+                conditional::ReadOutcome::Send => {
+                    let (body, whole) =
+                        graph_body(st.clone(), ds.clone(), snap, what, fmt, view.clone()).await?;
+                    if let Some((bytes, quads)) = whole {
+                        report.response_bytes = Some(bytes);
+                        report.rows = Some(quads);
+                    }
+                    (ct, body).into_response()
                 }
-                (ct, body).into_response()
             };
-            let resp = with_commit(resp, &ds, seq);
-            Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
+            let resp = with_commit(conditional::with_etag(resp, &tag, negotiated), &ds, seq);
+            let resp = match (&resolved, datetime) {
+                (Some(r), Some(_)) => history::memento_headers(resp, r, &uri),
+                (None, _) => {
+                    let mut resp = resp;
+                    resp.headers_mut().append(
+                        header::VARY,
+                        header::HeaderValue::from_static("accept-datetime"),
+                    );
+                    resp
+                }
+                (Some(_), None) => history::history_headers(resp, resolved.as_ref(), &uri),
+            };
+            Ok(report.attach(resp))
         }
         Method::PUT | Method::POST => {
             if st.read_only {
@@ -2117,7 +2532,10 @@ async fn gsp_on(
             };
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
+            wopts.opts.graphs = view.clone();
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -2143,9 +2561,13 @@ async fn gsp_on(
                         None => ReplaceTarget::Default,
                     };
                     ds.store
-                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)?
+                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)
+                        .map_err(|e| write_error(e, restricted))?
                 } else {
-                    let r = ds.store.load_with(&[src], CommitKind::GspPost, &wopts)?;
+                    let r = ds
+                        .store
+                        .load_with(&[src], CommitKind::GspPost, &wopts)
+                        .map_err(|e| write_error(e, restricted))?;
                     (if r.committed { r.commit.inserted } else { 0 }, r)
                 };
                 let status = if replace {
@@ -2160,6 +2582,7 @@ async fn gsp_on(
                     Some(body),
                     &receipt,
                     wanted,
+                    restricted,
                 )))
             })
             .await
@@ -2171,7 +2594,10 @@ async fn gsp_on(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
+            wopts.opts.graphs = view.clone();
             let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -2198,11 +2624,13 @@ async fn gsp_on(
                     &QueryOptions {
                         timeout,
                         cancel: wopts.cancel.clone(),
+                        graphs: wopts.graphs.clone(),
                         write: wopts,
                         ..Default::default()
                     },
                     sparkles::commit::CommitKind::GspDelete,
-                )?;
+                )
+                .map_err(|e| write_error(e, restricted))?;
                 let receipt = stats.commit.clone().expect("update receipts");
                 Ok(write_report(Op::Gsp, stats.deleted).attach(write_response(
                     &ds,
@@ -2210,6 +2638,7 @@ async fn gsp_on(
                     None,
                     &receipt,
                     wanted,
+                    restricted,
                 )))
             })
             .await
@@ -2233,7 +2662,13 @@ async fn upload(
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
-    let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    // each quad must land in a graph the caller may write
+    wopts.opts.graphs = request
+        .extensions()
+        .get::<Principal>()
+        .and_then(|p| p.view(&name, crate::auth::Endpoint::Upload));
+    let restricted = wopts.opts.graphs.is_some();
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -2365,7 +2800,8 @@ async fn upload(
             .collect::<Result<Vec<_>, _>>()?;
         let receipt = ds
             .store
-            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)?;
+            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)
+            .map_err(|e| write_error(e, restricted))?;
         let count = if receipt.committed {
             receipt.commit.inserted
         } else {
@@ -2379,6 +2815,7 @@ async fn upload(
             Some(body),
             &receipt,
             wanted,
+            restricted,
         )))
     })
     .await
@@ -2466,7 +2903,34 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
+    if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
+        redact_dataset_info(&mut info);
+        // the quads the caller can read
+        if let Ok(n) = v.visible_quads(&d.store.snapshot()) {
+            info["quads"] = n.into();
+        }
+    }
     info
+}
+
+/// Leave out of a `DatasetInfo` the figures that count every graph (quads, index
+/// entries, inferences), for a caller whose grants cover only some graphs; `graphs:
+/// "limited"` says so. The caller fills in the quads it can read.
+pub(crate) fn redact_dataset_info(info: &mut J) {
+    if let Some(m) = info.as_object_mut() {
+        m.remove("quads");
+        for k in ["text", "geo", "reasoning"] {
+            if let Some(J::Object(o)) = m.get_mut(k) {
+                o.retain(|k, _| {
+                    matches!(
+                        k.as_str(),
+                        "state" | "profile" | "stale" | "at" | "commit" | "commitsSince"
+                    )
+                });
+            }
+        }
+        m.insert("graphs".into(), "limited".into());
+    }
 }
 
 /// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
@@ -2637,6 +3101,9 @@ async fn clone_dataset(
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            if let Some(a) = v["at"].as_str() {
+                params.0.push(("at".into(), a.to_string()));
+            }
             let get = |k: &str| v[k].as_str().or_else(|| params.get(k)).map(str::to_string);
             (get("name"), get("inferences"), get("type"))
         } else {
@@ -2644,6 +3111,12 @@ async fn clone_dataset(
             let get = |k: &str| params.get(k).map(str::to_string);
             (get("name"), get("inferences"), get("type"))
         };
+    // a past state: checked (and materialized) before the task starts
+    let at = history::at_param(&params)?;
+    if let Some(a) = at.clone() {
+        let src = src.clone();
+        blocking(move || Ok(src.store.snapshot_at(&a, &Default::default()).map(|_| ())?)).await?;
+    }
     let name = name.unwrap_or_default().trim_start_matches('/').to_string();
     if !crate::state::valid_name(&name) {
         return Err(err(
@@ -2686,7 +3159,7 @@ async fn clone_dataset(
         let progress: sparkles::store::ProgressFn =
             Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
         let reasoning = src.reasoning.read().clone();
-        let rep = crate::clone::clone_into(
+        let rep = crate::clone::clone_into_at(
             &src.store,
             &src.name,
             reasoning,
@@ -2695,6 +3168,7 @@ async fn clone_dataset(
             inferences,
             Some(progress),
             Some(h.cancel_flag()),
+            at,
         )?;
         // the clone is in place: registering it is no longer undone by a cancel
         h.set_cancellable(false);
@@ -2731,13 +3205,16 @@ async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
     }
 }
 
-async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
+async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let reasoning = crate::reasoning::status_json(&st, &ds);
     // Fuseki's form: `{datasets: {"/ds": counters}}`
     let fuseki = json!({ format!("/{name}"): fuseki::fuseki_stats(&st, &ds) });
+    let params = Params::from_query(&uri);
+    let at = history::at_param(&params)?;
+    let opts = query_options(&st, &ds, &params);
     blocking(move || {
-        let snap = ds.store.snapshot();
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let gen_ = &snap.generation;
         let term = |id: u64| {
             snap.term(Id(id)).map(|t| match t {
@@ -2801,8 +3278,17 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             .collect();
         let cache = ds.store.cache();
         let rcache = ds.store.result_cache();
-        Ok(Json(json!({
+        let h = ds.store.history();
+        let resp = Json(json!({
             "name": ds.name,
+            "commit": snap.commit,
+            "at": resolved.as_ref().map(|r| r.at.to_string()),
+            "history": {
+                "bytes": h.bytes,
+                "generations": h.generations.iter().filter(|g| !g.current).count(),
+                "snapshots": h.snapshots,
+                "oldestReconstructable": h.oldest_reconstructable(),
+            },
             "quads": snap.len(),
             "baseQuads": gen_.meta.quads,
             "deltaInserts": snap.delta.inserts(),
@@ -2813,6 +3299,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             "predicates": predicates,
             "classes": classes,
             "diskBytes": ds.store.disk_bytes(),
+            "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
             "reasoning": reasoning,
             "datasets": fuseki,
             "geo": crate::geo::status_json(&ds),
@@ -2830,7 +3317,9 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
                 "misses": rcache.misses(),
             },
         }))
-        .into_response())
+        .into_response();
+        let resp = with_commit(resp, &ds, snap.commit);
+        Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await
 }
@@ -3055,6 +3544,20 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
         None => Codec::dump_default(),
     };
     let level = backup_level(codec, params.get("level"))?.map(Level);
+    // a past state: resolved (and checked readable) before the task starts
+    let at = match history::at_param(&params)? {
+        Some(a) => {
+            let ds = ds.clone();
+            Some(
+                blocking(move || {
+                    let (_, r) = ds.store.snapshot_at(&a, &Default::default())?;
+                    Ok(sparkles::history::At::Commit(r.commit.seq))
+                })
+                .await?,
+            )
+        }
+        None => None,
+    };
     task_start_check(&st, Some("backup"), &name)?;
     let dir = st.data_dir.join("backups");
     let reserve = st.limits.min_free_disk_bytes;
@@ -3082,7 +3585,11 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
         let t = std::time::Instant::now();
         std::fs::create_dir_all(&dir)?;
         let ts = sparkles::builder::now_rfc3339().replace(':', "-");
-        let path = dir.join(format!("{}_{ts}.nq{}", ds.name, codec.extension()));
+        let at_part = match &at {
+            Some(sparkles::history::At::Commit(n)) => format!("_commit-{n}"),
+            _ => String::new(),
+        };
+        let path = dir.join(format!("{}_{ts}{at_part}.nq{}", ds.name, codec.extension()));
         // written under a temporary name, so a failed backup leaves no partial file
         let tmp = tempfile::Builder::new()
             .prefix(".backup-")
@@ -3096,7 +3603,10 @@ pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) ->
         };
         let written = (|| -> sparkles::Result<()> {
             let mut w = codec.writer(out, level, threads)?;
-            ds.store.dump_nquads(&mut w)?;
+            match &at {
+                Some(a) => ds.store.dump_nquads_at(a, &mut w)?,
+                None => ds.store.dump_nquads(&mut w)?,
+            };
             w.finish()?;
             Ok(())
         })();
@@ -3130,7 +3640,7 @@ async fn reason(
     }
     let ds = dataset(&st, &name)?;
     let query = Params::from_query(&uri);
-    let (profile_name, rules, rerun, vocabularies, geo_default_geometry) =
+    let (profile_name, rules, rerun, vocabularies, geo_default_geometry, full) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3159,6 +3669,7 @@ async fn reason(
                 v["rerun"].as_bool().unwrap_or(false),
                 vocabularies,
                 v["geoDefaultGeometry"].as_bool().unwrap_or(false),
+                v["full"].as_bool().unwrap_or(false),
             )
         } else {
             let mut p = Params::default();
@@ -3169,9 +3680,11 @@ async fn reason(
                 p.get("rerun").is_some_and(truthy),
                 p.all("vocabulary"),
                 p.get("geoDefaultGeometry").is_some_and(truthy),
+                p.get("full").is_some_and(truthy),
             )
         };
     let rerun = rerun || query.get("rerun").is_some_and(truthy);
+    let full = full || query.get("full").is_some_and(truthy);
     let recorded = if rerun {
         // the recorded profile, including its custom rules and extras
         let info = ds
@@ -3208,7 +3721,14 @@ async fn reason(
         })?
     };
     task_start_check(&st, None, &name)?;
-    let task = crate::reasoning::start_reason(&st, ds, profile, extras, false);
+    let task = crate::reasoning::start_reason(
+        &st,
+        ds,
+        profile,
+        extras,
+        crate::reasoning::Trigger::Request,
+        !full,
+    );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
@@ -3221,6 +3741,7 @@ async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
     let st2 = st.clone();
     blocking(move || {
         let n = sparkles_reasoner::clear(&ds.store)?;
+        ds.closure.clear();
         ds.set_reasoning(None)?;
         st2.save_registry()?;
         Ok(Json(json!({ "removed": n })).into_response())
@@ -3244,6 +3765,81 @@ async fn unreason() -> ApiResult {
     ))
 }
 
+/// `PUT /$/reason/{ds}/auto`: the dataset's own automatic re-run setting,
+/// `{"enabled": bool, "debounceSeconds"?: number, "maxDelaySeconds"?: number}`. Answers
+/// with the reasoning status.
+async fn reason_auto_set(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Json<J>> {
+    let bad = |m: &str| err(StatusCode::BAD_REQUEST, m.to_string());
+    let v: J = serde_json::from_slice(&body).map_err(|e| bad(&e.to_string()))?;
+    let enabled = v["enabled"]
+        .as_bool()
+        .ok_or_else(|| bad("enabled must be true or false"))?;
+    let secs = |k: &str| match &v[k] {
+        J::Null => Ok(None),
+        x => x
+            .as_f64()
+            .filter(|s| s.is_finite() && (0.0..=86_400.0 * 365.0).contains(s))
+            .map(Some)
+            .ok_or_else(|| bad(&format!("{k} must be a number of seconds"))),
+    };
+    let setting = crate::state::AutoSetting {
+        enabled,
+        debounce_seconds: secs("debounceSeconds")?,
+        max_delay_seconds: secs("maxDelaySeconds")?,
+    };
+    set_auto(&st, &name, Some(setting)).await
+}
+
+/// `DELETE /$/reason/{ds}/auto`: the dataset follows the server's `--auto-reason`
+/// again.
+async fn reason_auto_clear(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    set_auto(&st, &name, None).await
+}
+
+#[cfg(not(feature = "reasoning"))]
+async fn set_auto(
+    _: &Arc<AppState>,
+    _: &str,
+    _: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `reasoning` feature",
+    ))
+}
+
+#[cfg(feature = "reasoning")]
+async fn set_auto(
+    st: &Arc<AppState>,
+    name: &str,
+    auto: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(st, name)?;
+    let Some(mut info) = ds.reasoning.read().clone() else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no recorded reasoning: materialize inferences first",
+        ));
+    };
+    info.auto = auto;
+    let st2 = st.clone();
+    let ds2 = ds.clone();
+    blocking(move || {
+        ds2.set_reasoning(Some(info))?;
+        st2.save_registry()?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(crate::reasoning::status_json(st, &ds)))
+}
+
 /// `GET /$/reason/{ds}`: the reasoning status, with the freshness of the inferences.
 async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
@@ -3255,10 +3851,34 @@ async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Jso
 
 /// `GET /$/reason/{ds}/diagnostics`: inconsistency checks over data (and inferences).
 #[cfg(feature = "reasoning")]
-async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
-    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+async fn reason_diagnostics(
+    State(st): St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions, ReportContext};
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    // JSON unless `format=turtle` or an Accept header that prefers Turtle
+    const OFFERS: [&str; 2] = ["application/json", "text/turtle"];
+    let turtle = match params.get("format") {
+        Some("json") => false,
+        Some("turtle" | "ttl") => true,
+        Some(f) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown report format '{f}' (expected json or turtle)"),
+            ));
+        }
+        None => {
+            let accept = headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("*/*");
+            negotiate(accept, &OFFERS) == Some(1)
+        }
+    };
     let checks: Vec<String> = params
         .get("checks")
         .unwrap_or_default()
@@ -3295,25 +3915,48 @@ async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -
             )
         })?,
     };
+    let graphs = diagnostics::parse_graphs(&params.all("graph")).map_err(|bad| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("graph must be default or an absolute IRI, not '{bad}'"),
+        )
+    })?;
     let info = ds.reasoning.read().clone();
-    let inferences = info.is_some() && params.get("reasoning").is_none_or(|v| v != "false");
+    // the inferences follow from the default graph: included by default when it is checked
+    let inferences = info.is_some()
+        && match params.get("reasoning") {
+            Some(v) => v != "false",
+            None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
+        };
     let mut prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
     prefixes.retain(|(_, ns)| !ns.is_empty());
     let opts = DiagnoseOptions {
         checks,
         limit,
         inferences,
+        graphs,
         closure,
         timeout: Some(timeout_param(&st, &params)),
         prefixes,
     };
     blocking(move || {
-        let (_, j) = crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
-        Ok(with_commit(
-            Json(j.clone()).into_response(),
-            &ds,
-            j["commit"].as_u64().unwrap_or(0),
-        ))
+        let (report, j) =
+            crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
+        let seq = j["commit"].as_u64().unwrap_or(0);
+        let r = if turtle {
+            let inf = &j["scope"]["inferences"];
+            let ttl = report.to_turtle(&ReportContext {
+                dataset: Some(&ds.name),
+                profile: inf["profile"].as_str(),
+                stale: inf["stale"].as_bool(),
+                commits_since: inf["commitsSince"].as_u64(),
+                prefixes: &opts.prefixes,
+            });
+            ([(header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl).into_response()
+        } else {
+            Json(j).into_response()
+        };
+        Ok(with_commit(r, &ds, seq))
     })
     .await
 }
@@ -3342,7 +3985,9 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
     if t.dataset.is_empty() {
         return p.has(crate::auth::ServerPerm::ServerAdmin);
     }
-    p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
+    // a task acts on a whole dataset: hidden from callers who see only some of its graphs
+    let sees = |ds: &str| p.can(ds, Level::Read) && !p.restricted(ds);
+    sees(&t.dataset) || t.target.as_deref().is_some_and(sees)
 }
 
 /// A task as `p` sees it: without `server-admin`, absolute paths in its message and in
@@ -3528,6 +4173,7 @@ async fn shacl(
     let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
+    let at = history::at_param(&params)?;
     // a client that disconnects stops the validation at its next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     let max_bytes = st.limits.max_result_bytes;
@@ -3545,7 +4191,12 @@ async fn shacl(
             .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
         let shapes = sparkles_shacl::Shapes::parse(text, format, None)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-        let snap = ds.store.snapshot();
+        let past = QueryOptions {
+            timeout: Some(timeout),
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &past)?;
         if let GraphParam::Named(iri) = &graph
             && !crate::validation_common::graph_exists(&snap, iri)
         {
@@ -3594,6 +4245,7 @@ async fn shacl(
         }
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
         let resp = with_commit(resp, &ds, snap.commit);
+        let resp = history::history_headers(resp, resolved.as_ref(), &uri);
         Ok(with_inferences(
             resp,
             &ds,
@@ -3636,7 +4288,11 @@ async fn shacl() -> ApiResult {
 }
 
 #[cfg(test)]
+mod budgets_tests;
+#[cfg(test)]
 mod compress_tests;
+#[cfg(test)]
+mod diff_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
@@ -3647,6 +4303,8 @@ mod nesting_tests;
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(all(test, feature = "text"))]
+mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
 mod validation_tests;
 

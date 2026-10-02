@@ -21,6 +21,7 @@ memmap2.workspace = true
 lz4_flex.workspace = true
 rayon.workspace = true
 regex.workspace = true
+memchr.workspace = true
 stacker.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,12 +36,15 @@ percent-encoding.workspace = true
 reqwest.workspace = true
 # the outbound policy: CIDR allowlists, DNS lookups off reqwest's runtime thread
 ipnet = "2"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 flate2.workspace = true
 zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
-tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "lz4-compression"], optional = true }
+tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"], optional = true }
+# the term automata of fuzzy `text:query` terms (the versions Tantivy uses)
+levenshtein_automata = { version = "0.2.1", optional = true }
+tantivy-fst = { version = "0.5", optional = true }
 tempfile = "3"
 # GeoSPARQL (feature `geo`)
 georust = { workspace = true, optional = true }
@@ -59,7 +63,7 @@ tempfile.workspace = true
 
 [features]
 # Full-text search over string literals (Tantivy), `text:query` in SPARQL
-text = ["dep:tantivy"]
+text = ["dep:tantivy", "dep:levenshtein_automata", "dep:tantivy-fst"]
 # GeoSPARQL: `geof:` functions, `spatial:` property functions and a spatial index
 geo = [
     "dep:georust",

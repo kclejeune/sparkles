@@ -2187,10 +2187,15 @@ default.
 **Chosen during implementation** (open to revision): with sort off, the CLI streams
 Turtle/TriG of any size, and `--max-bytes` (256 MiB) then bounds the largest statement.
 The "convert to N-Triples" error remains for SPARQL, JSON-LD and sorted Turtle/TriG.
-`sparkles lsp` reads only the nearest `.sparklesfmt.toml`. The opt-in task
-`fmt:jsonld-compare`, outside `ci`, compares the JSON-LD layout with `oxfmt`, which
-follows Prettier's JSON conventions and is already pinned in `ui/`. The SHACL shapes
-field became a CodeMirror editor so that its Format keeps one-step undo.
+`sparkles lsp` reads only the nearest `.sparklesfmt.toml`. In Turtle and TriG,
+`prune-prefixes` drops an unused declaration even when a later directive redefines its
+label, because its scope ends at the redefinition. An unused redefinition stays only when
+the last declaration of its label that the output keeps binds a different namespace.
+Dropping it would extend that binding over the redefinition's scope, and the next run
+would compact IRIs there with it. Streamed and in-memory formatting follow the same rule.
+The opt-in task `fmt:jsonld-compare`, outside `ci`, compares the JSON-LD layout with
+`oxfmt`, which follows Prettier's JSON conventions and is already pinned in `ui/`. The
+SHACL shapes field became a CodeMirror editor so that its Format keeps one-step undo.
 
 **Other deviations:** the body limit flag is `--format-max-mb` (default 16), like the
 server's other size flags. An ignore pragma right before the first node leads that node
@@ -2212,4 +2217,12 @@ and the W3C RDF results written as JSON-LD stand in for one, plus
 **Performance:** the §8 targets are not yet recorded in [BENCHMARKS](../BENCHMARKS.md).
 The WebAssembly module is about 250 KB with brotli, well under the 1.5 MB budget of §7.4.
 
-**Deferred:** fuzzing (§9.7), an MCP `format` tool (§13.2 Q10), `sparkles lint`.
+**MCP tool.** The `format` tool of §13.2 Q10 landed on 2026-10-02 in `sparkles mcp`
+([C11](C11-mcp-server.md)). It formats the six languages with `sparkles_fmt::format`, the
+engine of `sparkles fmt`. It takes the camelCase style options of `POST /$/format` and
+shares that endpoint's parsing of them. It returns the language, the text, whether the
+text changed and the warnings. The text may be up to 1 MiB, and `--mcp-max-bytes` caps
+the result. A call runs within its `timeoutSeconds`. It reads no dataset and no config
+file.
+
+**Deferred:** fuzzing (§9.7), `sparkles lint`.

@@ -1,0 +1,11 @@
+# irreflexive-property: an individual related to itself by an irreflexive property
+# (OWL 2 RL prp-irp).
+#
+# The checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?p WHERE {
+  ?p rdf:type owl:IrreflexiveProperty .
+  ?x ?p ?x .
+}

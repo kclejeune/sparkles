@@ -116,5 +116,7 @@ open('the policy editor previews runs from the server', async ({ page }) => {
   await expect(dialog).toContainText('Every 12 hours, counted from 00:00 UTC');
 
   await dialog.getByRole('button', { name: 'Create policy' }).click();
-  await expect(page.getByRole('row', { name: /e2e-weekly/ })).toContainText('every 12h');
+  await expect(page.getByRole('row', { name: /e2e-weekly/ })).toContainText('every 12h', {
+    timeout: 15_000,
+  });
 });

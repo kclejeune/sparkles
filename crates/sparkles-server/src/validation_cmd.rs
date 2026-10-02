@@ -23,8 +23,9 @@ pub struct ValidationArgs {
     /// shapes graph of the dataset (repeatable; SHACL)
     #[arg(long)]
     pub shapes_graph: Vec<String>,
-    /// a shapes file (Turtle), copied into the database (SHACL)
-    #[arg(long, conflicts_with = "shapes_graph")]
+    /// a shapes file (Turtle), copied into the database (SHACL); with --shapes-graph,
+    /// merged with the graphs
+    #[arg(long)]
     pub shapes: Option<PathBuf>,
     /// a schema file (ShExC, ShExJ, or ShExR in Turtle), copied into the database with
     /// its imports resolved (ShEx)
@@ -45,6 +46,11 @@ pub struct ValidationArgs {
     /// violation, warning or info (SHACL; default violation)
     #[arg(long)]
     pub threshold: Option<String>,
+    /// judge a write by the blocking results (SHACL) or nonconformant associations
+    /// (ShEx) it introduces, so those the data already has do not block it (allows
+    /// `--mode reject` on data that does not conform)
+    #[arg(long)]
+    pub grandfather: bool,
     #[arg(long, default_value_t = 10.0)]
     pub timeout: f64,
     #[arg(long, default_value_t = 100)]
@@ -198,18 +204,17 @@ fn set_shacl(
         a.threshold.as_deref().unwrap_or("violation")
     ))
     .context("--threshold is violation, warning or info")?;
-    let shapes = match &a.shapes {
-        Some(f) => ShapesSource {
-            inline: Some(std::fs::read_to_string(f)?),
-            source: Some(f.display().to_string()),
-            ..Default::default()
-        },
-        None if !a.shapes_graph.is_empty() => ShapesSource {
-            graphs: Some(a.shapes_graph.clone()),
-            ..Default::default()
-        },
-        None => bail!("give --shapes FILE or --shapes-graph IRI"),
+    if a.shapes.is_none() && a.shapes_graph.is_empty() {
+        bail!("give --shapes FILE, --shapes-graph IRI, or both");
+    }
+    let mut shapes = ShapesSource {
+        graphs: (!a.shapes_graph.is_empty()).then(|| a.shapes_graph.clone()),
+        ..Default::default()
     };
+    if let Some(f) = &a.shapes {
+        shapes.inline = Some(std::fs::read_to_string(f)?);
+        shapes.source = Some(f.display().to_string());
+    }
     let cfg = ValidationConfig {
         format: 2,
         language: Some(GuardLanguage::Shacl),
@@ -218,6 +223,11 @@ fn set_shacl(
         data_graph: data_graph(&a.data_graph),
         include_inferences: a.include_inferences,
         threshold,
+        baseline: if a.grandfather {
+            guard::BaselinePolicy::Grandfather
+        } else {
+            guard::BaselinePolicy::Strict
+        },
         timeout_seconds: a.timeout,
         report_limit: a.report_limit,
         updated: None,
@@ -282,6 +292,11 @@ fn set_shex(
         shape_map: MapSource::Compact(map.clone()),
         data_graph: data_graph(&a.data_graph),
         include_inferences: a.include_inferences,
+        baseline: if a.grandfather {
+            guard::BaselinePolicy::Grandfather
+        } else {
+            guard::BaselinePolicy::Strict
+        },
         timeout_seconds: a.timeout,
         report_limit: a.report_limit,
         updated: None,

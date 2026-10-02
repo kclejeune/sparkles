@@ -65,8 +65,11 @@ zeroize = { version = "1", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
 reqwest = { workspace = true, optional = true }
 rpassword = { version = "7", optional = true }
-# MCP server (`sparkles mcp`): the official Rust SDK, without its tool macros
-rmcp = { version = "~3.5", default-features = false, features = ["server", "transport-io"], optional = true }
+# MCP server (`sparkles mcp` on stdio, `serve --mcp` at `/$/mcp`): the official Rust SDK,
+# without its tool macros
+rmcp = { version = "~3.5", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
+# shuts down the SSE streams of `/$/mcp` with the server (already in the tree through rmcp)
+tokio-util = { version = "0.7", default-features = false, optional = true }
 # backup repositories (feature `backup`)
 sparkles-backup = { workspace = true, optional = true }
 # the formatter (feature `fmt`): `sparkles fmt` walks directories with gitignore rules and
@@ -114,8 +117,8 @@ auth = [
     "dep:jsonwebtoken",
     "dep:reqwest",
 ]
-# Model Context Protocol server for LLM agents (`sparkles mcp`, stdio)
-mcp = ["dep:rmcp"]
+# Model Context Protocol server for LLM agents (`sparkles mcp` on stdio, `serve --mcp`)
+mcp = ["dep:rmcp", "dep:tokio-util"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "dep:uuid"]
