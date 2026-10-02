@@ -490,19 +490,24 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | Method | Path                         | Description |
 |--------|------------------------------|-------------|
 | GET    | `/$/datasets`                | `{ "datasets": [DatasetInfo] }` |
-| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo`. `geo` = `true` adds a spatial index with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)). An invalid one is a `400`, and a build without the `geo` feature returns `501`. `201` on success, `409` if the dataset exists. |
+| POST   | `/$/datasets`                | Creates a dataset. The form or JSON body has `dbName`, `dbType` = `persistent` \| `mem`, and optionally `geo`. Fuseki's `dbType` values `tdb2` and `tdb` mean `persistent`, and `dbName` and `dbType` may also be query parameters. `geo` = `true` adds a spatial index with the defaults. In a JSON body `geo` can also be a `GeoConfig` (see [GeoSPARQL](#geosparql)). An invalid one is a `400`, and a build without the `geo` feature returns `501`. A body in an RDF syntax is a Fuseki service description; see [Assembler bodies](#assembler-bodies). `201` on success, `409` if the dataset exists. |
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
+| POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
-| GET    | `/$/stats/{ds}`              | `DatasetStats` |
+| GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
+| GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
 | GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
 | PUT    | `/$/quota/{ds}`              | *Extension.* Gives a persistent dataset a quota of its own. The JSON body is `{ "maxBytes": number }` or `{ "maxMb": number }`, and `0` means unlimited. Returns `DatasetQuota`. Needs `server-admin`. `400` for an in-memory dataset or a malformed body. |
 | DELETE | `/$/quota/{ds}`              | *Extension.* Removes the dataset's own quota, so `--max-dataset-mb` applies again. Returns `DatasetQuota`. Needs `server-admin`. |
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
-| POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
+| POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
+| POST   | `/$/backups/{ds}`            | Fuseki's alias of `/$/backup/{ds}` when the request has no JSON body. A JSON body (an `application/json` content type, or a body that is a JSON object) makes it a backup into a repository instead; see [Backup routes](#backup-routes). |
+| GET/POST | `/$/backups-list`          | Fuseki's list of the N-Quads backups in `<data>/backups`: `{ "backups": [string] }`, file names sorted. A caller without `server-admin` sees the files of the datasets it administers. |
+| GET/POST | `/$/validate/query`, `/$/validate/update`, `/$/validate/iri`, `/$/validate/data`, `/$/validate/langtag` | Fuseki's validators. See [Validators](#validators). |
 | POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
@@ -537,6 +542,19 @@ type DatasetInfo = {
   access?: "read" | "write" | "admin";        // with auth: the caller's level (absent without)
   text: null | { state: string; docs: number };     // full-text index (see Full-text search)
   geo: null | { state: string; rows: number };      // spatial index: state and rows (base + overlay + tail)
+  // Fuseki's description of the dataset
+  "ds.name": string;       // "/ds"
+  "ds.state": boolean;     // false while offline
+  "ds.services": { "srv.type": string; "srv.description": string; "srv.endpoints": string[] }[];
+                           // query, update, gsp-rw, gsp-r, upload, prefixes-rw, SHACL, and
+                           // gsp-direct-rw with --gsp-direct-naming; "" is the dataset URL
+};
+
+type FusekiCounters = {
+  Requests: number; RequestsGood: number; RequestsBad: number;
+  endpoints: { [name: string]: { Requests: number; RequestsGood: number; RequestsBad: number;
+                                 operation: string; description: string } };
+                           // endpoints that had a request; the dataset URL is "_1", "_2", …
 };
 
 type DatasetStats = {
@@ -555,6 +573,7 @@ type DatasetStats = {
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
+  datasets: { [path: string]: FusekiCounters };   // Fuseki's form, under "/ds"
 };
 
 type DatasetQuota = {
@@ -577,8 +596,65 @@ type Task = {
                             // except for callers with server-admin
   cancellable: boolean;     // DELETE /$/tasks/{id} would be accepted now
   detail?: object;          // a typed result, for task kinds that have one
+  // Fuseki's names
+  taskId: string;           // the id
+  task: string;             // "Compact" or "Backup" as in Fuseki, else the kind
+  started: string;          // startedAt
+  finished?: string;        // once the task has ended
+  success?: boolean;        // once the task has ended: true when it is done
 };
 ```
+
+Request counters (`FusekiCounters`, and Prometheus' `fuseki_requests*` families with
+`--metrics-fuseki-names`) are kept while metrics are on, and are empty with
+`--no-metrics`. `GET /$/server` also has Fuseki's `startDateTime` and `uptime` (seconds).
+
+### Assembler bodies
+
+`POST /$/datasets` with a body in an RDF syntax (`text/turtle`, `application/trig`,
+`application/n-triples`, `application/n-quads`, `application/rdf+xml` or
+`application/ld+json`) reads a Fuseki service description, as older Fuseki versions did
+(Fuseki 6 refuses them). It takes the part of a `config.ttl` that maps to a Sparkles
+dataset:
+
+* one `fuseki:Service` with a `fuseki:name` and a `fuseki:dataset`;
+* endpoints (`fuseki:endpoint [ fuseki:operation …; fuseki:name … ]`, or the older
+  `fuseki:serviceQuery` and similar properties) for operations Sparkles serves, at the
+  names it serves them at: `query` at the dataset URL, `sparql` or `query`, `update` at
+  the dataset URL or `update`, `gsp-rw` and `gsp-r` at the dataset URL, `data` or `get`,
+  `upload`, `shacl` and `prefixes-r` or `prefixes-rw` at `prefixes`, and
+  `gsp-direct-rw` or `gsp-direct-r` when the server runs with `--gsp-direct-naming`;
+* a dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB`, which becomes a persistent
+  dataset (or an in-memory one at `tdb2:location "--mem--"`), or `ja:MemoryDataset`,
+  `ja:DatasetTxnMem` or `ja:RDFDataset`, which become in-memory datasets.
+
+`tdb2:location` is ignored, as Sparkles keeps its databases under its data directory, and
+`tdb2:unionDefaultGraph` must match `--union-default-graph`. Everything else is a `400`
+that names it: other dataset types (text indexes, inference, GeoSPARQL), data to load
+(`ja:data`), contexts, access control in the description, RDF Patch, custom endpoint names,
+and a service with no write endpoint, since Sparkles serves every endpoint of a dataset.
+The error says what to do instead where Sparkles has it, such as `PUT /$/text/{ds}` for a
+text index or `--auth-config` for access control.
+
+### Validators
+
+Fuseki's `/$/validate/*` services take their input as query parameters or a form body and
+answer in JSON when `Accept` prefers `application/json` to `text/html`, else as an HTML
+page. They read no dataset.
+
+| Path | Parameters | JSON answer |
+|------|------------|-------------|
+| `/$/validate/query` | `query`, `languageSyntax` (`SPARQL`, the default, or `ARQ`) | `{input, formatted, algebra}`, or `{input, errors}` |
+| `/$/validate/update` | `update`, `languageSyntax` | `{input, formatted}`, or `{input, errors}` |
+| `/$/validate/iri` | `iri` (repeatable) | `{iris: [{iri, errors: string[], warning: string[]}]}`. A relative IRI gets a warning. |
+| `/$/validate/data` | `data`, `languageSyntax` (Jena's names: `N-Quads`, the default, `Turtle`, `N-Triples`, `TriG`, `RDF/XML`, `JSON-LD`, `N3`, `RDF/JSON`) | `{input}`, or `{input, errors}` with the first syntax error |
+| `/$/validate/langtag` | `langtag` or `lang` (repeatable) | `{langtags: [{input, errors, formatted, language, script?, region?, variant?, extension?, privateuse?}]}` |
+
+`errors` is `[{"parse-error": string, "parse-error-line"?: number, "parse-error-column"?:
+number}]`, as in Fuseki. `formatted` is the formatter's output (the parser's serialization
+in a build without the `fmt` feature), and `algebra` is the SPARQL algebra in SSE. Fuseki
+also gives the algebra in quad form and optimized, which Sparkles does not. Fuseki's
+language tag validator answers in HTML only. A missing parameter is a `400`.
 
 **Task slots.** At most `sparkles serve --max-tasks` background tasks run at once (default
 4, `0` for no limit). Background tasks are compaction, clones, reasoning, full-text and
@@ -809,18 +885,35 @@ must not exist or must be empty. `SRC` must be a database that no server has ope
 |------------|-----------------------|-------------|
 | GET/POST   | `/{ds}` , `/{ds}/sparql`, `/{ds}/query` | SPARQL 1.1 Query protocol, with a `query=` parameter, an `application/sparql-query` body, or a form. Supports `default-graph-uri` / `named-graph-uri`. |
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
-| POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. An update sent with GET (`/{ds}?update=…`) gets `405`. |
-| GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. A GET with neither returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
+| POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
+| GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
+| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
 | POST       | `/{ds}/shex`          | ShEx validation. This is a Sparkles extension; Fuseki has none. See [ShEx validation](#shex-validation). |
 
-Results are negotiated with `Accept` or, Fuseki style, the `format=` parameter:
+Results are negotiated with `Accept` or, Fuseki style, the `format=` parameter. Fuseki's
+`output=` and `results=` are the same parameter, and its short names work: `json`, `xml`,
+`sparql`, `csv`, `tsv` and `thrift` for results, and `json` (JSON-LD), `json-rdf`, `xml`,
+`text` (Turtle), `ttl`, `nt`, `n-quads` and `trig` for graphs. `force-accept` labels the
+response `text/plain`, so that a browser shows it.
 
 * SELECT/ASK: `application/sparql-results+json` (default), `application/sparql-results+xml`,
   `text/csv`, `text/tab-separated-values`, and `application/x-sparkles+json` (see below).
+  SELECT also comes in Jena's SPARQL Results Thrift (`application/sparql-results+thrift`),
+  which `RDFConnectionFuseki` asks for. An ASK in CSV or TSV has Jena's header row,
+  `_askResult` or `?_askResult`.
 * CONSTRUCT/DESCRIBE/GSP GET: `text/turtle` (default), `application/n-triples`,
-  `application/n-quads`, `application/trig`, `application/ld+json`, `application/rdf+xml`.
+  `application/n-quads`, `application/trig`, `application/ld+json`, `application/rdf+xml`,
+  and Jena's RDF Thrift (`application/rdf+thrift`), RDF Protobuf
+  (`application/rdf+protobuf`) and RDF/JSON (`application/rdf+json`, graphs only).
+
+Graph Store writes and uploads read the same syntaxes, and Jena's N3 media types
+(`text/rdf+n3`, `text/n3`, `application/n3`) as Turtle. RDF Thrift and RDF Protobuf bodies
+may use prefix names, values (`valInteger`, `valDecimal`, `valDouble`) and triple terms,
+as Jena writes them. An upload takes them by the file name extensions `.rt`, `.trdf`,
+`.rpb`, `.pbrdf` and `.rj`. The JSONP `callback` and XSLT `stylesheet` parameters of
+Fuseki are not supported.
 
 Query parameters beyond the standard protocol:
 
@@ -878,7 +971,8 @@ was read at and its serialization:
 ETag: W/"3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa:42:ttl"
 ```
 
-The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`. The tag is weak because
+The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`, or `rt`, `rpb` and `rj`
+for Jena's syntaxes. The tag is weak because
 the bytes of one commit's serialization can change without a commit. A compaction
 reorders the output, and a prefix change rewrites Turtle, while the data stays the same.
 The tag covers the whole dataset, so every commit changes the tag of every graph. A read
@@ -1302,6 +1396,13 @@ which hold schedules and retention, live under `/$/backup-policies`. The web UI 
 Backups page for all three. The older `POST /$/backup/{ds}`, which writes an N-Quads dump
 in the data directory, is unchanged and works for in-memory datasets too.
 
+Fuseki uses `POST /$/backups/{ds}` as another name for `POST /$/backup/{ds}`, and its
+clients send no body. So a `POST /$/backups/{ds}` is a backup into a repository only when
+its body is JSON: an `application/json` content type, or a body that is a JSON object.
+Without one it writes Fuseki's N-Quads dump. The web UI always sends JSON, and a
+repository backup always names its `repository`, so no request of the repository API
+changed meaning. `sparkles backup` works on repositories directly and calls no route.
+
 **What a backup holds.** A backup contains:
 
 * the files of the dataset's current index generation (`gen-NNNN/…`): the permutations,
@@ -1406,7 +1507,8 @@ marks the backups of the live dataset or of the one it replaced.
 
 ### Backup routes
 
-Every request body is JSON, and an empty body means `{}`. Unknown fields are ignored. Task
+Every request body is JSON, and an empty body means `{}`, except on `POST /$/backups/{ds}`,
+where a request without a JSON body is Fuseki's N-Quads dump. Unknown fields are ignored. Task
 endpoints return `202` with the `Task` (see [Datasets (admin)](#datasets-admin)) once it
 has started or been queued. Some also return a `Location`, as noted.
 
@@ -1424,7 +1526,7 @@ has started or been queued. Some also return a `Location`, as noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Breaks a lock (`204`). The action is audited. `404 no-such-lock`, `409 repository-read-only`. |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`. Lists the dataset's backups in every repository, or in `R` only, newest first, with `sameLineage`. A repository that cannot be reached is left out. One found unreachable in the last minute is not tried again. |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. An in-memory dataset is first copied to a temporary generation on disk, as described above. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less, or when the temporary copy of an in-memory dataset would leave the data directory's file system with less. |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`, sent as JSON (without a JSON body the request is Fuseki's N-Quads dump, as above). Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. An in-memory dataset is first copied to a temporary generation on disk, as described above. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less, or when the temporary copy of an in-memory dataset would leave the data directory's file system with less. |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary plus the manifest's files, blobs and upload statistics. |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Deletes the backup's manifest (`204`). Its blobs go at the next GC. `409 backup-busy` (with `task`) while a restore or verification of the backup runs on this server. `409 repository-read-only`. |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restores the backup. The body is a `RestoreRequest`. Starts a `backup-restore` task with `Location: /$/datasets/{target}`. See [Restore](#restore). |
@@ -3126,6 +3228,8 @@ the shapes graph in the request body, with Fuseki's semantics:
   (`urn:x-arq:UnionGraph`). A graph IRI selects that graph, or returns `404` if the graph
   does not exist. Jena's special IRIs `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph`
   are accepted as well.
+* **`target`.** Fuseki's `?target=` validates one node against the shapes whose targets
+  select it. It is an IRI, or a prefixed name of the dataset's prefixes such as `ex:bob`.
 * **`reasoning=true|false`.** When the dataset has materialized inferences, validation
   runs over data ∪ `urn:x-sparkles:inferred` unless `reasoning=false`. With `false`, the
   inferred graph is also left out of `graph=union`.

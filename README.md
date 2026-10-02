@@ -69,6 +69,8 @@ running queries.
 **Server and CLI**
 * Fuseki's endpoints, Graph Store Protocol, upload and `/$/` admin API. Sparkles adds
   endpoints for commits, schema discovery, clones, reasoning and validation ([API](docs/API.md)).
+* Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
+  against the server ([usage](docs/USAGE.md#fuseki-and-jena-clients)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)).
 

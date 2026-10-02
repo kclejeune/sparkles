@@ -380,6 +380,7 @@ export const datasetBackups = (ds: string, repository?: string) =>
     `/$/backups/${enc(ds)}${repository ? `?repository=${enc(repository)}` : ''}`,
   );
 
+/** Sent as JSON: `POST /$/backups/{ds}` without a JSON body is Fuseki's N-Quads dump. */
 export const createBackup = (
   ds: string,
   body: { repository: string; name?: string; note?: string },
