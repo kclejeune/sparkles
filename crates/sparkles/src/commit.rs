@@ -19,6 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// A dataset id (a version 4 UUID), named here for crates that do not depend on `uuid`.
+pub type DatasetId = uuid::Uuid;
+
 /// What produced a commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommitKind {

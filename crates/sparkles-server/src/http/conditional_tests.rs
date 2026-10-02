@@ -3,6 +3,7 @@
 use super::*;
 use axum::body::Body;
 use axum::extract::Request;
+use sparkles::commit::DatasetId;
 use sparkles::store::StoreOptions;
 use tower::ServiceExt;
 
@@ -310,7 +311,7 @@ async fn if_match_guards_graph_store_writes() {
     assert_eq!(create().await.status, StatusCode::PRECONDITION_FAILED);
     assert_eq!(s.head(), 5);
     // a tag of another dataset never matches
-    let other = format!("W/\"{}:5:ttl\"", uuid::Uuid::new_v4());
+    let other = format!("W/\"{}:5:ttl\"", DatasetId::new_v4());
     let r = call(
         &s.app,
         "POST",

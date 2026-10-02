@@ -14,6 +14,7 @@
 //! matches when it names the dataset's current head commit, in any serialization.
 
 use super::*;
+use sparkles::commit::DatasetId;
 use sparkles::guard::Precondition;
 use sparkles::store::Snapshot;
 
@@ -24,7 +25,7 @@ pub(super) const SPARKLES_COMMIT_MESSAGE: &str = "sparkles-commit-message";
 const FORMATS: [&str; 6] = ["ttl", "nt", "nq", "trig", "rdf", "jsonld"];
 
 /// The entity tag of a Graph Store representation read at commit `seq`.
-pub(super) fn etag(dataset_id: uuid::Uuid, seq: u64, fmt: RdfFormat) -> String {
+pub(super) fn etag(dataset_id: DatasetId, seq: u64, fmt: RdfFormat) -> String {
     format!("W/\"{dataset_id}:{seq}:{}\"", fmt.file_extension())
 }
 
@@ -78,12 +79,12 @@ fn tags(headers: &HeaderMap, name: header::HeaderName) -> Option<Tags> {
 }
 
 /// Whether an opaque tag names commit `seq` of dataset `id`, in any serialization.
-fn names_commit(opaque: &str, id: uuid::Uuid, seq: u64) -> bool {
+fn names_commit(opaque: &str, id: DatasetId, seq: u64) -> bool {
     let mut parts = opaque.rsplitn(3, ':');
     let (Some(fmt), Some(s), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<uuid::Uuid>() == Ok(id)
+    FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)
 }
 
 fn failed(msg: &str) -> ApiError {
@@ -105,7 +106,7 @@ pub(super) enum ReadOutcome {
 /// at commit `seq` (RFC 9110 §13.2.2). `If-Match` fails with `412`.
 pub(super) fn check_read(
     headers: &HeaderMap,
-    dataset_id: uuid::Uuid,
+    dataset_id: DatasetId,
     seq: u64,
     tag: &str,
 ) -> ApiResult<ReadOutcome> {
@@ -153,7 +154,7 @@ pub(super) fn with_etag(mut r: Response, tag: &str, negotiated: bool) -> Respons
 /// fields, checked by the store with the writer lock held. `None` without either field.
 pub(super) fn write_precondition(
     headers: &HeaderMap,
-    dataset_id: uuid::Uuid,
+    dataset_id: DatasetId,
     target: &Target,
 ) -> Option<Precondition> {
     let if_match = tags(headers, header::IF_MATCH);
@@ -264,13 +265,13 @@ mod tests {
 
     #[test]
     fn tags_name_a_commit() {
-        let id = uuid::Uuid::new_v4();
+        let id = DatasetId::new_v4();
         let t = etag(id, 42, RdfFormat::Turtle);
         assert_eq!(t, format!("W/\"{id}:42:ttl\""));
         let o = t.trim_start_matches("W/").trim_matches('"');
         assert!(names_commit(o, id, 42));
         assert!(!names_commit(o, id, 41));
-        assert!(!names_commit(o, uuid::Uuid::new_v4(), 42));
+        assert!(!names_commit(o, DatasetId::new_v4(), 42));
         assert!(!names_commit(&format!("{id}:42:xml"), id, 42));
         assert!(!names_commit("42", id, 42));
     }
