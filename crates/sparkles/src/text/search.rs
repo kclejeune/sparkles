@@ -50,11 +50,13 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     }
     ctx.check()?;
     let resolved = view.resolved()?;
-    // fuzzy terms expand against the searcher's terms
-    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, sh.fields.text)
+    // a language with an analyzer searches its stemmed text; fuzzy terms expand against
+    // the searcher's terms of that field
+    let field = sh.fields.text_for(spec.lang.as_deref());
+    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, field)
         .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
     let matchers = parsed.matchers;
-    let Some(query) = scoped(snap, spec, sh.fields, parsed.query) else {
+    let Some(query) = scoped(snap, spec, &sh.fields, parsed.query) else {
         return Ok(Table::empty(vars.to_vec()));
     };
     let out = Outputs::new(spec, vars, resolved, &sh.ids);
@@ -106,7 +108,7 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
         let mut analyzer = resolved
             .searcher
             .index()
-            .tokenizer_for_field(sh.fields.text)
+            .tokenizer_for_field(field)
             .map_err(text_err)?;
         let mut done: FxHashMap<Id, Id> = Default::default();
         for (i, id) in t.cols[c].iter_mut().enumerate() {
@@ -148,7 +150,7 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
 fn scoped(
     snap: &Snapshot,
     spec: &TextSpec,
-    f: super::imp::Fields,
+    f: &super::imp::Fields,
     text: Box<dyn Query>,
 ) -> Option<Box<dyn Query>> {
     let mut filters: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -299,6 +301,7 @@ struct Outputs<'a> {
     cg_out: Option<usize>,
     cgv: Option<usize>,
     cprop: Option<usize>,
+    crank: Option<usize>,
     need: Need,
     ids: &'a IdCache,
 }
@@ -344,6 +347,7 @@ impl<'a> Outputs<'a> {
             col(spec.graph_var),
             col(spec.prop),
         );
+        let crank = col(spec.rank);
         let hash = !resolved.uncertain.is_empty();
         let need = Need {
             s: cs.is_some() || spec.dedup || hash,
@@ -361,6 +365,7 @@ impl<'a> Outputs<'a> {
             cg_out,
             cgv,
             cprop,
+            crank,
             need,
             ids,
         }
@@ -383,6 +388,8 @@ impl<'a> Outputs<'a> {
         let mut default_graph = None;
         let mut stale_hits = 0usize;
         let mut row = vec![Id::UNDEF; self.vars.len()];
+        // the rank of the rows with the last score: tied rows share the first one's
+        let mut rank: Option<(u32, usize)> = None;
         for (i, (score, _)) in hits.iter().enumerate() {
             if i % 4096 == 4095 {
                 ctx.check()?;
@@ -431,6 +438,14 @@ impl<'a> Outputs<'a> {
             }
             if let Some(c) = self.cprop {
                 row[c] = p;
+            }
+            if let Some(c) = self.crank {
+                let r = match rank {
+                    Some((bits, r)) if bits == score.to_bits() => r,
+                    _ => t.len + 1,
+                };
+                rank = Some((score.to_bits(), r));
+                row[c] = Id::from_i64(r as i64).expect("a rank fits an inline integer");
             }
             t.push_row(&row);
         }

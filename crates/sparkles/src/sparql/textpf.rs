@@ -3,7 +3,7 @@
 //!
 //! ```sparql
 //! ?s text:query "query"                          # or "query"@lang
-//! (?s ?score ?literal ?g ?prop) text:query (pred* "query" limit "lang:xx")
+//! (?s ?score ?literal ?g ?prop ?rank) text:query (pred* "query" limit "lang:xx")
 //! ```
 //!
 //! SPARQL parses `( … )` into `rdf:first` / `rdf:rest` chains of blank nodes. This module
@@ -28,6 +28,8 @@ pub struct TextCall {
     pub literal: Option<TermPattern>,
     pub graph: Option<TermPattern>,
     pub prop: Option<TermPattern>,
+    /// the hit's rank in the score order (a Sparkles extension after Jena's slots)
+    pub rank: Option<TermPattern>,
     /// predicates to search (empty: every indexed predicate)
     pub predicates: Vec<NamedNode>,
     pub query: String,
@@ -154,7 +156,7 @@ pub fn take_calls_where(
 }
 
 fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall> {
-    if subjects.is_empty() || subjects.len() > 5 {
+    if subjects.is_empty() || subjects.len() > 6 {
         return Err(bad("malformed argument list"));
     }
     let mut slots = subjects.into_iter();
@@ -170,6 +172,7 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
     let literal = var_slot("the literal")?;
     let graph = var_slot("the graph")?;
     let prop = var_slot("the property")?;
+    let rank = var_slot("the rank")?;
 
     let mut predicates = Vec::new();
     let mut args = args.into_iter().peekable();
@@ -242,6 +245,7 @@ fn decode(subjects: Vec<TermPattern>, args: Vec<TermPattern>) -> Result<TextCall
         literal,
         graph,
         prop,
+        rank,
         predicates,
         query,
         lang,

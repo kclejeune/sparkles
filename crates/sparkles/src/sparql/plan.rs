@@ -207,6 +207,8 @@ pub struct TextSpec {
     /// the call's graph slot
     pub graph_out: Option<VarId>,
     pub prop: Option<VarId>,
+    /// the hit's rank: 1 + the number of hits with a higher score
+    pub rank: Option<VarId>,
     /// graph scope of the active graph
     pub graph: GraphFilter,
     /// `GRAPH ?g { … }` around the call: bound from each hit's graph
@@ -1306,14 +1308,15 @@ impl<'a> Planner<'a> {
         // search then reads no literal
         let output =
             |t: &Option<TermPattern>| t.as_ref().filter(|t| self.used_elsewhere(t)).cloned();
-        let (score, literal, graph_out, prop) = (
+        let (score, literal, graph_out, prop, rank) = (
             slot(&output(&c.score)),
             slot(&output(&c.literal)),
             slot(&c.graph),
             slot(&c.prop),
+            slot(&output(&c.rank)),
         );
         let Some((graph, graph_var)) = self.graph_filter(g) else {
-            let mut vars: Vec<VarId> = [score, literal, graph_out, prop]
+            let mut vars: Vec<VarId> = [score, literal, graph_out, prop, rank]
                 .into_iter()
                 .flatten()
                 .collect();
@@ -1336,6 +1339,7 @@ impl<'a> Planner<'a> {
             graph_out,
             graph_var,
             prop,
+            rank,
         ]
         .into_iter()
         .flatten()
@@ -1388,6 +1392,7 @@ impl<'a> Planner<'a> {
             literal,
             graph_out,
             prop,
+            rank,
             graph,
             graph_var,
             dedup,

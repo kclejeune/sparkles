@@ -825,6 +825,10 @@ enum Cmd {
         /// do not index these graphs (IRIs; urn:x-arq:DefaultGraph for the default graph)
         #[arg(long)]
         exclude_graph: Vec<String>,
+        /// also index the literals of this language stemmed, for lang: searches (a
+        /// primary tag such as en, or all)
+        #[arg(long)]
+        language: Vec<String>,
         /// rebuild even if the index is current
         #[arg(long)]
         rebuild: bool,
@@ -1242,11 +1246,12 @@ fn text_index(
     opts: StoreOptions,
     predicates: Vec<String>,
     exclude_graph: Vec<String>,
+    languages: Vec<String>,
     rebuild: bool,
     status: bool,
     disable: bool,
 ) -> Result<()> {
-    use sparkles::text::{PredicateSet, TextConfig};
+    use sparkles::text::{Languages, PredicateSet, TextConfig};
     let store = Store::open(loc, opts)?;
     if disable {
         store.disable_text()?;
@@ -1265,7 +1270,7 @@ fn text_index(
         return Ok(());
     }
     let t = Instant::now();
-    let configured = !predicates.is_empty() || !exclude_graph.is_empty();
+    let configured = !predicates.is_empty() || !exclude_graph.is_empty() || !languages.is_empty();
     let s = match store.text_status() {
         Some(_) if !configured && rebuild => store.rebuild_text()?,
         Some(s) if !configured => s,
@@ -1275,6 +1280,7 @@ fn text_index(
                 cfg.predicates = PredicateSet::Only(predicates);
             }
             cfg.graphs.exclude = exclude_graph;
+            cfg.languages = Languages::from_tags(&languages).map_err(anyhow::Error::msg)?;
             store.enable_text(cfg)?
         }
     };
@@ -1296,6 +1302,7 @@ fn text_index(
 fn text_index(
     _: &std::path::Path,
     _: StoreOptions,
+    _: Vec<String>,
     _: Vec<String>,
     _: Vec<String>,
     _: bool,
@@ -2213,6 +2220,7 @@ fn run() -> Result<()> {
             loc,
             predicate,
             exclude_graph,
+            language,
             rebuild,
             status,
             disable,
@@ -2221,6 +2229,7 @@ fn run() -> Result<()> {
             opts,
             predicate,
             exclude_graph,
+            language,
             rebuild,
             status,
             disable,
