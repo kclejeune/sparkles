@@ -48,6 +48,10 @@ test('the query page, each result view and its menus', async ({ page }) => {
   await open(page, /^Explain\b/);
   await open(page, 'Examples');
   await page.getByRole('button', { name: 'Examples' }).click();
+  await open(page, 'Saved');
+  await page.getByRole('menuitem', { name: /Save this query/ }).click();
+  await expectNoSidewaysScroll(page, 'the save dialog');
+  await page.keyboard.press('Escape');
   await open(page, 'Format options');
   await page.locator('.ds-button').click();
   await expect(page.getByRole('listbox', { name: 'Datasets' })).toBeVisible();
@@ -79,6 +83,14 @@ test('the explorer: graph, schema and text search', async ({ page }) => {
     `/ui/explore?ds=foaf&iri=${encodeURIComponent('http://example.org/people/alice')}`,
   );
   await visit(page, '/ui/explore?ds=foaf&tab=schema');
+  await open(page, 'Draft shapes');
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: /^Draft$/ })
+    .click();
+  await expect(page.getByLabel('Draft text')).toContainText('sh:NodeShape');
+  await expectNoSidewaysScroll(page, 'the drafted shapes');
+  await page.keyboard.press('Escape');
   await visit(page, '/ui/explore?ds=places&iri=http%3A%2F%2Fexample.org%2Fplaces%2Fparis');
   await page.goto('/ui/explore?ds=foaf&tab=search');
   await page.getByLabel('Full-text query').fill('a');

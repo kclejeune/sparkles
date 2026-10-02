@@ -188,6 +188,14 @@
     }
   }
 
+  // `#validate` (the schema browser's "Open in shapes editor") scrolls to the Validate panel
+  // once it is on the page
+  let validateSection = $state<HTMLElement>();
+  $effect(() => {
+    if (validateSection && page.url.hash === '#validate')
+      validateSection.scrollIntoView({ block: 'start' });
+  });
+
   // the Validate panel's language, per dataset (ShEx only where the server offers it)
   let validateLang = $state<ValidateLang>('shacl');
   let shexConforms = $state<boolean | null>(null);
@@ -680,7 +688,7 @@ ex:PersonShape a sh:NodeShape ;
         />
 
         <!-- SHACL validation -->
-        <section class="panel">
+        <section class="panel" id="validate" bind:this={validateSection}>
           <div class="panel-head">
             <h2>Validate</h2>
             {#if info?.endpoints?.shex}

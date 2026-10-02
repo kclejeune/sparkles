@@ -20,10 +20,25 @@
   import Icon from '$components/Icon.svelte';
   import PlanView from '$components/PlanView.svelte';
   import ResultMap from '$components/ResultMap.svelte';
+  import Modal from '$components/Modal.svelte';
   import ResultTable from '$components/ResultTable.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
+  import {
+    buildDefinition,
+    formDefaults,
+    inputType,
+    isRequired,
+    PARAM_TYPES,
+    placeholder,
+    queryVariables,
+    runValues,
+    saveProblems,
+    type FormValue,
+    type ParamRow,
+  } from '$lib/stored-queries';
 
-  type QTab = { id: string; title: string; query: string };
+  /** A query tab; `stored` names the saved query it was opened from. */
+  type QTab = { id: string; title: string; query: string; stored?: string };
   type View = 'table' | 'graph' | 'map' | 'plan' | 'raw' | 'explain';
   type Outcome = {
     status: 'running' | 'done' | 'error';
@@ -68,6 +83,7 @@
   let inferences = $state(saved.inferences !== false);
   let outcomes = $state<Record<string, Outcome>>({});
   let examplesOpen = $state(false);
+  let savedOpen = $state(false);
   let formatMenuOpen = $state(false);
   let formatting = $state(false);
   /** Format the query before each Run (per viewer, off by default). */
@@ -110,6 +126,168 @@
   $effect(() => {
     save(STORE_KEY, { tabs, active: activeId, limit, editorH, inferences });
   });
+
+  // --- saved (stored) queries ------------------------------------------------------
+
+  /** The dataset's stored queries (`/$/queries/{ds}`), without their text. */
+  let savedList = $state<api.StoredQuery[]>([]);
+  let savedError = $state<string | null>(null);
+  /** Full definitions by `ds/name`. */
+  let storedDefs = $state<Record<string, api.StoredQuery>>({});
+  /** The parameter form of each tab opened from a stored query. */
+  let forms = $state<Record<string, Record<string, FormValue>>>({});
+  const canAdmin = $derived(!!ds && auth.can(ds, 'admin'));
+
+  async function loadSaved(name: string) {
+    try {
+      const list = await api.storedQueries(name);
+      if (ds === name) {
+        savedList = list;
+        savedError = null;
+      }
+    } catch (e) {
+      if (ds === name) {
+        savedList = [];
+        // servers without stored queries answer 404
+        savedError = e instanceof api.ApiError && e.status === 404 ? null : api.errorMessage(e);
+      }
+    }
+  }
+  $effect(() => {
+    const name = ds;
+    savedList = [];
+    if (name) void loadSaved(name);
+  });
+
+  /** The definition behind the active tab, when it was opened from a stored query. */
+  const activeStored = $derived(
+    ds && active.stored ? storedDefs[`${ds}/${active.stored}`] : undefined,
+  );
+  $effect(() => {
+    const name = ds;
+    const stored = active.stored;
+    const tabId = active.id;
+    if (!name || !stored || storedDefs[`${name}/${stored}`]) return;
+    api.storedQuery(name, stored).then(
+      (d) => {
+        storedDefs[`${name}/${stored}`] = d;
+        forms[tabId] ??= formDefaults(d.parameters);
+      },
+      () => {},
+    );
+  });
+
+  // a tab whose definition is known gets its parameter form
+  $effect(() => {
+    const d = activeStored;
+    if (d && !forms[activeId]) forms[activeId] = formDefaults(d.parameters);
+  });
+
+  async function openSaved(item: api.StoredQuery) {
+    savedOpen = false;
+    if (!ds) return;
+    try {
+      const d = await api.storedQuery(ds, item.name);
+      storedDefs[`${ds}/${item.name}`] = d;
+      const cur = active;
+      if (!cur.query.trim() || cur.query === DEFAULT_QUERY) {
+        cur.query = d.query ?? '';
+        cur.title = item.name;
+        cur.stored = item.name;
+      } else {
+        addTab(d.query ?? '', item.name);
+        active.stored = item.name;
+      }
+      forms[activeId] = formDefaults(d.parameters);
+    } catch (e) {
+      toasts.error(`Could not open the saved query ${item.name}`, e);
+    }
+  }
+
+  function runSaved() {
+    const d = activeStored;
+    if (!d) return;
+    const { values, missing } = runValues(d.parameters, forms[activeId] ?? {});
+    if (missing.length) {
+      toasts.push('error', 'Fill in the required parameters', missing.join(', '));
+      return;
+    }
+    void run({ name: d.name, kind: d.kind ?? 'SELECT', values });
+  }
+
+  async function deleteSaved() {
+    const d = activeStored;
+    if (!ds || !d) return;
+    if (!confirm(`Delete the saved query ${d.name} of /${ds}? Its versions go with it.`)) return;
+    try {
+      await api.deleteStoredQuery(ds, d.name);
+      delete storedDefs[`${ds}/${d.name}`];
+      for (const t of tabs) if (t.stored === d.name) t.stored = undefined;
+      toasts.push('success', `Deleted ${d.name}`);
+      void loadSaved(ds);
+    } catch (e) {
+      toasts.error('Could not delete the saved query', e);
+    }
+  }
+
+  // the save dialog
+  let saveOpen = $state(false);
+  let saveName = $state('');
+  let saveDescription = $state('');
+  let saveRows = $state<(ParamRow & { use: boolean })[]>([]);
+  let saving = $state(false);
+  const saveIssues = $derived(
+    saveProblems(
+      saveName,
+      saveRows.filter((r) => r.use),
+    ),
+  );
+
+  function openSave() {
+    savedOpen = false;
+    const d = activeStored;
+    saveName = active.stored ?? '';
+    saveDescription = d?.description ?? '';
+    saveRows = queryVariables(active.query).map((v) => {
+      const p = d?.parameters?.[v];
+      return {
+        name: v,
+        use: !!p,
+        type: p?.type ?? 'string',
+        default: p?.default == null ? '' : String(p.default),
+        description: p?.description ?? '',
+      };
+    });
+    saveOpen = true;
+  }
+
+  async function saveStored() {
+    if (!ds || saveIssues.length) return;
+    saving = true;
+    const def = buildDefinition(
+      active.query,
+      saveDescription,
+      saveRows.filter((r) => r.use),
+    );
+    try {
+      const r = await api.putStoredQuery(ds, saveName, def);
+      storedDefs[`${ds}/${saveName}`] = r;
+      active.stored = saveName;
+      forms[activeId] = formDefaults(r.parameters);
+      saveOpen = false;
+      toasts.push(
+        'success',
+        r.changed ? `Saved ${saveName} (version ${r.version.version})` : `${saveName} is unchanged`,
+      );
+      void loadSaved(ds);
+    } catch (e) {
+      if (e instanceof api.ApiError && e.status === 403)
+        toasts.push('error', 'Saving a query needs admin access', e.message);
+      else toasts.error('Could not save the query', e);
+    } finally {
+      saving = false;
+    }
+  }
 
   $effect(() => {
     if (ds) {
@@ -206,7 +384,8 @@
   const withPrefixes = (tab: QTab, text: string, dsName: string) =>
     applyMissingPrefixes(tab, text, app.prefixes(dsName));
 
-  async function run() {
+  /** Run the editor's query, or (`stored`) a stored query with parameter values. */
+  async function run(stored?: { name: string; kind: string; values: Record<string, string> }) {
     const tabId = activeId;
     const dsName = ds;
     if (!dsName) {
@@ -216,15 +395,15 @@
     // capture the tab and its text before awaiting: the user may switch tabs meanwhile
     const tab = active;
     // format first when asked to; on any failure the query runs as written
-    if (formatOnRun && tabId === activeId) await formatQuery(true);
+    if (formatOnRun && !stored && tabId === activeId) await formatQuery(true);
     const original = tab.query;
     const owns = claim(tabId);
     outcomes[tabId]?.controller?.abort();
     await app.loadPrefixes(dsName);
     if (!owns()) return;
-    const text = withPrefixes(tab, original, dsName);
+    const text = stored ? original : withPrefixes(tab, original, dsName);
     if (tabId === activeId) editor?.showError(undefined);
-    const k = queryKind(text) ?? 'SELECT';
+    const k = stored?.kind ?? queryKind(text) ?? 'SELECT';
     let at: string | undefined;
     try {
       at = normalizeAt(app.queryAt) ?? undefined;
@@ -279,12 +458,10 @@
               : `${dsName} in ${fmtMs(ms)}`,
         );
       } else {
-        const result = await api.query(dsName, text, {
-          send: limit,
-          reasoning,
-          at,
-          signal: controller.signal,
-        });
+        const opts = { send: limit, reasoning, at, signal: controller.signal };
+        const result = stored
+          ? await api.runStoredQuery(dsName, stored.name, stored.values, opts)
+          : await api.query(dsName, text, opts);
         const elapsed = performance.now() - started;
         if (!owns()) return;
         // Keep the user's chosen view only when re-running the same kind of query.
@@ -559,11 +736,12 @@
         !(e.target as HTMLElement)?.closest?.('.cm-editor')
       ) {
         e.preventDefault();
-        run();
+        void run();
       }
     };
     const onDoc = (e: MouseEvent) => {
       if (examplesOpen && !(e.target as HTMLElement).closest('.examples')) examplesOpen = false;
+      if (savedOpen && !(e.target as HTMLElement).closest('.saved')) savedOpen = false;
       if (formatMenuOpen && !(e.target as HTMLElement).closest('.format-group'))
         formatMenuOpen = false;
     };
@@ -660,6 +838,51 @@
         </div>
       {/if}
     </div>
+    <div class="saved">
+      <button
+        class="btn sm"
+        aria-haspopup="menu"
+        aria-expanded={savedOpen}
+        disabled={!ds}
+        onclick={() => (savedOpen = !savedOpen)}
+      >
+        Saved <Icon name="chevronDown" size={13} />
+      </button>
+      {#if savedOpen}
+        <div class="menu" role="menu">
+          {#each savedList as q (q.name)}
+            <button role="menuitem" class="menu-item" onclick={() => openSaved(q)}>
+              <span
+                >{q.name}
+                <span class="faint mono small"
+                  >{q.kind ?? ''}{Object.keys(q.parameters ?? {}).length
+                    ? ` · ${Object.keys(q.parameters ?? {})
+                        .map((n) => `?${n}`)
+                        .join(' ')}`
+                    : ''}</span
+                ></span
+              >
+              <span class="faint">{q.description ?? ''}</span>
+            </button>
+          {:else}
+            <p class="faint small menu-note">
+              {savedError ?? `/${ds} has no saved queries.`}
+            </p>
+          {/each}
+          <button
+            role="menuitem"
+            class="menu-item"
+            onclick={openSave}
+            disabled={!canAdmin || !active.query.trim() || queryKind(active.query) === 'UPDATE'}
+            title={canAdmin ? undefined : `Requires admin access to /${ds}`}
+          >
+            <span><Icon name="plus" size={12} /> Save this query…</span>
+            <span class="faint">A named query with typed parameters, for HTTP, MCP and the CLI</span
+            >
+          </button>
+        </div>
+      {/if}
+    </div>
     {#if reasoningInfo && kind !== 'UPDATE'}
       <label
         class="limit inf"
@@ -743,7 +966,7 @@
     {:else}
       <button
         class="btn sm primary"
-        onclick={run}
+        onclick={() => run()}
         disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
         title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
           ? `Requires write access to /${ds}`
@@ -754,6 +977,65 @@
         <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
       </button>
     {/if}
+    {#if activeStored}
+      {@const form = forms[activeId] ?? {}}
+      <div class="params" aria-label="Saved query parameters">
+        <span class="small" title={activeStored.description ?? ''}
+          ><Icon name="archive" size={12} /> <strong>{activeStored.name}</strong>
+          <span class="faint">v{activeStored.version.version}</span></span
+        >
+        {#each Object.entries(activeStored.parameters ?? {}) as [pname, p] (pname)}
+          <label class="param small" title={p.description ?? p.type}>
+            <span class="mono">?{pname}{isRequired(p) ? '*' : ''}</span>
+            {#if p.enum?.length}
+              <select class="select sm" bind:value={form[pname]}>
+                {#if !isRequired(p)}<option value="">—</option>{/if}
+                {#each p.enum as v (String(v))}<option value={String(v)}>{String(v)}</option>{/each}
+              </select>
+            {:else if inputType(p.type) === 'checkbox'}
+              <input
+                type="checkbox"
+                checked={form[pname] === true}
+                onchange={(e) => (form[pname] = e.currentTarget.checked)}
+              />
+            {:else}
+              <input
+                class="input sm"
+                type={inputType(p.type)}
+                step={p.type === 'integer' ? 1 : 'any'}
+                placeholder={placeholder(p.type)}
+                value={String(form[pname] ?? '')}
+                oninput={(e) => (form[pname] = e.currentTarget.value)}
+                onkeydown={(e) => e.key === 'Enter' && runSaved()}
+              />
+            {/if}
+          </label>
+        {/each}
+        <span class="spacer"></span>
+        <button
+          class="btn sm primary"
+          onclick={runSaved}
+          disabled={outcome?.status === 'running'}
+          title="Run the stored version with these values (/{ds}/queries/{activeStored.name})"
+        >
+          <Icon name="play" size={12} /> Run saved query
+        </button>
+        {#if canAdmin}
+          <button
+            class="btn ghost icon sm"
+            aria-label="Delete the saved query"
+            title="Delete the saved query"
+            onclick={deleteSaved}><Icon name="trash" size={13} /></button
+          >
+        {/if}
+        <button
+          class="btn ghost icon sm"
+          aria-label="Detach the tab from the saved query"
+          title="Detach the tab from the saved query"
+          onclick={() => (active.stored = undefined)}><Icon name="x" size={12} /></button
+        >
+      </div>
+    {/if}
   </div>
 
   <div class="editor-wrap">
@@ -762,7 +1044,7 @@
       docId={active.id}
       value={active.query}
       onchange={setQuery}
-      onrun={run}
+      onrun={() => run()}
       onformat={() => void formatQuery()}
       {completion}
     />
@@ -1123,6 +1405,50 @@
   </section>
 </div>
 
+<Modal bind:open={saveOpen} title="Save as a stored query" width={560}>
+  <p class="muted small">
+    The editor's query is stored on the server for /{ds}. Runs bind each parameter to one value of
+    its type, so a value never changes the query. It is also an MCP tool.
+  </p>
+  <div class="save-form">
+    <label class="field">
+      <span class="small">Name</span>
+      <input class="input" bind:value={saveName} placeholder="people-by-age" />
+    </label>
+    <label class="field">
+      <span class="small">Description</span>
+      <input class="input" bind:value={saveDescription} placeholder="What the query answers" />
+    </label>
+    {#if saveRows.length}
+      <div class="small">Parameters</div>
+      <div class="param-rows">
+        {#each saveRows as r (r.name)}
+          <label class="row small">
+            <input type="checkbox" bind:checked={r.use} />
+            <span class="mono">?{r.name}</span>
+          </label>
+          <select class="select sm" bind:value={r.type} disabled={!r.use}>
+            {#each PARAM_TYPES as t (t)}<option value={t}>{t}</option>{/each}
+          </select>
+          <input
+            class="input sm"
+            bind:value={r.default}
+            disabled={!r.use}
+            placeholder="default (empty: required)"
+          />
+        {/each}
+      </div>
+    {/if}
+    {#each saveIssues as issue (issue)}<p class="err-text small">{issue}</p>{/each}
+  </div>
+  {#snippet actions()}
+    <button class="btn" onclick={() => (saveOpen = false)}>Cancel</button>
+    <button class="btn primary" onclick={saveStored} disabled={saving || saveIssues.length > 0}>
+      Save
+    </button>
+  {/snippet}
+</Modal>
+
 <style>
   .page {
     flex: 1;
@@ -1285,8 +1611,54 @@
     height: 24px;
     font-size: var(--fs-sm);
   }
-  .examples {
+  .examples,
+  .saved {
     position: relative;
+  }
+  .menu-note {
+    margin: 4px 8px;
+  }
+  .menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .params {
+    flex-basis: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border);
+    min-width: 0;
+  }
+  .param {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+  .param .input {
+    width: 140px;
+    max-width: 40vw;
+  }
+  .save-form {
+    display: grid;
+    gap: 10px;
+  }
+  .field {
+    display: grid;
+    gap: 4px;
+  }
+  .param-rows {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    gap: 6px 8px;
+    align-items: center;
+  }
+  .err-text {
+    color: var(--danger);
+    margin: 0;
   }
   .menu {
     position: absolute;
@@ -1566,6 +1938,7 @@
       position: relative;
     }
     .examples,
+    .saved,
     .format-group {
       position: static;
     }

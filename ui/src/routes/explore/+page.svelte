@@ -15,6 +15,7 @@
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
+  import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
   import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
@@ -389,6 +390,8 @@
   let schemaGraph = $state('default');
   /** Count materialized inferences (only offered when the dataset has them). */
   let schemaInferences = $state(true);
+  /** The "Draft shapes" dialog. */
+  let draftOpen = $state(false);
   let showBuiltinProps = $state(false);
   const hasInferences = $derived(!!app.datasets.find((d) => d.name === ds)?.reasoning);
   // A newer load (reload, other graph, dataset switch) supersedes an older one.
@@ -882,6 +885,14 @@
               <span>include inferences</span>
             </label>
           {/if}
+          <button
+            class="btn sm"
+            onclick={() => (draftOpen = true)}
+            disabled={!ds}
+            title="Draft SHACL shapes or a ShEx schema from the data"
+          >
+            <Icon name="wand" size={13} /> Draft shapes
+          </button>
         </div>
         <div class="schema-tools">
           <div class="tabs" role="tablist">
@@ -1161,6 +1172,16 @@
     </div>
   {/if}
 </div>
+
+{#if ds}
+  <ShapesDraftDialog
+    bind:open={draftOpen}
+    {ds}
+    graph={schemaGraph}
+    reasoning={hasInferences && schemaInferences}
+    {prefixes}
+  />
+{/if}
 
 <style>
   .page {

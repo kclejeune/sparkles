@@ -1686,6 +1686,58 @@ function schemaReport(ds, p) {
 const RDF_TYPE_IRI = NS.rdf + 'type';
 
 /** A page of an IRI-sorted list after the cursor (base64url JSON `{ a: lastIri }`). */
+/** Stored queries per dataset name (`/$/queries`). */
+const storedQueries = {};
+
+/** A drafted-shapes answer (`/$/schema/{ds}/shapes`): one empty shape per class. */
+function draftShapes(name, report, p) {
+  const classes = report.classes.filter((c) => !c.builtin && c.observed.instances > 0);
+  const local = (iri) => iri.replace(/^.*[#/:]/, '').replace(/[^A-Za-z0-9_-]/g, '_');
+  const base = `urn:x-sparkles:shape:${name}:`;
+  const shapes = classes.map((c) => ({
+    shape: `${base}${local(c.iri)}Shape`,
+    class: c.iri,
+    instances: c.observed.instances,
+    closed: p.get('closed') === 'true',
+    properties: [],
+  }));
+  return {
+    draftFormat: 1,
+    dataset: name,
+    snapshot: report.snapshot,
+    selection: { graph: p.get('graph') ?? 'default', reasoning: false },
+    options: {
+      support: Number(p.get('support') ?? 1),
+      minInstances: 1,
+      maxIn: 10,
+      maxCount: 1,
+      closed: p.get('closed') === 'true',
+      base,
+      classes: [],
+    },
+    totals: {
+      shapes: shapes.length,
+      propertyShapes: 0,
+      constraints: 0,
+      rejected: 0,
+      skippedClasses: 0,
+    },
+    shapes,
+    shacl:
+      '@prefix sh: <http://www.w3.org/ns/shacl#> .\n' +
+      shapes
+        .map((s) => `\n<${s.shape}>\n    a sh:NodeShape ;\n    sh:targetClass <${s.class}> .`)
+        .join('\n'),
+    shex: shapes.map((s) => `<${s.shape}> {\n}`).join('\n'),
+    shapeMap: shapes
+      .map(
+        (s) =>
+          `{FOCUS <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <${s.class}>}@<${s.shape}>`,
+      )
+      .join(',\n'),
+  };
+}
+
 function schemaPage(items, limit, cursor) {
   let after = null;
   if (cursor) after = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')).a;
@@ -1907,6 +1959,8 @@ const server = http.createServer(async (req, res) => {
           const r = schemaReport(ds, url.searchParams);
           if (r.error) return fail(res, r.status, r.error);
           const cursor = url.searchParams.get('cursor');
+          if (extra === 'shapes')
+            return send(res, 200, draftShapes(name, r.report, url.searchParams));
           if (extra === 'classes' || extra === 'predicates')
             return send(res, 200, schemaPage(r.report[extra], limit, cursor));
           return send(res, 200, {
@@ -1914,6 +1968,36 @@ const server = http.createServer(async (req, res) => {
             classes: schemaPage(r.report.classes, limit, null),
             predicates: schemaPage(r.report.predicates, limit, null),
           });
+        }
+        // stored queries: kept in memory, never run by the mock
+        case 'queries': {
+          if (!ds) return fail(res, 404, `No such dataset: ${name}`);
+          const store = (storedQueries[name] ??= new Map());
+          if (!extra) return send(res, 200, { dataset: name, queries: [...store.values()] });
+          if (req.method === 'GET') {
+            const q = store.get(extra);
+            return q ? send(res, 200, q) : fail(res, 404, `no stored query '${extra}' in /${name}`);
+          }
+          if (req.method === 'PUT') {
+            const def = JSON.parse((await readBody(req)).toString() || '{}');
+            const prev = store.get(extra);
+            const version = (prev?.version.version ?? 0) + 1;
+            const q = {
+              ...def,
+              name: extra,
+              dataset: name,
+              kind: /^\s*(?:PREFIX[^\n]*\n\s*)*ASK/i.test(def.query ?? '') ? 'ASK' : 'SELECT',
+              mcp: def.mcp !== false,
+              version: { version, created: new Date().toISOString(), digest: '0'.repeat(64) },
+            };
+            store.set(extra, q);
+            return send(res, prev ? 200 : 201, { ...q, changed: true });
+          }
+          if (req.method === 'DELETE') {
+            if (!store.delete(extra)) return fail(res, 404, `no stored query '${extra}'`);
+            return send(res, 204, '');
+          }
+          break;
         }
         case 'prefixes':
           if (!ds) return fail(res, 404, `No such dataset: ${name}`);
