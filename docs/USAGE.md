@@ -442,6 +442,7 @@ sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and
 sparkles load --loc db --check --strict data.ttl   # the same checks before a load
 sparkles qparse 'SELECT ...'                  # the query, formatted
 sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
+sparkles qparse --syntax sparql --query q.rq  # strict SPARQL, without ARQ's extensions
 sparkles uparse --print algebra 'DELETE ...'  # the update as SPARQL algebra
 sparkles compare a.ttl b.nt                   # exit 0 when isomorphic, 1 with a diff, 2 on errors
 sparkles iri '<http://Example.org:80/a/../b>' # components, normal form, warnings
@@ -482,7 +483,9 @@ components, the RFC 3986 normal form or the canonical case, and `--format json`.
 the same, and made-up names of aggregates and blank nodes print as `?.0` and `_:b0`.
 `--print plan` prints the physical plan of `query --explain`. It is planned against an
 empty database unless `--loc` or `--data` gives one with real statistics. A syntax
-error exits with status 1.
+error exits with status 1. Like Fuseki, `qparse` and `uparse` accept Jena ARQ's syntax
+extensions by default ([API.md](API.md#arq-syntax-extensions)). `--syntax sparql` (or
+Jena's `SPARQL_11` and `SPARQL_12`) rejects them, and `--syntax arq` is the default.
 
 `compare` reads both files into memory and compares them as RDF datasets up to
 blank-node isomorphism. The diff lists quads only in the first file with `<` and quads

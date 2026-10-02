@@ -72,7 +72,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
 | [G05](G05-command-line-tools.md) | `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfdiff`), `iri`, `langtag`, `rsparql`, `rupdate` and `rset`, and IRI and language-tag warnings in `convert --check`, `load --check` and `/$/validate/iri` | implemented |
-| [G06](G06-arq-query-extensions.md) | Jena ARQ's syntax extensions: `LATERAL`, property path ranges `{n,m}` and CONSTRUCT templates with `GRAPH` | designed, not built |
+| [G06](G06-arq-query-extensions.md) | Jena ARQ's syntax extensions: `LATERAL`, property path ranges `{n,m}` and CONSTRUCT templates with `GRAPH` | implemented in part (Phase 1) |
 | [P01](P01-python-bindings.md) | The `sparkles` Python package: datasets, SPARQL, terms, quads, transactions, dumps, reasoning and validation, built with PyO3 and maturin as abi3 wheels | implemented in part (Phase 1, most of Phase 2) |
 | [X01](X01-compression-codecs.md) | zstd and brotli next to gzip and LZ4 for inputs, responses, dumps, backups and the UI's assets | implemented in part (Phase 1) |
 | [X02](X02-formatter.md) | `sparkles fmt`, `POST /$/format`, `sparkles lsp` and the UI's Format button for SPARQL and RDF | implemented |

@@ -2,9 +2,9 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Phase 1 shipped: `LATERAL`, property path ranges and CONSTRUCT templates
-> with `GRAPH`. Configurable DESCRIBE and the rest of ARQ's function library are later
-> phases and will extend this spec.
+> **Phases:** Phase 1 shipped on 2026-10-02: `LATERAL`, property path ranges and
+> CONSTRUCT templates with `GRAPH`. Configurable DESCRIBE and the rest of ARQ's function
+> library are later phases and will extend this spec.
 >
 > **User docs:** [API: ARQ syntax extensions](../API.md#arq-syntax-extensions) ·
 > [Features](../FEATURES.md#sparql-arq-equivalent) ·
@@ -330,4 +330,59 @@ The ARQ tests named here are in Jena's `jena-arq/testing/ARQ` and are ported to
 
 ## Outcome
 
-Not yet landed.
+**Delivered.** Phase 1 landed on 2026-10-02 as designed in §2 to §6:
+- `SparqlParser::with_arq_syntax` in the vendored spargebra, on by default, with
+  `LATERAL` (spargebra's `sep-0006` code, now switched on), path ranges as
+  `PropertyPathExpression::Range` and CONSTRUCT templates with `GRAPH` as
+  `Query::Construct::graph_templates`. ARQ's aggregate keywords moved behind the same
+  switch;
+- the planner's join test for `LATERAL` and the `Lateral` operator
+  (`sparql/lateral.rs`), the scoped constant table and the `GRAPH ?g` fix, which also
+  corrects per-row `EXISTS` over a non-trivial `GRAPH ?g` group;
+- the range rewrite in the planner and the counting mode of the path operator;
+- CONSTRUCT quads in `QueryResult::quads`, in every dataset format of the server and the
+  CLI, and in the `x-sparkles+json` document;
+- the formatter, the editor keyword, `WhereBuilder::lateral` and range paths in the
+  query builder, and `qparse --syntax` and `uparse --syntax`.
+
+**Deviations and decisions.**
+- A guard rule cannot choose the parser's message. peg reports the alternatives that
+  failed furthest into the text, so strict mode gives an ordinary syntax error at the
+  extension rather than the words `ARQ syntax`.
+- One W3C negative syntax test, `constructwhere06` (`CONSTRUCT WHERE { GRAPH … }`), is
+  valid ARQ syntax, as ARQ's own `syntax-quad-construct-11` says. The W3C harness now
+  parses positive syntax tests in both modes and negative ones as strict SPARQL, which
+  is how Jena's runner reads `.rq` files.
+- `qparse --syntax` also takes Jena's names `SPARQL_11` and `SPARQL_12`.
+- In Python, `construct()` keeps returning `QueryTriples`, which gained a `quads`
+  attribute, and its `serialize` writes them in dataset formats. That replaced the
+  planned `construct_quads` method. Rust has `Dataset::construct_quads` as planned.
+- RDFS on read rewrites a range of at most 8 steps as the union of its sequences, so
+  that each entailed link counts once. Inside a longer or unbounded range, a link that
+  holds through a property and also through its subproperty counts twice.
+- A SERVICE inside a `LATERAL` that runs per row is sent as written, without the outer
+  values.
+- The `Lateral` operator evaluates its groups one after another. Running them in
+  parallel was left for later.
+
+**Tests.** `crates/sparkles/tests/arq_syntax.rs` ports ARQ's `Syntax-Lateral` (13
+cases), `Lateral` (7) and `syntax-quad-construct-*` (13) tests, the range cases of
+`TestPath` and `TestPathQuery`, and Jena 6.2.0's answers to 35 queries on small graphs for
+ranges and `LATERAL` (A1 to A9). It found that a sub-select that does not project an
+outer variable hides it, as in ARQ, which two of the first expectations had wrong. The
+formatter has golden files for the three forms, and its check that the output means the
+same as the input passes on them. The query builder, the Python bindings and `qparse`
+have tests of their parts. The W3C SPARQL suites still pass 482/328/157/269 (A10).
+
+**Measurements.** On the 1.05M-triple benchmark data, with a release build on a machine
+that other builds kept at a load of about 55:
+- `?p a ex:Researcher LATERAL { SELECT ?p ?f { ?p foaf:knows ?f } ORDER BY ?f LIMIT 1 }`
+  ran 30,279 groups in 666 ms, about 22 µs per group;
+- `?p a ex:Researcher LATERAL { ?p foaf:knows ?f }` and `?a foaf:knows{2} ?c` get the
+  same plans as the plain join and the sequence `foaf:knows/foaf:knows`;
+- eight of the benchmark's ordinary queries get the same plans from main and from this
+  branch, and their timings, interleaved over 11 rounds, differ only by noise.
+
+**Not built.** ARQ's other path forms (`:p^:q`, `distinct(…)`, `shortest(…)`,
+`multi(…)`), `SEMIJOIN`, `ANTIJOIN`, `LET`, `UNFOLD` and the `JSON` query form (§1
+non-goals), and parallel evaluation of `LATERAL` groups.
