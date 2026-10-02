@@ -604,23 +604,27 @@ mod imp {
         pub(super) lang: Field,
         pub(super) text: Field,
         /// the stemmed text of each analyzed language (`text_<tag>`), by primary tag
-        stemmed: Vec<(String, Field)>,
+        stemmed: Vec<(String, Field, Analyzer)>,
     }
 
     impl Fields {
-        /// The stemmed field of a language tag's primary subtag, if it has one.
-        fn stemmed_for(&self, tag: &str) -> Option<Field> {
+        /// The stemmed field of a language tag's primary subtag and its analyzer, if it
+        /// has one.
+        fn stemmed_for(&self, tag: &str) -> Option<(Field, Analyzer)> {
             let primary = tag.split('-').next().unwrap_or(tag);
             self.stemmed
-                .binary_search_by(|(t, _)| t.as_str().cmp(primary))
+                .binary_search_by(|(t, ..)| t.as_str().cmp(primary))
                 .ok()
-                .map(|i| self.stemmed[i].1)
+                .map(|i| (self.stemmed[i].1, self.stemmed[i].2))
         }
 
         /// The field a search with language `lang` searches: the language's stemmed
-        /// text when it has an analyzer, else the standard text.
-        pub(super) fn text_for(&self, lang: Option<&str>) -> Field {
-            lang.and_then(|l| self.stemmed_for(l)).unwrap_or(self.text)
+        /// text when it has an analyzer, else the standard text (`None`).
+        pub(super) fn text_for(&self, lang: Option<&str>) -> (Field, Option<Analyzer>) {
+            match lang.and_then(|l| self.stemmed_for(l)) {
+                Some((f, a)) => (f, Some(a)),
+                None => (self.text, None),
+            }
         }
     }
 
@@ -650,7 +654,7 @@ mod imp {
                 .into_iter()
                 .map(|(tag, a)| {
                     let f = b.add_text_field(&format!("text_{tag}"), text(&tokenizer_name(a)));
-                    (tag, f)
+                    (tag, f, a)
                 })
                 .collect(),
         };
@@ -680,10 +684,11 @@ mod imp {
         }
     }
 
-    /// A language's analyzer: the standard tokens, without the language's stop words,
-    /// stemmed, then ASCII-folded like the standard text (stemmers expect the letters
-    /// of their language, so folding comes last). Removed stop words leave gaps in the
-    /// positions, as in Lucene, so a phrase across one still needs the gap.
+    /// A language's analyzer: the standard tokens, lowercased, without the language's
+    /// stop words, and stemmed. As in Lucene's language analyzers, the stems are not
+    /// ASCII-folded: folding would merge words the language keeps apart, such as
+    /// Swedish `städer` and `stad` or Spanish `año` and `ano`. Removed stop words leave
+    /// gaps in the positions, as in Lucene, so a phrase across one still needs the gap.
     pub(super) fn language_analyzer(a: Analyzer) -> TextAnalyzer {
         use tantivy::tokenizer::{Language as L, Stemmer, StopWordFilter};
         let lang = match a {
@@ -714,19 +719,21 @@ mod imp {
             Some(stop) => b.filter_dynamic(stop),
             None => b,
         };
-        b.filter_dynamic(Stemmer::new(lang))
-            .filter_dynamic(AsciiFoldingFilter)
-            .build()
+        b.filter_dynamic(Stemmer::new(lang)).build()
     }
 
-    /// The text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
-    /// regular expression term is normalized as the indexed tokens are (lowercased and
-    /// ASCII-folded), but not split.
-    pub(super) fn normalizer() -> TextAnalyzer {
-        TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+    /// A text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
+    /// regular expression term is normalized as the indexed tokens are, but not split or
+    /// stemmed. Terms of the standard text (`None`) are lowercased and ASCII-folded, and
+    /// those of a language only lowercased, as Lucene's analyzers normalize them.
+    pub(super) fn normalizer(analyzer: Option<Analyzer>) -> TextAnalyzer {
+        let b = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
             .filter(LowerCaser)
-            .filter(AsciiFoldingFilter)
-            .build()
+            .dynamic();
+        match analyzer {
+            None => b.filter_dynamic(AsciiFoldingFilter).build(),
+            Some(_) => b.build(),
+        }
     }
 
     /// What every view of one index generation shares.
@@ -1248,7 +1255,7 @@ mod imp {
             }
             d.add_text(f.text, &lex[..end]);
             // a language with an analyzer: the stemmed text too
-            if let Some(field) = lang.and_then(|t| f.stemmed_for(&t.to_ascii_lowercase())) {
+            if let Some((field, _)) = lang.and_then(|t| f.stemmed_for(&t.to_ascii_lowercase())) {
                 d.add_text(field, &lex[..end]);
             }
             Some(Doc {
@@ -1877,8 +1884,10 @@ mod imp {
                 [(0, "ada".to_string()), (3, "fox".to_string())]
             );
             assert_eq!(words(Analyzer::French, "Les chevaux"), ["cheval"]);
-            // stemmed before folding: the umlaut is the stemmer's
+            // the German stemmer removes the umlaut itself
             assert_eq!(words(Analyzer::German, "die Häuser"), ["haus"]);
+            // stems are not folded: Swedish keeps städer (städ) apart from stad
+            assert_eq!(words(Analyzer::Swedish, "städer stad"), ["städ", "stad"]);
             assert_eq!(words(Analyzer::Spanish, "las canciones"), ["cancion"]);
             // a language without a stop word list in Tantivy still stems
             assert_eq!(words(Analyzer::Turkish, "kitaplar"), ["kitap"]);

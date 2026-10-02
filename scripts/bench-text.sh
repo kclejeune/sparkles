@@ -113,7 +113,9 @@ RDFS=http://www.w3.org/2000/01/rdf-schema#
 
 # the jena-text assembler: TDB2 wrapped in a text dataset whose Lucene index (standard
 # analyzer, the default) has one field per predicate and stores the literals, so
-# text:query can return them
+# text:query can return them. With multilingual support and a language field, a tagged
+# literal is also indexed with its language's analyzer, which lang: searches use, as
+# Sparkles does with --language en
 cat > fuseki-text.ttl << EOF
 @prefix fuseki: <http://jena.apache.org/fuseki#> .
 @prefix rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -135,12 +137,14 @@ cat > fuseki-text.ttl << EOF
 <#lucene> rdf:type text:TextIndexLucene ;
     text:directory <file:$WORK/jena-text> ;
     text:storeValues true ;
+    text:multilingualSupport true ;
     text:entityMap <#entMap> .
 
 <#entMap> rdf:type text:EntityMap ;
     text:entityField "uri" ;
     text:uidField "uid" ;
     text:defaultField "name" ;
+    text:langField "lang" ;
     text:map (
         [ text:field "name" ; text:predicate <${FOAF}name> ]
         [ text:field "title" ; text:predicate <${EX}title> ]
@@ -170,7 +174,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   if has sparkles; then
     BUILD+=(--prepare "$SPARKLES text-index --loc sparkles.db --disable > /dev/null 2>&1 || true"
       --command-name sparkles
-      "$SPARKLES text-index --loc sparkles.db --predicate ${FOAF}name --predicate ${EX}title --predicate ${RDFS}label")
+      "$SPARKLES text-index --loc sparkles.db --predicate ${FOAF}name --predicate ${EX}title --predicate ${RDFS}label --language en")
   fi
   if has jena; then
     BUILD+=(--prepare 'rm -rf jena-text' --command-name jena-fuseki
@@ -244,7 +248,8 @@ fi
 # Each query has a text:query form (Sparkles and Jena run the same text) and a QLever form.
 # The words are ones the three tokenizers treat alike. Lucene's standard analyzer, Tantivy's
 # simple tokenizer and QLever all split the generated literals at spaces, hyphens and
-# parentheses and lowercase them, and none of them stems or drops stop words here. A
+# parentheses and lowercase them, and none of them stems or drops stop words in a search
+# without a language. Only the stemmed query (7) names a language. A
 # search that should return every hit passes an explicit limit, because jena-text
 # otherwise stops at 10,000 hits. Sparkles allows a million without a limit.
 P='PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> PREFIX text: <http://jena.apache.org/text#> PREFIX ql: <http://qlever.cs.uni-freiburg.de/builtin-functions/> '
@@ -289,6 +294,13 @@ add conjunction set \
 add highlight count \
   "SELECT ?s ?lit WHERE { (?s ?score ?lit) text:query (foaf:name \"ada\" $ALL \"highlight:\") }" \
   "SELECT ?s ?lit WHERE { $(qtext ada foaf:name) }"
+# 7. a stemmed search in English titles ("On the theory of topic N (d)"@en): "theories"
+# finds "theory" through the English analyzers, Lucene's EnglishAnalyzer (Porter) in Jena
+# and Tantivy's English Snowball stemmer in Sparkles, and the number keeps the hit set
+# small. QLever does not stem, so its form searches for the indexed word.
+add stemmed set \
+  "SELECT ?s ?lit WHERE { (?s ?score ?lit) text:query (ex:title \"+theories +42\" $ALL \"lang:en\") }" \
+  "SELECT ?s ?lit WHERE { $(qtext 'theory 42' ex:title) }"
 # There is no prefix query. All three engines take al*, but QLever returns a row per
 # matching word, so "Alan Allen" counts twice.
 

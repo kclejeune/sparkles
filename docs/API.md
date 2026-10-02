@@ -1855,14 +1855,18 @@ SELECT ?s ?score ?label WHERE {
   literal whose language tag has an analyzer is indexed twice, once as above and once
   stemmed. A search with `lang:` or a language-tagged query string searches the stemmed
   text of that language, so `"runs"@en` matches `Running quickly`@en. The analyzer of a
-  language removes its stop words (where Tantivy has a list for it), applies Tantivy's
-  Snowball stemmer and then folds to ASCII. It is applied to the query in the same way.
+  language lowercases, removes the language's stop words (where Tantivy has a list for
+  it) and applies Tantivy's Snowball stemmer. It is applied to the query in the same way.
+  As in Lucene, stemmed terms are not folded to ASCII, so Swedish `städer` and `stad`
+  stay apart.
   * The language of a literal and of a search is its primary subtag, so `en-GB` literals
     are stemmed as English and `lang:en-gb` searches the English text and keeps only
     `en-GB` literals.
   * As in Lucene, prefixes, wildcards, fuzzy words, regular expressions and ranges are
     not stemmed. They match the stemmed terms, so `runn*` finds `runner` but not
-    `running`, which was indexed as `run`.
+    `running`, which was indexed as `run`. They are lowercased, and for German the
+    umlauts and ß are replaced as the German stemmer replaces them, so `häu*` finds
+    `Häuser`.
   * A removed stop word leaves a gap in the positions, as in Lucene. The phrase
     `"ada and the fox"` matches `Ada and the fox`, and `"ada fox"` does not.
   * A search without a language searches the unstemmed text, as in Jena. A language

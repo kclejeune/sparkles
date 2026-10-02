@@ -52,8 +52,8 @@ pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
     let resolved = view.resolved()?;
     // a language with an analyzer searches its stemmed text; fuzzy terms expand against
     // the searcher's terms of that field
-    let field = sh.fields.text_for(spec.lang.as_deref());
-    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, field)
+    let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
+    let parsed = super::lucene::parse(&spec.query, &resolved.searcher, field, analyzer)
         .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
     let matchers = parsed.matchers;
     let Some(query) = scoped(snap, spec, &sh.fields, parsed.query) else {

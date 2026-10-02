@@ -102,6 +102,8 @@ fn a_language_search_is_stemmed_and_the_plain_one_is_not() {
     assert_eq!(hits(&s, "\"cheval\" \"lang:fr\""), ["f", "g"]);
     assert_eq!(hits(&s, "\"cheval\""), ["g"]);
     assert_eq!(hits(&s, "\"haus\" \"lang:de\""), ["h"]);
+    // a German prefix loses its umlauts as the German stems do
+    assert_eq!(hits(&s, "\"häu*\" \"lang:de\""), ["h"]);
     // a language without an analyzer in this index: the standard text, filtered
     assert_eq!(hits(&s, "\"running\" \"lang:nl\""), ["i"]);
     assert_eq!(hits(&s, "\"run\" \"lang:nl\""), Vec::<String>::new());
