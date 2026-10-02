@@ -8,6 +8,12 @@ fn ran() -> u64 {
     RAN.load(Ordering::SeqCst)
 }
 
+/// Runs of `query` on the test dataset count as quick however long they take, so that
+/// what follows a quick run does not depend on the machine's load.
+fn ignore_time(query: &str) {
+    crate::http::QUICK.ignore_time(crate::http::inline::QuickQueries::key("ds", query));
+}
+
 async fn select(app: &Router, q: &str, accept: &str) -> Resp {
     let req = Request::post("/ds/sparql")
         .header(header::CONTENT_TYPE, "application/sparql-query")
@@ -21,6 +27,7 @@ async fn select(app: &Router, q: &str, accept: &str) -> Resp {
 async fn a_quick_query_runs_in_place_the_second_time_with_the_same_answer() {
     let s = server();
     let q = "SELECT ?s ?n WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?n } ORDER BY ?n";
+    ignore_time(q);
     for accept in [
         "application/sparql-results+json",
         "text/csv",
@@ -58,6 +65,7 @@ async fn a_quick_query_runs_in_place_the_second_time_with_the_same_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_quick_query_reports_its_error_and_runs_on_the_pool_next() {
     let s = server();
+    ignore_time("SELECT ?s WHERE { ?s ?p ?o }");
     let form = |budget: &str| {
         Request::post(format!("/ds/sparql{budget}"))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
