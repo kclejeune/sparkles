@@ -615,6 +615,8 @@ pub struct Saved {
 pub struct Catalog {
     root: Option<PathBuf>,
     doc: RwLock<FileDoc>,
+    /// why the file could not be read ([`Catalog::open_or_broken`]); changes are refused
+    broken: Option<String>,
 }
 
 fn digest(parent: Option<&str>, def: &Definition) -> String {
@@ -656,7 +658,35 @@ impl Catalog {
         Ok(Catalog {
             root: root.map(Path::to_path_buf),
             doc: RwLock::new(doc),
+            broken: None,
         })
+    }
+
+    /// [`Catalog::open`], or, when the file cannot be read, an empty catalog that refuses
+    /// changes (so a malformed file is never overwritten) and names the problem.
+    pub fn open_or_broken(root: Option<&Path>) -> Catalog {
+        Catalog::open(root).unwrap_or_else(|e| Catalog {
+            root: root.map(Path::to_path_buf),
+            doc: RwLock::new(FileDoc {
+                format: FORMAT,
+                ..Default::default()
+            }),
+            broken: Some(e.to_string()),
+        })
+    }
+
+    /// Why the file could not be read, if it could not.
+    pub fn broken(&self) -> Option<&str> {
+        self.broken.as_deref()
+    }
+
+    fn writable(&self) -> Result<()> {
+        match &self.broken {
+            Some(e) => Err(Error::Conflict(format!(
+                "the stored queries cannot be changed until {FILE} is fixed or removed: {e}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// The current version of every query, by name.
@@ -710,6 +740,7 @@ impl Catalog {
                 "invalid query name '{name}': use letters, digits, _ and -, at most {MAX_NAME} characters"
             )));
         }
+        self.writable()?;
         def.check()?;
         let mut doc = self.doc.write();
         let current = doc
@@ -765,6 +796,7 @@ impl Catalog {
 
     /// Remove a query and its versions; `false` when there was none.
     pub fn delete(&self, name: &str, if_version: Option<u64>) -> Result<bool> {
+        self.writable()?;
         let mut doc = self.doc.write();
         let have = doc
             .queries

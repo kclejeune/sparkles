@@ -607,6 +607,59 @@ async fn drafted_shapes_cover_the_view() {
 }
 
 #[tokio::test]
+async fn stored_queries_run_on_the_view() {
+    let s = server();
+    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    let def: sparkles::stored::Definition = serde_json::from_value(serde_json::json!({
+        "query": "SELECT ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o FILTER(CONTAINS(?o, ?word)) } } ORDER BY ?s",
+        "parameters": { "word": { "type": "string", "default": "fox" } }
+    }))
+    .unwrap();
+    ds.queries
+        .put("foxes", def.clone(), sparkles::stored::Change::default())
+        .unwrap();
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                u,
+                &[("authorization", &b(user)), ("accept", "text/csv")],
+                "",
+            )
+            .await
+        }
+    };
+    let rows = |r: &R| -> Vec<String> { r.text().lines().skip(1).map(str::to_string).collect() };
+    let r = get("/graphs/queries/foxes", "gfull").await;
+    assert_eq!(rows(&r), ["http://ex/a1", "http://ex/b1"], "{}", r.text());
+    // a reader of http://ex/a/* sees the foxes of those graphs only
+    let r = get("/graphs/queries/foxes", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(rows(&r), ["http://ex/a1"]);
+    // the definitions are dataset settings that a limited reader may list
+    let r = get("/$/queries/graphs", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a grant limited to the Graph Store reads reaches no query
+    let r = get("/graphs/queries/foxes", "gep").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // changing a definition needs admin
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/queries/graphs/foxes",
+        &[
+            ("authorization", &b("gfull")),
+            ("content-type", "application/json"),
+        ],
+        &serde_json::to_string(&def).unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}
+
+#[tokio::test]
 async fn endpoint_permissions() {
     let s = server();
     let get = |u: &'static str, user: &'static str| {

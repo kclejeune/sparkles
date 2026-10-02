@@ -120,6 +120,8 @@ pub struct Dataset {
     pub validation: RwLock<Option<Validation>>,
     /// write-time validation counters (the store's guard observer)
     pub validation_metrics: Arc<crate::obs::ValidationMetrics>,
+    /// the stored queries (`queries.json`)
+    pub queries: sparkles::stored::Catalog,
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
@@ -646,6 +648,12 @@ impl AppState {
         let validation = install_validation(&store);
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
         store.set_guard_observer(Some(validation_metrics.clone()));
+        let queries = sparkles::stored::Catalog::open_or_broken(store.root());
+        if let Some(e) = queries.broken() {
+            tracing::error!(
+                "stored queries of /{name}: {e}; they cannot be changed until it is fixed"
+            );
+        }
         Ok(Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -655,6 +663,7 @@ impl AppState {
             schema_cache: Mutex::new(None),
             validation: RwLock::new(validation),
             validation_metrics,
+            queries,
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
         }))
