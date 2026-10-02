@@ -93,6 +93,48 @@ fn disjoint_classes_follow_the_subclass_closure() {
 }
 
 #[test]
+fn chosen_graphs_are_checked_as_one_merge() {
+    // the ontology in one graph, the data in another, a conflict only in their merge
+    let s = store("ex:Cat owl:disjointWith ex:Dog .");
+    update(
+        &s,
+        "INSERT DATA {
+           GRAPH ex:onto { ex:Kitten <http://www.w3.org/2000/01/rdf-schema#subClassOf> ex:Cat }
+           GRAPH ex:data { ex:tom a ex:Kitten, ex:Dog }
+         }",
+    );
+    let with = |graphs: &[&str]| DiagnoseOptions {
+        graphs: sparkles_reasoner::diagnostics::parse_graphs(graphs).unwrap(),
+        ..opts()
+    };
+    assert_eq!(check(&s, &opts()).status, ReportStatus::NoneFound);
+    let r = check(&s, &with(&["http://ex.org/data"]));
+    assert_eq!(r.status, ReportStatus::NoneFound, "no disjointness axiom");
+    let r = check(&s, &with(&["default", "http://ex.org/data"]));
+    assert_eq!(r.status, ReportStatus::NoneFound, "no subclass axiom");
+    let r = check(
+        &s,
+        &with(&["default", "http://ex.org/onto", "http://ex.org/data"]),
+    );
+    assert_eq!(r.status, ReportStatus::ViolationsFound);
+    assert_eq!(findings(&r, "disjoint-classes")[0]["focus"], uri("tom"));
+    let j = r.to_json();
+    assert_eq!(j["scope"]["graph"], "graphs");
+    assert_eq!(
+        j["scope"]["graphs"],
+        json!(["default", "http://ex.org/onto", "http://ex.org/data"])
+    );
+    assert!(
+        r.to_turtle(&Default::default())
+            .contains("<http://ex.org/onto>")
+    );
+    assert_eq!(
+        sparkles_reasoner::diagnostics::parse_graphs(&["default", "not an iri"]),
+        Err("not an iri".to_string())
+    );
+}
+
+#[test]
 fn owl_nothing_members_and_unsatisfiable_classes() {
     let s = store("ex:x a owl:Nothing .");
     let r = check(&s, &opts());

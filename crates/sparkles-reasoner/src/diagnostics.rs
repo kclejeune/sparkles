@@ -1,6 +1,7 @@
 //! Inconsistency diagnostics: a fixed, sound subset of the OWL 2 RL rules whose
 //! conclusion is `false` (OWL 2 Profiles §4.3), each checked by one SPARQL SELECT over
-//! the query default graph, optionally extended by the materialized inferences.
+//! the query default graph, optionally extended by the materialized inferences. The
+//! checks can also run over the merge of chosen graphs ([`DiagnoseOptions::graphs`]).
 //!
 //! A finding is a genuine inconsistency of the checked graph (the OWL 2 RL/RDF rules are
 //! sound). The converse does not hold: finding nothing does **not** establish OWL
@@ -212,8 +213,11 @@ pub struct DiagnoseOptions {
     pub checks: Vec<String>,
     /// findings per check (at most [`MAX_LIMIT`])
     pub limit: usize,
-    /// extend the default graph by [`INFERRED_GRAPH`]
+    /// extend the checked graph by [`INFERRED_GRAPH`]
     pub inferences: bool,
+    /// The graphs whose merge is checked: graph IRIs, or [`DEFAULT_GRAPH`] for the
+    /// default graph. Empty checks the query default graph.
+    pub graphs: Vec<String>,
     pub closure: Closure,
     /// for the whole report
     pub timeout: Option<Duration>,
@@ -227,11 +231,31 @@ impl Default for DiagnoseOptions {
             checks: Vec::new(),
             limit: 100,
             inferences: false,
+            graphs: Vec::new(),
             closure: Closure::Subclass,
             timeout: None,
             prefixes: Vec::new(),
         }
     }
+}
+
+/// The name of the default graph among [`DiagnoseOptions::graphs`].
+pub const DEFAULT_GRAPH: &str = "default";
+
+/// Check the graph names of [`DiagnoseOptions::graphs`]: `default` or absolute IRIs,
+/// without duplicates. Returns the bad name.
+pub fn parse_graphs<S: AsRef<str>>(names: &[S]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        let n = n.as_ref().trim();
+        if n != DEFAULT_GRAPH && NamedNode::new(n).is_err() {
+            return Err(n.to_string());
+        }
+        if !out.iter().any(|g| g == n) {
+            out.push(n.to_string());
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +347,8 @@ pub struct DiagnosticsReport {
     pub commit: u64,
     pub computed_at: String,
     pub inferences: bool,
+    /// the checked graphs ([`DiagnoseOptions::graphs`]); empty for the query default graph
+    pub graphs: Vec<String>,
     pub closure: Closure,
     pub status: ReportStatus,
     pub checks: Vec<CheckOutcome>,
@@ -377,15 +403,20 @@ impl DiagnosticsReport {
                 })
             })
             .collect();
+        let mut scope = json!({
+            "graph": "default",
+            "inferences": { "included": self.inferences },
+            "closure": self.closure.name(),
+        });
+        if !self.graphs.is_empty() {
+            scope["graph"] = "graphs".into();
+            scope["graphs"] = self.graphs.clone().into();
+        }
         json!({
             "diagnosticsFormat": 1,
             "commit": self.commit,
             "computedAt": self.computed_at,
-            "scope": {
-                "graph": "default",
-                "inferences": { "included": self.inferences },
-                "closure": self.closure.name(),
-            },
+            "scope": scope,
             "status": self.status.name(),
             "note": NOTE,
             "checks": checks,
@@ -421,6 +452,13 @@ impl DiagnosticsReport {
         add(&report, spk("status"), s(self.status.name()));
         add(&report, spk("note"), s(NOTE));
         add(&report, spk("closure"), s(self.closure.name()));
+        for g in &self.graphs {
+            let o = match NamedNode::new(g.as_str()) {
+                Ok(n) if g != DEFAULT_GRAPH => n.into(),
+                _ => s(g),
+            };
+            add(&report, spk("graph"), o);
+        }
         add(&report, spk("inferencesIncluded"), bool_(self.inferences));
         if self.inferences {
             if let Some(p) = ctx.profile {
@@ -588,6 +626,7 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
             text: check.query.replace("{TYPE}", opts.closure.type_path()),
             deadline,
             inferences: opts.inferences,
+            graphs: &opts.graphs,
             names: &names,
         };
         match run.findings(limit) {
@@ -628,6 +667,7 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
         commit: snap.commit,
         computed_at: sparkles::builder::now_rfc3339(),
         inferences: opts.inferences,
+        graphs: opts.graphs.clone(),
         closure: opts.closure,
         status,
         checks: outcomes,
@@ -642,6 +682,7 @@ struct Run<'a> {
     text: String,
     deadline: Option<Instant>,
     inferences: bool,
+    graphs: &'a [String],
     names: &'a Names,
 }
 
@@ -661,14 +702,28 @@ impl Run<'_> {
             ),
             None => None,
         };
+        // chosen graphs replace the default graph, as a protocol dataset does
+        let mut chosen: Vec<String> = self
+            .graphs
+            .iter()
+            .map(|g| match g.as_str() {
+                DEFAULT_GRAPH => "urn:x-arq:DefaultGraph".to_string(),
+                g => g.to_string(),
+            })
+            .collect();
+        let mut extra = Vec::new();
+        if inferences {
+            if chosen.is_empty() {
+                extra.push(INFERRED_GRAPH.to_string());
+            } else {
+                chosen.push(INFERRED_GRAPH.to_string());
+            }
+        }
         Ok(QueryOptions {
             timeout,
             no_cache: true,
-            default_graph_extra: if inferences {
-                vec![INFERRED_GRAPH.to_string()]
-            } else {
-                Vec::new()
-            },
+            default_graph_uris: chosen,
+            default_graph_extra: extra,
             initial_bindings: bindings,
             ..Default::default()
         })

@@ -3334,14 +3334,26 @@ async fn reason_diagnostics(
             )
         })?,
     };
+    let graphs = diagnostics::parse_graphs(&params.all("graph")).map_err(|bad| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("graph must be default or an absolute IRI, not '{bad}'"),
+        )
+    })?;
     let info = ds.reasoning.read().clone();
-    let inferences = info.is_some() && params.get("reasoning").is_none_or(|v| v != "false");
+    // the inferences follow from the default graph: included by default when it is checked
+    let inferences = info.is_some()
+        && match params.get("reasoning") {
+            Some(v) => v != "false",
+            None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
+        };
     let mut prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
     prefixes.retain(|(_, ns)| !ns.is_empty());
     let opts = DiagnoseOptions {
         checks,
         limit,
         inferences,
+        graphs,
         closure,
         timeout: Some(timeout_param(&st, &params)),
         prefixes,

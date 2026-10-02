@@ -474,6 +474,39 @@ async fn no_automatic_runs_on_a_read_only_server() {
 }
 
 #[tokio::test]
+async fn diagnostics_over_chosen_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.attach("t", DbType::Mem, None).unwrap();
+    load(&st, "t", "ex:Cat owl:disjointWith ex:Dog .");
+    let app = router(st.clone());
+    update(
+        &app,
+        "t",
+        "INSERT DATA { GRAPH ex:data { ex:tom a ex:Cat, ex:Dog } }",
+    )
+    .await;
+    let r = get_json(&app, "/$/reason/t/diagnostics").await;
+    assert_eq!(r["status"], "none-found");
+    let q = "/$/reason/t/diagnostics?graph=default&graph=http%3A%2F%2Fex.org%2Fdata";
+    let r = get_json(&app, q).await;
+    assert_eq!(r["status"], "violations-found", "{r}");
+    assert_eq!(r["scope"]["graph"], "graphs");
+    assert_eq!(
+        r["scope"]["graphs"],
+        serde_json::json!(["default", "http://ex.org/data"])
+    );
+    let r = send(
+        &app,
+        Request::get("/$/reason/t/diagnostics?graph=nope")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
 async fn diagnostics_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let st = open(dir.path(), None, false);

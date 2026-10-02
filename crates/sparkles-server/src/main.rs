@@ -1131,6 +1131,10 @@ enum Cmd {
         /// Check the asserted data only, without the materialized inferences
         #[arg(long, requires = "check")]
         no_inferences: bool,
+        /// Check the merge of these graphs instead of the default graph: `default` or a
+        /// graph IRI (repeatable). The inferences are included only with `default`
+        #[arg(long = "graph", value_name = "GRAPH", requires = "check")]
+        graphs: Vec<String>,
         /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
         #[arg(long, default_value = "subclass", requires = "check")]
         closure: String,
@@ -2441,6 +2445,7 @@ fn run() -> Result<()> {
             checks,
             limit,
             no_inferences,
+            graphs,
             closure,
             format,
             timeout,
@@ -2458,6 +2463,13 @@ fn run() -> Result<()> {
                 eprintln!("error: unknown diagnostics check '{bad}'");
                 std::process::exit(2);
             }
+            let graphs = match diagnostics::parse_graphs(&graphs) {
+                Ok(g) => g,
+                Err(bad) => {
+                    eprintln!("error: --graph must be default or an absolute IRI, not '{bad}'");
+                    std::process::exit(2);
+                }
+            };
             let extras = sparkles_reasoner::Extras::parse(&vocab, geo_default_geometry)?;
             extras.validate()?;
             if check && !(1..=diagnostics::MAX_LIMIT).contains(&limit) {
@@ -2530,10 +2542,13 @@ fn run() -> Result<()> {
                     .snapshot()
                     .lookup_iri(sparkles_reasoner::INFERRED_GRAPH)
                     .is_some();
+            let default_checked =
+                graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH);
             let dopts = DiagnoseOptions {
                 checks,
                 limit,
-                inferences: has_inferred && !no_inferences,
+                inferences: has_inferred && !no_inferences && default_checked,
+                graphs,
                 closure,
                 timeout: timeout.map(Duration::from_secs_f64),
                 prefixes: store.prefixes().into_iter().collect(),
@@ -2918,6 +2933,9 @@ fn print_diagnostics(r: &sparkles_reasoner::diagnostics::DiagnosticsReport, j: &
         println!(
             "note: the inferences are not known to be up to date; findings marked (uses inferences) may be outdated"
         );
+    }
+    if !r.graphs.is_empty() {
+        println!("checked graphs: {}", r.graphs.join(", "));
     }
     let n = r.findings.len();
     let checks = r.checks.len();
