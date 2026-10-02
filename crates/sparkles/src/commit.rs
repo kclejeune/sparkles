@@ -1038,6 +1038,51 @@ impl Catalog {
         i.checked_sub(1).and_then(|i| self.records.get(i).copied())
     }
 
+    /// The first retained commit made at or after `ms` (timestamps never decrease).
+    pub fn first_at_or_after(&self, ms: i64) -> Option<u64> {
+        let i = self.records.partition_point(|c| c.timestamp_ms < ms);
+        self.records.get(i).map(|c| c.seq)
+    }
+
+    /// Drop the records of the commits before `cutoff` (never the newest one). A
+    /// persistent catalog is rewritten to a new file that replaces the old one
+    /// atomically, so readers without the lock see either. Returns the records dropped.
+    pub fn prune_before(&mut self, cutoff: u64) -> Result<u64> {
+        let last = self.records.back().map_or(self.first, |c| c.seq);
+        let cutoff = cutoff.min(last);
+        if cutoff <= self.first {
+            return Ok(0);
+        }
+        let n = cutoff - self.first;
+        if let Some(path) = self.path.clone() {
+            self.flush_pending();
+            if !self.pending.is_empty() {
+                return Err(Error::Invalid(
+                    "the commit catalog could not be written".into(),
+                ));
+            }
+            let mut f = OpenOptions::new().read(true).open(&path)?;
+            let mut h = [0u8; REC];
+            f.read_exact(&mut h)?;
+            let Some((id, _)) = decode_header(&h) else {
+                return Err(Error::Corrupt(format!(
+                    "{}: the header is damaged",
+                    path.display()
+                )));
+            };
+            let mut buf = Vec::with_capacity((self.records.len() - n as usize + 1) * REC);
+            buf.extend_from_slice(&encode_header(id, cutoff));
+            for c in self.records.iter().skip(n as usize) {
+                buf.extend_from_slice(&encode_record(c));
+            }
+            crate::store::write_atomic(&path, &buf)?;
+            self.file = Some(OpenOptions::new().append(true).open(&path)?);
+        }
+        self.records.drain(..n as usize);
+        self.first = cutoff;
+        Ok(n)
+    }
+
     /// The first retained record.
     pub fn first(&self) -> Option<CommitInfo> {
         self.records.front().copied()

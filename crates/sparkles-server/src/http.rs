@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 mod budgets;
+mod changes;
 mod conditional;
 mod diff;
 #[cfg(feature = "fmt")]
@@ -53,6 +54,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static("sparkles-diff-to"),
         header::HeaderName::from_static("sparkles-diff-added"),
         header::HeaderName::from_static("sparkles-diff-removed"),
+        header::HeaderName::from_static(changes::SPARKLES_CHANGES_NEXT),
         header::CONTENT_LOCATION,
         header::VARY,
         header::LINK,
@@ -132,6 +134,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/text", get(text_search).post(text_search))
         .route("/{ds}/diff", get(diff::diff))
+        .route("/{ds}/changes", get(changes::changes))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
         .route("/{ds}/prefixes", any(dataset_prefixes))

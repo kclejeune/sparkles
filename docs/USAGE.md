@@ -232,23 +232,42 @@ Past states are read with `--at`, which takes a commit number, `commit:N`,
 `time:<RFC 3339>` or `snapshot:NAME`. Every commit since the last compaction or bulk
 commit can be read, and `sparkles log` marks them with `*`. A named snapshot or the
 retention window keeps older ones. `sparkles diff` shows the quads added and removed
-between two states, and `--format json` or `--format count` change its output.
+between two states, and `--format json`, `--format count` or `--format patch` change its
+output. `patch` writes an RDF Patch that Jena's tools read, and `patch-binary` writes it
+as RDF Thrift.
 
 ```sh
 sparkles query    --loc db --at snapshot:release-1 'SELECT ...'
 sparkles dump     --loc db --at time:2026-09-30T14:00:00Z > then.nq
 sparkles clone    --loc db --to sandbox --at commit:40
 sparkles diff     --loc db snapshot:release-1 head --graph http://ex.org/g
+sparkles diff     --loc db 40 head --format patch > changes.rdfp
 sparkles snapshot create   --loc db release-1 --note 'before the migration'
 sparkles snapshot create   --loc db tmp --expires 7d
+sparkles snapshot create   --loc db hot --at commit:40 --warm   # kept materialized
 sparkles snapshot retain   --loc db --keep-age 7d --max-bytes 20GiB
 sparkles snapshot schedule --loc db --prefix daily- --every 1d --keep-last 7
-sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect
+sparkles snapshot catalog  --loc db --keep-commits 100000 --keep-age 90d
+sparkles snapshot gc       --loc db        # expire pins, make scheduled ones, collect, prune
 ```
 
-A running server does the work of `snapshot gc` every minute. Over HTTP the same
-features are `?at=`, `GET /{ds}/diff`, `/$/snapshots/{ds}` and `/$/history/{ds}`
+A running server does the work of `snapshot gc` every minute. `snapshot catalog` sets how
+long the commit catalog keeps the metadata of commits that can no longer be read. Without
+it, every commit stays listed. Over HTTP the same features are `?at=`, `GET /{ds}/diff`,
+`/$/snapshots/{ds}` and `/$/history/{ds}`
 ([API: Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots)).
+
+A server also offers a change feed, `GET /{ds}/changes?after=N`. It lists the commits after
+commit N with their changes, as JSON or as one RDF Patch per commit. With `wait=30` a
+request waits for the next commit, and with `Accept: text/event-stream` the commits arrive
+as server-sent events that resume after the last one a client saw
+([API: Change feed](API.md#change-feed)).
+
+```sh
+curl 'http://localhost:3030/ds/changes?after=41&wait=30'
+curl -H 'Accept: application/rdf-patch' 'http://localhost:3030/ds/changes?after=41'
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
 
 The global flag `--commit-digests` makes a command record a change digest with every
 commit of the databases it opens. A database keeps the setting once it is on, so later

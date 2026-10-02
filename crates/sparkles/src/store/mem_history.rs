@@ -76,6 +76,7 @@ impl Store {
             expires_ms: p.expires_ms,
             generation: Some("mem".into()),
             reconstructable: true,
+            warm: p.warm,
         }
     }
 
@@ -83,8 +84,7 @@ impl Store {
         &self,
         name: &str,
         at: &At,
-        note: Option<String>,
-        expires_ms: Option<i64>,
+        o: &crate::history::SnapshotOptions,
     ) -> Result<(NamedSnapshot, bool)> {
         let mem = self.mem_history.as_ref().expect("an in-memory store");
         let w = self.writer.lock();
@@ -121,8 +121,9 @@ impl Store {
         let pin = Pin {
             seq,
             created_ms: self.now_ms(),
-            note,
-            expires_ms,
+            note: o.note.clone(),
+            expires_ms: o.expires_ms,
+            warm: o.warm,
         };
         m.pins.insert(name.to_string(), (pin.clone(), snap));
         Ok((self.mem_named(name, &pin), true))

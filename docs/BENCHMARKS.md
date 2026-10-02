@@ -388,6 +388,13 @@ snapshot. After a server restart, the first read at the base of the sealed gener
 takes 89–93 ms, because it opens that generation's files. The first read at
 base + 100,000 takes 605 ms again.
 
+These figures predate the sparse WAL index. A read now starts from the nearest known
+state, so a read near the head or near a cached commit replays only the commits in
+between. At a smaller scale (1M triples and 50,000 commits), the first read in the middle
+went from 213 ms to 67 ms, and a read 100 commits before the head from 486 ms to 2.7 ms
+([F06 Outcome](specs/F06-snapshots-and-point-in-time.md#replay-speedups-rdf-patch-and-the-change-feed)).
+The 10.5M run has not been repeated.
+
 ### Backup repositories (10.5M triples)
 
 `mise run bench:backup` (`scripts/backup-bench.sh`) ran against the 10.5M-quad benchmark

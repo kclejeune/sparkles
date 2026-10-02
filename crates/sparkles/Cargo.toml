@@ -36,7 +36,7 @@ percent-encoding.workspace = true
 reqwest.workspace = true
 # the outbound policy: CIDR allowlists, DNS lookups off reqwest's runtime thread
 ipnet = "2"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 flate2.workspace = true
 zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }

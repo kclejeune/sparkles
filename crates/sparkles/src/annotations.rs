@@ -253,6 +253,30 @@ impl Annotations {
         Ok(())
     }
 
+    /// Drop the annotations of the commits before `cutoff` (the catalog no longer has
+    /// them). A file is rewritten and replaces the old one atomically.
+    pub fn prune_before(&mut self, cutoff: u64, dataset_id: uuid::Uuid) -> Result<()> {
+        if self.map.first_key_value().is_none_or(|(s, _)| *s >= cutoff) {
+            return Ok(());
+        }
+        self.map = self.map.split_off(&cutoff);
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let flags = if self.digests { FLAG_DIGESTS } else { 0 };
+        let mut buf = encode_header(dataset_id, flags).to_vec();
+        for (seq, a) in &self.map {
+            buf.extend_from_slice(&encode_record(*seq, a));
+        }
+        crate::store::write_atomic(path, &buf)?;
+        self.file = Some(OpenOptions::new().read(true).write(true).open(path)?);
+        self.len = buf.len() as u64;
+        Ok(())
+    }
+
     /// In-memory stores forget the annotations of commits the catalog no longer has.
     pub fn forget_before(&mut self, seq: u64) {
         if self.path.is_none() {
