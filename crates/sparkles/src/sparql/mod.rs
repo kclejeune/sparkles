@@ -454,6 +454,7 @@ fn execute_parsed(
     let ctx = Arc::new(make_ctx(snap, opts, dataset, base));
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
     let mut planner = Planner::new(&ctx);
+    planner.source = Some(parsed);
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
     for (name, term) in &opts.initial_bindings {
         let v = ctx.var(name.trim_start_matches(['?', '$']));
@@ -551,7 +552,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         let (pattern, dataset, base) = split(&parsed);
         let ctx = make_ctx(snap, opts, dataset, base);
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
-        let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
+        let mut planner = Planner::new(&ctx);
+        planner.source = Some(&parsed);
+        let node = planner.plan(pattern, &ActiveGraph::Default, Vec::new())?;
         let mut info = exec::describe(&ctx, &node);
         info.warnings = ctx.warnings();
         Ok((parsed.to_sse(), info))

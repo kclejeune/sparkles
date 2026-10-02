@@ -197,6 +197,8 @@ pub struct TextSpec {
     pub graph_var: Option<VarId>,
     /// merge hits of the same (s, p, o) from different graphs (merged default graph)
     pub dedup: bool,
+    /// `highlight:` options: the literal output is the highlighted fragments
+    pub highlight: Option<crate::text::HighlightOpts>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -502,6 +504,11 @@ pub struct Planner<'a> {
     bnode_scope: u32,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
+    /// the whole query being planned, if known: a search output it mentions nowhere else
+    /// is left out (see [`Planner::used_elsewhere`])
+    pub source: Option<&'a spargebra::Query>,
+    /// the source's SSE form, or `None` when every variable counts as used
+    source_sse: std::cell::OnceCell<Option<String>>,
 }
 
 /// `<<( s p o )>>` with variables: the triple term bound to `t` is decomposed into
@@ -519,7 +526,37 @@ impl<'a> Planner<'a> {
             subst: FxHashMap::default(),
             bnode_scope: 0,
             unpacks: Default::default(),
+            source: None,
+            source_sse: Default::default(),
         }
+    }
+
+    /// Whether the variable or blank node `t`, which a property function call binds,
+    /// occurs in the query anywhere but that call. Every occurrence in the algebra's SSE
+    /// form counts, so the answer errs towards "used" (a string that happens to contain
+    /// the name counts too). Without the source query, and with `COUNT(DISTINCT *)`,
+    /// which depends on every variable, everything is used.
+    fn used_elsewhere(&self, t: &TermPattern) -> bool {
+        let sse = self.source_sse.get_or_init(|| {
+            let sse = self.source?.to_sse();
+            (!sse.contains("(count distinct)")).then_some(sse)
+        });
+        let Some(sse) = sse else {
+            return true;
+        };
+        let name = match t {
+            TermPattern::Variable(v) => format!("?{}", v.as_str()),
+            TermPattern::BlankNode(b) => format!("_:{}", b.as_str()),
+            _ => return true,
+        };
+        let mentions = sse
+            .match_indices(&name)
+            .filter(|(i, _)| {
+                !sse[i + name.len()..]
+                    .starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '\u{b7}')
+            })
+            .count();
+        mentions != 1
     }
 
     pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
@@ -1159,9 +1196,13 @@ impl<'a> Planner<'a> {
             PT::V(v) => PathEnd::Var(v),
             PT::C(id) => PathEnd::Const(id),
         };
+        // a score or literal the rest of the query never reads is not produced, and the
+        // search then reads no literal
+        let output =
+            |t: &Option<TermPattern>| t.as_ref().filter(|t| self.used_elsewhere(t)).cloned();
         let (score, literal, graph_out, prop) = (
-            slot(&c.score),
-            slot(&c.literal),
+            slot(&output(&c.score)),
+            slot(&output(&c.literal)),
             slot(&c.graph),
             slot(&c.prop),
         );
@@ -1198,7 +1239,7 @@ impl<'a> Planner<'a> {
             }
         }
         let desc = format!(
-            "{} ← {:?}{}{}{}",
+            "{} ← {:?}{}{}{}{}",
             vars.iter()
                 .map(|v| format!("?{}", self.ctx.var_name(*v)))
                 .collect::<Vec<_>>()
@@ -1221,6 +1262,11 @@ impl<'a> Planner<'a> {
                 .map(|l| format!(" lang={l}"))
                 .unwrap_or_default(),
             c.limit.map(|l| format!(" limit {l}")).unwrap_or_default(),
+            // the options are part of the description, and so of the result cache key
+            match (&c.highlight, literal) {
+                (Some(h), Some(_)) => format!(" highlight {h:?}"),
+                _ => String::new(),
+            },
         );
         let spec = TextSpec {
             query: c.query,
@@ -1239,6 +1285,7 @@ impl<'a> Planner<'a> {
             graph,
             graph_var,
             dedup,
+            highlight: c.highlight.filter(|_| literal.is_some()),
         };
         let est = spec.limit.unwrap_or(1000) as f64;
         let mut n = Node::leaf(Kind::TextSearch(Box::new(spec)), vars, est, desc);

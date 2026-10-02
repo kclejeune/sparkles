@@ -25,7 +25,15 @@
 use crate::error::{Error, Result};
 
 #[cfg(feature = "text")]
+mod highlight;
+#[cfg(feature = "text")]
 mod lazydir;
+#[cfg(feature = "text")]
+mod lucene;
+#[cfg(feature = "text")]
+mod search;
+#[cfg(feature = "text")]
+mod sloppy;
 use serde::{Deserialize, Serialize};
 
 /// Which predicates are indexed.
@@ -139,6 +147,75 @@ impl Default for TextConfig {
             max_hits: default_max_hits(),
             docstore_compression: None,
         }
+    }
+}
+
+/// Jena's `highlight:` options of `text:query`: the literal output becomes the best
+/// fragments of the literal with the matched words marked.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HighlightOpts {
+    /// fragments kept at most (`m:`, 3)
+    pub max_frags: usize,
+    /// the length of a fragment in characters (`z:`, 128)
+    pub frag_size: usize,
+    /// the marks around a match (`s:` and `e:`, ↦ and ↤)
+    pub start: String,
+    pub end: String,
+    /// between fragments (`f:`, ∣)
+    pub frag_sep: String,
+    /// marks consecutive matches as one (`jh:`, yes)
+    pub join_hi: bool,
+    /// merges adjacent fragments (`jf:`, yes)
+    pub join_frags: bool,
+}
+
+impl Default for HighlightOpts {
+    fn default() -> Self {
+        HighlightOpts {
+            max_frags: 3,
+            frag_size: 128,
+            start: "\u{21a6}".into(),
+            end: "\u{21a4}".into(),
+            frag_sep: "\u{2223}".into(),
+            join_hi: true,
+            join_frags: true,
+        }
+    }
+}
+
+impl HighlightOpts {
+    /// Parse the options after `highlight:`, separated by `|`, such as
+    /// `s:<em> | e:</em> | z:150`.
+    pub fn parse(s: &str) -> std::result::Result<HighlightOpts, String> {
+        let mut o = HighlightOpts::default();
+        for opt in s.split('|').map(str::trim).filter(|o| !o.is_empty()) {
+            let (key, val) = opt
+                .split_once(':')
+                .ok_or_else(|| format!("highlight option {opt:?} is not key:value"))?;
+            let num = |v: &str| {
+                v.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("highlight option {key}: needs a positive number"))
+            };
+            let flag = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" => Ok(true),
+                "n" | "no" | "false" => Ok(false),
+                _ => Err(format!("highlight option {key}: is y or n")),
+            };
+            match key.trim() {
+                "m" => o.max_frags = num(val)?,
+                "z" => o.frag_size = num(val)?,
+                "s" => o.start = val.to_string(),
+                "e" => o.end = val.to_string(),
+                "f" => o.frag_sep = val.to_string(),
+                "jh" => o.join_hi = flag(val)?,
+                "jf" => o.join_frags = flag(val)?,
+                k => return Err(format!("unknown highlight option {k:?}")),
+            }
+        }
+        Ok(o)
     }
 }
 
@@ -265,9 +342,11 @@ pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
 }
 
 #[cfg(feature = "text")]
+pub use imp::TextIndex;
+#[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
 #[cfg(feature = "text")]
-pub use imp::{TextIndex, search};
+pub use search::search;
 
 #[cfg(not(feature = "text"))]
 /// Placeholder: full-text search is not compiled in.
@@ -287,9 +366,6 @@ mod imp {
     use super::lazydir::LazySyncDir;
     use super::*;
     use crate::id::{Id, Tag};
-    use crate::sparql::ctx::Ctx;
-    use crate::sparql::plan::{GraphFilter, PathEnd, TextSpec};
-    use crate::sparql::table::{Table, VarId};
     use crate::store::Snapshot;
     use parking_lot::Mutex;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -298,31 +374,30 @@ mod imp {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
-    use tantivy::collector::TopDocs;
-    use tantivy::query::{
-        BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery,
-    };
     use tantivy::schema::{
-        BytesOptions, Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing,
-        TextOptions, Value,
+        BytesOptions, FAST, Field, IndexRecordOption, STRING, Schema, TextFieldIndexing,
+        TextOptions,
     };
     use tantivy::tokenizer::{
         AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
     };
     use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-    const FORMAT: u32 = 1;
+    /// The index format. Format 2 keeps each document's terms in columns (fast fields),
+    /// where format 1 kept them in the doc store. An index of another format is rebuilt
+    /// on open.
+    const FORMAT: u32 = 2;
     const TOKENIZER: &str = "sparkles_standard";
 
     #[derive(Clone, Copy)]
     pub(crate) struct Fields {
         key: Field,
-        s: Field,
-        p: Field,
+        pub(super) s: Field,
+        pub(super) p: Field,
         o: Field,
-        g: Field,
-        lang: Field,
-        text: Field,
+        pub(super) g: Field,
+        pub(super) lang: Field,
+        pub(super) text: Field,
     }
 
     fn schema() -> (Schema, Fields) {
@@ -333,34 +408,50 @@ mod imp {
                 .set_tokenizer(TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         );
+        // A hit's terms are read from columns (fast fields), not from stored documents:
+        // a column read costs far less than decompressing a doc store block.
         let fields = Fields {
             key: b.add_bytes_field("key", bytes_indexed.clone()),
-            s: b.add_bytes_field("s", bytes_indexed.set_stored()),
-            p: b.add_text_field("p", STRING | STORED),
-            o: b.add_bytes_field("o", BytesOptions::default().set_stored()),
-            g: b.add_text_field("g", STRING | STORED),
+            s: b.add_bytes_field("s", bytes_indexed.set_fast()),
+            p: b.add_text_field("p", STRING | FAST),
+            o: b.add_bytes_field("o", BytesOptions::default().set_fast()),
+            g: b.add_text_field("g", STRING | FAST),
             lang: b.add_text_field("lang", STRING),
             text: b.add_text_field("text", text),
         };
         (b.build(), fields)
     }
 
+    /// The longest token the text field indexes, in bytes.
+    pub(super) const MAX_TOKEN: usize = 40;
+
     fn register_tokenizer(index: &Index) {
         index.tokenizers().register(
             TOKENIZER,
             TextAnalyzer::builder(SimpleTokenizer::default())
-                .filter(RemoveLongFilter::limit(40))
+                .filter(RemoveLongFilter::limit(MAX_TOKEN))
                 .filter(LowerCaser)
                 .filter(AsciiFoldingFilter)
                 .build(),
         );
     }
 
+    /// The text field's analysis without its tokenizer: a prefix, wildcard, fuzzy or
+    /// regular expression term is normalized as the indexed tokens are (lowercased and
+    /// ASCII-folded), but not split.
+    pub(super) fn normalizer() -> TextAnalyzer {
+        TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default())
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build()
+    }
+
     /// What every view of one index generation shares.
     pub(crate) struct Shared {
-        pub(crate) index: Index,
         pub(crate) fields: Fields,
         pub(crate) config: TextConfig,
+        /// ids of terms the searches of this index have looked up
+        pub(crate) ids: super::search::IdCache,
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -376,7 +467,7 @@ mod imp {
     /// and object keys), which are checked against the snapshot.
     pub(crate) struct Resolved {
         pub(crate) searcher: tantivy::Searcher,
-        uncertain: Arc<FxHashSet<u64>>,
+        pub(super) uncertain: Arc<FxHashSet<u64>>,
     }
 
     /// The views of the commits applied between two seals share a slot, set when the
@@ -475,11 +566,15 @@ mod imp {
     }
 
     /// The hash that stands for a document in [`Resolved::uncertain`].
-    fn doc_hash(s: &[u8], o: &[u8]) -> u64 {
+    pub(super) fn doc_hash(s: &[u8], o: &[u8]) -> u64 {
+        key_hash(s) ^ key_hash(o).rotate_left(32)
+    }
+
+    /// One term's part of [`doc_hash`] (a search hashes each distinct term once).
+    pub(super) fn key_hash(k: &[u8]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
-        s.hash(&mut h);
-        o.hash(&mut h);
+        k.hash(&mut h);
         h.finish()
     }
 
@@ -489,7 +584,7 @@ mod imp {
         d.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn text_err(e: impl std::fmt::Display) -> Error {
+    pub(super) fn text_err(e: impl std::fmt::Display) -> Error {
         Error::Invalid(format!("full-text index: {e}"))
     }
 
@@ -703,9 +798,9 @@ mod imp {
             .map_err(text_err)?;
         Ok(Live {
             shared: Arc::new(Shared {
-                index,
                 fields,
                 config: config.clone(),
+                ids: Default::default(),
             }),
             writer: Some(writer),
             last: Slot::sealed(reader.searcher(), Default::default()),
@@ -752,7 +847,7 @@ mod imp {
     }
 
     /// Key bytes of an id for documents (`_` + big-endian id for blank nodes).
-    fn term_key(snap: &Snapshot, id: Id) -> Option<Vec<u8>> {
+    pub(super) fn term_key(snap: &Snapshot, id: Id) -> Option<Vec<u8>> {
         match id.tag() {
             Tag::BNode => {
                 let mut k = vec![b'_'];
@@ -764,7 +859,7 @@ mod imp {
         }
     }
 
-    fn graph_name(snap: &Snapshot, g: Id) -> Option<String> {
+    pub(super) fn graph_name(snap: &Snapshot, g: Id) -> Option<String> {
         if g == Id::DEFAULT_GRAPH {
             return Some(DEFAULT_GRAPH_IRI.to_string());
         }
@@ -1464,256 +1559,5 @@ mod imp {
                 tracing::warn!("full-text index checkpoint on close: {e}");
             }
         }
-    }
-
-    /// Evaluate a `text:query` call against the snapshot's text view.
-    pub fn search(ctx: &Ctx, spec: &TextSpec, vars: &[VarId]) -> Result<Table> {
-        let snap = &ctx.snap;
-        if snap.historical {
-            return Err(Error::HistoryUnsupported(format!(
-                "full-text search is only available at the head; this query reads commit {}",
-                snap.commit
-            )));
-        }
-        let Some(view) = &snap.text else {
-            return Err(Error::invalid(
-                "dataset has no full-text index; enable it with `sparkles text-index` or --text",
-            ));
-        };
-        if view.seq != snap.commit {
-            return Err(unavailable("dataset", "stale", view.seq, snap.commit));
-        }
-        let sh = &view.index;
-        let f = sh.fields;
-        for p in &spec.predicates {
-            if !sh.config.predicates.contains(p) {
-                return Err(Error::invalid(format!(
-                    "text:query: <{p}> is not text-indexed"
-                )));
-            }
-        }
-        let parser = QueryParser::for_index(&sh.index, vec![f.text]);
-        let text = parser
-            .parse_query(&spec.query)
-            .map_err(|e| Error::invalid(format!("text:query: {e}")))?;
-        let mut filters: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        let str_terms = |field: Field, vals: &mut dyn Iterator<Item = String>| -> Box<dyn Query> {
-            Box::new(TermSetQuery::new(
-                vals.map(|v| Term::from_field_text(field, &v)),
-            ))
-        };
-        if !spec.predicates.is_empty() {
-            filters.push((
-                Occur::Must,
-                str_terms(f.p, &mut spec.predicates.iter().cloned()),
-            ));
-        }
-        if let Some(lang) = &spec.lang {
-            filters.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(f.lang, lang),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-        if let PathEnd::Const(s) = &spec.subject {
-            match term_key(snap, *s) {
-                Some(k) => filters.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(
-                        Term::from_field_bytes(f.s, &k),
-                        IndexRecordOption::Basic,
-                    )),
-                )),
-                None => return Ok(Table::empty(vars.to_vec())),
-            }
-        }
-        let default_term = || Term::from_field_text(f.g, DEFAULT_GRAPH_IRI);
-        match &spec.graph {
-            GraphFilter::All => {}
-            GraphFilter::Default => filters.push((
-                Occur::Must,
-                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
-            )),
-            GraphFilter::Named => filters.push((
-                Occur::MustNot,
-                Box::new(TermQuery::new(default_term(), IndexRecordOption::Basic)),
-            )),
-            GraphFilter::One(g) => {
-                let names: Vec<String> = graph_name(snap, Id(*g)).into_iter().collect();
-                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
-            }
-            GraphFilter::Set(gs) => {
-                let names: Vec<String> =
-                    gs.iter().filter_map(|g| graph_name(snap, Id(*g))).collect();
-                filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
-            }
-        }
-        let query: Box<dyn Query> = if filters.is_empty() {
-            text
-        } else {
-            let mut must = vec![(Occur::Must, text)];
-            let has_positive = filters.iter().any(|(o, _)| *o == Occur::Must);
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for (o, q) in filters {
-                match o {
-                    Occur::Must => clauses.push((Occur::Must, q)),
-                    other => must.push((other, q)),
-                }
-            }
-            if has_positive {
-                must.push((
-                    Occur::Must,
-                    Box::new(ConstScoreQuery::new(
-                        Box::new(BooleanQuery::new(clauses)),
-                        0.0,
-                    )),
-                ));
-            }
-            Box::new(BooleanQuery::new(must))
-        };
-        ctx.check()?;
-        let resolved = view.resolved()?;
-        let max = sh.config.max_hits;
-        let want = spec.limit.unwrap_or(max);
-        // with dedup (a merged default graph) or documents filtered out against the
-        // snapshot, fetch more until enough hits remain
-        let mut fetch = if spec.dedup {
-            want.saturating_mul(2)
-        } else {
-            want
-        }
-        .saturating_add(1)
-        .min(max.saturating_add(1));
-        // columns
-        let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
-        let (cs, cscore, clit, cg_out, cgv, cprop) = (
-            match spec.subject {
-                PathEnd::Var(v) => col(Some(v)),
-                _ => None,
-            },
-            col(spec.score),
-            col(spec.literal),
-            col(spec.graph_out),
-            col(spec.graph_var),
-            col(spec.prop),
-        );
-        let mut stale_hits;
-        let t = loop {
-            let hits = resolved
-                .searcher
-                .search(&query, &TopDocs::with_limit(fetch.max(1)).order_by_score())
-                .map_err(text_err)?;
-            ctx.check()?;
-            if spec.limit.is_none() && hits.len() > max {
-                // more hits than a search may return without a limit
-                return Err(Error::BudgetExceeded(crate::Budget {
-                    kind: crate::BudgetKind::Rows,
-                    limit: max as u64,
-                    requested: hits.len() as u64,
-                }));
-            }
-            // the per-query memory budget, before the output is built
-            ctx.check_output(hits.len(), vars.len())?;
-            let complete = hits.len() < fetch || fetch > max;
-            let mut t = Table::new(vars.to_vec());
-            let mut seen: FxHashSet<(Id, Id, Id)> = Default::default();
-            let mut row = vec![Id::UNDEF; vars.len()];
-            stale_hits = 0usize;
-            for (i, (score, addr)) in hits.into_iter().enumerate() {
-                if i % 4096 == 4095 {
-                    ctx.check()?;
-                }
-                if t.len() >= want {
-                    break;
-                }
-                let d: TantivyDocument = resolved.searcher.doc(addr).map_err(text_err)?;
-                let get_bytes = |fld: Field| d.get_first(fld).and_then(|v| v.as_bytes());
-                let get_str = |fld: Field| d.get_first(fld).and_then(|v| v.as_str());
-                let (Some(sk), Some(ok), Some(p), Some(g)) =
-                    (get_bytes(f.s), get_bytes(f.o), get_str(f.p), get_str(f.g))
-                else {
-                    stale_hits += 1;
-                    continue;
-                };
-                // a document the searcher may hold for a quad this snapshot does not
-                // have (whose terms it may not have either)
-                let uncertain = !resolved.uncertain.is_empty()
-                    && resolved.uncertain.contains(&doc_hash(sk, ok));
-                let s_id = match sk.split_first() {
-                    Some((b'_', rest)) if rest.len() == 8 => {
-                        Some(Id::bnode(u64::from_be_bytes(rest.try_into().unwrap())))
-                    }
-                    _ => snap.lookup_key(sk),
-                };
-                let (Some(s_id), Some(o_id), Some(p_id)) =
-                    (s_id, snap.lookup_key(ok), snap.lookup_iri(p))
-                else {
-                    stale_hits += usize::from(!uncertain);
-                    continue;
-                };
-                let g_id = if g == DEFAULT_GRAPH_IRI {
-                    Some(Id::DEFAULT_GRAPH)
-                } else if let Some(label) = g.strip_prefix("_:") {
-                    crate::store::parse_bnode_label(label)
-                } else {
-                    snap.lookup_iri(g)
-                };
-                let Some(g_id) = g_id else {
-                    stale_hits += usize::from(!uncertain);
-                    continue;
-                };
-                if uncertain && !snap.contains(&[s_id, p_id, o_id, g_id])? {
-                    continue;
-                }
-                if spec.dedup && !seen.insert((s_id, p_id, o_id)) {
-                    continue;
-                }
-                row.fill(Id::UNDEF);
-                if let Some(c) = cs {
-                    row[c] = s_id;
-                }
-                if let Some(c) = cscore {
-                    row[c] = ctx.intern_value(&crate::sparql::value::Value::Float(score.into()));
-                }
-                if let Some(c) = clit {
-                    row[c] = o_id;
-                }
-                // the graph slot names the default graph by its IRI (a term, not the
-                // store's default-graph marker)
-                let g_term = if g_id == Id::DEFAULT_GRAPH {
-                    ctx.intern_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                        DEFAULT_GRAPH_IRI,
-                    )))
-                } else {
-                    g_id
-                };
-                if let Some(c) = cg_out {
-                    row[c] = g_term;
-                }
-                if let Some(c) = cgv {
-                    if row[c] != Id::UNDEF && row[c] != g_id {
-                        continue; // ?g used both as GRAPH ?g and as the graph slot
-                    }
-                    row[c] = g_id;
-                }
-                if let Some(c) = cprop {
-                    row[c] = p_id;
-                }
-                t.push_row(&row);
-                ctx.check_rows(t.len())?;
-            }
-            if t.len() >= want || complete {
-                break t;
-            }
-            fetch = fetch.saturating_mul(2).min(max.saturating_add(1));
-        };
-        if stale_hits > 0 {
-            tracing::warn!(
-                "text:query skipped {stale_hits} hits whose terms are not in the snapshot"
-            );
-        }
-        Ok(t)
     }
 }

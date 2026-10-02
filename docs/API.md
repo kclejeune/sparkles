@@ -1660,11 +1660,50 @@ SELECT ?s ?score ?label WHERE {
 
 * **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
   subject is optional. A constant subject restricts the search to that subject.
-* **Object.** A query string, or `(predicate* "query" limit "lang:xx")`. A language tag
-  on the query string acts as `lang:`.
-* **Query syntax.** The syntax has terms, `"phrases"` (with `~slop`), `AND`/`OR` (OR by
-  default), `+required`/`-excluded`, parentheses, and phrase prefixes `"quick bro"*`. A
-  literal `:` is written `\:`.
+* **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
+  The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
+  query string acts as `lang:`.
+* **Highlighting.** With a `"highlight:…"` argument, as in Jena, `?literal` becomes the
+  best fragments of the matched literal with the matching words marked. It keeps the
+  literal's language tag. The options follow `highlight:` and are separated by `|`.
+  `m:` is the most fragments kept (3), `z:` the fragment size in characters (128), `s:`
+  and `e:` the marks around a match (↦ and ↤), and `f:` the text between fragments (∣).
+  `jh:n` marks each word of a phrase on its own, and `jf:n` keeps adjacent fragments
+  apart and keeps fragments without a match. For example,
+  `"highlight:s:<em> | e:</em> | z:150"` gives `the quick <em>brown fox</em> jumped`.
+  Fragments follow Lucene's highlighter. A fragment starts after the word that crosses a
+  multiple of the fragment size, the best fragments come first, and a phrase is marked
+  only where it occurs. A literal with no match to mark is returned unchanged. Without
+  `highlight:` the search never reads the text of a literal.
+* **Query syntax.** Query strings use Lucene's classic query syntax, as jena-text does,
+  with OR as the default operator. A query string matches the same literals as in Jena
+  when both analyzers produce the same tokens. These forms are supported:
+  * Words such as `fox` and phrases such as `"brown fox"`. A phrase with a slop, such as
+    `"fox brown"~2`, matches its words within that many moves of each other, in either
+    order.
+  * `+word` and `-word`, `AND` or `&&`, `OR` or `||`, `NOT` or `!`, and parentheses. As in
+    Lucene, a clause after `AND` also makes the clause before it required.
+  * Prefixes such as `al*`, alone or inside a boolean query like `+ada +lov*`, and
+    wildcards such as `a?an` and `*lace`.
+  * Fuzzy words. `roam~` allows two edits, `roam~1` allows one, and `roam~0.8` allows the
+    number of edits Lucene derives from that similarity. As in Lucene, a fuzzy word matches
+    at most the 50 closest terms of the index.
+  * Regular expressions such as `/al(an|len)/`, term ranges such as `[ada TO alan]` and
+    `{ada TO alan}`, and boosts such as `ada^2`. A lone `*` matches every literal of the
+    call's predicates.
+
+  Prefixes, wildcards, fuzzy words, regular expressions and range bounds are lowercased
+  and ASCII-folded like the indexed text, but they are not split into words. A word that
+  the analyzer splits, such as `fei-fei`, becomes an OR of its parts, as in Lucene. Sparkles
+  reads `"quick bro"*` as a phrase whose last word is a prefix, while Jena reads it as the
+  phrase or any document. A literal `:` is written `\:`.
+* **Refused query strings.** A field name such as `name:ada` or `*:*` gives `400`, because
+  the call's predicates select what is searched. A query string whose words are all
+  excluded, such as `-ada`, gives `400`, and so does one in which no word is left after
+  analysis. Jena returns no results for these two. A phrase with a slop that repeats a
+  word, a fractional edit distance such as `ada~1.5`, and the regular expression operators
+  of Lucene that Tantivy reads differently (`@`, `#`, `<`, `>`, `&`, `~`, `^` and `$`) are
+  also refused.
 * **Results.** There is one solution per matching quad, so a subject with two matching
   literals appears twice. `?score` is an `xsd:float`. In a merged default graph (the union
   default graph, or several `FROM`s), identical triples from different graphs count once.
@@ -1686,9 +1725,15 @@ SELECT ?s ?score ?label WHERE {
   by a `text.dirty` file next to it, is checksum-verified and caught up from the WAL. The
   WAL also restores what was only staged. The index is rebuilt only if it is damaged or
   older than the WAL.
-* **Errors.** `400` for malformed calls, unparseable query strings, predicates that
-  are not indexed, and datasets without an index. `501` if the server was built without
-  the `text` feature.
+* **Errors.** `400` for malformed calls, unparseable or refused query strings, predicates
+  that are not indexed, and datasets without an index. `507` when a search matches more
+  than `maxHits` literals and has no limit, or a limit above `maxHits`. A limit of at most
+  `maxHits` keeps the best hits instead. `501` if the server was built without the `text`
+  feature.
+* **Cost.** A search reads the terms of its hits from columns of the index and looks each
+  distinct term up in the store's dictionary once. Later searches find the ids of terms
+  looked up before in a cache. A score or literal that the rest of the query never uses is
+  not produced, so a `COUNT` or a join on the subject never reads the literals.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1696,21 +1741,31 @@ SELECT ?s ?score ?label WHERE {
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
 | POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts
 type TextConfig = {
   predicates?: "all" | string[];                         // default "all"
   graphs?: { include?: "all" | string[]; exclude?: string[] };  // graph IRIs; urn:x-arq:DefaultGraph
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
-  maxHits?: number;                                     // default 1000000 hits without a limit (then 507)
+  maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
   seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
   epoch: number; diskBytes: number; segments: number;
-  config: TextConfig; formatVersion: 1;
+  config: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
+};
+type TextHits = {
+  dataset: string; commit: number;
+  limited: boolean;                    // as many hits as the limit
+  hits: {
+    s: Term; score: number; p: Term; g: Term;   // Term as in SPARQL JSON results
+    literal: Term;                     // the literal, or with highlighting its fragments
+    snippet?: string;                  // HTML: the fragments, escaped, matches in <mark>
+  }[];
 };
 ```
 
@@ -2949,9 +3004,10 @@ which is about five times faster than gzip for a slightly larger file. `--compre
 (`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
 the file's extension, and writes uncompressed without one.
 
-**Full-text documents** are stored with zstd (level 3). `"docstoreCompression": "lz4"`
-or `"none"` in the text configuration picks another codec, and changing it rebuilds the
-index. Indexes built before zstd was available keep LZ4 until they are rebuilt.
+**Full-text documents** keep their terms in columns of the index since index format 2, so
+the Tantivy doc store holds no fields and its codec no longer changes the index size. The
+doc store still uses zstd (level 3) by default, and `"docstoreCompression": "lz4"` or
+`"none"` in the text configuration is still accepted. Changing it rebuilds the index.
 
 ## Errors
 

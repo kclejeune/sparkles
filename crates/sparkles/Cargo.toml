@@ -41,6 +41,9 @@ zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
 tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "lz4-compression"], optional = true }
+# the term automata of fuzzy `text:query` terms (the versions Tantivy uses)
+levenshtein_automata = { version = "0.2.1", optional = true }
+tantivy-fst = { version = "0.5", optional = true }
 tempfile = "3"
 # GeoSPARQL (feature `geo`)
 georust = { workspace = true, optional = true }
@@ -59,7 +62,7 @@ tempfile.workspace = true
 
 [features]
 # Full-text search over string literals (Tantivy), `text:query` in SPARQL
-text = ["dep:tantivy"]
+text = ["dep:tantivy", "dep:levenshtein_automata", "dep:tantivy-fst"]
 # GeoSPARQL: `geof:` functions, `spatial:` property functions and a spatial index
 geo = [
     "dep:georust",
