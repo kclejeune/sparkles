@@ -227,15 +227,18 @@ fn final_quads(base: &[Q], ins: &[Q], del: &[Q]) -> Vec<Q> {
     all.into_iter().collect()
 }
 
+/// A pattern's solution as (s, p, o), `None` where the pattern binds none.
+type Solution = (Option<String>, Option<String>, Option<String>);
+
+/// The pattern's solutions on `quads` for `caller`, or `Err(all)` for a pattern without
+/// the triple's variables.
+type Eval = fn(&[Q], &Caller) -> Result<Vec<Solution>, bool>;
+
 /// A protection and how the test evaluates its pattern.
 #[derive(Clone)]
 struct Prot {
     p: Protection,
-    /// the pattern's solutions on `quads` for `caller`, as (s, p, o) where a column the
-    /// pattern does not bind is `None`; `Err(true/false)` for a pattern without them
-    eval: Option<
-        fn(&[Q], &Caller) -> Result<Vec<(Option<String>, Option<String>, Option<String>)>, bool>,
-    >,
+    eval: Option<Eval>,
 }
 
 fn prot(name: &str) -> Protection {
@@ -251,7 +254,7 @@ fn prot(name: &str) -> Protection {
     }
 }
 
-fn s_of(qs: &[Q], f: impl Fn(&Q) -> bool) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+fn s_of(qs: &[Q], f: impl Fn(&Q) -> bool) -> Vec<Solution> {
     qs.iter()
         .filter(|q| f(q))
         .map(|q| (Some(q.0.clone()), None, None))
