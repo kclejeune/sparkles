@@ -187,13 +187,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             key: _,
             counts,
             metadata,
-        } => {
-            if *metadata {
-                class_counts(ctx, &n.vars, counts.len())
-            } else {
-                group_count_scan(ctx, spec, &n.vars, counts.len())?
-            }
-        }
+        } => match metadata {
+            Some(c) => metadata_counts(c, &n.vars, counts.len()),
+            None => group_count_scan(ctx, spec, &n.vars, counts.len())?,
+        },
         Kind::CountJoinRuns { var } => {
             let mut sides = Vec::with_capacity(2);
             for c in &n.children {
@@ -514,21 +511,20 @@ fn block_passes(spec: &ScanSpec, b: &Block, s: usize, e: usize) -> bool {
                 .all(|&g| spec.graph.accepts(g)))
 }
 
-/// Per-class subject counts from the index statistics (admitted by the planner only when
-/// they are exact), in class id order like the index runs.
-fn class_counts(ctx: &Ctx, vars: &[VarId], naggs: usize) -> Table {
-    let mut classes = ctx.snap.generation.stats.classes.clone();
-    classes.sort_unstable();
+/// Counts per key from the index statistics (exact for the snapshot), in key order like
+/// the index runs.
+fn metadata_counts(c: &super::stats::Counts, vars: &[VarId], naggs: usize) -> Table {
     let mut t = Table::new(vars.to_vec());
-    t.cols[0] = classes.iter().map(|&(c, _)| Id(c)).collect();
-    let cnt: Vec<Id> = classes
+    t.cols[0] = c.counts.iter().map(|&(k, _)| Id(k)).collect();
+    let cnt: Vec<Id> = c
+        .counts
         .iter()
         .map(|&(_, n)| Id::from_i64(n as i64).unwrap_or(Id::UNDEF))
         .collect();
     for a in 0..naggs {
         t.cols[1 + a] = cnt.clone();
     }
-    t.len = classes.len();
+    t.len = c.counts.len();
     t
 }
 

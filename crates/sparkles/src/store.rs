@@ -54,6 +54,8 @@ pub struct Generation {
     pub vectors: crate::vector::GenerationVectors,
     /// the spatial index's geometry column and base tree for this generation
     pub geo: crate::geo::GenerationGeo,
+    /// counts from the statistics without the quads of graphs a query does not read
+    pub counts: crate::sparql::stats::CountCache,
 }
 
 impl Generation {
@@ -70,6 +72,7 @@ impl Generation {
             _tmp: None,
             vectors: Default::default(),
             geo: Default::default(),
+            counts: Default::default(),
         }
     }
 
@@ -119,6 +122,7 @@ impl Generation {
             _tmp: None,
             vectors: Default::default(),
             geo: Default::default(),
+            counts: Default::default(),
         })
     }
 
@@ -149,7 +153,11 @@ impl Delta {
     pub fn is_empty(&self) -> bool {
         self.ins[0].is_empty() && self.del[0].is_empty()
     }
-    fn range<'a>(set: &'a OrdSet<Key>, prefix: &[u64]) -> impl Iterator<Item = &'a Key> + 'a {
+    /// The keys of `set` that start with `prefix`, in order.
+    pub(crate) fn range<'a>(
+        set: &'a OrdSet<Key>,
+        prefix: &[u64],
+    ) -> impl Iterator<Item = &'a Key> + 'a {
         Self::key_range(set, pad(prefix, 0), pad(prefix, u64::MAX))
     }
     fn key_range(set: &OrdSet<Key>, lo: Key, hi: Key) -> impl Iterator<Item = &Key> + '_ {
@@ -183,6 +191,9 @@ pub struct Snapshot {
         Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
     /// a past state (see [`Store::snapshot_at`]), not the live one
     pub historical: bool,
+    /// exact counts from the statistics corrected for this snapshot's delta, worked out
+    /// once per snapshot
+    pub counts: Arc<crate::sparql::stats::CountCache>,
 }
 
 /// The kind of term an id stands for (see [`Snapshot::term_kind`]).
@@ -208,6 +219,21 @@ impl TermKind {
             _ => TermKind::Other,
         }
     }
+}
+
+/// The first row in `[s, e)` of a block with every column decoded whose key is not less
+/// than `k`.
+fn first_row_from(b: &Block, s: usize, e: usize, k: &Key) -> usize {
+    let (mut lo, mut hi) = (s, e);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if b.key(mid) < *k {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// A contiguous run of rows produced by a scan.
@@ -402,8 +428,8 @@ impl Snapshot {
 
     /// [`scan_between`](Self::scan_between) for a reader that only looks at the key
     /// columns in `mask` of base blocks: the others may be left undecoded (and read as
-    /// 0). When the delta has changes in the range, every column is decoded, because
-    /// the merge compares full keys.
+    /// 0). A block with delta changes in it, or between it and the block before, has
+    /// every column decoded, because the merge compares full keys.
     pub fn scan_between_cols(
         &self,
         perm: Perm,
@@ -413,20 +439,37 @@ impl Snapshot {
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
         let pi = perm.index();
-        let mut ins = Delta::key_range(&self.delta.ins[pi], lo, hi).peekable();
-        let mut del = Delta::key_range(&self.delta.del[pi], lo, hi).peekable();
-        let mask = if ins.peek().is_some() || del.peek().is_some() {
-            crate::index::ALL_COLS
-        } else {
-            mask
-        };
+        let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
+        let mut ins = Delta::key_range(ins_set, lo, hi).peekable();
+        let mut del = Delta::key_range(del_set, lo, hi).peekable();
+        let changed = ins.peek().is_some() || del.peek().is_some();
         let base = self.perm(perm);
+        // the delta keys a block's rows are merged with lie after the block before it
+        let mask_of = |b: usize| {
+            if !changed {
+                return mask;
+            }
+            let from = match b.checked_sub(1) {
+                Some(p) => Bound::Excluded(base.blocks[p].last),
+                None => Bound::Unbounded,
+            };
+            let to = Bound::Included(base.blocks[b].last);
+            if ins_set.range((from, to)).next().is_some()
+                || del_set.range((from, to)).next().is_some()
+            {
+                crate::index::ALL_COLS
+            } else {
+                mask
+            }
+        };
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_key_range_cols(&self.cache, &lo, &hi, mask, |blk, s, e| {
+            let r = base.for_each_key_range_masked(&self.cache, &lo, &hi, mask_of, |blk, s, e| {
                 if stop {
                     return Ok(!stop);
                 }
+                // with undecoded columns read as 0 this is at most the true last key, and
+                // such a block has no delta key at or before its last row left to merge
                 let last = blk.key(e - 1);
                 let ins_hit = ins.peek().is_some_and(|k| **k <= last);
                 let del_hit = del.peek().is_some_and(|k| **k <= last);
@@ -436,43 +479,40 @@ impl Snapshot {
                     }
                     return Ok(!stop);
                 }
-                // merge row by row
-                let mut run_start = s;
-                for i in s..e {
-                    let k = blk.key(i);
-                    let mut flush_before = false;
-                    let mut skip = false;
-                    if ins.peek().is_some_and(|x| **x < k) {
-                        flush_before = true;
+                // merge: the rows before the next delta key go out as one slice, found by
+                // binary search, then the inserted key or the deleted row
+                let mut i = s;
+                loop {
+                    let next_ins = ins.peek().filter(|k| ***k <= last).map(|k| **k);
+                    let next_del = del.peek().filter(|k| ***k <= last).map(|k| **k);
+                    let (k, inserted) = match (next_ins, next_del) {
+                        (None, None) => break,
+                        (Some(a), Some(d)) if d < a => (d, false),
+                        (Some(a), _) => (a, true),
+                        (None, Some(d)) => (d, false),
+                    };
+                    let j = first_row_from(blk, i, e, &k);
+                    if i < j && !f(Chunk::Block(blk, i, j))? {
+                        stop = true;
+                        return Ok(!stop);
                     }
-                    if del.peek().is_some_and(|x| **x == k) {
-                        skip = true;
-                    }
-                    if flush_before || skip {
-                        if run_start < i && !f(Chunk::Block(blk, run_start, i))? {
+                    i = j;
+                    if inserted {
+                        // an inserted key is not in the base, so row `j` comes after it
+                        if !f(Chunk::Row(k))? {
                             stop = true;
                             return Ok(!stop);
                         }
-                        while let Some(x) = ins.peek().filter(|x| ***x < k) {
-                            if !f(Chunk::Row(**x))? {
-                                stop = true;
-                                return Ok(!stop);
-                            }
-                            ins.next();
+                        ins.next();
+                    } else {
+                        // a deleted key is in the base (one that is not is skipped)
+                        if i < e && blk.key(i) == k {
+                            i += 1;
                         }
-                        if skip {
-                            del.next();
-                            run_start = i + 1;
-                        } else {
-                            run_start = i;
-                        }
-                    }
-                    // deletes that don't exist in base (shouldn't happen) are skipped
-                    while del.peek().is_some_and(|x| **x < k) {
                         del.next();
                     }
                 }
-                if run_start < e && !f(Chunk::Block(blk, run_start, e))? {
+                if i < e && !f(Chunk::Block(blk, i, e))? {
                     stop = true;
                 }
                 Ok(!stop)
@@ -848,6 +888,7 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
+                counts: Default::default(),
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1055,6 +1096,7 @@ impl Store {
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
                 delta_stats: Default::default(),
+                counts: Default::default(),
                 historical: false,
             })),
             writer: Arc::new(Mutex::new(WriterState {
@@ -1345,6 +1387,7 @@ impl Store {
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: true,
         });
         h.cache.insert(0, ((owner, seq), snap.clone(), bytes));
@@ -2417,6 +2460,7 @@ impl Store {
                         union_default_graph: self.opts.union_default_graph,
                         geo_op_vertices: self.opts.geo_op_vertices,
                         delta_stats: Default::default(),
+                        counts: Default::default(),
                         historical: false,
                     })
                 };
@@ -2496,6 +2540,7 @@ impl Store {
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         };
         if bulk.is_some() {
@@ -2991,6 +3036,7 @@ impl WriteTxn<'_> {
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         }
     }
@@ -3338,6 +3384,7 @@ impl WriteTxn<'_> {
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
             delta_stats: Default::default(),
+            counts: Default::default(),
             historical: false,
         };
         self.store.maintain_text(&mut snap, &self.log);
@@ -3684,6 +3731,7 @@ pub(crate) fn replay_wal(
         union_default_graph: false,
         geo_op_vertices: StoreOptions::default().geo_op_vertices,
         delta_stats: Default::default(),
+        counts: Default::default(),
         historical: false,
     };
     let mut quads = out.base_quads;
@@ -4063,6 +4111,124 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         drop(store);
         let store = Store::open(&dir.path().join("db"), opts).unwrap();
         assert_eq!(store.snapshot().len(), 104);
+    }
+
+    #[test]
+    fn scans_merge_the_delta_into_base_blocks() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // several blocks per permutation, some quads in a named graph
+        let mut nt = String::new();
+        for i in 0..90_000u64 {
+            let g = if i % 13 == 0 {
+                " <http://ex.org/g>"
+            } else {
+                ""
+            };
+            nt.push_str(&format!(
+                "<http://ex.org/s{}> <http://ex.org/p{}> <http://ex.org/o{}>{g} .\n",
+                i % 5000,
+                i % 7,
+                (i * 31) % 9973
+            ));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        assert!(store.snapshot().perm(Perm::Spo).blocks.len() > 2);
+        let mut model: std::collections::BTreeSet<[Id; 4]> = Default::default();
+        store
+            .snapshot()
+            .for_each_quad(|q| {
+                model.insert(*q);
+                Ok(())
+            })
+            .unwrap();
+        let quads: Vec<[Id; 4]> = model.iter().copied().collect();
+        let pick = |r: u64| quads[r as usize % quads.len()];
+        // deletes, inserts of new combinations of terms (clustered and spread out),
+        // re-inserts of deleted quads, over a few commits
+        let mut deleted = Vec::new();
+        for _ in 0..4 {
+            let mut t = store.write();
+            for _ in 0..300 {
+                match next() % 4 {
+                    0 | 1 => {
+                        let q = pick(next());
+                        t.delete(q).unwrap();
+                        model.remove(&q);
+                        deleted.push(q);
+                    }
+                    2 => {
+                        let (a, b, c) = (pick(next()), pick(next()), pick(next()));
+                        let q = [a[0], b[1], c[2], pick(next())[3]];
+                        t.insert(q).unwrap();
+                        model.insert(q);
+                    }
+                    _ if !deleted.is_empty() => {
+                        let q = deleted[next() as usize % deleted.len()];
+                        t.insert(q).unwrap();
+                        model.insert(q);
+                    }
+                    _ => {}
+                }
+            }
+            t.commit().unwrap();
+        }
+        let snap = store.snapshot();
+        for perm in Perm::ALL {
+            let keys: Vec<Key> = model.iter().map(|q| perm.to_key(q)).collect();
+            let mut keys = keys;
+            keys.sort_unstable();
+            let some = |r: u64| keys[r as usize % keys.len()];
+            let mut ranges = vec![([0; 4], [u64::MAX; 4])];
+            for _ in 0..6 {
+                let k = some(next());
+                ranges.push((pad(&k[..1], 0), pad(&k[..1], u64::MAX)));
+                let (a, b) = (some(next()), some(next()));
+                ranges.push((a.min(b), a.max(b)));
+            }
+            for (lo, hi) in ranges {
+                for mask in [crate::index::ALL_COLS, 0b0001, 0b0110, 0b1000] {
+                    let want: Vec<Vec<u64>> = keys
+                        .iter()
+                        .filter(|k| **k >= lo && **k <= hi)
+                        .map(|k| {
+                            (0..4)
+                                .filter(|c| mask & (1 << c) != 0)
+                                .map(|c| k[c])
+                                .collect()
+                        })
+                        .collect();
+                    let mut got: Vec<Vec<u64>> = Vec::new();
+                    snap.scan_between_cols(perm, lo, hi, mask, |c| {
+                        match c {
+                            Chunk::Block(b, s, e) => got.extend((s..e).map(|i| {
+                                (0..4)
+                                    .filter(|c| mask & (1 << c) != 0)
+                                    .map(|c| b.cols[c][i])
+                                    .collect()
+                            })),
+                            Chunk::Row(k) => got.push(
+                                (0..4)
+                                    .filter(|c| mask & (1 << c) != 0)
+                                    .map(|c| k[c])
+                                    .collect(),
+                            ),
+                        }
+                        Ok(true)
+                    })
+                    .unwrap();
+                    assert_eq!(got, want, "{perm:?} {lo:?}..={hi:?} mask {mask:b}");
+                }
+            }
+        }
     }
 
     #[test]

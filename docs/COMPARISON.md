@@ -182,7 +182,9 @@ authentication.
   memory budget.
 * **Immutable base plus delta.** Updates are layered on the immutable index, in the style
   of QLever's `DeltaTriples`. Snapshots are versioned, and caches are keyed by snapshot
-  version.
+  version. A scan merges the delta into the blocks it changes. It finds the base rows
+  between two delta keys by binary search, and only those blocks have every column
+  decoded.
 * **Columnar execution and planning.** Execution is column-major. The planner is a DP over
   interesting sort orders with a greedy fallback, and merge joins run on sorted scans.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
@@ -209,8 +211,8 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **`COUNT(DISTINCT ?v)` from index runs.** Over one triple pattern, the scan switches to a
   permutation sorted on `?v` and counts runs of equal ids (`CountDistinctFromIndex`). No
   rows are materialized or hashed. When the pattern is `?s ?p ?o`, or binds only its
-  predicate, the count comes from the index statistics instead, under the same conditions
-  as the class counts below (`CountDistinctFromMetadata`, part of `metadata_counts`).
+  predicate, the count comes from the index statistics instead, corrected like the counts
+  from statistics below (`CountDistinctFromMetadata`, part of `metadata_counts`).
 * **Filters on vocabulary keys.** `CONTAINS`, `STRSTARTS`, `STRENDS` and `REGEX` over `?v`
   or `STR(?v)`, and `LANGMATCHES(LANG(?v), …)`, are tested on the stored key bytes
   (`"lexical 0xFF @lang`, `<iri`). Each front-coded block is read once, in parallel,
@@ -258,9 +260,20 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Count joins from key runs.** `COUNT(*)` over two scans joined on one variable reads both
   sides as (key, run length) pairs from indexes sorted on that variable and sums the
   products (`CountJoinFromRuns`).
-* **Class counts from statistics.** `GROUP BY ?class` with a count over `?s a ?class` uses
-  the per-class counts in the index statistics when they are exact: no delta, and all data
-  in the default graph (`GroupCountFromMetadata`).
+* **Counts from statistics.** `GROUP BY ?class` with a count over `?s a ?class`, and
+  `GROUP BY ?p` with a count over `?s ?p ?o`, read their counts from the index statistics
+  (`GroupCountFromMetadata`, part of `metadata_counts`). The statistics describe the base
+  index as the last compaction or bulk load wrote it, so the updates since then are
+  applied at query time. Each inserted or deleted quad changes a quad count by one. It
+  changes a distinct count only when an index probe finds no other quad that holds the
+  value before or after the change. Quads of graphs the query does not read are taken out
+  in the same way. The quad counts per predicate are used only when the query reads a
+  single graph, because a union of graphs counts a triple once however many graphs hold
+  it. The planner uses the statistics when one probe per changed value costs less than
+  reading the scan. The corrected counts are kept with the snapshot, so later queries at
+  the same commit reuse them. EXPLAIN notes `[from statistics, corrected for N delta
+  quads]` or `[from statistics, without N quads of graphs not read]`. The
+  `delta_statistics` switch limits the statistics to a store without a delta.
 * **Batched path frontiers.** `p*` and `p+` traversals expand a large BFS level with one
   merged pass over the predicate's index rows instead of a seek per node.
 * **Selective column decoding.** The block cache holds decoded columns, and scans decode
