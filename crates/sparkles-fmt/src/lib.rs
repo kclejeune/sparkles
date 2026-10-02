@@ -38,6 +38,7 @@ pub mod jsonld;
 pub mod lex;
 #[doc(hidden)]
 pub mod lines;
+pub mod lint;
 #[doc(hidden)]
 pub mod normalize;
 pub mod options;

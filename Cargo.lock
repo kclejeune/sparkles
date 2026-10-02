@@ -3694,6 +3694,7 @@ dependencies = [
  "lz4_flex 0.14.0",
  "oxjsonld",
  "oxrdf",
+ "oxsdatatypes",
  "oxttl",
  "proptest",
  "rayon",
