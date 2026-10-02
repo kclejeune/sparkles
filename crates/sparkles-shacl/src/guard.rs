@@ -24,8 +24,10 @@
 use crate::data::DataGraph;
 use crate::incremental::{Fallback, Model, Tuning};
 use crate::validate::{Sel, ShapeRun, validate_selected};
-use crate::{PropertyPath, Shapes, ValidateOptions, ValidationReport, ValidationResult};
-use anyhow::{Context, Result, bail};
+use crate::{
+    PropertyPath, Shapes, ShapesSyntax, ValidateOptions, ValidationReport, ValidationResult,
+};
+use anyhow::{Context, Result, anyhow, bail};
 use oxrdf::{NamedNode, Term};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -113,7 +115,8 @@ pub struct ShapesSource {
     /// shapes text given when setting the configuration (not stored in the file)
     #[serde(default, skip_serializing)]
     pub inline: Option<String>,
-    /// media type of `inline` (default Turtle)
+    /// media type of `inline` (default Turtle): an RDF syntax or `text/shaclc`. Shapes
+    /// in another syntax than Turtle are stored as Turtle.
     #[serde(default, skip_serializing)]
     pub format: Option<String>,
 }
@@ -1152,13 +1155,8 @@ pub fn read_config(root: &Path) -> Result<Option<ValidationConfig>> {
 fn shapes_text(
     cfg: &ValidationConfig,
     root: Option<&Path>,
-) -> Result<Option<(String, crate::RdfFormat)>> {
-    let format = cfg
-        .shapes
-        .format
-        .as_deref()
-        .and_then(sparkles::io::format_for_media_type)
-        .unwrap_or(crate::RdfFormat::Turtle);
+) -> Result<Option<(String, ShapesSyntax)>> {
+    let format = inline_syntax(cfg)?;
     let text = match (&cfg.shapes.inline, &cfg.shapes.file, root) {
         (Some(t), _, _) => t.clone(),
         (None, None, _) if cfg.shapes.graphs.is_some() => return Ok(None),
@@ -1167,6 +1165,16 @@ fn shapes_text(
         (None, _, None) => bail!("no shapes given"),
     };
     Ok(Some((text, format)))
+}
+
+/// The syntax of a configuration's inline shapes (Turtle without a format).
+fn inline_syntax(cfg: &ValidationConfig) -> Result<ShapesSyntax> {
+    match cfg.shapes.format.as_deref() {
+        None => Ok(ShapesSyntax::default()),
+        Some(mt) => ShapesSyntax::from_media_type(mt).ok_or_else(|| {
+            anyhow!("shapes: unknown format {mt:?} (an RDF media type or text/shaclc)")
+        }),
+    }
 }
 
 /// The shapes of a configuration over `snap`, and the graph of its shapes file when it
@@ -1297,6 +1305,13 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         sparkles::guard::config::remove_files(r, &[CONFIG_FILE, SHAPES_FILE])?;
         StatusFile::remove(r)?;
         if let Some(text) = cfg.shapes.inline.take() {
+            // the shapes file is Turtle, whatever the syntax given
+            let syntax = inline_syntax(&cfg)?;
+            let text = if syntax == ShapesSyntax::default() {
+                text
+            } else {
+                crate::syntax::convert(&text, syntax, ShapesSyntax::default(), None)?
+            };
             write_atomic(&r.join(SHAPES_FILE), text.as_bytes())?;
             cfg.shapes.file = Some(SHAPES_FILE.into());
             cfg.shapes.sha256 = Some(sha256_hex(text.as_bytes()));

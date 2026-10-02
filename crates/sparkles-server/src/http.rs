@@ -4280,12 +4280,12 @@ async fn shacl(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let ct = content_type(&headers);
-    // Turtle unless the content type names another RDF syntax (curl's default
-    // `application/x-www-form-urlencoded` included; `text/plain` too, as Turtle is a
-    // superset of N-Triples)
+    // Turtle unless the content type names another RDF syntax or SHACLC
+    // (`text/shaclc`); curl's default `application/x-www-form-urlencoded` is Turtle, and
+    // so is `text/plain`, as Turtle is a superset of N-Triples
     let format = match ct.as_str() {
-        "text/plain" => RdfFormat::Turtle,
-        ct => sparkles::io::format_for_media_type(ct).unwrap_or(RdfFormat::Turtle),
+        "text/plain" => sparkles_shacl::ShapesSyntax::default(),
+        ct => sparkles_shacl::ShapesSyntax::from_media_type(ct).unwrap_or_default(),
     };
     let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;

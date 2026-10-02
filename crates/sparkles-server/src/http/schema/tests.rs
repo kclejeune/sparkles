@@ -588,8 +588,20 @@ async fn drafted_shapes() {
     );
     assert!(j["shacl"].as_str().unwrap().contains("sh:closed true"));
 
-    // Turtle and ShExC by format= or Accept
+    // Turtle, SHACLC and ShExC by format= or Accept
     for (path, accept, ct, needle) in [
+        (
+            "/$/schema/t/shapes?format=shaclc",
+            "*/*",
+            "text/shaclc",
+            "shape shape:",
+        ),
+        (
+            "/$/schema/t/shapes",
+            "text/shaclc",
+            "text/shaclc",
+            "shape shape:",
+        ),
         (
             "/$/schema/t/shapes?format=turtle",
             "*/*",
@@ -632,6 +644,36 @@ async fn drafted_shapes() {
     assert_eq!(report["conforms"], true, "{report}");
     let body = serde_json::json!({
         "language": "shacl", "mode": "warn", "shapes": { "inline": turtle }
+    });
+    let (status, _, text) = send(
+        &s.app,
+        Request::put("/$/validation/t")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let j: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+
+    // and so does the SHACLC draft
+    let (_, _, compact) = get_accept(&s.app, "/$/schema/t/shapes?format=shaclc", "*/*").await;
+    let (status, _, report) = send(
+        &s.app,
+        Request::post("/t/shacl")
+            .header(header::CONTENT_TYPE, "text/shaclc")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(compact.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let report: J = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["conforms"], true, "{report}");
+    let body = serde_json::json!({
+        "language": "shacl", "mode": "warn",
+        "shapes": { "inline": compact, "format": "text/shaclc" }
     });
     let (status, _, text) = send(
         &s.app,

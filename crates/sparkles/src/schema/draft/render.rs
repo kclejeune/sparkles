@@ -1,5 +1,6 @@
-//! The draft as text: a SHACL shapes graph in Turtle, a ShEx schema in ShExC and the
-//! query shape map that goes with it. The counts go into comments.
+//! The draft as text: a SHACL shapes graph in Turtle and in the SHACL Compact Syntax, a
+//! ShEx schema in ShExC and the query shape map that goes with it. The counts go into
+//! comments.
 
 use super::{ConstraintDraft, ConstraintValue, NodeShapeDraft, PropertyDraft, SH, ShapesDraft};
 use std::collections::BTreeSet;
@@ -256,6 +257,132 @@ pub fn shacl(d: &ShapesDraft, names: &Prefixes) -> String {
     let mut out = String::new();
     header_comment(d, &mut out, "SHACL shapes");
     out.push_str(&names.header(&used, true));
+    out.push_str(&body);
+    out
+}
+
+/// Whether SHACLC reads a property type IRI as `sh:datatype` (the `xsd:` namespace and
+/// the RDF datatypes); otherwise as `sh:class`.
+fn shaclc_datatype(iri: &str) -> bool {
+    iri.starts_with(XSD)
+        || ["langString", "HTML", "JSON", "XMLLiteral"]
+            .iter()
+            .any(|l| iri.strip_prefix(RDF) == Some(*l))
+}
+
+/// One SHACLC atom for a constraint (the counts are written together, elsewhere).
+fn shaclc_atom(c: &ConstraintDraft, names: &Prefixes, used: &mut BTreeSet<usize>) -> String {
+    match (c.component, &c.value) {
+        ("nodeKind", ConstraintValue::Iri(k)) => match k.strip_prefix(SH) {
+            Some(kind) => kind.to_string(),
+            None => format!("nodeKind={}", names.iri(k, used)),
+        },
+        ("datatype", ConstraintValue::Iri(d)) if shaclc_datatype(d) => names.iri(d, used),
+        ("class", ConstraintValue::Iri(k)) if !shaclc_datatype(k) => names.iri(k, used),
+        (name, ConstraintValue::Iri(i)) => format!("{name}={}", names.iri(i, used)),
+        (name, ConstraintValue::Count(n)) => format!("{name}={n}"),
+        (name, ConstraintValue::Bool(b)) => format!("{name}={b}"),
+        ("languageIn", ConstraintValue::List(tags)) => format!(
+            "languageIn=[{}]",
+            tags.iter()
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        (name, ConstraintValue::List(items)) => format!(
+            "{name}=[{}]",
+            items
+                .iter()
+                .map(|t| term(t, names, used))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    }
+}
+
+/// A property shape in SHACLC: the path, then one atom per line with its counts as a
+/// comment, and the rejected candidates as comments.
+fn shaclc_property(p: &PropertyDraft, names: &Prefixes, used: &mut BTreeSet<usize>) -> String {
+    // (atom, comment)
+    let mut atoms: Vec<(String, String)> = Vec::new();
+    let find = |k: &str| p.constraints.iter().find(|c| c.component == k);
+    let (min, max) = (find("minCount"), find("maxCount"));
+    if min.is_some() || max.is_some() {
+        let n = |c: Option<&ConstraintDraft>, none: &str| match c.map(|c| &c.value) {
+            Some(ConstraintValue::Count(n)) => n.to_string(),
+            _ => none.to_string(),
+        };
+        let notes: Vec<String> = [("minCount", min), ("maxCount", max)]
+            .into_iter()
+            .filter_map(|(k, c)| c.map(|c| format!("{k}: {}", note(c))))
+            .collect();
+        atoms.push((
+            format!("[{}..{}]", n(min, "0"), n(max, "*")),
+            notes.join("; "),
+        ));
+    }
+    for c in &p.constraints {
+        if c.component != "minCount" && c.component != "maxCount" {
+            atoms.push((shaclc_atom(c, names, used), note(c)));
+        }
+    }
+    let mut out = format!(
+        "    {}  # {} with a value\n",
+        names.iri(&p.path, used),
+        plural(p.instances, "instance")
+    );
+    let n = atoms.len();
+    for (i, (atom, comment)) in atoms.into_iter().enumerate() {
+        let end = if i + 1 == n { " ." } else { "" };
+        let _ = writeln!(out, "        {atom}{end}  # {comment}");
+    }
+    if n == 0 {
+        out.push_str("        .\n");
+    }
+    for c in &p.rejected {
+        let atom = match (c.component, &c.value) {
+            ("minCount" | "maxCount", ConstraintValue::Count(n)) => {
+                format!("sh:{} {n}", c.component)
+            }
+            _ => shaclc_atom(c, names, used),
+        };
+        let _ = writeln!(
+            out,
+            "        # not drafted: {atom}  ({} of {} instances, would exclude {})",
+            c.satisfied, c.applicable, c.excluded
+        );
+    }
+    out
+}
+
+/// The shapes graph in the SHACL Compact Syntax, with the counts as comments.
+pub fn shaclc(d: &ShapesDraft, names: &Prefixes) -> String {
+    let mut used = BTreeSet::new();
+    let mut body = String::new();
+    for s in &d.shapes {
+        let _ = writeln!(body);
+        let _ = writeln!(
+            body,
+            "shape {} -> {} {{  # {}",
+            names.iri(&s.shape, &mut used),
+            names.iri(&s.class, &mut used),
+            plural(s.instances, "instance")
+        );
+        if s.closed {
+            let _ = writeln!(
+                body,
+                "    closed=true ignoredProperties=[{}] .",
+                names.iri(&format!("{RDF}type"), &mut used)
+            );
+        }
+        for p in &s.properties {
+            body.push_str(&shaclc_property(p, names, &mut used));
+        }
+        body.push_str("}\n");
+    }
+    let mut out = String::new();
+    header_comment(d, &mut out, "SHACL shapes");
+    out.push_str(&names.header(&used, false));
     out.push_str(&body);
     out
 }

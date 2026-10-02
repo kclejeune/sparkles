@@ -1064,7 +1064,7 @@ the threshold is listed as rejected with the same counts.
 | `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
 | `closed` | `false` | Draft closed shapes, with `sh:ignoredProperties ( rdf:type )`. |
 | `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
-| `format` | `json` | `json`, `turtle` (the SHACL shapes) or `shexc` (the ShEx schema). `Accept: text/turtle` and `Accept: text/shex` choose them too. |
+| `format` | `json` | `json`, `turtle` (the SHACL shapes), `shaclc` (the SHACL shapes in the compact syntax) or `shexc` (the ShEx schema). `Accept: text/turtle`, `Accept: text/shaclc` and `Accept: text/shex` choose them too. |
 | `timeout`, `at` | | As for queries. |
 
 ```ts
@@ -1080,6 +1080,7 @@ type ShapesDraft = {
             properties: { path: string; instances: number; maxValues: number;
                           constraints: Constraint[]; rejected: Constraint[] }[] }[];
   shacl: string;      // the shapes graph in Turtle, with the counts as comments
+  shaclc: string;     // the same shapes in SHACLC, with the counts as comments
   shex: string;       // the ShEx schema in ShExC
   shapeMap: string;   // {FOCUS rdf:type <C>}@<shape>, … for the ShEx schema
 };
@@ -3778,7 +3779,7 @@ versions, format 1 without `language`, are still read:
 |---|---|---|---|
 | `language` | `shacl`, `shex` | `shacl` | The shape language. It is always written, and a `PUT` without it means SHACL. |
 | `mode` | `reject`, `warn`, `off` | — | With `reject`, a write that leaves results at or above the threshold is not committed (`422`). With `warn`, the write commits, and the receipt and header report the findings. |
-| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
+| `shapes` (SHACL) | `{ "graphs"?: [iri, …], "inline"?: "<turtle>", "format"?: media type }` | — | Named graphs of the dataset, shapes given inline, or both. Named graphs are read from the state being validated, so changes to them are validated too and must parse. Inline shapes are copied to `validation-shapes.ttl`. They may be in any RDF syntax or in SHACLC (`text/shaclc`), and shapes in another syntax than Turtle are stored as Turtle. An unknown `format` is a `400`. With both, the file's shapes are merged with the graphs into one shapes graph, and a write to a shapes graph is validated against the merged shapes. |
 | `dataGraph` | `"default"`, `"union"`, `[iri, …]` | `"default"` | The data graph. It never includes the shapes graphs, and includes the inferred graph only with `includeInferences`. |
 | `threshold` (SHACL) | `violation`, `warning`, `info` | `violation` | Results at or above it block. |
 | `baseline` | `strict`, `grandfather` | `strict` | With `strict`, any blocking result in the state after a write decides. With `grandfather`, only the blocking results the write introduces decide, so results the data already has do not block unrelated writes, and `reject` can be enabled on data that does not conform. Results are matched as a multiset: SHACL results by focus node, path, value, source shape, component and constraint, ShEx associations by node and shape. When a write changes a SHACL shapes graph, its results are compared with those the old shapes gave. |
@@ -3958,6 +3959,7 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **Body.** The body is the shapes graph. `Content-Type` selects the syntax:
   `application/n-triples`, `application/rdf+xml`, `application/ld+json`,
   `application/trig` or `application/n-quads`. All graphs of a quad format are merged.
+  `text/shaclc` is the SHACL Compact Syntax (see [SHACLC](#shacl-compact-syntax-shaclc)).
   Turtle is used for `text/turtle` and for any other or absent content type, such as
   curl's default `application/x-www-form-urlencoded`.
 * **`graph`.** `default` is the default and means the dataset's default graph. With
@@ -3973,11 +3975,18 @@ the shapes graph in the request body, with Fuseki's semantics:
 * **`timeout=<seconds>`.** Works as for queries, with the server default otherwise. A
   timeout returns `408`.
 * SHACL Core and SHACL-SPARQL are supported. A parse error in the shapes graph is a `400`.
+  A SHACLC error gives the line and column.
 * **`sh:targetWhere`** (SHACL 1.2 Core) is supported: the focus nodes are the nodes of the
   data graph, its subjects and objects, that conform to the given shape. When that shape
   has `sh:class`, `sh:hasValue` or `sh:in`, or a property shape on a predicate or an
   inverse predicate with `sh:minCount` of at least 1, only the nodes those allow are
   tested. Otherwise every node of the data graph is.
+* **List constraints** (SHACL 1.2 Core) are supported: `sh:memberShape`,
+  `sh:minListLength`, `sh:maxListLength` and `sh:uniqueMembers`. Each value node must be a
+  well-formed RDF list, or it gets a result with the value node as `sh:value`. A
+  `sh:memberShape` result has one `sh:detail` per member that does not conform, holding
+  that member's results against the member shape. A `sh:uniqueMembers true` result has one
+  `sh:detail` per repeated member, with the member as `sh:value`.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -3995,25 +4004,70 @@ negotiated with `Accept` or `format=`:
 | `format=text` | human-readable summary (one line per result) |
 
 ```ts
-type ShaclReport = {
-  conforms: boolean;
-  results: {
-    focusNode: Term;
-    resultPath: Term | { type: "path"; value: string /* SPARQL property path */ } | null;
-    value: Term | null;
-    sourceShape: Term;
-    sourceConstraintComponent: Term;   // e.g. { type: "uri", value: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }
-    sourceConstraint?: Term;           // SHACL-SPARQL constraints
-    severity: Term;                    // sh:Violation | sh:Warning | sh:Info
-    messages: string[];                // sh:resultMessage texts
-  }[];
+type ShaclReport = { conforms: boolean; results: ShaclResult[] };
+type ShaclResult = {
+  focusNode: Term;
+  resultPath: Term | { type: "path"; value: string /* SPARQL property path */ } | null;
+  value: Term | null;
+  sourceShape: Term;
+  sourceConstraintComponent: Term;   // e.g. { type: "uri", value: "http://www.w3.org/ns/shacl#MinCountConstraintComponent" }
+  sourceConstraint?: Term;           // SHACL-SPARQL constraints
+  severity: Term;                    // sh:Violation | sh:Warning | sh:Info
+  messages: string[];                // sh:resultMessage texts
+  details?: ShaclResult[];           // sh:detail results, only when there are some
 };
 ```
 
 The CLI equivalent is `sparkles shacl --loc DB --shapes shapes.ttl [--graph default|union|IRI]
 [--format ttl|json|text|nt|jsonld|rdfxml] [--no-inferences]`, or `--data FILE…` in place
-of `--loc` to validate files in memory. Like Jena's `shacl validate`, it exits with status
+of `--loc` to validate files in memory. The shapes file's syntax comes from its name, and
+`.shaclc` and `.shc` files are SHACLC. Like Jena's `shacl validate`, it exits with status
 1 when the data does not conform.
+
+### SHACL Compact Syntax (SHACLC)
+
+The design and its rationale are in
+[G03 SHACL Compact Syntax and list constraints](specs/G03-shaclc.md).
+
+SHACLC is the compact syntax for shapes of the SHACL 1.2 Compact Syntax draft and the
+SHACL 1.0 Working Group Note, with the media type `text/shaclc` and the file extensions
+`.shaclc` and `.shc`. Sparkles reads it wherever shapes are given and writes it where
+drafted shapes are shown:
+
+| Place | SHACLC |
+|---|---|
+| `POST /{ds}/shacl` | `Content-Type: text/shaclc` |
+| `PUT /$/validation/{ds}` | `"shapes": { "inline": "…", "format": "text/shaclc" }` |
+| `GET /$/schema/{ds}/shapes` | `format=shaclc` or `Accept: text/shaclc` |
+| `sparkles shacl`, `sparkles validation` | `--shapes FILE.shaclc` or `FILE.shc` |
+| `sparkles schema --draft-shapes` | `--format shaclc` |
+| MCP `validate_shacl` | `shapesFormat: "shaclc"` |
+| Python `Dataset.validate_shacl` | `format="shaclc"` |
+
+```
+PREFIX ex: <http://example.com/ns#>
+
+shape ex:PersonShape -> ex:Person {
+    closed=true ignoredProperties=[rdf:type] .
+    ex:ssn       xsd:string [0..1] pattern="^\\d{3}-\\d{2}-\\d{4}$" .
+    ex:worksFor  IRI ex:Company [0..*] .
+    ex:speakers  IRI [1..1] memberShape=ex:Speaker maxListLength=10 .
+}
+```
+
+The prefixes `rdf`, `rdfs`, `sh` and `xsd` are bound without a `PREFIX` line. Keywords
+ignore case, as in Jena. Sparkles reads what Jena reads beyond the grammar: a shape
+reference alone in a node shape body (`@ex:S .`), `targetClass=` as a node parameter, and
+`group`, `order`, `name`, `description` and `defaultValue` as property parameters. It also
+reads the SHACL 1.2 list parameters `memberShape`, `minListLength`, `maxListLength` and
+`uniqueMembers` as node and property parameters. A document with a `BASE` (or read with a
+base, as the CLI reads files) produces `<base> a owl:Ontology` and an `owl:imports` triple
+per `IMPORTS`, as the production rules say.
+
+Shapes written as SHACLC read back to the same graph. A shapes graph with triples that
+SHACLC cannot express, such as a named property shape, `sh:minCount 0` or a label on a
+shape, is not written at all, and the error names those triples. The Rust API is
+`sparkles_shacl::compact::{parse, write}` and `sparkles_shacl::ShapesSyntax`.
 
 ## ShEx validation
 
@@ -5366,7 +5420,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null}` |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
-| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
+| `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 | `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |

@@ -3790,6 +3790,7 @@ name = "sparkles-shacl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",

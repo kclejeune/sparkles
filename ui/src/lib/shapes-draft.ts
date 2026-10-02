@@ -4,7 +4,8 @@
 import type { DraftShape, ShapesDraft } from './api';
 import { fmtInt } from './format';
 
-export type DraftLang = 'shacl' | 'shex';
+/** The draft's text: SHACL in Turtle or in SHACLC, or ShEx. */
+export type DraftLang = 'shacl' | 'shaclc' | 'shex';
 
 /** The support typed into the dialog, or null when it is not a number in (0, 1]. */
 export function parseSupport(text: string): number | null {
@@ -62,6 +63,7 @@ export function summaryLine(d: ShapesDraft): string {
 /** The text of the draft in a language; ShEx carries its shape map as a comment. */
 export function draftText(d: ShapesDraft, lang: DraftLang): string {
   if (lang === 'shacl') return d.shacl;
+  if (lang === 'shaclc') return d.shaclc;
   const map = d.shapeMap
     .split('\n')
     .map((l) => `# ${l}`)

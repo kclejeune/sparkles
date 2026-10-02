@@ -1074,6 +1074,8 @@ export type ShaclOptions = {
   graph?: string;
   /** Include materialized inferences (server default: yes, when present). */
   reasoning?: boolean;
+  /** The syntax of the shapes: Turtle (the default) or SHACLC. */
+  syntax?: 'turtle' | 'shaclc';
   signal?: AbortSignal;
 };
 
@@ -1089,13 +1091,16 @@ function shaclRequest(
   const qs = p.toString();
   return request(`/${enc(ds)}/shacl${qs ? `?${qs}` : ''}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'text/turtle', Accept: accept },
+    headers: {
+      'Content-Type': opts.syntax === 'shaclc' ? 'text/shaclc' : 'text/turtle',
+      Accept: accept,
+    },
     body: shapes,
     signal: opts.signal,
   });
 }
 
-/** Validate a data graph against a Turtle shapes graph; compact JSON report. */
+/** Validate a data graph against a shapes graph (Turtle or SHACLC); compact JSON report. */
 export async function shacl(
   ds: string,
   shapes: string,
@@ -2174,6 +2179,8 @@ export type ShapesDraft = {
   shapes: DraftShape[];
   /** The shapes graph in Turtle. */
   shacl: string;
+  /** The shapes graph in the SHACL Compact Syntax. */
+  shaclc: string;
   /** The ShEx schema in ShExC. */
   shex: string;
   /** The query shape map of the ShEx schema. */

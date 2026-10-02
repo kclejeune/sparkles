@@ -216,6 +216,9 @@ pub(crate) struct Engine<'a> {
     collected: AtomicUsize,
 }
 
+/// Members past which a list counts as ill-formed (a hostile list cannot exhaust memory).
+const MAX_LIST_MEMBERS: usize = 1 << 24;
+
 /// A one-element result message.
 fn msg(s: String) -> Vec<Literal> {
     vec![Literal::new_simple_literal(s)]
@@ -602,8 +605,71 @@ impl<'a> Engine<'a> {
             source_constraint,
             severity: shape.severity.clone(),
             messages,
+            details: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Attach details to the result just recorded (when results are collected).
+    fn attach_details(out: &mut Out, details: Vec<ValidationResult>) {
+        if out.collect
+            && let Some(r) = out.results.last_mut()
+        {
+            r.details = details;
+        }
+    }
+
+    /// The members of `head` if it is a SHACL list (SHACL 1.2 Core, "SHACL Lists"):
+    /// `rdf:nil` without `rdf:first` or `rdf:rest`, or an IRI or blank node with exactly
+    /// one `rdf:first` and one `rdf:rest` whose value is a SHACL list, without a cycle.
+    /// `None` when it is not one, or longer than [`MAX_LIST_MEMBERS`].
+    pub(crate) fn shacl_list(&self, head: Id) -> Result<Option<Vec<Id>>> {
+        if matches!(self.term(head)?, Term::Literal(_) | Term::Triple(_)) {
+            return Ok(None);
+        }
+        let (first, rest, nil) = (self.data.rdf_first, self.data.rdf_rest, self.data.rdf_nil);
+        let mut members = Vec::new();
+        let mut seen = FxHashSet::default();
+        let mut n = head;
+        loop {
+            if !seen.insert(n) || members.len() > MAX_LIST_MEMBERS {
+                return Ok(None);
+            }
+            if members.len() % 4096 == 4095 {
+                self.check_limits()?;
+            }
+            let firsts = self.data.objects(n, first)?;
+            let rests = self.data.objects(n, rest)?;
+            if n == nil {
+                return Ok((firsts.is_empty() && rests.is_empty()).then_some(members));
+            }
+            let ([f], [r]) = (&firsts[..], &rests[..]) else {
+                return Ok(None);
+            };
+            members.push(*f);
+            n = *r;
+        }
+    }
+
+    /// Report a value node that is not a SHACL list, for a list constraint.
+    fn not_a_list(
+        &self,
+        out: &mut Out,
+        si: ShapeId,
+        focus: Id,
+        path: RPath,
+        v: Id,
+        component: NamedNode,
+    ) -> Result<()> {
+        let name = component
+            .as_str()
+            .strip_prefix(crate::vocab::SH_NS)
+            .unwrap_or(component.as_str())
+            .trim_end_matches("ConstraintComponent")
+            .to_string();
+        self.report(out, si, focus, path, Some(v), component, None, || {
+            msg(format!("{name}: {} is not a SHACL list", self.show(v)))
+        })
     }
 
     fn show(&self, id: Id) -> String {
@@ -1044,6 +1110,144 @@ impl<'a> Engine<'a> {
             }
             Constraint::Sparql(sc) => {
                 self.check_sparql(si, sc, focus, out)?;
+            }
+            Constraint::MemberShape(s) => {
+                for &v in values {
+                    let Some(members) = self.shacl_list(v)? else {
+                        self.not_a_list(out, si, focus, path(), v, comp())?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                        continue;
+                    };
+                    let mut failing = Vec::new();
+                    for &m in &members {
+                        if !self.conforms(*s, m, cx)? {
+                            failing.push(m);
+                            if !out.collect {
+                                break;
+                            }
+                        }
+                    }
+                    if failing.is_empty() {
+                        continue;
+                    }
+                    let n = failing.len();
+                    self.report(out, si, focus, path(), Some(v), comp(), None, || {
+                        msg(format!(
+                            "MemberShape[{}]: {n} member{} of {} do{} not conform",
+                            self.shapes.shapes[*s].node,
+                            if n == 1 { "" } else { "s" },
+                            self.show(v),
+                            if n == 1 { "es" } else { "" },
+                        ))
+                    })?;
+                    if out.stop() {
+                        return Ok(());
+                    }
+                    // the details: each failing member's results against the member shape
+                    let mut details = Vec::new();
+                    for m in failing {
+                        let mut sub = Out::collect();
+                        cx.stack.push((*s, m));
+                        let r = self.validate_focus(*s, m, &mut sub, cx);
+                        cx.stack.pop();
+                        r?;
+                        details.extend(sub.results);
+                    }
+                    Self::attach_details(out, details);
+                }
+            }
+            Constraint::MinListLength(n) | Constraint::MaxListLength(n) => {
+                let min = matches!(c, Constraint::MinListLength(_));
+                for &v in values {
+                    let Some(members) = self.shacl_list(v)? else {
+                        self.not_a_list(out, si, focus, path(), v, comp())?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                        continue;
+                    };
+                    let len = members.len() as u64;
+                    if (min && len < *n) || (!min && len > *n) {
+                        self.report(out, si, focus, path(), Some(v), comp(), None, || {
+                            msg(format!(
+                                "{}[{n}]: {} has {len} member{}",
+                                if min {
+                                    "MinListLength"
+                                } else {
+                                    "MaxListLength"
+                                },
+                                self.show(v),
+                                if len == 1 { "" } else { "s" },
+                            ))
+                        })?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Constraint::UniqueMembers(unique) => {
+                for &v in values {
+                    let Some(members) = self.shacl_list(v)? else {
+                        self.not_a_list(out, si, focus, path(), v, comp())?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                        continue;
+                    };
+                    if !unique {
+                        continue;
+                    }
+                    // each repeated member once, in the order of its first repeat
+                    let mut seen = FxHashSet::default();
+                    let mut repeated = Vec::new();
+                    for &m in &members {
+                        if !seen.insert(m) && !repeated.contains(&m) {
+                            repeated.push(m);
+                        }
+                    }
+                    if repeated.is_empty() {
+                        continue;
+                    }
+                    self.report(out, si, focus, path(), Some(v), comp(), None, || {
+                        msg(format!(
+                            "UniqueMembers: {} repeats {}",
+                            self.show(v),
+                            repeated
+                                .iter()
+                                .map(|m| self.show(*m))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+                    if out.stop() {
+                        return Ok(());
+                    }
+                    if out.collect {
+                        let mut sub = Out::collect();
+                        for m in repeated {
+                            self.report(
+                                &mut sub,
+                                si,
+                                focus,
+                                path(),
+                                Some(m),
+                                comp(),
+                                None,
+                                || {
+                                    msg(format!(
+                                        "UniqueMembers: {} occurs more than once in {}",
+                                        self.show(m),
+                                        self.show(v)
+                                    ))
+                                },
+                            )?;
+                        }
+                        Self::attach_details(out, sub.results);
+                    }
+                }
             }
             Constraint::Component(cc) => {
                 self.check_component(si, cc, focus, values, out)?;

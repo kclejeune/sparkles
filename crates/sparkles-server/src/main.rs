@@ -1346,7 +1346,8 @@ enum Cmd {
         #[arg(long, value_name = "SOURCE", conflicts_with = "draft_shapes")]
         shapes: Vec<String>,
         /// Draft SHACL shapes (or, with --format shexc, a ShEx schema) from the data
-        /// instead of printing the schema; --format is then turtle, shexc or json
+        /// instead of printing the schema; --format is then turtle, shaclc (the SHACL
+        /// Compact Syntax), shexc or json
         #[arg(long)]
         draft_shapes: bool,
         /// Draft a constraint when at least this share of the instances it applies to
@@ -1382,7 +1383,8 @@ enum Cmd {
         /// Data files to validate (loaded into memory)
         #[arg(long)]
         data: Vec<PathBuf>,
-        /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ...; `.gz` allowed)
+        /// Shapes graph file (Turtle, N-Triples, RDF/XML, JSON-LD, ..., or SHACLC as
+        /// `.shaclc` or `.shc`; `.gz` allowed)
         #[arg(long)]
         shapes: PathBuf,
         /// Data graph: `default`, `union` (all graphs) or a graph IRI
@@ -3556,14 +3558,16 @@ fn schema_draft(
     #[derive(PartialEq)]
     enum Out {
         Turtle,
+        Shaclc,
         ShexC,
         Json,
     }
     let out = match a.format.as_str() {
         "turtle" | "text" => Out::Turtle,
+        "shaclc" => Out::Shaclc,
         "shexc" => Out::ShexC,
         "json" => Out::Json,
-        f => bail!("unknown format '{f}' with --draft-shapes (turtle, shexc or json)"),
+        f => bail!("unknown format '{f}' with --draft-shapes (turtle, shaclc, shexc or json)"),
     };
     if !(a.support > 0.0 && a.support <= 1.0) {
         bail!("--support must be in (0, 1]");
@@ -3620,6 +3624,7 @@ fn schema_draft(
     let mut w = std::io::stdout().lock();
     match out {
         Out::Turtle => w.write_all(draft.shacl.as_bytes())?,
+        Out::Shaclc => w.write_all(draft.shaclc.as_bytes())?,
         Out::ShexC => {
             w.write_all(draft.shex.as_bytes())?;
             writeln!(
@@ -3640,8 +3645,8 @@ fn schema_draft(
 #[cfg(feature = "shacl")]
 fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
     use std::io::Read;
-    let (format, _) =
-        sparkles::io::format_for_path(path).unwrap_or((oxrdfio::RdfFormat::Turtle, None));
+    // `.shaclc` and `.shc` are SHACLC; other names as for RDF files, Turtle by default
+    let (format, _) = sparkles_shacl::ShapesSyntax::from_path(path).unwrap_or_default();
     let codec = Source::from_path(path, None)
         .and_then(|s| s.codec())
         .unwrap_or_default();

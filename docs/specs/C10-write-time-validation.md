@@ -1256,3 +1256,12 @@ keep their Phase 1 defaults.
   `reject` and grandfather `reject`, against 18 ms with validation off. The write no
   shape reads took 13 to 19 ms. Validating the SHACL-SPARQL shape alone in full takes
   about 0.8 s, which every write paid before this phase, twice in grandfather mode.
+
+**Shapes syntaxes (2026-10-02, with [G03](G03-shaclc.md)).** Inline shapes may be given
+in any RDF syntax or in SHACLC (`"format": "text/shaclc"`). Shapes in another syntax than
+Turtle are now stored in `validation-shapes.ttl` as Turtle. Before, inline JSON-LD or
+RDF/XML was stored as given under that name and read back as Turtle. An unknown `format`
+is now an error rather than Turtle. `sparkles validation --shapes` takes the syntax from
+the file name. The list constraints of SHACL 1.2 are validated incrementally: they read
+`rdf:first` and `rdf:rest` along each value node's list, and `sh:memberShape` nests the
+member shape's reads under `path/rdf:rest*/rdf:first`.

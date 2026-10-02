@@ -83,6 +83,22 @@ def test_a11_shacl(ds: Dataset) -> None:
         ds.validate_shacl("not turtle at all {")
 
 
+def test_shacl_compact_syntax(ds: Dataset) -> None:
+    compact = """
+    PREFIX ex: <http://ex.org/>
+    PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+    shape ex:PersonShape -> ex:Person {
+        foaf:age [1..*] message="needs an age" .
+    }
+    """
+    report = ds.validate_shacl(compact, format="shaclc")
+    (r,) = report.results
+    assert r.focus_node == ex("carol") and r.message == "needs an age"
+    assert not ds.validate_shacl(compact, format="text/shaclc").conforms
+    with pytest.raises(RdfSyntaxError):
+        ds.validate_shacl("shape {", format="shaclc")
+
+
 def test_a11_shex(ds: Dataset) -> None:
     report = ds.validate_shex(SHEX, "{FOCUS a ex:Person}@ex:Person")
     assert not report.conforms

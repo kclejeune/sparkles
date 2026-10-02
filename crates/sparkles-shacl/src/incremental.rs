@@ -225,6 +225,17 @@ impl Analyzer<'_> {
             dir: Dir::Out,
         };
         let mut nested: Vec<ShapeId> = Vec::new();
+        // shapes evaluated at the members of the value nodes (`sh:memberShape`)
+        let mut members: Vec<ShapeId> = Vec::new();
+        // a list constraint reads `rdf:first` and `rdf:rest` along each value node's list
+        let along_lists = || {
+            let mut prefix = path.clone();
+            prefix.push(PropertyPath::ZeroOrMore(Box::new(PropertyPath::Predicate(
+                rdf::REST.into_owned(),
+            ))));
+            prefix
+        };
+        let mut lists = false;
         for c in &shape.constraints {
             match c {
                 Constraint::Class(_) => {
@@ -270,6 +281,13 @@ impl Analyzer<'_> {
                         crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
                     out.extend(reads.into_iter().map(Dep::from));
                 }
+                Constraint::MemberShape(s) => {
+                    lists = true;
+                    members.push(*s);
+                }
+                Constraint::MinListLength(_)
+                | Constraint::MaxListLength(_)
+                | Constraint::UniqueMembers(_) => lists = true,
                 // these depend on the value nodes alone
                 Constraint::Datatype(_)
                 | Constraint::NodeKind(_)
@@ -286,6 +304,27 @@ impl Analyzer<'_> {
                 | Constraint::UniqueLang
                 | Constraint::HasValue(_)
                 | Constraint::In(_) => {}
+            }
+        }
+        if lists {
+            for p in [rdf::FIRST, rdf::REST] {
+                out.push(Dep {
+                    prefix: along_lists(),
+                    pred: Some(p.into_owned()),
+                    dir: Dir::Out,
+                });
+            }
+        }
+        // a member shape is evaluated at each member of each value node
+        for s in members {
+            for d in self.deps(s)? {
+                let mut prefix = along_lists();
+                prefix.push(PropertyPath::Predicate(rdf::FIRST.into_owned()));
+                prefix.extend(d.prefix);
+                out.push(Dep { prefix, ..d });
+            }
+            if out.len() > MAX_DEPS {
+                return Err(Fallback::Budget);
             }
         }
         // a referenced shape is evaluated at each value node

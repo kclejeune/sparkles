@@ -3,6 +3,10 @@
 //! * **SHACL Core**: node and property shapes, all targets (including implicit class
 //!   targets), `sh:deactivated`, `sh:severity`, `sh:message`, all property path forms
 //!   and every core constraint component.
+//! * **SHACL 1.2 Core** list constraints (`sh:memberShape`, `sh:minListLength`,
+//!   `sh:maxListLength`, `sh:uniqueMembers`) and `sh:targetWhere`.
+//! * **SHACL Compact Syntax** (SHACLC): shapes are read from it and written to it
+//!   ([`compact`], [`ShapesSyntax`]).
 //! * **SHACL-SPARQL**: `sh:sparql` SELECT constraints and SPARQL-based constraint
 //!   components (ASK / SELECT validators), with pre-binding of `$this`, `$value`,
 //!   `$currentShape`, `$shapesGraph` and parameters.
@@ -27,6 +31,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod compact;
 pub mod constraints;
 mod data;
 pub mod guard;
@@ -36,6 +41,7 @@ pub mod path;
 pub mod report;
 pub mod shapes;
 pub mod sparql;
+pub mod syntax;
 mod validate;
 pub mod vocab;
 
@@ -43,6 +49,7 @@ pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
 pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
 pub use sparkles::io::RdfFormat;
+pub use syntax::ShapesSyntax;
 pub use validate::{TooManyResults, ValidateOptions, validate, validate_node};
 
 /// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles::xsd`]).

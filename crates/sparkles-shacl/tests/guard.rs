@@ -304,6 +304,46 @@ fn inline_shapes_file_and_union_data_graph() {
 }
 
 #[test]
+fn inline_shaclc_is_stored_as_turtle() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let mut c = cfg(GuardMode::Reject);
+    c.shapes = ShapesSource {
+        inline: Some(
+            "PREFIX ex: <http://ex.org/>
+             shape ex:PersonShape -> ex:Person {
+                 ex:name xsd:string [1..*] .
+                 ex:age maxInclusive=150 severity=sh:Warning .
+             }"
+            .into(),
+        ),
+        format: Some("text/shaclc".into()),
+        ..Default::default()
+    };
+    enable(&s, c);
+    let named = "INSERT DATA { ex:b a ex:Person }";
+    assert!(matches!(upd(&s, named), Err(Error::Rejected(_))));
+    // the stored file is Turtle, and the configuration does not keep the syntax
+    let stored = std::fs::read_to_string(root.join(guard::SHAPES_FILE)).unwrap();
+    assert!(stored.contains("@prefix ex: <http://ex.org/>"), "{stored}");
+    sparkles_shacl::Shapes::parse(&stored, RdfFormat::Turtle, None).unwrap();
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    guard::install(&s).unwrap();
+    assert!(matches!(upd(&s, named), Err(Error::Rejected(_))));
+    upd(&s, "INSERT DATA { ex:c a ex:Person ; ex:name \"C\" }").unwrap();
+    // an unknown format is an error
+    let mut c = cfg(GuardMode::Reject);
+    c.shapes = ShapesSource {
+        inline: Some(SHAPES.into()),
+        format: Some("text/unknown".into()),
+        ..Default::default()
+    };
+    assert!(guard::set_config(&s, Some(c)).is_err());
+}
+
+#[test]
 fn configurations_are_written_as_format_2_and_format_1_still_reads() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

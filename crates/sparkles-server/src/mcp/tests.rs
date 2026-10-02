@@ -368,7 +368,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             "validate_shacl",
             json!({"type":"object","additionalProperties":false,"required":["shapes"],"properties":{
                 "dataset": ds,
-                "shapes": {"type":"string","minLength":1,"maxLength":1048576,"description":"The shapes graph in Turtle"},
+                "shapes": {"type":"string","minLength":1,"maxLength":1048576,"description":"The shapes graph in Turtle, or in SHACLC with shapesFormat"},
+                "shapesFormat": {"enum":["turtle","shaclc"],"default":"turtle","description":"The syntax of `shapes`: Turtle, or the SHACL Compact Syntax"},
                 "graph": {"type":"string","default":"default","description":"`default`, `union` (all graphs) or a graph IRI"},
                 "reasoning": rs,
                 "maxResults": {"type":"integer","minimum":1,"maximum":1000,"default":20},

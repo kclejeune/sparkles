@@ -562,9 +562,15 @@ its instances have. Review the draft, then use it for write-time validation:
 ```sh
 sparkles schema --loc db --draft-shapes > shapes.ttl                 # the data conforms
 sparkles schema --loc db --draft-shapes --support 0.95 --closed      # rules most instances follow
+sparkles schema --loc db --draft-shapes --format shaclc > shapes.shaclc  # the SHACL Compact Syntax
 sparkles schema --loc db --draft-shapes --format shexc               # a ShEx schema and its shape map
 sparkles validation --loc db --mode warn --shapes shapes.ttl
 ```
+
+Shapes files may be in any RDF syntax or in the SHACL Compact Syntax. `sparkles shacl`
+and `sparkles validation` read a file ending in `.shaclc` or `.shc` as SHACLC, and the
+database keeps write-time shapes as Turtle whatever syntax they came in
+([API.md](API.md#shacl-compact-syntax-shaclc)).
 
 With the default support of 1, every constraint holds for every instance, so the current
 data conforms. With `--support 0.95`, a constraint is drafted when 95% of the instances
@@ -985,7 +991,8 @@ The tools are read-only unless the operator turns on the write tool:
   computes embeddings.
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
-  shape and reason. They do not follow imports.
+  shape and reason. They do not follow imports. `validate_shacl` takes the shapes in
+  Turtle, or in SHACLC with `shapesFormat: "shaclc"`.
 * `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
   the way `sparkles fmt` does, and returns the text with any warnings. It reads no
   dataset.

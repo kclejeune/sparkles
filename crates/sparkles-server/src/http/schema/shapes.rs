@@ -1,5 +1,6 @@
 //! `GET /$/schema/{ds}/shapes`: SHACL shapes and a ShEx schema drafted from the data
-//! (`sparkles::schema::draft`), as JSON with the counts, as Turtle or as ShExC.
+//! (`sparkles::schema::draft`), as JSON with the counts, as Turtle, as SHACLC or as
+//! ShExC.
 
 use super::super::{ApiResult, INFERRED_GRAPH, Params, St, blocking, dataset, negotiate};
 use super::{bad, schema_error};
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 enum Format {
     Json,
     Turtle,
+    Shaclc,
     ShexC,
 }
 
@@ -28,11 +30,19 @@ fn format(params: &Params, headers: &HeaderMap) -> ApiResult<Format> {
         return match f {
             "json" => Ok(Format::Json),
             "turtle" | "ttl" | "shacl" => Ok(Format::Turtle),
+            "shaclc" => Ok(Format::Shaclc),
             "shexc" | "shex" => Ok(Format::ShexC),
-            f => Err(bad(format!("unknown format '{f}': json, turtle or shexc"))),
+            f => Err(bad(format!(
+                "unknown format '{f}': json, turtle, shaclc or shexc"
+            ))),
         };
     }
-    const OFFERS: [&str; 3] = ["application/json", "text/turtle", "text/shex"];
+    const OFFERS: [&str; 4] = [
+        "application/json",
+        "text/turtle",
+        "text/shex",
+        "text/shaclc",
+    ];
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -40,6 +50,7 @@ fn format(params: &Params, headers: &HeaderMap) -> ApiResult<Format> {
     Ok(match negotiate(accept, &OFFERS) {
         Some(1) => Format::Turtle,
         Some(2) => Format::ShexC,
+        Some(3) => Format::Shaclc,
         _ => Format::Json,
     })
 }
@@ -169,6 +180,11 @@ pub(in crate::http) async fn shapes(
             Format::Turtle => (
                 [(header::CONTENT_TYPE, "text/turtle; charset=utf-8")],
                 draft.shacl,
+            )
+                .into_response(),
+            Format::Shaclc => (
+                [(header::CONTENT_TYPE, "text/shaclc; charset=utf-8")],
+                draft.shaclc,
             )
                 .into_response(),
             Format::ShexC => (

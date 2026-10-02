@@ -1014,3 +1014,10 @@ parameters, both sources, the errors and the cursor rule.
 `router_tests::auth::graphs::constraints_cover_the_view` checks the rules for callers
 limited to some graphs, `mcp::tests::describe_schema_constraints_and_subject_classes`
 covers the tool, `tests/cli_schema.rs` runs the CLI, and Vitest covers the UI helpers.
+
+**SHACLC drafts (2026-10-02, with [G03](G03-shaclc.md)).** The draft is also rendered in
+the SHACL Compact Syntax, with the same counts as comments. The JSON gains a `shaclc`
+field, `format=shaclc` and `Accept: text/shaclc` select it, `sparkles schema
+--draft-shapes --format shaclc` prints it, and the UI's dialog has a SHACLC tab.
+`tests/draft.rs` of `sparkles-shacl` checks that every drafted SHACLC reads to the same
+graph as the drafted Turtle.

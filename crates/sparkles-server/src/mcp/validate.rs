@@ -1,4 +1,4 @@
-//! The validation tools: `validate_shacl` (a SHACL shapes graph in Turtle) and
+//! The validation tools: `validate_shacl` (a SHACL shapes graph in Turtle or SHACLC) and
 //! `validate_shex` (a ShEx schema with a shape map). Both validate one snapshot of a
 //! dataset's data graph, as `/{ds}/shacl` and `/{ds}/shex` do, and answer counts plus
 //! the first `maxResults` results in compact terms. Neither writes, fetches imports or
@@ -221,11 +221,21 @@ fn too_many(limit: usize) -> ToolError {
 struct ShaclArgs {
     dataset: Option<String>,
     shapes: String,
+    shapes_format: Option<ShapesFormat>,
     graph: Option<String>,
     reasoning: Option<bool>,
     max_results: Option<u64>,
     timeout_seconds: Option<f64>,
     at_commit: Option<u64>,
+}
+
+/// The syntax of `validate_shacl`'s shapes.
+#[cfg(feature = "shacl")]
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ShapesFormat {
+    Turtle,
+    Shaclc,
 }
 
 /// The rank of a SHACL severity (2 violation, 1 warning, 0 info) and its short name.
@@ -290,9 +300,12 @@ impl Tools<'_> {
         let prefixes = Prefixes::new(&t.prefixes);
         let names = prefixes.names();
         let ctx = self.ctx(&names, t.timeout.as_secs_f64());
-        let shapes =
-            sparkles_shacl::Shapes::parse(&a.shapes, sparkles::io::RdfFormat::Turtle, None)
-                .map_err(|e| ToolError::new("syntax", 400, format!("shapes: {e:#}")))?;
+        let syntax = match a.shapes_format.unwrap_or(ShapesFormat::Turtle) {
+            ShapesFormat::Turtle => sparkles_shacl::ShapesSyntax::default(),
+            ShapesFormat::Shaclc => sparkles_shacl::ShapesSyntax::Compact,
+        };
+        let shapes = sparkles_shacl::Shapes::parse(&a.shapes, syntax, None)
+            .map_err(|e| ToolError::new("syntax", 400, format!("shapes: {e:#}")))?;
         let opts = sparkles_shacl::ValidateOptions {
             data_graph: t.inputs.data_graph.clone(),
             extra_graphs: t.inputs.extra_graphs.clone(),

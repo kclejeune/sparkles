@@ -67,6 +67,11 @@ pub mod sh {
         IGNORED_PROPERTIES = "ignoredProperties",
         HAS_VALUE = "hasValue",
         IN = "in",
+        // list constraints (SHACL 1.2 Core)
+        MEMBER_SHAPE = "memberShape",
+        MIN_LIST_LENGTH = "minListLength",
+        MAX_LIST_LENGTH = "maxListLength",
+        UNIQUE_MEMBERS = "uniqueMembers",
         // node kinds
         BLANK_NODE = "BlankNode",
         IRI = "IRI",
@@ -103,6 +108,7 @@ pub mod sh {
         SOURCE_CONSTRAINT_COMPONENT = "sourceConstraintComponent",
         RESULT_SEVERITY = "resultSeverity",
         RESULT_MESSAGE = "resultMessage",
+        DETAIL = "detail",
         // components
         CLASS_CC = "ClassConstraintComponent",
         DATATYPE_CC = "DatatypeConstraintComponent",
@@ -134,6 +140,10 @@ pub mod sh {
         HAS_VALUE_CC = "HasValueConstraintComponent",
         IN_CC = "InConstraintComponent",
         SPARQL_CC = "SPARQLConstraintComponent",
+        MEMBER_SHAPE_CC = "MemberShapeConstraintComponent",
+        MIN_LIST_LENGTH_CC = "MinListLengthConstraintComponent",
+        MAX_LIST_LENGTH_CC = "MaxListLengthConstraintComponent",
+        UNIQUE_MEMBERS_CC = "UniqueMembersConstraintComponent",
     }
 }
 
@@ -160,5 +170,6 @@ pub mod owl {
     use super::NamedNodeRef;
     terms! { "http://www.w3.org/2002/07/owl#";
         IMPORTS = "imports",
+        ONTOLOGY = "Ontology",
     }
 }
