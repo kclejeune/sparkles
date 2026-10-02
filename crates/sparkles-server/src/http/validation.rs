@@ -50,6 +50,7 @@ pub(super) fn write_options(
         report_limit,
         message: super::conditional::commit_message(headers)?,
         precondition: None,
+        no_wait: false,
     })
 }
 

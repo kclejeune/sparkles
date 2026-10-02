@@ -1825,7 +1825,11 @@ fn run() -> Result<()> {
             backup::start(&st, rt.handle());
             let grace = Duration::from_secs_f64(shutdown_grace);
             let st_after = st.clone();
-            let served = rt.block_on(async move {
+            // The server runs as a task on a worker thread, not on this thread (which
+            // `block_on` would use): the worker that sees a connection arrive accepts it
+            // and runs its request itself, instead of waking this thread to accept and
+            // then another worker to serve it.
+            let serve = async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
                     None => Some(
@@ -1896,9 +1900,7 @@ fn run() -> Result<()> {
                     if let Some(m) = &st2.mcp {
                         m.shutdown.cancel();
                     }
-                    tracing::info!(
-                        "shutting down: finishing requests in flight (up to {grace:?})"
-                    );
+                    tracing::info!("shutting down: finishing requests in flight (up to {grace:?})");
                     let _ = draining_tx.send(());
                 };
                 // the peer address feeds trusted-proxy checks
@@ -1930,6 +1932,11 @@ fn run() -> Result<()> {
                     );
                 }
                 anyhow::Ok(())
+            };
+            let served = rt.block_on(async move {
+                tokio::spawn(serve)
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("the server task failed: {e}")))
             });
             // cancels what still runs (dropping a request's future sets its cancel flag)
             // and waits a little for it to stop; a write stops before its commit or

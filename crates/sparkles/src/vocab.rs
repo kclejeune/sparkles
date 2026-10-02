@@ -387,7 +387,14 @@ impl AppendVocab {
 /// reader's snapshot remains valid while the writer appends.
 pub struct DeltaVocab {
     inner: RwLock<AppendVocab>,
-    file: Option<parking_lot::Mutex<BufWriter<File>>>,
+    file: Option<parking_lot::Mutex<DeltaFile>>,
+}
+
+/// The append handle of a delta vocabulary file.
+struct DeltaFile {
+    w: BufWriter<File>,
+    /// entries were appended since the last [`DeltaVocab::sync`]
+    unsynced: bool,
 }
 
 impl DeltaVocab {
@@ -446,7 +453,10 @@ impl DeltaVocab {
         let f = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(DeltaVocab {
             inner: RwLock::new(v),
-            file: Some(parking_lot::Mutex::new(BufWriter::new(f))),
+            file: Some(parking_lot::Mutex::new(DeltaFile {
+                w: BufWriter::new(f),
+                unsynced: false,
+            })),
         })
     }
 
@@ -471,17 +481,25 @@ impl DeltaVocab {
         let (id, new) = self.inner.write().insert(key);
         if new && let Some(f) = &self.file {
             let mut f = f.lock();
-            f.write_all(&(key.len() as u32).to_le_bytes())?;
-            f.write_all(key)?;
+            f.unsynced = true;
+            f.w.write_all(&(key.len() as u32).to_le_bytes())?;
+            f.w.write_all(key)?;
         }
         Ok(id)
     }
 
+    /// Make every inserted entry durable. Without new entries since the last sync this
+    /// does nothing: an `fdatasync` of a file with nothing to write still costs a device
+    /// cache flush on some file systems, and every commit calls this.
     pub fn sync(&self) -> Result<()> {
         if let Some(f) = &self.file {
             let mut f = f.lock();
-            f.flush()?;
-            f.get_ref().sync_data()?;
+            if !f.unsynced {
+                return Ok(());
+            }
+            f.w.flush()?;
+            f.w.get_ref().sync_data()?;
+            f.unsynced = false;
         }
         Ok(())
     }
@@ -493,8 +511,8 @@ impl DeltaVocab {
         match &self.file {
             Some(f) => {
                 let mut f = f.lock();
-                f.flush()?;
-                Ok(f.get_ref().metadata()?.len())
+                f.w.flush()?;
+                Ok(f.w.get_ref().metadata()?.len())
             }
             None => Ok(0),
         }
@@ -504,6 +522,28 @@ impl DeltaVocab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_sync_only_when_entries_were_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dvocab.bin");
+        let unsynced = |v: &DeltaVocab| v.file.as_ref().unwrap().lock().unsynced;
+        let v = DeltaVocab::open(&path).unwrap();
+        assert!(!unsynced(&v));
+        assert_eq!(v.insert(b"<http://x/a>").unwrap(), 0);
+        assert!(unsynced(&v));
+        v.sync().unwrap();
+        assert!(!unsynced(&v));
+        // a key it already has appends nothing
+        assert_eq!(v.insert(b"<http://x/a>").unwrap(), 0);
+        assert!(!unsynced(&v));
+        assert_eq!(v.insert(b"<http://x/b>").unwrap(), 1);
+        v.sync().unwrap();
+        drop(v);
+        let v = DeltaVocab::open(&path).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(1).unwrap(), b"<http://x/b>");
+    }
 
     #[test]
     fn get_sorted_matches_get() {

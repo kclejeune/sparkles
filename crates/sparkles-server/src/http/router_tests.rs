@@ -24,6 +24,7 @@ mod format;
 mod geo;
 #[cfg(feature = "geo")]
 mod geo_convert;
+mod inline;
 mod loads;
 #[cfg(feature = "mcp")]
 mod mcp;

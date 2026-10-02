@@ -90,6 +90,7 @@
 //! reason than cancellation or a timeout, leaves the EXISTS to per-row evaluation.
 
 use super::ctx::{Charge, Ctx};
+use super::exec::PAR_MIN_LEN;
 use super::expr::{ExistsSpec, Expr, Row, ebv};
 use super::plan::{ActiveGraph, Node, Planner, expr_vars};
 use super::table::{Table, VarId};
@@ -338,11 +339,13 @@ fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -
         && let Some(c) = key.col
         && !t.cols[c]
             .par_iter()
+            .with_min_len(PAR_MIN_LEN)
             .any(|id| id.is_undef() || id.tag() == Tag::Special)
     {
         ctx.check()?;
         let keep: Vec<bool> = t.cols[c]
             .par_iter()
+            .with_min_len(PAR_MIN_LEN)
             .map(|id| set.contains(id) != negated)
             .collect();
         drop(held);

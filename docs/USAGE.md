@@ -31,7 +31,8 @@ The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as thei
 allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
 by default. The `sparkles` library leaves the choice of allocator to its embedder. Once
 no request has been active for `--idle-release-ms` (default 1000 ms), `sparkles serve`
-hands free heap memory back to the OS. A build with
+hands free heap memory back to the OS. The interval counts from the end of the last
+request, so requests that keep arriving, even with short gaps, never meet a release. A build with
 `--no-default-features --features reasoning,shacl` uses the system allocator and
 `malloc_trim` instead.
 
@@ -153,6 +154,13 @@ outbound total is named `outbound-bytes`. A query can lower its own budgets with
 raise them ([API.md](API.md#budgets)). A query or write stops as soon as its client
 disconnects, and a write then commits nothing. `sparkles query --memory-mb N` applies the
 memory budget on the command line, where there is no limit by default.
+
+Short requests run on the thread that received them rather than on a separate pool, so
+they do not wait for other threads to wake up. These are queries whose previous run with
+the same text took under 10 ms, and updates of up to 64 KiB that only use `INSERT DATA`
+and `DELETE DATA`, on a dataset without write-time validation, when no other write holds
+the dataset. Such a request runs to its end even if its client disconnects, though its
+timeout still applies. Everything else runs on the pool and stops on a disconnect.
 
 ## Command-line tools
 
