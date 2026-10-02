@@ -143,6 +143,64 @@ export type DatasetQuota = {
   usedBytes: number;
 };
 
+/** The settings of a dataset's automatic compaction (`0` turns a size, idle or age trigger off). */
+export type CompactionPolicy = {
+  enabled: boolean;
+  minDeltaQuads: number;
+  deltaRatio: number;
+  maxDeltaQuads: number;
+  maxDeltaMb: number;
+  maxWalMb: number;
+  idleSeconds: number;
+  maxAgeSeconds: number;
+  minIntervalSeconds: number;
+};
+
+/** `GET /$/compaction/{ds}`: what automatic compaction sees of a dataset, and does. */
+export type CompactionStatus = {
+  dataset: string;
+  /** Effective: the server's switch, the dataset's own and a writable server. */
+  enabled: boolean;
+  /** False under `--no-auto-compact`. */
+  serverEnabled: boolean;
+  policy: CompactionPolicy;
+  /** The settings the dataset overrides (its `compaction.json`). */
+  own: Partial<CompactionPolicy>;
+  state: 'off' | 'idle' | 'due' | 'deferred' | 'running';
+  trigger?: string;
+  triggerKind?: 'max-delta' | 'ratio' | 'delta-bytes' | 'wal-bytes' | 'idle' | 'age';
+  /** Why a due compaction waits (`min-interval`, `backup`, `history`, `disk`, …). */
+  deferred?: string;
+  deferredDetail?: string;
+  task?: string;
+  measures: {
+    generation: string;
+    baseQuads: number;
+    deltaQuads: number;
+    deltaBytes: number;
+    walBytes: number;
+    idleSeconds: number | null;
+    oldestChangeSeconds: number | null;
+    /** The delta size at which the relative trigger fires. */
+    threshold: number;
+  };
+  last?: {
+    automatic: boolean;
+    trigger?: string;
+    startedAt: string;
+    finishedAt: string;
+    seconds: number;
+    outcome: 'done' | 'failed' | 'abandoned' | 'cancelled';
+    generation?: string;
+    lockMs?: number;
+    buildMs?: number;
+    caughtUpCommits?: number;
+    error?: string;
+  };
+  automaticRuns: number;
+  failures: number;
+};
+
 /** `GET /$/metrics?format=json`: the metrics registry as JSON. */
 export type MetricsSnapshot = {
   formatVersion: 1;
@@ -206,6 +264,8 @@ export type DatasetStats = {
   reasoning?: ReasoningStatus | null;
   /** Spatial index status (null: disabled); absent on servers that predate it. */
   geo?: GeoStatus | null;
+  /** Automatic compaction; absent on servers that predate it. */
+  compaction?: CompactionStatus;
   /** The commit the statistics describe; absent on servers that predate it. */
   commit?: number;
   /** The selector of a past state (`commit:42`), or null at the head. */
@@ -584,6 +644,17 @@ export const datasetStats = (ds: string, at?: string) =>
   json<DatasetStats>(`/$/stats/${enc(ds)}${at ? `?at=${enc(at)}` : ''}`);
 
 export const compact = (ds: string) => json<Task>(`/$/compact/${enc(ds)}`, { method: 'POST' });
+
+/** `GET /$/compaction/{ds}`. */
+export const compactionStatus = (ds: string) => json<CompactionStatus>(`/$/compaction/${enc(ds)}`);
+
+/** Replace the dataset's own compaction settings (`PUT /$/compaction/{ds}`). */
+export const setCompaction = (ds: string, own: Partial<CompactionPolicy>) =>
+  json<CompactionStatus>(`/$/compaction/${enc(ds)}`, { ...jsonBody(own), method: 'PUT' });
+
+/** Remove the dataset's own compaction settings (`DELETE /$/compaction/{ds}`). */
+export const clearCompaction = (ds: string) =>
+  json<CompactionStatus>(`/$/compaction/${enc(ds)}`, { method: 'DELETE' });
 
 export const backup = (ds: string) => json<Task>(`/$/backup/${enc(ds)}`, { method: 'POST' });
 

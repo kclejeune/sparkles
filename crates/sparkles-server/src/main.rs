@@ -10,6 +10,8 @@ mod auth;
 mod backup;
 mod check_cmd;
 mod clone;
+mod compaction;
+mod compaction_cmd;
 mod compress;
 mod exposure;
 #[cfg(feature = "fmt")]
@@ -795,6 +797,8 @@ enum Cmd {
         /// tasks have their own --backup-max-tasks
         #[arg(long, default_value_t = state::DEFAULT_MAX_TASKS)]
         max_tasks: usize,
+        #[command(flatten)]
+        auto_compact: compaction::AutoCompactArgs,
         /// Limit a request class per client: CLASS[@DATASET]=RATE[,burst=N]
         /// [,concurrency=N][,client-concurrency=N][,failure-cost=N] or CLASS=off; classes
         /// auth, query, update, admin (e.g. query=100/s,burst=200)
@@ -1073,6 +1077,9 @@ enum Cmd {
     /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
     /// back to the default (--default)
     Quota(quota_cmd::QuotaArgs),
+    /// Show or change a dataset's automatic compaction settings, on a local database or
+    /// on a server
+    Compaction(compaction_cmd::CompactionArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -1082,6 +1089,10 @@ enum Cmd {
     Compact {
         #[arg(long)]
         loc: PathBuf,
+        /// Compact only when the dataset's compaction policy (its compaction.json and
+        /// the defaults) says a compaction is due
+        #[arg(long)]
+        if_due: bool,
     },
     /// Back up to a backup repository (create, list, show, delete, restore, verify,
     /// policy); without a subcommand, write a compressed N-Quads dump of --loc to --out
@@ -1718,6 +1729,7 @@ fn run() -> Result<()> {
             max_upload_mb,
             min_free_disk_mb,
             max_tasks,
+            auto_compact,
             max_mem_dataset_mb,
             max_dataset_mb,
             shutdown_grace,
@@ -1816,6 +1828,7 @@ fn run() -> Result<()> {
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
+            st.compaction = auto_compact.state()?;
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
                 query_memory_bytes: mib(query_memory_mb),
@@ -1922,6 +1935,9 @@ fn run() -> Result<()> {
             } else {
                 // the loop also serves datasets that enable automatic runs themselves
                 reasoning::spawn_auto_reason(st.clone());
+            }
+            if !st.read_only {
+                compaction::spawn(st.clone());
             }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -2412,8 +2428,24 @@ fn run() -> Result<()> {
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
-        Cmd::Compact { loc } => {
+        Cmd::Compaction(args) => compaction_cmd::run(args, opts),
+        Cmd::Compact { loc, if_due } => {
             let store = Store::open(&loc, opts)?;
+            if if_due {
+                let policy =
+                    sparkles::store::CompactionPolicy::default().with(&store.compaction_settings());
+                match policy.verdict(&store.compaction_measures()) {
+                    Some(t) if policy.enabled => eprintln!("due: {}", t.detail),
+                    Some(_) => {
+                        eprintln!("not compacted: automatic compaction is off for this dataset");
+                        return Ok(());
+                    }
+                    None => {
+                        eprintln!("not compacted: the compaction policy says nothing is due");
+                        return Ok(());
+                    }
+                }
+            }
             let t = Instant::now();
             store.compact()?;
             eprintln!(

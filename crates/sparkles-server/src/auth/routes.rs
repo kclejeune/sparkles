@@ -73,6 +73,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/compaction/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
     ("/$/format", &["POST"]),
     // MCP (`serve --mcp`): every message is checked against the caller's datasets
@@ -214,6 +215,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/history/{ds}"
         | "/$/validation/{ds}"
         | "/$/quota/{ds}"
+        | "/$/compaction/{ds}"
         | "/{ds}/prefixes"
             if get =>
         {
@@ -233,6 +235,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/vector/{ds}/{name}/rebuild"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
+        | "/$/compaction/{ds}"
         | "/$/backup/{ds}"
         | "/$/cache/clear/{ds}"
         | "/$/snapshots/{ds}"
@@ -344,7 +347,8 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/$/backups/{ds}"
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/history/{ds}"
-        | "/$/quota/{ds}" => get,
+        | "/$/quota/{ds}"
+        | "/$/compaction/{ds}" => get,
         "/{ds}/prefixes" => !get,
         _ => false,
     }

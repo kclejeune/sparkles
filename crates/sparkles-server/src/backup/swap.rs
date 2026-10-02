@@ -119,6 +119,8 @@ pub(crate) fn replace_with(
         r.insert(name.to_string(), task.to_string());
     }
     let _restoring = Restoring { st, name };
+    // a running compaction holds the dataset: stop it rather than wait for it
+    crate::compaction::cancel(st, name);
     // requests that passed the restoring check hold the dataset until they answer
     // (the router's restoring layer): wait for them while it is still registered, so
     // none looks it up after it left the map

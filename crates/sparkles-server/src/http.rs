@@ -158,6 +158,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         );
     // the spatial index (`/$/geo`)
     let app = app.merge(crate::geo::routes());
+    // automatic compaction (`/$/compaction`)
+    let app = app.merge(crate::compaction::routes());
     // vector indexes (`/$/vector`)
     let app = app.merge(crate::vector::routes());
     // backup repositories, per-dataset backups and backup policies
@@ -2935,6 +2937,7 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
             "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
             "reasoning": reasoning,
             "geo": crate::geo::status_json(&ds),
+            "compaction": crate::compaction::status_json(&st, &ds),
             "cache": {
                 "entries": cache.entries(),
                 "bytes": cache.bytes(),
@@ -3050,14 +3053,7 @@ async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
     }
     let ds = dataset(&st, &name)?;
     task_start_check(&st, Some("compact"), &name)?;
-    let task = st.start_task("compact", &name, move |h| {
-        h.progress(0.1, "rebuilding index");
-        ds.store.compact()?;
-        Ok(format!(
-            "compacted to {}",
-            ds.store.snapshot().generation.name
-        ))
-    });
+    let task = crate::compaction::start_compaction(&st, ds, None);
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 

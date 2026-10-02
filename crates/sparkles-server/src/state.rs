@@ -282,6 +282,9 @@ pub struct AppState {
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
     /// triples (`serve --reason-cache-triples`)
     pub reason_cache_triples: usize,
+    /// automatic compaction (`serve --auto-compact-*`) and what is known of each
+    /// dataset's compactions
+    pub compaction: crate::compaction::AutoCompact,
     /// dataset names being created by a task (clone), with the task id
     reserved: Mutex<BTreeMap<String, String>>,
     /// datasets being replaced in place (an in-place restore), with the task id: every
@@ -550,6 +553,7 @@ impl AppState {
             http_compression: Default::default(),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            compaction: Default::default(),
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -611,6 +615,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            compaction: Default::default(),
             reserved: Mutex::new(BTreeMap::new()),
             restoring: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "backup")]
@@ -1121,6 +1126,12 @@ impl TaskQueue {
             0 => usize::MAX,
             n => n,
         }
+    }
+
+    /// Whether a task started now would run at once rather than wait.
+    pub fn has_free_slot(&self) -> bool {
+        let q = self.inner.lock();
+        q.queued.is_empty() && q.running < self.max()
     }
 
     /// Tasks running now and waiting.
