@@ -35,6 +35,7 @@ mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
 mod validation_common;
+mod vector;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -621,6 +622,9 @@ enum Cmd {
         #[arg(long)]
         disable: bool,
     },
+    /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
+    /// with --loc, or with --server)
+    Vector(vector::VectorArgs),
     /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
     GeoIndex {
         #[arg(long)]
@@ -1813,6 +1817,7 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
+        Cmd::Vector(a) => vector::cli(a, opts),
         Cmd::GeoIndex {
             loc,
             predicate,

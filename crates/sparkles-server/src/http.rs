@@ -110,7 +110,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}/explain", get(explain).post(explain))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
-        .route("/$/vector/{ds}", get(vector_status))
         .route("/{ds}/prefixes", any(dataset_prefixes))
         .route(
             "/$/snapshots/{ds}",
@@ -132,6 +131,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         );
     // the spatial index (`/$/geo`)
     let app = app.merge(crate::geo::routes());
+    // vector indexes (`/$/vector`)
+    let app = app.merge(crate::vector::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
@@ -990,38 +991,6 @@ fn params_wants_sparkles(h: &HeaderMap) -> bool {
     h.get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("application/x-sparkles+json"))
-}
-
-// ------------------------------------------------------------------- vectors ------
-
-/// `GET /$/vector/{ds}`: the vector memory budget and the predicates whose vectors are
-/// packed in the current generation (packing happens on a predicate's first search).
-async fn vector_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
-    let ds = dataset(&st, &name)?;
-    let snap = ds.store.snapshot();
-    let vectors = &snap.generation.vectors;
-    let predicates: Vec<J> = vectors
-        .status()
-        .into_iter()
-        .map(|p| {
-            let iri = match snap.term(Id(p.predicate)) {
-                Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
-                other => other.map(|t| t.to_string()).unwrap_or_default(),
-            };
-            json!({
-                "predicate": iri,
-                "bytes": p.bytes,
-                "malformed": p.malformed,
-                "dimensions": p.dims.iter().map(|(dim, rows)| json!({ "dimension": dim, "vectors": rows })).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({
-        "budgetBytes": sparkles::vector::budget(),
-        "usedBytes": vectors.used_bytes(),
-        "generation": snap.generation.name,
-        "predicates": predicates,
-    })))
 }
 
 // ---------------------------------------------------------------- full-text ------

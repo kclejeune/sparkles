@@ -64,6 +64,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     ("/$/vector/{ds}", &["GET"]),
+    ("/$/vector/{ds}/{name}", &["GET", "PUT", "DELETE"]),
+    ("/$/vector/{ds}/{name}/rebuild", &["POST"]),
+    ("/$/vector/{ds}/{name}/recall", &["POST"]),
     ("/$/snapshots/{ds}", &["GET", "POST"]),
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
@@ -182,6 +185,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/commits/{ds}"
         | "/$/commits/{ds}/{reference}"
         | "/$/vector/{ds}"
+        | "/$/vector/{ds}/{name}/recall"
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
@@ -192,6 +196,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/reason/{ds}"
         | "/$/text/{ds}"
         | "/$/geo/{ds}"
+        | "/$/vector/{ds}/{name}"
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
@@ -208,6 +213,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
         | "/$/geo/{ds}/rebuild"
+        | "/$/vector/{ds}/{name}"
+        | "/$/vector/{ds}/{name}/rebuild"
         | "/$/datasets/{ds}/clone"
         | "/$/compact/{ds}"
         | "/$/backup/{ds}"

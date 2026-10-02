@@ -996,6 +996,130 @@ async fn vector_status_lists_packed_predicates() {
     );
 }
 
+#[tokio::test]
+async fn vector_index_endpoints() {
+    let s = server();
+    let ds = s.state.get("ds").unwrap();
+    let mut nt = String::new();
+    for i in 0..300 {
+        let x = i as f32 / 10.0;
+        nt += &format!(
+            "<urn:v{i}> <urn:emb> \"[{}, {}, 1]\"^^<urn:x-sparkles:vector> .\n",
+            x.sin(),
+            x.cos()
+        );
+    }
+    nt += "<urn:w> <urn:emb> \"[1, 2]\"^^<urn:x-sparkles:vector> .\n";
+    nt += "<urn:x> <urn:emb> \"[oops]\"^^<urn:x-sparkles:vector> .\n";
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    ds.store.compact().unwrap();
+    let get = |p: &str| Request::get(p.to_string()).body(Body::empty()).unwrap();
+    let put = |name: &str, body: &str| {
+        Request::put(format!("/$/vector/ds/{name}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let post = |p: &str| Request::post(p.to_string()).body(Body::empty()).unwrap();
+    let r = send(&s.app, put("e", r#"{"predicate":"urn:emb","dimension":0}"#)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("dimension"));
+    let r = send(
+        &s.app,
+        put(
+            "e",
+            r#"{"predicate":"urn:emb","dimension":3,"hnsw":{"m":8},"exactThreshold":0}"#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["index"]["name"], "e");
+    let task = j["task"]["id"].as_str().unwrap().to_string();
+    for _ in 0..500 {
+        let t = send(&s.app, get(&format!("/$/tasks/{task}"))).await.json();
+        if t["state"] != "running" {
+            assert_eq!(t["state"], "done", "{t}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let st = send(&s.app, get("/$/vector/ds/e")).await.json();
+    assert_eq!(st["state"], "ready", "{st}");
+    assert_eq!(st["rows"], 300);
+    assert_eq!(st["skipped"]["wrongDimension"], 1);
+    assert_eq!(st["skipped"]["malformed"], 1);
+    assert_eq!(st["hnsw"]["m"], 8);
+    let all = send(&s.app, get("/$/vector/ds")).await.json();
+    assert_eq!(all["indexes"][0]["name"], "e");
+    // one index per predicate
+    let r = send(&s.app, put("f", r#"{"predicate":"urn:emb","dimension":3}"#)).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    // a new efSearch replaces the configuration
+    let r = send(
+        &s.app,
+        put(
+            "e",
+            r#"{"predicate":"urn:emb","dimension":3,"hnsw":{"m":8,"efSearch":100},"exactThreshold":0}"#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rc = send(&s.app, post("/$/vector/ds/e/recall?samples=50&k=5")).await;
+    assert_eq!(rc.status, StatusCode::OK, "{}", rc.text());
+    assert!(
+        rc.json()["recall"].as_f64().unwrap() >= 0.9,
+        "{}",
+        rc.text()
+    );
+    // searches use the graph
+    let q = "SELECT ?s { ?s <urn:x-sparkles:vectorSearch> (<urn:emb> <urn:v7> 3) }";
+    let enc = |q: &str| {
+        percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    let r = send(
+        &s.app,
+        Request::get(format!("/ds/sparql?query={}", enc(q)))
+            .header(header::ACCEPT, "application/x-sparkles+json")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("\"method\":\"hnsw\""), "{}", r.text());
+    let bad = "SELECT ?s { ?s <urn:x-sparkles:vectorSearch> (<urn:emb> \"[1,0]\"^^<urn:x-sparkles:vector>) }";
+    let r = send(&s.app, get(&format!("/ds/sparql?query={}", enc(bad)))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(
+        send(&s.app, post("/$/vector/ds/e/rebuild")).await.status,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        send(&s.app, get("/$/vector/ds/nope")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let del = |n: &str| {
+        Request::delete(format!("/$/vector/ds/{n}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        send(&s.app, del("nope")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(send(&s.app, del("e")).await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        send(&s.app, get("/$/vector/ds/e")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
 async fn get_uri(app: &Router, uri: &str) -> Resp {
     send(app, Request::get(uri).body(Body::empty()).unwrap()).await
 }
