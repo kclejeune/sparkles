@@ -199,6 +199,9 @@
             </td>
             <td>
               <span class="mono">{x.dataset.name}</span>
+              {#if b.fromMemory(x)}<span class="badge" title="A backup of an in-memory dataset"
+                  >in-memory</span
+                >{/if}
               {#if lin}<span class="badge warn" title={lin.title}>{lin.label}</span>{/if}
             </td>
             <td class="small" title={fmtTime(x.commit.timestamp)}>{fmtCommitAge(x.commit, now)}</td>
