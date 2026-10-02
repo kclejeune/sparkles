@@ -73,6 +73,35 @@ only from the UI itself, with its inline start-up scripts allowed by hash. Their
 WebAssembly module. That permits WebAssembly compilation only, not JavaScript's `eval`.
 API responses have `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
 
+### TLS
+
+Most deployments terminate TLS at a reverse proxy, such as the nginx virtual host of the
+NixOS module, and keep the server on loopback or a Unix socket. When nothing sits in
+front of it, the server can serve HTTPS itself:
+
+```sh
+sparkles serve --host 0.0.0.0 --port 443 --auth-config /etc/sparkles/auth.toml \
+  --tls-cert /etc/sparkles/fullchain.pem --tls-key /etc/sparkles/key.pem --loc wiki=db/wiki
+```
+
+`--tls-cert` is a PEM file with the server's certificate first and its intermediates
+after it. `--tls-key` is its PEM private key (PKCS#8, PKCS#1 or SEC1). The server checks
+that the key fits the certificate before it binds. It speaks TLS 1.2 and 1.3 through
+rustls, and clients choose HTTP/2 or HTTP/1.1 through ALPN. Plain HTTP on the same port
+gets no answer.
+
+The server reads both files again on SIGHUP and when either file changes, which it
+checks once a minute. A certificate renewed by an ACME client is therefore picked up
+without a restart. A pair that does not load, such as a new certificate next to the old
+key, is logged as an error, and the server keeps the pair it has. Connections that are
+open keep their certificate. Handshakes run beside the accept loop, at most 1024 at once
+and each for at most 10 seconds, so slow clients cannot hold up others.
+
+Over TLS, the server sets `X-Forwarded-Proto: https` on requests that do not carry the
+header, so session cookies get `Secure` and the `__Host-` prefix, and origin checks see
+`https`. The `--metrics-addr` listener and `--unix-socket` stay plain HTTP, and
+`--tls-cert` cannot be combined with `--unix-socket`.
+
 ### Endpoints and operations
 
 A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/data`
@@ -188,6 +217,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--host ADDR` | `127.0.0.1` | Listen address. A non-loopback address needs `--auth-config` or `--allow-open-network`. |
 | `--allow-open-network` | off | Serve without `--auth-config` on a non-loopback address, and log a warning. Also `SPARKLES_ALLOW_OPEN_NETWORK=1`. |
 | `--public-host NAME` | | A host name that clients use to reach the server, such as a reverse proxy's. Repeatable. Without `--auth-config`, names other than IP addresses, `localhost` and `--host` are refused with `421`. With `--auth-config`, the same applies to requests that carry trusted proxy headers from loopback or the Unix socket. |
+| `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
@@ -1345,6 +1375,13 @@ store (agenix, sops-nix), owned by the `sparkles` user. Do not also set nginx
 `basicAuthFile`. nginx would forward its own `Authorization` header, which Sparkles
 would then reject. `unixSocket` makes the server listen on a Unix socket that nginx
 proxies to, so trusted proxy headers can be limited to it (`proxy.trusted = ["unix"]`).
+
+`tls.certFile` and `tls.keyFile` pass `--tls-cert` and `--tls-key` for a server that
+serves HTTPS itself. `systemctl reload sparkles` re-reads them, and the server also
+notices when they change. The service user must be able to read both files. For a
+certificate from `security.acme`, add the user to the certificate's group, for example
+`users.users.sparkles.extraGroups = [ "acme" ]`. With `nginx.enable` as well, nginx
+connects to the server over https. The key file must lie outside the Nix store.
 
 For backup repositories, `backup.configFile` passes `--backup-config`. Like
 `auth.configFile`, it stays out of the Nix store, and `systemctl reload sparkles`
