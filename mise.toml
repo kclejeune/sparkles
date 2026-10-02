@@ -212,8 +212,8 @@ run = "scripts/py-test.sh"
 [tasks."py:lint"]
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"
 run = [
-  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --locked -- -D warnings",
-  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --locked --no-default-features -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets -- -D warnings",
+  "cargo clippy --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks."py:lock"]

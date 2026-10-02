@@ -125,9 +125,12 @@ minute or two.
 `crates/sparkles-py` builds the `sparkles` Python package
 ([USAGE](USAGE.md#python), [spec P01](specs/P01-python-bindings.md)). The crate is its
 own cargo workspace, excluded from the root one, so `cargo build`, `mise run lint` and
-`mise run test` neither compile PyO3 nor need Python. It has its own `Cargo.lock`, which
-`mise run py:lock` refreshes from the root lock after the workspace's dependencies
-change. The flake's check fails while the two disagree on what the crate needs.
+`mise run test` neither compile PyO3 nor need Python. It has its own `Cargo.lock`. When
+the library crates gain a dependency, `py:test`, `py:lint` and `mise run licenses` add it
+to that lock, as cargo does with the root lock, and the changed file is committed with
+the rest. `mise run py:lock` refreshes the lock from the root one, so that both resolve
+the same versions. `py:build`, `licenses:check` and the flake's check use the lock as it
+is and fail while it lacks something the crate needs.
 
 `mise run py:test` (`scripts/py-test.sh`) builds the extension with cargo in the root
 `target` directory, so it reuses the workspace's compiled dependencies. It assembles the

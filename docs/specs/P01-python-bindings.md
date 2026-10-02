@@ -640,6 +640,10 @@ passed to a term constructor raises `ValueError`, and a wrong argument type rais
   seconds, and the 56 tests take 7 to 12 seconds on an idle machine. The tests are
   deterministic. The one timing-sensitive assertion, that another thread runs during a
   query, applies only when the query takes over 50 ms.
+* `py:test`, `py:lint` and `mise run licenses` let cargo add a new dependency of the
+  library crates to the crate's lock, as cargo does with the root lock. A dependency
+  added elsewhere then needs only `mise run licenses`, which it needs for the root lock
+  anyway. `py:build`, `licenses:check` and the flake check use the lock as committed.
 * `Literal` from a `float` uses Python's `repr`, such as `"1.5"^^xsd:double`, with `INF`,
   `-INF` and `NaN` for the special values. §4.2 asked for the canonical form `1.0E0`.
   Both are valid lexical forms of `xsd:double`, and the value round-trips.

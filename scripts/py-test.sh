@@ -20,7 +20,7 @@ dir=debug
 
 # maturin sets this for its builds; with it, PyO3 links like an extension module
 PYO3_BUILD_EXTENSION_MODULE=1 cargo build --manifest-path "$crate/Cargo.toml" \
-  --target-dir target --profile "$profile" --locked
+  --target-dir target --profile "$profile"
 
 lib="target/$dir/lib_sparkles.so"
 [ -e "$lib" ] || lib="target/$dir/lib_sparkles.dylib"

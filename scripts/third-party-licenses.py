@@ -90,14 +90,16 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."""
 
 
-def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml")):
+def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml"), locked=True):
+    """`cargo metadata` for a platform. Without `locked`, cargo may add what the
+    manifest needs to its lock file first."""
     out = subprocess.run(
         [
             "cargo",
             "metadata",
             "--format-version",
             "1",
-            "--locked",
+            *(["--locked"] if locked else []),
             "--filter-platform",
             target,
             "--manifest-path",
@@ -283,7 +285,9 @@ def main():
         crate = os.path.join(ROOT, "crates", "sparkles-py")
         pkgs = {}
         for t in ROOTS[0][1]:
-            for p in linked(metadata(t, os.path.join(crate, "Cargo.toml")), "sparkles-py"):
+            # `mise run licenses` brings the lock up to date, as the py:* tasks do
+            meta = metadata(t, os.path.join(crate, "Cargo.toml"), locked=check)
+            for p in linked(meta, "sparkles-py"):
                 pkgs[p["id"]] = p
         text = render(pkgs.values(), WHEEL_INTRO, "crates/sparkles-py/Cargo.lock")
         write_or_check(os.path.join(crate, "THIRD_PARTY_LICENSES.md"), text, len(pkgs), check)
