@@ -17,6 +17,8 @@ sparkles-shex = { workspace = true, optional = true }
 oxrdf.workspace = true
 oxrdfio.workspace = true
 spargebra.workspace = true
+# `rset`, and the result tables of `rsparql`
+sparesults.workspace = true
 oxiri.workspace = true
 oxilangtag.workspace = true
 serde.workspace = true
