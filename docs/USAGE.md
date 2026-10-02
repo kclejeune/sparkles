@@ -236,6 +236,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
 | `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
+| `--max-clones N` | `2` | Clones that may run at once, within `--max-tasks`. More clones wait as `queued`, and other tasks still start in free slots. `0` leaves only the limit of `--max-tasks`. |
 | `--no-auto-compact` | | Never compact automatically. `POST /$/compact/{ds}` and `sparkles compact` still work. See [Automatic compaction](#automatic-compaction) for the `--auto-compact-*` flags. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
@@ -313,6 +314,7 @@ sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
 sparkles clone   --loc db --to sandbox        # independent copy (same blank nodes, new dataset id)
+sparkles clone   --loc db --to part --graph default --graph 'http://ex.org/g/*'   # some graphs only
 sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles diff    --loc db 41 42               # what commit 42 changed, as + and - N-Quads lines

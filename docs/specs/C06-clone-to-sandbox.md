@@ -2,10 +2,13 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Phase 1 shipped. It covers `sparkles clone`, `POST /$/datasets/{ds}/clone`
-> as a task, name reservation, cleanup, copying or dropping inferences, and the UI's
-> Clone action. From Phase 2, task cancellation shipped, and a free-space guard covers
-> clones. The rest of Phases 2 and 3 is not built.
+> **Phases:** Phases 1 and 2 shipped. Phase 1 covers `sparkles clone`,
+> `POST /$/datasets/{ds}/clone` as a task, name reservation, cleanup, copying or dropping
+> inferences, and the UI's Clone action. Phase 2 added task cancellation, a free-space
+> guard, the fast path that shares the source's index files, in-memory destinations, a
+> limit on concurrent clones and partial clones by graph. From Phase 3, cloning at a past
+> commit shipped with point-in-time reads. Cloning across servers and branching are not
+> built.
 >
 > **User docs:** [API: Clone](../API.md#clone) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -567,15 +570,89 @@ with `forkedFrom: null`.
   and leaves nothing behind. This serves the purpose of the planned disk-space
   preflight.
 
+**Phase 2.** The rest of Phase 2 landed on 2026-10-02.
+
+- **The file path.** A clone shares the source generation's index files instead of
+  rebuilding them when three things hold. The captured snapshot is the generation's base,
+  so the delta is empty and the source has had no change since its last compaction or
+  bulk load. The clone is of the head. Every graph that has quads is kept, so
+  `inferences=drop` on a source without inferences still qualifies. Any other clone is
+  rebuilt as Phase 1 did, and the report names the reason.
+- **How files are shared.** `mode=auto` (the default) clones each file with the `FICLONE`
+  ioctl, which btrfs, XFS and ZFS with block cloning support, and copies it otherwise.
+  The copy uses `copy_file_range` on Linux, which some file systems turn into block
+  clones on their own. `mode=link` makes hard links first and falls back the same way
+  when the source is on another file system. `mode=rebuild` always rebuilds. The spec
+  had planned a `--link` flag. A `mode` parameter replaced it, so that the HTTP endpoint
+  has the same choice. The report, the task's `detail` and `origin.json` say which
+  method was used.
+- **Which files.** The clone shares the immutable files of the generation directory:
+  the permutation indexes, the vocabulary and `stats.json`. It writes its own
+  `commit.json`, an empty `wal.log` and its own `meta.json`, which is the source's with
+  the captured prefixes and blank-node counter. The counter can be ahead of the base's
+  when blank nodes were made and deleted again since the base was built, and the clone
+  never hands those ids out again. Subdirectories hold derived indexes (spatial,
+  vector), which the clone rebuilds when it opens, as before.
+- **Independence.** Index files are never written once their generation is published,
+  and every rewrite of a small file goes through a rename. A reflinked or copied file is
+  therefore independent of the source, and a hard-linked one is never written through
+  either name. Tests write to and compact both sides of a linked clone, then delete the
+  source's directory, and the clone still checks clean.
+- **Compaction during a clone.** The capture takes a lease on the source generation
+  under the writer lock, the same lease a backup takes. A compaction (C13) or bulk commit
+  that switches the source's generation while the files are copied keeps the old
+  directory until the lease is dropped, and then collects it. The history status shows
+  the lease as `clone:<name>`. Tests run a bulk load and a compaction at that point.
+- **Crash safety.** The copy is built in the same temporary directory as a rebuilt one,
+  and `CURRENT` is written last, so a half-made clone is never a database. The server
+  removes `databases/.clone-*` at startup as before. `sparkles clone` now removes the
+  `DST.clone-tmp-PID` directories of runs whose process is gone.
+- **History.** A clone carries no history. It is a new lineage, and the source's commit
+  records belong to the source's dataset id. Named snapshots, retention settings, older
+  generations retained by F06 and the commit catalog stay with the source. A clone that
+  should start from a past state uses `at=`, which always rebuilds.
+- **In-memory destinations.** `type=mem` (and `Store::clone_to_memory`) makes the clone
+  a new in-memory dataset. Its base is a generation in a temporary directory, as an
+  in-memory dataset's is after a bulk load, so the file path applies to it too. Like
+  every in-memory dataset it is registered again after a restart, empty. Its origin is
+  kept in memory, and the full-text, spatial and vector indexes are configured and
+  built as on the source. Write-time validation and stored queries live in files and do
+  not carry over. In-memory datasets could already be cloned into persistent ones.
+- **Partial clones.** `graph=` (repeatable, or a JSON `graphs` array) and
+  `sparkles clone --graph` copy only the graphs named. Names and patterns follow graph
+  grants, through the access module's `GraphRule`. Patterns never match the inferred
+  graph, and graphs named by blank nodes are never selected. The rebuild reads only the
+  selected graphs from the GSPO index, so a small graph of a large dataset copies
+  quickly. A partial clone keeps the reasoning status only when it names the inferred
+  graph, and then marks it stale, because the inferences may come from graphs it left
+  out.
+- **Concurrency.** `serve --max-clones` (default 2) limits the clones that run at once.
+  Clones were already counted in the `--max-tasks` slots. A clone over its limit waits
+  as `queued`, and a freed slot goes to the first waiting task that may run, so waiting
+  clones never hold back other tasks.
+
+**Measurements.** These are clone times with the release build through `sparkles clone`,
+on datasets loaded from the benchmark data (`scripts/gen-data.py`) with `sparkles load`.
+Each figure is the median of three runs, with the range in parentheses. The machine was
+heavily loaded by other work, with a load average between 45 and 70 on 16 cores, so the
+rebuild times vary by more than a factor of two. The file system was ext4, which has no
+reflinks, so `auto` copied the files. The rebuild is the Phase 1 path, unchanged, and is
+the time before this work.
+
+| Dataset | On disk | Rebuild | Copy (`auto`) | Hard links (`link`) |
+|---|---|---|---|---|
+| 1.05M triples | 28 MB | 3.69 s (2.89–3.82) | 0.34 s (0.32–0.40) | 0.04 s (0.04–0.13) |
+| 10.5M triples | 286 MB | 38.5 s (16.7–43.9) | 1.22 s (0.50–6.87) | 0.08 s (0.07–0.09) |
+
+The rebuild's peak RSS was 1.44 GB at 10.5M triples, because of its sort buffers. The
+copy's and the link's were 35 MB.
+
 **Open questions.** The defaults stayed as specified. `inferences=copy` is the default,
-orphaned directories are reported with `409` rather than adopted, concurrent clones are
-not limited, and `POST /$/datasets` has no `cloneFrom` alias.
+orphaned directories are reported with `409` rather than adopted, and `POST /$/datasets`
+has no `cloneFrom` alias. Question 3 is answered by `--max-clones`, which defaults to 2.
 
 **Not built.**
-- The file-copy and reflink fast path.
-- In-memory destinations. `type=mem` is refused with `400`.
-- A limit on concurrent clones.
-- Partial clones by graph. The library can exclude graphs, and `inferences=drop` uses
-  that, but no flag exposes it.
-- All of Phase 3: cloning at a past commit, cross-server clones, and branching and
-  merging.
+- Cloning across servers through archives.
+- Branching and merging.
+- The UI's Clone dialog has no choice of type, graphs or mode. It makes a persistent
+  clone of every graph, which takes the file path when it can.
