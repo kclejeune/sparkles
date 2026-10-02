@@ -272,6 +272,26 @@ SKIP_LOAD="${usage_skip_load:+1}" SKIP_QUERIES="${usage_skip_queries:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" scripts/bench.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:watdiv"]
+description = "WatDiv basic testing (20 templates: linear, star, snowflake, complex): the five engines of bench, answers checked first"
+depends = ["build"]
+usage = '''
+arg "[scale]" default="100" help="WatDiv scale factor (1 is about 112k triples, 100 about 11.0M)"
+arg "[workdir]" default="target/bench-watdiv" help="generator, data, queries, indexes and results/ (summary.md)"
+flag "--runs <n>" default="10" help="measured runs per query instance"
+flag "--warmup <n>" default="2" help="warm-up runs per query instance"
+flag "--instances <n>" default="5" help="query instances per template (fixed seed)"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--answers-only" help="only re-check answers across engines and rebuild the summary"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to (re-)measure; others' results are kept"
+flag "--queries <list>" help="only these templates or instances (L1 S3-2 …)"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" INSTANCES="$usage_instances" ENGINES="$usage_engines" \
+QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
+scripts/bench-watdiv.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
+'''
+
 [tasks."bench:billion"]
 description = "Real-data benchmark on English DBpedia 2022.12 at a chosen scale, up to 1.24B triples: Sparkles vs QLever (also Jena, Oxigraph); downloads and indexes are cached"
 depends = ["build"]
