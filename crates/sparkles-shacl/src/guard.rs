@@ -338,6 +338,12 @@ impl ShaclGuard {
         &self.cfg
     }
 
+    /// The shapes every write is validated against now. They are read again when a
+    /// write changes a shapes graph.
+    pub fn shapes(&self) -> Arc<Shapes> {
+        self.loaded.read().shapes.clone()
+    }
+
     /// The limits past which a write is validated in full.
     pub fn tuning(&self) -> Tuning {
         *self.tuning.read()
@@ -802,7 +808,9 @@ fn engine_error(e: anyhow::Error) -> sparkles::Error {
     }
 }
 
-fn severity_of(iri: &str) -> Severity {
+/// The rank of a `sh:severity` IRI. An IRI outside SHACL's severities ranks as a
+/// violation, so that it fails closed.
+pub fn severity_of(iri: &str) -> Severity {
     match iri {
         "http://www.w3.org/ns/shacl#Warning" => Severity::Warning,
         "http://www.w3.org/ns/shacl#Info" => Severity::Info,
@@ -1179,6 +1187,26 @@ fn load_shapes(
         (None, Some((text, format))) => Ok((Shapes::parse(&text, format, None)?, None)),
         (None, None) => bail!("no shapes given"),
     }
+}
+
+/// The SHACL shapes of the write-time validation configured for a persistent store, read
+/// without installing a guard: its shapes graphs in the store's current state and its
+/// shapes file. `None` when the store has no SHACL configuration or validation is off.
+pub fn configured_shapes(store: &Store) -> Result<Option<(ValidationConfig, Shapes)>> {
+    let Some(root) = store.root() else {
+        return Ok(None);
+    };
+    if sparkles::guard::config::config_language(root)? != Some(GuardLanguage::Shacl) {
+        return Ok(None);
+    }
+    let Some(cfg) = read_config(root)? else {
+        return Ok(None);
+    };
+    if cfg.mode == GuardMode::Off {
+        return Ok(None);
+    }
+    let (shapes, _) = load_shapes(&cfg, Some(root), &store.snapshot())?;
+    Ok(Some((cfg, shapes)))
 }
 
 /// Install the guard of a persistent store from its `validation.json` (after

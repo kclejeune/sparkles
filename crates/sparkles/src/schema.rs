@@ -11,6 +11,14 @@
 //!   `owl:Class`, `rdfs:subClassOf`, `rdfs:domain`, labels, ...), read from the
 //!   declared graphs.
 //!
+//! A third layer, **constraints**, lists the SHACL shapes the dataset uses per target
+//! class ([`constraints`]). This crate holds its types, and `sparkles_shacl::constraints`
+//! builds it, so the report never derives a constraint from the counts.
+//!
+//! On request, each predicate also lists the classes of its subjects
+//! ([`SchemaOptions::subject_classes`]), from a merge join of the predicate's subjects
+//! with the `rdf:type` triples, both in subject order.
+//!
 //! Counting uses the permutation indexes directly: one ordered pass over PSO and one over
 //! POS per predicate, which merge the base index with the delta, so the numbers are exact
 //! after updates. A triple stored in several selected graphs counts once, as in SPARQL's
@@ -198,6 +206,10 @@ pub struct SchemaOptions {
     /// these, and a hidden graph named by `graph` or `declared_graph` is reported as
     /// missing.
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
+    /// Also list, for each predicate, the classes of its subjects
+    /// ([`PredicateObserved::subject_classes`]). This costs one pass over the `rdf:type`
+    /// triples of the selection and memory for them.
+    pub subject_classes: bool,
 }
 
 impl Default for SchemaOptions {
@@ -213,6 +225,7 @@ impl Default for SchemaOptions {
             max_entries: DEFAULT_MAX_ENTRIES,
             term_totals: false,
             graphs: None,
+            subject_classes: false,
         }
     }
 }
@@ -398,6 +411,30 @@ pub struct PredicateObserved {
     /// Subjects with two or more distinct objects.
     pub subjects_with_multiple: u64,
     pub objects: ObjectKinds,
+    /// The IRI classes of the predicate's subjects, sorted by class IRI. A subject with
+    /// several classes counts under each of them. Only computed when
+    /// [`SchemaOptions::subject_classes`] asks for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject_classes: Option<Vec<SubjectClass>>,
+    /// The triples and subjects whose subject has no `rdf:type` with an IRI object in the
+    /// selection (with [`SchemaOptions::subject_classes`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untyped_subjects: Option<SubjectCount>,
+}
+
+/// Triples of a predicate whose subjects have one class, and how many such subjects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubjectClass {
+    pub class: String,
+    pub triples: u64,
+    pub subjects: u64,
+}
+
+/// Triples and distinct subjects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SubjectCount {
+    pub triples: u64,
+    pub subjects: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -464,6 +501,18 @@ pub struct SchemaSummary<'a> {
     pub hierarchy: &'a Hierarchy,
     pub classes: Page<'a, ClassEntry>,
     pub predicates: Page<'a, PredicateEntry>,
+    /// The SHACL constraints layer, when the caller added one
+    /// ([`SchemaSummary::with_constraints`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<&'a ConstraintsLayer>,
+}
+
+impl<'a> SchemaSummary<'a> {
+    /// The summary with a constraints layer.
+    pub fn with_constraints(mut self, constraints: Option<&'a ConstraintsLayer>) -> Self {
+        self.constraints = constraints;
+        self
+    }
 }
 
 /// Entries addressable by IRI (for pagination).
@@ -514,6 +563,7 @@ impl SchemaReport {
             hierarchy: &self.hierarchy,
             classes,
             predicates,
+            constraints: None,
         }
     }
 }
@@ -823,21 +873,26 @@ impl PredAcc {
     }
 }
 
-/// Pass A over `PSO[p]`: triples, distinct subjects, objects per subject.
+/// Pass A over `PSO[p]`: triples, distinct subjects, objects per subject, and with
+/// `join`, the classes of the subjects.
 fn subject_pass(
     snap: &Snapshot,
     p: u64,
     filter: &GraphFilter,
     budget: &Budget,
     acc: &mut PredAcc,
+    mut join: Option<&mut ClassJoin>,
 ) -> crate::Result<()> {
     let o = &mut acc.obs;
     let mut prev: Option<(u64, u64)> = None;
     let mut run = 0u64;
-    let end_subject = |o: &mut PredicateObserved, run: u64| {
+    let mut end_subject = |o: &mut PredicateObserved, s: Option<u64>, run: u64| {
         o.max_per_subject = o.max_per_subject.max(run);
         if run >= 2 {
             o.subjects_with_multiple += 1;
+        }
+        if let (Some(j), Some(s)) = (join.as_deref_mut(), s) {
+            j.subject(s, run);
         }
     };
     for_each_key(snap, Perm::Pso, &[p], budget, |k| {
@@ -846,15 +901,78 @@ fn subject_pass(
         }
         o.triples += 1;
         if prev.is_none_or(|(s, _)| s != k[1]) {
-            end_subject(o, run);
+            end_subject(o, prev.map(|(s, _)| s), run);
             o.distinct_subjects += 1;
             run = 0;
         }
         run += 1;
         prev = Some((k[1], k[2]));
     })?;
-    end_subject(o, run);
+    end_subject(o, prev.map(|(s, _)| s), run);
     Ok(())
+}
+
+/// The `(subject, class)` pairs of the selection's `rdf:type` triples whose object is
+/// an IRI, sorted by subject and then by class.
+fn subject_types(
+    snap: &Snapshot,
+    rdf_type: u64,
+    filter: &GraphFilter,
+    budget: &Budget,
+) -> crate::Result<Vec<(u64, u64)>> {
+    let mut iri: FxHashMap<u64, bool> = FxHashMap::default();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut prev: Option<(u64, u64)> = None;
+    for_each_key(snap, Perm::Pso, &[rdf_type], budget, |k| {
+        if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
+            return;
+        }
+        prev = Some((k[1], k[2]));
+        if *iri.entry(k[2]).or_insert_with(|| is_iri(snap, k[2])) {
+            out.push((k[1], k[2]));
+        }
+    })?;
+    Ok(out)
+}
+
+/// The merge join of one predicate's subjects, in `PSO` order, with
+/// [`subject_types`]: the triples and subjects of each class.
+struct ClassJoin<'a> {
+    types: &'a [(u64, u64)],
+    pos: usize,
+    by_class: FxHashMap<u64, SubjectCount>,
+    untyped: SubjectCount,
+}
+
+impl<'a> ClassJoin<'a> {
+    fn new(types: &'a [(u64, u64)]) -> Self {
+        ClassJoin {
+            types,
+            pos: 0,
+            by_class: FxHashMap::default(),
+            untyped: SubjectCount::default(),
+        }
+    }
+
+    /// Subject `s` has `run` triples. Subjects arrive in ascending order.
+    fn subject(&mut self, s: u64, run: u64) {
+        self.pos += self.types[self.pos..].partition_point(|t| t.0 < s);
+        let mut typed = false;
+        while let Some(&(ts, c)) = self.types.get(self.pos) {
+            if ts != s {
+                break;
+            }
+            typed = true;
+            let e = self.by_class.entry(c).or_default();
+            e.triples += run;
+            e.subjects += 1;
+            self.pos += 1;
+        }
+        if !typed {
+            self.untyped.triples += run;
+            self.untyped.subjects += 1;
+        }
+    }
 }
 
 /// Base-vocabulary literal objects waiting for a batched key lookup.
@@ -1065,12 +1183,28 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     let mut class_instances: FxHashMap<u64, u64> = FxHashMap::default();
     let mut anon_types: FxHashSet<u64> = FxHashSet::default();
     let mut total_triples = 0u64;
+    let types = match rdf_type.filter(|_| opts.subject_classes) {
+        Some(t) => in_phase(subject_types(snap, t, &observed, &budget), || {
+            "reading the classes of subjects".into()
+        })?,
+        None => Vec::new(),
+    };
+    // the subject classes of each predicate by class id, named at the end
+    let mut joins: FxHashMap<u64, (FxHashMap<u64, SubjectCount>, SubjectCount)> =
+        FxHashMap::default();
     for (i, &p) in preds.iter().enumerate() {
         let phase = || format!("scanning predicates ({}/{})", i + 1, preds.len());
         let mut acc = PredAcc::default();
-        in_phase(subject_pass(snap, p, &observed, &budget, &mut acc), phase)?;
+        let mut join = opts.subject_classes.then(|| ClassJoin::new(&types));
+        in_phase(
+            subject_pass(snap, p, &observed, &budget, &mut acc, join.as_mut()),
+            phase,
+        )?;
         if acc.obs.triples == 0 {
             continue;
+        }
+        if let Some(j) = join {
+            joins.insert(p, (j.by_class, j.untyped));
         }
         let ci = (Some(p) == rdf_type).then_some(&mut class_instances);
         in_phase(
@@ -1253,10 +1387,27 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     for (id, p) in props {
         done += 1;
         let Some(iri) = iris.get(id) else { continue };
+        let mut observed = p.observed.unwrap_or_default();
+        if opts.subject_classes {
+            let (by_class, untyped) = joins.remove(&id).unwrap_or_default();
+            let mut list: Vec<SubjectClass> = by_class
+                .into_iter()
+                .filter_map(|(c, n)| {
+                    Some(SubjectClass {
+                        class: iris.get(c)?,
+                        triples: n.triples,
+                        subjects: n.subjects,
+                    })
+                })
+                .collect();
+            list.sort_by(|a, b| a.class.cmp(&b.class));
+            observed.subject_classes = Some(list);
+            observed.untyped_subjects = Some(untyped);
+        }
         pred_list.push(PredicateEntry {
             builtin: builtin(&iri),
             iri,
-            observed: p.observed.unwrap_or_default(),
+            observed,
             declared: PredicateDeclared {
                 types: p.types.iter().map(|t| t.to_string()).collect(),
                 domains: iris.all(&p.domains),
@@ -1459,6 +1610,9 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<usize> {
 
 mod void;
 pub use void::{VOID_NS, VoidOptions, description_iri, void_text, void_triples};
+
+pub mod constraints;
+pub use constraints::ConstraintsLayer;
 
 pub mod draft;
 pub use draft::{DraftOptions, ShapesDraft, draft_shapes};

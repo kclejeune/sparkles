@@ -726,3 +726,66 @@ fn term_totals_follow_the_selection() {
     // a triple in several graphs counts once; a blank subject is no entity
     assert_eq!(totals("union"), t(3, 2, 2));
 }
+
+#[test]
+fn subject_classes_of_predicates() {
+    let s = store_with(
+        r#"ex:a a ex:Person, ex:Agent ; ex:name "A", "A2" .
+           ex:b a ex:Person ; ex:name "B" .
+           ex:o a ex:Org ; ex:name "O" .
+           ex:u ex:name "U" .
+           _:t a _:anon ; ex:name "T" .
+           ex:g { ex:u a ex:Person }"#,
+    );
+    let opts = |graph: GraphSelection| SchemaOptions {
+        graph,
+        subject_classes: true,
+        ..Default::default()
+    };
+    type Classes = (Vec<(String, u64, u64)>, (u64, u64));
+    let classes = |r: &SchemaReport| -> Classes {
+        let o = &pred(r, &ex("name")).observed;
+        let list = o
+            .subject_classes
+            .as_ref()
+            .expect("subject classes")
+            .iter()
+            .map(|c| {
+                let name = c.class.trim_start_matches("http://ex.org/").to_string();
+                (name, c.triples, c.subjects)
+            })
+            .collect();
+        let u = o.untyped_subjects.expect("untyped subjects");
+        (list, (u.triples, u.subjects))
+    };
+    let r = report(&s, &opts(GraphSelection::Default));
+    assert_eq!(
+        classes(&r),
+        (
+            vec![
+                ("Agent".into(), 2, 1),
+                ("Org".into(), 1, 1),
+                ("Person".into(), 3, 2)
+            ],
+            (2, 2)
+        )
+    );
+    // the type of ex:u is in another graph
+    let r = report(&s, &opts(GraphSelection::Union));
+    let (list, untyped) = classes(&r);
+    assert_eq!(list[2], ("Person".into(), 4, 3));
+    assert_eq!(untyped, (1, 1));
+    // only on request
+    let r = report(&s, &SchemaOptions::default());
+    assert!(pred(&r, &ex("name")).observed.subject_classes.is_none());
+    let json = serde_json::to_string(pred(&r, &ex("name"))).unwrap();
+    assert!(!json.contains("subjectClasses"), "{json}");
+
+    // the delta is merged, and compaction changes nothing
+    update(&s, r#"INSERT DATA { ex:c a ex:Org ; ex:name "C" }"#);
+    for _ in 0..2 {
+        let r = report(&s, &opts(GraphSelection::Default));
+        assert_eq!(classes(&r).0[1], ("Org".into(), 2, 2));
+        s.compact().unwrap();
+    }
+}

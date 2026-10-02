@@ -140,6 +140,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Req
             max_entries: st.schema_max_entries,
             term_totals: false,
             graphs,
+            subject_classes: false,
         },
         selection,
         limit,

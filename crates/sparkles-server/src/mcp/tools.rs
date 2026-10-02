@@ -776,6 +776,7 @@ impl Tools<'_> {
             max_entries: self.server.state.schema_max_entries,
             term_totals: false,
             graphs: graphs.clone(),
+            subject_classes: false,
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
         if graphs.is_none() {
