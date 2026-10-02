@@ -3,7 +3,9 @@
 # With `ui = null` the web UI is not built (no Node.js) and /ui shows a placeholder.
 {
   lib,
+  stdenv,
   rustPlatform,
+  installShellFiles,
   ui ? null,
 }:
 let
@@ -26,6 +28,9 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ../Cargo.lock;
+
+  # shell completions and man pages (`sparkles completions`, `sparkles man`)
+  nativeBuildInputs = [ installShellFiles ];
   cargoBuildFlags = [
     "-p"
     "sparkles-server"
@@ -55,6 +60,17 @@ rustPlatform.buildRustPackage {
   ''
   + lib.optionalString (ui != null) ''
     install -Dm644 ${ui}/licenses.txt $out/share/doc/sparkles/THIRD_PARTY_LICENSES-UI.md
+  ''
+  # completions, man pages and the OpenAPI description come from the binary itself, so
+  # only a build that can run it installs them
+  + lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+    installShellCompletion --cmd sparkles \
+      --bash <($out/bin/sparkles completions bash) \
+      --zsh <($out/bin/sparkles completions zsh) \
+      --fish <($out/bin/sparkles completions fish)
+    $out/bin/sparkles man --dir man
+    installManPage man/*.1
+    $out/bin/sparkles openapi > $out/share/doc/sparkles/openapi.json
   '';
 
   meta = {

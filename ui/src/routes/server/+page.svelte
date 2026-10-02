@@ -462,7 +462,19 @@
 
   {#if info}
     <section class="panel">
-      <div class="panel-head"><h2>Endpoints</h2></div>
+      <div class="panel-head">
+        <h2>Endpoints</h2>
+        <span class="spacer"></span>
+        <!-- the OpenAPI description of the whole HTTP API (docs/API.md, OpenAPI description) -->
+        <a
+          class="btn"
+          href="/$/openapi.json"
+          target="_blank"
+          rel="noopener"
+          title="The OpenAPI 3.1 description of the HTTP API">API description</a
+        >
+        <a class="btn" href="/$/openapi.yaml" target="_blank" rel="noopener">YAML</a>
+      </div>
       <table class="data">
         <thead
           ><tr><th>Dataset</th><th>Query</th><th>Update</th><th>Graph store</th><th>Upload</th></tr

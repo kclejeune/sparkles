@@ -80,6 +80,9 @@ running queries.
 **Server and CLI**
 * Fuseki's endpoints, Graph Store Protocol, upload and `/$/` admin API. Sparkles adds
   endpoints for commits, schema discovery, clones, reasoning and validation ([API](docs/API.md)).
+* An OpenAPI 3.1 description of the whole API at `/$/openapi.json`, kept equal to the
+  server's routes by a test, for client generators and API viewers
+  ([API](docs/API.md#openapi-description)).
 * Stored queries with typed parameters, which clients and MCP agents run by name. Values
   are bound as terms and never spliced into the text ([API](docs/API.md#stored-queries)).
 * Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
@@ -267,6 +270,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `fmt`, `lsp` | Run the formatter or its language server. |
 | `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
 | `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |
+| `completions`, `man`, `openapi` | Print shell completions for bash, zsh, fish, elvish or PowerShell, write man pages, or print the OpenAPI description of the HTTP API. |
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.
 
@@ -346,6 +350,7 @@ with Dataset("mydb") as ds:                      # or Dataset() in memory
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature with its status, and the known gaps. |
 | [docs/USAGE.md](docs/USAGE.md) | Running the server and CLI, with options, formatting, backups, outbound requests, integrity checks, MCP, embedding, the Python package and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
+| [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description of the HTTP API, as the server serves it at `/$/openapi.json`. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | How Sparkles compares with Jena/Fuseki, QLever, Fluree and Oxigraph, where it departs from Jena and QLever on purpose, and the optimizations it adopted from QLever. |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured performance, against the other engines and on its own. |
 | [docs/editors.md](docs/editors.md) | Formatter and language-server setups for editors. |

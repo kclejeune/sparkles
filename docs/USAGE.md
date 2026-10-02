@@ -14,6 +14,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Endpoints and operations](#endpoints-and-operations)
   * [`serve` options](#serve-options)
 * [Command-line tools](#command-line-tools)
+  * [Shell completions and man pages](#shell-completions-and-man-pages)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Backup repositories](#backup-repositories)
@@ -449,6 +450,30 @@ The other commands are:
   ([below](#file-tools)).
 
 `sparkles help COMMAND` describes each one.
+
+### Shell completions and man pages
+
+`sparkles completions SHELL` prints a completion script for `bash`, `zsh`, `fish`,
+`elvish` or `powershell`. The scripts complete subcommands, flags and the values of flags
+that take one of a fixed set, and they come from the same definition as `--help`, so they
+match the binary that printed them. Write the script where your shell looks for
+completions:
+
+```sh
+sparkles completions bash > ~/.local/share/bash-completion/completions/sparkles
+sparkles completions zsh > ~/.zfunc/_sparkles      # a directory in $fpath
+sparkles completions fish > ~/.config/fish/completions/sparkles.fish
+sparkles completions powershell >> $PROFILE
+```
+
+`sparkles man --dir DIR` writes a man page for `sparkles` and one for each subcommand,
+such as `sparkles-serve.1` and `sparkles-auth-login.1`. Without `--dir` it prints
+`sparkles.1`. The Nix package installs the bash, zsh and fish completions and the man
+pages, so `man sparkles-serve` works after `nix profile install`.
+
+`sparkles openapi` prints the OpenAPI 3.1 description of the HTTP API, and
+`--format yaml` prints it as YAML. A running server serves the same document at
+`/$/openapi.json` ([API.md](API.md#openapi-description)).
 
 `sparkles schema --loc db --format void` prints the schema report as a VoID description
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
