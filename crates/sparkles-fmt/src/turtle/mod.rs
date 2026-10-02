@@ -43,7 +43,8 @@ impl LangImpl for Turtle {
         LexMode::Turtle
     }
 
-    fn reference(&self, text: &str, _tokens: &[Token]) -> Result<RdfReference, FormatError> {
+    fn reference(&self, text: &str, tokens: &[Token]) -> Result<RdfReference, FormatError> {
+        crate::sparql::nesting(text, tokens)?;
         rdf_reference(text, self.language())
     }
 

@@ -466,7 +466,14 @@ fn string(rest: &str) -> Option<(TokenKind, usize)> {
             _ => {}
         }
     }
-    None
+    // an unterminated `"""` is no long string: the longest match is the empty `""`
+    long.then_some((
+        match q {
+            b'\'' => TokenKind::String1,
+            _ => TokenKind::String2,
+        },
+        2,
+    ))
 }
 
 /// After `_:`: `(PN_CHARS_U | [0-9]) ((PN_CHARS | '.')* PN_CHARS)?`.
@@ -695,6 +702,17 @@ mod tests {
                 (StringLong1, "'''x''y'''"),
                 (StringLong2, "\"\"\"a\n\"b\"\"\""),
                 (Unknown, "\""),
+            ]
+        );
+        // an unterminated long quote is an empty string and what follows
+        assert_eq!(
+            kinds("\"\"\"a\"@en '''b'"),
+            [
+                (String2, "\"\""),
+                (String2, "\"a\""),
+                (LangDir, "@en"),
+                (String1, "''"),
+                (String1, "'b'"),
             ]
         );
         assert_eq!(

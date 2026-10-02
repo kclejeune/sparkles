@@ -59,6 +59,14 @@ pub trait LangImpl {
 
 /// Format `text` with `lang`, checking the result.
 pub fn run<L: LangImpl>(lang: &L, text: &str, opts: &Options) -> Result<Formatted, FormatError> {
+    // a cursor inside a character means the start of that character
+    let snapped = opts
+        .cursor
+        .map(|c| text.floor_char_boundary(c.min(text.len())));
+    let opts = &Options {
+        cursor: snapped,
+        ..opts.clone()
+    };
     let mode = lang.lex_mode();
     let tokens = lex(text, mode);
     // kept byte for byte, without even a reference parse
@@ -175,9 +183,19 @@ mod fault {
 /// The base IRI of both parses, so relative IRIs resolve (a `BASE` in the text wins).
 pub const SPARQL_BASE: &str = "http://sparkles-fmt.invalid/base/";
 
-/// The namespace an undeclared prefix gets in both parses.
+/// The namespace an undeclared prefix gets in both parses. The label is percent-encoded
+/// beyond ASCII letters, digits, `-`, `_` and `.`: a prefix label may hold characters an
+/// IRI may not (U+FFF0 to U+FFFD).
 pub fn undeclared_namespace(label: &str) -> String {
-    format!("http://sparkles-fmt.invalid/prefix/{label}/")
+    let mut ns = String::from("http://sparkles-fmt.invalid/prefix/");
+    for b in label.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => ns.push(b as char),
+            _ => ns.push_str(&format!("%{b:02X}")),
+        }
+    }
+    ns.push('/');
+    ns
 }
 
 /// The algebra of a SPARQL document.

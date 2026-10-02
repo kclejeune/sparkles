@@ -13,18 +13,22 @@ use crate::tree::{Element, NodeId};
 /// `UpdateUnit`: the file header, then the prologues and operations with a blank line
 /// between each two, an operation's `;` right after its last token (`};`), the
 /// comments at the end of the file and one final newline. A `;` that ends the request
-/// is dropped.
+/// is dropped, unless nothing comes before it (the reference parser accepts a `;`
+/// alone): dropped, it would leave its comments at the start of the file, a header
+/// the second time.
 pub fn update_unit(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
     let mut parts = Vec::new();
     parts.extend(cx.header());
     let children = cx.children(n);
     let mut any = false;
+    let mut written = false;
     for (i, &e) in children.iter().enumerate() {
         match e {
             Element::Token(t) if cx.tree.token_kind(t) == TokenKind::Semicolon => {
                 // a separator only when something follows it
-                if i + 1 < children.len() {
+                if i + 1 < children.len() || !written {
                     parts.push(cx.tok(t));
+                    written = true;
                 }
             }
             e => {
@@ -33,6 +37,10 @@ pub fn update_unit(cx: &mut Ctx<'_, '_>, n: NodeId) -> DocId {
                 }
                 parts.push(cx.element(e));
                 any = true;
+                written |= match e {
+                    Element::Node(c) => cx.tree.first_token(c).is_some(),
+                    Element::Token(_) => true,
+                };
             }
         }
     }

@@ -434,6 +434,9 @@ fn directive_block(tx: &mut Tx<'_, '_>, decls: &[NodeId], sorted: bool, pruned: 
         });
         after_other = false;
     }
+    if let Some(first) = under_header(tx, decls, &prefixes) {
+        prefixes[first].has_comments = true;
+    }
     let runs = normalize::plan_runs(&prefixes, &tx.opts.prefix_groups);
 
     for &v in &versions {
@@ -684,6 +687,48 @@ impl CommentRules for TurtleRules {
     fn is_closer(&self, kind: TokenKind) -> bool {
         kind == TokenKind::Dot || crate::sparql::parse::is_closer(kind)
     }
+}
+
+/// The declaration (an index into `prefixes`) whose comments the file header (every
+/// comment before the first token) counts as, when it touches the first declaration:
+/// the one printed first, right under the header. The second run reads the header as
+/// that declaration's leading block, and a declaration printed first under comments of
+/// its own has them as the header the second time; counting them the same both times
+/// keeps the run from dropping it as a plain duplicate once and keeping it the other.
+fn under_header(tx: &Tx<'_, '_>, decls: &[NodeId], prefixes: &[PrefixDecl]) -> Option<usize> {
+    let &d = decls.first()?;
+    let touches = tx.tree.kind(d) == NodeKind::PrefixDecl
+        && prefixes.first().map(|p| p.node) == Some(d)
+        && !decls
+            .iter()
+            .any(|&v| tx.tree.kind(v) == NodeKind::VersionDecl)
+        && tx.tree.first_token(d) == tx.tree.first_token(tx.tree.root())
+        && !tx.comments.header().is_empty()
+        && !tx.comments.blank_before(d)
+        && tx.comments.detached_before(d).is_empty();
+    if !touches {
+        return None;
+    }
+    // the first run, sorted as `normalize::plan_runs` sorts it (one that binds a label
+    // twice stays as written)
+    let groups = &tx.opts.prefix_groups;
+    let end = (1..prefixes.len())
+        .find(|&i| prefixes[i].barrier_before || (groups.is_empty() && prefixes[i].blank_before))
+        .unwrap_or(prefixes.len());
+    let run = &prefixes[..end];
+    if run
+        .iter()
+        .any(|a| run.iter().any(|b| a.label == b.label && a.iri != b.iri))
+    {
+        return Some(0);
+    }
+    let group_of = |label: &str| {
+        groups
+            .iter()
+            .position(|g| g.iter().any(|l| l == label))
+            .unwrap_or(groups.len())
+    };
+    (0..end).min_by_key(|&i| (group_of(&run[i].label), run[i].label.as_str(), i))
 }
 
 #[cfg(test)]

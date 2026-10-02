@@ -1,0 +1,54 @@
+# The cargo-fuzz targets of the formatter. A workspace of its own, with its own lockfile,
+# so libfuzzer-sys and the nightly toolchain stay out of the repository's workspace, its
+# lockfile and its third-party license notices. See README.md.
+[package]
+name = "sparkles-fmt-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sparkles-fmt = { path = ".." }
+
+[workspace]
+members = ["."]
+
+# the repository's patched spargebra, as in the root Cargo.toml
+[patch.crates-io]
+spargebra = { path = "../../../vendor/spargebra" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fmt_sparql"
+path = "fuzz_targets/fmt_sparql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmt_turtle"
+path = "fuzz_targets/fmt_turtle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmt_lines"
+path = "fuzz_targets/fmt_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmt_jsonld"
+path = "fuzz_targets/fmt_jsonld.rs"
+test = false
+doc = false
+bench = false

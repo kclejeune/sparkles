@@ -46,6 +46,7 @@ mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
+mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
 mise run test         # all Rust tests            (test:w3c, test:shacl, test:shex for suite summaries)
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)

@@ -141,6 +141,15 @@ flag "--strict" help="exit 1 when an output differs"
 '''
 run = 'scripts/fmt-jsonld-prettier.sh ${usage_strict:+--strict}'
 
+[tasks."fmt:fuzz"]
+description = "Fuzz the formatter with cargo-fuzz (needs a nightly toolchain and cargo-fuzz; see crates/sparkles-fmt/fuzz/README.md); not part of ci"
+usage = '''
+arg "[target]..." help="fmt_sparql, fmt_turtle, fmt_lines or fmt_jsonld (default: all four)" var=#true
+flag "--time <seconds>" help="seconds per target" default="1800"
+flag "--jobs <n>" help="fuzzing processes per target" default="2"
+'''
+run = 'crates/sparkles-fmt/fuzz/run.sh --time "$usage_time" --jobs "$usage_jobs" ${usage_target:-}'
+
 [tasks."fmt:wasm"]
 description = "Check that the formatter builds for the browser (wasm32-unknown-unknown, which rust-toolchain.toml installs), with Clippy"
 run = "cargo clippy -p sparkles-fmt-wasm --target wasm32-unknown-unknown -- -D warnings"
