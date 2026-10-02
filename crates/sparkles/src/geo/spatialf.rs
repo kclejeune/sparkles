@@ -146,19 +146,14 @@ impl Call<'_, '_> {
     /// The datatype of geometry argument `i` (a GeoJSON literal or else WKT).
     fn datatype(&self, i: usize) -> &'static str {
         match self.value(i) {
-            Ok(Value::Other { dt, .. }) if &*dt == GEOJSON_LITERAL => GEOJSON_LITERAL,
+            Ok(Value::Other { dt, .. }) => write::result_datatype(&dt),
             _ => WKT_LITERAL,
         }
     }
 
     /// A geometry as a literal of datatype `dt`, charged to the query.
     fn geometry(&self, g: &Geom, dt: &'static str) -> EvalResult<Val> {
-        let lex = if dt == GEOJSON_LITERAL {
-            g.crs.known().ok_or(TypeError)?;
-            write::to_geojson(g)
-        } else {
-            write::to_wkt(g)
-        };
+        let lex = write::serialize(g, dt).ok_or(TypeError)?;
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
             Err(_) => return Err(TypeError),

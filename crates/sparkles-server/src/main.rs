@@ -949,7 +949,7 @@ enum Cmd {
         #[arg(long)]
         loc: PathBuf,
         /// index the geometry literals of these predicates (default: geo:asWKT,
-        /// geo:asGeoJSON, geo:hasSerialization)
+        /// geo:asGeoJSON, geo:asGML, geo:asKML, geo:hasSerialization)
         #[arg(long)]
         predicate: Vec<String>,
         /// feature → geometry links of the spatial: functions (default:

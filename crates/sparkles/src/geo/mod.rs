@@ -59,6 +59,8 @@ pub(crate) mod tree;
 pub mod wgs84;
 #[cfg(feature = "geo")]
 pub mod write;
+#[cfg(feature = "geo")]
+pub mod xml;
 
 #[cfg(all(test, feature = "geo"))]
 mod smoke_tests;

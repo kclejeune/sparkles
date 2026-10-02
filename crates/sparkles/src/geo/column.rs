@@ -15,7 +15,7 @@ use super::config::GeoConfig;
 use super::crs::{CRS84, CRS84_IRI, CrsRef};
 use super::geom::GeomError;
 use super::persist::{self, FileKind, Identity, Mapped};
-use super::vocab::{GEOJSON_LITERAL, WKT_LITERAL};
+use super::vocab::{GEOJSON_LITERAL, GML_LITERAL, KML_LITERAL, WKT_LITERAL};
 use super::wgs84::{self, Pair};
 use crate::id::{Id, KEY_SEP, Tag};
 use crate::store::Snapshot;
@@ -198,11 +198,10 @@ fn classify_with(key: &[u8], cfg: &GeoConfig, recheck: bool) -> Slot {
     let Some(dt) = suffix.strip_prefix(b"^") else {
         return Slot::Other;
     };
-    let dt = if dt == WKT_LITERAL.as_bytes() {
-        WKT_LITERAL
-    } else if dt == GEOJSON_LITERAL.as_bytes() {
-        GEOJSON_LITERAL
-    } else {
+    let Some(dt) = [WKT_LITERAL, GEOJSON_LITERAL, GML_LITERAL, KML_LITERAL]
+        .into_iter()
+        .find(|d| d.as_bytes() == dt)
+    else {
         return Slot::Other;
     };
     let lex = &key[1..sep];

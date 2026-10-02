@@ -1493,6 +1493,42 @@ ex:G1 { ex:p4 geo:hasGeometry ex:g4 . ex:g4 geo:asWKT "POINT(3 3)"^^geo:wktLiter
         );
     }
 
+    /// GML and KML serializations are indexed and searched like WKT.
+    #[test]
+    fn gml_and_kml_literals_are_searched() {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = r#"
+@prefix ex: <http://example.org/> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+ex:fg geo:hasGeometry ex:gg . ex:gg geo:asGML "<gml:Point xmlns:gml='http://www.opengis.net/gml/3.2' srsName='http://www.opengis.net/def/crs/EPSG/0/4326'><gml:pos>2 2</gml:pos></gml:Point>"^^geo:gmlLiteral .
+ex:fk geo:hasGeometry ex:gk . ex:gk geo:asKML "<Point><coordinates>2.1,2</coordinates></Point>"^^geo:kmlLiteral .
+ex:far geo:hasGeometry ex:gf . ex:gf geo:asKML "<Point><coordinates>40,40</coordinates></Point>"^^geo:kmlLiteral .
+"#;
+        s.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        for indexed in [false, true] {
+            if indexed {
+                s.enable_geo(crate::geo::GeoConfig::default()).unwrap();
+            }
+            assert_eq!(
+                select(&s, "SELECT ?f { ?f spatial:nearby (2 2 50) }"),
+                ["fg", "fk"]
+            );
+            assert_eq!(
+                select(
+                    &s,
+                    "SELECT ?g { ?g geo:asKML ?w FILTER(geof:sfWithin(?w, \
+                     \"POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))\"^^geo:wktLiteral)) }"
+                ),
+                ["gk"]
+            );
+        }
+    }
+
     #[test]
     fn variable_arguments() {
         let s = store();

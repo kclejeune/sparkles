@@ -52,6 +52,8 @@ tempfile = "3"
 georust = { workspace = true, optional = true }
 geo-index = { workspace = true, optional = true }
 geographiclib-rs = { workspace = true, optional = true }
+# GML and KML geometry literals (the version oxrdfxml already builds)
+quick-xml = { version = "0.37", optional = true }
 
 # statvfs: the free disk space a store keeps
 [target.'cfg(unix)'.dependencies]
@@ -71,6 +73,7 @@ geo = [
     "dep:georust",
     "dep:geo-index",
     "dep:geographiclib-rs",
+    "dep:quick-xml",
 ]
 # zstd inputs, dumps and backups (libzstd, a C build), and zstd for the text doc store
 zstd = ["dep:zstd", "tantivy?/zstd-compression"]

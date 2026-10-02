@@ -1,4 +1,5 @@
-//! Parsing `geo:wktLiteral` and `geo:geoJSONLiteral` lexical forms.
+//! Parsing `geo:wktLiteral` and `geo:geoJSONLiteral` lexical forms (GML and KML are in
+//! [`super::xml`]).
 //!
 //! WKT has its own small parser rather than the `wkt` crate's: errors need a byte
 //! offset, and GeoSPARQL literals also use LINEARRING, TRIANGLE, TIN and
@@ -7,7 +8,7 @@
 
 use super::crs::{CRS84, CrsRef};
 use super::geom::{Geom, GeomError, GeomType, Layout};
-use super::vocab::{GEOJSON_LITERAL, WKT_LITERAL};
+use super::vocab::{GEOJSON_LITERAL, GML_LITERAL, KML_LITERAL, WKT_LITERAL};
 use georust::{
     Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon,
     Point, Polygon,
@@ -27,6 +28,10 @@ pub fn parse_limited(lex: &str, dt: &str, max_vertices: u32) -> Result<Geom, Geo
         parse_wkt(lex, max_vertices)
     } else if dt == GEOJSON_LITERAL {
         parse_geojson(lex, max_vertices)
+    } else if dt == GML_LITERAL {
+        super::xml::parse_gml(lex, max_vertices)
+    } else if dt == KML_LITERAL {
+        super::xml::parse_kml(lex, max_vertices)
     } else {
         Err(GeomError::new(format!(
             "unsupported geometry datatype <{dt}>"
@@ -36,21 +41,21 @@ pub fn parse_limited(lex: &str, dt: &str, max_vertices: u32) -> Result<Geom, Geo
 
 /// Is `dt` a geometry datatype this build can parse?
 pub fn is_geometry_datatype(dt: &str) -> bool {
-    dt == WKT_LITERAL || dt == GEOJSON_LITERAL
+    super::vocab::is_geometry_datatype(dt)
 }
 
 /// The shared state of both parsers: layout, Z range and vertex count of the geometry.
-struct Acc {
+pub(super) struct Acc {
     layout: Option<Layout>,
     z: Option<(f64, f64)>,
     vertices: u32,
     max_vertices: u32,
     /// the literal is latitude first: swap into internal (east, north) order
-    swap: bool,
+    pub(super) swap: bool,
 }
 
 impl Acc {
-    fn new(max_vertices: u32) -> Acc {
+    pub(super) fn new(max_vertices: u32) -> Acc {
         Acc {
             layout: None,
             z: None,
@@ -73,7 +78,7 @@ impl Acc {
     }
 
     /// A coordinate from its ordinates.
-    fn coord(&mut self, ords: &[f64]) -> Result<Coord<f64>, String> {
+    pub(super) fn coord(&mut self, ords: &[f64]) -> Result<Coord<f64>, String> {
         let l = match self.layout {
             Some(l) => l,
             None => match ords.len() {
@@ -119,7 +124,7 @@ impl Acc {
         Ok(Coord { x, y })
     }
 
-    fn finish(self, crs: CrsRef, declared: GeomType, g: Geometry<f64>) -> Geom {
+    pub(super) fn finish(self, crs: CrsRef, declared: GeomType, g: Geometry<f64>) -> Geom {
         Geom {
             crs,
             declared,
@@ -134,7 +139,7 @@ impl Acc {
 }
 
 /// A ring needs 4 points and must be closed.
-fn check_ring(ring: &[Coord<f64>]) -> Result<(), String> {
+pub(super) fn check_ring(ring: &[Coord<f64>]) -> Result<(), String> {
     if ring.len() < 4 {
         return Err(format!(
             "a ring has {} points, at least 4 needed",
@@ -1062,13 +1067,8 @@ mod tests {
 
     #[test]
     fn other_datatypes() {
-        assert!(
-            parse(
-                "POINT(1 2)",
-                "http://www.opengis.net/ont/geosparql#gmlLiteral"
-            )
-            .is_err()
-        );
+        assert!(parse("POINT(1 2)", GML_LITERAL).is_err());
+        assert!(parse("<Point><coordinates>1,2</coordinates></Point>", KML_LITERAL).is_ok());
         assert!(parse("POINT(1 2)", "http://www.w3.org/2001/XMLSchema#string").is_err());
         assert!(is_geometry_datatype(WKT_LITERAL) && is_geometry_datatype(GEOJSON_LITERAL));
     }
