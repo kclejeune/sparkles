@@ -939,7 +939,8 @@ impl TermChecker {
             return;
         }
         iri_warnings(iri, &mut self.scratch);
-        self.record(format!("<{iri}>"));
+        // the key of an IRI is the IRI; a language tag's starts with `@`, which no IRI does
+        self.record(iri.to_string());
     }
 
     pub fn langtag(&mut self, tag: &str) {
@@ -987,35 +988,48 @@ impl TermChecker {
 
     /// Fold another checker's findings into this one.
     pub fn merge(&mut self, other: TermChecker) {
-        let mut by_value: Vec<(String, Vec<Issue>)> = Vec::new();
+        // the kept values first, in the order they were found
+        let mut order: Vec<String> = Vec::new();
+        let mut issues: std::collections::HashMap<String, Vec<Issue>> = Default::default();
         for (v, i) in other.warnings {
-            match by_value.last_mut() {
-                Some((last, is)) if *last == v => is.push(i),
-                _ => by_value.push((v, vec![i])),
+            if !issues.contains_key(&v) {
+                order.push(v.clone());
             }
+            issues.entry(v).or_default().push(i);
         }
-        let mut kept: HashSet<String> = HashSet::new();
-        for (v, is) in by_value {
+        let rest: Vec<String> = other
+            .seen
+            .into_iter()
+            .filter(|v| !issues.contains_key(v))
+            .collect();
+        for v in order.into_iter().chain(rest) {
             if self.seen.contains(&v) {
                 continue;
             }
-            kept.insert(v.clone());
-            self.scratch = is;
-            self.record(v);
+            match issues.remove(&v) {
+                Some(is) => {
+                    self.scratch = is;
+                    self.record(v);
+                }
+                // counted, but past the other checker's limit
+                None => {
+                    self.seen.insert(v);
+                    self.total += 1;
+                }
+            }
         }
-        // values the other checker counted but did not keep
-        let unkept = other
-            .seen
-            .into_iter()
-            .filter(|v| !kept.contains(v) && !self.seen.contains(v))
-            .count();
-        self.total += unkept.min(other.total);
     }
 
-    /// Print the findings on stderr as `name: <value>: message [code]`.
+    /// Print the findings on stderr as `name: warning: <iri>: message [code]` (or
+    /// `@tag`).
     pub fn report(&self, name: &str) {
         for (v, i) in &self.warnings {
-            eprintln!("{name}: warning: {v}: {} [{}]", i.message, i.code);
+            let shown = if v.starts_with('@') {
+                v.clone()
+            } else {
+                format!("<{v}>")
+            };
+            eprintln!("{name}: warning: {shown}: {} [{}]", i.message, i.code);
         }
         let shown: HashSet<&String> = self.warnings.iter().map(|(v, _)| v).collect();
         if self.total > shown.len() {
