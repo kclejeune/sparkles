@@ -3147,7 +3147,6 @@ fn open_or_load(loc: Option<PathBuf>, data: &[PathBuf], opts: StoreOptions) -> R
     })
 }
 
-#[cfg(feature = "shacl")]
 /// `sparkles schema --draft-shapes` arguments.
 struct SchemaDraftArgs {
     graph: String,
@@ -3256,6 +3255,7 @@ fn schema_draft(
     Ok(())
 }
 
+#[cfg(feature = "shacl")]
 fn read_shapes(path: &std::path::Path) -> Result<sparkles_shacl::Shapes> {
     use std::io::Read;
     let (format, _) =

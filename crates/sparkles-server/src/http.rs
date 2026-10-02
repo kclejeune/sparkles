@@ -1364,8 +1364,8 @@ fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
 
 /// The client asked for a commit receipt: `receipt=true`, or an `Accept` that names the
 /// Sparkles media type (`*/*` does not count).
-/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes).
-#[cfg(feature = "mcp")]
+/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes and
+/// stored-query versions).
 pub(crate) fn commit_message_header(h: &HeaderMap) -> Result<Option<Arc<str>>, String> {
     conditional::commit_message(h).map_err(|e| {
         e.1["error"]
