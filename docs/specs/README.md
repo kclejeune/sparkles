@@ -48,7 +48,8 @@ frontend and property-graph view, a GraphQL adapter and a Datalog frontend. G01 
 
 A spec's status is one of three values. *Implemented* means every phase shipped.
 *Implemented in part* means the first phase shipped and some later phases or items were
-not built; the status block says which. *Designed, not built* means there is no code yet.
+not built; the status block says which. *Specified* means the design is written and
+there is no code yet.
 
 | Spec | Summary | Status |
 |---|---|---|
@@ -69,6 +70,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
+| [F09](F09-branches-and-merges.md) | Branches that share their parent's index until they compact, `?branch=` and `/{ds}@{branch}`, three-way merges of quad sets with cell conflicts and resolutions, protected branches, and clones of branches | specified |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
 | [G03](G03-shaclc.md) | The SHACL Compact Syntax (`text/shaclc`) read and written wherever shapes go in or come out, and the SHACL 1.2 list constraints | implemented in part (Phase 1) |
