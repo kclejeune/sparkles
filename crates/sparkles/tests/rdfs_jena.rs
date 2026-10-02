@@ -10,7 +10,7 @@
 use oxrdf::Term;
 use serde_json::Value;
 use sparkles::io::{RdfFormat, Source};
-use sparkles::sparql::rdfs::RdfsSchema;
+use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema};
 use sparkles::sparql::{QueryKind, QueryOptions, query};
 use sparkles::store::{Store, StoreOptions};
 use std::collections::BTreeSet;
@@ -89,7 +89,7 @@ fn suite(name: &str, failures: &mut Vec<String>) -> usize {
     let expected = &all[name];
     let store = store();
     let opts = QueryOptions {
-        rdfs: Some(Arc::new(schema(name))),
+        rdfs: Some(Arc::new(RdfsOnRead::fixed(schema(name)))),
         ..Default::default()
     };
     let queries = std::fs::read_to_string(dir().join(name).join("queries.txt")).unwrap();
@@ -154,7 +154,7 @@ fn rdfs_on_read_matches_jena() {
 fn no_schema_changes_nothing() {
     let store = store();
     let empty = QueryOptions {
-        rdfs: Some(Arc::new(RdfsSchema::default())),
+        rdfs: Some(Arc::new(RdfsOnRead::fixed(RdfsSchema::default()))),
         ..Default::default()
     };
     for opts in [QueryOptions::default(), empty] {
@@ -181,7 +181,7 @@ fn blank_node_terms_are_skipped() {
 fn update_where_sees_derived_triples() {
     let store = store();
     let opts = QueryOptions {
-        rdfs: Some(Arc::new(schema("full"))),
+        rdfs: Some(Arc::new(RdfsOnRead::fixed(schema("full")))),
         ..Default::default()
     };
     sparkles::sparql::update::update(
@@ -208,4 +208,33 @@ fn update_where_sees_derived_triples() {
         .collect();
     xs.sort();
     assert_eq!(xs, ["http://example.org/rex", "http://example.org/tom"]);
+}
+
+/// A schema graph of the dataset is read in the state each query sees.
+#[test]
+fn schema_graph_follows_commits() {
+    use sparkles::sparql::rdfs::SchemaSource;
+    let store = store();
+    let opts = QueryOptions {
+        rdfs: Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(Some(
+            "http://example.org/schema".into(),
+        ))))),
+        ..Default::default()
+    };
+    let animals = |store: &Store| {
+        let q = format!("{PREFIXES}SELECT ?x {{ ?x a ex:Animal }}");
+        query(store.snapshot(), &q, &opts).unwrap().rows().len()
+    };
+    let insert = |triple: &str| {
+        let u = format!("{PREFIXES}INSERT DATA {{ GRAPH ex:schema {{ {triple} }} }}");
+        sparkles::sparql::update::update(&store, &u, &QueryOptions::default()).unwrap();
+    };
+    assert_eq!(animals(&store), 0);
+    insert("ex:Dog rdfs:subClassOf ex:Animal");
+    assert_eq!(animals(&store), 1);
+    // ex:tom is a Kitten, which this schema does not place under ex:Cat yet
+    insert("ex:Cat rdfs:subClassOf ex:Animal");
+    assert_eq!(animals(&store), 1);
+    insert("ex:Kitten rdfs:subClassOf ex:Cat");
+    assert_eq!(animals(&store), 2);
 }

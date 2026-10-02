@@ -32,8 +32,13 @@
 //! dataset is wrapped with the schema.
 
 use super::ctx::Ctx;
+use crate::error::Result;
+use crate::id::Id;
+use crate::index::Perm;
+use crate::store::Snapshot;
 use oxrdf::vocab::{rdf, rdfs};
 use oxrdf::{NamedNode, NamedNodeRef, Term, Triple, Variable};
+use parking_lot::Mutex;
 use spargebra::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
     PropertyPathExpression,
@@ -42,6 +47,7 @@ use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 type Set = BTreeSet<NamedNode>;
 type Map = BTreeMap<NamedNode, Set>;
@@ -105,6 +111,34 @@ impl RdfsSchema {
             && self.sub_prop.is_empty()
             && self.domain.is_empty()
             && self.range.is_empty()
+    }
+
+    /// Classes with a superclass, properties with a superproperty, properties with a
+    /// domain, and properties with a range.
+    pub fn counts(&self) -> [usize; 4] {
+        [
+            self.sup_class.len(),
+            self.sup_prop.len(),
+            self.domain.len(),
+            self.range.len(),
+        ]
+    }
+
+    /// The schema's triples, closed: a subclass and subproperty triple for each pair of
+    /// the closure, and the domain and range triples.
+    pub fn triples(&self) -> Vec<Triple> {
+        let mut out = Vec::new();
+        for (m, p) in [
+            (&self.sup_class, rdfs::SUB_CLASS_OF),
+            (&self.sup_prop, rdfs::SUB_PROPERTY_OF),
+            (&self.domain, rdfs::DOMAIN),
+            (&self.range, rdfs::RANGE),
+        ] {
+            for [a, b] in pairs(m) {
+                out.push(Triple::new(a, p.into_owned(), b));
+            }
+        }
+        out
     }
 
     /// Jena's `hasClassDeclarations`: some `rdfs:subClassOf`.
@@ -174,6 +208,99 @@ fn closure(edges: &Map) -> (Map, Map) {
         up.insert(start.clone(), seen);
     }
     (up, down)
+}
+
+/// Where RDFS on read takes its schema from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaSource {
+    /// a schema read once, from a file or a request body
+    Fixed(Arc<RdfsSchema>),
+    /// a graph of the dataset (`None`: the default graph), read in the state each query
+    /// sees
+    Graph(Option<String>),
+}
+
+/// RDFS on read for a dataset: the schema's source, and the schema of a graph source as
+/// last read.
+#[derive(Debug)]
+pub struct RdfsOnRead {
+    pub source: SchemaSource,
+    /// (generation, delta version, commit) of the snapshot last read, and its schema
+    last: Mutex<Option<((usize, u64, u64), Arc<RdfsSchema>)>>,
+}
+
+impl RdfsOnRead {
+    pub fn new(source: SchemaSource) -> RdfsOnRead {
+        RdfsOnRead {
+            source,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// A fixed schema.
+    pub fn fixed(schema: RdfsSchema) -> RdfsOnRead {
+        RdfsOnRead::new(SchemaSource::Fixed(Arc::new(schema)))
+    }
+
+    /// The schema a query of `snap` uses. A graph source is read again when the snapshot
+    /// is another state than the one read last.
+    pub fn schema(&self, snap: &Snapshot) -> Result<Arc<RdfsSchema>> {
+        let graph = match &self.source {
+            SchemaSource::Fixed(s) => return Ok(s.clone()),
+            SchemaSource::Graph(g) => g,
+        };
+        let key = (
+            Arc::as_ptr(&snap.generation) as usize,
+            snap.version,
+            snap.commit,
+        );
+        if let Some((k, s)) = &*self.last.lock()
+            && *k == key
+        {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(schema_of_graph(snap, graph.as_deref())?);
+        *self.last.lock() = Some((key, s.clone()));
+        Ok(s)
+    }
+}
+
+/// The schema in graph `graph` (`None`: the default graph) of a snapshot.
+pub fn schema_of_graph(snap: &Snapshot, graph: Option<&str>) -> Result<RdfsSchema> {
+    let g = match graph {
+        None => Id::DEFAULT_GRAPH,
+        Some(iri) => match snap.lookup_iri(iri) {
+            Some(g) => g,
+            None => return Ok(RdfsSchema::default()),
+        },
+    };
+    let mut triples = Vec::new();
+    for p in [
+        rdfs::SUB_CLASS_OF,
+        rdfs::SUB_PROPERTY_OF,
+        rdfs::DOMAIN,
+        rdfs::RANGE,
+    ] {
+        let Some(pid) = snap.lookup_iri(p.as_str()) else {
+            continue;
+        };
+        for k in snap.scan_keys(Perm::Pos, &[pid.0])? {
+            let q = Perm::Pos.to_quad(&k);
+            if q[3] != g {
+                continue;
+            }
+            let (Some(s), Some(o)) = (snap.term(q[0]), snap.term(q[2])) else {
+                continue;
+            };
+            let s = match s {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => continue,
+            };
+            triples.push(Triple::new(s, p.into_owned(), o));
+        }
+    }
+    Ok(RdfsSchema::from_triples(&triples))
 }
 
 /// The query pattern with RDFS on read applied, when the context has a schema.

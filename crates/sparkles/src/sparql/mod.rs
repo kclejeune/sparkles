@@ -98,7 +98,7 @@ pub struct QueryOptions {
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
     /// RDFS on read: patterns match the RDFS closure of each graph with respect to this
     /// schema (see [`rdfs`]).
-    pub rdfs: Option<Arc<rdfs::RdfsSchema>>,
+    pub rdfs: Option<Arc<rdfs::RdfsOnRead>>,
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
@@ -332,7 +332,10 @@ fn make_ctx(
         .outbound_budget
         .clone()
         .unwrap_or_else(|| crate::outbound::RequestBudget::new(&opts.outbound));
-    ctx.rdfs = opts.rdfs.clone();
+    ctx.rdfs = match &opts.rdfs {
+        Some(r) => Some(r.schema(&ctx.snap)?),
+        None => None,
+    };
     ctx.use_cache = !opts.no_cache;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;

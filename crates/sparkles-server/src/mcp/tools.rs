@@ -446,6 +446,14 @@ impl Tools<'_> {
                 Vec::new()
             },
             prefixes: prefix_vec(prefixes),
+            // RDFS on read, as over HTTP
+            rdfs: self
+                .server
+                .state
+                .datasets
+                .read()
+                .get(ds)
+                .and_then(|d| d.rdfs.read().clone()),
             ..Default::default()
         };
         // SERVICE and LOAD are the principal's server permissions, and the graphs its

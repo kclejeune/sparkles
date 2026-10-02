@@ -72,6 +72,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/rdfs/{ds}", &["GET", "PUT", "DELETE"]),
     ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
     ("/$/format", &["POST"]),
@@ -213,6 +214,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/validation/{ds}"
+        | "/$/rdfs/{ds}"
         | "/$/quota/{ds}"
         | "/{ds}/prefixes"
             if get =>
@@ -238,7 +240,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}"
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
-        | "/$/validation/{ds}" => Dataset(Admin),
+        | "/$/validation/{ds}"
+        | "/$/rdfs/{ds}" => Dataset(Admin),
         // backups: the listing is filtered by the handler (names and types for dataset
         // admins); a backup's handlers also check that it belongs to `{ds}`, and a
         // restore needs admin on its target
@@ -344,6 +347,7 @@ pub fn whole_dataset(route: &str, method: &Method) -> bool {
         | "/$/backups/{ds}"
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/history/{ds}"
+        | "/$/rdfs/{ds}"
         | "/$/quota/{ds}" => get,
         "/{ds}/prefixes" => !get,
         _ => false,

@@ -123,6 +123,8 @@ pub struct Dataset {
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
+    /// RDFS on read, when set (see [`crate::rdfs`])
+    pub rdfs: RwLock<Option<Arc<sparkles::sparql::rdfs::RdfsOnRead>>>,
 }
 
 pub use crate::write_validation::Validation;
@@ -644,6 +646,7 @@ impl AppState {
         };
         let reasoning = store.root().and_then(read_reasoning_file);
         let validation = install_validation(&store);
+        let rdfs = crate::rdfs::load(&store);
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
         store.set_guard_observer(Some(validation_metrics.clone()));
         Ok(Arc::new(Dataset {
@@ -657,6 +660,7 @@ impl AppState {
             validation_metrics,
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
+            rdfs: RwLock::new(rdfs),
         }))
     }
 

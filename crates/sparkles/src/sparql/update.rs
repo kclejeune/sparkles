@@ -219,7 +219,6 @@ impl Request<'_> {
         ctx.forbid_service = self.opts.forbid_service;
         ctx.outbound = self.opts.outbound.clone();
         ctx.outbound_budget = self.budget.clone();
-        ctx.rdfs = self.opts.rdfs.clone();
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }
@@ -302,6 +301,9 @@ fn run_op(
             }
             // the WHERE clause reads the request's graph view only
             super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
+            if let Some(r) = &req.opts.rdfs {
+                ctx.rdfs = Some(r.schema(&ctx.snap)?);
+            }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;

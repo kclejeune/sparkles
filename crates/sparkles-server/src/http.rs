@@ -160,6 +160,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::geo::routes());
     // vector indexes (`/$/vector`)
     let app = app.merge(crate::vector::routes());
+    // RDFS on read (`/$/rdfs`)
+    let app = app.merge(crate::rdfs::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
@@ -749,6 +751,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         } else {
             Vec::new()
         },
+        rdfs: ds.rdfs.read().clone(),
         ..Default::default()
     }
 }
@@ -2540,6 +2543,7 @@ fn dataset_info(ds: &Dataset) -> J {
         "modified": head.timestamp(),
         "text": text_summary(ds),
         "geo": crate::geo::summary(ds),
+        "rdfs": crate::rdfs::info_json(ds),
     });
     // a clone: where it was forked from
     if let Some(f) = ds.store.forked_from() {
