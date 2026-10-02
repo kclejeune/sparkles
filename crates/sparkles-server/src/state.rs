@@ -53,6 +53,22 @@ pub struct ReasoningInfo {
     /// copied from a clone source whose inferences were already stale
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_stale: bool,
+    /// this dataset's automatic re-runs; `None` follows the server's `--auto-reason`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoSetting>,
+}
+
+/// A dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSetting {
+    pub enabled: bool,
+    /// seconds without a commit before a run; the server's, else 5
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_seconds: Option<f64>,
+    /// seconds after which a run starts even while writes continue; 12 × the debounce
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay_seconds: Option<f64>,
 }
 
 pub struct Dataset {

@@ -35,7 +35,7 @@ use std::io::{BufWriter, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Immutable base index generation.
 pub struct Generation {
@@ -745,6 +745,22 @@ struct BulkCommit {
     default_graph: bool,
 }
 
+/// Counts a writer waiting for the writer lock while it lives.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(n: &'a AtomicUsize) -> Waiting<'a> {
+        n.fetch_add(1, Ordering::Relaxed);
+        Waiting(n)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Whether loading `sources` may write to the default graph: a quad format may hold
 /// default-graph quads, a triple format writes there unless a target graph is set.
 fn sources_reach_default_graph(sources: &[Source]) -> bool {
@@ -783,6 +799,8 @@ pub struct Store {
     guard_observer: parking_lot::RwLock<Option<Arc<dyn crate::guard::GuardObserver>>>,
     /// `validation.json` asks for a guard: commits fail without one (fail closed)
     guard_required: AtomicBool,
+    /// write transactions waiting for the writer lock
+    writers_waiting: AtomicUsize,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -881,6 +899,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(false),
+            writers_waiting: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1090,6 +1109,7 @@ impl Store {
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
             guard_required: AtomicBool::new(guard_required_by(root)),
+            writers_waiting: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1933,8 +1953,16 @@ impl Store {
 
     /// [`write_as`](Self::write_as) with options for the write guard.
     pub fn write_with(&self, kind: CommitKind, opts: crate::guard::WriteOptions) -> WriteTxn<'_> {
+        let waiting = Waiting::new(&self.writers_waiting);
         let guard = self.writer.lock();
+        drop(waiting);
         self.begin(guard, kind, opts)
+    }
+
+    /// Write transactions waiting for the writer lock right now. A long holder of the
+    /// lock, such as an automatic reasoning run, can give way to them.
+    pub fn writers_waiting(&self) -> usize {
+        self.writers_waiting.load(Ordering::Relaxed)
     }
 
     /// [`write_with`](Self::write_with), but a write whose `opts` are cancelled or past
@@ -1951,6 +1979,7 @@ impl Store {
 
     /// The writer lock, waited for in slices while `o` can be cancelled or time out.
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
+        let _waiting = Waiting::new(&self.writers_waiting);
         if o.cancel.is_none() && o.deadline.is_none() {
             return Ok(self.writer.lock());
         }

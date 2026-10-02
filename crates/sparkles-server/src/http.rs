@@ -80,6 +80,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/reason/{ds}",
             get(reason_status).post(reason).delete(unreason),
         )
+        .route(
+            "/$/reason/{ds}/auto",
+            axum::routing::put(reason_auto_set).delete(reason_auto_clear),
+        )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
@@ -2833,7 +2837,13 @@ async fn reason(
         })?
     };
     task_start_check(&st, None, &name)?;
-    let task = crate::reasoning::start_reason(&st, ds, profile, extras, false);
+    let task = crate::reasoning::start_reason(
+        &st,
+        ds,
+        profile,
+        extras,
+        crate::reasoning::Trigger::Request,
+    );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
@@ -2867,6 +2877,74 @@ async fn unreason() -> ApiResult {
         StatusCode::NOT_IMPLEMENTED,
         "built without the `reasoning` feature",
     ))
+}
+
+/// `PUT /$/reason/{ds}/auto`: the dataset's own automatic re-run setting,
+/// `{"enabled": bool, "debounceSeconds"?: number, "maxDelaySeconds"?: number}`. Answers
+/// with the reasoning status.
+async fn reason_auto_set(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Json<J>> {
+    let bad = |m: &str| err(StatusCode::BAD_REQUEST, m.to_string());
+    let v: J = serde_json::from_slice(&body).map_err(|e| bad(&e.to_string()))?;
+    let enabled = v["enabled"]
+        .as_bool()
+        .ok_or_else(|| bad("enabled must be true or false"))?;
+    let secs = |k: &str| match &v[k] {
+        J::Null => Ok(None),
+        x => x
+            .as_f64()
+            .filter(|s| s.is_finite() && (0.0..=86_400.0 * 365.0).contains(s))
+            .map(Some)
+            .ok_or_else(|| bad(&format!("{k} must be a number of seconds"))),
+    };
+    let setting = crate::state::AutoSetting {
+        enabled,
+        debounce_seconds: secs("debounceSeconds")?,
+        max_delay_seconds: secs("maxDelaySeconds")?,
+    };
+    set_auto(&st, &name, Some(setting)).await
+}
+
+/// `DELETE /$/reason/{ds}/auto`: the dataset follows the server's `--auto-reason`
+/// again.
+async fn reason_auto_clear(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    set_auto(&st, &name, None).await
+}
+
+async fn set_auto(
+    st: &Arc<AppState>,
+    name: &str,
+    auto: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    if !cfg!(feature = "reasoning") {
+        return Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "built without the `reasoning` feature",
+        ));
+    }
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(st, name)?;
+    let Some(mut info) = ds.reasoning.read().clone() else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no recorded reasoning: materialize inferences first",
+        ));
+    };
+    info.auto = auto;
+    let st2 = st.clone();
+    let ds2 = ds.clone();
+    blocking(move || {
+        ds2.set_reasoning(Some(info))?;
+        st2.save_registry()?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(crate::reasoning::status_json(st, &ds)))
 }
 
 /// `GET /$/reason/{ds}`: the reasoning status, with the freshness of the inferences.

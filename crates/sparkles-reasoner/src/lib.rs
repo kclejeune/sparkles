@@ -293,6 +293,10 @@ impl Derivation {
 /// them, land in [`INFERRED_GRAPH`] like the RDFS axiomatic triples); the GeoSPARQL
 /// default geometries are derived before the rules run, so the rules see them, and are
 /// written with the other derived triples (a re-run or [`clear`] keeps them consistent).
+///
+/// The first progress report comes after the store's writer lock is taken. The cancel
+/// flag is checked during the rule iterations and once more before the commit, and a
+/// cancelled run changes nothing.
 pub fn materialize_with(
     store: &Store,
     profile: &Profile,

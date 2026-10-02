@@ -1107,7 +1107,14 @@ export type ReasoningStatus = {
   stale: boolean | null;
   commitsSince: number | null;
   staleReason?: string;
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string };
+  auto: {
+    enabled: boolean;
+    /** `server`: --auto-reason; `dataset`: the dataset's own setting */
+    source?: 'server' | 'dataset';
+    debounceSeconds?: number;
+    maxDelaySeconds?: number;
+    scheduledAt?: string;
+  };
   warnings: string[];
 };
 
@@ -1131,6 +1138,18 @@ export async function reasonStatus(ds: string): Promise<ReasoningStatus | null> 
   );
   return body && 'profile' in body ? body : null;
 }
+
+/** The dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`). */
+export const setAutoReasoning = (ds: string, enabled: boolean) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+
+/** Drop the dataset's own setting: the server's `--auto-reason` applies again. */
+export const clearAutoReasoning = (ds: string) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, { method: 'DELETE' });
 
 /** Re-run the recorded profile (including custom rules). */
 export const rerunReasoning = (ds: string) =>

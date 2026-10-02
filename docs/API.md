@@ -433,13 +433,15 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a `Task`. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a cancellable `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
+| PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
+| DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, or an N-Quads backup. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results. Returns `{ "cleared": number /* entries */, "bytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
@@ -2021,10 +2023,14 @@ The design and its rationale are in [C08 Inference freshness and diagnostics](sp
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally. A
 materialization records the dataset id and the commit it wrote. When it changed nothing,
-it records the head it read instead. Any later commit makes the inferences **stale**,
-including commits that only touch named graphs the reasoner does not read. Compaction and
-restarts do not. A status written by an older version, or recorded for another dataset
-id, has unknown freshness (`stale: null`).
+it records the head it read instead. A later commit that changes the default graph makes
+the inferences **stale**, because the default graph is all the reasoner reads. Commits
+that change only named graphs leave them fresh, and so do changes to the inferred graph
+itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
+Each commit records whether it may have changed the default graph. A commit recorded by
+an older version, or one whose record is no longer kept, counts as a change. A status
+written by an older version, or recorded for another dataset id, has unknown freshness
+(`stale: null`).
 
 ```ts
 type ReasoningStatus = {
@@ -2034,9 +2040,12 @@ type ReasoningStatus = {
   commit: number | null;       // commit the inferences were materialized at; null = unknown
   head: number;                // current head commit
   stale: boolean | null;       // null = unknown
-  commitsSince: number | null; // head − commit; null when unknown or not comparable
+  commitsSince: number | null; // head − commit, counting every commit; null when unknown
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
+  auto: { enabled: boolean;
+          source: "server" | "dataset"; // --auto-reason, or the dataset's own setting
+          debounceSeconds?: number; maxDelaySeconds?: number;
+          scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
@@ -2057,6 +2066,20 @@ writes continue, it runs at the latest after the maximum delay, which defaults t
 attempt waits for the next commit. Runs never start for unknown freshness, nor on
 `--read-only` servers. Each run is a full recomputation that holds the dataset's writer
 lock, so updates wait while it runs.
+
+A dataset can have its own setting, which takes precedence over the server's.
+`PUT /$/reason/{ds}/auto` with `{"enabled": true}` turns automatic runs on for that
+dataset even without `--auto-reason`, and `{"enabled": false}` turns them off. Without
+`debounceSeconds`, the dataset uses the server's debounce, or 5 seconds when the server
+has none. The maximum delay defaults to 12 × the debounce. The setting is stored in the
+dataset's `reasoning.json`, survives re-runs and restarts, and goes away with
+`DELETE /$/reason/{ds}`. `sparkles infer` keeps it too.
+
+A write that waits for the writer lock supersedes an automatic run that started after
+the debounce. The run is cancelled at its next check, the task ends `cancelled`, and the
+write goes ahead. The next run starts after the next debounce. A run forced by the
+maximum delay is never superseded, so continuous writes cannot postpone it forever. A
+`DELETE /$/tasks/{id}` cancels any reasoning run, and a cancelled run changes nothing.
 
 **Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks taken from
 the OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3). Each check is one

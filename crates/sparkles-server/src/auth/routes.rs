@@ -50,6 +50,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
+    ("/$/reason/{ds}/auto", &["PUT", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
     ("/$/tasks", &["GET"]),
     // DELETE (cancel) checks admin on the task's dataset in the handler
@@ -204,6 +205,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // prefixes are dataset content; snapshots and history retention pin storage
         "/{ds}/prefixes" => Dataset(Write),
         "/$/reason/{ds}"
+        | "/$/reason/{ds}/auto"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
