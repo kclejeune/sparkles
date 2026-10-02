@@ -689,6 +689,10 @@ pub struct StoreOptions {
     /// Persistent stores write the spatial index's files (`gen-NNNN/geo/`) after each
     /// build; `false` builds in memory only and writes nothing (read-only servers).
     pub geo_files: bool,
+    /// Compute a change digest for every WAL commit (see
+    /// [`annotations::change_digest`](crate::annotations::change_digest)). A persistent
+    /// store remembers it: once on, later openings compute digests too.
+    pub commit_digests: bool,
 }
 
 /// Default of [`StoreOptions::max_prefixes`].
@@ -719,6 +723,7 @@ impl Default for StoreOptions {
             geo_op_vertices: 2_000_000,
             geo_query_rewrite: true,
             geo_files: true,
+            commit_digests: false,
         }
     }
 }
@@ -759,6 +764,8 @@ pub struct Store {
     _lock: Option<File>,
     dataset_id: uuid::Uuid,
     catalog: Arc<Mutex<Catalog>>,
+    /// commit messages and change digests (lock order: writer, then annotations)
+    annotations: Mutex<crate::annotations::Annotations>,
     /// test hook replacing the wall clock (milliseconds since the epoch)
     clock: Arc<Mutex<Option<Clock>>>,
     /// full-text index, when enabled for this dataset
@@ -863,6 +870,7 @@ impl Store {
             _lock: None,
             dataset_id,
             catalog: Arc::new(Mutex::new(Catalog::memory(root, opts.memory_commit_ring))),
+            annotations: Mutex::new(crate::annotations::Annotations::memory(opts.commit_digests)),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
@@ -875,6 +883,7 @@ impl Store {
             opts,
         };
         store.open_geo();
+        store.digest_root(&root);
         store
     }
 
@@ -1040,6 +1049,8 @@ impl Store {
             .open(&wal_path)?;
         let dvocab_len = gen_.dvocab.len();
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
+        let annotations =
+            crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
         let store = Store {
             root: Some(root.to_path_buf()),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -1070,6 +1081,7 @@ impl Store {
             _lock: Some(lock),
             dataset_id,
             catalog: Arc::new(Mutex::new(catalog)),
+            annotations: Mutex::new(annotations),
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
@@ -1084,6 +1096,9 @@ impl Store {
         store.collect_history(gen_no, head.seq);
         store.open_text(&wal_text)?;
         store.open_geo();
+        if head.seq == 0 {
+            store.digest_root(&head);
+        }
         Ok(store)
     }
 
@@ -1600,6 +1615,71 @@ impl Store {
         self.writer.lock().head
     }
 
+    /// The message and change digest recorded for commit `seq`, if it has either.
+    pub fn annotation(&self, seq: u64) -> Option<crate::annotations::Annotation> {
+        self.annotations.lock().get(seq).cloned()
+    }
+
+    /// This store computes a change digest for every WAL commit
+    /// ([`StoreOptions::commit_digests`]).
+    pub fn commit_digests(&self) -> bool {
+        self.annotations.lock().digests()
+    }
+
+    /// Record the annotation of commit `c`, which is about to become durable (writer lock
+    /// held): its message, and when digests are on and `changes` can tell them, its
+    /// change digest. `changes` gives the deleted and inserted quads as N-Quads lines; it
+    /// returns `None` for a commit whose change set is not at hand (bulk commits).
+    fn annotate(
+        &self,
+        c: &CommitInfo,
+        message: Option<Arc<str>>,
+        changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
+    ) -> Result<crate::annotations::Annotation> {
+        let mut a = self.annotations.lock();
+        let digest = if a.digests() {
+            changes().map(|(deleted, inserted)| {
+                let parent = c.parent().and_then(|p| a.get(p)).and_then(|p| p.digest);
+                crate::annotations::change_digest(
+                    self.dataset_id,
+                    c,
+                    parent.as_ref(),
+                    deleted,
+                    inserted,
+                )
+            })
+        } else {
+            None
+        };
+        let ann = crate::annotations::Annotation { message, digest };
+        a.append(c.seq, ann.clone(), self.dataset_id)?;
+        Ok(ann)
+    }
+
+    /// In-memory stores keep annotations only for the commits their catalog keeps.
+    fn forget_annotations(&self) {
+        if self.root.is_none()
+            && let Some(first) = self.catalog.lock().first()
+        {
+            self.annotations.lock().forget_before(first.seq);
+        }
+    }
+
+    /// The digest of an empty `create` root commit, when digests are on and it has none.
+    fn digest_root(&self, root: &CommitInfo) {
+        if root.seq != 0 || root.kind != CommitKind::Create || root.inserted != 0 {
+            return;
+        }
+        let a = self.annotations.lock();
+        if !a.digests() || a.get(0).is_some_and(|a| a.digest.is_some()) {
+            return;
+        }
+        drop(a);
+        if let Err(e) = self.annotate(root, None, || Some((Vec::new(), Vec::new()))) {
+            tracing::warn!(error = %e, "could not record the root commit's change digest");
+        }
+    }
+
     /// Metadata of one commit, if it exists and is retained.
     pub fn commit(&self, seq: u64) -> Option<CommitInfo> {
         self.catalog.lock().get(seq)
@@ -1929,19 +2009,28 @@ impl Store {
     }
 
     /// The writer lock, waited for in slices while `o` can be cancelled or time out.
+    /// Then the write's precondition, if it has one, is checked on the head snapshot.
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
-        if o.cancel.is_none() && o.deadline.is_none() {
-            return Ok(self.writer.lock());
-        }
-        loop {
-            o.check()?;
-            if let Some(w) = self
-                .writer
-                .try_lock_for(std::time::Duration::from_millis(20))
-            {
-                return Ok(w);
+        let w = if o.cancel.is_none() && o.deadline.is_none() {
+            self.writer.lock()
+        } else {
+            loop {
+                o.check()?;
+                if let Some(w) = self
+                    .writer
+                    .try_lock_for(std::time::Duration::from_millis(20))
+                {
+                    break w;
+                }
             }
+        };
+        if let Some(p) = &o.precondition {
+            p.check(&self.snapshot())?;
         }
+        if let Some(m) = &o.message {
+            crate::annotations::validate_message(m)?;
+        }
+        Ok(w)
     }
 
     /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
@@ -2328,6 +2417,10 @@ impl Store {
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
+        let message = match (&bulk, check.as_ref().and_then(|(_, o)| o.message.as_ref())) {
+            (Some(_), Some(m)) => crate::annotations::validate_message(m)?,
+            _ => None,
+        };
         // the old generation's WAL is the only other copy of the recent commits' ids:
         // the catalog must be durable before it is discarded
         self.catalog.lock().sync()?;
@@ -2448,6 +2541,7 @@ impl Store {
             },
             None => w.head,
         };
+        let mut annotation = crate::annotations::Annotation::default();
         if let Some(root) = &self.root {
             // Publication order: the new generation's files (with the commit its base
             // holds) and directory entries are durable, its WAL file exists durably, then
@@ -2463,14 +2557,27 @@ impl Store {
                 .open(dir.join("wal.log"))?;
             sync_dir(&dir)?;
             sync_dir(root)?;
-            write_atomic(&root.join("CURRENT"), name.as_bytes())?;
+            // a bulk commit's message is durable before the switch (no digest: its
+            // change set is not at hand)
+            if bulk.is_some() {
+                annotation = self.annotate(&head, message.clone(), || None)?;
+            }
+            if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
+                if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err() {
+                    w.poisoned = true;
+                }
+                return Err(e);
+            }
             w.wal = Some(BufWriter::new(wal));
+        } else if bulk.is_some() {
+            annotation = self.annotate(&head, message.clone(), || None)?;
         }
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
         if bulk.is_some() {
             w.head = head;
             self.catalog.lock().append(head);
+            self.forget_annotations();
         }
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
@@ -2542,11 +2649,15 @@ impl Store {
         if validation.is_some() && bulk.is_some() {
             self.guard_committed(head.seq);
         }
+        if bulk.is_none() {
+            annotation = self.annotation(head.seq).unwrap_or_default();
+        }
         let receipt = Receipt {
             dataset_id: self.dataset_id,
             committed: bulk.is_some(),
             commit: head,
             validation,
+            annotation,
         };
         Ok((meta.quads.saturating_sub(before), receipt))
     }
@@ -3269,8 +3380,13 @@ impl WriteTxn<'_> {
                 committed: false,
                 commit: head,
                 validation: None,
+                annotation: self.store.annotation(head.seq).unwrap_or_default(),
             });
         }
+        let message = match &self.opts.message {
+            Some(m) => crate::annotations::validate_message(m)?,
+            None => None,
+        };
         // nothing is written when the disk (or an in-memory store's limit) has no room
         self.store
             .check_disk((self.log.len() as u64 + 1) * WAL_REC as u64)?;
@@ -3296,6 +3412,10 @@ impl WriteTxn<'_> {
             exact: true,
             reconstructed: false,
         };
+        // the message and digest are durable before the commit is (see `annotations`)
+        let annotation = self
+            .store
+            .annotate(&c, message, || Some(self.change_lines()))?;
         let next_bnode = self.guard.next_bnode;
         if let Some(wal) = self.guard.wal.as_mut() {
             let mut data = Vec::with_capacity(self.log.len() * WAL_REC);
@@ -3319,11 +3439,13 @@ impl WriteTxn<'_> {
                 .and_then(|_| wal.get_ref().sync_data());
             if let Err(e) = written {
                 self.guard.poisoned = true;
+                let _ = self.store.annotations.lock().undo(c.seq);
                 return Err(e.into());
             }
         }
         self.guard.head = c;
         self.store.catalog.lock().append(c);
+        self.store.forget_annotations();
         let version = self.base.version + 1;
         let mut snap = Snapshot {
             generation: gen_.clone(),
@@ -3351,7 +3473,33 @@ impl WriteTxn<'_> {
             committed: true,
             commit: c,
             validation,
+            annotation,
         })
+    }
+
+    /// The net changes of this transaction as canonical N-Quads lines: (deleted,
+    /// inserted). The log holds effective changes only, so a quad was present at the
+    /// start iff its first change is a delete, and is present at the end iff its last
+    /// change is an insert.
+    fn change_lines(&self) -> (Vec<String>, Vec<String>) {
+        let mut ends: rustc_hash::FxHashMap<[Id; 4], (u8, u8)> = Default::default();
+        for (op, q) in &self.log {
+            ends.entry(*q).or_insert((*op, *op)).1 = *op;
+        }
+        let view = self.view();
+        let (mut deleted, mut inserted) = (Vec::new(), Vec::new());
+        for (q, (first, last)) in ends {
+            let (was, is) = (first == WAL_DELETE, last == WAL_INSERT);
+            if was == is {
+                continue;
+            }
+            let Some(t) = view.quad_to_terms(&q) else {
+                continue;
+            };
+            let line = crate::annotations::nquads_line(&t);
+            if was { &mut deleted } else { &mut inserted }.push(line);
+        }
+        (deleted, inserted)
     }
 }
 

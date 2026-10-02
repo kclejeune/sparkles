@@ -1,3 +1,4 @@
+pub mod annotations;
 pub mod builder;
 pub mod check;
 pub mod codec;

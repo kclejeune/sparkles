@@ -186,7 +186,7 @@ pub struct BackupCapture {
     pub index_format: u32,
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
-    /// and when present `text.json`, `origin.json`, `validation.json`,
+    /// and when present `annotations.bin`, `text.json`, `origin.json`, `validation.json`,
     /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`).
     /// `reasoning.json` is the caller's to add (the server
     /// holds the current status and applies the "not after `s`" rule).
@@ -251,7 +251,8 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 7] = [
+const OPTIONAL_META: [&str; 8] = [
+    crate::annotations::FILE,
     "text.json",
     "geo.json",
     "origin.json",
