@@ -210,6 +210,8 @@ pub struct ShapesDraft {
     pub shapes: Vec<NodeShapeDraft>,
     /// The shapes graph in Turtle.
     pub shacl: String,
+    /// The shapes graph in the SHACL Compact Syntax (SHACLC).
+    pub shaclc: String,
     /// The ShEx schema in ShExC.
     pub shex: String,
     /// The query shape map for the ShEx schema: `{FOCUS rdf:type <C>}@<shape>, …`.
@@ -1215,11 +1217,13 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
         totals,
         shapes,
         shacl: String::new(),
+        shaclc: String::new(),
         shex: String::new(),
         shape_map: String::new(),
     };
     let names = render::Prefixes::new(&opts.prefixes, &opts.base);
     draft.shacl = render::shacl(&draft, &names);
+    draft.shaclc = render::shaclc(&draft, &names);
     draft.shex = render::shexc(&draft, &names, &subclasses);
     draft.shape_map = render::shape_map(&draft, &names);
     Ok(draft)
