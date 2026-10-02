@@ -3728,7 +3728,15 @@ impl WriteTxn<'_> {
                 + gen_.dvocab.with(|v| v.bytes()) as u64;
             self.store.check_memory(size)?;
         }
-        gen_.dvocab.sync()?;
+        // A commit that added terms syncs them together with its WAL records (see
+        // `sync_commit`); without a WAL they are synced here. They are written to the
+        // file first, so that a reader of the WAL (`sparkles check`, a backup) finds
+        // every term its commit records name.
+        if self.guard.wal.is_none() {
+            gen_.dvocab.sync()?;
+        } else if gen_.dvocab.needs_sync() {
+            gen_.dvocab.flush()?;
+        }
         let c = CommitInfo {
             seq: head.seq + 1,
             timestamp_ms: self.store.commit_time(&head),
@@ -3766,11 +3774,12 @@ impl WriteTxn<'_> {
             let written = wal
                 .write_all(&data)
                 .and_then(|_| wal.flush())
-                .and_then(|_| wal.get_ref().sync_data());
+                .map_err(Error::from)
+                .and_then(|_| sync_commit(wal.get_ref(), &gen_.dvocab));
             if let Err(e) = written {
                 self.guard.poisoned = true;
                 let _ = self.store.annotations.lock().undo(c.seq);
-                return Err(e.into());
+                return Err(e);
             }
             self.store.quota.add(data.len() as u64);
         }
@@ -4055,6 +4064,47 @@ fn open_history(
     Ok(h)
 }
 
+/// Make a commit durable: its WAL records, already written to `wal`, and the delta terms
+/// it added, if any. The two files are synced at the same time, on two threads, so a
+/// commit that adds terms waits for one `fdatasync` rather than two in a row (on ext4
+/// both wait for the same journal commit). A crash can then leave the commit record
+/// durable without the terms it names: replay treats a last commit naming delta ids
+/// that `delta.vocab` lacks as a torn tail, like one whose checksum fails. The commit is
+/// acknowledged only after both syncs succeed, so no acknowledged commit is dropped.
+fn sync_commit(wal: &File, dvocab: &DeltaVocab) -> Result<()> {
+    if !dvocab.needs_sync() {
+        return Ok(wal.sync_data()?);
+    }
+    // the caller wrote both files' new bytes before either sync starts, so that both
+    // are part of the journal commit the first sync starts
+    std::thread::scope(|s| {
+        let vocab = std::thread::Builder::new()
+            .name("vocab-sync".into())
+            .spawn_scoped(s, || dvocab.sync());
+        let synced = wal.sync_data();
+        let vocab = match vocab {
+            Ok(h) => h.join().unwrap_or_else(|_| {
+                Err(std::io::Error::other("the delta vocabulary sync panicked").into())
+            }),
+            // no thread to spare: one after the other
+            Err(_) => dvocab.sync(),
+        };
+        synced?;
+        vocab
+    })
+}
+
+/// The highest delta-vocabulary id among `quads`, plus one (0 when they name none).
+fn delta_ids_end<'a>(quads: impl IntoIterator<Item = &'a [Id; 4]>) -> u64 {
+    quads
+        .into_iter()
+        .flatten()
+        .filter(|id| id.tag() == crate::id::Tag::Delta)
+        .map(|id| id.payload() + 1)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The last commit in a generation's WAL, from its commit records alone.
 pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
     let Ok(buf) = std::fs::read(dir.join("wal.log")) else {
@@ -4140,6 +4190,7 @@ pub(crate) fn replay_wal(
     let recs = buf.as_chunks::<WAL_REC>().0;
     // the last complete transaction may be torn; damage before it is corruption
     let last_commit = recs.iter().rposition(|r| r[0] == WAL_COMMIT);
+    let dvocab_len = from.generation.dvocab.len();
     let mut out = Replay {
         delta: Delta::default(),
         version: 0,
@@ -4192,6 +4243,21 @@ pub(crate) fn replay_wal(
                         "{}: checksum mismatch in the transaction ending at byte {}",
                         from.path.display(),
                         (i + 1) * WAL_REC
+                    )));
+                }
+                // A commit's new terms and its WAL records are synced at the same time
+                // (see `sync_commit`): after a crash, the last commit may name terms
+                // that did not reach `delta.vocab`. It was never acknowledged.
+                let needs = delta_ids_end(pending.iter().map(|(_, q)| q));
+                if needs > dvocab_len {
+                    if Some(i) == last_commit {
+                        break; // torn tail
+                    }
+                    return Err(Error::Corrupt(format!(
+                        "{}: the transaction ending at byte {} names delta term {}, beyond the {dvocab_len} terms of delta.vocab",
+                        from.path.display(),
+                        (i + 1) * WAL_REC,
+                        needs - 1
                     )));
                 }
                 let (mut ins, mut del) = (0i64, 0i64);
@@ -4439,6 +4505,37 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
                 "{s} after reopen: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_failed_sync_of_new_terms_fails_the_commit_and_stops_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, Default::default()).unwrap();
+        store.load(&[src()]).unwrap();
+        let insert = |store: &Store, s: &str| {
+            let mut t = store.write();
+            let q = t
+                .encode_quad(&quad(s, "p", "o"), &mut Default::default())
+                .unwrap();
+            assert!(t.insert(q).unwrap());
+            t.commit()
+        };
+        let head = insert(&store, "n1").unwrap().commit.seq;
+        let len = store.snapshot().len();
+        store.snapshot().generation.dvocab.fail_next_sync();
+        // the WAL records are written and synced, the terms' sync fails
+        assert!(insert(&store, "n2").is_err());
+        // nothing was published, and no further write is accepted: the outcome of the
+        // failed commit is known only after the next open, as for a failed WAL sync
+        assert_eq!(store.head_commit().seq, head);
+        assert_eq!(store.snapshot().len(), len);
+        assert!(matches!(insert(&store, "n3"), Err(Error::Poisoned)));
+        drop(store);
+        // the terms reached the file (only their sync failed): the commit is there
+        let store = Store::open(&root, Default::default()).unwrap();
+        assert_eq!(store.head_commit().seq, head + 1);
+        assert_eq!(insert(&store, "n3").unwrap().commit.seq, head + 2);
     }
 
     #[test]

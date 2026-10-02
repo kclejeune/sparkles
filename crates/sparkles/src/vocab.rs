@@ -395,6 +395,8 @@ struct DeltaFile {
     w: BufWriter<File>,
     /// entries were appended since the last [`DeltaVocab::sync`]
     unsynced: bool,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 impl DeltaVocab {
@@ -456,6 +458,8 @@ impl DeltaVocab {
             file: Some(parking_lot::Mutex::new(DeltaFile {
                 w: BufWriter::new(f),
                 unsynced: false,
+                #[cfg(test)]
+                fail_next_sync: false,
             })),
         })
     }
@@ -498,10 +502,30 @@ impl DeltaVocab {
                 return Ok(());
             }
             f.w.flush()?;
+            #[cfg(test)]
+            if f.fail_next_sync {
+                f.fail_next_sync = false;
+                return Err(std::io::Error::other("injected sync failure").into());
+            }
             f.w.get_ref().sync_data()?;
             f.unsynced = false;
         }
         Ok(())
+    }
+
+    /// Whether entries were inserted since the last [`sync`](Self::sync), that is,
+    /// whether the next one writes and syncs anything.
+    pub fn needs_sync(&self) -> bool {
+        self.file.as_ref().is_some_and(|f| f.lock().unsynced)
+    }
+
+    /// Make the next [`sync`](Self::sync) with new entries fail after writing them to
+    /// the file, as a failed `fdatasync` would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_sync(&self) {
+        if let Some(f) = &self.file {
+            f.lock().fail_next_sync = true;
+        }
     }
 
     /// Write buffered entries to the file (without `fsync`) and return its length in
