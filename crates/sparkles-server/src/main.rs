@@ -26,6 +26,7 @@ mod outbound;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
+mod rdfs;
 mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
@@ -667,6 +668,11 @@ enum Cmd {
         /// configuration it has; the data is validated in full and the result logged
         #[arg(long, value_name = "NAME[=CONFIG]")]
         validate: Vec<String>,
+        /// Answer a dataset's queries over the RDFS closure of its graphs with respect to
+        /// the schema in FILE, as Fuseki's --rdfs does (NAME=FILE, repeatable); the
+        /// setting is kept like one made with PUT /$/rdfs/{ds}
+        #[arg(long, value_name = "NAME=FILE")]
+        rdfs: Vec<String>,
         /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
         /// is refused and queries run without the index
         #[arg(long, default_value_t = 4096)]
@@ -1027,6 +1033,13 @@ enum Cmd {
         /// Allow plain http to a --server other than localhost
         #[arg(long)]
         insecure_http: bool,
+        /// RDFS on read: match the RDFS closure of each graph with respect to the schema
+        /// in this file, as Fuseki's --rdfs does
+        #[arg(long, value_name = "FILE", conflicts_with = "rdfs_graph")]
+        rdfs: Option<PathBuf>,
+        /// RDFS on read with the schema in this graph of the database: `default` or an IRI
+        #[arg(long, value_name = "GRAPH")]
+        rdfs_graph: Option<String>,
         // where SERVICE may connect in a local run (a --server applies its own policy)
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -1235,6 +1248,28 @@ enum Cmd {
         /// Timeout of the checks in seconds
         #[arg(long, requires = "check")]
         timeout: Option<f64>,
+        /// A graph whose triples the rules read: `default` or a graph IRI (repeatable;
+        /// default: the default graph). Without input options, a run reads the graphs
+        /// the recorded status names
+        #[arg(long = "data-graph", value_name = "GRAPH")]
+        data_graphs: Vec<String>,
+        /// A graph that holds the ontology, read like the data graphs (repeatable)
+        #[arg(long = "ontology-graph", value_name = "GRAPH")]
+        ontology_graphs: Vec<String>,
+        /// What to do with owl:imports: `none`, `dataset` (follow them to graphs of the
+        /// database, the default) or `fetch` (also load the missing ones, as LOAD does)
+        #[arg(long, value_name = "MODE")]
+        imports: Option<String>,
+        /// A Jena location-mapping file (lm:name/lm:altName, lm:prefix/lm:altPrefix) for
+        /// the imports
+        #[arg(long, value_name = "FILE")]
+        location_mapping: Option<PathBuf>,
+        /// Load again the imports that earlier runs fetched
+        #[arg(long)]
+        refresh_imports: bool,
+        // where fetched imports may come from
+        #[command(flatten)]
+        outbound: outbound::OutboundArgs,
     },
     /// Print the schema of a database (or data files): classes and predicates with exact
     /// counts and their RDFS/OWL declarations; exits with status 2 when a budget is exceeded
@@ -1721,6 +1756,7 @@ fn run() -> Result<()> {
             text,
             geo,
             validate,
+            rdfs,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -1976,6 +2012,9 @@ fn run() -> Result<()> {
             for v in validate {
                 validate_at_startup(&st, &v)?;
             }
+            for r in rdfs {
+                rdfs::configure(&st, &r)?;
+            }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
@@ -2201,6 +2240,8 @@ fn run() -> Result<()> {
             server,
             dataset,
             insecure_http,
+            rdfs,
+            rdfs_graph,
             outbound,
         } => {
             let q = match (query, text) {
@@ -2225,12 +2266,23 @@ fn run() -> Result<()> {
             }
             let outbound = outbound.local_policy()?;
             let store = open_or_load(loc, &data, opts)?;
+            use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema, SchemaSource};
+            let rdfs = match (rdfs, rdfs_graph) {
+                (Some(f), _) => Some(RdfsOnRead::fixed(RdfsSchema::from_triples(
+                    &rdfs::read_file(&f).with_context(|| format!("--rdfs {}", f.display()))?,
+                ))),
+                (None, Some(g)) => Some(RdfsOnRead::new(SchemaSource::Graph(
+                    (g != "default").then_some(g),
+                ))),
+                (None, None) => None,
+            };
             let qopts = QueryOptions {
                 timeout: timeout.map(Duration::from_secs_f64),
                 max_memory_bytes: (memory_mb > 0).then_some(memory_mb << 20),
                 allow_service: true,
                 outbound,
                 prefixes: store.prefixes().into_iter().collect(),
+                rdfs: rdfs.map(Arc::new),
                 ..Default::default()
             };
             let snap = match at {
@@ -2598,6 +2650,12 @@ fn run() -> Result<()> {
             closure,
             format,
             timeout,
+            data_graphs,
+            ontology_graphs,
+            imports,
+            location_mapping,
+            refresh_imports,
+            outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
             // bad check options exit with 2, before any work
@@ -2657,16 +2715,80 @@ fn run() -> Result<()> {
                 } else {
                     reasoning::incremental_since(previous.as_ref(), &store)
                 };
+                // the input graphs: as given, else as recorded
+                let given = !data_graphs.is_empty()
+                    || !ontology_graphs.is_empty()
+                    || imports.is_some()
+                    || location_mapping.is_some();
+                let inputs = if given {
+                    let graphs = |v: &[String]| {
+                        v.iter()
+                            .map(|g| sparkles_reasoner::GraphRef::parse(g))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| anyhow::anyhow!(e))
+                    };
+                    let mut i = sparkles_reasoner::Inputs::default();
+                    if !data_graphs.is_empty() {
+                        i.data_graphs = graphs(&data_graphs)?;
+                    }
+                    i.ontology_graphs = graphs(&ontology_graphs)?;
+                    if let Some(m) = &imports {
+                        i.imports = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                    }
+                    if let Some(f) = &location_mapping {
+                        let (format, _) = sparkles::io::format_for_path(f)
+                            .with_context(|| format!("{}: unknown RDF format", f.display()))?;
+                        i.location_mapping = sparkles_reasoner::LocationMapping::from_jena(
+                            &std::fs::read(f)?,
+                            format,
+                        )?;
+                    }
+                    i
+                } else {
+                    match &previous {
+                        Some(p) => reasoning::recorded_inputs(p)?,
+                        None => Default::default(),
+                    }
+                };
+                inputs.validate()?;
+                let fetched_before: Vec<String> = previous
+                    .as_ref()
+                    .map(|p| p.fetched_imports.clone())
+                    .unwrap_or_default();
+                let mut fetched = fetched_before.clone();
+                if inputs.imports == sparkles_reasoner::ImportMode::Fetch || refresh_imports {
+                    let qopts = QueryOptions {
+                        outbound: outbound.local_policy()?,
+                        ..Default::default()
+                    };
+                    let refresh = if refresh_imports {
+                        fetched_before
+                    } else {
+                        Vec::new()
+                    };
+                    let f = sparkles_reasoner::fetch_imports(&store, &inputs, &refresh, &qopts)?;
+                    for i in &f.fetched {
+                        eprintln!("fetched owl:imports <{i}>");
+                    }
+                    for w in &f.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    fetched.extend(f.fetched);
+                }
                 let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
                     &extras,
                     sparkles_reasoner::Incremental { since, cache: None },
-                    &Default::default(),
+                    &sparkles_reasoner::ReasonOptions {
+                        inputs: inputs.clone(),
+                        ..Default::default()
+                    },
                 )?;
                 // lets `sparkles serve` pick the inferences up for this database, with
                 // the database's automatic re-run setting kept
                 let mut info = reasoning::recorded(&profile, &extras, &r, &store);
+                reasoning::record_inputs(&mut info, &inputs, &r, fetched);
                 info.auto = previous.and_then(|i| i.auto);
                 state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(

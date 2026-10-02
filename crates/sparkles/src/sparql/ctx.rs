@@ -393,6 +393,8 @@ pub struct Ctx {
     pub outbound_budget: Arc<crate::outbound::RequestBudget>,
     /// consult / fill the store's result cache
     pub use_cache: bool,
+    /// RDFS on read (see [`super::rdfs`])
+    pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
@@ -436,6 +438,7 @@ impl Ctx {
             outbound: Default::default(),
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
+            rdfs: None,
             opt: Optimizations::default(),
             geo: Default::default(),
             warnings: Default::default(),

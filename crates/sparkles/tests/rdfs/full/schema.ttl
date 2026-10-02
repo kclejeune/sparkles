@@ -1,0 +1,31 @@
+# A schema with every kind of declaration RDFS on read reads (tests/rdfs_jena.rs).
+@prefix ex:   <http://example.org/> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+ex:Kitten rdfs:subClassOf ex:Cat .
+ex:Cat    rdfs:subClassOf ex:Mammal .
+ex:Dog    rdfs:subClassOf ex:Mammal .
+ex:Mammal rdfs:subClassOf ex:Animal .
+ex:Person rdfs:subClassOf ex:Agent .
+ex:Pet    rdfs:subClassOf ex:Thing .
+
+# a cycle
+ex:Loop1 rdfs:subClassOf ex:Loop2 .
+ex:Loop2 rdfs:subClassOf ex:Loop1 .
+
+ex:hasMother rdfs:subPropertyOf ex:hasParent .
+ex:hasParent rdfs:subPropertyOf ex:hasRelative .
+
+ex:owns rdfs:domain ex:Person ;
+        rdfs:range  ex:Pet .
+ex:age  rdfs:range  ex:Number .
+
+# a domain of a superproperty is not inherited by ex:hasMother
+ex:hasParent rdfs:domain ex:Animal .
+
+# a subproperty of rdf:type
+ex:kind rdfs:subPropertyOf rdf:type .
+
+# a blank node class, which no data triple can name
+_:anon rdfs:subClassOf ex:Animal .

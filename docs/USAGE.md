@@ -189,6 +189,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
+| `--rdfs NAME=FILE` | | Answer a dataset's queries over the RDFS closure of its graphs with respect to the schema in `FILE`, as Fuseki's `--rdfs` does. The setting is kept like one made with `PUT /$/rdfs/{ds}` ([API](API.md#rdfs-on-read)). |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
 | `--geo-op-vertices N` | `2000000` | Largest total of input vertices for one geometry operation (overlay, buffer, hull, relate). A larger operation is a type error. |
@@ -246,6 +247,7 @@ directly. A running server locks the databases it holds, so use the HTTP API ins
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
+sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
 sparkles dump    --loc db > dump.nq
@@ -261,6 +263,7 @@ sparkles infer   --loc db --profile owl-rl --full   # materialize in full
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
+sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,
                                               #   --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
@@ -279,6 +282,14 @@ the previous closure from the database, removes what the removed triples no long
 support and derives what the added triples support. It prints whether the run was
 full or incremental and, for a full run that could have been incremental, why
 ([API.md](API.md#reasoning-status-and-diagnostics)).
+
+A run reads the default graph and the graphs its `owl:imports` lead to, unless
+`--data-graph` and `--ontology-graph` name other graphs. `--imports none|dataset|fetch`
+decides what happens to imports, and with `fetch` the missing ones are loaded into the
+database, each into the graph named by its IRI, as `LOAD` would. `--location-mapping
+FILE` reads a Jena location-mapping file, and `--refresh-imports` loads the fetched
+imports again. A run without these options reads the graphs the recorded status names
+([API.md](API.md#input-graphs-and-imports)).
 
 `sparkles vector create` writes the index to `vector.json`, builds it, and waits for the
 build. Later openings of the database map the built index from its file. Every

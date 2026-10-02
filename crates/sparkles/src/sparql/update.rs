@@ -121,7 +121,10 @@ fn run_update(
         opts,
         deadline: opts.timeout.map(|t| t0 + t),
         base: parsed.base_iri.clone(),
-        budget: RequestBudget::new(&opts.outbound),
+        budget: opts
+            .outbound_budget
+            .clone()
+            .unwrap_or_else(|| RequestBudget::new(&opts.outbound)),
         produced: Default::default(),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
@@ -298,7 +301,11 @@ fn run_op(
             }
             // the WHERE clause reads the request's graph view only
             super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
-            let node = Planner::new(&ctx).plan(pattern, &ActiveGraph::Default, Vec::new())?;
+            if let Some(r) = &req.opts.rdfs {
+                ctx.rdfs = Some(r.schema(&ctx.snap)?);
+            }
+            let pattern = super::rdfs::apply(&ctx, pattern);
+            let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
             let (table, _) = super::exec::execute(&ctx, &node)?;
             // a graph a template takes from a variable is checked for every solution,
             // before anything else of the quad is looked up

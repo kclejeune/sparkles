@@ -1,0 +1,24 @@
+# The data of the RDFS-on-read comparison with Jena (tests/rdfs_jena.rs).
+@prefix ex:   <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+ex:tom  a ex:Kitten .
+ex:rex  a ex:Dog .
+ex:ann  ex:owns ex:tom , "a toy" ;
+        ex:hasMother ex:beth ;
+        ex:age 42 .
+ex:beth a ex:Person .
+ex:x1   a ex:Loop1 .
+ex:z    ex:kind ex:Cat .
+# a subclass triple in the data, which is not part of the schema
+ex:c    rdfs:subClassOf ex:Animal .
+ex:w    a ex:c .
+
+ex:g1 {
+  ex:felix a ex:Cat .
+  ex:bob   ex:owns ex:felix .
+}
+
+ex:g2 {
+  ex:felix ex:hasMother ex:mia .
+}

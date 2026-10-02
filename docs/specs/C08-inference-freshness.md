@@ -1,6 +1,6 @@
 # C08: Inference freshness and inconsistency diagnostics
 
-> **Status:** implemented (Phases 1, 2 and 3).
+> **Status:** implemented (Phases 1, 2, 3 and 4).
 >
 > **Phases:** Phase 1 shipped. It covers commit-based freshness, `GET /$/reason/{ds}`,
 > the `Sparkles-Inferences` header, re-runs, opt-in automatic re-materialization, the
@@ -9,9 +9,12 @@
 > shipped as well: staleness limited to default-graph commits, the remaining OWL 2 RL
 > checks, the Turtle report, a per-dataset auto setting and superseded automatic runs.
 > Phase 3 shipped incremental materialization with the backward/forward algorithm and
-> diagnostics over chosen graphs.
+> diagnostics over chosen graphs. Phase 4 shipped input graphs, `owl:imports` and RDFS
+> on read.
 >
 > **User docs:** [API: Reasoning status and diagnostics](../API.md#reasoning-status-and-diagnostics) ·
+> [API: Input graphs and imports](../API.md#input-graphs-and-imports) ·
+> [API: RDFS on read](../API.md#rdfs-on-read) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -466,6 +469,9 @@ stopgap writes no `datasetId`.
 **Phase 3:** incremental, DRed-style materialization to make auto mode cheap, and
 diagnostics over chosen named graphs.
 
+**Phase 4:** input graphs other than the default graph, `owl:imports`, staleness over
+every input graph, and Jena's RDFS on read. §11 describes it.
+
 ## 7. Acceptance examples
 
 The examples use dataset `t`, with `ex:` = `http://ex.org/`.
@@ -640,6 +646,180 @@ finding.
 - Apache Jena documentation on `rb:violation`-style validation in rule reasoners. Cited
   from working knowledge, only as a rejected alternative, and not re-fetched.
 - Fluree was not consulted: no code, documentation or product pages.
+
+## 11. Phase 4: input graphs, imports and RDFS on read
+
+Phases 1 to 3 reason over the default graph alone. An ontology kept in a named graph, or
+one that the data imports with `owl:imports`, takes no part. Jena's `OntModel` follows
+imports, and Fuseki can answer queries over the RDFS closure of a dataset without
+materializing it (`--rdfs FILE`, `ja:DatasetRDFS`). Phase 4 adds both.
+
+### 11.1 Input graphs
+
+A materialization reads a set of input graphs. The request names them:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `dataGraphs` | `["default"]` | Graphs whose triples the rules read: `default` or graph IRIs. |
+| `ontologyGraphs` | `[]` | Graphs that hold the ontology, read the same way. |
+| `imports` | `"dataset"` | `none` ignores `owl:imports`. `dataset` follows them to graphs of the dataset. `fetch` also fetches missing ones (§11.2). |
+| `locationMapping` | none | Jena-style mappings from an import IRI to another location (§11.2). |
+| `refreshImports` | `false` | Fetch again the imports that an earlier run fetched. |
+
+The reasoner reads the union of the triples of every input graph. A blank node that
+occurs in two graphs is one node, as in the union default graph. The rules make no
+difference between data and ontology graphs. The split records what each graph is for,
+and the inferred graph can never be an input. Every derived triple that is in none of
+the input graphs goes to `urn:x-sparkles:inferred`, so queries that add the inferred
+graph to the default graph see the entailments of the whole input. The ontology triples
+themselves stay in their graphs.
+
+`sparkles infer` takes `--data-graph`, `--ontology-graph`, `--imports`,
+`--location-mapping FILE` and `--refresh-imports`. The status records the request, so
+re-runs and automatic runs read the same graphs.
+
+### 11.2 `owl:imports`
+
+An import is a triple `?o owl:imports <I>` in an input graph, imported graphs included.
+Objects that are not IRIs are ignored with a warning. A location mapping first turns `I`
+into a location `L`. An exact entry (`name` → `altName`) wins over a prefix rewrite
+(`prefix` → `altPrefix`), and among prefixes the longest match wins. Without a mapping,
+`L` is `I`. Jena's location-mapping files use the same two forms (`lm:name`/`lm:altName`
+and `lm:prefix`/`lm:altPrefix`), and the CLI reads such a file.
+
+The import then resolves to the first of these that exists:
+
+1. the named graph `I`;
+2. the named graph `L`, when it differs from `I`;
+3. with `imports: "fetch"`, the document at `L`, when `L` is an `http`, `https` or `file`
+   URL. The run loads it with `LOAD <L> INTO GRAPH <I>`, so the copy is kept in the
+   dataset as graph `I`.
+
+Fetches follow the rules of `LOAD`. That means the outbound policy (`--outbound-*`),
+the response ceiling and timeouts, content negotiation and compressed bodies, and for
+`file:` URLs `serve --load-dir`. The fetches of one run share one request budget
+(`--outbound-request-max-mb`, `--outbound-request-timeout`), and a run follows at most
+100 imports. A run fetches before it takes the writer lock, each document in its own
+commit, and then reads the dataset as usual. A later run finds the copy in the dataset
+and does not fetch it again, so the inferences do not depend on the network and a run
+can be repeated. `refreshImports` replaces the copies that an earlier run fetched, each
+in one commit.
+
+An import that does not resolve gives a warning, and the run goes on without it. Its
+graph name still counts as an input for staleness, so loading the graph later makes the
+inferences stale. Cycles and repeated imports are read once. A failed fetch is a warning,
+except that a refused destination or a spent budget fails the run, as it fails an update.
+
+### 11.3 Staleness
+
+The status records the configuration and the resolved input graphs, including the names
+of imports that did not resolve. The inferences are fresh while no commit after the
+recorded one changed one of these graphs. The commit's flag answers for the default
+graph, as in Phase 2. For a named graph, the server reads the commit diff restricted to
+that graph, once per new head, and remembers the answer for the dataset. When the diff
+can no longer read the commits, the status is stale with the reason "the changes since
+the materialization can no longer be read". A commit that adds or removes an
+`owl:imports` triple changes an input graph, so it makes the inferences stale too.
+
+### 11.4 Incremental runs
+
+An incremental run takes the changes of the union of the input graphs. A triple joins
+the union when it is added to a graph and was in no input graph before. It leaves the
+union when it is removed and remains in no input graph. The closure kept in memory, and
+the state saved with a persistent dataset, record the input graphs.
+
+A run materializes in full, with the fallback reason "the input graphs changed", when
+the set of input graphs differs from the recorded one. That happens when the request
+names other graphs, an import is added or removed, a mapping changes, or a missing
+import now resolves. Changes to the content of an ontology graph do not force a full
+run. Backward/forward maintains schema triples like any other, and the rule for large
+deletions counts the triples of the union.
+
+### 11.5 RDFS on read
+
+RDFS on read answers queries over the RDFS closure of each graph with respect to a fixed
+schema, without materializing anything. It follows Jena's `MatchRDFS` exactly, which
+covers a subset of RDFS:
+
+- `rdfs:subClassOf` and `rdfs:subPropertyOf` are closed transitively over the schema. A
+  class is its own superclass only through a cycle or an explicit `C rdfs:subClassOf C`.
+- `rdfs:domain` and `rdfs:range` apply to the property that declares them. A domain or
+  range is not inherited by subproperties.
+- Only the schema defines the vocabulary. Data triples with these predicates are matched
+  as plain triples and change no answer.
+- The schema's own triples are not added to the data.
+
+Jena answers a triple pattern by its shape. Writing `sup(C)` for the strict superclasses
+of `C` and `psup(p)` for the strict superproperties of `p`, a pattern matches:
+
+| Pattern | Matches |
+|---|---|
+| `s p o`, `p` a property other than the three below | Stored `s p o`, plus `s q o` for each subproperty `q` of `p`. |
+| `s rdfs:subClassOf o`, `s rdfs:subPropertyOf o` | Stored triples only. |
+| `s rdf:type o` with `s` or `o` constant | Stored types, the domains of the properties of `s`, the ranges of the properties pointing at `s`, and their superclasses. A literal gets a range type. |
+| `?s rdf:type ?o` | The same, except that a literal gets no range type, and `s q o` counts as a type when `rdf:type` is in `psup(q)` and the schema has a class hierarchy. |
+| `s ?p o` with `s` constant | The triples with subject `s` and what one rule step adds to them. Superproperties apply only when the schema has a class hierarchy. |
+| `?s ?p o` with `o` constant | Stored triples with object `o`, the instances of `o` as for `rdf:type`, and the superproperties of every predicate. |
+| `?s ?p ?o` | The union of the cases above. |
+
+A schema without `rdfs:subClassOf`, `rdfs:domain` and `rdfs:range` triples answers type
+patterns from stored triples. Jena's applies the shape that its evaluation sees. In a
+join, a variable that an earlier pattern bound makes the pattern a constant one, so
+Jena's answers to the `?s rdf:type ?o` and `s ?p o` shapes can depend on the order in
+which it evaluates. Sparkles takes the shape from the pattern as written. Jena may also
+return a derived triple more than once, for example a type that two stored types share.
+Sparkles returns each triple once per graph. The derived triples differ only in two edge
+cases, literals with a range type and subproperties of `rdf:type`.
+
+**Where it applies.** The planner rewrites the query algebra before it plans it. Each
+triple pattern whose answer can change becomes a union of stored-triple patterns with
+the schema's terms as constants, under `DISTINCT` on the pattern's variables. Patterns
+that cannot change stay as they are, so they keep every index optimization. The rewrite
+applies in every graph, including `GRAPH ?g`, the union graph and a merged default
+graph. Each graph is closed on its own, as in Jena, where every graph of the dataset is
+wrapped with the schema. It applies to SELECT, ASK, CONSTRUCT and DESCRIBE patterns,
+`EXISTS`, subqueries and update `WHERE` clauses. A property path link `p` becomes
+`p|q…` for the subproperties `q`. Sequences, alternatives and inverses that contain
+`rdf:type` or a negated property set are split into triple patterns. Inside `*`, `+` and
+`?`, an `rdf:type` link and a negated property set match stored triples only.
+
+Graph Store reads, DESCRIBE's descriptions, the reasoner, schema reports, SHACL and
+full-text search read stored triples. Updates write to the stored graphs, as in Jena.
+
+**Configuration.** RDFS on read is a dataset setting. `PUT /$/rdfs/{ds}` sets it with
+`{"graph": IRI}`, a graph of the dataset whose current triples are the schema, or with
+an RDF body, which is stored with the dataset. `GET` reports it and `DELETE` removes it.
+`serve --rdfs NAME=FILE` sets it at startup, like Fuseki's `--rdfs`, and
+`sparkles query --rdfs FILE` applies it to one local query. The setting of a persistent
+dataset is kept in `rdfs.json`. A schema graph is read again after each commit, when a
+query needs it. Schema terms that are blank nodes cannot be constants of the rewritten
+query, so they are left out with a warning. Everyone who may query the dataset sees the
+consequences of the schema, whatever graphs they may read.
+
+**Testing.** Fixtures run the same queries over the same data and schema in Jena 6.2
+(`sparql --desc` with a `ja:DatasetRDFS` assembler) and in Sparkles, and compare the
+answers as sets. A script regenerates the expected answers from Jena.
+
+### 11.6 Acceptance examples
+
+**M. Ontology in a named graph.** Load `ex:Cat rdfs:subClassOf ex:Animal` into graph
+`ex:onto` and `ex:tom a ex:Cat` into the default graph. Materialize with
+`ontologyGraphs: ["http://ex.org/onto"]`. Then `ex:tom a ex:Animal` is in the inferred
+graph, and the subclass triple is not. Inserting `ex:Animal rdfs:subClassOf ex:Thing`
+into `ex:onto` makes the status stale, and an incremental re-run adds `ex:tom a
+ex:Thing`.
+
+**N. Imports.** The default graph holds `<> owl:imports <http://ex.org/onto>` and the
+dataset has the graph `http://ex.org/onto`. A run reads it without configuration. With
+`imports: "fetch"` and the graph missing, a run loads it from the URL into the graph
+`http://ex.org/onto`, and a second run makes no request. With a mapping from
+`http://ex.org/` to `http://mirror.example/`, the document comes from the mirror and is
+still kept as graph `http://ex.org/onto`.
+
+**O. RDFS on read.** With the schema `ex:Cat rdfs:subClassOf ex:Animal .
+ex:owns rdfs:range ex:Pet .` and the data `ex:tom a ex:Cat . ex:ann ex:owns ex:rex .`,
+`SELECT ?x { ?x a ex:Animal }` returns `ex:tom`, and `SELECT ?t { ex:rex a ?t }` returns
+`ex:Pet`, as Jena does. Nothing is written to the dataset.
 
 ## Outcome
 
@@ -827,3 +1007,92 @@ again, so it costs more than a full run for any deletion.
 **Not built.** Rules that are not monotonic, list changes under OWL 2 RL and large
 deletions still run in full. The UI shows the run's method only in the task message.
 `dt-not-type` is still never checked.
+
+**Phase 4.** Phase 4 landed on 2026-10-02 as §11 describes, with these parts:
+
+- **Input graphs.** `ReasonOptions::inputs` names the data and ontology graphs, the
+  imports mode and the location mapping, and defaults to the default graph with its
+  imports followed in the dataset. `POST /$/reason/{ds}` takes the same fields, a form
+  takes `dataGraph`, `ontologyGraph` and `imports`, and `sparkles infer` takes
+  `--data-graph`, `--ontology-graph`, `--imports`, `--location-mapping` and
+  `--refresh-imports`. The status records the configuration when it is not the default,
+  and `inputGraphs`, `watchedGraphs`, `imports` and `fetchedImports` when the run read
+  more than the default graph or found imports. Re-runs, automatic runs and
+  `sparkles infer` without input options read the recorded graphs.
+- **Imports.** `sparkles_reasoner::fetch_imports` loads each missing import with a
+  SPARQL `LOAD` in its own commit, with the caller's `QueryOptions`. All the fetches of
+  one run share one outbound budget through the new `QueryOptions::outbound_budget`. The
+  server passes its outbound policy and `--load-dir`, and the CLI its local policy.
+  `refreshImports` drops and loads again, in one commit each, the copies that the status
+  lists as fetched.
+- **Staleness.** The default graph keeps the commit flag of Phase 2. A named input
+  graph is checked with the commit diff restricted to it, remembered by dataset and
+  recorded commit so that each new head reads only the commits since the last one asked
+  about. An in-memory dataset whose kept states no longer reach the recorded commit
+  reports stale inferences.
+- **Incremental runs.** The commit diff of each input graph, or the deltas of a kept
+  closure, give the changes of each graph, and a triple joins or leaves the union only
+  when no other input graph holds it. The kept closure and `reasoning-generalized.json`
+  record the input graphs, and a different set is the fallback "the input graphs changed
+  since the previous run". The graphs are resolved again under the writer lock, and a
+  set that changed between reading the changes and taking the lock runs in full.
+- **RDFS on read.** `sparkles::sparql::rdfs` builds the schema (Jena's `SetupRDFS`) and
+  rewrites the algebra per Jena's `MatchRDFS` shapes. `QueryOptions::rdfs` carries it,
+  either fixed or read from a graph of the snapshot, and the query, EXPLAIN and update
+  `WHERE` entry points apply it. The server keeps the setting per dataset
+  (`/$/rdfs/{ds}`, `rdfs.json`, `serve --rdfs NAME=FILE`), and `sparkles query --rdfs
+  FILE` or `--rdfs-graph GRAPH` sets it for one local query. The MCP tools apply the
+  dataset's setting too.
+
+**Phase 4 decisions.**
+
+- Jena's answers come from a small Java program that wraps the data with
+  `RDFSFactory.datasetRDFS`, the call behind `ja:DatasetRDFS`. `sparql --desc` refuses
+  an assembler file with both the RDFS dataset and its base dataset, because it finds
+  two dataset roots. `scripts/rdfs-jena-expected.sh` runs the program and writes
+  `crates/sparkles/tests/rdfs/expected.json`.
+- Reading Jena's `MatchRDFS` showed three behaviours that Sparkles follows. A pattern
+  with a constant subject applies superproperties only when the schema has a class
+  hierarchy, because `ApplyRDFS` guards them with the class test. Type patterns with a
+  constant give range types to literals, while `?s rdf:type ?o` does not. Subproperties
+  of `rdf:type` count only in `?s rdf:type ?o` and in patterns with a variable
+  predicate. The fixtures have a schema without a class hierarchy and one of
+  subproperties only to pin these down.
+- Jena's `LocationMapper` picks, among matching prefixes, the one with the longest
+  replacement. Sparkles picks the longest matching prefix, which is what a mapping of a
+  namespace and one of its sub-namespaces means.
+- A class with more than 16 subclasses is matched by one type scan joined with a table
+  of the subclasses, instead of a union of scans, and the planner now looks each
+  repeated term of a VALUES table up once. On the 1,000,418-triple benchmark data, that
+  took `?x a C` for the root class from 469 ms to 86 ms, and a constant subject from
+  32 ms to 5.7 ms.
+- Changes to the content of ontology graphs are maintained incrementally, as schema
+  triples in the default graph already were. Only a change of the set of input graphs
+  forces a full run.
+
+**Phase 4 measurements.** The RDFS-on-read figures are in the
+[API reference](../API.md#rdfs-on-read), measured with
+`cargo run --release -p sparkles-reasoner --example rdfs_on_read -- 1000000` while other
+builds shared the machine (load about 36). RDFS on read answered selective patterns in
+under 6 ms and patterns with 30,000 to 2 million answers 8 to 35 times slower than
+materialized inferences, which took 11.7 s and 2.5 million triples to build.
+
+**Phase 4 tests.** The reasoner's tests compare incremental runs with full runs over the
+same input graphs after random inserts and deletes spread over the default graph, a data
+graph, an ontology graph and a graph that is not an input, with copies of triples in
+several graphs. They run for RDFS and OWL 2 RL, with the closure kept in memory, read
+from the dataset, and kept for a persistent dataset. Other tests cover ontology graphs,
+imports in the dataset and through a mapping, a new import set, Jena location-mapping
+files, fetches from files and over HTTP under the outbound policy, refreshes and
+refused loads. The RDFS-on-read tests compare 55 queries over three schemas with Jena
+6.2's answers, and cover updates, a schema graph that changes, and large class
+hierarchies. The server tests cover the input fields, the recorded status, staleness
+from named graphs before and after a restart, re-runs, fetched imports under
+`--load-dir` with a refresh, and `/$/rdfs/{ds}` with persistence.
+
+**Phase 4 not built.** The Python bindings and the UI have no input graph or RDFS-on-read
+settings. Inside `*`, `+` and `?`, an `rdf:type` link and a negated property set match
+stored triples only, and Graph Store reads and DESCRIBE's descriptions show stored
+triples. Diagnostics still include the inferences by default only when the default graph
+is checked. Jena's ontology document manager also reads an `ont-policy.rdf`, can skip
+imports by IRI and caches models in memory, and Sparkles has none of these.

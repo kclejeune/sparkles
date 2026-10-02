@@ -1,0 +1,9 @@
+# Queries over properties/schema.ttl (see full/queries.txt for the format).
+any-const-subject	SELECT ?p ?o { ex:ann ?p ?o }
+any-const-subject-z	SELECT ?p ?o { ex:z ?p ?o }
+any-const-object	SELECT ?s ?p { ?s ?p ex:beth }
+any	SELECT ?s ?p ?o { ?s ?p ?o }
+type-any	SELECT ?x ?t { ?x a ?t }
+type-const-object	SELECT ?x { ?x a ex:Person }
+type-const-subject	SELECT ?t { ex:ann a ?t }
+subproperty	SELECT ?x ?y { ?x ex:hasRelative ?y }

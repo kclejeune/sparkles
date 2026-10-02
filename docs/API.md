@@ -503,12 +503,15 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary. Returns a cancellable `Task` whose `detail` says how the run went. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). The body can also name the input graphs with `dataGraphs`, `ontologyGraphs`, `imports`, `locationMapping` and `refreshImports`, and a form with `dataGraph`, `ontologyGraph` and `imports` ([input graphs and imports](#input-graphs-and-imports)). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules, extras and input graphs, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary, a malformed input graph, or the inferred graph as an input. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
+| GET    | `/$/rdfs/{ds}`               | The dataset's RDFS-on-read setting, `{ "enabled": false }` when there is none. See [RDFS on read](#rdfs-on-read). |
+| PUT    | `/$/rdfs/{ds}`               | Sets RDFS on read, like Fuseki's `--rdfs`. The body is `{ "graph": IRI \| "default" }` for a schema graph of the dataset, or a schema document in an RDF syntax given by `Content-Type`. Needs `admin`. `400` for a malformed body, `415` for another content type, `403` on a read-only server. |
+| DELETE | `/$/rdfs/{ds}`               | Removes RDFS on read. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
@@ -3090,13 +3093,19 @@ the style needs it, comes from the style.
 The design and its rationale are in [C08 Inference freshness and diagnostics](specs/C08-inference-freshness.md).
 
 A materialization of `urn:x-sparkles:inferred` records the dataset id and the commit it
-wrote. When it changed nothing, it records the head it read instead. A later commit that changes the default graph makes
-the inferences **stale**, because the default graph is all the reasoner reads. Commits
-that change only named graphs leave them fresh, and so do changes to the inferred graph
-itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
+wrote. When it changed nothing, it records the head it read instead. It also records the
+graphs it read, which are the default graph unless the run named
+[other input graphs or followed imports](#input-graphs-and-imports). A later commit that
+changes one of these graphs makes the inferences **stale**. Commits that change only
+other graphs leave them fresh, and so do changes to the inferred graph itself.
+`commitsSince` still counts every commit. Compaction and restarts change nothing.
+
 Each commit records whether it may have changed the default graph. A commit recorded by
-an older version, or one whose record is no longer kept, counts as a change. A status
-written by an older version, or recorded for another dataset id, has unknown freshness
+an older version, or one whose record is no longer kept, counts as a change. For a named
+input graph, the server reads the commit diff restricted to that graph, once for each new
+head. When the diff can no longer read those commits, the inferences are stale with the
+reason "the changes since the materialization can no longer be read". A status written
+by an older version, or recorded for another dataset id, has unknown freshness
 (`stale: null`).
 
 ```ts
@@ -3117,6 +3126,17 @@ type ReasoningStatus = {
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
   run?: ReasoningRun;          // how the last run went
+  // the input graphs, when the run read more than the default graph or found imports
+  inputs?: {                   // the configuration, when it is not the default one
+    dataGraphs: string[];      // "default" or graph IRIs
+    ontologyGraphs?: string[];
+    imports: "none" | "dataset" | "fetch";
+    locationMapping?: ({ name: string; altName: string } | { prefix: string; altPrefix: string })[];
+  };
+  inputGraphs?: string[];      // the graphs read, the resolved imports included
+  watchedGraphs?: string[];    // the graphs whose changes make the inferences stale
+  imports?: { iri: string; location?: string /* after the mapping */; graph?: string /* absent: unresolved */ }[];
+  fetchedImports?: string[];   // imports that runs loaded into the dataset
 };
 
 type ReasoningRun = {
@@ -3125,8 +3145,8 @@ type ReasoningRun = {
   inferredAdded: number;       // triples the run added to the inferred graph
   inferredRemoved: number;     // triples the run removed from it
   changes?: {                  // incremental runs
-    explicitAdded: number;     // default graph triples added since the previous run
-    explicitRemoved: number;   // default graph triples removed since then
+    explicitAdded: number;     // triples added to the input graphs since the previous run
+    explicitRemoved: number;   // triples removed from them since then
     checked: number;           // derived triples whose other proofs were searched for
     removed: number;           // derived triples that no longer follow, generalized ones included
     derived: number;           // derived triples that now follow
@@ -3137,8 +3157,9 @@ type ReasoningRun = {
 
 **Incremental runs.** A re-run, an automatic run and `sparkles infer` update the
 previous materialization instead of computing it again when they can. Such a run reads
-the triples added to and removed from the default graph since the recorded commit, from
-the commit diff. It removes the derived triples that lost their last proof and derives
+the triples added to and removed from the input graphs since the recorded commit, from
+the commit diff. With several input graphs, a triple counts as added when no input graph
+held it before, and as removed when none holds it any more. It removes the derived triples that lost their last proof and derives
 the consequences of the added triples. The inferred graph it writes is the one a full run would write, and
 the differential tests compare the two for RDFS, OWL 2 RL and Jena rules.
 
@@ -3154,7 +3175,7 @@ The run needs the closure of the previous run, which includes the derived triple
 are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
 it in memory after a run, up to `serve --reason-cache-triples` triples (10 million by
 default, about 135 bytes each). After a restart, and in `sparkles infer`, the run builds
-it again from the default graph and the inferred graph of the recorded commit. A
+it again from the input graphs and the inferred graph of the recorded commit. A
 persistent dataset keeps the derived triples that are not valid RDF in its
 `reasoning-generalized.*` files for that purpose. An in-memory dataset without a kept
 closure runs in full.
@@ -3169,10 +3190,13 @@ A run materializes in full, and the status's `run.fallback` says why, when:
 - the rules read RDF lists, as OWL 2 RL does, and a list triple changed or is derived.
   What list builtins see then depends on the order of derivation.
 - the profile, the rule text or the vocabularies differ from the previous run's.
+- the set of input graphs differs from the previous run's. The request named other
+  graphs, an import was added or removed, a mapping changed, or a missing import now
+  resolves. Changes to the content of an ontology graph do not force a full run.
 - the commit diff no longer reaches the recorded commit. A compaction or a bulk load
   starts a new generation, and a dataset that keeps no history then loses the older
   commits.
-- more than one in twenty triples of a default graph of at least 10,000 triples were
+- more than one in twenty triples of input graphs holding at least 10,000 triples were
   removed. A full run is faster then.
 
 **Header.** A query or SHACL validation that includes the inferred graph while the
@@ -3301,6 +3325,143 @@ runs the checks, after materializing when `--profile` or `--rules` is given. `--
 works as the `graph` parameter. It exits
 with 0 (`none-found`), 1 (`violations-found`) or 2 (`incomplete` or an error).
 `sparkles stats` shows a `reasoning` line.
+
+### Input graphs and imports
+
+By default a run reads the default graph and the graphs that its `owl:imports` lead to.
+The request can name other graphs:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `dataGraphs` | `["default"]` | Graphs whose triples the rules read: `default` or graph IRIs. |
+| `ontologyGraphs` | `[]` | Graphs that hold the ontology. They are read the same way. |
+| `imports` | `"dataset"` | `none` ignores `owl:imports`, `dataset` follows them to graphs of the dataset, and `fetch` also loads the missing ones. |
+| `locationMapping` | none | `[{ "name": IRI, "altName": IRI }, { "prefix": IRI, "altPrefix": IRI }]`, as in Jena's location-mapping files. |
+| `refreshImports` | `false` | Loads again the imports that earlier runs fetched. |
+
+The rules read the union of the triples of these graphs. A blank node in two graphs is
+one node, as in the union default graph. A derived triple that no input graph holds goes
+to `urn:x-sparkles:inferred`, so queries see the entailments of the whole input with
+`reasoning=true`, while the ontology's own triples stay in their graphs. The inferred
+graph can never be an input.
+
+An import is a triple `?o owl:imports <I>` in an input graph, imported graphs included.
+The location mapping turns `I` into a location `L`. An exact `name` entry wins over a
+`prefix` rewrite, and the longest matching prefix wins. The import resolves to the named
+graph `I`, or else the named graph `L`. With `imports: "fetch"`, a run first loads each
+missing import whose location is an `http`, `https` or `file` URL with
+`LOAD <L> INTO GRAPH <I>`, in its own commit. The fetches follow the rules of `LOAD`: the
+outbound policy and its timeouts and response ceiling (`--outbound-*`), and
+`--load-dir` for files. They share one request budget, and a run follows at most 100
+imports. Later runs find the copy in graph `I` and fetch nothing, so the inferences do
+not depend on the network. A refused destination or a spent budget fails the run, and
+any other failed fetch is a warning. An import that does not resolve is a warning too.
+Its graph names stay watched, so loading the graph later makes the inferences stale.
+
+```sh
+curl -X POST localhost:3030/$/reason/ds -H 'Content-Type: application/json' -d '{
+  "profile": "owl-rl",
+  "ontologyGraphs": ["http://example.org/ontology"],
+  "imports": "fetch",
+  "locationMapping": [{ "prefix": "http://purl.example/", "altPrefix": "https://mirror.example/" }]
+}'
+```
+
+`sparkles infer` takes `--data-graph` and `--ontology-graph` (repeatable), `--imports`,
+`--location-mapping FILE` with a Jena location-mapping file, and `--refresh-imports`.
+Without them, it reads the graphs that the recorded status names. Its fetches use the
+local `--outbound-*` policy, which allows private addresses unless
+`--outbound-block-private` is given.
+
+## RDFS on read
+
+The design and its rationale are in
+[C08 Phase 4](specs/C08-inference-freshness.md#115-rdfs-on-read).
+
+RDFS on read answers queries over the RDFS closure of each graph with respect to a fixed
+schema, without materializing anything. It is Fuseki's `--rdfs FILE` and Jena's
+`ja:DatasetRDFS`, with the same answers. The schema is either a graph of the dataset,
+read in the state each query sees, or a document given once.
+
+```sh
+curl -X PUT localhost:3030/$/rdfs/ds -H 'Content-Type: text/turtle' --data-binary @schema.ttl
+curl -X PUT localhost:3030/$/rdfs/ds -H 'Content-Type: application/json' -d '{"graph": "http://example.org/schema"}'
+sparkles serve --loc ds=db --rdfs ds=schema.ttl
+sparkles query --loc db --rdfs schema.ttl 'SELECT ?x { ?x a <http://example.org/Animal> }'
+```
+
+`GET /$/rdfs/{ds}` returns `{ "enabled": true, "source": "upload" | "graph", "graph"?:
+string, "schema": { "classesWithSuperclasses", "propertiesWithSuperproperties",
+"propertiesWithDomains", "propertiesWithRanges", "skipped" } }`. Dataset info has the
+same `source` and `graph` under `rdfs`. A persistent dataset keeps the setting in
+`rdfs.json`, and an uploaded schema's triples in `rdfs-schema.nt`. `sparkles query
+--rdfs-graph GRAPH` takes the schema from a graph of the database.
+
+The semantics are those of Jena's `MatchRDFS`, which covers a subset of RDFS:
+
+- `rdfs:subClassOf` and `rdfs:subPropertyOf` are closed transitively over the schema.
+- `rdfs:domain` and `rdfs:range` apply to the property that declares them. A subproperty
+  does not inherit them.
+- Only the schema defines the vocabulary. Data triples with these predicates match as
+  plain triples, and the schema's own triples are not added to the data.
+
+Jena answers a triple pattern by its shape:
+
+| Pattern | Matches |
+|---|---|
+| `s p o`, `p` a property other than the three below | Stored `s p o`, plus `s q o` for each subproperty `q` of `p`. |
+| `s rdfs:subClassOf o`, `s rdfs:subPropertyOf o` | Stored triples only. |
+| `s rdf:type o` with `s` or `o` constant | Stored types, the domains of the properties of `s` and the ranges of the properties pointing at `s`, with their superclasses. A literal gets a range type. |
+| `?s rdf:type ?o` | The same, except that a literal gets no range type, and `s q o` counts as a type when `q` is below `rdf:type` and the schema has a class hierarchy. |
+| `s ?p o` with `s` constant | The triples of `s` and what one rule step derives from them. Superproperties apply only when the schema has a class hierarchy. |
+| `?s ?p o` with `o` constant | Stored triples with object `o`, the instances of `o` as for `rdf:type`, and the superproperties of every predicate. |
+| `?s ?p ?o` | The union of the cases above. |
+
+A schema without `rdfs:subClassOf`, `rdfs:domain` and `rdfs:range` answers type
+patterns from stored triples. Fixtures run the same queries over the same data and three
+schemas in Jena 6.2 and in Sparkles, and compare the answers
+([tests](../crates/sparkles/tests/rdfs_jena.rs)). Two differences remain. Jena may return
+a derived triple more than once, and Sparkles returns it once per graph. Jena picks the
+shape from what its evaluation has bound when it reads a pattern, and Sparkles from the
+pattern as written. The answers then differ only for literals with a range type and for
+subproperties of `rdf:type`.
+
+The planner rewrites the query before planning it. Each triple pattern whose answers
+can change becomes a union of patterns over stored triples, with the schema's terms as
+constants, under `DISTINCT`. Other patterns keep every index optimization. The rewrite
+applies in every graph, including `GRAPH ?g`, the union graph and a default graph merged
+with the inferences, and each graph is closed on its own. It covers SELECT, ASK,
+CONSTRUCT and DESCRIBE patterns, `EXISTS`, subqueries, update `WHERE` clauses and the MCP
+tools. A path link `p` becomes `p` or one of its subproperties. Sequences, alternatives
+and inverses that contain `rdf:type` or a negated property set are split into triple
+patterns, and inside `*`, `+` and `?` an `rdf:type` link or a negated property set
+matches stored triples only. Graph Store reads, DESCRIBE's descriptions, the reasoner,
+schema reports, SHACL and ShEx read stored triples. Updates write to the stored graphs,
+as in Jena. Schema terms that are blank nodes cannot be constants of the rewritten query,
+so they are left out and counted in `skipped`. Everyone who may query the dataset sees
+the consequences of the schema, whatever graphs they may read.
+
+**Cost.** `cargo run --release -p sparkles-reasoner --example rdfs_on_read -- 1000000`
+compares stored answers, RDFS on read and materialized `rdfs-simple` inferences on the
+generated benchmark data, whose schema has 1,365 classes in a tree of depth 5 and 40
+properties. Medians of five runs, with other builds sharing the machine (load about 36):
+
+| Query | Answers | Stored | On read | Materialized |
+|---|---|---|---|---|
+| `?x a C` for a leaf class | 196 | 0.0 ms | 0.1 ms | 0.0 ms |
+| `?x a C` for an inner class | 132,580 | 0.6 ms | 22 ms | 2.6 ms |
+| `?x a C` for the root class | 200,000 | 0.8 ms | 86 ms | 3.4 ms |
+| `?x p ?y` with three subproperties | 60,000 | 0.4 ms | 10 ms | 1.1 ms |
+| `ex:i42 ?p ?o` | 14 | 0.0 ms | 5.7 ms | 0.0 ms |
+| `?x a ?t` | 2,000,181 | 13 ms | 1,303 ms | 39 ms |
+| a join of two type patterns and a property | 30,940 | 0.7 ms | 55 ms | 7.1 ms |
+
+Materializing took 11.7 s and added 2.5 million triples. RDFS on read costs nothing up
+front and nothing in storage. Instead, each query pays for the closure of the patterns it
+reads. A selective pattern costs a few milliseconds of rewriting and planning, and a
+pattern with many answers takes 8 to 35 times as long as over materialized inferences.
+The materialized counts are larger because `rdfs-simple` also inherits domains and
+ranges through subproperties.
 
 ## Write-time validation
 

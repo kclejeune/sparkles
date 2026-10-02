@@ -59,6 +59,23 @@ pub struct ReasoningInfo {
     /// how the last run materialized
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunInfo>,
+    /// the input graphs as the request configured them (`dataGraphs`, `ontologyGraphs`,
+    /// `imports`, `locationMapping`); absent: the default graph and its imports
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<serde_json::Value>,
+    /// the graphs the run read (`default` or IRIs); absent: the default graph alone
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_graphs: Option<Vec<String>>,
+    /// the graphs whose changes make the inferences stale: those read, and those the
+    /// imports that did not resolve name; absent: the default graph alone
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_graphs: Option<Vec<String>>,
+    /// the imports the run found, resolved or not
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<serde_json::Value>,
+    /// the imports that runs fetched into the dataset, by IRI
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetched_imports: Vec<String>,
 }
 
 /// How a materialization ran: in full or incrementally, and what it changed.
@@ -125,6 +142,8 @@ pub struct Dataset {
     /// the closure of the last materialization, for the next incremental run
     #[cfg(feature = "reasoning")]
     pub closure: sparkles_reasoner::Cache,
+    /// RDFS on read, when set (see [`crate::rdfs`])
+    pub rdfs: RwLock<Option<Arc<sparkles::sparql::rdfs::RdfsOnRead>>>,
 }
 
 pub use crate::write_validation::Validation;
@@ -646,6 +665,7 @@ impl AppState {
         };
         let reasoning = store.root().and_then(read_reasoning_file);
         let validation = install_validation(&store);
+        let rdfs = crate::rdfs::load(&store);
         let validation_metrics = Arc::new(crate::obs::ValidationMetrics::new(name));
         store.set_guard_observer(Some(validation_metrics.clone()));
         let queries = sparkles::stored::Catalog::open_or_broken(store.root());
@@ -666,6 +686,7 @@ impl AppState {
             queries,
             #[cfg(feature = "reasoning")]
             closure: sparkles_reasoner::Cache::new(self.reason_cache_triples),
+            rdfs: RwLock::new(rdfs),
         }))
     }
 
