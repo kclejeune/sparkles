@@ -1,7 +1,13 @@
-"""Conversions between sparkles terms and rdflib terms.
+"""rdflib integration: term conversions and the `SparklesStore` store plugin.
 
-rdflib is imported only when a function here is called. Methods of sparkles that take
-a term also accept rdflib's URIRef, BNode and Literal directly.
+rdflib is imported only when a function here is called or `SparklesStore` is first
+used. Methods of sparkles that take a term also accept rdflib's URIRef, BNode and
+Literal directly.
+
+The wheel registers `SparklesStore` as the rdflib store plugin `Sparkles`, so
+`rdflib.Graph("Sparkles")`, `rdflib.Dataset("Sparkles")` and
+`rdflib.ConjunctiveGraph("Sparkles")` keep their triples in Sparkles and run SPARQL in
+its engine.
 """
 
 from __future__ import annotations
@@ -13,11 +19,21 @@ from sparkles._sparkles import BlankNode, DefaultGraph, Literal, NamedNode, Quad
 if TYPE_CHECKING:
     import rdflib
 
+    from sparkles._rdflib_store import SparklesStore
+
     _Term = Union[NamedNode, BlankNode, Literal, Triple, Variable, DefaultGraph]
 
-__all__ = ["from_rdflib", "to_rdflib"]
+__all__ = ["SparklesStore", "from_rdflib", "to_rdflib"]
 
 _XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "SparklesStore":
+        from sparkles._rdflib_store import SparklesStore
+
+        return SparklesStore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def to_rdflib(term: _Term | Quad) -> Any:
