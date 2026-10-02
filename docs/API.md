@@ -56,8 +56,8 @@ of the request carries it.
 `/$/ready` and `/$/metrics` are logged at DEBUG. Each line has these fields:
 
 * `dataset`, or `$none`.
-* `operation`: `query`, `update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin` or
-  `other`.
+* `operation`: `query`, `update`, `gsp`, `upload`, `shacl`, `shex`, `explain`, `admin`,
+  `mcp` or `other`.
 * `status`.
 * `outcome`: `ok`, `client_error`, `error`, `timeout`, `cancelled`, `budget`,
   `rate_limited`, `denied` or `rejected`. `rejected` is a write refused by write-time
@@ -309,12 +309,14 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, and `/{ds}` with `update=` or any other write. A form POST to `/{ds}` counts as an update. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format`. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
+An MCP message is charged by its tool and the dataset it names, and other MCP messages
+are not limited (see [HTTP endpoint](#http-endpoint-mcp)).
 
 `SPEC` is `CLASS[@DATASET]=LIMIT`. `LIMIT` is `off` or a comma-separated list of these
 settings:
@@ -3116,6 +3118,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
+| `/$/mcp` | any | Any caller. Each tool call needs `read` on its dataset, and `sparql_update` needs `write`. An anonymous caller that can read no dataset gets `401`. See [HTTP endpoint](#http-endpoint-mcp). |
 | `/$/auth/tokens` (GET, POST), `/$/auth/tokens/{id}` (DELETE) | | a signed-in caller |
 | `/$/auth/tokens?owner=…` | DELETE | `server-admin` |
 | `/$/auth/device/{code}`, `…/approve`, `…/deny`, `/$/auth/cli/authorize` | | a web UI session or proxy identity |
@@ -3399,14 +3402,16 @@ device approvals and reloads.
 
 The design and its rationale are in [C11 MCP server](specs/C11-mcp-server.md).
 
-`sparkles mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io) on
-stdin/stdout, as JSON-RPC 2.0 with one message per line. It is not an HTTP endpoint, but
-it exposes the same engine as the server.
+The server speaks the [Model Context Protocol](https://modelcontextprotocol.io) over two
+transports that offer the same tools, resources and prompts. `sparkles mcp` speaks it on
+stdin/stdout, as JSON-RPC 2.0 with one message per line, and runs as the user who starts
+it. `sparkles serve --mcp` serves it over Streamable HTTP at `/$/mcp`, where every call
+runs as the HTTP request's caller (see [HTTP endpoint](#http-endpoint-mcp)).
 
 ```
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
-             [--allow-service] [--timeout SECS] [--query-memory-mb N] [--max-rows N]
-             [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
+             [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
+             [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--schema-max-entries N] [--text]
 ```
 
@@ -3420,6 +3425,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--max-rows N` | `200000000` | Rows of any intermediate result. |
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
 | `--max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
+| `--allow-update` | off | Offers `sparql_update` and opens the databases for writing. Without it the process never writes. |
 | `--allow-service` | off | Allows `SERVICE` in queries. |
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
@@ -3430,16 +3436,18 @@ The process exits 0 when stdin closes and 1 on a startup error. Logs go to stder
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses
 `server/discover`, and each request carries the protocol version and client capabilities
 in its `_meta`. An unknown revision gets `-32022` with `data.supported`. The capabilities
-are `{"tools": {}}`. `server/discover` and `tools/list` are cacheable for an hour
-(`ttlMs: 3600000`, `cacheScope: "public"`), because the tool set is fixed for the life of
-the process. `notifications/cancelled` stops the referenced call, and no response is sent
-for that call. The server's `instructions` describe the workflow
+are `{"tools": {}, "resources": {}, "prompts": {}}`. `server/discover` and `tools/list`
+are cacheable for an hour (`ttlMs: 3600000`), because the tool set is fixed for the life
+of the process. Their `cacheScope` is `public`, except on an HTTP server with
+authentication, where tool listings differ between callers and the scope is `private`.
+`notifications/cancelled` stops the referenced call, and no response is sent for that
+call. The server's `instructions` describe the workflow
 (`list_datasets` → `describe_schema` → `sparql_query`) and say that tool results are
 untrusted data.
 
 ### Tools
 
-Tools appear in this order. All are read-only
+Tools appear in this order. All but `sparql_update` are read-only
 (`annotations: {"readOnlyHint": true, "openWorldHint": false}`). `sparql_query` is
 open-world when SERVICE is allowed. The common arguments are:
 
@@ -3465,6 +3473,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
+| `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. Listed only when the server allows updates and the caller may write to a dataset (below). |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
@@ -3520,6 +3529,124 @@ last use. Otherwise the call fails with `unknown-commit`, with a message such as
 "commit 57 does not exist …". All internal queries of one call read one snapshot, and
 `describe_schema` cursors are bound to their snapshot.
 
+### The write tool
+
+`sparql_update` is off by default. The operator turns it on with `sparkles mcp
+--allow-update` or `sparkles serve --mcp-allow-update`, and a `--read-only` server never
+offers it. Over HTTP it is listed only for a caller with `write` on some dataset it can
+see, and a call on a dataset the caller may only read fails with `forbidden`. Its
+annotations are `{"readOnlyHint": false, "destructiveHint": true, "idempotentHint":
+false, "openWorldHint": false}`, so hosts that confirm destructive tools ask the user
+first. The change is committed at once and cannot be undone through MCP.
+
+The update runs like one sent to `/{ds}/update`, with the dataset's prefixes
+predeclared. It passes the dataset's [write-time validation](#write-time-validation), and
+a rejected write fails with `validation-failed` and writes nothing. `message` is recorded
+with the commit under the rules of `Sparkles-Commit-Message`. When the call has no
+`message`, an HTTP request's `Sparkles-Commit-Message` header supplies it. `LOAD` is
+refused with `load-disabled`, because it would read files or fetch URLs. A query sent to
+this tool fails with `not-an-update`. The result is the write's receipt, with the
+commit's sequence number, the quads inserted and deleted, and the validation summary when
+a guard ran.
+
+### Resources and prompts
+
+Each dataset the caller may read has two resources:
+
+| URI | `mimeType` | Content |
+|---|---|---|
+| `sparkles://{ds}/schema` | `application/json` | The `describe_schema` summary at the head commit, for the default graph with default reasoning. |
+| `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
+
+`resources/list` returns them sorted by URI, and `resources/templates/list` returns the
+two URI templates. A `resources/read` result may be cached for 30 seconds by the caller
+only (`ttlMs: 30000`, `cacheScope: "private"`). An unknown URI, or a dataset the caller
+cannot read, is `-32602`. Hosts choose resources as context for the model, so the tools
+remain the main interface.
+
+| Prompt | Arguments | Message |
+|---|---|---|
+| `explore_dataset` | `dataset` | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
+| `answer_question` | `dataset`, `question` | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to inspect the schema first, use LIMIT, verify IRIs with `describe_resource`, cite the commit, and treat data as data. |
+
+Both arguments of each prompt are required, and a missing one or a dataset the caller
+cannot read is `-32602`. Prompt text never contains data from the dataset. Only the
+dataset name, its prefixes and the user's question are filled in.
+
+### HTTP endpoint `/$/mcp`
+
+`sparkles serve --mcp` mounts the endpoint. Without the flag, `/$/mcp` is `404`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--mcp` | off | Serves the MCP tools at `/$/mcp`. |
+| `--mcp-allow-update` | off | Offers `sparql_update`. It has no effect, and logs a warning, on a `--read-only` server. |
+| `--mcp-allow-service` | off | Allows `SERVICE` in MCP queries. `--no-service` still wins, and with auth the caller needs `federate`. |
+| `--mcp-dataset PATTERN` | all | The datasets MCP may show, by name or `*` pattern (repeatable). Permissions still apply within them. |
+| `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
+| `--mcp-query-memory-mb N` | `2048` | Memory budget of a call's queries. `--query-memory-mb` caps it. |
+| `--mcp-max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
+| `--mcp-disable-tool NAME` | | Does not offer the tool (repeatable). |
+| `--mcp-max-sessions N` | `256` | Sessions of legacy clients open at once. `0` serves those clients without sessions. |
+
+A call may ask for a `timeoutSeconds` up to the server's `--timeout`, and calls default
+to 30 seconds. The intermediate-row cap is `--max-rows`.
+
+**Transport.** The endpoint follows the Streamable HTTP transport of the MCP
+specification. A client POSTs one JSON-RPC message with `Content-Type: application/json`
+and `Accept: application/json, text/event-stream`.
+
+- A request of revision `2026-07-28` is stateless. It carries `MCP-Protocol-Version`,
+  `Mcp-Method` and, for `tools/call`, `resources/read` and `prompts/get`, `Mcp-Name`. The
+  answer is one `application/json` response. Headers that disagree with the body get
+  `400` with `-32020`. An unknown method gets `404` with `-32601`.
+- A legacy client starts with `initialize` and gets an `Mcp-Session-Id`. It sends that
+  header, and `MCP-Protocol-Version`, with every later message. Answers to its requests
+  come as a short `text/event-stream`. GET with the session id opens the session's
+  server-to-client stream, and DELETE ends the session. An unknown or ended session is
+  `404`. A session closes after 5 minutes without traffic.
+- A notification or response from the client gets `202` with no body.
+- A body that is not JSON gets `400` with `-32700`. A body over 4 MiB gets `413`. Other
+  methods than POST, GET and DELETE get `405`.
+
+**Who calls.** Every message runs as the request's principal, authenticated as on every
+other route by HTTP Basic, an API token, a web UI session or trusted proxy headers.
+
+- The tools, resources and prompts see only the datasets the principal may read. A
+  dataset it cannot read is reported like one that does not exist (`unknown-dataset`),
+  and `list_datasets` leaves it out.
+- `sparql_update` needs `write` on its dataset. `SERVICE` needs `federate`.
+- An anonymous caller that can read no dataset gets `401` with the server's
+  `WWW-Authenticate` challenges, so a client knows to sign in. Invalid credentials are
+  `401` as on every route.
+- A legacy session belongs to the principal that opened it. The same session id from
+  another caller is `404`. Each message still runs as its own caller.
+
+Clients authenticate with a bearer token in the `Authorization` header. Create one with
+`sparkles auth token create` or `POST /$/auth/tokens`, and scope it to the datasets the
+agent should reach. The endpoint does not publish OAuth protected-resource metadata,
+because the server accepts only its own API tokens and the OIDC provider issues none of
+them. Browser sessions and proxy identities are ambient credentials, so their POSTs need
+the CSRF header as on every other route.
+
+**Limits.** A `tools/call` is charged to the `query` [rate limit](#rate-limiting) of its
+dataset, and a `sparql_update` call to the `update` limit, as the SPARQL endpoints are.
+The client key is the same, so a caller's MCP calls and its SPARQL requests share their
+budgets. A `resources/read` counts as a query. Listings, `initialize`, prompts and
+notifications are not charged. A limited message gets `429` or `503` with `Retry-After`,
+like any other request. The concurrency permits are held until the tool's work ends, even
+when the client has disconnected. Closing the connection of a stateless request cancels
+its tool call.
+
+**Origin and Host.** The endpoint is behind the same checks as every route. A request
+whose `Origin` is not the server's own or an allowed CORS origin (`--cors-origin`, or
+`cors.origins` with auth) gets `403`. Without auth, a `Host` the server does not answer
+to gets `421`, which stops DNS rebinding. Browser clients on an allowed origin can read
+`Mcp-Session-Id`, and send the MCP headers.
+
+The access log records MCP messages with `operation=mcp`. The `sparkles_requests_total`
+and `sparkles_request_duration_seconds` metrics count them under the same label.
+
 ### Errors
 
 A failed call is a result with `isError: true` and one text block
@@ -3534,6 +3661,11 @@ is the equivalent HTTP status:
 | `syntax` | 400 | A SPARQL syntax error, with line and column. The hint lists the predeclared prefixes. Also a shapes graph, ShEx schema or shape map that does not parse. |
 | `invalid-shapes`, `invalid-schema` | 400 | Shapes the SHACL validator cannot use. A ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape), or a shape-map label it does not define. |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query`. |
+| `not-an-update` | 400 | A query sent to `sparql_update`. |
+| `forbidden` | 403 | `sparql_update` on a dataset the caller may only read, or `SERVICE` without `federate`. |
+| `load-disabled` | 403 | `LOAD` in `sparql_update`. |
+| `validation-failed` | 422 | Write-time validation rejected the update. Nothing was written. |
+| `storage-full` | 507 | The write would leave less free disk than the server keeps, or grow an in-memory dataset past its limit. |
 | `timeout` | 408 | The call's timeout passed. |
 | `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |

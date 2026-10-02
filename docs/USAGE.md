@@ -521,7 +521,7 @@ does the same:
 }
 ```
 
-The tools are read-only:
+The tools are read-only unless the operator turns on the write tool:
 
 * `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
   `describe_resource` and `list_commits`.
@@ -534,6 +534,15 @@ The tools are read-only:
 * `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
   the way `sparkles fmt` does, and returns the text with any warnings. It reads no
   dataset.
+* `sparql_update` runs SPARQL Update. It is offered only with `--allow-update` (or
+  `serve --mcp-allow-update`), never on a read-only server. Writes pass the dataset's
+  write-time validation, the call's `message` becomes the commit message, and `LOAD` is
+  refused. Hosts that confirm destructive tools ask before each call.
+
+Hosts can also attach two resources per dataset as context, the schema summary
+(`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`). Two prompts,
+`explore_dataset` and `answer_question`, start a session with the tool workflow and the
+dataset's prefixes.
 
 [API.md](API.md#mcp-server) has the tool schemas. Results are sized for a model's
 context. Query rows come back as a compact table with the dataset's prefixes, up to 100
@@ -550,8 +559,55 @@ the maximum. At most `--max-concurrent` calls (4) run at a time. SERVICE is off 
 any URL. When allowed, SERVICE follows the
 [outbound policy](#outbound-requests-service-and-load). `--disable-tool NAME` removes a
 tool. A database held by a running `sparkles serve` is refused, because the server holds
-its lock. The MCP server supports only stdio. Logs go to stderr, and stdout carries
-JSON-RPC only.
+its lock. Use the server's HTTP endpoint for such a database. Logs go to stderr, and
+stdout carries JSON-RPC only.
+
+### Over HTTP
+
+`sparkles serve --mcp` serves the same tools at `/$/mcp` with the Streamable HTTP
+transport, next to the SPARQL endpoints:
+
+```sh
+sparkles serve --data ./data --mcp                       # read-only tools
+sparkles serve --data ./data --mcp --mcp-allow-update    # plus sparql_update
+sparkles serve --data ./data --mcp --mcp-dataset 'wiki*' # only these datasets
+```
+
+Each call runs as the HTTP request's caller. With `--auth-config`, an agent sees only
+the datasets its credentials may read, and `sparql_update` appears only when they may
+write to one of them. Give the agent its own API token, scoped to what it needs:
+
+```sh
+sparkles auth token create --name agent --dataset wiki=write --dataset 'docs-*=read'
+```
+
+Then point the host at the endpoint with the token as a bearer header. In a project's
+`.mcp.json` for Claude Code, `${SPARKLES_TOKEN}` is read from the environment:
+
+```json
+{
+  "mcpServers": {
+    "sparkles": {
+      "type": "http",
+      "url": "https://sparql.example.org/$/mcp",
+      "headers": { "Authorization": "Bearer ${SPARKLES_TOKEN}" }
+    }
+  }
+}
+```
+
+The command line does the same with
+`claude mcp add --transport http sparkles 'https://sparql.example.org/$/mcp' --header
+"Authorization: Bearer $SPARKLES_TOKEN"`. Other hosts take the same URL and header. A
+server without auth needs no header, and it listens on loopback only.
+
+MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
+apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
+smaller of `--mcp-query-memory-mb` and `--query-memory-mb`. A call may ask for up to the
+server's `--timeout`. Requests from web pages pass the same Origin and Host checks as the
+rest of the API. Hosts that still use the older `initialize` handshake get a session,
+which belongs to the caller that opened it. [API.md](API.md#http-endpoint-mcp) lists the
+flags and the transport details.
 
 ## Embedding the library
 
@@ -682,6 +738,10 @@ is the client.
 `loadDir` passes `--load-dir`, so `LOAD <file:…>` over HTTP may read from that
 directory only. The service gets the directory read-only. It must not contain `dataDir`
 or lie under `/tmp`.
+
+`mcp.enable = true` passes `--mcp` and serves the [MCP tools](#over-http) at `/$/mcp`.
+`mcp.allowUpdate` passes `--mcp-allow-update`, and `mcp.datasets` passes one
+`--mcp-dataset` per name or pattern. Other `--mcp-*` flags go in `extraArgs`.
 
 `metrics.fusekiNames = true` passes `--metrics-fuseki-names`, and
 `metrics.listenAddress = "127.0.0.1:9464"` passes `--metrics-addr` for a scrape port of

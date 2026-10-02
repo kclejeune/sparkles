@@ -131,6 +131,14 @@ let
   )
   ++ lib.optional cfg.readOnly "--read-only"
   ++ lib.optional (!cfg.allowService) "--no-service"
+  ++ lib.optional cfg.mcp.enable "--mcp"
+  ++ lib.optional (cfg.mcp.enable && cfg.mcp.allowUpdate) "--mcp-allow-update"
+  ++ lib.optionals cfg.mcp.enable (
+    lib.concatMap (d: [
+      "--mcp-dataset"
+      d
+    ]) cfg.mcp.datasets
+  )
   ++ lib.optional cfg.otel.enable "--otel"
   ++ lib.optional cfg.otel.logs "--otel-logs"
   ++ lib.optional cfg.otel.queryText "--otel-query-text"
@@ -305,6 +313,34 @@ in
       type = types.bool;
       default = true;
       description = "Allow federated `SERVICE` queries to other endpoints.";
+    };
+
+    mcp = {
+      enable = mkEnableOption ''
+        the Model Context Protocol endpoint `/$/mcp` for LLM agents (`--mcp`). Each call
+        runs as the request's caller and sees only the datasets it may read'';
+
+      allowUpdate = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Offer the `sparql_update` tool at `/$/mcp` (`--mcp-allow-update`) to callers that
+          may write to a dataset. It has no effect with {option}`readOnly`.
+        '';
+      };
+
+      datasets = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "wiki"
+          "public-*"
+        ];
+        description = ''
+          The datasets the MCP tools may see, by name or `*` pattern (`--mcp-dataset`).
+          Empty (the default): all of them. Permissions still apply within them.
+        '';
+      };
     };
 
     cacheMb = mkOption {

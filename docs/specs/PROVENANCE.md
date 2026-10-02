@@ -211,6 +211,13 @@ implementation landed.
     Its dependencies are MIT, Apache-2.0 or both, including `schemars` 1.2.2 (MIT). The
     published crate carries no `LICENSE` file. The license text is in the upstream
     repository.
+  - **HTTP transport** (2026-10-02): rmcp's `transport-streamable-http-server` feature
+    is on as well, for `/$/mcp`. It adds one crate, `sse-stream` 0.2.6 (MIT OR
+    Apache-2.0), which turns HTTP bodies into SSE streams. `tokio-util` 0.7 (MIT) became
+    a direct dependency of the `mcp` feature, for the token that ends the endpoint's
+    streams at shutdown. It was already in the tree through rmcp. The transport, its
+    session rules and the auth integration follow the C11 spec and the C09 permission
+    model. No other MCP server was consulted.
 - **Rejected** (spec §9):
   - a hand-rolled JSON-RPC layer (the fallback, isolated behind `adapter.rs`);
   - rmcp `#[tool]` macros with `schemars`-derived schemas;
