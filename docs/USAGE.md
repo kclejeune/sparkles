@@ -302,6 +302,7 @@ directly. A running server locks the databases it holds, so use the HTTP API ins
 
 ```sh
 sparkles load    --loc db data/*.ttl.gz       # parallel bulk load (tdb2.tdbloader)
+sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV and TSV tables, see below
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
@@ -614,6 +615,64 @@ Each change is a new version with its time, author and message. The MCP server o
 every stored query as a tool named `<dataset>__<query>`, and the UI's query page lists
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
+
+### Loading CSV and TSV
+
+`sparkles load` reads `.csv` and `.tsv` files, compressed or not, next to RDF files, and
+loads them all in one commit. Each table is mapped to triples in one of three ways
+([spec C05](specs/C05-tabular-imports.md)).
+
+Without options, every row becomes one subject and every column one predicate. `--base`
+sets the namespace of both, and `--key` names the column whose value names the row:
+
+```sh
+printf 'id,name\n7,Ann\n8,Bob\n' > people.csv
+sparkles load --loc db people.csv --base http://ex.org/p/ --key id
+# <http://ex.org/p/7> <http://ex.org/p/name> "Ann" .   and so on
+```
+
+Without `--key`, a row is named by its position in the file, as
+`<file:///…/people.csv#row=2>`, and without `--base` the namespace is the file's URL
+followed by `#`. Every value is a plain string, and an empty cell gives no triple.
+
+A CSVW metadata file gives the columns datatypes, null values, list separators and their
+own subjects, predicates and objects. It follows the W3C Metadata Vocabulary for Tabular
+Data, so other CSVW tools read the same files. `sparkles csv mapping` prints the default
+mapping as such a file, which is the easiest way to start one:
+
+```sh
+sparkles csv mapping people.csv --base http://ex.org/p/ --key id > people.csv-metadata.json
+# edit it: "datatype": "integer", "propertyUrl": "schema:name", "lang": "en", ...
+sparkles load --loc db people.csv --mapping people.csv-metadata.json
+```
+
+A file named `people.csv-metadata.json` next to `people.csv` is used without
+`--mapping`, and the command says so. With `--mapping` and no table file, the tables of
+the mapping are loaded from their `url`.
+
+A CONSTRUCT template, as in Tarql, maps each row with SPARQL. Each column is a variable
+named after its header, `?ROWNUM` is the row number, and an empty cell leaves its
+variable unbound:
+
+```sh
+cat > people.rq <<'EOF'
+PREFIX schema: <http://schema.org/>
+CONSTRUCT { ?person a schema:Person ; schema:name ?name }
+WHERE { BIND (IRI(CONCAT("http://ex.org/person/", ?id)) AS ?person) }
+EOF
+sparkles load --loc db people.csv --template people.rq
+```
+
+With `--mapping` as well, the template sees the mapping's typed values. The template
+runs against an empty dataset, and `LIMIT`, `ORDER BY`, aggregates, `FROM` and `SERVICE`
+are refused, because rows are mapped in batches of 10,000.
+
+A cell that does not match its datatype, or a row with the wrong number of cells, stops
+the load with the file, row and column, and nothing is committed. `sparkles csv convert`
+writes the triples without loading them, as N-Triples, N-Quads (`--graph`) or Turtle.
+`--server` loads into a running server: the CLI converts the tables and sends the
+triples. On a server, `POST /{ds}/upload` takes tables too
+([API](API.md#csv-and-tsv-uploads)).
 
 ## Automatic compaction
 

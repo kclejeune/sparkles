@@ -22,6 +22,7 @@ pub mod schema;
 pub mod sparql;
 pub mod store;
 pub mod stored;
+pub mod tabular;
 pub mod text;
 pub mod validation;
 pub mod vector;

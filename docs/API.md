@@ -1165,7 +1165,7 @@ must not exist or must be empty. `SRC` must be a database that no server has ope
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
 | any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
-| POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. |
+| POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
 | POST       | `/{ds}/shex`          | ShEx validation. This is a Sparkles extension; Fuseki has none. See [ShEx validation](#shex-validation). |
 
@@ -1215,6 +1215,37 @@ Query parameters beyond the standard protocol:
   --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
+
+### CSV and TSV uploads
+
+`POST /{ds}/upload` maps CSV and TSV tables to triples and loads them with any RDF files
+of the same request, in one commit ([spec C05](specs/C05-tabular-imports.md)).
+
+* A multipart part whose file name ends in `.csv`, `.tsv` or `.tab`, before an optional
+  compression extension, is a table. A part named `mapping` holds a CSVW metadata
+  document (JSON), and a part named `template` holds a SPARQL CONSTRUCT query. Each is
+  limited to 1 MiB, and it applies to every table of the request.
+* A plain body with `Content-Type: text/csv` or `text/tab-separated-values` is one table
+  mapped with the default mapping.
+* The `base` parameter is the default mapping's namespace and the URL of a mapped table
+  that has no `url`. `key` names the column that names each row in the default mapping.
+  The server has no file URL to build a namespace from, so the default mapping needs
+  `base`.
+
+```sh
+curl -X POST 'localhost:3030/ds/upload?base=http://ex.org/p/&key=id' \
+  -H 'Content-Type: text/csv' --data-binary @people.csv
+curl -X POST localhost:3030/ds/upload \
+  -F mapping=@people.csv-metadata.json -F file=@people.csv
+```
+
+The answer adds `tables` to the usual counts, with the `file`, `rows`, `triples` and
+`warnings` of each table. A cell that does not match its datatype, a row with the wrong
+number of cells, a bad mapping or a refused template answers `400` with the file, row and
+column, and nothing is committed. The N-Triples written for the tables count against
+`--max-decompressed-mb` (`413`) and the free-disk reserve (`507`). A template runs with
+the server's query memory and row budgets. Dry runs and timeouts work as for any upload.
+The Graph Store endpoint does not read CSV.
 
 ### Service description
 

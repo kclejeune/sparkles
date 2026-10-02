@@ -13,6 +13,7 @@ mod clone;
 mod compaction;
 mod compaction_cmd;
 mod compress;
+mod csv_cmd;
 mod exposure;
 #[cfg(feature = "fmt")]
 mod fmt;
@@ -986,7 +987,8 @@ enum Cmd {
         #[arg(long)]
         disable: bool,
     },
-    /// Bulk load RDF files into a database (creates it if needed)
+    /// Bulk load RDF files, and CSV and TSV tables, into a database (creates it if
+    /// needed)
     Load {
         #[arg(long, required_unless_present = "server")]
         loc: Option<PathBuf>,
@@ -994,6 +996,8 @@ enum Cmd {
         #[arg(long)]
         graph: Option<String>,
         files: Vec<PathBuf>,
+        #[command(flatten)]
+        csv: csv_cmd::CsvArgs,
         /// Compression of the files: auto (magic bytes, then the extension), none, gzip,
         /// zstd, brotli or lz4
         #[arg(long, default_value = "auto")]
@@ -1407,6 +1411,9 @@ enum Cmd {
     // rset
     #[command(flatten)]
     Tools(tools::ToolCmd),
+    /// CSV and TSV tables: convert them to RDF without loading, or print the CSVW
+    /// metadata of the default mapping
+    Csv(csv_cmd::CsvCmdArgs),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -2254,10 +2261,12 @@ fn run() -> Result<()> {
         Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
         Cmd::Tools(cmd) => tools::run(cmd, opts),
+        Cmd::Csv(args) => csv_cmd::run(args),
         Cmd::Load {
             loc,
             graph,
             files,
+            csv,
             compression,
             lenient,
             check,
@@ -2272,13 +2281,16 @@ fn run() -> Result<()> {
                 .map(sparkles::annotations::validate_message)
                 .transpose()?
                 .flatten();
+            // tables become temporary N-Triples files, kept until the load is done
+            let prepared = csv_cmd::prepare(&files, &csv)?;
+            let files = &prepared.files;
             // the term checks read the files once before anything is written
             if check {
                 let explicit = match compression.as_str() {
                     "auto" => None,
                     c => Some(sparkles::codec::Codec::parse(c)?),
                 };
-                tools::convert::precheck(&files, explicit, lenient, strict)?;
+                tools::convert::precheck(files, explicit, lenient, strict)?;
             }
             let Some(loc) = loc else {
                 if lenient {
@@ -2291,7 +2303,7 @@ fn run() -> Result<()> {
                     insecure_http,
                     ds,
                     graph.as_deref(),
-                    &files,
+                    files,
                     message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
@@ -2308,9 +2320,13 @@ fn run() -> Result<()> {
             };
             let sources = files
                 .iter()
-                .map(|f| -> Result<Source> {
+                .zip(&prepared.names)
+                .zip(&prepared.converted)
+                .map(|((f, name), &converted)| -> Result<Source> {
                     let mut s = Source::from_path(f, g.clone())?;
-                    s.compression = explicit;
+                    s.name = name.clone();
+                    // a converted table is plain N-Triples
+                    s.compression = if converted { None } else { explicit };
                     s.lenient = lenient;
                     // fail before loading anything
                     s.codec()?;
