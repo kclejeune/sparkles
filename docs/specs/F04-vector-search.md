@@ -2,12 +2,12 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Phases 1, 1b and 2 shipped, apart from their UI pieces. They cover
-> `spk:vector` literals, the similarity functions, `spk:vectorSearch` with variable
-> queries, `candidates:join` and `distinct:subject`, configured indexes with persisted
-> files and background builds, `/$/vector/{ds}/{name}`, `sparkles vector`, and an HNSW
-> graph with an exact overlay of each snapshot's changes. The `/similar` page, the
-> dataset page's index cards and Phase 3 are not built.
+> **Phases:** Phases 1, 1b and 2 shipped. They cover `spk:vector` literals, the
+> similarity functions, `spk:vectorSearch` with variable queries, `candidates:join` and
+> `distinct:subject`, configured indexes with persisted files and background builds,
+> `/$/vector/{ds}/{name}`, `sparkles vector`, an HNSW graph with an exact overlay of each
+> snapshot's changes, the `/similar` page and the dataset page's index cards. Phase 3 is
+> not built.
 >
 > **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -926,7 +926,7 @@ Phases 1b and 2 landed on 2026-10-02.
 * The default `exactThreshold` is 10,000 rows, not 20,000.
 * `PUT` answers `{ index, task }` once the configuration is written, and the task
   follows the build. The recall endpoint is synchronous, not a task.
-* `DatasetStats.vector` and the `/similar` UI are not built.
+* `DatasetStats.vector` is not built. The UI reads `GET /$/vector/{ds}` instead.
 * Vector search results are not cached.
 
 **Tests at landing.**
@@ -966,7 +966,36 @@ graph. The peak memory of a build is 0.7 GB at 100k × 384 and 4.7 GB at 1M × 3
 1M × 768 it reaches 9.3 GB, most of which is mapped vocabulary pages holding the literals'
 text. The server maps the index file and used 3.2 GB at 1M × 768 after the measurements.
 
-**Not built.** The `/similar` UI page and the dataset page's index cards, quantization,
-and everything in Phase 3: background catch-up of the graph with overlay inserts,
+**UI.** The §2.7 pieces landed on 2026-10-02, after the server work.
+* The dataset page has a "Vector indexes" panel with a card for each index. A card shows
+  the predicate, dimension, metric and model, the state with a progress bar during a
+  build, rows, memory, the exact threshold, the HNSW settings with node and layer
+  counts, the segment, graph and file sizes, the overlay, the skipped counts and the last
+  build. An overlay over 10 % of the rows gets a hint that compacting folds it in. The
+  panel also shows the budget in use and the predicates packed without an index, each
+  with a shortcut to index it.
+* Create, Edit, Rebuild and Drop are shown only to callers with `admin` on the dataset,
+  and are disabled on a read-only server. The create dialog reads the dimension from one
+  of the predicate's vectors, and the edit dialog says whether the change keeps the build.
+* "Measure recall" calls the recall endpoint with a chosen k and `ef`. The server keeps
+  no measurement, so the card shows the last one taken in this browser.
+* `/similar` sits between Explore and Datasets in the navigation. It picks an index, a
+  packed predicate or any other predicate, and searches from an entity or from a pasted
+  vector. The vector is checked against the §4.1 grammar as it is typed, with the first
+  error's offset and a warning when its dimension differs from the index's. An entity
+  with several vectors under the predicate is searched by the one picked. Results show
+  the rank, the label, a score bar, the matched vector and actions to open the entity in
+  Explore or to search from it. The footer gives the time and the plan's `method` and
+  `exactBecause`, and the generated SPARQL opens in the query editor. The URL keeps the
+  dataset, index, entity and controls, and the explorer's Similar section links there.
+* The page has no graph picker and no graph column, and labels come from a second query
+  instead of an `OPTIONAL` in the search. k goes up to 100 through a fixed list.
+* The mock (`ui/mock/vector.mjs`) serves every `/$/vector` endpoint with `vector-index`
+  tasks, and its `spk:vectorSearch` follows the index's metric, dimension, `ef:` and
+  `exact:true` and reports the plan counters. Vitest covers the query builder, the
+  vector grammar, the plan counters and the index form, and `ui/tests/mock/vector.spec.ts`
+  and the phone overflow tests drive both pages against the mock.
+
+**Not built.** Quantization, and everything in Phase 3: background catch-up of the graph with overlay inserts,
 keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, hybrid
 ranking with [F03](F03-full-text-search.md), and a compact datatype.
