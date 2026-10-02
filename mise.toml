@@ -205,9 +205,18 @@ description = "Build the Python bindings' release wheel (abi3, CPython 3.10+) wi
 tools = { "github:PyO3/maturin" = "1.15.0" }
 run = "maturin build --release --locked --manifest-path crates/sparkles-py/Cargo.toml --target-dir target --out target/wheels"
 
+[tasks."py:sdist"]
+description = "Build the Python bindings' source distribution into target/wheels, with the vendored spargebra that maturin leaves out"
+tools = { "github:PyO3/maturin" = "1.15.0" }
+run = "python3 scripts/py-sdist.py target/wheels"
+
 [tasks."py:test"]
 description = "Build the Python extension and run its pytest suite (python3 from PATH, with pytest from the dev shell or a venv in target/py-venv); extra args go to pytest"
 run = "scripts/py-test.sh"
+
+[tasks."py:wheel-test"]
+description = "Install a built wheel or sdist into a fresh venv for each given python and run the pytest suite against it: mise run py:wheel-test -- target/wheels/<file> python3"
+run = "scripts/py-wheel-test.sh"
 
 [tasks."py:lint"]
 description = "Clippy (warnings are errors) on the Python bindings, with their default features and with none"

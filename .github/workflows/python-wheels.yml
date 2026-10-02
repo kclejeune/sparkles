@@ -1,0 +1,195 @@
+# Wheels and the source distribution of the Python bindings (crates/sparkles-py, the
+# `sparkles-rdf` distribution). Each job builds an abi3 wheel with maturin-action, installs
+# it, runs the pytest suite against the installation (scripts/py-wheel-test.sh), and
+# uploads it as an artifact. The publish job runs only for a `py-v*` tag, and only when
+# the repository variable PYPI_PUBLISH is "true" and PyPI trusted publishing is set up for
+# the `pypi` environment (docs/DEVELOPMENT.md). Until then the workflow builds and tests,
+# and publishes nothing.
+name: Python wheels
+
+on:
+  push:
+    tags: ["py-v*"]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "vendor/**"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "scripts/py-sdist.py"
+      - "scripts/py-wheel-test.sh"
+      - ".github/workflows/python-wheels.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MATURIN_VERSION: "1.15.0"
+  MANIFEST: crates/sparkles-py/Cargo.toml
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.libc }} ${{ matrix.target }}
+    # arm64 builds and tests natively on GitHub's arm64 runners
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64, libc: manylinux, compat: "2_28", runner: ubuntu-24.04 }
+          - { target: aarch64, libc: manylinux, compat: "2_28", runner: ubuntu-24.04-arm }
+          - { target: x86_64, libc: musllinux, compat: musllinux_1_2, runner: ubuntu-24.04 }
+          - { target: aarch64, libc: musllinux, compat: musllinux_1_2, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.compat }}
+          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
+      - name: Set up CPython 3.10 and 3.14
+        if: matrix.libc == 'manylinux'
+        uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.14
+      - name: Test the wheel on CPython 3.10 and 3.14
+        if: matrix.libc == 'manylinux'
+        run: scripts/py-wheel-test.sh dist/*.whl python3.10 python3.14
+      - name: Test the wheel in Alpine
+        if: matrix.libc == 'musllinux'
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io python:3.13-alpine \
+            sh -c "apk add --no-cache bash > /dev/null && scripts/py-wheel-test.sh dist/*.whl python3"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.libc }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64, runner: macos-15-intel }
+          - { target: aarch64, runner: macos-15 }
+    env:
+      # the oldest macOS the wheels support (spec P01, §2.4)
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up CPython 3.10 and 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.14
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
+      - name: Test the wheel on CPython 3.10 and 3.14
+        run: scripts/py-wheel-test.sh dist/*.whl python3.10 python3.14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up CPython 3.10
+        id: py310
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          architecture: x64
+      - name: Set up CPython 3.14
+        id: py314
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          architecture: x64
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: x64
+          args: --release --locked --manifest-path ${{ env.MANIFEST }} --out dist
+      - name: Test the wheel on CPython 3.10 and 3.14
+        shell: bash
+        env:
+          PY310: ${{ steps.py310.outputs.python-path }}
+          PY314: ${{ steps.py314.outputs.python-path }}
+        run: scripts/py-wheel-test.sh dist/*.whl "$PY310" "$PY314"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up CPython 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Build the sdist
+        run: |
+          pip install --quiet "maturin==$MATURIN_VERSION"
+          python scripts/py-sdist.py dist
+      - name: Build a wheel from the sdist and test it, as `pip install sparkles-rdf` would
+        run: scripts/py-wheel-test.sh dist/*.tar.gz python3.14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    # a release tag, and publishing switched on for the repository
+    if: startsWith(github.ref, 'refs/tags/py-v') && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sparkles-rdf
+    permissions:
+      # PyPI trusted publishing (OpenID Connect): no API token is stored
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check that the tag names the crate's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/sparkles-py/Cargo.toml | head -1)
+          if [ "$GITHUB_REF_NAME" != "py-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the version $version" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
