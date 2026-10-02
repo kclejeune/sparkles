@@ -24,5 +24,5 @@ pub mod vector;
 pub mod vocab;
 pub mod xsd;
 
-pub use dataset::{Dataset, GraphView, Solution, Solutions, Transaction};
+pub use dataset::{Dataset, GraphView, QuadIter, Solution, Solutions, Transaction};
 pub use error::{Budget, BudgetKind, Error, Result};
