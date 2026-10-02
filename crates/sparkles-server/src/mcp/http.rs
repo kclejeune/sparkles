@@ -57,6 +57,9 @@ pub struct ServeArgs {
     /// (ignored, with a warning, on a --read-only server)
     #[arg(long)]
     pub mcp_allow_update: bool,
+    /// Do not offer the datasets' stored queries as tools at /$/mcp
+    #[arg(long)]
+    pub mcp_no_stored_queries: bool,
     /// Allow federated SERVICE calls in MCP queries (--no-service still wins, and with
     /// auth the caller needs the `federate` permission)
     #[arg(long)]
@@ -156,6 +159,7 @@ impl ServeArgs {
                     .cloned()
                     .collect::<BTreeSet<_>>(),
                 datasets: self.mcp_dataset.clone(),
+                stored_queries: !self.mcp_no_stored_queries,
             },
             max_sessions: self.mcp_max_sessions,
             shutdown: CancellationToken::new(),
@@ -242,9 +246,16 @@ fn charge_of(message: &Value) -> Charge {
             } else {
                 Class::Query
             };
+            // a stored query's tool names its dataset (`<dataset>__<query>`)
+            let dataset =
+                str_at(params.and_then(|p| p.get("arguments")), "dataset").or_else(|| {
+                    name.as_deref()
+                        .and_then(|n| n.split_once("__"))
+                        .map(|(ds, _)| ds.to_string())
+                });
             Charge {
                 class: Some(class),
-                dataset: str_at(params.and_then(|p| p.get("arguments")), "dataset"),
+                dataset,
                 initialize: false,
             }
         }

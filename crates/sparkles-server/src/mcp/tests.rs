@@ -404,7 +404,7 @@ async fn a03_tool_list() {
     let mut c = Client::start(fixture_server());
     let r = c.request(2, "tools/list", json!({"_meta": m()})).await;
     let res = &r["result"];
-    assert_eq!(res["ttlMs"], 3_600_000);
+    assert_eq!(res["ttlMs"], 60_000);
     assert_eq!(res["cacheScope"], "public");
     assert!(res.get("nextCursor").is_none());
     let tools = res["tools"].as_array().unwrap();
@@ -562,6 +562,97 @@ async fn draft_shapes_tool() {
     let (text, meta) = c.error("draft_shapes", json!({"support": 2})).await;
     assert!(text.contains("support"), "{text}");
     assert_eq!(meta["code"], "bad-argument");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_queries_are_tools() {
+    let server = fixture_server();
+    let ds = server.state.datasets.read()["t"].clone();
+    let put = |name: &str, def: Value| {
+        let d: sparkles::stored::Definition = serde_json::from_value(def).unwrap();
+        ds.queries
+            .put(name, d, sparkles::stored::Change::default())
+            .unwrap();
+    };
+    put(
+        "older",
+        json!({
+            "query": "PREFIX ex: <http://ex.org/>\nSELECT ?p ?age WHERE { ?p ex:age ?age FILTER(?age >= ?minAge) OPTIONAL { ?p ex:knows ?unused } } ORDER BY ?p",
+            "description": "People at least minAge years old",
+            "parameters": {
+                "minAge": {"type": "integer", "default": 18, "description": "Youngest age"},
+                "unused": {"type": "iri", "required": false}
+            }
+        }),
+    );
+    put("hidden", json!({"query": "ASK { ?s ?p ?o }", "mcp": false}));
+    let mut c = Client::start(server);
+    let r = c.request(2, "tools/list", json!({"_meta": m()})).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"t__older"), "{names:?}");
+    assert!(!names.contains(&"t__hidden"), "{names:?}");
+    let t = tools.iter().find(|t| t["name"] == "t__older").unwrap();
+    assert!(
+        t["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("People at least minAge years old")
+    );
+    assert_eq!(t["annotations"]["readOnlyHint"], true);
+    let props = &t["inputSchema"]["properties"];
+    assert_eq!(
+        props["minAge"],
+        json!({"type": "integer", "description": "Youngest age (an integer)", "default": 18})
+    );
+    assert_eq!(props["unused"]["format"], "iri");
+    assert!(props["maxRows"].is_object() && props["atCommit"].is_object());
+    assert!(t["inputSchema"].get("required").is_none(), "{t}");
+    // a call binds the arguments
+    let text = c
+        .text("t__older", json!({"minAge": 26, "format": "json"}))
+        .await;
+    let j: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["rows"].as_array().unwrap().len(), 1, "{j}");
+    let text = c.text("t__older", json!({})).await;
+    assert!(
+        text.contains("ex:alice") && text.contains("ex:bob"),
+        "{text}"
+    );
+    let (msg, meta) = c.error("t__older", json!({"minAge": "old"})).await;
+    assert!(msg.contains("minAge"), "{msg}");
+    assert_eq!(meta["code"], "bad-argument");
+    let (msg, _) = c.error("t__older", json!({"nope": 1})).await;
+    assert!(msg.contains("unknown parameter 'nope'"), "{msg}");
+    // a query that is not offered is an unknown tool
+    let r = c
+        .request(
+            101,
+            "tools/call",
+            json!({"_meta": m(), "name": "t__hidden", "arguments": {}}),
+        )
+        .await;
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool"),
+        "{r}"
+    );
+}
+
+#[test]
+fn stored_tool_names_fit_clients() {
+    use super::stored::tool_name;
+    assert_eq!(tool_name("wiki", "people-by-age"), "wiki__people-by-age");
+    assert_eq!(tool_name("my.data", "q"), "my_data__q");
+    let long = tool_name(&"d".repeat(40), &"q".repeat(40));
+    assert_eq!(long.len(), 64);
+    assert_ne!(long, tool_name(&"d".repeat(40), &"q".repeat(41)));
+    assert!(
+        long.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

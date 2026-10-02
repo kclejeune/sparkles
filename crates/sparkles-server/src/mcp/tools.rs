@@ -55,7 +55,8 @@ pub fn run(
         #[cfg(feature = "fmt")]
         "format" => t.format(args),
         "sparql_update" => t.sparql_update(args),
-        _ => Err(ToolError::internal(&call.request_id)),
+        // a stored query of a dataset (`<dataset>__<query>`)
+        name => t.stored_query(name, args),
     }
 }
 
@@ -302,7 +303,7 @@ enum Format {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct SparqlQueryArgs {
+pub(super) struct SparqlQueryArgs {
     dataset: Option<String>,
     query: String,
     format: Option<Format>,
@@ -783,6 +784,15 @@ impl Tools<'_> {
 
     fn sparql_query(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
         let a: SparqlQueryArgs = parse(args)?;
+        self.run_sparql(a, Vec::new())
+    }
+
+    /// `sparql_query` with `bindings` as initial bindings (stored queries).
+    pub(super) fn run_sparql(
+        &self,
+        a: SparqlQueryArgs,
+        bindings: Vec<(String, Term)>,
+    ) -> Result<Outcome, ToolError> {
         let cfg = self.cfg();
         query_text(&a.query)?;
         let max_rows = bounded(
@@ -831,7 +841,7 @@ impl Tools<'_> {
             };
         }
         let deadline = self.call.arrived + timeout;
-        let opts = self
+        let mut opts = self
             .query_options(
                 &ds.name,
                 crate::auth::Endpoint::Query,
@@ -840,6 +850,7 @@ impl Tools<'_> {
                 &prefix_map,
             )
             .map_err(|e| ctx.engine(e))?;
+        opts.initial_bindings = bindings;
         let mut r = sparql::execute_query(snap.clone(), &parsed, &opts, parse_ms)
             .map_err(|e| ctx.engine(e))?;
         if r.kind == QueryKind::Select {

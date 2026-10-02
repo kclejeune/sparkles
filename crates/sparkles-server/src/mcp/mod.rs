@@ -20,6 +20,7 @@ mod pins;
 mod render;
 mod schemas;
 mod search;
+mod stored;
 mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -102,6 +103,9 @@ pub struct McpArgs {
     /// Do not offer this tool (repeatable)
     #[arg(long, value_name = "NAME")]
     pub disable_tool: Vec<String>,
+    /// Do not offer the datasets' stored queries as tools
+    #[arg(long)]
+    pub no_stored_queries: bool,
     /// Largest number of classes, and of predicates, a schema report may have
     #[arg(long, value_name = "N", default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
     pub schema_max_entries: usize,
@@ -126,6 +130,8 @@ pub struct McpConfig {
     pub disabled: BTreeSet<String>,
     /// the dataset names (`*` patterns) the tools may see; empty: all
     pub datasets: Vec<String>,
+    /// offer the stored queries of the datasets as tools (C16)
+    pub stored_queries: bool,
 }
 
 impl Default for McpConfig {
@@ -140,6 +146,7 @@ impl Default for McpConfig {
             max_concurrent: 4,
             disabled: BTreeSet::new(),
             datasets: Vec::new(),
+            stored_queries: true,
         }
     }
 }
@@ -291,7 +298,7 @@ impl McpServer {
         args: Map<String, Value>,
         call: Call,
     ) -> Result<Result<Outcome, ToolError>, UnknownTool> {
-        if !self.offers(name) {
+        if !self.offers(name) && self.stored_tool(&call.principal, name).is_none() {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
@@ -450,6 +457,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         max_concurrent: args.max_concurrent,
         disabled: args.disable_tool.into_iter().collect(),
         datasets: Vec::new(),
+        stored_queries: !args.no_stored_queries,
     };
     let server = McpServer::new(st, cfg);
     let rt = tokio::runtime::Builder::new_multi_thread()
