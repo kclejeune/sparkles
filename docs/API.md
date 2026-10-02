@@ -969,8 +969,8 @@ A Graph Store `GET` with `at` gets the entity tag of the commit it read (see
 
 **Accept-Datetime.** A Graph Store `GET` or `HEAD` without `at` acts as its own Memento
 TimeGate (RFC 7089, 200-style negotiation). With an `Accept-Datetime` header, such as
-`Accept-Datetime: Wed, 30 Sep 2026 14:03:11 GMT`, the response is the state as of the
-end of that second: the last readable commit at or before it. A time before the oldest
+`Accept-Datetime: Wed, 30 Sep 2026 14:03:11 GMT`, the response is the last readable
+commit at or before the end of that second. A time before the oldest
 readable commit gets that commit, as RFC 7089 asks, where `at=time:` answers `404`. The
 response carries `Memento-Datetime`, `Content-Location` with the memento's own URL
 (`…&at=commit:42`), `Link: <…>; rel="original timegate"` and `Vary: accept-datetime`.
@@ -993,8 +993,9 @@ at a time.
 
 ### Diffs between commits
 
-`GET /{ds}/diff?from=SEL&to=SEL` returns the net change between two readable states: the
-quads `to` has that `from` lacks (added) and the reverse (removed). Both parameters take
+`GET /{ds}/diff?from=SEL&to=SEL` returns the net change between two readable states. The
+added quads are those `to` has and `from` lacks, and the removed quads are the reverse.
+Both parameters take
 the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
 `?to=commit:42` shows what commit 42 changed. The two may come in either order.
 `graph=IRI` or `default` limits the diff to one graph.

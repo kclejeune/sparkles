@@ -151,17 +151,27 @@ pub(super) async fn diff(
     .await?;
     let id = ds.store.dataset_id();
     let fixed = matches!(d.from.at, At::Commit(_)) && matches!(d.to.at, At::Commit(_));
+    // everything that shapes the body: the commits, the format, the quads listed and the
+    // graph
     let tag = format!(
-        "W/\"{id}:{}..{}:{}{}\"",
+        "W/\"{id}:{}..{}:{}{}{}\"",
         d.from.commit.seq,
         d.to.commit.seq,
-        if text { "diff" } else { "json" },
+        match (text, with_quads) {
+            (true, _) => "diff",
+            (false, true) => "json+quads",
+            (false, false) => "json",
+        },
+        match params.get("limit") {
+            Some(_) if with_quads => format!(":limit={limit}"),
+            _ => String::new(),
+        },
         match (&params.get("graph"), params.has("default")) {
             (Some(g), _) => format!(
-                ":{}",
+                ":graph={}",
                 form_urlencoded::byte_serialize(g.as_bytes()).collect::<String>()
             ),
-            (None, true) => ":default".to_string(),
+            (None, true) => ":graph=default".to_string(),
             _ => String::new(),
         }
     );

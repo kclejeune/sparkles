@@ -1131,8 +1131,8 @@ CLI, `b09f623` added `at` to more endpoints, and `6282681` changed the UI.
 
 **Diffs.** `Store::diff`, `GET /{ds}/diff?from=&to=` and `sparkles diff` return the net
 quads added and removed between two readable commits, in either order. The design rests
-on one property of the write-ahead log: every change it records took effect. An insert
-is logged only for an absent quad and a delete only for a present one. The net
+on one property of the write-ahead log. Every change it records took effect, because an
+insert is logged only for an absent quad and a delete only for a present one. The net
 difference between two commits is then the symmetric difference of the changes between
 them. Each change toggles its quad in a map, and a quad changed back cancels out. A
 quad's first change tells its state at `from`, and its last change tells its state at

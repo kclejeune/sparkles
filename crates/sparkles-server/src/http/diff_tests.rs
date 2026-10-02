@@ -252,6 +252,17 @@ async fn diff_errors_tags_and_budgets() {
     )
     .await;
     assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    // the quads listed shape the body, so they shape the tag
+    let other = get(&s.app, "/h/diff?from=commit:3&to=commit:4&quads=true").await;
+    assert_ne!(other.header("etag").unwrap(), tag);
+    let r = get_with(
+        &s.app,
+        "/h/diff?from=commit:3&to=commit:4&quads=true",
+        "if-none-match",
+        &tag,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
     // the head moves: no tag
     assert!(get(&s.app, "/h/diff?from=3").await.header("etag").is_none());
     // a diff of a gone commit is 410
