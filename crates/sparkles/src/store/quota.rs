@@ -10,7 +10,7 @@
 //!
 //! Size is measured by walking the directory, at most once a second while a quota is
 //! set, and after every rebuild. Between walks, small commits add the bytes they append
-//! to the write-ahead log.
+//! to the write-ahead log. A rebuild is checked with walks of its own.
 
 use super::{Store, dir_size, write_atomic};
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -139,15 +139,19 @@ impl Quota {
     }
 
     /// Before a rebuild that commits (a bulk load or replace) publishes the generation
-    /// built in its own directory: the directory as it is now, less the generation
-    /// `old` it replaces. Refused only over the quota and larger than before, so a
-    /// replace that shrinks a dataset over its quota goes through.
-    pub(crate) fn check_rebuild(&self, old: Option<&Path>) -> Result<()> {
+    /// it built in `new`. Once published, the dataset takes the directory as it is now,
+    /// less the generation `old` that `new` replaces. Before, it takes the directory less
+    /// `new`. The rebuild is refused only when it would be over the quota and larger than
+    /// before, so a replace that shrinks a dataset over its quota goes through. Both
+    /// sizes come from walks made here. The cached measurement of [`used`](Self::used) is
+    /// not used, since a walk made during a long build would count `new` in it.
+    pub(crate) fn check_rebuild(&self, old: Option<&Path>, new: &Path) -> Result<()> {
         let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
             return Ok(());
         };
-        let before = self.used();
-        let projected = dir_size(root).saturating_sub(old.map_or(0, dir_size));
+        let now = dir_size(root);
+        let before = now.saturating_sub(dir_size(new));
+        let projected = now.saturating_sub(old.map_or(0, dir_size));
         if projected > limit && projected > before {
             return Err(Self::exceeded(limit, projected));
         }
@@ -329,7 +333,10 @@ mod tests {
         let used = s.disk_usage();
         s.set_quota(Some(used + used / 2)).unwrap();
         let commit = s.head_commit().seq;
-        // a bulk load that would more than double the dataset is built, then refused
+        // A bulk load that would more than double the dataset is built, then refused.
+        // It is refused even when the size measured above is taken again after the new
+        // generation is written, as happens when the build takes over a second.
+        s.quota.invalidate();
         let e = s.load(&[ttl(5000, "b")]).unwrap_err();
         quota_err(e);
         assert_eq!(s.head_commit().seq, commit);

@@ -8,7 +8,8 @@
 //!
 //! * **Levels** are drawn from `⌊−ln(U) · mL⌋` with `mL = 1/ln(M)` (§4), from a hash of
 //!   the node number and a seed, so a build is reproducible up to the order in which
-//!   parallel insertions meet.
+//!   parallel insertions meet. A sequential build (`Params::sequential`) inserts the
+//!   nodes in order and gives the same graph every time.
 //! * **Insertion** follows Algorithm 1: a greedy descent (`ef = 1`) through the layers
 //!   above the node's level, then a search with `efConstruction` per layer from there
 //!   down, neighbours chosen by the heuristic of Algorithm 4 (a candidate is kept only if
@@ -37,6 +38,9 @@ pub struct Params {
     /// candidates kept while inserting
     pub ef_construction: usize,
     pub seed: u64,
+    /// insert one node at a time, in order: the graph then does not depend on how
+    /// threads are scheduled (tests)
+    pub sequential: bool,
 }
 
 /// What a graph is built over: `len` nodes and the distance between two of them (lower is
@@ -284,7 +288,7 @@ impl Graph {
         };
         if n > 1 {
             // the first nodes one at a time, so the parallel ones start from a graph
-            let seq = n.min(512) as u32;
+            let seq = if p.sequential { n } else { n.min(512) } as u32;
             (1..seq).for_each(insert);
             (seq..n as u32).into_par_iter().for_each(insert);
         }
@@ -440,6 +444,7 @@ mod tests {
             m: 8,
             ef_construction: 64,
             seed: 3,
+            sequential: false,
         };
         let g = Graph::build(&pts, &p, &ctl()).unwrap();
         assert!(g.check());
@@ -467,6 +472,31 @@ mod tests {
         assert!(got.iter().all(|x| x.1 % 2 == 0));
     }
 
+    /// A sequential build gives the same graph every time, whatever runs beside it.
+    #[test]
+    fn sequential_builds_are_reproducible() {
+        let pts = Points(points(3000, 5));
+        let p = Params {
+            m: 8,
+            ef_construction: 32,
+            seed: 7,
+            sequential: true,
+        };
+        let a = Graph::build(&pts, &p, &ctl()).unwrap();
+        let b = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap()
+            .install(|| Graph::build(&pts, &p, &ctl()).unwrap());
+        assert!(a.check());
+        assert_eq!((a.entry, a.top, a.nodes), (b.entry, b.top, b.nodes));
+        assert_eq!(&*a.level0, &*b.level0);
+        assert_eq!(a.upper.len(), b.upper.len());
+        for (x, y) in a.upper.iter().zip(&b.upper) {
+            assert_eq!((&*x.0, &*x.1), (&*y.0, &*y.1));
+        }
+    }
+
     #[test]
     fn small_and_cancelled() {
         let pts = Points(points(3, 1));
@@ -474,6 +504,7 @@ mod tests {
             m: 4,
             ef_construction: 8,
             seed: 0,
+            sequential: false,
         };
         let g = Graph::build(&pts, &p, &ctl()).unwrap();
         let mut got: Vec<u32> = g

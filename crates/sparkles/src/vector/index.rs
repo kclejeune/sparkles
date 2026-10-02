@@ -480,6 +480,8 @@ pub(crate) struct BuildCtl<'a> {
     pub load: bool,
     /// write the index's file after a build
     pub write: bool,
+    /// build the graph one node at a time (see [`hnsw::Params::sequential`])
+    pub sequential: bool,
 }
 
 /// How a build ended.
@@ -613,6 +615,7 @@ pub(crate) fn build_index(
             m: h.m,
             ef_construction: h.ef_construction,
             seed: SEED,
+            sequential: ctl.sequential,
         };
         let Some(g) = Graph::build(
             &space,

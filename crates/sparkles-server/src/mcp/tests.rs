@@ -1048,6 +1048,13 @@ async fn a15_describe_resource() {
         .await;
     assert_eq!(e["code"], "bad-argument");
     assert!(t.starts_with("invalid IRI 'ex alice'"), "{t}");
+    // a blank node a query minted (`_:q…`), or another spelling of a stored node's
+    // label, names no node of the dataset
+    for label in ["_:q0", "_:b00", "_:B0"] {
+        let (t, e) = c.error("describe_resource", json!({"iri": label})).await;
+        assert_eq!(e["code"], "bad-argument");
+        assert!(t.contains("not a blank node label of this dataset"), "{t}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

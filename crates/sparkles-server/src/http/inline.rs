@@ -70,7 +70,12 @@ pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {
 
 /// The query texts (per dataset) whose last run was quick.
 #[derive(Default)]
-pub struct QuickQueries(Mutex<HashSet<u64>>);
+pub struct QuickQueries {
+    quick: Mutex<HashSet<u64>>,
+    /// test hook: queries whose runs count as quick however long they took
+    #[cfg(test)]
+    timeless: Mutex<HashSet<u64>>,
+}
 
 impl QuickQueries {
     pub fn key(dataset: &str, query: &str) -> u64 {
@@ -81,12 +86,27 @@ impl QuickQueries {
     }
 
     pub fn is_quick(&self, key: u64) -> bool {
-        self.0.lock().contains(&key)
+        self.quick.lock().contains(&key)
+    }
+
+    /// Test hook: a run of the query with this key that ends with a whole response
+    /// counts as quick, however long it took. On a loaded machine a run that is quick
+    /// on its own can take longer than [`QUICK_QUERY_MS`]. A failed or streamed run
+    /// still makes the query not quick.
+    #[cfg(test)]
+    pub fn ignore_time(&self, key: u64) {
+        self.timeless.lock().insert(key);
     }
 
     /// Record how long a run of the query took, in milliseconds of work.
     pub fn record(&self, key: u64, ms: f64) {
-        let mut set = self.0.lock();
+        #[cfg(test)]
+        let ms = if ms.is_finite() && self.timeless.lock().contains(&key) {
+            0.0
+        } else {
+            ms
+        };
+        let mut set = self.quick.lock();
         if ms < QUICK_QUERY_MS {
             if set.len() >= REMEMBERED && !set.contains(&key) {
                 set.clear();
@@ -114,6 +134,12 @@ mod tests {
         assert!(!q.is_quick(b));
         // a slow run makes it run on the blocking pool again
         q.record(a, QUICK_QUERY_MS * 2.0);
+        assert!(!q.is_quick(a));
+        // with the test hook, a slow run counts as quick, a failed one does not
+        q.ignore_time(a);
+        q.record(a, QUICK_QUERY_MS * 2.0);
+        assert!(q.is_quick(a));
+        q.record(a, f64::INFINITY);
         assert!(!q.is_quick(a));
     }
 

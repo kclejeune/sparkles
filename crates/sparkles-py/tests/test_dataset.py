@@ -154,6 +154,28 @@ def test_blank_nodes(ds: Dataset) -> None:
     assert rows[0]["b"] == stored
 
 
+def test_minted_blank_nodes_are_not_stored_ones(ds: Dataset) -> None:
+    ds.extend([Quad(BlankNode("x"), ex("p"), Literal(1))])
+    (q,) = ds.quads_for_pattern(None, ex("p"))
+    stored = q.subject
+    assert isinstance(stored, BlankNode) and stored.value.startswith("b")
+    # a blank node that a query mints has a label of its own kind
+    (row,) = ds.query("SELECT (BNODE() AS ?n) WHERE {}")
+    minted = row["n"]
+    assert isinstance(minted, BlankNode) and minted.value.startswith("q")
+    # a later request does not take it for a stored node or for one it mints itself
+    assert list(ds.quads_for_pattern(minted)) == []
+    assert ds.query("ASK { ?n ?p ?o }", bindings={"n": minted}) is False
+    same = "ASK { BIND(BNODE() AS ?m) FILTER(sameTerm(?m, ?n)) }"
+    assert ds.query(same, bindings={"n": minted}) is False
+    assert ds.query("ASK { ?n ?p ?o }", bindings={"n": stored}) is True
+    # inserted by an update, it becomes a new stored node
+    ds.update("INSERT { ?n <http://ex.org/q> 2 } WHERE { BIND(BNODE() AS ?n) }")
+    (made,) = ds.quads_for_pattern(None, ex("q"))
+    assert isinstance(made.subject, BlankNode) and made.subject.value.startswith("b")
+    assert made.subject != stored
+
+
 def test_a10_dump(ds: Dataset, tmp_path: Path) -> None:
     ds.add(Quad(ex("a"), ex("p"), Literal("in g"), ex("g")))
     data = ds.dump(format="nq")

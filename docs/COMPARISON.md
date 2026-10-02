@@ -123,7 +123,7 @@ or web UI.
 | Values are inlined only when their lexical form is canonical | QLever inlines lossily: doubles lose 4 bits and the lexical form is dropped. Sparkles keeps exact RDF term identity (`"01"^^xsd:integer` ≠ `"1"^^xsd:integer`), as Jena does. Doubles whose low mantissa bits are set go to the vocabulary. |
 | The graph is a 4th key column in every permutation, plus a GSPO permutation | Matches QLever's graph column. GSPO gives TDB2-style graph-scoped access (dumps, enumerating `GRAPH ?g {}`). |
 | Deltas are persistent ordered sets (`imbl`), logged to the WAL | Snapshots publish in O(1) for MVCC. QLever locates delta triples per block instead; Sparkles may adopt that later. |
-| Blank nodes are stored ids and serialize as `_:b<hex>` | Labels round-trip through the protocol, as with Jena's `<_:…>` handling. |
+| Blank nodes are stored ids and serialize as `_:b<hex>` | A stored node keeps its label across requests, and the dataset APIs and query bindings accept it back. Blank nodes that a query makes are `_:q<hex>` and belong to their result. |
 | LZ4 instead of zstd for index blocks; front coding instead of FSST for the vocabulary | Fast decoding on the query path. zstd is used where ratio matters more than decode speed: backups, dumps, HTTP and the full-text document store. zstd blocks and FSST remain possible upgrades. |
 | Canonical decimal output follows XSD 1.1 (`"4"^^xsd:decimal`); Jena writes `"4.0"` | Inherited from `oxsdatatypes`. The values are equal, so value-based result comparison is unaffected. |
 | SPARQL parsing and algebra through `spargebra`, not a port of ARQ's JavaCC grammar | The algebra matches SPARQL 1.1 §18. ARQ's syntax extensions (LET, `apf:` property functions, custom aggregates) are not supported. |

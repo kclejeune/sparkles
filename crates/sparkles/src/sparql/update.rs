@@ -316,14 +316,25 @@ fn run_op(
                 let id = table.cols[c][i];
                 (!id.is_undef()).then_some(id)
             };
+            // A blank node the WHERE clause minted (BNODE(), a SERVICE result) is not in
+            // the store: inserting it makes a new stored node, the same one wherever the
+            // operation inserts it, and never one that exists already.
+            let mut minted = Minted::default();
             // resolve query-local ids into store ids
-            let to_store = |txn: &mut WriteTxn<'_>, ctx: &Ctx, id: Id| -> Result<Option<Id>> {
+            let to_store = |txn: &mut WriteTxn<'_>,
+                            minted: &mut Minted,
+                            ctx: &Ctx,
+                            id: Id|
+             -> Result<Option<Id>> {
                 Ok(match id.tag() {
                     Tag::Local => match ctx.term(id) {
-                        Some(t) => Some(txn.intern(&t)?),
+                        Some(t) => {
+                            let t = minted.stored(txn, &t);
+                            Some(txn.intern(&t)?)
+                        }
                         None => None,
                     },
-                    Tag::BNode if id.payload() & Id::LOCAL_BNODE_BIT != 0 => None,
+                    Tag::BNode => Some(minted.id(txn, id)),
                     _ => Some(id),
                 })
             };
@@ -371,7 +382,7 @@ fn run_op(
                     let mut tp = |txn: &mut WriteTxn<'_>, t: &TermPattern| -> Result<Option<Id>> {
                         Ok(match t {
                             TermPattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                                Some(id) => to_store(txn, &ctx, id)?,
+                                Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                                 None => None,
                             },
                             TermPattern::BlankNode(b) => Some(bnode(txn, &mut bnodes, b)),
@@ -396,7 +407,10 @@ fn run_op(
                                     &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
                                     &mut bn,
                                 ) {
-                                    Some(term) => Some(txn.intern(&term)?),
+                                    Some(term) => {
+                                        let term = minted.stored(txn, &term);
+                                        Some(txn.intern(&term)?)
+                                    }
                                     None => None,
                                 }
                             }
@@ -409,7 +423,7 @@ fn run_op(
                             Some(txn.intern(&Term::NamedNode(n.clone()))?)
                         }
                         NamedNodePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                            Some(id) => to_store(txn, &ctx, id)?,
+                            Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                             None => None,
                         },
                     };
@@ -419,7 +433,7 @@ fn run_op(
                             Some(txn.intern(&Term::NamedNode(n.clone()))?)
                         }
                         GraphNamePattern::Variable(v) => match get(&ctx, v.as_str(), i) {
-                            Some(id) => to_store(txn, &ctx, id)?,
+                            Some(id) => to_store(txn, &mut minted, &ctx, id)?,
                             None => None,
                         },
                     };
@@ -648,6 +662,45 @@ fn graph_pat(
         }
         GraphNamePattern::NamedNode(n) => Some(ctx.intern_term(&Term::NamedNode(n.clone()))),
         GraphNamePattern::Variable(v) => get(v.as_str()),
+    }
+}
+
+/// The stored blank nodes that the minted blank nodes of one operation's solutions
+/// become when inserted.
+#[derive(Default)]
+struct Minted(FxHashMap<u64, Id>);
+
+impl Minted {
+    /// The stored id of a blank node id: itself for a stored node, else (a node the
+    /// WHERE clause minted) a new stored node, the same one for the same minted node.
+    fn id(&mut self, txn: &mut WriteTxn<'_>, id: Id) -> Id {
+        if id.payload() & Id::LOCAL_BNODE_BIT == 0 {
+            return id;
+        }
+        *self
+            .0
+            .entry(id.payload())
+            .or_insert_with(|| txn.new_bnode())
+    }
+
+    /// `t` with the minted blank nodes inside its triple terms replaced by stored ones.
+    fn stored(&mut self, txn: &mut WriteTxn<'_>, t: &Term) -> Term {
+        match t {
+            Term::BlankNode(b) => match crate::id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Term::BlankNode(crate::store::bnode_for(self.id(txn, Id::bnode(p)))),
+                None => t.clone(),
+            },
+            Term::Triple(tr) => {
+                let s = match self.stored(txn, &tr.subject.clone().into()) {
+                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                    _ => unreachable!("a subject stays a subject"),
+                };
+                let o = self.stored(txn, &tr.object);
+                Term::Triple(Box::new(oxrdf::Triple::new(s, tr.predicate.clone(), o)))
+            }
+            t => t.clone(),
+        }
     }
 }
 
