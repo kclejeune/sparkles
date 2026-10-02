@@ -477,7 +477,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
-| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. See [Schema discovery](#schema-discovery). |
+| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
@@ -670,13 +670,53 @@ A report is never returned partially.
 The counts come from one ordered pass over the PSO index and one over the POS index per
 predicate, so a report costs about two sequential reads of the selected triples.
 
+**VoID export.** The summary is also served as RDF, as a description in the
+[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with `Accept: text/turtle`,
+another RDF media type (`application/n-triples`, `application/ld+json`,
+`application/rdf+xml`, `application/trig`, `application/n-quads`), or the `format`
+parameter (`turtle`, `ntriples`, `jsonld`, `rdfxml`, `trig`, `nquads`, or `json` for the
+JSON document). JSON stays the default. The selection parameters apply as above, and
+`limit` and `cursor` do not, because the description is always complete.
+
+```turtle
+<urn:x-sparkles:schema:wiki:42> a void:Dataset ;
+    dcterms:title "wiki" ;
+    dcterms:created "2026-10-02T12:04:00Z"^^xsd:dateTime ;
+    void:triples 5 ;                # distinct triples in the selection
+    void:entities 3 ;               # distinct IRI subjects
+    void:classes 2 ;                # distinct rdf:type objects
+    void:properties 3 ;             # predicates with triples
+    void:distinctSubjects 3 ;
+    void:distinctObjects 4 ;
+    void:classPartition _:c1 , _:c2 ;
+    void:propertyPartition _:p1 , _:p2 , _:p3 .
+_:c1 void:class ex:Person ; void:entities 2 .   # instances
+_:c2 void:class owl:Class ; void:entities 1 .
+_:p1 void:property ex:knows ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+_:p2 void:property rdf:type ; void:triples 3 ; void:distinctSubjects 3 ; void:distinctObjects 2 .
+_:p3 void:property rdfs:label ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+```
+
+The node's IRI is `urn:x-sparkles:schema:<dataset>:<snapshot version>`. Every class with
+instances gets a class partition, and every predicate with triples a property
+partition. The partitions reuse the report's exact counts. `void:entities`,
+`void:distinctSubjects` and `void:distinctObjects` of the whole selection are not part of
+the JSON report. They cost one more pass over the SPO and OSP indexes, which only RDF
+requests make. The declarations follow the description as the triples that assert them:
+`rdf:type`, `rdfs:subClassOf`, `owl:equivalentClass`, `owl:disjointWith`, `rdfs:domain`,
+`rdfs:range`, `rdfs:subPropertyOf`, `owl:inverseOf`, labels, comments and the
+`owl:Ontology` headers. `declarations=false` leaves them out. Labels keep their language
+tags.
+
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json] [--timeout S]
-[--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the `SchemaSummary`
-with every item and `next: null`. `text` prints one line per class and per predicate. The
-command exits with status 2 when the timeout or the entry cap is exceeded. The Rust API is
-`sparkles::schema::discover`.
+[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
+[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
+`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
+predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
+declarations. The command exits with status 2 when the timeout or the entry cap is
+exceeded. The Rust API is `sparkles::schema::discover`, and
+`sparkles::schema::void_text` renders a report as VoID.
 
 ### Clone
 

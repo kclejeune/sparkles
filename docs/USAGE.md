@@ -195,6 +195,11 @@ The other commands are:
 
 `sparkles help COMMAND` describes each one.
 
+`sparkles schema --loc db --format void` prints the schema report as a VoID description
+in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
+`GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
+([API.md](API.md#schema-discovery)).
+
 ## Formatting
 
 `sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle

@@ -918,7 +918,8 @@ enum Cmd {
         /// Declarations to read: `asserted`, or `all` (including inferred ones)
         #[arg(long, default_value = "asserted")]
         declared: String,
-        /// Output format: text or json
+        /// Output format: text, json, void (the VoID description in Turtle) or turtle
+        /// (the VoID description and the declarations in Turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout in seconds
@@ -2200,10 +2201,13 @@ fn run() -> Result<()> {
         } => {
             use sparkles::index::Perm;
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
-            let json = match format.as_str() {
-                "json" => true,
-                "text" => false,
-                f => bail!("unknown format '{f}' (text or json)"),
+            // `void` is the VoID description, `turtle` the description and the declarations
+            let (json, void) = match format.as_str() {
+                "json" => (true, None),
+                "text" => (false, None),
+                "void" => (false, Some(false)),
+                "turtle" => (false, Some(true)),
+                f => bail!("unknown format '{f}' (text, json, void or turtle)"),
             };
             let declared_from_inferred = match declared.as_str() {
                 "asserted" => false,
@@ -2232,6 +2236,7 @@ fn run() -> Result<()> {
                 deadline: timeout.map(|t| Instant::now() + Duration::from_secs_f64(t)),
                 cancel: None,
                 max_entries,
+                term_totals: void.is_some(),
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -2242,7 +2247,18 @@ fn run() -> Result<()> {
                 Err(e) => return Err(e.into()),
             };
             let mut out = std::io::stdout().lock();
-            if json {
+            if let Some(declarations) = void {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(store.prefixes());
+                let vopts = sparkles::schema::VoidOptions {
+                    dataset: &name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                let turtle = oxrdfio::RdfFormat::Turtle;
+                let text = sparkles::schema::void_text(&report, &vopts, turtle);
+                out.write_all(text.as_bytes())?;
+            } else if json {
                 // every item on one page
                 let summary = report.summary(
                     &name,

@@ -4,8 +4,8 @@
 >
 > **Phases:** Phase 1 shipped: the `sparkles::schema` library, `GET /$/schema/{ds}` with
 > paginated class and predicate listings, `sparkles schema`, and the UI schema browser.
-> Phase 2 (the SHACL constraints layer, subject classes per predicate and the VoID/Turtle
-> export) and Phase 3 are not built.
+> From Phase 2, the VoID/Turtle export shipped. The SHACL constraints layer, subject
+> classes per predicate and Phase 3 are not built.
 >
 > **User docs:** [API: Schema discovery](../API.md#schema-discovery) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -635,8 +635,30 @@ the commit-bound alternative.
 **Later use.** The MCP server's schema tools are built on `sparkles::schema`
 ([C11](C11-mcp-server.md)).
 
-**Not built.** None of Phase 2 was built: the SHACL constraints layer,
-`detail=subjectClasses`, the VoID/Turtle export, the GSPO-driven scan for small named
-graphs, and `/$/stats` class counts from the same pass. Phase 3 was not built either:
+**VoID export.** The VoID/Turtle export of Phase 2 landed on 2026-10-02.
+`GET /$/schema/{ds}` with an RDF `Accept` header or `format=` answers with one
+`void:Dataset` node, `urn:x-sparkles:schema:<ds>:<version>`, as the spec proposed. The
+node carries `void:triples`, `void:entities`, `void:classes`, `void:properties`,
+`void:distinctSubjects` and `void:distinctObjects`, one blank `void:classPartition` per
+class with instances, and one `void:propertyPartition` per used predicate. The
+declarations follow as the asserted triples, and `declarations=false` leaves them out.
+`sparkles schema --format void` prints the description in Turtle, and `--format turtle`
+adds the declarations. Four choices were made during implementation, and the maintainer
+may revisit them.
+
+- The selection's distinct subjects and objects were not in the report. A new
+  `SchemaOptions::term_totals` counts them with one more pass over the SPO and OSP
+  indexes, and only RDF requests ask for it. The JSON document does not show them, so it
+  does not depend on which request filled the cache.
+- `void:entities` of the dataset counts the distinct IRI subjects, and that of a class
+  partition counts the class's instances.
+- `void:classes` counts the distinct `rdf:type` objects, blank nodes included, as the
+  VoID note defines it.
+- The description also carries `dcterms:title` (the dataset name) and `dcterms:created`
+  (the time the report was computed). Labels and comments keep their language tags.
+
+**Not built.** The rest of Phase 2 was not built: the SHACL constraints layer,
+`detail=subjectClasses`, the GSPO-driven scan for small named graphs, and `/$/stats` class
+counts from the same pass. Phase 3 was not built either:
 per-class property profiles, anonymous class expressions, schema diffs and incremental
 maintenance.

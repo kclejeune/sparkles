@@ -715,6 +715,7 @@ impl Tools<'_> {
             deadline: Some(deadline),
             cancel: Some(self.call.cancel.clone()),
             max_entries: self.server.state.schema_max_entries,
+            term_totals: false,
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
         *ds.schema_cache.lock() = Some(SchemaCacheEntry {
