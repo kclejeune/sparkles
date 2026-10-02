@@ -194,6 +194,48 @@ impl Terms {
         self.snap.term(i)
     }
 
+    /// The vocabulary key of a term (`None` for a local blank node).
+    pub fn key_of(&self, id: u64) -> Option<Vec<u8>> {
+        let i = Id(id);
+        match i.tag() {
+            Tag::Local => match self.local(id)? {
+                LocalTerm::Key(k) => Some(k),
+                LocalTerm::BNode => None,
+            },
+            Tag::Vocab | Tag::Delta => self.snap.key(i).map(|k| k.into_owned()),
+            _ => self.snap.term(i).map(|t| id::term_key(&t)),
+        }
+    }
+
+    /// Is this (possibly generalized) triple valid RDF?
+    pub fn valid(&self, t: &[u64; 3]) -> bool {
+        matches!(self.kind(t[0]), Kind::Iri | Kind::BNode)
+            && self.kind(t[1]) == Kind::Iri
+            && self.kind(t[2]) != Kind::Other
+    }
+
+    /// Read terms from a later snapshot of the same generation. Local terms that the
+    /// store now has are returned with their store ids, for the caller to replace.
+    pub fn rebase(&mut self, snap: Arc<Snapshot>) -> FxHashMap<u64, u64> {
+        self.snap = snap;
+        let mut moved = FxHashMap::default();
+        let mut l = self.locals.write().unwrap();
+        let Locals { map, .. } = &mut *l;
+        map.retain(|key, id| {
+            if key.starts_with(b"\0") {
+                return true;
+            }
+            match self.snap.lookup_key(key) {
+                Some(s) => {
+                    moved.insert(*id, s.0);
+                    false
+                }
+                None => true,
+            }
+        });
+        moved
+    }
+
     pub fn value(&self, id: u64) -> Option<Value> {
         self.term(id).map(|t| Value::from_term(&t))
     }

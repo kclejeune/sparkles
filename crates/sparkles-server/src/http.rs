@@ -3062,7 +3062,7 @@ async fn reason(
     }
     let ds = dataset(&st, &name)?;
     let query = Params::from_query(&uri);
-    let (profile_name, rules, rerun, vocabularies, geo_default_geometry) =
+    let (profile_name, rules, rerun, vocabularies, geo_default_geometry, full) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -3091,6 +3091,7 @@ async fn reason(
                 v["rerun"].as_bool().unwrap_or(false),
                 vocabularies,
                 v["geoDefaultGeometry"].as_bool().unwrap_or(false),
+                v["full"].as_bool().unwrap_or(false),
             )
         } else {
             let mut p = Params::default();
@@ -3101,9 +3102,11 @@ async fn reason(
                 p.get("rerun").is_some_and(truthy),
                 p.all("vocabulary"),
                 p.get("geoDefaultGeometry").is_some_and(truthy),
+                p.get("full").is_some_and(truthy),
             )
         };
     let rerun = rerun || query.get("rerun").is_some_and(truthy);
+    let full = full || query.get("full").is_some_and(truthy);
     let recorded = if rerun {
         // the recorded profile, including its custom rules and extras
         let info = ds
@@ -3146,6 +3149,7 @@ async fn reason(
         profile,
         extras,
         crate::reasoning::Trigger::Request,
+        !full,
     );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
@@ -3159,6 +3163,7 @@ async fn unreason(State(st): St, Path(name): Path<String>) -> ApiResult {
     let st2 = st.clone();
     blocking(move || {
         let n = sparkles_reasoner::clear(&ds.store)?;
+        ds.closure.clear();
         ds.set_reasoning(None)?;
         st2.save_registry()?;
         Ok(Json(json!({ "removed": n })).into_response())
@@ -3332,14 +3337,26 @@ async fn reason_diagnostics(
             )
         })?,
     };
+    let graphs = diagnostics::parse_graphs(&params.all("graph")).map_err(|bad| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("graph must be default or an absolute IRI, not '{bad}'"),
+        )
+    })?;
     let info = ds.reasoning.read().clone();
-    let inferences = info.is_some() && params.get("reasoning").is_none_or(|v| v != "false");
+    // the inferences follow from the default graph: included by default when it is checked
+    let inferences = info.is_some()
+        && match params.get("reasoning") {
+            Some(v) => v != "false",
+            None => graphs.is_empty() || graphs.iter().any(|g| g == diagnostics::DEFAULT_GRAPH),
+        };
     let mut prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
     prefixes.retain(|(_, ns)| !ns.is_empty());
     let opts = DiagnoseOptions {
         checks,
         limit,
         inferences,
+        graphs,
         closure,
         timeout: Some(timeout_param(&st, &params)),
         prefixes,

@@ -440,6 +440,63 @@ fn a_wal_checksum_mismatch_mid_log_is_an_error() {
     assert!(Store::open(&root, StoreOptions::default()).is_err());
 }
 
+/// A commit's new terms and its WAL records are synced at the same time, so after a crash
+/// the last commit may name terms that `delta.vocab` lacks: a torn tail, which open
+/// drops. The same for an earlier commit is damage, which open refuses.
+#[test]
+fn a_final_wal_transaction_whose_terms_were_lost_is_a_warning() {
+    let entry_ends = |path: &Path| {
+        let buf = std::fs::read(path).unwrap();
+        let (mut pos, mut ends) = (0usize, Vec::new());
+        while pos + 4 <= buf.len() {
+            pos += 4 + u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            ends.push(pos as u64);
+        }
+        ends
+    };
+    let cut = |path: &Path, len: u64| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(len)
+            .unwrap()
+    };
+    let (_d, root) = fresh();
+    let vocab = gen_dir(&root).join("delta.vocab");
+    // ex:later and its label (commit 5), then the two labels of commit 7
+    let ends = entry_ends(&vocab);
+    assert_eq!(ends.len(), 4);
+    cut(&vocab, ends[2]);
+    let r = run(&root, false);
+    assert_eq!(status(&r, "wal"), Status::Warning, "{}", r.to_text());
+    assert!(
+        messages(&r, "wal").contains("names delta terms that delta.vocab lacks"),
+        "{}",
+        r.to_text()
+    );
+    assert_eq!(r.head, Some(6));
+    assert_eq!(
+        Store::open(&root, StoreOptions::default())
+            .unwrap()
+            .head_commit()
+            .seq,
+        6
+    );
+    // commit 5's label lost as well: damage before the last commit
+    let (_d, root) = fresh();
+    let vocab = gen_dir(&root).join("delta.vocab");
+    cut(&vocab, ends[0]);
+    let r = run(&root, false);
+    assert_eq!(status(&r, "wal"), Status::Error, "{}", r.to_text());
+    assert!(
+        messages(&r, "wal").contains("beyond the delta vocabulary"),
+        "{}",
+        r.to_text()
+    );
+    assert!(Store::open(&root, StoreOptions::default()).is_err());
+}
+
 #[test]
 fn a_torn_final_wal_transaction_is_a_warning() {
     let (_d, root) = fresh();

@@ -2512,6 +2512,36 @@ const HASH_BUILD_COST: f64 = 48.0;
 /// parallel pieces of the larger input, and is counted as one row.
 const FLAT_HASH_BUILD_COST: f64 = 8.0;
 
+/// A merge join's cost per input row, besides its output rows. Timed alone on generated
+/// tables (`costcal_tests::cal_tables`), a merge join takes 0.6 to 8 ns per input row
+/// where a scan reads a row in 0.8 to 2.2 ns: little for rows it skips, several times
+/// more for rows that match, most of it building the output. Hash joins of the same
+/// inputs are underpriced as much (at 100k rows a side both took 3 to 5 times their
+/// cost), so raising this alone turns merges into hash joins that run slower: across
+/// the bench queries at 1.05M and 10.5M triples and WatDiv, run alternately pinned to
+/// the performance cores, 2 made the plans 8% slower on geometric mean (32 queries more
+/// than 10% slower than their fastest plan, against 17 with 1), 1.5 2%, and 0.75 was
+/// within noise of 1.
+const MERGE_ROW_COST: f64 = 1.0;
+
+/// [`MERGE_ROW_COST`], which the calibration tests can override with
+/// `SPARKLES_CAL_MERGE_ROW_COST`.
+#[inline]
+pub(super) fn merge_row_cost() -> f64 {
+    #[cfg(test)]
+    {
+        static COST: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *COST.get_or_init(|| {
+            std::env::var("SPARKLES_CAL_MERGE_ROW_COST")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(MERGE_ROW_COST)
+        })
+    }
+    #[cfg(not(test))]
+    MERGE_ROW_COST
+}
+
 /// What the join costs depend on besides the inputs: whether index joins are offered and
 /// what inserting a row into a hash table costs.
 #[derive(Clone, Copy, Debug)]
@@ -2570,7 +2600,7 @@ fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Nod
         JoinAlgo::Cross => a.sorted.clone(),
     };
     let base = match algo {
-        JoinAlgo::Merge => a.est + b.est,
+        JoinAlgo::Merge => (a.est + b.est) * merge_row_cost(),
         JoinAlgo::Hash => hash_base(Costing::of(ctx).hash_build, a.est, b.est),
         JoinAlgo::Cross => a.est * b.est,
     };
@@ -2727,7 +2757,7 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
             && l.certain.contains(k)
             && r.certain.contains(k));
     let (sorted, base) = if merge {
-        (l.sorted.clone(), l.est + r.est)
+        (l.sorted.clone(), (l.est + r.est) * merge_row_cost())
     } else if ctx.opt.merge_left_join {
         (
             Vec::new(),

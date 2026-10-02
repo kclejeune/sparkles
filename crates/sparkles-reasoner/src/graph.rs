@@ -1,6 +1,10 @@
 //! In-memory id-level triple set with hash indexes, append-only so that semi-naive
 //! evaluation can restrict any access path to a row range (`[lo, hi)`): every index
 //! list holds triple positions in ascending order.
+//!
+//! Incremental maintenance removes triples by marking their rows dead: a dead row stays
+//! in the index lists (evaluation skips it) but leaves the triple index, so the triple
+//! can be added again as a new row.
 
 use rustc_hash::FxHashMap;
 
@@ -18,6 +22,9 @@ pub(crate) struct Graph {
     distinct_o: FxHashMap<u64, u32>,
     by_s: Option<FxHashMap<u64, Vec<u32>>>,
     by_o: Option<FxHashMap<u64, Vec<u32>>>,
+    /// one bit per dead row (empty while no row is dead)
+    dead: Vec<u64>,
+    dead_rows: u32,
 }
 
 /// Candidate triple positions for one access.
@@ -104,6 +111,29 @@ impl Graph {
         }
         let base = start as u32;
         let rows = || new.iter().enumerate().map(|(k, t)| (base + k as u32, t));
+        if new.len() < 4096 {
+            // a few rows: threads cost more than they save
+            for (i, t) in rows() {
+                self.by_p.entry(t[1]).or_default().push(i);
+                let e = self.by_ps.entry((t[1], t[0])).or_default();
+                if e.is_empty() {
+                    *self.distinct_s.entry(t[1]).or_default() += 1;
+                }
+                e.push(i);
+                let e = self.by_po.entry((t[1], t[2])).or_default();
+                if e.is_empty() {
+                    *self.distinct_o.entry(t[1]).or_default() += 1;
+                }
+                e.push(i);
+                if let Some(m) = &mut self.by_s {
+                    m.entry(t[0]).or_default().push(i);
+                }
+                if let Some(m) = &mut self.by_o {
+                    m.entry(t[2]).or_default().push(i);
+                }
+            }
+            return new.len();
+        }
         let Graph {
             by_p,
             by_ps,
@@ -176,9 +206,42 @@ impl Graph {
         }
     }
 
+    /// The row of a live triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {
         self.index.get(t).copied()
+    }
+
+    /// Whether row `i` holds a live triple.
+    #[inline]
+    pub fn alive(&self, i: u32) -> bool {
+        self.dead
+            .get(i as usize / 64)
+            .is_none_or(|w| w & (1 << (i % 64)) == 0)
+    }
+
+    /// Mark the row of a live triple dead; returns false if the triple is not live.
+    pub fn kill(&mut self, t: &Triple) -> bool {
+        let Some(i) = self.index.remove(t) else {
+            return false;
+        };
+        let w = i as usize / 64;
+        if self.dead.len() <= w {
+            self.dead.resize(w + 1, 0);
+        }
+        self.dead[w] |= 1 << (i % 64);
+        self.dead_rows += 1;
+        true
+    }
+
+    /// Number of dead rows.
+    pub fn dead_rows(&self) -> u32 {
+        self.dead_rows
+    }
+
+    /// Number of live triples.
+    pub fn live(&self) -> usize {
+        self.index.len()
     }
 
     /// Candidates for a pattern with the given bound positions, restricted to rows
@@ -253,7 +316,10 @@ impl Graph {
     /// The objects of `(s p ?)` among rows `< hi`.
     pub fn objects(&self, s: u64, p: u64, hi: u32) -> impl Iterator<Item = u64> + '_ {
         let c = self.cands(Some(s), Some(p), None, 0, hi);
-        (0..c.len()).map(move |i| self.triples[c.get(i) as usize][2])
+        (0..c.len())
+            .map(move |i| c.get(i))
+            .filter(|&i| self.alive(i))
+            .map(move |i| self.triples[i as usize][2])
     }
 
     /// Members of an RDF list (`rdf:first` / `rdf:rest`), or `None` if `head` is not a
@@ -300,6 +366,22 @@ mod tests {
         assert_eq!(g.cands(Some(1), None, None, 0, 4).len(), 3);
         assert_eq!(g.pstats(10), (1, 2));
         assert_eq!(g.count_p(10, 1, 4), 1);
+    }
+
+    #[test]
+    fn dead_rows() {
+        let mut g = Graph::default();
+        g.add_batch([[1, 10, 2], [1, 10, 3]]);
+        assert!(g.kill(&[1, 10, 2]));
+        assert!(!g.kill(&[1, 10, 2]));
+        assert!(!g.alive(0) && g.alive(1) && g.alive(5));
+        assert_eq!(g.position(&[1, 10, 2]), None);
+        assert_eq!(g.objects(1, 10, 2).collect::<Vec<_>>(), [3]);
+        // added again as a new row
+        assert!(g.add([1, 10, 2]));
+        assert_eq!(g.position(&[1, 10, 2]), Some(2));
+        assert_eq!(g.objects(1, 10, 3).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!((g.live(), g.dead_rows()), (2, 1));
     }
 
     #[test]

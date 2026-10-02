@@ -146,6 +146,7 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
+| `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
 `sparkles serve --help` lists the other options, including `--read-only`,
 `--result-cache-mb`, `--auto-reason`, `--auth-config`, `--unix-socket`,
@@ -185,7 +186,8 @@ sparkles stats   --loc db
 sparkles log     --loc db                     # commit history (works next to a running server)
 sparkles diff    --loc db 41 42               # what commit 42 changed, as + and - N-Quads lines
 sparkles check   --loc db                     # verify the files, read-only (--quick, --format json)
-sparkles infer   --loc db --profile owl-rl    # materialize inferences
+sparkles infer   --loc db --profile owl-rl    # materialize inferences, updating the last run when it can
+sparkles infer   --loc db --profile owl-rl --full   # materialize in full
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
@@ -200,6 +202,13 @@ sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server U
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 ```
+
+`sparkles infer` updates the materialization that `reasoning.json` records when its
+rules are the same and monotonic and the commit diff still reaches its commit. It reads
+the previous closure from the database, removes what the removed triples no longer
+support and derives what the added triples support. It prints whether the run was
+full or incremental and, for a full run that could have been incremental, why
+([API.md](API.md#reasoning-status-and-diagnostics)).
 
 `sparkles vector create` writes the index to `vector.json`, builds it, and waits for the
 build. Later openings of the database map the built index from its file. Every
@@ -573,7 +582,7 @@ clean, 1 when any check found an error, and 2 when there are warnings only.
 | `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. A torn tail is a warning. |
 | `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
 | `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
-| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. Commit numbers continue from the generation's base commit, and ids resolve. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave. Commit numbers continue from the generation's base commit, and ids resolve. |
 | `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
