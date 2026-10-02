@@ -890,7 +890,7 @@ async fn query_endpoint(
         }
     };
     let ran = if in_place {
-        inline::run(run)
+        inline::run(run).and_then(|r| r)
     } else {
         blocking(run).await
     };
@@ -1553,13 +1553,14 @@ async fn update_endpoint(
         let mut now = opts.clone();
         now.write.no_wait = true;
         match inline::run(|| run(&ds, &update, &now)) {
-            Err(Error::WriterBusy) => {}
-            r => {
+            Ok(Err(Error::WriterBusy)) => {}
+            Ok(r) => {
                 return r
                     .map_err(ApiError::from)
                     .map(|stats| update_response(&ds, stats, wanted))
                     .map_err(|e| with_timeout(e, timeout));
             }
+            Err(e) => return Err(e),
         }
     }
     blocking(move || {

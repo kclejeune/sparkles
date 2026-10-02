@@ -44,10 +44,24 @@ pub fn available() -> bool {
 pub static RAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Run `f` on this thread, after handing this worker's other tasks to another thread.
-pub fn run<T>(f: impl FnOnce() -> T) -> T {
+/// A panic becomes a `500` response, as it does for work on the blocking pool.
+pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {
     #[cfg(test)]
     RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    tokio::task::block_in_place(f)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::task::block_in_place(f)
+    }))
+    .map_err(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        super::err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the request panicked: {msg}"),
+        )
+    })
 }
 
 /// The query texts (per dataset) whose last run was quick.
@@ -109,6 +123,27 @@ mod tests {
         q.record(u64::MAX, 0.1);
         assert!(!q.is_quick(0));
         assert!(q.is_quick(u64::MAX));
+    }
+
+    #[test]
+    fn a_panic_in_place_becomes_an_error() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let r = rt.block_on(async {
+            tokio::spawn(async { run(|| -> u32 { panic!("boom") }) })
+                .await
+                .unwrap()
+        });
+        let e = r.expect_err("an error");
+        assert_eq!(e.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(e.1["error"].as_str().unwrap().contains("boom"));
+        // the runtime keeps working
+        assert_eq!(
+            rt.block_on(async { tokio::spawn(async { 1 }).await.unwrap() }),
+            1
+        );
     }
 
     #[test]
