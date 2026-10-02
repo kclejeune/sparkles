@@ -12,6 +12,7 @@
 
 mod backup;
 mod geo;
+mod vector;
 pub use backup::{BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
@@ -729,6 +730,9 @@ pub struct StoreOptions {
     /// Persistent stores write the spatial index's files (`gen-NNNN/geo/`) after each
     /// build; `false` builds in memory only and writes nothing (read-only servers).
     pub geo_files: bool,
+    /// Persistent stores write each vector index build to `gen-NNNN/vectors/`; `false`
+    /// builds in memory only.
+    pub vector_files: bool,
 }
 
 /// Default of [`StoreOptions::max_prefixes`].
@@ -759,6 +763,7 @@ impl Default for StoreOptions {
             geo_op_vertices: 2_000_000,
             geo_query_rewrite: true,
             geo_files: true,
+            vector_files: true,
         }
     }
 }
@@ -805,6 +810,8 @@ pub struct Store {
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
     /// spatial index, when enabled for this dataset
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
+    /// configured vector indexes (`vector.json`)
+    vector: Arc<vector::VectorRegistry>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// write guard checked before every commit (write-time validation)
@@ -907,6 +914,7 @@ impl Store {
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
+            vector: Default::default(),
             history: None,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -1115,6 +1123,7 @@ impl Store {
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
+            vector: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -1126,6 +1135,7 @@ impl Store {
         store.collect_history(gen_no, head.seq);
         store.open_text(&wal_text)?;
         store.open_geo();
+        store.open_vectors();
         Ok(store)
     }
 
@@ -2549,6 +2559,8 @@ impl Store {
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
         self.current.store(Arc::new(new_snap));
+        // and its own vector indexes, built in the background
+        self.vectors_switched(snap);
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -2749,6 +2761,18 @@ impl Store {
         };
         if let Some(cfg) = geo_cfg {
             write_atomic(&dir.join(crate::geo::CONFIG_FILE), &cfg)?;
+        }
+        // and the vector indexes
+        let vector_cfg = self.vector_configs();
+        if !vector_cfg.is_empty() {
+            let file = crate::vector::VectorConfigFile {
+                indexes: vector_cfg,
+                ..Default::default()
+            };
+            write_atomic(
+                &dir.join(crate::vector::config::CONFIG_FILE),
+                &serde_json::to_vec_pretty(&file).unwrap(),
+            )?;
         }
         // write-time validation stays configured; the clone judges its first write in full
         if let Some(root) = &self.root {

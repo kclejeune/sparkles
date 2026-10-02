@@ -157,6 +157,8 @@ pub enum VectorQuery {
     Vector(Arc<[f32]>),
     /// an entity whose (single) vector under the predicate is the query
     Entity(Id),
+    /// bound by the rest of the group: a vector literal or an entity per input row
+    Var(VarId),
 }
 
 /// A `spk:vectorSearch` call planned as a leaf (exact top-k similarity search).
@@ -174,6 +176,20 @@ pub struct VectorSpec {
     pub graph_var: Option<VarId>,
     /// merge rows with the same (s, vector) from different graphs (merged default graph)
     pub dedup: bool,
+    /// `exact:true` and `ef:N`
+    pub mode: crate::vector::SearchMode,
+    /// `distinct:subject`: at most one row (the best) per subject
+    pub distinct_subject: bool,
+    /// `candidates:join`: only subjects the rest of the group binds
+    pub candidates: bool,
+}
+
+impl VectorSpec {
+    /// Whether the search reads the rest of its group (child 0): a variable query or
+    /// `candidates:join`.
+    pub fn needs_input(&self) -> bool {
+        self.candidates || matches!(self.query, VectorQuery::Var(_))
+    }
 }
 
 /// A `text:query` call planned as a leaf (full-text search).
@@ -1044,26 +1060,21 @@ impl<'a> Planner<'a> {
             Some(TermPattern::Literal(_)) => {
                 return Err(bad("the query must be an spk:vector literal or an entity"));
             }
-            Some(t @ (TermPattern::NamedNode(_) | TermPattern::BlankNode(_))) => {
-                match self.term_pattern(&t) {
-                    PT::C(id) => VectorQuery::Entity(id),
-                    // a blank node in a pattern is a variable
-                    PT::V(_) => {
-                        return Err(Error::unsupported(
-                            "spk:vectorSearch: a variable query vector is not supported yet",
-                        ));
-                    }
-                }
-            }
-            Some(TermPattern::Variable(_)) => {
-                return Err(Error::unsupported(
-                    "spk:vectorSearch: a variable query vector is not supported yet",
-                ));
-            }
+            Some(
+                t @ (TermPattern::NamedNode(_)
+                | TermPattern::BlankNode(_)
+                | TermPattern::Variable(_)),
+            ) => match self.term_pattern(&t) {
+                PT::C(id) => VectorQuery::Entity(id),
+                // a variable (or a blank node, which is one in a pattern)
+                PT::V(v) => VectorQuery::Var(v),
+            },
             _ => return Err(shape()),
         };
         let mut k = 10;
-        let mut metric = Metric::Cosine;
+        let mut metric = None;
+        let mut mode = vector::SearchMode::default();
+        let (mut distinct_subject, mut candidates) = (false, false);
         for a in args {
             let TermPattern::Literal(l) = a else {
                 return Err(shape());
@@ -1071,9 +1082,21 @@ impl<'a> Planner<'a> {
             if l.datatype() == oxrdf::vocab::xsd::STRING {
                 match l.value().split_once(':') {
                     Some(("metric", m)) => {
-                        metric = Metric::parse(m)
-                            .ok_or_else(|| bad(&format!("unknown metric {m:?}")))?;
+                        metric = Some(
+                            Metric::parse(m)
+                                .ok_or_else(|| bad(&format!("unknown metric {m:?}")))?,
+                        );
                     }
+                    Some(("exact", "true")) => mode.exact = true,
+                    Some(("exact", "false")) => mode.exact = false,
+                    Some(("ef", n)) => {
+                        let ef = n.parse::<usize>().map_err(|_| {
+                            bad(&format!("ef must be a positive integer, got {n:?}"))
+                        })?;
+                        mode.ef = Some(vector::SearchMode::validate_ef(ef)?);
+                    }
+                    Some(("distinct", "subject")) => distinct_subject = true,
+                    Some(("candidates", "join")) => candidates = true,
                     _ => return Err(bad(&format!("unknown option {:?}", l.value()))),
                 }
             } else {
@@ -1116,6 +1139,20 @@ impl<'a> Planner<'a> {
             vars.push(gv);
         }
         let dedup = graph_var.is_none() && graph.multi();
+        // the metric of the predicate's configured index, else cosine
+        let metric = metric.unwrap_or_else(|| {
+            pred.and_then(|p| {
+                self.ctx
+                    .snap
+                    .generation
+                    .vectors
+                    .configured_for(&self.ctx.snap, p.0)
+            })
+            .map_or(Metric::Cosine, |(_, c)| c.metric)
+        });
+        if candidates && !matches!(subject, PathEnd::Var(_)) {
+            return Err(bad("candidates:join needs a variable subject"));
+        }
         let desc = format!(
             "{} ← {} {} k={}{}",
             vars.iter()
@@ -1128,7 +1165,15 @@ impl<'a> Planner<'a> {
             match &query {
                 VectorQuery::Vector(v) => format!(" dim={}", v.len()),
                 VectorQuery::Entity(e) => format!(" like {}", self.pt_str(&PT::C(*e))),
-            }
+                VectorQuery::Var(v) => format!(" like ?{}", self.ctx.var_name(*v)),
+            } + if mode.exact { " exact" } else { "" }
+                + &mode.ef.map_or(String::new(), |e| format!(" ef={e}"))
+                + if distinct_subject {
+                    " distinct:subject"
+                } else {
+                    ""
+                }
+                + if candidates { " candidates:join" } else { "" }
         );
         let spec = VectorSpec {
             pred,
@@ -1141,10 +1186,59 @@ impl<'a> Planner<'a> {
             graph,
             graph_var,
             dedup,
+            mode,
+            distinct_subject,
+            candidates,
         };
         let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
         n.cost = k as f64 * 16.0;
         Ok(n)
+    }
+
+    /// A search that reads the rest of its group (`left`): a variable query bound there,
+    /// or `candidates:join` over the subjects bound there.
+    fn attach_vector(&self, left: Node, search: Node) -> Result<Node> {
+        let Kind::VectorSearch(spec) = &search.kind else {
+            unreachable!("only vector searches depend on their group");
+        };
+        let bad = |m: String| Error::invalid(format!("spk:vectorSearch: {m}"));
+        if let VectorQuery::Var(v) = spec.query
+            && !left.vars.contains(&v)
+        {
+            return Err(bad(format!(
+                "the query variable ?{} is not bound by the rest of the group",
+                self.ctx.var_name(v)
+            )));
+        }
+        if spec.candidates
+            && let PathEnd::Var(s) = spec.subject
+            && !left.vars.contains(&s)
+        {
+            return Err(bad(format!(
+                "candidates:join needs ?{} bound by the rest of the group",
+                self.ctx.var_name(s)
+            )));
+        }
+        let mut vars = left.vars.clone();
+        for v in &search.vars {
+            if !vars.contains(v) {
+                vars.push(*v);
+            }
+        }
+        let mut certain = left.certain.clone();
+        certain.extend(search.vars.iter().copied());
+        let est = (left.est * spec.k as f64).max(1.0);
+        Ok(Node {
+            dist: vars.iter().map(|&v| (v, est)).collect(),
+            cost: left.cost + est * 16.0,
+            vars,
+            certain,
+            sorted: Vec::new(),
+            est,
+            desc: search.desc,
+            kind: search.kind,
+            children: vec![left],
+        })
     }
 
     /// A `text:query` call as a search leaf.
@@ -1676,6 +1770,10 @@ impl<'a> Planner<'a> {
         for t in &triples {
             leaves.push(self.scan_options(t)?);
         }
+        // searches that read the rest of the group are attached to it at the end
+        let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
+            .into_iter()
+            .partition(|n| matches!(&n.kind, Kind::VectorSearch(s) if s.needs_input()));
         for n in nodes {
             leaves.push(vec![n]);
         }
@@ -1715,6 +1813,17 @@ impl<'a> Planner<'a> {
         while let Some(i) = unpacks.iter().position(|u| result.vars.contains(&u.t)) {
             let u = unpacks.remove(i);
             result = self.unpack(result, u);
+            let (now, later): (Vec<Expr>, Vec<Expr>) =
+                std::mem::take(&mut filters).into_iter().partition(|f| {
+                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
+                });
+            filters = later;
+            if !now.is_empty() {
+                result = filter(result, now, self.ctx);
+            }
+        }
+        for d in dependent {
+            result = self.attach_vector(result, d)?;
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {
                     !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
