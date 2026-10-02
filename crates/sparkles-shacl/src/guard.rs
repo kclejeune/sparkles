@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
 pub use sparkles::guard::config::{
-    Baseline, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
+    Baseline, BaselinePolicy, CONFIG_FILE, CheckRecord, Counters, DataGraphSel, STATUS_FILE,
 };
 use sparkles::guard::config::{
     CheckHistory, DecisionCounts, INFERRED_GRAPH as INFERRED, StatusFile, sha256_hex, write_atomic,
@@ -51,25 +51,6 @@ use std::time::{Duration, Instant};
 
 /// A shapes file copied into the database directory.
 pub const SHAPES_FILE: &str = sparkles::guard::config::SHACL_SHAPES_FILE;
-
-/// How a write is judged against the results the data already has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BaselinePolicy {
-    /// on the state after the write: any blocking result counts (`reject` can only be
-    /// enabled on data without blocking results)
-    #[default]
-    Strict,
-    /// on the blocking results the write introduces: results the state before the write
-    /// had do not block it
-    Grandfather,
-}
-
-impl BaselinePolicy {
-    fn is_strict(&self) -> bool {
-        *self == BaselinePolicy::Strict
-    }
-}
 
 /// Write-time SHACL validation of one dataset (`validation.json`, format 2 with
 /// `"language": "shacl"`; format 1 files, without `language`, are read too).

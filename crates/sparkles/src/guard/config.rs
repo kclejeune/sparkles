@@ -97,6 +97,26 @@ pub fn now_rfc3339() -> String {
     )
 }
 
+/// How a write is judged against the results the data already has (`baseline` in
+/// `validation.json`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaselinePolicy {
+    /// on the state after the write: any blocking result counts (`reject` can only be
+    /// enabled on data without blocking results)
+    #[default]
+    Strict,
+    /// on the blocking results the write introduces: results the state before the write
+    /// had do not block it
+    Grandfather,
+}
+
+impl BaselinePolicy {
+    pub fn is_strict(&self) -> bool {
+        *self == BaselinePolicy::Strict
+    }
+}
+
 /// The data graph: `"default"`, `"union"`, or a list of graph IRIs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]

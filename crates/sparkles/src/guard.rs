@@ -362,7 +362,12 @@ pub struct Rejection {
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.summary.language == GuardLanguage::Shex {
-            let n = self.summary.blocking;
+            let n = self.summary.introduced.unwrap_or(self.summary.blocking);
+            let new = if self.summary.introduced.is_some() {
+                "new "
+            } else {
+                ""
+            };
             return match &self.summary.shapes_error {
                 Some(e) => write!(
                     f,
@@ -370,7 +375,7 @@ impl std::fmt::Display for Rejection {
                 ),
                 None => write!(
                     f,
-                    "ShEx validation failed: {n} nonconformant association{}; nothing was committed",
+                    "ShEx validation failed: {n} {new}nonconformant association{}; nothing was committed",
                     if n == 1 { "" } else { "s" }
                 ),
             };

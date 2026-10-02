@@ -45,9 +45,9 @@ pub struct ValidationArgs {
     /// violation, warning or info (SHACL; default violation)
     #[arg(long)]
     pub threshold: Option<String>,
-    /// judge a write by the blocking results it introduces, so results the data
-    /// already has do not block it (SHACL; allows `--mode reject` on data that does not
-    /// conform)
+    /// judge a write by the blocking results (SHACL) or nonconformant associations
+    /// (ShEx) it introduces, so those the data already has do not block it (allows
+    /// `--mode reject` on data that does not conform)
     #[arg(long)]
     pub grandfather: bool,
     #[arg(long, default_value_t = 10.0)]
@@ -84,9 +84,6 @@ fn language(a: &ValidationArgs) -> Result<GuardLanguage> {
             }
             if a.threshold.is_some() {
                 bail!("--threshold is for SHACL: every nonconformant ShEx association blocks");
-            }
-            if a.grandfather {
-                bail!("--grandfather is for SHACL");
             }
         }
     }
@@ -295,6 +292,11 @@ fn set_shex(
         shape_map: MapSource::Compact(map.clone()),
         data_graph: data_graph(&a.data_graph),
         include_inferences: a.include_inferences,
+        baseline: if a.grandfather {
+            guard::BaselinePolicy::Grandfather
+        } else {
+            guard::BaselinePolicy::Strict
+        },
         timeout_seconds: a.timeout,
         report_limit: a.report_limit,
         updated: None,

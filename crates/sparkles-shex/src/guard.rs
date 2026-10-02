@@ -9,6 +9,11 @@
 //!   data to conform;
 //! * `warn`: the commit is written; its receipt carries the findings.
 //!
+//! With `baseline: "grandfather"`, `reject` may be enabled on data that does not
+//! conform, and a write is judged by the nonconformant associations it introduces: those
+//! of the state after it that the state before it did not have (matched by node and
+//! shape, as a multiset).
+//!
 //! ShEx has no severities and no threshold: every nonconformant association blocks, and
 //! counts as one violation of the summary. The schema is copied into the database when
 //! the configuration is set, with its imports resolved then, so a write never fetches
@@ -25,8 +30,8 @@
 //! kept up to date by every validated write and persisted in `validation-status.json`).
 //! A write then validates only the associations whose result it can change (see
 //! [`incremental`]), in the states before and after it, and moves the counts by the
-//! difference. It validates in full when the state of the head is unknown, in `reject`
-//! mode when the head does not conform, for bulk writes, for a map with a SPARQL
+//! difference. It validates in full when the state of the head is unknown, in strict
+//! `reject` mode when the head does not conform, for bulk writes, for a map with a SPARQL
 //! selector, and when too many nodes are affected.
 
 use crate::ast::Schema;
@@ -41,6 +46,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
+pub use sparkles::guard::config::BaselinePolicy;
 use sparkles::guard::config::{
     Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
     STATUS_FILE, StatusFile, sha256_hex, write_atomic,
@@ -79,6 +85,10 @@ pub struct ShexValidationConfig {
     pub data_graph: DataGraphSel,
     #[serde(default)]
     pub include_inferences: bool,
+    /// `strict` (the default) or `grandfather`: a write is judged by the nonconformant
+    /// associations it introduces
+    #[serde(default, skip_serializing_if = "BaselinePolicy::is_strict")]
+    pub baseline: BaselinePolicy,
     #[serde(default = "ten")]
     pub timeout_seconds: f64,
     #[serde(default = "hundred")]
@@ -294,33 +304,59 @@ impl ShexGuard {
         }
     }
 
-    /// Validate `view` and summarize under this configuration.
+    fn grandfather(&self) -> bool {
+        self.cfg.baseline == BaselinePolicy::Grandfather
+    }
+
+    fn limit(&self, o: &WriteOptions) -> usize {
+        o.report_limit
+            .unwrap_or(self.cfg.report_limit)
+            .clamp(1, 10_000)
+    }
+
+    /// The result map of all of `snap`.
+    fn validate_map(
+        &self,
+        snap: &Arc<Snapshot>,
+        o: &WriteOptions,
+        deadline: Instant,
+    ) -> sparkles::Result<ResultMap> {
+        match self.options(snap, o, deadline) {
+            Some(vo) => crate::validate(snap, &self.schema, &self.map, &vo).map_err(engine_error),
+            // none of the listed data graphs exists: nothing to validate
+            None => Ok(ResultMap {
+                conforms: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Validate all of `view` and summarize under this configuration. In grandfather
+    /// mode `before` (the state before the write) is validated too, and the
+    /// nonconformant associations `view` adds decide; without it none counts as added.
     fn validate_state(
         &self,
         view: &Arc<Snapshot>,
+        before: Option<&Arc<Snapshot>>,
         o: &WriteOptions,
     ) -> sparkles::Result<ValidationSummary> {
         let t0 = Instant::now();
-        let limit = o
-            .report_limit
-            .unwrap_or(self.cfg.report_limit)
-            .clamp(1, 10_000);
-        let Some(vo) = self.options(view, o, self.deadline(t0, o)) else {
-            // none of the listed data graphs exists: nothing to validate
-            self.associations.store(0, Ordering::Relaxed);
-            let empty = ResultMap {
-                conforms: true,
-                ..Default::default()
-            };
-            return Ok(self.summarize(empty, limit, 0));
+        let deadline = self.deadline(t0, o);
+        let rm = self.validate_map(view, o, deadline)?;
+        let introduced = match before {
+            Some(base) if self.grandfather() => {
+                let pre = self.validate_map(base, o, deadline)?;
+                Some(new_nonconformant(&rm.results, &pre.results))
+            }
+            _ if self.grandfather() => Some(vec![false; rm.results.len()]),
+            _ => None,
         };
-        let rm = crate::validate(view, &self.schema, &self.map, &vo).map_err(engine_error)?;
         let ms = t0.elapsed().as_millis() as u64;
         self.last_full.store(ms, Ordering::Relaxed);
         self.associations
             .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
         *self.warnings.lock() = rm.warnings.clone();
-        Ok(self.summarize(rm, limit, ms))
+        Ok(self.summarize(rm, introduced, self.limit(o), ms))
     }
 
     fn deadline(&self, t0: Instant, o: &WriteOptions) -> Instant {
@@ -361,7 +397,8 @@ impl ShexGuard {
         c: &Candidate<'_>,
         reason: &str,
     ) -> sparkles::Result<(ValidationSummary, Exact)> {
-        let mut s = self.validate_state(&c.view, c.opts)?;
+        let base = Arc::new(c.base.clone());
+        let mut s = self.validate_state(&c.view, Some(&base), c.opts)?;
         s.fallback = Some(reason.to_string());
         s.focus_nodes = Some(s.total);
         let exact = Exact {
@@ -386,7 +423,7 @@ impl ShexGuard {
         let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
             return self.full(c, "baseline");
         };
-        if self.cfg.mode == GuardMode::Reject && exact.nonconformant > 0 {
+        if self.cfg.mode == GuardMode::Reject && !self.grandfather() && exact.nonconformant > 0 {
             // the report must show the associations that block every write
             return self.full(c, "baseline");
         }
@@ -466,18 +503,21 @@ impl ShexGuard {
             return self.full(c, "baseline");
         };
         let focus = (after.conformant + after.nonconformant) as u64;
-        let limit = c
-            .opts
-            .report_limit
-            .unwrap_or(self.cfg.report_limit)
-            .clamp(1, 10_000);
-        let mut s = self.summarize(after, limit, t0.elapsed().as_millis() as u64);
+        let introduced = self
+            .grandfather()
+            .then(|| new_nonconformant(&after.results, &before.results));
+        let mut s = self.summarize(
+            after,
+            introduced,
+            self.limit(c.opts),
+            t0.elapsed().as_millis() as u64,
+        );
         s.strategy = Strategy::Incremental;
         s.blocking = nonconformant;
         s.total = total;
         s.by_severity.violation = nonconformant;
         s.conforms = nonconformant == 0;
-        s.status = match (nonconformant > 0, self.cfg.mode) {
+        s.status = match (s.introduced.unwrap_or(nonconformant) > 0, self.cfg.mode) {
             (true, GuardMode::Reject) => GuardStatus::Rejected,
             (true, _) => GuardStatus::Warned,
             (false, _) => GuardStatus::Passed,
@@ -492,10 +532,31 @@ impl ShexGuard {
         Ok((s, exact))
     }
 
-    /// Count and bound the results, and decide: every nonconformant association blocks.
-    fn summarize(&self, mut rm: ResultMap, limit: usize, millis: u64) -> ValidationSummary {
+    /// Count and bound the results, and decide: every nonconformant association blocks,
+    /// or in grandfather mode (`introduced`: which results are new) every new one. New
+    /// results are listed first.
+    fn summarize(
+        &self,
+        mut rm: ResultMap,
+        introduced: Option<Vec<bool>>,
+        limit: usize,
+        millis: u64,
+    ) -> ValidationSummary {
         let blocking = rm.nonconformant as u64;
-        let status = match (blocking > 0, self.cfg.mode) {
+        let introduced_n = introduced
+            .as_ref()
+            .map(|v| v.iter().filter(|x| **x).count() as u64);
+        if let Some(new) = &introduced {
+            let mut ranked: Vec<(bool, crate::ShapeResult)> = new
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut rm.results))
+                .collect();
+            // stable: map order within each group
+            ranked.sort_by_key(|(n, _)| !*n);
+            rm.results = ranked.into_iter().map(|(_, r)| r).collect();
+        }
+        let status = match (introduced_n.unwrap_or(blocking) > 0, self.cfg.mode) {
             (true, GuardMode::Reject) => GuardStatus::Rejected,
             (true, _) => GuardStatus::Warned,
             (false, _) => GuardStatus::Passed,
@@ -524,7 +585,7 @@ impl ShexGuard {
             millis,
             results,
             shapes_error: None,
-            introduced: None,
+            introduced: introduced_n,
             focus_nodes: None,
             fallback: None,
             report_turtle: None,
@@ -676,6 +737,34 @@ impl CommitGuard for ShexGuard {
     fn language(&self) -> GuardLanguage {
         GuardLanguage::Shex
     }
+}
+
+/// For each result of `after`: whether it is nonconformant and not among `before`
+/// (associations, by node and shape, are matched as a multiset).
+fn new_nonconformant(after: &[crate::ShapeResult], before: &[crate::ShapeResult]) -> Vec<bool> {
+    let key = |r: &crate::ShapeResult| (r.node.to_string(), format!("{:?}", r.shape));
+    let mut left: FxHashMap<(String, String), usize> = FxHashMap::default();
+    for r in before
+        .iter()
+        .filter(|r| r.status == crate::Status::Nonconformant)
+    {
+        *left.entry(key(r)).or_default() += 1;
+    }
+    after
+        .iter()
+        .map(|r| {
+            if r.status != crate::Status::Nonconformant {
+                return false;
+            }
+            match left.get_mut(&key(r)) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .collect()
 }
 
 fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
@@ -950,8 +1039,8 @@ pub fn set_config(
     }
 
     let view = Arc::new(txn.view());
-    let summary = guard.validate_state(&view, &WriteOptions::default())?;
-    if guard.cfg.mode == GuardMode::Reject && summary.blocking > 0 {
+    let summary = guard.validate_state(&view, None, &WriteOptions::default())?;
+    if guard.cfg.mode == GuardMode::Reject && !guard.grandfather() && summary.blocking > 0 {
         return Ok(SetOutcome::NotConforming(summary));
     }
     let head = txn.base().commit;
