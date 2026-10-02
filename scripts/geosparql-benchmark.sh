@@ -14,8 +14,13 @@
 # correct answers and the score per requirement, and writes every answer and comparison
 # under target/geosparql-benchmark/results/.
 #
+# The database is set up for every conformance class the benchmark tests: RDFS entailment
+# with the GeoSPARQL vocabulary (`infer --profile rdfs --vocab geosparql`) and the query
+# rewrite extension (`"queryRewrite": true` in geo.json). EXTENSIONS=0 leaves both out.
+#
 # Env: SPARKLES (default target/release/sparkles), PORT (default 3942),
-# GSB_COMMIT (default the pinned commit below), MAX_TIME (seconds per query, default 60).
+# GSB_COMMIT (default the pinned commit below), MAX_TIME (seconds per query, default 60),
+# EXTENSIONS (default 1).
 set -euo pipefail
 
 if [ "${SPARKLES_ALLOW_GPL_BENCHMARK:-}" != 1 ]; then
@@ -47,6 +52,10 @@ DB=$WORK/db
 rm -rf "$DB" "$WORK/server" "$WORK/results"
 mkdir -p "$WORK/results"
 "$SPARKLES" load --loc "$DB" "$RES/gsb_dataset/dataset.rdf"
+if [ "${EXTENSIONS:-1}" != 0 ]; then
+  "$SPARKLES" infer --loc "$DB" --profile rdfs --vocab geosparql
+  echo '{"queryRewrite": true}' > "$DB/geo.json"
+fi
 "$SPARKLES" geo-index --loc "$DB"
 
 SPID=

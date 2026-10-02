@@ -21,7 +21,7 @@ use super::crs::{self, CRS84, CrsRef, EPSG_4326};
 use super::geom::Geom;
 use super::ops::{self, distance, relate};
 use super::units::{Unit, UnitKind, unit};
-use super::vocab::{GEOJSON_LITERAL, Relation, SPATIALF, WKT_LITERAL};
+use super::vocab::{Relation, SPATIALF, WKT_LITERAL};
 use super::{DistanceModel, GeomRef, memo, write};
 use crate::sparql::ctx::Ctx;
 use crate::sparql::expr::{Expr, Row, Val, arg};
@@ -290,11 +290,13 @@ impl Call<'_, '_> {
         let g = self.geom(0)?;
         let dt = match datatype {
             None => self.datatype(0),
-            Some(i) => match &*self.uri(i)? {
-                WKT_LITERAL => WKT_LITERAL,
-                GEOJSON_LITERAL => GEOJSON_LITERAL,
-                _ => return Err(TypeError),
-            },
+            Some(i) => {
+                let dt = self.uri(i)?;
+                if !super::vocab::is_geometry_datatype(&dt) {
+                    return Err(TypeError);
+                }
+                write::result_datatype(&dt)
+            }
         };
         let out = match srs {
             None => (*g).clone(),
