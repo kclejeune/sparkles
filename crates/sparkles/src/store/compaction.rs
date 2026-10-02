@@ -1,0 +1,1235 @@
+//! Compaction in the background, and the policy that decides when it is due.
+//!
+//! [`Store::compact_with`] builds a new generation from a snapshot without the writer
+//! lock. Writes go on meanwhile. While a compaction runs, each commit also leaves its
+//! changes in a tap (`WriterState::tap`), which the compaction drains and carries into
+//! the new generation: the ids are translated into the new generation's, the changes are
+//! applied to its delta, and each commit is written to its log under its own number. The
+//! writer lock is held only for the last, short round of that catch-up and the switch of
+//! `CURRENT`.
+//!
+//! [`CompactionPolicy`] says from [`CompactionMeasures`] whether a compaction is due. A
+//! dataset's own settings ([`CompactionSettings`]) live in `compaction.json`. The server
+//! runs the policy; the C13 spec has the design.
+
+use super::*;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
+use std::time::{Duration, Instant};
+
+/// The file in a dataset directory that holds the dataset's own compaction settings.
+pub const COMPACTION_FILE: &str = "compaction.json";
+
+/// The file that marks a generation directory as a compaction's unfinished build.
+const BUILDING_FILE: &str = "compacting";
+
+/// A catch-up round that finds fewer commits than this is the last one, and runs under
+/// the writer lock.
+const LAST_ROUND: usize = 64;
+/// Catch-up rounds without the writer lock, at most.
+const MAX_ROUNDS: usize = 16;
+/// Builder temporary files per quad, for the free-space estimate.
+const TEMP_BYTES_PER_QUAD: u64 = 32;
+/// No timestamp yet.
+const NONE: i64 = i64::MIN;
+
+// ------------------------------------------------------------------- policy ------
+
+/// When a dataset is compacted automatically. `0` turns off the size, idle and age
+/// triggers it is the limit of.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPolicy {
+    pub enabled: bool,
+    /// no quad-count, idle or age trigger fires with a smaller delta
+    pub min_delta_quads: u64,
+    /// the relative trigger: `min_delta_quads + delta_ratio × base quads`
+    pub delta_ratio: f64,
+    /// the absolute trigger, whatever the base
+    pub max_delta_quads: u64,
+    /// the estimated memory of the delta and its new terms, in MiB
+    pub max_delta_mb: u64,
+    /// the write-ahead log of the current generation, in MiB
+    pub max_wal_mb: u64,
+    /// no commit for this long, with at least `min_delta_quads` in the delta
+    pub idle_seconds: u64,
+    /// the oldest commit not yet compacted is older than this
+    pub max_age_seconds: u64,
+    /// no automatic compaction starts sooner than this after the previous one ended
+    pub min_interval_seconds: u64,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        CompactionPolicy {
+            enabled: true,
+            min_delta_quads: 10_000,
+            delta_ratio: 0.05,
+            max_delta_quads: 1_000_000,
+            max_delta_mb: 512,
+            max_wal_mb: 1024,
+            idle_seconds: 300,
+            max_age_seconds: 86_400,
+            min_interval_seconds: 60,
+        }
+    }
+}
+
+/// A dataset's own compaction settings: each one set overrides the server's.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_delta_quads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delta_quads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delta_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wal_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_interval_seconds: Option<u64>,
+}
+
+/// The setting names, as JSON keys and `key=value` arguments.
+pub const SETTING_NAMES: [&str; 9] = [
+    "enabled",
+    "minDeltaQuads",
+    "deltaRatio",
+    "maxDeltaQuads",
+    "maxDeltaMb",
+    "maxWalMb",
+    "idleSeconds",
+    "maxAgeSeconds",
+    "minIntervalSeconds",
+];
+
+impl CompactionSettings {
+    pub fn is_empty(&self) -> bool {
+        *self == CompactionSettings::default()
+    }
+
+    /// Settings from a JSON object of setting names (a `format` member is ignored).
+    pub fn from_json(v: &serde_json::Value) -> Result<CompactionSettings> {
+        let mut v = v.clone();
+        let Some(o) = v.as_object_mut() else {
+            return Err(Error::invalid(
+                "compaction settings must be a JSON object of settings",
+            ));
+        };
+        o.remove("format");
+        let s: CompactionSettings = serde_json::from_value(v).map_err(|e| {
+            Error::invalid(format!(
+                "compaction settings: {e} (the settings are {})",
+                SETTING_NAMES.join(", ")
+            ))
+        })?;
+        s.validate()?;
+        Ok(s)
+    }
+
+    /// Set one setting from `key=value` text (`sparkles compaction --set`). A value
+    /// that is not valid leaves the settings as they were.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let mut next = self.clone();
+        next.set_unchecked(key, value)?;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    fn set_unchecked(&mut self, key: &str, value: &str) -> Result<()> {
+        let n = || {
+            value.trim().replace('_', "").parse::<u64>().map_err(|_| {
+                Error::invalid(format!("{key}: expected a whole number, not {value:?}"))
+            })
+        };
+        match key {
+            "enabled" => {
+                self.enabled = Some(match value.trim() {
+                    "true" | "on" | "yes" | "1" => true,
+                    "false" | "off" | "no" | "0" => false,
+                    _ => {
+                        return Err(Error::invalid(format!(
+                            "enabled: expected true or false, not {value:?}"
+                        )));
+                    }
+                })
+            }
+            "minDeltaQuads" => self.min_delta_quads = Some(n()?),
+            "deltaRatio" => {
+                self.delta_ratio = Some(value.trim().parse::<f64>().map_err(|_| {
+                    Error::invalid(format!("deltaRatio: expected a number, not {value:?}"))
+                })?)
+            }
+            "maxDeltaQuads" => self.max_delta_quads = Some(n()?),
+            "maxDeltaMb" => self.max_delta_mb = Some(n()?),
+            "maxWalMb" => self.max_wal_mb = Some(n()?),
+            "idleSeconds" => self.idle_seconds = Some(n()?),
+            "maxAgeSeconds" => self.max_age_seconds = Some(n()?),
+            "minIntervalSeconds" => self.min_interval_seconds = Some(n()?),
+            _ => {
+                return Err(Error::invalid(format!(
+                    "unknown compaction setting {key:?} (the settings are {})",
+                    SETTING_NAMES.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Some(r) = self.delta_ratio
+            && !(r.is_finite() && (0.0..=1000.0).contains(&r))
+        {
+            return Err(Error::invalid(format!(
+                "deltaRatio must be a number from 0 to 1000, not {r}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl CompactionPolicy {
+    /// This policy with a dataset's own settings applied.
+    pub fn with(&self, own: &CompactionSettings) -> CompactionPolicy {
+        CompactionPolicy {
+            enabled: own.enabled.unwrap_or(self.enabled),
+            min_delta_quads: own.min_delta_quads.unwrap_or(self.min_delta_quads),
+            delta_ratio: own.delta_ratio.unwrap_or(self.delta_ratio),
+            max_delta_quads: own.max_delta_quads.unwrap_or(self.max_delta_quads),
+            max_delta_mb: own.max_delta_mb.unwrap_or(self.max_delta_mb),
+            max_wal_mb: own.max_wal_mb.unwrap_or(self.max_wal_mb),
+            idle_seconds: own.idle_seconds.unwrap_or(self.idle_seconds),
+            max_age_seconds: own.max_age_seconds.unwrap_or(self.max_age_seconds),
+            min_interval_seconds: own
+                .min_interval_seconds
+                .unwrap_or(self.min_interval_seconds),
+        }
+    }
+
+    /// The delta size at which the relative trigger fires for a base of `base_quads`
+    /// (capped by the absolute trigger).
+    pub fn threshold(&self, base_quads: u64) -> u64 {
+        let rel = self
+            .min_delta_quads
+            .saturating_add((self.delta_ratio * base_quads as f64) as u64)
+            .max(1);
+        match self.max_delta_quads {
+            0 => rel,
+            max => rel.min(max),
+        }
+    }
+
+    /// Whether a compaction is due, and why (the first trigger that fires). It does not
+    /// look at `enabled`.
+    pub fn verdict(&self, m: &CompactionMeasures) -> Option<Trigger> {
+        let delta = m.delta_quads;
+        let pending = delta > 0 || m.head > m.base_seq;
+        if !pending {
+            return None;
+        }
+        let t = |kind, detail: String| Some(Trigger { kind, detail });
+        if self.max_delta_quads > 0 && delta >= self.max_delta_quads {
+            return t(
+                TriggerKind::MaxDelta,
+                format!(
+                    "delta of {delta} quads reached maxDeltaQuads {}",
+                    self.max_delta_quads
+                ),
+            );
+        }
+        let threshold = self.threshold(m.base_quads);
+        if delta >= threshold {
+            return t(
+                TriggerKind::Ratio,
+                format!(
+                    "delta of {delta} quads reached {threshold} ({} + {} x {} base quads)",
+                    self.min_delta_quads, self.delta_ratio, m.base_quads
+                ),
+            );
+        }
+        if self.max_delta_mb > 0 && m.delta_bytes >= self.max_delta_mb << 20 {
+            return t(
+                TriggerKind::DeltaBytes,
+                format!(
+                    "delta of about {} reached maxDeltaMb {}",
+                    crate::error::human_bytes(m.delta_bytes),
+                    self.max_delta_mb
+                ),
+            );
+        }
+        if self.max_wal_mb > 0 && m.wal_bytes >= self.max_wal_mb << 20 {
+            return t(
+                TriggerKind::WalBytes,
+                format!(
+                    "write-ahead log of {} reached maxWalMb {}",
+                    crate::error::human_bytes(m.wal_bytes),
+                    self.max_wal_mb
+                ),
+            );
+        }
+        let floor = delta >= self.min_delta_quads.max(1);
+        if self.idle_seconds > 0
+            && floor
+            && m.idle_ms.is_some_and(|i| i >= self.idle_seconds * 1000)
+        {
+            return t(
+                TriggerKind::Idle,
+                format!(
+                    "no commit for {} s, with a delta of {delta} quads",
+                    m.idle_ms.unwrap_or(0) / 1000
+                ),
+            );
+        }
+        if self.max_age_seconds > 0
+            && m.head > m.base_seq
+            && m.oldest_change_ms
+                .is_some_and(|a| a >= self.max_age_seconds * 1000)
+        {
+            return t(
+                TriggerKind::Age,
+                format!(
+                    "the oldest change not compacted is {} s old",
+                    m.oldest_change_ms.unwrap_or(0) / 1000
+                ),
+            );
+        }
+        None
+    }
+}
+
+/// What made a compaction due.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Trigger {
+    pub kind: TriggerKind,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriggerKind {
+    MaxDelta,
+    Ratio,
+    DeltaBytes,
+    WalBytes,
+    Idle,
+    Age,
+}
+
+impl TriggerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerKind::MaxDelta => "max-delta",
+            TriggerKind::Ratio => "ratio",
+            TriggerKind::DeltaBytes => "delta-bytes",
+            TriggerKind::WalBytes => "wal-bytes",
+            TriggerKind::Idle => "idle",
+            TriggerKind::Age => "age",
+        }
+    }
+}
+
+/// What the policy looks at, measured without the writer lock.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionMeasures {
+    /// the current generation
+    pub generation: String,
+    /// the commit its base index holds
+    pub base_seq: u64,
+    pub head: u64,
+    pub base_quads: u64,
+    /// inserted plus deleted quads in the delta
+    pub delta_quads: u64,
+    pub delta_inserts: u64,
+    pub delta_deletes: u64,
+    /// estimated memory of the delta and the terms it added
+    pub delta_bytes: u64,
+    /// bytes of the current generation's write-ahead log (0 in memory)
+    pub wal_bytes: u64,
+    /// milliseconds since the last commit (`None`: not known)
+    pub idle_ms: Option<u64>,
+    /// age of the oldest commit not yet compacted, in milliseconds
+    pub oldest_change_ms: Option<u64>,
+    /// a compaction of the store is running
+    pub compacting: bool,
+}
+
+/// Why a due compaction should wait, as far as the store can tell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Blocker {
+    /// `running`, `bulk-load`, `backup`, `history` or `disk`
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+// -------------------------------------------------------------- tracking ------
+
+/// A commit's changes, kept for a compaction that runs while it is made.
+pub(crate) struct TapCommit {
+    pub info: CommitInfo,
+    /// the blank-node counter after the commit
+    pub next_bnode: u64,
+    pub changes: Vec<(u8, [Id; 4])>,
+}
+
+/// What the store tracks for the compaction policy, readable without the writer lock.
+pub(crate) struct Track {
+    /// the commit the current generation's base holds
+    base_seq: AtomicU64,
+    /// when the oldest commit not yet compacted was made (`NONE`: no such commit)
+    oldest_change_ms: AtomicI64,
+    /// when the last commit was made (`NONE`: not known)
+    last_commit_ms: AtomicI64,
+    /// a bulk commit is rebuilding the generation
+    pub rebuilding: AtomicBool,
+    /// a compaction is running
+    pub running: AtomicBool,
+    /// the generation number a background compaction builds (0: none)
+    pub reserved: AtomicU32,
+    /// the dataset's own settings
+    pub settings: Mutex<CompactionSettings>,
+}
+
+impl Track {
+    pub fn new(base_seq: u64, oldest: Option<i64>, last: Option<i64>) -> Track {
+        Track {
+            base_seq: AtomicU64::new(base_seq),
+            oldest_change_ms: AtomicI64::new(oldest.unwrap_or(NONE)),
+            last_commit_ms: AtomicI64::new(last.unwrap_or(NONE)),
+            rebuilding: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            reserved: AtomicU32::new(0),
+            settings: Mutex::new(CompactionSettings::default()),
+        }
+    }
+
+    /// A commit was published to the delta at `ts`.
+    pub fn committed(&self, ts: i64) {
+        self.last_commit_ms.store(ts, Ordering::Relaxed);
+        let _ =
+            self.oldest_change_ms
+                .compare_exchange(NONE, ts, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// A new generation holds commit `base_seq`; `oldest` is the first commit after it,
+    /// if there is one.
+    pub fn rebased(&self, base_seq: u64, oldest: Option<i64>) {
+        self.base_seq.store(base_seq, Ordering::Relaxed);
+        self.oldest_change_ms
+            .store(oldest.unwrap_or(NONE), Ordering::Relaxed);
+    }
+
+    /// A bulk commit was made at `ts` (its generation holds it).
+    pub fn bulk_committed(&self, base_seq: u64, ts: i64) {
+        self.last_commit_ms.store(ts, Ordering::Relaxed);
+        self.rebased(base_seq, None);
+    }
+}
+
+/// Clears `Track::rebuilding` when a bulk rebuild ends, however it ends.
+pub(crate) struct Rebuilding<'a>(pub &'a AtomicBool);
+
+impl Drop for Rebuilding<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+// --------------------------------------------------------------- compact ------
+
+/// How [`Store::compact_with`] builds.
+#[derive(Clone, Default)]
+pub struct CompactOptions {
+    /// threads for the build (`None`: the global pool, every core)
+    pub threads: Option<usize>,
+    /// lower the build threads' priority (Linux: nice 10)
+    pub low_priority: bool,
+    /// the average rate at which the build may write, in bytes per second
+    pub io_bytes_per_sec: Option<u64>,
+    /// stops the build ([`Error::Cancelled`]) when set
+    pub cancel: Option<Arc<AtomicBool>>,
+    pub progress: Option<crate::builder::ProgressFn>,
+}
+
+/// What a compaction did.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactReport {
+    /// the generation it published (the current one when abandoned)
+    pub generation: String,
+    pub quads: u64,
+    /// the commit the new generation's base holds
+    pub base_commit: u64,
+    /// commits made during the build and carried into the new generation
+    pub caught_up_commits: u64,
+    /// why it published nothing (a bulk commit rebuilt the dataset meanwhile)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<String>,
+    /// how long the switch held the writer lock
+    pub lock_ms: f64,
+    pub build_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Undoes what an unfinished compaction set up: the tap, the reserved number, the
+/// quota's exclusion and the new generation's directory.
+struct Run<'a> {
+    store: &'a Store,
+    dir: Option<PathBuf>,
+    published: bool,
+}
+
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        let s = self.store;
+        if !self.published {
+            s.writer.lock().tap = None;
+            if let Some(dir) = &self.dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        s.compaction.reserved.store(0, Ordering::Relaxed);
+        if self.dir.is_some() {
+            s.quota.exclude(None);
+        }
+        s.compaction.running.store(false, Ordering::Release);
+    }
+}
+
+/// The commits made during a build, carried into the new generation.
+struct CatchUp {
+    gen_: Arc<Generation>,
+    cache: Arc<BlockCache>,
+    delta: Delta,
+    wal: Option<BufWriter<File>>,
+    wal_len: u64,
+    index: wal::WalIndex,
+    /// old ids to new ones
+    ids: rustc_hash::FxHashMap<u64, Id>,
+    last: u64,
+    commits: u64,
+    next_bnode: u64,
+    /// the timestamp of the first commit carried over
+    oldest_ms: Option<i64>,
+}
+
+impl CatchUp {
+    fn translate(&mut self, id: Id, view: &Snapshot) -> Result<Id> {
+        if !matches!(id.tag(), Tag::Vocab | Tag::Delta) {
+            return Ok(id);
+        }
+        if let Some(&n) = self.ids.get(&id.0) {
+            return Ok(n);
+        }
+        let key = view
+            .key(id)
+            .ok_or_else(|| Error::Corrupt(format!("compaction: dangling id {id:?}")))?;
+        let n = match self.gen_.vocab.find(&key) {
+            Ok(i) => Id::vocab(i),
+            Err(_) => Id::delta(self.gen_.dvocab.insert(&key)?),
+        };
+        self.ids.insert(id.0, n);
+        Ok(n)
+    }
+
+    /// Carry `batch` (in commit order) over; `view` is a snapshot of the old generation
+    /// that knows every term the batch names.
+    fn apply(&mut self, batch: &[TapCommit], view: &Snapshot) -> Result<()> {
+        let mut rec = [0u8; WAL_REC];
+        for c in batch {
+            if c.info.seq != self.last + 1 {
+                return Err(Error::Corrupt(format!(
+                    "compaction: commit {} follows commit {}",
+                    c.info.seq, self.last
+                )));
+            }
+            let mut data = Vec::with_capacity((c.changes.len() + 1) * WAL_REC);
+            for (op, q) in &c.changes {
+                let n = [
+                    self.translate(q[0], view)?,
+                    self.translate(q[1], view)?,
+                    self.translate(q[2], view)?,
+                    self.translate(q[3], view)?,
+                ];
+                let in_base = self
+                    .gen_
+                    .perm(Perm::Spo)
+                    .contains(&self.cache, &Perm::Spo.to_key(&n))?;
+                apply(&mut self.delta, &n, *op == WAL_INSERT, in_base);
+                rec[0] = *op;
+                for j in 0..4 {
+                    rec[1 + j * 8..9 + j * 8].copy_from_slice(&n[j].0.to_le_bytes());
+                }
+                data.extend_from_slice(&rec);
+            }
+            rec[0] = WAL_COMMIT;
+            rec[1..9].copy_from_slice(&c.next_bnode.to_le_bytes());
+            let flags = if c.info.unvalidated {
+                commit::WAL_FLAG_UNVALIDATED
+            } else {
+                0
+            };
+            commit::seal_wal_commit(
+                &mut rec,
+                c.info.seq,
+                c.info.timestamp_ms,
+                c.info.kind,
+                flags,
+                &data,
+            );
+            data.extend_from_slice(&rec);
+            if let Some(w) = self.wal.as_mut() {
+                w.write_all(&data)?;
+                self.wal_len += data.len() as u64;
+                self.index.note(wal::WalPoint {
+                    seq: c.info.seq,
+                    offset: self.wal_len,
+                    folding: false,
+                });
+            }
+            self.last = c.info.seq;
+            self.commits += 1;
+            self.next_bnode = self.next_bnode.max(c.next_bnode);
+            self.oldest_ms.get_or_insert(c.info.timestamp_ms);
+        }
+        Ok(())
+    }
+
+    /// Make the carried commits and their new terms durable.
+    fn sync(&mut self) -> Result<()> {
+        match self.wal.as_mut() {
+            Some(w) => {
+                w.flush()?;
+                if self.gen_.dvocab.needs_sync() {
+                    self.gen_.dvocab.flush()?;
+                }
+                sync_commit(w.get_ref(), &self.gen_.dvocab)
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// Lower the calling thread's CPU priority (a build thread of a background compaction).
+fn lower_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid has no preconditions; setpriority only reads its arguments, and
+    // its failure (an unprivileged caller may only lower priority) is ignored
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+impl Store {
+    /// The dataset's own compaction settings (`compaction.json` of a persistent store).
+    pub fn compaction_settings(&self) -> CompactionSettings {
+        self.compaction.settings.lock().clone()
+    }
+
+    /// Replace the dataset's own compaction settings (`None` or empty: remove them, so
+    /// that the server's apply). A persistent store keeps them in `compaction.json`.
+    pub fn set_compaction_settings(&self, s: Option<CompactionSettings>) -> Result<()> {
+        let s = s.unwrap_or_default();
+        s.validate()?;
+        let mut cur = self.compaction.settings.lock();
+        if let Some(root) = &self.root {
+            let path = root.join(COMPACTION_FILE);
+            if s.is_empty() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => sync_dir(root)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                let mut v = serde_json::to_value(&s).expect("settings serialize");
+                v.as_object_mut()
+                    .expect("an object")
+                    .insert("format".into(), 1.into());
+                let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
+                bytes.push(b'\n');
+                write_atomic(&path, &bytes)?;
+            }
+        }
+        *cur = s;
+        Ok(())
+    }
+
+    /// What the compaction policy looks at, measured without the writer lock.
+    pub fn compaction_measures(&self) -> CompactionMeasures {
+        let snap = self.snapshot();
+        let now = self.now_ms();
+        let t = &self.compaction;
+        let since = |ms: i64| (ms != NONE).then(|| now.saturating_sub(ms).max(0) as u64);
+        CompactionMeasures {
+            generation: snap.generation.name.clone(),
+            base_seq: t.base_seq.load(Ordering::Relaxed),
+            head: snap.commit,
+            base_quads: snap.generation.meta.quads,
+            delta_quads: (snap.delta.inserts() + snap.delta.deletes()) as u64,
+            delta_inserts: snap.delta.inserts() as u64,
+            delta_deletes: snap.delta.deletes() as u64,
+            delta_bytes: delta_bytes(&snap.delta)
+                + snap.generation.dvocab.with(|v| v.bytes()) as u64,
+            wal_bytes: self.wal_bytes(),
+            idle_ms: since(t.last_commit_ms.load(Ordering::Relaxed)),
+            oldest_change_ms: since(t.oldest_change_ms.load(Ordering::Relaxed)),
+            compacting: t.running.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Why a compaction should not start now, as far as the store can tell: one is
+    /// running, a bulk commit is rebuilding, a backup leases the current generation, the
+    /// retention window would lose a generation it covers, or (with `disk`) the file
+    /// system lacks room for the new generation and the free-space reserve.
+    pub fn compaction_blocker(&self, disk: bool) -> Option<Blocker> {
+        let b = |reason, detail: String| Some(Blocker { reason, detail });
+        if self.compaction.running.load(Ordering::Relaxed) {
+            return b("running", "a compaction is running".into());
+        }
+        if self.compaction.rebuilding.load(Ordering::Relaxed) {
+            return b(
+                "bulk-load",
+                "a bulk commit is rebuilding the dataset".into(),
+            );
+        }
+        let (Some(root), Some(hist)) = (&self.root, &self.history) else {
+            return None;
+        };
+        let snap = self.snapshot();
+        let current = commit::generation_number(&snap.generation.name);
+        {
+            let h = hist.lock();
+            if let Some(l) = h.leases.values().find(|l| l.generation == current) {
+                return b(
+                    "backup",
+                    format!("{} is reading {}", l.label, snap.generation.name),
+                );
+            }
+            if let Some(no) = self.window_would_drop(&h, current, snap.commit) {
+                return b(
+                    "history",
+                    format!(
+                        "the retention window would drop gen-{no:04}: it keeps at most {} generations{}",
+                        self.opts.history_max_generations,
+                        h.retention
+                            .max_bytes
+                            .map(|m| format!(" and {}", crate::error::human_bytes(m)))
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
+        if disk {
+            let need = self.compaction_disk_need(&snap);
+            let reserve = self.opts.min_free_disk_bytes.unwrap_or(0);
+            if let Err(e) = crate::disk::check_reserve(root, reserve, need, true) {
+                return b("disk", e.to_string());
+            }
+        }
+        None
+    }
+
+    /// The disk a compaction of `snap` needs at its peak, estimated: the current base
+    /// scaled to the quads it will hold, plus the builder's temporary files.
+    fn compaction_disk_need(&self, snap: &Snapshot) -> u64 {
+        let quads = snap.len();
+        let base = snap.generation.meta.quads.max(1);
+        let scaled = (snap.generation.disk_bytes() as f64 * quads as f64 / base as f64) as u64;
+        scaled + quads * TEMP_BYTES_PER_QUAD
+    }
+
+    /// A generation that the retention window keeps now but would drop if the current
+    /// generation were compacted at `head`, because of its generation or byte limit.
+    fn window_would_drop(
+        &self,
+        h: &crate::history::HistoryState,
+        current: u32,
+        head: u64,
+    ) -> Option<u32> {
+        let r = h.retention;
+        if r.keep_commits.is_none_or(|n| n == 0) && r.keep_age_ms.is_none() {
+            return None;
+        }
+        let cat = self.catalog.lock();
+        let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
+        let now = self.now_ms();
+        let max = self.opts.history_max_generations;
+        let lost = |s: &crate::history::HistoryState, cur: u32| {
+            let kept = s.needed(cur, head, now, &ts, max);
+            let mut all = s.clone_for_simulation();
+            all.retention.max_bytes = None;
+            let wanted = all.needed(cur, head, now, &ts, usize::MAX);
+            wanted
+                .into_keys()
+                .filter(|no| !kept.contains_key(no))
+                .collect::<Vec<u32>>()
+        };
+        let before = lost(h, current);
+        let mut after = h.clone_for_simulation();
+        let next = current + 1;
+        if let Some(g) = after.gens.get_mut(&current) {
+            g.end = head;
+            g.bytes = dir_size(&g.dir);
+            let base = CommitInfo {
+                seq: head,
+                ..g.base
+            };
+            let entry = crate::history::GenEntry {
+                name: format!("gen-{next:04}"),
+                dir: g.dir.clone(),
+                base,
+                end: head,
+                fold_legacy: false,
+                bytes: 0,
+            };
+            after.gens.insert(next, entry);
+        }
+        lost(&after, next)
+            .into_iter()
+            .find(|no| !before.contains(no))
+    }
+
+    /// Compact: merge the base and the delta into a new generation, without stopping
+    /// writes. The build reads a snapshot without the writer lock. The commits made
+    /// meanwhile are carried into the new generation, and the writer lock is held only
+    /// for the last of them and the switch. The data and the head do not change.
+    ///
+    /// A bulk commit during the build makes the compaction moot: it publishes nothing
+    /// and says why in [`CompactReport::abandoned`]. Only one compaction of a store runs
+    /// at a time ([`Error::Conflict`] otherwise).
+    pub fn compact_with(&self, o: &CompactOptions) -> Result<CompactReport> {
+        let t0 = Instant::now();
+        if self.compaction.running.swap(true, Ordering::Acquire) {
+            return Err(Error::Conflict(
+                "a compaction of this dataset is already running".into(),
+            ));
+        }
+        let mut run = Run {
+            store: self,
+            dir: None,
+            published: false,
+        };
+        let cancelled = || o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        // start: the snapshot to build, with the tap on from its commit
+        let (snap0, base, next_bnode, name, dir, tmp) = {
+            let mut w = self.writer.lock();
+            if w.poisoned {
+                return Err(Error::Poisoned);
+            }
+            // the commits up to here are durable in the catalog, and the full-text index
+            // at its position, before the old generation's log can go
+            self.catalog.lock().sync()?;
+            #[cfg(feature = "text")]
+            if let Some(ti) = self.text.load_full() {
+                ti.checkpoint()?;
+            }
+            let snap = self.snapshot();
+            let (dir, name, tmp) = match &self.root {
+                Some(root) => {
+                    let cur = commit::generation_number(&snap.generation.name);
+                    let n = cur.max(self.compaction.reserved.load(Ordering::Relaxed)) + 1;
+                    self.compaction.reserved.store(n, Ordering::Relaxed);
+                    let name = format!("gen-{n:04}");
+                    let dir = root.join(&name);
+                    if dir.exists() {
+                        std::fs::remove_dir_all(&dir)?;
+                    }
+                    (dir, name, None)
+                }
+                None => {
+                    let t = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
+                    (t.path().to_path_buf(), "mem".to_string(), Some(t))
+                }
+            };
+            w.tap = Some(Vec::new());
+            (snap, w.head, w.next_bnode, name, dir, tmp)
+        };
+        if self.root.is_some() {
+            run.dir = Some(dir.clone());
+            self.quota.exclude(Some(&dir));
+            // marks the directory as this dataset's unfinished build, which the next open
+            // removes after a crash
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(BUILDING_FILE), self.dataset_id.to_string())?;
+        }
+        self.failpoint("compact-started");
+        let tb = Instant::now();
+        let meta = self.build_compacted(&snap0, &dir, next_bnode, o)?;
+        let build = tb.elapsed();
+        self.failpoint("compact-built");
+        let persistent = self.root.is_some();
+        let mut gen_ = Generation::open(&dir, &name, persistent)?;
+        gen_._tmp = tmp;
+        let gen_ = Arc::new(gen_);
+        let mut cu = CatchUp {
+            gen_: gen_.clone(),
+            cache: self.cache.clone(),
+            delta: Delta::default(),
+            wal: if persistent {
+                Some(BufWriter::new(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("wal.log"))?,
+                ))
+            } else {
+                None
+            },
+            wal_len: 0,
+            index: wal::WalIndex::new(base.seq, false),
+            ids: Default::default(),
+            last: base.seq,
+            commits: 0,
+            next_bnode: meta.next_bnode,
+            oldest_ms: None,
+        };
+        let superseded = |w: &WriterState| -> Option<String> {
+            if self.snapshot().generation.uid != snap0.generation.uid || w.tap.is_none() {
+                Some("a bulk commit rebuilt the dataset during the build".into())
+            } else if w.poisoned {
+                Some("the store stopped taking writes".into())
+            } else {
+                None
+            }
+        };
+        let abandoned = |why: String| CompactReport {
+            generation: self.snapshot().generation.name.clone(),
+            abandoned: Some(why),
+            build_ms: build.as_secs_f64() * 1e3,
+            total_ms: t0.elapsed().as_secs_f64() * 1e3,
+            ..Default::default()
+        };
+        // catch-up rounds without the writer lock
+        for _ in 0..MAX_ROUNDS {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let (batch, view) = {
+                let mut w = self.writer.lock();
+                if let Some(why) = superseded(&w) {
+                    return Ok(abandoned(why));
+                }
+                let batch = std::mem::take(w.tap.as_mut().expect("checked above"));
+                (batch, self.snapshot())
+            };
+            cu.apply(&batch, &view)?;
+            if batch.len() < LAST_ROUND {
+                break;
+            }
+        }
+        self.failpoint("compact-caught-up");
+        // the switch, under the writer lock
+        let mut w = self.writer.lock();
+        let tl = Instant::now();
+        if let Some(why) = superseded(&w) {
+            return Ok(abandoned(why));
+        }
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let rest = std::mem::take(w.tap.as_mut().expect("checked above"));
+        let view = self.snapshot();
+        cu.apply(&rest, &view)?;
+        cu.sync()?;
+        w.next_bnode = w.next_bnode.max(cu.next_bnode);
+        let new_no = commit::generation_number(&name);
+        if let Some(root) = &self.root {
+            // the new generation's files, its log and its base commit are durable before
+            // CURRENT names it; a crash before the switch leaves the old one current
+            std::fs::remove_file(dir.join(BUILDING_FILE))?;
+            write_synced(
+                &dir.join("commit.json"),
+                &commit::gen_commit_bytes(self.dataset_id, "compaction", &base),
+            )?;
+            sync_dir(&dir)?;
+            sync_dir(root)?;
+            self.failpoint("compact-before-current");
+            if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
+                let switched =
+                    std::fs::read_to_string(root.join("CURRENT")).is_ok_and(|c| c.trim() == name);
+                if switched {
+                    // the next open uses the new generation, which lacks the commits
+                    // this process would make to the old one: take no more writes
+                    w.tap = None;
+                    w.poisoned = true;
+                    run.published = true;
+                }
+                return Err(e);
+            }
+            let wal = cu.wal.take().expect("a persistent store has a log");
+            w.wal = Some(wal);
+            w.wal_len = cu.wal_len;
+            *gen_.wal_index.lock() = Some(std::mem::replace(
+                &mut cu.index,
+                wal::WalIndex::new(base.seq, false),
+            ));
+        }
+        w.tap = None;
+        run.published = true;
+        if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
+            w.poisoned = true;
+            return Err(e);
+        }
+        let dvocab_len = gen_.dvocab.len();
+        let mut new_snap = Snapshot {
+            generation: gen_,
+            delta: std::mem::take(&mut cu.delta),
+            version: view.version + 1,
+            cache: self.cache.clone(),
+            results: self.results.clone(),
+            dvocab_len,
+            commit: view.commit,
+            text: view.text.clone(),
+            geo: None,
+            union_default_graph: self.opts.union_default_graph,
+            geo_op_vertices: self.opts.geo_op_vertices,
+            delta_stats: Default::default(),
+            counts: Default::default(),
+            historical: false,
+        };
+        self.rebuild_geo_locked(&mut new_snap, &view);
+        let quads = new_snap.len();
+        self.current.store(Arc::new(new_snap));
+        self.commits.send_replace(view.commit);
+        self.vectors_switched(&view);
+        self.compaction.rebased(base.seq, cu.oldest_ms);
+        if let (Some(root), Some(h), Some(old)) = (&self.root, &self.history, &view.generation.dir)
+            && old.starts_with(root)
+        {
+            let mut h = h.lock();
+            let old_no = commit::generation_number(&view.generation.name);
+            if let Some(g) = h.gens.get_mut(&old_no) {
+                g.end = view.commit;
+                g.bytes = dir_size(&g.dir);
+            }
+            h.gens.insert(
+                new_no,
+                crate::history::GenEntry {
+                    name: name.clone(),
+                    dir: dir.clone(),
+                    base,
+                    end: view.commit,
+                    fold_legacy: false,
+                    bytes: 0,
+                },
+            );
+            self.collect_locked(&mut h, new_no, view.commit);
+        }
+        let lock = tl.elapsed();
+        drop(w);
+        drop(run);
+        self.quota.invalidate();
+        Ok(CompactReport {
+            generation: name,
+            quads,
+            base_commit: base.seq,
+            caught_up_commits: cu.commits,
+            abandoned: None,
+            lock_ms: lock.as_secs_f64() * 1e3,
+            build_ms: build.as_secs_f64() * 1e3,
+            total_ms: t0.elapsed().as_secs_f64() * 1e3,
+        })
+    }
+
+    /// Build the generation of `snap` in `dir`, under the build limits of `o`.
+    fn build_compacted(
+        &self,
+        snap: &Snapshot,
+        dir: &Path,
+        next_bnode: u64,
+        o: &CompactOptions,
+    ) -> Result<IndexMeta> {
+        let mut bopts = self.opts.build.clone();
+        bopts.first_bnode = next_bnode;
+        if let Some(t) = o.threads {
+            bopts.threads = t.max(1);
+        }
+        let interrupt = self.compaction_interrupt(o, dir);
+        let build = || -> Result<IndexMeta> {
+            let mut builder = Builder::new(dir, bopts.clone())?.with_interrupt(interrupt.clone());
+            if let Some(p) = &o.progress {
+                builder = builder.with_progress(p.clone());
+            }
+            write_snapshot(&builder, snap, |_| Ok(true), &[])?;
+            builder.add_prefixes(self.prefixes());
+            let meta = builder.finish()?;
+            interrupt()?;
+            Ok(meta)
+        };
+        if o.threads.is_none() && !o.low_priority {
+            return build();
+        }
+        let low = o.low_priority;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(bopts.threads)
+            .thread_name(|i| format!("compact-{i}"))
+            .start_handler(move |_| {
+                if low {
+                    lower_priority();
+                }
+            })
+            .build()
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+        pool.install(build)
+    }
+
+    /// What stops or paces a compaction's build: its cancel flag, the free-space reserve,
+    /// and its write rate.
+    fn compaction_interrupt(&self, o: &CompactOptions, dir: &Path) -> crate::builder::InterruptFn {
+        let cancel = o.cancel.clone();
+        let reserve = self.root.as_ref().and(self.opts.min_free_disk_bytes);
+        let rate = o.io_bytes_per_sec.filter(|r| *r > 0);
+        let dir = dir.to_path_buf();
+        let start = Instant::now();
+        Arc::new(move || {
+            let stop = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            if stop() {
+                return Err(Error::Cancelled);
+            }
+            if let Some(r) = reserve {
+                crate::disk::check_reserve(&dir, r, 0, false)?;
+            }
+            if let Some(rate) = rate {
+                // ahead of the rate: wait until the bytes written so far are due
+                let due = Duration::from_secs_f64(dir_size(&dir) as f64 / rate as f64);
+                while start.elapsed() < due {
+                    if stop() {
+                        return Err(Error::Cancelled);
+                    }
+                    std::thread::sleep((due - start.elapsed()).min(Duration::from_millis(100)));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Remove the unfinished builds of compactions that a crash interrupted: directories
+/// `gen-N` above the current generation that hold this dataset's build marker.
+pub(crate) fn remove_interrupted(root: &Path, dataset_id: uuid::Uuid, current: u32) {
+    let Ok(dir) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(num) = name.strip_prefix("gen-") else {
+            continue;
+        };
+        if !num.bytes().all(|b| b.is_ascii_digit()) || commit::generation_number(&name) <= current {
+            continue;
+        }
+        let ours = std::fs::read_to_string(e.path().join(BUILDING_FILE))
+            .is_ok_and(|id| id.trim() == dataset_id.to_string());
+        if ours && let Err(err) = crate::history::delete_generation(root, &e.path()) {
+            tracing::warn!("could not remove the interrupted compaction {name}: {err}");
+        }
+    }
+}
+
+/// Read a dataset's `compaction.json` (`None` without one).
+pub(crate) fn read_settings(root: &Path) -> Result<CompactionSettings> {
+    match std::fs::read(root.join(COMPACTION_FILE)) {
+        Ok(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))?;
+            CompactionSettings::from_json(&v)
+                .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CompactionSettings::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn m(base: u64, delta: u64) -> CompactionMeasures {
+        CompactionMeasures {
+            base_quads: base,
+            delta_quads: delta,
+            head: if delta > 0 { 1 } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_relative_trigger_fires_at_its_threshold() {
+        let p = CompactionPolicy::default();
+        assert_eq!(p.threshold(100_000), 15_000);
+        assert_eq!(p.verdict(&m(100_000, 14_999)), None);
+        let t = p.verdict(&m(100_000, 15_000)).unwrap();
+        assert_eq!(t.kind, TriggerKind::Ratio, "{t:?}");
+        // a huge base is capped by the absolute trigger
+        assert_eq!(p.threshold(1_000_000_000), 1_000_000);
+        let t = p.verdict(&m(1_000_000_000, 1_000_000)).unwrap();
+        assert_eq!(t.kind, TriggerKind::MaxDelta);
+        // nothing to compact
+        assert_eq!(p.verdict(&m(0, 0)), None);
+    }
+
+    #[test]
+    fn idle_needs_the_floor_and_age_does_not() {
+        let p = CompactionPolicy::default();
+        let mut x = m(1_000_000, 9_999);
+        x.idle_ms = Some(3_600_000);
+        assert_eq!(p.verdict(&x), None);
+        x.delta_quads = 10_000;
+        assert_eq!(p.verdict(&x).unwrap().kind, TriggerKind::Idle);
+        let mut y = m(1_000_000, 1);
+        y.oldest_change_ms = Some(86_400_000);
+        assert_eq!(p.verdict(&y).unwrap().kind, TriggerKind::Age);
+        y.oldest_change_ms = Some(86_399_999);
+        assert_eq!(p.verdict(&y), None);
+        // turned off
+        let off = p.with(&CompactionSettings {
+            max_age_seconds: Some(0),
+            idle_seconds: Some(0),
+            ..Default::default()
+        });
+        y.oldest_change_ms = Some(u64::MAX / 2);
+        x.idle_ms = Some(u64::MAX / 2);
+        assert_eq!(off.verdict(&y), None);
+        assert_eq!(off.verdict(&x), None);
+    }
+
+    #[test]
+    fn size_triggers() {
+        let p = CompactionPolicy::default();
+        let mut x = m(1_000_000_000, 100);
+        x.wal_bytes = 1024 << 20;
+        assert_eq!(p.verdict(&x).unwrap().kind, TriggerKind::WalBytes);
+        x.wal_bytes = 0;
+        x.delta_bytes = 512 << 20;
+        assert_eq!(p.verdict(&x).unwrap().kind, TriggerKind::DeltaBytes);
+    }
+
+    #[test]
+    fn settings_parse_validate_and_override() {
+        let mut s = CompactionSettings::default();
+        s.set("deltaRatio", "0.02").unwrap();
+        s.set("enabled", "off").unwrap();
+        s.set("minDeltaQuads", "5_000").unwrap();
+        assert!(s.set("deltaRatio", "-1").is_err());
+        assert!(s.set("nope", "1").is_err());
+        let p = CompactionPolicy::default().with(&s);
+        assert!(!p.enabled);
+        assert_eq!((p.delta_ratio, p.min_delta_quads), (0.02, 5_000));
+        let j = serde_json::json!({"format": 1, "deltaRatio": 0.5});
+        let t = CompactionSettings::from_json(&j).unwrap();
+        assert_eq!(t.delta_ratio, Some(0.5));
+        assert!(CompactionSettings::from_json(&serde_json::json!({"ratio": 1})).is_err());
+        assert!(CompactionSettings::from_json(&serde_json::json!([1])).is_err());
+    }
+}

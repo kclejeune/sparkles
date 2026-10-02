@@ -549,6 +549,16 @@ impl HistoryState {
         }
     }
 
+    /// A copy of what decides which generations are kept (pins, retention, leases and
+    /// the generation table), without the open generations and cached states, for
+    /// working out what a change would keep.
+    pub fn clone_for_simulation(&self) -> HistoryState {
+        let mut h = HistoryState::new(self.pins.clone(), self.retention);
+        h.leases = self.leases.clone();
+        h.gens = self.gens.clone();
+        h
+    }
+
     /// Generation ranges `(number, base, end)`; the current generation ends at `head`.
     fn ranges(&self, current: u32, head: u64) -> Vec<(u32, u64, u64)> {
         self.gens
