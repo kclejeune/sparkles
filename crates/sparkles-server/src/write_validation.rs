@@ -50,6 +50,7 @@ impl Validation {
     /// in-memory dataset, which has no directory: `validation.json`, and the copy of
     /// SHACL shapes given inline or of the ShEx schema. They are what a persistent
     /// dataset with the same configuration keeps.
+    #[cfg(feature = "backup")]
     pub fn memory_files(&self) -> Vec<(String, Vec<u8>)> {
         #[cfg(any(feature = "shacl", feature = "shex"))]
         let config = sparkles::guard::config::CONFIG_FILE.to_string();
@@ -232,7 +233,7 @@ mod tests {
 
     /// The files of an in-memory dataset's validation install the same guard in a
     /// database directory (a backup restored as a persistent dataset).
-    #[cfg(all(feature = "shex", feature = "shacl"))]
+    #[cfg(all(feature = "shex", feature = "shacl", feature = "backup"))]
     #[test]
     fn in_memory_validation_files_install_in_a_directory() {
         let mem = Store::in_memory(Default::default());
