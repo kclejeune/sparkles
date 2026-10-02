@@ -136,6 +136,12 @@ body {
   height: 100%;
 }
 
+/* no font inflation when a phone turns to landscape */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -167,6 +173,12 @@ h3 {
 
 p {
   margin: 0;
+}
+
+/* a fieldset is at least as wide as its content by default, which a long line pushes
+   past a phone's screen */
+fieldset {
+  min-inline-size: 0;
 }
 
 a {
@@ -301,6 +313,12 @@ pre,
   background-size: 4px 4px;
   background-repeat: no-repeat;
 }
+/* a select is as wide as its longest option: never wider than its box. WebKit lets the
+   text of a narrowed select spill out and makes its container scroll, unless clipped */
+select {
+  max-width: 100%;
+  overflow: hidden;
+}
 .input:focus,
 .select:focus,
 .textarea:focus {
@@ -313,8 +331,23 @@ pre,
   color: var(--text-3);
 }
 
+/* iOS Safari zooms into a text field whose font is under 16px when it gets the focus, and
+   the zoomed page then pans sideways; on a touch screen, text fields and the code editors
+   use 16px */
+@media (pointer: coarse) {
+  input:not([type='checkbox'], [type='radio'], [type='range'], [type='file']),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+  .cm-editor .cm-scroller {
+    font-size: 16px;
+  }
+}
+
 label.field {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 4px;
   font-size: var(--fs-sm);
   color: var(--text-2);
@@ -342,6 +375,11 @@ label.field {
 }
 .panel-body {
   padding: 12px 14px;
+}
+@media (max-width: 600px) {
+  .panel-head {
+    flex-wrap: wrap;
+  }
 }
 
 .muted {
@@ -490,11 +528,16 @@ table.data .num {
   overflow: auto;
 }
 
-/* segmented tabs */
+/* segmented tabs; on a narrow screen the strip scrolls sideways, not the page */
 .tabs {
   display: flex;
   align-items: stretch;
   gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
 }
 .tab {
   display: inline-flex;
@@ -509,6 +552,8 @@ table.data .num {
   font-weight: 500;
   cursor: pointer;
   border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  flex: none;
 }
 .tab:hover {
   color: var(--text);

@@ -1095,6 +1095,7 @@ ex:PersonShape a sh:NodeShape ;
   .page {
     padding: 18px 28px 40px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
     max-width: 1320px;
     width: 100%;
@@ -1171,6 +1172,7 @@ ex:PersonShape a sh:NodeShape ;
   }
   .col {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
     min-width: 0;
   }
@@ -1249,6 +1251,7 @@ ex:PersonShape a sh:NodeShape ;
   }
   .shacl {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
   }
   .shacl[hidden] {
@@ -1264,6 +1267,7 @@ ex:PersonShape a sh:NodeShape ;
     gap: 6px;
     font-size: var(--fs-sm);
     min-width: 0;
+    max-width: 100%;
   }
   .inline .select {
     max-width: 260px;
@@ -1432,7 +1436,7 @@ ex:PersonShape a sh:NodeShape ;
   }
   @media (max-width: 1100px) {
     .cols {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .figures {
       grid-template-columns: repeat(3, 1fr);

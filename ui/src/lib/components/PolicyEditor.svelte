@@ -466,10 +466,12 @@
   }
   .form {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px;
   }
   .group {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
   legend {
@@ -531,6 +533,7 @@
   }
   .seg {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
   }
   .seg label {
@@ -557,6 +560,8 @@
     gap: 6px;
     font-size: var(--fs-sm);
     color: var(--text-2);
+    min-width: 0;
+    max-width: 100%;
   }
   .grow {
     flex: 1;

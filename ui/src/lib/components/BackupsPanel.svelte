@@ -137,53 +137,57 @@
         No backups of {name} yet{admin && persistent ? ': back it up into a repository.' : '.'}
       </p>
     {:else}
-      <table class="data">
-        <thead>
-          <tr>
-            <th>Backup</th>
-            <th>Commit</th>
-            <th class="num">Size</th>
-            <th class="num" title="Size over the bytes it added">Dedup</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each shown as x (`${x.repository}/${x.name}`)}
+      <div class="scroll-x">
+        <table class="data">
+          <thead>
             <tr>
-              <td class="name">
-                <button class="linkish mono" onclick={() => dialogs?.show('details', x)}
-                  >{x.name}</button
-                >
-                <div class="faint small">
-                  {x.repository} · {fmtRelative(x.completed, now)}{x.policy ? ` · ${x.policy}` : ''}
-                  {#if x.sameLineage === false}<span
-                      class="badge warn"
-                      title="Another dataset id ({x.dataset.id}): an earlier dataset of this name"
-                      >other lineage</span
-                    >{/if}
-                  {#if x.verified?.status === 'error'}<span
-                      class="badge danger"
-                      title="Last verify ({x.verified.level}) {fmtTime(x.verified.at)}"
-                      >verify failed</span
-                    >{/if}
-                </div>
-              </td>
-              <td class="small" title={fmtTime(x.commit.timestamp)}
-                >{fmtCommitAge(x.commit, now)}</td
-              >
-              <td class="num small">{fmtBytes(x.logicalBytes)}</td>
-              <td class="num small">{fmtDedup(x)}</td>
-              <td class="actions">
-                {#if admin}
-                  <button class="btn sm" onclick={() => dialogs?.show('restore', x)}
-                    >Restore…</button
-                  >
-                {/if}
-              </td>
+              <th>Backup</th>
+              <th>Commit</th>
+              <th class="num">Size</th>
+              <th class="num" title="Size over the bytes it added">Dedup</th>
+              <th></th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each shown as x (`${x.repository}/${x.name}`)}
+              <tr>
+                <td class="name">
+                  <button class="linkish mono" onclick={() => dialogs?.show('details', x)}
+                    >{x.name}</button
+                  >
+                  <div class="faint small">
+                    {x.repository} · {fmtRelative(x.completed, now)}{x.policy
+                      ? ` · ${x.policy}`
+                      : ''}
+                    {#if x.sameLineage === false}<span
+                        class="badge warn"
+                        title="Another dataset id ({x.dataset.id}): an earlier dataset of this name"
+                        >other lineage</span
+                      >{/if}
+                    {#if x.verified?.status === 'error'}<span
+                        class="badge danger"
+                        title="Last verify ({x.verified.level}) {fmtTime(x.verified.at)}"
+                        >verify failed</span
+                      >{/if}
+                  </div>
+                </td>
+                <td class="small" title={fmtTime(x.commit.timestamp)}
+                  >{fmtCommitAge(x.commit, now)}</td
+                >
+                <td class="num small">{fmtBytes(x.logicalBytes)}</td>
+                <td class="num small">{fmtDedup(x)}</td>
+                <td class="actions">
+                  {#if admin}
+                    <button class="btn sm" onclick={() => dialogs?.show('restore', x)}
+                      >Restore…</button
+                    >
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
       <div class="foot">
         {#if list.length > SHOWN}
           <button class="btn ghost sm" onclick={() => (showAll = !showAll)}
@@ -216,6 +220,9 @@
 <style>
   .small {
     font-size: var(--fs-sm);
+  }
+  .scroll-x {
+    overflow-x: auto;
   }
   .restored {
     margin: 0;

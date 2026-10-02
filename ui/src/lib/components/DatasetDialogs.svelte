@@ -153,6 +153,7 @@
 <style>
   .form {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px;
   }
   .hint {

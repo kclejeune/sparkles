@@ -93,4 +93,19 @@
     justify-content: center;
     text-decoration: none;
   }
+  /* the sidebar is a top bar: the user gets a row of their own under the nav */
+  @media (max-width: 760px) {
+    .user {
+      order: 4;
+      width: 100%;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px 12px;
+      padding: 6px 0 0;
+    }
+    .signin {
+      width: auto;
+    }
+  }
 </style>

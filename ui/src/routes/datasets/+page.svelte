@@ -144,6 +144,7 @@
   .page {
     padding: 24px 28px 40px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 18px;
     max-width: 1200px;
     width: 100%;
@@ -152,6 +153,7 @@
     display: flex;
     align-items: flex-end;
     gap: 8px;
+    flex-wrap: wrap;
   }
   .head p {
     margin-top: 4px;

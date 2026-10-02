@@ -1480,10 +1480,31 @@
     min-height: 0;
     min-width: 0;
   }
+  /* a phone: the toolbar wraps and its buttons land anywhere, so the menus hang from the
+     toolbar's right edge instead of their button's, which could put them off screen */
+  @media (max-width: 600px) {
+    /* the wrapped toolbar and the editor would leave the results a sliver of a short
+       screen: they get a fixed share of it, and the page scrolls down to them */
+    .page {
+      height: auto;
+      grid-template-rows: auto auto min(var(--editor-h), 40vh) 7px max(320px, 70vh);
+    }
+    .toolbar {
+      position: relative;
+    }
+    .examples,
+    .format-group {
+      position: static;
+    }
+    .menu {
+      right: 12px;
+      max-width: calc(100% - 24px);
+    }
+  }
   @media (max-width: 900px) {
     .explain {
-      grid-template-columns: 1fr;
-      grid-template-rows: 200px 1fr;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: 200px minmax(0, 1fr);
     }
     .tlegend span {
       display: none;

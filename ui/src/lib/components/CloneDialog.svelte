@@ -102,6 +102,7 @@
 <style>
   .form {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
   }
   .intro {

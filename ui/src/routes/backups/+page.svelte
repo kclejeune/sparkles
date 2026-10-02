@@ -191,6 +191,7 @@
   .page {
     padding: 24px 28px 40px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
     align-content: start;
     max-width: 1280px;
@@ -200,6 +201,7 @@
     display: flex;
     align-items: flex-end;
     gap: 8px;
+    flex-wrap: wrap;
   }
   .head p {
     margin-top: 4px;
@@ -209,6 +211,7 @@
   }
   .tabpanel {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     align-content: start;
   }

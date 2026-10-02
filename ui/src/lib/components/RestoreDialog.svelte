@@ -158,7 +158,7 @@
   <ol class="stepper" aria-label="Restore steps">
     {#each STEPS as s, i (s)}
       <li class:done={i < step} aria-current={i === step ? 'step' : undefined}>
-        <span class="n">{i < step ? '✓' : i + 1}</span>{s}
+        <span class="n">{i < step ? '✓' : i + 1}</span><span class="step">{s}</span>
       </li>
     {/each}
   </ol>
@@ -415,6 +415,12 @@
   }
   .stepper li.done {
     color: var(--text-2);
+  }
+  /* a phone: only the current step is named, the others are numbered */
+  @media (max-width: 480px) {
+    .stepper li:not([aria-current='step']) .step {
+      display: none;
+    }
   }
   .n {
     display: inline-grid;

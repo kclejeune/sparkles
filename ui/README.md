@@ -149,6 +149,13 @@ Once the backup endpoints exist, these tests move to `tests/e2e`. `geo.spec.ts` 
 the Map tab, the explorer's Nearby and the Spatial index panel against the mock's
 `places`.
 
+`phone.spec.ts`, in both suites, opens the pages at a phone's width (320 CSS pixels, the
+iPhone SE's viewport and touch, in Chromium): every route, each result view, the
+explorer's tabs, and the dialogs and menus (the mock suite). It fails when the page, the
+layout's `main` or an open dialog scrolls sideways, and names the elements that stick out
+of the screen. Wide content such as tables, code and plans must scroll inside its own
+container instead. `tests/phone.ts` holds the check.
+
 ## Serving from the Rust server
 
 - Serve `ui/build/` at `/ui/`. Unknown paths under `/ui/` must fall back to

@@ -477,6 +477,7 @@
   .page {
     padding: 24px 28px 40px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
     max-width: 1100px;
     width: 100%;

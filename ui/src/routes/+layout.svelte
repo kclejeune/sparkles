@@ -178,7 +178,7 @@
 <style>
   .shell {
     display: grid;
-    grid-template-columns: var(--sidebar-w) 1fr;
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
     height: 100vh;
     height: 100dvh;
   }
@@ -367,7 +367,7 @@
     box-shadow: 0 0 0 3px var(--danger-soft);
   }
   .shell.bare {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .shell.bare .sidebar {
     display: none;
@@ -381,11 +381,14 @@
   }
 
   @media (max-width: 760px) {
+    /* minmax(0, …): a bare 1fr track grows to its widest item's min-content width (the
+       nav links in a row), and the whole page then scrolls sideways */
     .shell {
-      grid-template-columns: 1fr;
-      grid-template-rows: auto 1fr;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
     }
     .sidebar {
+      min-width: 0;
       flex-direction: row;
       flex-wrap: wrap;
       align-items: center;
@@ -396,7 +399,13 @@
     }
     .switcher {
       flex: 1;
-      min-width: 140px;
+      min-width: 0;
+    }
+    /* the switcher sits mid-row: open its menu leftwards, within the screen */
+    .ds-menu {
+      left: auto;
+      right: 0;
+      width: max(100%, min(240px, calc(100vw - 24px)));
     }
     nav {
       display: flex;
@@ -407,6 +416,9 @@
     nav a.active::before {
       display: none;
     }
+    nav a {
+      flex: none;
+    }
     .sidebar > .spacer {
       display: none;
     }
@@ -415,6 +427,15 @@
       padding: 0;
     }
     .status span:not(.dot) {
+      display: none;
+    }
+  }
+  /* a phone: text-only nav links, so that all of them fit on one row */
+  @media (max-width: 480px) {
+    nav a {
+      padding: 0 6px;
+    }
+    nav a :global(.icon) {
       display: none;
     }
   }

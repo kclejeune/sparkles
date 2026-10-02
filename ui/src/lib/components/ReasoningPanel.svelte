@@ -201,6 +201,7 @@
 <style>
   .reason {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
   }
   .status {
@@ -218,13 +219,16 @@
   .rerun {
     justify-self: start;
   }
+  .reason > .row {
+    flex-wrap: wrap;
+  }
   .badge.warn {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
   }
   .profiles {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
   }
   .opt {
@@ -251,7 +255,7 @@
   }
   @media (max-width: 760px) {
     .profiles {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 </style>

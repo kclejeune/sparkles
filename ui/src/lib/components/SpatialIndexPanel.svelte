@@ -602,6 +602,7 @@
   }
   .form {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
   }
   .form p {
@@ -609,6 +610,7 @@
   }
   .field.inline {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
   }

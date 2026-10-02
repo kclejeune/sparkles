@@ -73,7 +73,8 @@ test('a token minted on the tokens page signs in to the UI and calls the API', a
     await other.goto('/ui/login');
     await other.getByLabel('API token').fill(token);
     await other.getByRole('button', { name: 'Sign in with token' }).click();
-    await expect(other).toHaveURL(/\/ui\/$/);
+    // the home page forwards to the query page
+    await expect(other).toHaveURL(/\/ui\/(query)?$/);
     await expect(other.locator('.user .who')).toContainText(USER);
     await expect(other.locator('.user .who')).toContainText('token');
   } finally {

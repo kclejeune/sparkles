@@ -86,6 +86,7 @@
   .body {
     padding: 8px 16px 16px;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
   }
   .actions {

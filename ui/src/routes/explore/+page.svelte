@@ -1471,6 +1471,11 @@
   }
   .ontology .mono {
     font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .ontology > label {
+    min-width: 0;
+    max-width: 100%;
   }
   .schema-tools {
     display: flex;
@@ -1618,6 +1623,9 @@
     .bar {
       gap: 8px;
     }
+    .bar > .tabs {
+      flex-shrink: 1;
+    }
     .split {
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
@@ -1626,6 +1634,16 @@
       border-left: 0;
       border-top: 1px solid var(--border);
       max-height: 50vh;
+    }
+  }
+  /* a phone: the search box on a row of its own, the tabs under it */
+  @media (max-width: 600px) {
+    .bar {
+      flex-wrap: wrap;
+    }
+    .search {
+      flex-basis: 100%;
+      max-width: none;
     }
   }
 </style>
