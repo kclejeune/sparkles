@@ -5,8 +5,8 @@
 //! on the key, and ranges whose blocks are adjacent are read by one scan: a coordinated
 //! seek per cluster of keys, which for dense keys is one sweep over the pattern. Each
 //! input row is then joined with the rows of its key, so the input's order and its
-//! duplicates are kept. The planner offers it next to the merge and hash joins when the
-//! estimated probing reads well under half of what scanning the pattern would.
+//! duplicates are kept. The planner offers it next to the merge and hash joins and costs
+//! it per key, per block touched and per row read (see the cost model below).
 //!
 //! Consecutive index joins on one subject variable whose patterns have constant
 //! predicates (a star) are fused into one operator. It reads the keys once and, per
@@ -63,14 +63,30 @@ pub struct StarPattern {
 // cost model
 // ------------------------------------------------------------------------------
 
-/// Work of finding one key's rows in a decoded block (binary searches), in rows read.
-const KEY_COST: f64 = 4.0;
-/// Starting one scan (block lookup, delta ranges), in rows read.
+// Costs are in the planner's unit, one row read by a scan. They were measured on warm
+// stores of 1.05M and 10.5M triples (the ignored tests in `costcal_tests`), where a scan
+// reads a row in 1.3 to 1.6 ns and a probe spends 160 to 270 ns per key.
+
+/// Finding one key's rows: its range, the binary searches in its block and the spans of
+/// the key in the rows read.
+const KEY_COST: f64 = 140.0;
+/// Added to a key's cost for each doubling of the pattern's rows per input key: keys far
+/// apart search farther and miss the CPU caches more often.
+const KEY_GAP_COST: f64 = 6.0;
+/// A block the keys touch: fetching it from the block cache and finding the first key.
+const BLOCK_COST: f64 = 256.0;
+/// A row read: copied out of its block, then joined with the input rows of its key, 25 to
+/// 50 ns with its output row. Merge and hash joins count their output rows too, so this
+/// is what probing adds per row, taken at the low end because the rows read are estimated
+/// from the pattern's average rows per key.
+const ROW_COST: f64 = 8.0;
+/// Probing is offered when it costs less than this many times scanning the pattern, which
+/// is about what reading it whole and merging its rows costs.
+const PROBE_LIMIT: f64 = 2.0;
+/// Starting one scan of a cluster of keys, and decoding a block, in rows read: these
+/// decide how a fused star is read.
 const SEEK_COST: f64 = 64.0;
-/// Decoding a block, in rows read (a scan decodes every block it reads as well).
 const BLOCK_DECODE: f64 = (BLOCK_ROWS / 8) as f64;
-/// Probing is offered when it costs less than this share of scanning the pattern.
-const PROBE_SHARE: f64 = 0.5;
 
 #[cfg(test)]
 thread_local! {
@@ -95,15 +111,16 @@ fn forced_walk() -> Option<bool> {
 }
 
 /// Estimated cost of probing a pattern of `rows` rows for `keys` distinct keys with
-/// `per_key` rows each, and of scanning it whole (same units: rows read).
-fn probe_costs(keys: f64, rows: f64, per_key: f64) -> (f64, f64) {
+/// `per_key` rows each, and the share of the pattern's rows it reads.
+fn probe_cost(keys: f64, rows: f64, per_key: f64) -> (f64, f64) {
     let blocks = (rows / BLOCK_ROWS as f64).ceil().max(1.0);
     // blocks holding at least one of `keys` keys spread over the pattern
     let touched = blocks * (1.0 - (1.0 - 1.0 / blocks).powf(keys));
     let read = (keys * per_key).min(rows);
-    let probe = keys * KEY_COST + touched * (SEEK_COST + BLOCK_DECODE) + read;
-    let scan = blocks * BLOCK_DECODE + rows;
-    (probe, scan)
+    let gap = (rows / keys).max(1.0);
+    let probe =
+        keys * (KEY_COST + KEY_GAP_COST * gap.log2()) + touched * BLOCK_COST + read * ROW_COST;
+    (probe, if rows > 0.0 { read / rows } else { 0.0 })
 }
 
 // ------------------------------------------------------------------------------
@@ -203,33 +220,25 @@ pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
 }
 
 impl ProbeSide {
-    /// The estimated cost of probing the pattern for `keys_in` distinct keys and of
-    /// scanning it whole.
-    pub(super) fn costs(&self, keys_in: f64) -> (f64, f64) {
-        probe_costs(keys_in, self.rows, self.per_key)
+    /// The estimated cost of probing the pattern, which costs `pat_cost` to read whole
+    /// with its filters, for `keys_in` distinct keys, if probing is worth offering: the
+    /// probes, and the filters on the rows read.
+    pub(super) fn cost(&self, keys_in: f64, pat_cost: f64) -> Option<f64> {
+        let (probe, share) = probe_cost(keys_in, self.rows, self.per_key);
+        if !(probe < PROBE_LIMIT * self.rows || forced()) {
+            return None;
+        }
+        Some(probe + (pat_cost - self.rows).max(0.0) * share)
     }
 }
 
-/// Whether probing at `probe_cost` is worth offering against scanning at `scan_cost`.
-pub(super) fn offered(probe_cost: f64, scan_cost: f64) -> bool {
-    probe_cost < PROBE_SHARE * scan_cost || forced()
-}
-
 /// The cost of an index join whose input costs `drive_cost` for `drive_est` rows and
-/// whose pattern costs `probe_cost` for `probe_est` rows, where probing reads `ratio` of
-/// what scanning the pattern would, with `est` output rows.
-pub(super) fn join_cost(
-    drive_cost: f64,
-    drive_est: f64,
-    probe_cost: f64,
-    probe_est: f64,
-    ratio: f64,
-    est: f64,
-) -> f64 {
+/// whose pattern costs `probe_cost` to probe, with `est` output rows.
+pub(super) fn join_cost(drive_cost: f64, drive_est: f64, probe_cost: f64, est: f64) -> f64 {
     if forced() {
         drive_cost + 1.0
     } else {
-        drive_cost + drive_est + (probe_cost + probe_est) * ratio + est
+        drive_cost + drive_est + probe_cost + est
     }
 }
 
@@ -259,15 +268,15 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
         return None;
     }
     let keys_in = drive.d(key).min(drive.est).max(1.0);
-    let (probe_cost, scan_cost) = side.costs(keys_in);
-    if !offered(probe_cost, scan_cost) {
+    let Some(probe_cost) = side.cost(keys_in, probe.cost) else {
         tracing::debug!(
-            "index join on {} into {} not offered: probing ~{probe_cost:.0} of scanning ~{scan_cost:.0}",
+            "index join on {} into {} not offered: probing {keys_in:.0} keys costs more than scanning {:.0} rows",
             var_str(ctx, key),
-            scan.desc
+            scan.desc,
+            side.rows
         );
         return None;
-    }
+    };
     let mut keys = vec![key];
     keys.extend(
         probe
@@ -284,14 +293,7 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
         .take_while(|v| !keys[1..].contains(v))
         .copied()
         .collect();
-    let cost = join_cost(
-        drive.cost,
-        drive.est,
-        probe.cost,
-        probe.est,
-        probe_cost / scan_cost,
-        est,
-    );
+    let cost = join_cost(drive.cost, drive.est, probe_cost, est);
     let base = scan.desc.split(" | ").next().unwrap_or_default();
     let desc = if filter.is_empty() {
         format!("on {} | {base}", var_str(ctx, key))

@@ -121,10 +121,10 @@ fn pair_floor(a: &Sum, probe_a: bool, b: &Sum, probe_b: bool, est: f64) -> f64 {
     let mut floor = a.cost + b.cost + a.est + b.est + est;
     // an index join costs at least what it would if probing were free
     if probe_b {
-        floor = floor.min(indexjoin::join_cost(a.cost, a.est, 0.0, 0.0, 0.0, est));
+        floor = floor.min(indexjoin::join_cost(a.cost, a.est, 0.0, est));
     }
     if probe_a {
-        floor = floor.min(indexjoin::join_cost(b.cost, b.est, 0.0, 0.0, 0.0, est));
+        floor = floor.min(indexjoin::join_cost(b.cost, b.est, 0.0, est));
     }
     // sums in another order may round lower
     floor * (1.0 - 1e-9)
@@ -164,7 +164,7 @@ fn joins(
             });
         }
     }
-    let base = 2.0 * a.est.min(b.est) + a.est.max(b.est);
+    let base = plan::hash_base(a.est, b.est);
     out.push(Cand {
         cost: a.cost + b.cost + base + est,
         sorted: if a.est >= b.est { a.sorted } else { b.sorted },
@@ -220,22 +220,12 @@ fn probe(
         s => s,
     };
     // the cost if probing were free bounds the cost from below
-    let floor = indexjoin::join_cost(drive.cost, drive.est, pat.cost, pat.est, 0.0, est);
+    let floor = indexjoin::join_cost(drive.cost, drive.est, 0.0, est);
     if !keep(floor, sorted) {
         return None;
     }
-    let (probe_cost, scan_cost) = p.costs(d.min(drive.est).max(1.0));
-    if !indexjoin::offered(probe_cost, scan_cost) {
-        return None;
-    }
-    let cost = indexjoin::join_cost(
-        drive.cost,
-        drive.est,
-        pat.cost,
-        pat.est,
-        probe_cost / scan_cost,
-        est,
-    );
+    let probe_cost = p.cost(d.min(drive.est).max(1.0), pat.cost)?;
+    let cost = indexjoin::join_cost(drive.cost, drive.est, probe_cost, est);
     Some((cost, sorted))
 }
 
