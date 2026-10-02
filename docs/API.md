@@ -503,7 +503,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a cancellable `Task`. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
@@ -2492,9 +2492,8 @@ the style needs it, comes from the style.
 
 The design and its rationale are in [C08 Inference freshness and diagnostics](specs/C08-inference-freshness.md).
 
-Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally. A
-materialization records the dataset id and the commit it wrote. When it changed nothing,
-it records the head it read instead. A later commit that changes the default graph makes
+A materialization of `urn:x-sparkles:inferred` records the dataset id and the commit it
+wrote. When it changed nothing, it records the head it read instead. A later commit that changes the default graph makes
 the inferences **stale**, because the default graph is all the reasoner reads. Commits
 that change only named graphs leave them fresh, and so do changes to the inferred graph
 itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
@@ -2520,8 +2519,64 @@ type ReasoningStatus = {
   warnings: string[];          // the last run's warnings
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
+  run?: ReasoningRun;          // how the last run went
+};
+
+type ReasoningRun = {
+  method: "full" | "incremental";
+  fallback?: string;           // why a run that could have been incremental ran in full
+  inferredAdded: number;       // triples the run added to the inferred graph
+  inferredRemoved: number;     // triples the run removed from it
+  changes?: {                  // incremental runs
+    explicitAdded: number;     // default graph triples added since the previous run
+    explicitRemoved: number;   // default graph triples removed since then
+    checked: number;           // derived triples whose other proofs were searched for
+    removed: number;           // derived triples that no longer follow, generalized ones included
+    derived: number;           // derived triples that now follow
+    source: "memory" | "store"; // where the previous closure came from
+  };
 };
 ```
+
+**Incremental runs.** A re-run, an automatic run and `sparkles infer` update the
+previous materialization instead of computing it again when they can. Such a run reads
+the triples added to and removed from the default graph since the recorded commit, from
+the commit diff. It removes the derived triples that lost their last proof and derives
+the consequences of the added triples. The inferred graph it writes is the one a full run would write, and
+the differential tests compare the two for RDFS, OWL 2 RL and Jena rules.
+
+Removals follow the backward/forward algorithm of Motik, Nenov, Piro and Horrocks
+(AAAI 2015). Before a derived triple is removed, a backward search looks for another
+proof of it among the triples that remain, and the triple stays when it has one. DRed,
+which removes every consequence first and derives the survivors again, would remove most
+of an RDFS closure for one `rdf:type` triple, because almost everything follows from
+the class axioms and `rdfs:Resource`. Additions are derived semi-naively from the new
+triples.
+
+The run needs the closure of the previous run, which includes the derived triples that
+are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
+it in memory after a run, up to `serve --reason-cache-triples` triples (10 million by
+default, about 135 bytes each). After a restart, and in `sparkles infer`, the run builds
+it again from the default graph and the inferred graph of the recorded commit. A
+persistent dataset keeps the derived triples that are not valid RDF in its
+`reasoning-generalized.*` files for that purpose. An in-memory dataset without a kept
+closure runs in full.
+
+A run materializes in full, and the status's `run.fallback` says why, when:
+
+- the rules use `noValue`, `now`, `makeTemp`, `makeSkolem`, a head action or a blank node
+  in a head, or a `listForAll` that no `listMember` and triple pattern of the same rule
+  cover. These rules are not monotonic, or they create new blank nodes in every run.
+- the GeoSPARQL default geometries are on, because a feature loses its default geometry
+  when it gets a second one.
+- the rules read RDF lists, as OWL 2 RL does, and a list triple changed or is derived.
+  What list builtins see then depends on the order of derivation.
+- the profile, the rule text or the vocabularies differ from the previous run's.
+- the commit diff no longer reaches the recorded commit. A compaction or a bulk load
+  starts a new generation, and a dataset that keeps no history then loses the older
+  commits.
+- more than one in twenty triples of a default graph of at least 10,000 triples were
+  removed. A full run is faster then.
 
 **Header.** A query or SHACL validation that includes the inferred graph while the
 inferences are not fresh at the snapshot it read carries a `Sparkles-Inferences` header.
@@ -2535,8 +2590,9 @@ profile once a dataset with stale inferences has had no commit for `SECS` second
 writes continue, it runs at the latest after the maximum delay, which defaults to
 12 × `SECS`. The messages of these tasks start with `auto:`. After a failed run, the next
 attempt waits for the next commit. Runs never start for unknown freshness, nor on
-`--read-only` servers. Each run is a full recomputation that holds the dataset's writer
-lock, so updates wait while it runs.
+`--read-only` servers. Each run holds the dataset's writer lock, so updates wait while it
+runs. Runs are incremental when they can be, and then take milliseconds for small
+changes.
 
 A dataset can have its own setting, which takes precedence over the server's.
 `PUT /$/reason/{ds}/auto` with `{"enabled": true}` turns automatic runs on for that
@@ -2562,7 +2618,8 @@ establish OWL consistency.
 |---|---|---|
 | `checks` | all | Comma-separated check ids. |
 | `limit` | 100 (1–10000) | Findings per check. |
-| `reasoning` | `true` if inferences exist | Includes `urn:x-sparkles:inferred`. |
+| `graph` | the default graph | A graph to check, repeatable: `default` or a graph IRI. The checks run over the merge of the graphs given, so an ontology in one graph and its data in another are checked together. |
+| `reasoning` | `true` if inferences exist and the default graph is checked | Includes `urn:x-sparkles:inferred`. The inferences follow from the default graph alone, so a check of named graphs leaves them out unless `reasoning=true` asks for them. |
 | `closure` | `subclass` | `subclass` makes type tests follow `rdfs:subClassOf*`. `none` uses stated types only. |
 | `timeout` | server query timeout | Time budget for the whole report. |
 | `format` | `json` | `json` or `turtle`. Without it, an `Accept: text/turtle` header selects Turtle. |
@@ -2604,7 +2661,8 @@ finding holds there and `uses-inferences` otherwise. With stale inferences, only
 type DiagnosticsReport = {
   diagnosticsFormat: 1;
   dataset: string; commit: number /* snapshot checked */; computedAt: string;
-  scope: { graph: "default";
+  scope: { graph: "default" | "graphs";   // "graphs" when `graph` chose them
+           graphs?: string[];             // the checked graphs, "default" for the default graph
            inferences: { included: boolean; profile?: string; stale?: boolean | null; commitsSince?: number | null };
            closure: "subclass" | "none" };
   status: "violations-found" | "none-found" | "incomplete";
@@ -2641,8 +2699,9 @@ are `spk:` properties, and evidence with several terms is an RDF list. The repor
 ```
 
 In the CLI, `sparkles infer --loc DB --status` prints the status.
-`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json|turtle]`
-runs the checks, after materializing when `--profile` or `--rules` is given. It exits
+`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--graph G]… [--closure subclass|none] [--format text|json|turtle]`
+runs the checks, after materializing when `--profile` or `--rules` is given. `--graph`
+works as the `graph` parameter. It exits
 with 0 (`none-found`), 1 (`violations-found`) or 2 (`incomplete` or an error).
 `sparkles stats` shows a `reasoning` line.
 

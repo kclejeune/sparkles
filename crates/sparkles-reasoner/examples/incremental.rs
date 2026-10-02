@@ -14,8 +14,8 @@ use oxrdf::{GraphName, NamedNode, Quad, Triple};
 use sparkles::io::{RdfFormat, Source};
 use sparkles::store::{Store, StoreOptions};
 use sparkles_reasoner::{
-    Cache, Extras, Incremental, Method, Profile, ReasonOptions, ReasonReport, infer,
-    materialize_incremental,
+    Cache, Extras, Incremental, Method, Profile, ReasonOptions, ReasonReport, dred_overdeletion,
+    infer, materialize_incremental,
 };
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -151,11 +151,14 @@ fn main() {
     since = r.receipt.unwrap().commit.seq;
     let mut round = 0;
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
-    println!("change           memory ms  store ms  full ms  removed  derived  checked");
+    println!(
+        "change           memory ms  store ms  full ms  removed  derived  checked  dred removes first"
+    );
     for k in [1usize, 100, 10_000] {
         for kind in ["insert", "delete"] {
             let mut times = [Vec::new(), Vec::new(), Vec::new()];
             let mut counts = (0, 0, 0);
+            let mut dred = 0;
             for rep in 0..3 {
                 for (wi, &way) in ways.iter().enumerate() {
                     round += 1;
@@ -176,6 +179,9 @@ fn main() {
                     } else {
                         (Vec::new(), batch.clone())
                     };
+                    if kind == "delete" && rep == 0 && wi == 0 {
+                        dred = dred_overdeletion(s.snapshot(), &profile, &batch).unwrap();
+                    }
                     change(&s, &add, &del);
                     let r = match way {
                         Way::Memory => run(&s, &profile, Some(since), Some(&cache)),
@@ -209,13 +215,14 @@ fn main() {
             };
             let mut times = times.map(|v| v.into_iter().map(u128::from).collect::<Vec<_>>());
             println!(
-                "{kind:>6} {k:>6}   {:>9}  {:>8}  {:>7}  {:>7}  {:>7}  {:>7}",
+                "{kind:>6} {k:>6}   {:>9}  {:>8}  {:>7}  {:>7}  {:>7}  {:>7}  {:>18}",
                 med(&mut times[0]),
                 med(&mut times[1]),
                 med(&mut times[2]),
                 counts.0,
                 counts.1,
-                counts.2
+                counts.2,
+                dred
             );
         }
     }

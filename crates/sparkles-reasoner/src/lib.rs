@@ -903,6 +903,45 @@ pub fn clear(store: &Store) -> anyhow::Result<u64> {
     Ok(n)
 }
 
+/// How many facts of the closure of `snap`'s default graph DRed would delete first if
+/// the triples `removed` were removed from it: the facts with a derivation that uses one
+/// of them, transitively. Backward/forward deletes only those without another proof. For
+/// measurements.
+#[doc(hidden)]
+pub fn dred_overdeletion(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    removed: &[Triple],
+) -> anyhow::Result<usize> {
+    let d = derive(snap, profile, &Extras::default(), &ReasonOptions::default())?;
+    let mut warnings = Vec::new();
+    let rules = engine::compile(
+        &profile_rules(profile, &Extras::default())?,
+        &d.terms,
+        &mut warnings,
+    );
+    let removed: Vec<[u64; 3]> = removed
+        .iter()
+        .map(|t| {
+            [
+                d.terms.id_for(&t.subject.clone().into()),
+                d.terms.id_for(&t.predicate.clone().into()),
+                d.terms.id_for(&t.object),
+            ]
+        })
+        .collect();
+    let limits = engine::Limits {
+        max_iterations: usize::MAX,
+        max_inferred: usize::MAX,
+        cancel: None,
+        progress: None,
+    };
+    let mut c = incremental::Closure::new(d.graph, d.terms, d.base_len);
+    Ok(incremental::dred_overdeletion(
+        &mut c, &rules, &limits, &removed,
+    ))
+}
+
 /// Run the rules over a snapshot's default graph and return the derived triples that
 /// are valid RDF, without writing anything (dry run / testing). Blank nodes created by
 /// `makeTemp` / `makeSkolem` get labels `r<hex>`.

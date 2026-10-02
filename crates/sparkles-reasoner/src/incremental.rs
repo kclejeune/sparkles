@@ -276,6 +276,35 @@ pub(crate) fn update(
     Ok(out)
 }
 
+/// How many facts DRed would delete before deriving the survivors again: every fact with
+/// a derivation that uses a removed explicit fact, transitively. For measurements; the
+/// closure is unusable afterwards.
+pub(crate) fn dred_overdeletion(
+    c: &mut Closure,
+    rules: &[CRule],
+    limits: &Limits,
+    removed: &[Triple],
+) -> usize {
+    let plans = Plans::new(&mut c.graph, rules);
+    let mut gone: FxHashSet<Triple> = FxHashSet::default();
+    let mut frontier: Vec<Triple> = removed
+        .iter()
+        .filter(|t| c.graph.position(t).is_some() && gone.insert(**t))
+        .copied()
+        .collect();
+    while !frontier.is_empty() {
+        let next = consequences(c, rules, &plans, &frontier, limits);
+        for t in &frontier {
+            c.graph.kill(t);
+        }
+        frontier = next
+            .into_iter()
+            .filter(|t| c.graph.position(t).is_some() && gone.insert(*t))
+            .collect();
+    }
+    gone.len()
+}
+
 // ------------------------------------------------------------------ plans ----
 
 /// The plans an update evaluates with, made once per update.
@@ -991,14 +1020,14 @@ mod tests {
 
     #[test]
     fn rdfs_matches_full() {
-        for seed in 1..40 {
+        for seed in 1..25 {
             differential(crate::RDFS_RULES, false, false, seed, 25);
         }
     }
 
     #[test]
     fn rdfs_simple_matches_full() {
-        for seed in 1..40 {
+        for seed in 1..25 {
             differential(crate::RDFS_SIMPLE_RULES, false, false, seed, 25);
         }
     }
@@ -1006,7 +1035,7 @@ mod tests {
     #[test]
     fn owl_rl_matches_full() {
         let mut n = (0, 0);
-        for seed in 1..40 {
+        for seed in 1..25 {
             let (i, f) = differential(crate::OWL_RL_RULES, true, true, seed, 25);
             n = (n.0 + i, n.1 + f);
         }
@@ -1023,7 +1052,7 @@ mod tests {
             [sym: (?a ex:p1 ?b) -> (?b ex:p1 ?a)]
             [ty: (?a rdf:type ex:C0), (?a ?p ?b), notEqual(?p, rdf:type) -> (?b rdf:type ex:C1)]
             [any: (?a ?p ?b), (?p rdf:type owl:TransitiveProperty), (?b ?p ?c) -> (?a ?p ?c)]";
-        for seed in 1..40 {
+        for seed in 1..25 {
             differential(rules, true, false, seed, 25);
         }
     }

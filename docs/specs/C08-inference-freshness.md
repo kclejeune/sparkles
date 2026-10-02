@@ -1,6 +1,6 @@
 # C08: Inference freshness and inconsistency diagnostics
 
-> **Status:** implemented in part
+> **Status:** implemented (Phases 1, 2 and 3).
 >
 > **Phases:** Phase 1 shipped. It covers commit-based freshness, `GET /$/reason/{ds}`,
 > the `Sparkles-Inferences` header, re-runs, opt-in automatic re-materialization, the
@@ -8,7 +8,8 @@
 > built on durable commit identity, so the §5.1 stopgap was never needed. Phase 2
 > shipped as well: staleness limited to default-graph commits, the remaining OWL 2 RL
 > checks, the Turtle report, a per-dataset auto setting and superseded automatic runs.
-> Phase 3 is not built.
+> Phase 3 shipped incremental materialization with the backward/forward algorithm and
+> diagnostics over chosen graphs.
 >
 > **User docs:** [API: Reasoning status and diagnostics](../API.md#reasoning-status-and-diagnostics) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -710,5 +711,119 @@ reasoner never reads that graph, and every run rewrites it, so changes to it lea
 inferences fresh. The status does not expose an `inputCommit` field. The UI gained a
 button that turns the dataset's own automatic re-runs on or off.
 
-**Not built.** Phase 3, incremental DRed-style materialization and diagnostics over
-chosen named graphs, is not built. `dt-not-type` is still never checked.
+**Phase 3.** Phase 3 landed on 2026-10-02 with these parts:
+
+- **Incremental materialization.** `sparkles_reasoner::materialize_incremental` takes
+  the commit of the recorded materialization and updates it instead of computing it
+  again. It reads the default graph's changes since that commit from the commit diff. It
+  removes the derived triples that lost their last proof, derives the consequences of
+  the added triples semi-naively, and writes the difference to the inferred graph. The
+  inferred graph it writes is the one a full run writes. Re-runs, automatic runs and
+  `sparkles infer` all use it, and `{"full": true}` or `--full` asks for a full run.
+- **The closure between runs.** Each dataset of a server keeps the closure of its last
+  run in memory, up to `serve --reason-cache-triples` triples. Without it, after a
+  restart and in `sparkles infer`, a run builds the closure again from the default graph
+  and the inferred graph as of the recorded commit, which it recovers from their state
+  now and the commit diff. The closure also holds derived triples that are not valid RDF,
+  such as a literal subject or a blank node predicate. They never reach the inferred
+  graph, but they take part in derivations: with `ex:p rdfs:subPropertyOf _:q` and
+  `_:q rdfs:domain ex:C`, `ex:x ex:p ex:y` entails `ex:x a ex:C` only through
+  `ex:x _:q ex:y`. A persistent dataset keeps them as term keys in
+  `reasoning-generalized.bin`, with a log of later changes in
+  `reasoning-generalized.log` and their commit, rules digest and checksums in
+  `reasoning-generalized.json`.
+- **Fallbacks.** A run materializes in full, and the status says why, for rules with
+  `noValue`, `now`, `makeTemp`, `makeSkolem`, head actions or blank nodes in heads, and
+  for a `listForAll` that no `listMember` and atom of the same rule cover. It does the
+  same for GeoSPARQL default geometries, for an RDF list that changed or is derived under
+  rules that read lists, for changed rules, for a commit the diff no longer reaches, and
+  for the removal of more than one in twenty triples of a default graph of 10,000 or
+  more.
+- **Reporting.** The status gains `run`, with the method, the fallback reason, the
+  inferred graph's additions and removals, and for incremental runs the explicit
+  changes, the triples searched, removed and derived, and where the closure came from.
+  The reason task's `detail` holds the same, and its message and `sparkles infer` say it
+  in one line.
+- **Diagnostics over chosen graphs.** `graph=default|IRI`, repeatable, and
+  `sparkles infer --check --graph` run the checks over the merge of those graphs, so an
+  ontology and its data in separate named graphs are checked together. The inferences
+  are included by default only when the default graph is among them, because they
+  follow from it alone. The report's scope lists the graphs.
+
+**Phase 3 decisions.** The non-goals of §1 left out incremental maintenance with DRed.
+Phase 3 built it with the backward/forward algorithm of Motik, Nenov, Piro and Horrocks
+(AAAI 2015) instead of DRed (Gupta, Mumick and Subrahmanian, 1993). DRed deletes every
+fact with a derivation through a removed fact before it derives the survivors again.
+Under RDFS that reaches most of the closure from a single `rdf:type` triple: the type
+makes its class an `rdfs:Class`, the class axioms make it a subclass of `rdfs:Resource`,
+and through that every instance's types. Backward/forward searches for another proof
+before it deletes a fact, and keeps the fact when it finds one. The search explores the
+rule instances that derive a fact, depth first, and counts the unproved facts of each
+instance. A fact is proved when it is explicit or one of its instances has none left.
+When the search ends without a proof, it has explored every instance of every fact it
+reached, so none of them has a proof, and they are all remembered as unprovable for the
+rest of the run. The measurements below show the difference.
+
+- The commit diff takes the writer lock, which the run holds while it updates the
+  inferred graph. The run reads the changes before it takes the lock. When a commit lands
+  in between, the run compares the kept closure's snapshot with the locked one instead,
+  or reads the changes again.
+- In-memory datasets keep no log. A kept closure holds the snapshot of its commit, and
+  the changes come from comparing its deltas with the head's.
+- Ids are local to a generation, so a compaction or a bulk load drops the kept closure,
+  and the next run builds it from the dataset when the diff still reaches the recorded
+  commit.
+- What list builtins see depends on the order of derivation when a list cell has more
+  than one `rdf:first`. Incremental runs therefore need every list triple to be explicit
+  and unchanged when the rules read lists. OWL 2 RL's `cls-int1` reads the types of an
+  individual through `listForAll`, and its `listMember` and `(?y rdf:type ?ci)` atom make
+  every type it reads a body atom of some instance, which incremental runs need.
+- The saved state is written without syncing. A file lost or torn in a crash only makes
+  the next run a full one, because the commit and the checksums are checked on reading.
+- A kept closure takes about 135 bytes per triple, about 530 MB for the 3.95 million
+  facts of the benchmark's closure, so the default limit is 10 million triples.
+
+**Exactness.** The unit tests compare the whole closure, generalized triples and explicit
+flags included, with a full derivation after each of 25 random steps of inserts and
+deletes, for 24 seeds each of RDFS, RDFS simple, OWL 2 RL with RDF lists, and Jena rules
+with builtins. The store tests compare the inferred graph with a full run's after random
+changes, with the closure kept in memory, read from the dataset, and kept for a
+persistent dataset, and across compaction, bulk loads, a restart and edits of the
+inferred graph. The server tests cover re-runs, automatic runs on an in-memory dataset,
+a restart and changed rules, and a CLI test runs `sparkles infer` as separate processes.
+A search that always finds a proof, and one that marks facts unprovable when the root
+was proved, both fail these tests.
+
+**Measurements.** `cargo run --release -p sparkles-reasoner --example incremental -- DIR`
+measures the `bench:reasoner` data, 1,000,418 triples in a persistent dataset, whose
+RDFS closure has 3,953,414 facts. Each change is timed with the closure kept in memory
+(memory), read back from the dataset (dataset), and as a full run (full). The numbers
+are medians of three runs in milliseconds. Other builds shared the machine (load 35 to
+50), so full runs took 7 to 15 s instead of the 3.9 s of a quiet machine. The ratios are
+what matters.
+
+| Change | RDFS memory | RDFS dataset | RDFS full | OWL 2 RL memory | OWL 2 RL dataset | OWL 2 RL full |
+|---|---|---|---|---|---|---|
+| insert 1 | 17 | 3,804 | 13,022 | 19 | 2,679 | 8,340 |
+| delete 1 | 11 | 5,501 | 9,087 | 15 | 2,936 | 6,873 |
+| insert 100 | 4 | 2,247 | 8,062 | 37 | 2,368 | 7,099 |
+| delete 100 | 53 | 4,656 | 7,621 | 25 | 2,194 | 6,415 |
+| insert 10,000 | 350 | 3,292 | 6,849 | 251 | 2,411 | 15,069 |
+| delete 10,000 | 2,154 | 10,666 | 8,839 | 4,849 | 4,566 | 11,819 |
+
+Reading the closure back from the dataset costs about 2 to 3 s, which dominates the
+dataset column. Deleting 10,000 triples from the dataset's closure took longer than a
+full RDFS run, and on 100,000 triples deleting 10,000 took longer than a full run even
+from memory, which set the limit for large deletions.
+
+For the same deletions, the example also counts what DRed would delete first. Under RDFS
+one triple reaches 1,829,224 of the 3,953,414 facts, where backward/forward searched 6
+and removed 2. 100 triples reach 2,446,823 facts against 823 searched and 339 removed,
+and 10,000 reach 2,461,880 against 60,342 searched and 32,891 removed. OWL 2 RL is
+similar, with 1,829,454 facts for one triple. DRed would then derive almost all of them
+again, so it costs more than a full run for any deletion.
+
+
+**Not built.** Rules that are not monotonic, list changes under OWL 2 RL and large
+deletions still run in full. The UI shows the run's method only in the task message.
+`dt-not-type` is still never checked.
