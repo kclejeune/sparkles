@@ -417,6 +417,8 @@ async fn server_info_lists_the_limits() {
             "maxResultBytes": 0,
             "maxExportBytes": 0,
             "maxRows": 200_000_000,
+            "maxRowsProduced": 0,
+            "maxDatasetBytes": 0,
             "maxQueryBodyBytes": 16u64 << 20,
             "maxUpdateBodyBytes": 256u64 << 20,
             "maxAdminBodyBytes": 16u64 << 20,

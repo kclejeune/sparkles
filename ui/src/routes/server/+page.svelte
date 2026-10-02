@@ -438,6 +438,18 @@
           <dt>Intermediate rows</dt>
           <dd>{limits.maxRows ? fmtInt(limits.maxRows) : 'unlimited'}</dd>
         </div>
+        {#if limits.maxRowsProduced !== undefined}
+          <div>
+            <dt>Rows produced per query</dt>
+            <dd>{limits.maxRowsProduced ? fmtInt(limits.maxRowsProduced) : 'unlimited'}</dd>
+          </div>
+        {/if}
+        {#if limits.maxDatasetBytes !== undefined}
+          <div>
+            <dt>Dataset storage quota</dt>
+            <dd>{limit(limits.maxDatasetBytes)}</dd>
+          </div>
+        {/if}
       </dl>
     {/if}
   </section>
