@@ -428,7 +428,7 @@ pub(super) async fn predicates(
 mod shapes;
 pub(super) use shapes::shapes;
 
-mod constraints;
+pub(crate) mod constraints;
 pub(super) use constraints::constraints;
 
 #[cfg(test)]

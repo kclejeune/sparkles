@@ -3089,58 +3089,34 @@ fn schema_constraints(
     snap: &sparkles::store::Snapshot,
     shapes: &[String],
 ) -> Result<Option<sparkles::schema::ConstraintsLayer>> {
-    if shapes.iter().any(|s| s == "none") {
-        if shapes.len() > 1 {
-            bail!("--shapes none cannot be combined with other shapes");
-        }
-        return Ok(None);
-    }
+    let req = http::ShapesRequest::from_values(shapes).map_err(anyhow::Error::msg)?;
     #[cfg(feature = "shacl")]
     {
         use sparkles_shacl::constraints::{configured_source, graphs_source};
         let mut layer = sparkles::schema::ConstraintsLayer::default();
-        let guard = shapes.is_empty() || shapes.iter().any(|s| s == "guard");
-        if guard {
+        if req.guard != Some(false) {
             match sparkles_shacl::guard::configured_shapes(store)? {
                 Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
-                None if !shapes.is_empty() => {
+                None if req.guard == Some(true) => {
                     bail!("the database has no write-time SHACL validation")
                 }
                 None => {}
             }
         }
-        let mut graphs: Vec<String> = Vec::new();
-        for s in shapes.iter().filter(|s| *s != "guard") {
-            match s.as_str() {
-                "default" | sparkles::sparql::ctx::DEFAULT_GRAPH_IRI => {
-                    graphs.push("default".into())
-                }
-                "union" | sparkles::sparql::ctx::UNION_GRAPH_IRI => {
-                    bail!("--shapes: name the graphs that hold shapes, not the union graph")
-                }
-                iri => {
-                    let iri = iri
-                        .strip_prefix('<')
-                        .and_then(|i| i.strip_suffix('>'))
-                        .unwrap_or(iri);
-                    oxrdf::NamedNode::new(iri)
-                        .with_context(|| format!("--shapes: invalid graph IRI '{iri}'"))?;
-                    if !validation_common::graph_exists(snap, iri) {
-                        bail!("no such graph: <{iri}>");
-                    }
-                    graphs.push(iri.to_string());
-                }
+        for g in req.graphs.iter().filter(|g| *g != "default") {
+            if !validation_common::graph_exists(snap, g) {
+                bail!("no such graph: <{g}>");
             }
         }
-        if !graphs.is_empty() {
-            layer.sources.push(graphs_source(snap, &graphs)?);
+        if !req.graphs.is_empty() {
+            layer.sources.push(graphs_source(snap, &req.graphs)?);
         }
         Ok((!layer.is_empty()).then_some(layer))
     }
     #[cfg(not(feature = "shacl"))]
     {
         let _ = (store, snap);
-        if !shapes.is_empty() {
+        if req.guard == Some(true) || !req.graphs.is_empty() {
             bail!("built without the `shacl` feature");
         }
         Ok(None)

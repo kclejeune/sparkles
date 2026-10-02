@@ -139,7 +139,7 @@ pub struct PropertyConstraint {
 impl PropertyConstraint {
     /// A short line such as `min 1 · max 1 · datatype xsd:string · class ex:Org`, with
     /// IRIs shortened by `short`.
-    pub fn summary(&self, short: impl Fn(&str) -> String) -> String {
+    pub fn summary(&self, mut short: impl FnMut(&str) -> String) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(n) = self.min_count {
             parts.push(format!("min {n}"));

@@ -26,18 +26,18 @@ use std::time::Instant;
 
 /// Which shapes the layer is built from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(in crate::http) struct ShapesRequest {
+pub(crate) struct ShapesRequest {
     /// the guard's shapes: `None` when present (no `shapes=`), `Some(true)` when asked
     /// for, `Some(false)` when not
-    guard: Option<bool>,
+    pub guard: Option<bool>,
     /// shapes graphs: IRIs, or `default`
-    graphs: Vec<String>,
+    pub graphs: Vec<String>,
 }
 
 impl ShapesRequest {
-    /// The `shapes` parameters of a request.
-    pub(in crate::http) fn parse(params: &Params) -> ApiResult<ShapesRequest> {
-        let values = params.all("shapes");
+    /// The sources named by `shapes=` values (`--shapes` of the CLI): `guard`, `none`,
+    /// `default` or a graph IRI. No value means the guard's shapes when there are any.
+    pub(crate) fn from_values<S: AsRef<str>>(values: &[S]) -> Result<ShapesRequest, String> {
         if values.is_empty() {
             return Ok(ShapesRequest::default());
         }
@@ -46,18 +46,21 @@ impl ShapesRequest {
             graphs: Vec::new(),
         };
         let mut none = false;
-        for v in &values {
-            let v = v.trim();
-            match v {
-                "none" => none = true,
-                "guard" => r.guard = Some(true),
-                "default" | sparkles::sparql::ctx::DEFAULT_GRAPH_IRI => {
-                    r.graphs.push("default".into());
+        for v in values {
+            let g = match v.as_ref().trim() {
+                "none" => {
+                    none = true;
+                    continue;
                 }
+                "guard" => {
+                    r.guard = Some(true);
+                    continue;
+                }
+                "default" | sparkles::sparql::ctx::DEFAULT_GRAPH_IRI => "default".to_string(),
                 "union" | sparkles::sparql::ctx::UNION_GRAPH_IRI => {
-                    return Err(bad(
-                        "shapes: name the graphs that hold shapes, not the union graph",
-                    ));
+                    return Err(
+                        "shapes: name the graphs that hold shapes, not the union graph".into(),
+                    );
                 }
                 iri => {
                     let iri = iri
@@ -65,31 +68,50 @@ impl ShapesRequest {
                         .and_then(|i| i.strip_suffix('>'))
                         .unwrap_or(iri);
                     oxrdf::NamedNode::new(iri)
-                        .map_err(|e| bad(format!("shapes: invalid graph IRI '{iri}': {e}")))?;
-                    r.graphs.push(iri.to_string());
+                        .map_err(|e| format!("shapes: invalid graph IRI '{iri}': {e}"))?;
+                    iri.to_string()
                 }
+            };
+            if !r.graphs.contains(&g) {
+                r.graphs.push(g);
             }
         }
         if none && values.len() > 1 {
-            return Err(bad("shapes=none cannot be combined with other shapes"));
+            return Err("shapes=none cannot be combined with other shapes".into());
         }
-        r.graphs.dedup();
         Ok(r)
+    }
+
+    /// The `shapes` parameters of a request.
+    pub(in crate::http) fn parse(params: &Params) -> ApiResult<ShapesRequest> {
+        Self::from_values(&params.all("shapes")).map_err(bad)
     }
 }
 
-fn not_found(msg: impl Into<String>) -> super::super::ApiError {
-    err(StatusCode::NOT_FOUND, msg)
+/// Why a constraints layer could not be built: an HTTP status and a message.
+#[derive(Debug)]
+pub(crate) struct LayerError {
+    pub status: u16,
+    pub message: String,
 }
 
-/// The constraints layer of `req` over `snap`, or `None` when it has no source.
+fn layer_error(status: u16, message: impl Into<String>) -> LayerError {
+    LayerError {
+        status,
+        message: message.into(),
+    }
+}
+
+/// The constraints layer of `req` over `snap`, or `None` when it has no source. A
+/// caller limited to some graphs (`view`) reads only shapes graphs it may read, and
+/// sees the guard's shapes only when it may read all of the guard's shapes graphs.
 #[cfg(feature = "shacl")]
-pub(in crate::http) fn layer(
+pub(crate) fn build(
     ds: &Dataset,
     snap: &Snapshot,
     req: &ShapesRequest,
     view: Option<&GraphAccess>,
-) -> ApiResult<Option<ConstraintsLayer>> {
+) -> Result<Option<ConstraintsLayer>, LayerError> {
     let view = view.filter(|v| !v.reads_all());
     let readable = |g: &str| {
         view.is_none_or(|v| {
@@ -106,8 +128,6 @@ pub(in crate::http) fn layer(
             Some(crate::state::Validation::Shacl(g)) => Some(g.clone()),
             _ => None,
         };
-        // the guard's shapes graphs are dataset content: a caller limited to some
-        // graphs sees the guard's shapes only when it may read all of them
         let guard = guard.filter(|g| {
             g.config()
                 .shapes
@@ -121,10 +141,13 @@ pub(in crate::http) fn layer(
                 .sources
                 .push(sparkles_shacl::constraints::guard_source(&g)),
             None if req.guard == Some(true) => {
-                return Err(not_found(format!(
-                    "dataset {} has no write-time SHACL validation whose shapes this caller may read",
-                    ds.name
-                )));
+                return Err(layer_error(
+                    404,
+                    format!(
+                        "dataset {} has no write-time SHACL validation whose shapes this caller may read",
+                        ds.name
+                    ),
+                ));
             }
             None => {}
         }
@@ -133,30 +156,42 @@ pub(in crate::http) fn layer(
         for g in &req.graphs {
             let exists = g == "default" || crate::validation_common::graph_exists(snap, g);
             if !exists || !readable(g) {
-                return Err(not_found(format!("no such graph: <{g}>")));
+                return Err(layer_error(404, format!("no such graph: <{g}>")));
             }
         }
         let source = sparkles_shacl::constraints::graphs_source(snap, &req.graphs)
-            .map_err(|e| bad(format!("shapes: {e:#}")))?;
+            .map_err(|e| layer_error(400, format!("shapes: {e:#}")))?;
         layer.sources.push(source);
     }
     Ok((!layer.is_empty()).then_some(layer))
 }
 
 #[cfg(not(feature = "shacl"))]
-pub(in crate::http) fn layer(
+pub(crate) fn build(
     _ds: &Dataset,
     _snap: &Snapshot,
     req: &ShapesRequest,
     _view: Option<&GraphAccess>,
-) -> ApiResult<Option<ConstraintsLayer>> {
+) -> Result<Option<ConstraintsLayer>, LayerError> {
     if req.guard == Some(true) || !req.graphs.is_empty() {
-        return Err(err(
-            StatusCode::NOT_IMPLEMENTED,
-            "built without the `shacl` feature",
-        ));
+        return Err(layer_error(501, "built without the `shacl` feature"));
     }
     Ok(None)
+}
+
+/// [`build`] for the HTTP handlers.
+pub(in crate::http) fn layer(
+    ds: &Dataset,
+    snap: &Snapshot,
+    req: &ShapesRequest,
+    view: Option<&GraphAccess>,
+) -> ApiResult<Option<ConstraintsLayer>> {
+    build(ds, snap, req, view).map_err(|e| {
+        err(
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST),
+            e.message,
+        )
+    })
 }
 
 /// `GET /$/schema/{ds}/constraints`: the constraints layer alone, without computing the

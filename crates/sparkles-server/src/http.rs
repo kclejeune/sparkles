@@ -35,6 +35,7 @@ mod inline;
 mod jena_formats;
 mod queries;
 mod schema;
+pub(crate) use schema::constraints::{ShapesRequest, build as constraints_layer};
 mod sd;
 mod shex;
 mod stream;

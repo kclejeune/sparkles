@@ -256,6 +256,7 @@ enum Section {
     Summary,
     Classes,
     Predicates,
+    Constraints,
 }
 
 impl Section {
@@ -264,6 +265,7 @@ impl Section {
             Section::Summary => "summary",
             Section::Classes => "classes",
             Section::Predicates => "predicates",
+            Section::Constraints => "constraints",
         }
     }
 }
@@ -279,6 +281,8 @@ struct DescribeSchemaArgs {
     limit: Option<u64>,
     cursor: Option<String>,
     at_commit: Option<u64>,
+    subject_classes: Option<bool>,
+    shapes: Option<Vec<String>>,
 }
 
 /// describe_schema continuation: base64url JSON.
@@ -568,17 +572,40 @@ impl Tools<'_> {
             },
         };
         let reasoning = Self::reasoning(&ds, a.reasoning);
-        let selection = fnv(&format!(
-            "{}\n{}\n{reasoning}\nfalse",
-            graph.name(),
-            graph.name()
-        ));
+        let subject_classes = a.subject_classes.unwrap_or(false);
+        let mut selection = format!("{}\n{}\n{reasoning}\nfalse", graph.name(), graph.name());
+        if subject_classes {
+            selection.push_str("\nsubjectClasses");
+        }
+        let selection = fnv(&selection);
+        // the constraints layer's sources: graph IRIs may be prefixed names
+        let mut shapes: Vec<String> = Vec::new();
+        for v in a.shapes.iter().flatten() {
+            match v.trim() {
+                v @ ("guard" | "none" | "default" | "union") => shapes.push(v.to_string()),
+                v => match parse_iri(v, &prefix_map, false)? {
+                    Term::NamedNode(n) => shapes.push(n.into_string()),
+                    _ => {
+                        return Err(ToolError::bad_argument(
+                            "shapes are guard, none, default or graph IRIs",
+                        ));
+                    }
+                },
+            }
+        }
+        let shapes =
+            crate::http::ShapesRequest::from_values(&shapes).map_err(ToolError::bad_argument)?;
+        if a.shapes.is_some() && section != Section::Constraints {
+            return Err(ToolError::bad_argument(
+                "shapes applies to section=constraints",
+            ));
+        }
         let stale = |status: u16, msg: &str| {
             ToolError::new("stale-cursor", status, msg.to_string()).hint("restart without cursor")
         };
         let (snap, after) = match a.cursor.as_deref() {
             Some(c) => {
-                if section == Section::Summary {
+                if matches!(section, Section::Summary | Section::Constraints) {
                     return Err(ToolError::bad_argument(
                         "cursor applies to section=classes or section=predicates",
                     ));
@@ -614,6 +641,7 @@ impl Tools<'_> {
             &snap,
             graph.clone(),
             reasoning,
+            subject_classes,
             selection,
             timeout,
             &ctx,
@@ -696,6 +724,27 @@ impl Tools<'_> {
                     .map(|p| predicate_json(p, &mut terms))
                     .collect();
             }
+            Section::Constraints => {
+                let view = self
+                    .call
+                    .principal
+                    .view(&ds.name, crate::auth::Endpoint::Info);
+                let layer = crate::http::constraints_layer(&ds, &snap, &shapes, view.as_deref())
+                    .map_err(|e| {
+                        let code = match e.status {
+                            404 => "unknown-graph",
+                            501 => "unsupported",
+                            _ => "invalid-shapes",
+                        };
+                        ToolError::new(code, e.status, e.message)
+                    })?
+                    .unwrap_or_default();
+                out["constraints"] = layer
+                    .sources
+                    .iter()
+                    .map(|src| constraints_json(src, &mut terms))
+                    .collect();
+            }
             Section::Classes | Section::Predicates => {
                 let iris: Vec<&str> = if section == Section::Classes {
                     classes.iter().map(|c| c.iri.as_str()).collect()
@@ -746,6 +795,7 @@ impl Tools<'_> {
         snap: &Arc<Snapshot>,
         graph: GraphSelection,
         reasoning: bool,
+        subject_classes: bool,
         selection: u64,
         timeout: Duration,
         ctx: &ErrorContext,
@@ -776,7 +826,7 @@ impl Tools<'_> {
             max_entries: self.server.state.schema_max_entries,
             term_totals: false,
             graphs: graphs.clone(),
-            subject_classes: false,
+            subject_classes,
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
         if graphs.is_none() {
@@ -1209,6 +1259,44 @@ fn class_json(c: &ClassEntry, terms: &mut Terms) -> Value {
     e
 }
 
+/// One source of the constraints layer: one line per property shape.
+fn constraints_json(
+    src: &sparkles::schema::constraints::ConstraintSource,
+    terms: &mut Terms,
+) -> Value {
+    let mut e = json!({
+        "source": src.kind,
+        "graphs": src.graphs.iter().map(|g| if g == "default" { g.clone() } else { terms.iri(g) }).collect::<Vec<_>>(),
+        "classes": src.classes.iter().map(|c| {
+            let mut ce = json!({
+                "class": terms.iri(&c.class),
+                "properties": c.properties.iter().map(|p| json!({
+                    "path": terms.iri(&p.path),
+                    "constraints": p.summary(|i| terms.iri(i)),
+                    "enforcement": p.enforcement,
+                })).collect::<Vec<_>>(),
+            });
+            if c.closed {
+                ce["closed"] = true.into();
+            }
+            if c.other_paths > 0 {
+                ce["otherPaths"] = c.other_paths.into();
+            }
+            ce
+        }).collect::<Vec<_>>(),
+    });
+    if let Some(m) = &src.mode {
+        e["mode"] = m.as_str().into();
+    }
+    if let Some(t) = &src.threshold {
+        e["threshold"] = t.as_str().into();
+    }
+    if src.other_targets > 0 {
+        e["otherTargets"] = src.other_targets.into();
+    }
+    e
+}
+
 fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
     let o = &p.observed;
     let mut kinds: Vec<(String, u64)> = Vec::new();
@@ -1275,6 +1363,27 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
     }
     if vector {
         e["vector"] = true.into();
+    }
+    // the ten classes with the most triples, then the untyped subjects
+    if let Some(classes) = &o.subject_classes {
+        let mut top: Vec<_> = classes.iter().collect();
+        top.sort_by(|a, b| {
+            b.triples
+                .cmp(&a.triples)
+                .then_with(|| a.class.cmp(&b.class))
+        });
+        let mut list: Vec<String> = top
+            .iter()
+            .take(10)
+            .map(|c| format!("{} {}", terms.iri(&c.class), c.triples))
+            .collect();
+        if top.len() > 10 {
+            list.push(format!("+{} more classes", top.len() - 10));
+        }
+        if let Some(u) = o.untyped_subjects.filter(|u| u.triples > 0) {
+            list.push(format!("untyped {}", u.triples));
+        }
+        e["subjectClasses"] = list.into();
     }
     e
 }

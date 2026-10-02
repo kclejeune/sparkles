@@ -103,7 +103,16 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         "iri":{"type":"string"},"label":{"type":"string"},"triples":{"type":"integer"},
         "distinctSubjects":{"type":"integer"},"distinctObjects":{"type":"integer"},
         "maxPerSubject":{"type":"integer"},"objects":strings(),
-        "domains":strings(),"ranges":strings(),"vector":{"type":"boolean"}}});
+        "domains":strings(),"ranges":strings(),"vector":{"type":"boolean"},
+        "subjectClasses":strings()}});
+    let constraint_source = json!({"type":"object","required":["source","graphs","classes"],"properties":{
+        "source":{"enum":["guard","graphs"]},"graphs":strings(),
+        "mode":{"type":"string"},"threshold":{"type":"string"},"otherTargets":{"type":"integer"},
+        "classes":{"type":"array","items":{"type":"object","required":["class","properties"],"properties":{
+            "class":{"type":"string"},"closed":{"type":"boolean"},"otherPaths":{"type":"integer"},
+            "properties":{"type":"array","items":{"type":"object","required":["path","constraints","enforcement"],"properties":{
+                "path":{"type":"string"},"constraints":{"type":"string"},
+                "enforcement":{"enum":["reject-on-write","warn-on-write","validated-on-request"]}}}}}}}}});
     let side = |item: Value| {
         json!({"type":"object","required":["total","predicates","predicatesTotal","triples","truncated"],"properties":{
             "total":{"type":"integer"},
@@ -154,26 +163,29 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "describe_schema",
             "Describe schema",
-            "Classes and predicates of a dataset with exact counts, labels and RDFS/OWL declarations. section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor.",
+            "Classes and predicates of a dataset with exact counts, labels and RDFS/OWL declarations. section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor. section=constraints lists the SHACL constraints per class: those of the dataset's write-time validation, or of the shapes graphs named in `shapes`, with what enforces each. Counts are observations of one snapshot, never constraints.",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
-                "section": {"enum":["summary","classes","predicates"],"default":"summary"},
+                "section": {"enum":["summary","classes","predicates","constraints"],"default":"summary"},
                 "graph": graph(),
                 "reasoning": rs(),
                 "includeBuiltin": {"type":"boolean","default":false,"description":"Also list rdf:, rdfs:, owl:, xsd:, sh: classes"},
                 "limit": {"type":"integer","minimum":1,"maximum":500,"description":"Entries per list (default 25 for summary, 100 otherwise)"},
                 "cursor": {"type":"string","description":"`next` from the previous page"},
+                "subjectClasses": {"type":"boolean","default":false,"description":"List the classes of each predicate's subjects with their triple counts"},
+                "shapes": {"type":"array","items":{"type":"string"},"description":"section=constraints: `guard` (the write-time validation, the default), `default`, `none` or shapes graph IRIs"},
                 "atCommit": at()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","graph","reasoning","section","totals","builtinClassesHidden","next","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
-                "reasoning":{"type":"boolean"},"section":{"enum":["summary","classes","predicates"]},
+                "reasoning":{"type":"boolean"},"section":{"enum":["summary","classes","predicates","constraints"]},
                 "totals":{"type":"object","properties":{"triples":{"type":"integer"},"classes":{"type":"integer"},"predicates":{"type":"integer"}}},
                 "builtinClassesHidden":{"type":"integer"},
                 "ontology":{"type":"array","items":{"type":"object","required":["iri"],"properties":{"iri":{"type":"string"},"label":{"type":"string"},"versionInfo":{"type":"string"}}}},
                 "roots":strings(),
                 "classes":{"type":"array","items":schema_class},
                 "predicates":{"type":"array","items":schema_predicate},
+                "constraints":{"type":"array","items":constraint_source},
                 "next":nullable("string"),
                 "prefixes":prefixes()}}),
             ),
