@@ -586,6 +586,11 @@ enum Cmd {
         /// Enable the spatial index (GeoSPARQL) for a dataset: NAME, or NAME=geo.json
         #[arg(long)]
         geo: Vec<String>,
+        /// Set a dataset's write-time validation at startup from NAME=CONFIG.json (the
+        /// body of PUT /$/validation/{ds}), or with NAME alone validate it with the
+        /// configuration it has; the data is validated in full and the result logged
+        #[arg(long, value_name = "NAME[=CONFIG]")]
+        validate: Vec<String>,
         /// Memory for each dataset's spatial index, in MiB; a build that would exceed it
         /// is refused and queries run without the index
         #[arg(long, default_value_t = 4096)]
@@ -1209,6 +1214,19 @@ fn store_opts(cli: &Cli) -> StoreOptions {
     }
 }
 
+/// `serve --validate NAME[=CONFIG]`
+#[cfg(any(feature = "shacl", feature = "shex"))]
+fn validate_at_startup(st: &state::AppState, spec: &str) -> Result<()> {
+    let line = write_validation::validate_at_startup(st, spec)?;
+    tracing::info!("{line}");
+    Ok(())
+}
+
+#[cfg(not(any(feature = "shacl", feature = "shex")))]
+fn validate_at_startup(_: &state::AppState, _: &str) -> Result<()> {
+    bail!("built without write-time validation (cargo features \"shacl\" and \"shex\")")
+}
+
 /// `serve --text NAME[=CONFIG]`
 #[cfg(feature = "text")]
 fn enable_text_for(st: &state::AppState, spec: &str) -> Result<()> {
@@ -1385,6 +1403,12 @@ fn print_log(
             .and_then(|a| a.message.as_deref())
             .map(|m| format!("  {m}"))
             .unwrap_or_default();
+        // a write that bypassed the dataset's write-time validation
+        let message = if c.unvalidated {
+            format!("  [unvalidated]{message}")
+        } else {
+            message
+        };
         let line = format!(
             "{:>6}{}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
@@ -1565,6 +1589,7 @@ fn run() -> Result<()> {
             idle_release_ms,
             text,
             geo,
+            validate,
             geo_mb,
             geo_op_vertices,
             no_geo_rewrite,
@@ -1814,6 +1839,9 @@ fn run() -> Result<()> {
             }
             for g in geo {
                 geo::enable_for(&st, &g)?;
+            }
+            for v in validate {
+                validate_at_startup(&st, &v)?;
             }
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()

@@ -713,3 +713,79 @@ fn shapes_from_graphs_and_a_file_are_merged() {
     )
     .unwrap();
 }
+
+/// A write that bypasses validation is flagged in the commit catalog, which keeps the
+/// flag across a restart and rebuilds it from the WAL.
+#[test]
+fn bypassed_writes_are_flagged_in_the_commit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let catalog = |root: &std::path::Path| -> Vec<(u64, bool)> {
+        let (_, cs) = sparkles::commit::read_catalog(&root.join("commits.bin"))
+            .unwrap()
+            .unwrap();
+        cs.iter().map(|c| (c.seq, c.unvalidated)).collect()
+    };
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        enable(&s, inline(GuardMode::Reject, SHAPES));
+        let bypass = QueryOptions {
+            write: sparkles::guard::WriteOptions {
+                bypass_validation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let st = update(
+            &s,
+            &format!("{P}INSERT DATA {{ ex:x a ex:Person }}"),
+            &bypass,
+        )
+        .unwrap();
+        let c = st.commit.unwrap();
+        assert!(c.commit.unvalidated);
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["commit"]["unvalidated"],
+            true
+        );
+        let st = upd(&s, "DELETE DATA { ex:x a ex:Person }").unwrap();
+        assert!(!st.commit.unwrap().commit.unvalidated);
+    }
+    // a library write to a validated database without its guard is a bypass too
+    {
+        let s = Store::open(
+            &root,
+            StoreOptions {
+                unvalidated_writes: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let st = upd(&s, "INSERT DATA { ex:y a ex:Person }").unwrap();
+        let c = st.commit.unwrap();
+        assert!(c.commit.unvalidated);
+        assert_eq!(
+            c.validation.unwrap().status,
+            sparkles::guard::GuardStatus::Bypassed
+        );
+    }
+    let flags = catalog(&root);
+    let n = flags.len();
+    assert_eq!(
+        flags[n - 3..].iter().map(|x| x.1).collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    // the WAL records the flag: a rebuilt catalog has it
+    std::fs::remove_file(root.join("commits.bin")).unwrap();
+    drop(
+        Store::open(
+            &root,
+            StoreOptions {
+                unvalidated_writes: true,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(catalog(&root), flags);
+}

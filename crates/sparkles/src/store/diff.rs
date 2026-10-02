@@ -373,7 +373,7 @@ fn walk_wal(
             WAL_INSERT | WAL_DELETE => txn.extend_from_slice(&rec),
             WAL_COMMIT => {
                 let seq = match commit::open_wal_commit(&rec, &txn) {
-                    Some(Ok((seq, _, _))) => {
+                    Some(Ok((seq, _, _, _))) => {
                         seen_v2 = true;
                         seq
                     }

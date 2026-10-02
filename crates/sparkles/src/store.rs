@@ -1000,6 +1000,7 @@ impl Store {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         };
         let store = Store {
             root: None,
@@ -1085,6 +1086,7 @@ impl Store {
                 exact: true,
                 reconstructed: false,
                 default_graph: true,
+                unvalidated: false,
             };
             write_synced(
                 &dir.join("commit.json"),
@@ -1151,6 +1153,7 @@ impl Store {
                     exact: prev.is_none(),
                     reconstructed: false,
                     default_graph: true,
+                    unvalidated: false,
                 };
                 (c, true)
             }
@@ -2408,7 +2411,9 @@ impl Store {
         let g = self.guard();
         let observer = self.guard_observer.read().clone();
         let language = g.as_ref().map_or(GuardLanguage::Shacl, |g| g.language());
-        if opts.bypass_validation {
+        // a store opened to write without its required guard bypasses it on every write
+        let unguarded = g.is_none() && self.guard_required() && self.opts.unvalidated_writes;
+        if opts.bypass_validation || unguarded {
             let mut summary = ValidationSummary::empty(
                 GuardStatus::Bypassed,
                 GuardMode::Off,
@@ -2795,6 +2800,9 @@ impl Store {
                 exact: b.net_del == 0,
                 reconstructed: false,
                 default_graph: b.default_graph,
+                unvalidated: validation
+                    .as_ref()
+                    .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
             },
             None => w.head,
         };
@@ -3029,6 +3037,7 @@ impl Store {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         };
         let forked_from = ForkedFrom {
             id: self.dataset_id,
@@ -3741,6 +3750,9 @@ impl WriteTxn<'_> {
             exact: true,
             reconstructed: false,
             default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH),
+            unvalidated: validation
+                .as_ref()
+                .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
         };
         // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
@@ -3759,7 +3771,12 @@ impl WriteTxn<'_> {
             }
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&next_bnode.to_le_bytes());
-            commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, &data);
+            let flags = if c.unvalidated {
+                commit::WAL_FLAG_UNVALIDATED
+            } else {
+                0
+            };
+            commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, flags, &data);
             data.extend_from_slice(&rec);
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
@@ -4067,7 +4084,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
             WAL_INSERT | WAL_DELETE => {}
             WAL_COMMIT => {
                 match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
-                    Some(Ok((seq, _, _))) => {
+                    Some(Ok((seq, _, _, _))) => {
                         seen_v2 = true;
                         end = seq;
                     }
@@ -4223,7 +4240,7 @@ pub(crate) fn replay_wal(
                 out.version += 1;
                 let prev = out.commits.last().copied().unwrap_or(from.base);
                 match meta {
-                    Some(Ok((seq, ts, kind))) => {
+                    Some(Ok((seq, ts, kind, flags))) => {
                         seen_v2 = true;
                         if seq != prev.seq + 1 {
                             return Err(Error::Corrupt(format!(
@@ -4244,6 +4261,7 @@ pub(crate) fn replay_wal(
                             exact: true,
                             reconstructed: false,
                             default_graph,
+                            unvalidated: flags & commit::WAL_FLAG_UNVALIDATED != 0,
                         });
                     }
                     // a legacy commit record: folded into the baseline when the
@@ -4261,6 +4279,7 @@ pub(crate) fn replay_wal(
                         exact: true,
                         reconstructed: true,
                         default_graph,
+                        unvalidated: false,
                     }),
                 }
                 if from.keep_touched && out.commits.len() > before {

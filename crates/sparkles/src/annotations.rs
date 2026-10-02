@@ -514,6 +514,7 @@ mod tests {
             exact: true,
             reconstructed: false,
             default_graph: true,
+            unvalidated: false,
         };
         let id = uuid::Uuid::nil();
         let l = |s: &str| s.to_string();
