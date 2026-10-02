@@ -725,6 +725,10 @@ fn property_functions(patterns: &[TriplePattern]) -> std::result::Result<(), Str
         super::textpf::take_calls(patterns, crate::vector::VECTOR_SEARCH, "spk:vectorSearch")
             .map(|(c, _)| !c.is_empty()),
     )?;
+    call(
+        super::textpf::take_calls(patterns, super::hybrid::HYBRID_SEARCH, "spk:hybridSearch")
+            .map(|(c, _)| !c.is_empty()),
+    )?;
     call(super::geopf::take_spatial_calls(patterns).map(|(c, _)| !c.is_empty()))
 }
 

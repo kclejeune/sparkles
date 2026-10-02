@@ -1793,8 +1793,11 @@ SELECT ?s ?score ?label WHERE {
 } ORDER BY DESC(?score)
 ```
 
-* **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
-  subject is optional. A constant subject restricts the search to that subject.
+* **Subject list.** `(?s ?score ?literal ?graph ?predicate ?rank)`. Every slot after the
+  subject is optional. A constant subject restricts the search to that subject. The
+  sixth slot is a Sparkles extension. It binds the hit's rank as an `xsd:integer`, one
+  more than the number of hits with a higher score, so hits with equal scores share a
+  rank. Unused slots can be blank nodes, as in `(?s ?score [] [] [] ?rank)`.
 * **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
   The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
   query string acts as `lang:`.
@@ -1847,6 +1850,32 @@ SELECT ?s ?score ?label WHERE {
   before any join.
 * **Analyzer.** Tokens are split on non-alphanumeric characters, lowercased and
   ASCII-folded, so `café` matches `cafe`.
+* **Languages.** An index can also stem the literals of chosen languages, as jena-text
+  does with `text:multilingualSupport`. `languages` in the configuration names them. A
+  literal whose language tag has an analyzer is indexed twice, once as above and once
+  stemmed. A search with `lang:` or a language-tagged query string searches the stemmed
+  text of that language, so `"runs"@en` matches `Running quickly`@en. The analyzer of a
+  language lowercases, removes the language's stop words (where Tantivy has a list for
+  it) and applies Tantivy's Snowball stemmer. It is applied to the query in the same way.
+  As in Lucene, stemmed terms are not folded to ASCII, so Swedish `städer` and `stad`
+  stay apart.
+  * The language of a literal and of a search is its primary subtag, so `en-GB` literals
+    are stemmed as English and `lang:en-gb` searches the English text and keeps only
+    `en-GB` literals.
+  * As in Lucene, prefixes, wildcards, fuzzy words, regular expressions and ranges are
+    not stemmed. They match the stemmed terms, so `runn*` finds `runner` but not
+    `running`, which was indexed as `run`. They are lowercased, and for German the
+    umlauts and ß are replaced as the German stemmer replaces them, so `häu*` finds
+    `Häuser`.
+  * A removed stop word leaves a gap in the positions, as in Lucene. The phrase
+    `"ada and the fox"` matches `Ada and the fox`, and `"ada fox"` does not.
+  * A search without a language searches the unstemmed text, as in Jena. A language
+    without an analyzer in the index is searched unstemmed and filtered by its tag.
+  * The analyzers are `arabic`, `danish`, `dutch`, `english`, `finnish`, `french`,
+    `german`, `greek`, `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
+    `russian`, `spanish`, `swedish`, `tamil` and `turkish`. Their default tags are `ar`,
+    `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `no` (and `nb` and `nn`), `pt`,
+    `ro`, `ru`, `es`, `sv`, `ta` and `tr`.
 * **Consistency.** Indexes are updated in the same commit as the data, so a query sees
   the text of its own snapshot, including the writes just before it. A write only stages
   its documents. The index commit, which writes a new segment, happens at the next text
@@ -1885,6 +1914,7 @@ type TextConfig = {
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
   maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
+  languages?: "all" | string[] | { [tag: string]: string };  // stemmed languages; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
@@ -1904,10 +1934,16 @@ type TextHits = {
 };
 ```
 
+`languages` is `"all"` for every analyzer under its default tags, a list of tags with
+their default analyzers, such as `["en", "fr"]`, or a map from a primary language tag to
+an analyzer name, such as `{"en": "english", "gl": "portuguese"}`. `--language all` and
+`--language en` set it from the CLI. An index without `languages` keeps the schema and
+configuration it had before languages existed and is not rebuilt.
+
 Dataset info (`/$/datasets`) has `text: null | { state, docs }`. The configuration lives
 in the database directory, in `text.json`, with the index in `text/`. The CLI commands
 are
-`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--rebuild | --status | --disable]`
+`sparkles text-index --loc DB [--predicate IRI…] [--exclude-graph IRI…] [--language TAG…] [--rebuild | --status | --disable]`
 and `sparkles serve --text NAME[=config.json]`.
 
 ## Vector similarity
@@ -2043,6 +2079,45 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Hybrid text and vector search
+
+`spk:hybridSearch` runs a full-text search and a vector search and fuses their rankings
+by reciprocal rank fusion (Cormack, Clarke and Büttcher, SIGIR 2009). The design is in
+[F04](specs/F04-vector-search.md#outcome).
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>
+SELECT ?s ?score ?textRank ?vectorRank WHERE {
+  (?s ?score ?textRank ?vectorRank) spk:hybridSearch (
+      (rdfs:label "brown fox" 100 "lang:en")
+      (ex:emb "[0.1, -0.2, 0.3]"^^spk:vector 100)
+      10 "rrf:60" "weights:1,0.5") .
+} ORDER BY DESC(?score)
+```
+
+* **Arguments.** The first element is the object list of `text:query`, or a bare query
+  string. The second is the object list of `spk:vectorSearch`. An optional limit follows,
+  1 to 10,000 subjects with 10 by default, and then the options. `rrf:k` sets the
+  constant of the fusion (60 by default). `weights:wt,wv` weights the text and the vector
+  ranking (1 and 1 by default).
+* **Subject list.** `(?s ?score ?textRank ?vectorRank)`. Every slot after the subject is
+  optional. `?score` is the fused score as an `xsd:double`. A rank is unbound when its
+  list does not hold the subject. A constant subject returns that subject's row of the
+  fused ranking.
+* **Rankings.** Each list runs as its own property function would, within the active
+  graph and with its own options, budgets and errors. The text list's limit and the
+  vector list's `k` set how deep each ranking goes, 100 when they are absent. Each
+  ranking keeps one entry per subject, its best hit, or per subject and graph under
+  `GRAPH ?g`. A subject's rank is one more than the number of subjects in that list with
+  a better score, so ties share a rank. For the euclidean metric a lower distance is
+  better.
+* **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
+  hold it. The best `limit` subjects are returned, and ties break by term id.
+* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
+  a vector literal or an entity, and `candidates:join` is refused. Errors follow the two
+  searches, and malformed calls and options give `400`. The call needs the `text`
+  feature and a full-text index.
 
 ## GeoSPARQL
 

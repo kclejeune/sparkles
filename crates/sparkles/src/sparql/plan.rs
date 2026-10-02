@@ -207,6 +207,8 @@ pub struct TextSpec {
     /// the call's graph slot
     pub graph_out: Option<VarId>,
     pub prop: Option<VarId>,
+    /// the hit's rank: 1 + the number of hits with a higher score
+    pub rank: Option<VarId>,
     /// graph scope of the active graph
     pub graph: GraphFilter,
     /// `GRAPH ?g { … }` around the call: bound from each hit's graph
@@ -352,6 +354,8 @@ pub enum Kind {
     TextSearch(Box<TextSpec>),
     /// exact vector similarity search (`spk:vectorSearch`)
     VectorSearch(Box<VectorSpec>),
+    /// a text and a vector ranking fused (`spk:hybridSearch`)
+    HybridSearch(Box<super::hybrid::HybridSpec>),
     /// scan of a spatially indexed predicate restricted by spatial filters on its object
     SpatialScan(Box<super::geopf::SpatialScanSpec>),
     /// a `spatial:` property function
@@ -482,6 +486,7 @@ impl Node {
             Kind::Service { .. } => "Service",
             Kind::TextSearch(_) => "TextSearch",
             Kind::VectorSearch(_) => "VectorSearch",
+            Kind::HybridSearch(_) => "HybridSearch",
             Kind::SpatialScan(_) => "SpatialScan",
             Kind::SpatialPf(_) => "SpatialPf",
             Kind::IndexJoin(j) if j.probes.len() > 1 => "StarJoin",
@@ -932,6 +937,15 @@ impl<'a> Planner<'a> {
                     crate::vector::VECTOR_SEARCH,
                     "spk:vectorSearch",
                 )?;
+                let (hcalls, mut patterns) = super::textpf::take_calls(
+                    &patterns,
+                    super::hybrid::HYBRID_SEARCH,
+                    "spk:hybridSearch",
+                )?;
+                let hcalls = hcalls
+                    .into_iter()
+                    .map(|(s, o)| Ok((s, super::hybrid::take_lists(&mut patterns, o)?)))
+                    .collect::<Result<Vec<_>>>()?;
                 let (rcalls, patterns) =
                     super::georewrite::take_rewrite_triples(patterns, self.ctx)?;
                 let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
@@ -943,6 +957,11 @@ impl<'a> Planner<'a> {
                 }
                 for (subjects, args) in vcalls {
                     items.push(Item::Node(self.vector_leaf(subjects, args, g)?));
+                }
+                for (subjects, args) in hcalls {
+                    items.push(Item::Node(super::hybrid::hybrid_leaf(
+                        self, subjects, args, g,
+                    )?));
                 }
                 for c in scalls {
                     items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
@@ -1069,7 +1088,7 @@ impl<'a> Planner<'a> {
 
     /// A `spk:vectorSearch` call as a search leaf:
     /// `(?s ?score ?vector) spk:vectorSearch (predicate query [k] ["metric:…"])`.
-    fn vector_leaf(
+    pub(super) fn vector_leaf(
         &self,
         subjects: Vec<TermPattern>,
         args: Vec<TermPattern>,
@@ -1291,7 +1310,7 @@ impl<'a> Planner<'a> {
     }
 
     /// A `text:query` call as a search leaf.
-    fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
+    pub(super) fn text_leaf(&self, c: super::textpf::TextCall, g: &ActiveGraph) -> Result<Node> {
         let slot = |t: &Option<TermPattern>| -> Option<VarId> {
             match t.as_ref().map(|t| self.term_pattern(t)) {
                 Some(PT::V(v)) => Some(v),
@@ -1306,14 +1325,15 @@ impl<'a> Planner<'a> {
         // search then reads no literal
         let output =
             |t: &Option<TermPattern>| t.as_ref().filter(|t| self.used_elsewhere(t)).cloned();
-        let (score, literal, graph_out, prop) = (
+        let (score, literal, graph_out, prop, rank) = (
             slot(&output(&c.score)),
             slot(&output(&c.literal)),
             slot(&c.graph),
             slot(&c.prop),
+            slot(&output(&c.rank)),
         );
         let Some((graph, graph_var)) = self.graph_filter(g) else {
-            let mut vars: Vec<VarId> = [score, literal, graph_out, prop]
+            let mut vars: Vec<VarId> = [score, literal, graph_out, prop, rank]
                 .into_iter()
                 .flatten()
                 .collect();
@@ -1336,6 +1356,7 @@ impl<'a> Planner<'a> {
             graph_out,
             graph_var,
             prop,
+            rank,
         ]
         .into_iter()
         .flatten()
@@ -1388,6 +1409,7 @@ impl<'a> Planner<'a> {
             literal,
             graph_out,
             prop,
+            rank,
             graph,
             graph_var,
             dedup,

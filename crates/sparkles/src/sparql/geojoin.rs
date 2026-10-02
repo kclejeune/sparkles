@@ -619,6 +619,7 @@ mod on {
             | Kind::Values(_)
             | Kind::TextSearch(_)
             | Kind::VectorSearch(_)
+            | Kind::HybridSearch(_)
             | Kind::SpatialScan(_)
             | Kind::SpatialPf(_)
             | Kind::SpatialRelate(_) => {

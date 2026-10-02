@@ -6,8 +6,9 @@
 > similarity functions, `spk:vectorSearch` with variable queries, `candidates:join` and
 > `distinct:subject`, configured indexes with persisted files and background builds,
 > `/$/vector/{ds}/{name}`, `sparkles vector`, an HNSW graph with an exact overlay of each
-> snapshot's changes, the `/similar` page and the dataset page's index cards. Phase 3 is
-> not built.
+> snapshot's changes, the `/similar` page and the dataset page's index cards. Of Phase 3,
+> hybrid ranking with full-text search shipped as `spk:hybridSearch`. The rest of Phase 3
+> is not built.
 >
 > **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -996,6 +997,80 @@ text. The server maps the index file and used 3.2 GB at 1M × 768 after the meas
   vector grammar, the plan counters and the index form, and `ui/tests/mock/vector.spec.ts`
   and the phone overflow tests drive both pages against the mock.
 
-**Not built.** Quantization, and everything in Phase 3: background catch-up of the graph with overlay inserts,
-keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, hybrid
-ranking with [F03](F03-full-text-search.md), and a compact datatype.
+**Hybrid ranking (2026-10-02).** Phase 3's hybrid ranking with
+[F03](F03-full-text-search.md) is a property function, `spk:hybridSearch`
+(`urn:x-sparkles:hybridSearch`). It runs a `text:query` search and a `spk:vectorSearch`
+search and fuses their rankings by reciprocal rank fusion (Cormack, Clarke and Büttcher,
+SIGIR 2009).
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>  PREFIX ex: <http://example.org/>
+SELECT ?s ?score ?textRank ?vectorRank WHERE {
+  (?s ?score ?textRank ?vectorRank) spk:hybridSearch (
+      (rdfs:label "brown fox" 100 "lang:en")
+      (ex:embMiniLM "[0.01, -0.2, 0.09]"^^spk:vector 100)
+      10 "rrf:60" "weights:1,0.5") .
+} ORDER BY DESC(?score)
+```
+
+```
+subject := term | ( term [?score [?textRank [?vectorRank]]] )
+object  := ( text vector [limit] ["rrf:k"] ["weights:wt,wv"] )
+text    := "query" | "query"@lang | ( iri* "query" [depth] ["lang:xx"] )
+vector  := ( predicate query [depth] ["option:value" …] )
+```
+
+| Slot | Meaning |
+|---|---|
+| `?s` / constant | The subject. A constant keeps that subject's row of the fused ranking, if either list holds it. |
+| `?score` | The fused score as an `xsd:double`. Higher is better. |
+| `?textRank` | The subject's rank in the text ranking. It is unbound when the text list does not hold the subject. |
+| `?vectorRank` | The subject's rank in the vector ranking. It is unbound when the vector list does not hold the subject. |
+| `text` | The object list of `text:query`, or a bare query string. Its limit is the depth of the text ranking. |
+| `vector` | The object list of `spk:vectorSearch`. Its `k` is the depth of the vector ranking, and its options apply. |
+| `limit` | The number of subjects returned, 1 to 10,000. The default is 10. |
+| `"rrf:k"` | The constant k of the fusion, a number of at least 0. The default is 60, the paper's value. |
+| `"weights:wt,wv"` | The weights of the text and vector rankings, numbers of at least 0 that are not both 0. The default is `1,1`. |
+
+Semantics:
+
+* **The two searches.** Each list runs as its own property function would, once and
+  within the active graph, with the same scope rules, budgets and errors. A list without
+  a limit or `k` has a depth of 100, where `text:query` would return every hit and
+  `spk:vectorSearch` would return 10.
+* **Ranks.** Each ranking is reduced to one entry per subject, its best hit. Under
+  `GRAPH ?g` the entries are per subject and graph instead, and `?g` is bound. A subject's
+  rank is one more than the number of subjects in that list with a better score, so tied
+  subjects share a rank. For the euclidean metric a lower distance is better.
+* **Fusion.** A subject's fused score is the sum of `w / (k + rank)` over the lists that
+  hold it. A subject that only one list holds gets only that list's term, and a list with
+  weight 0 adds nothing but still contributes its subjects. The result is the `limit`
+  subjects with the highest fused scores. Ties break by term id, as in `spk:vectorSearch`.
+* **Joins.** The call is a leaf like the two searches, so `limit` is the top n before any
+  join. Rows are emitted best first, but only `ORDER BY DESC(?score)` orders a result.
+* **Restrictions.** The text list takes no `highlight:` option. The vector query must be
+  a vector literal or an entity, and `candidates:join` is refused, because the call does
+  not read the rest of its group. Arguments must be constants.
+
+| Condition | Status |
+|---|---|
+| A malformed call, a slot after `?s` that is not a variable, a limit outside 1 to 10,000, a negative or non-numeric `rrf:`, or weights that are not two numbers of at least 0 with a positive sum. | 400 |
+| An error of either search, such as a predicate that is not text-indexed, a dataset without a full-text index, or a `k` above 10,000. | As for that search |
+| A text depth above `maxHits` with more hits than `maxHits`. | 507 |
+| A build without the `text` feature. | 501 |
+
+The implementation is `sparql/hybrid.rs`. It plans both searches with the planner code of
+their own property functions, under hidden output variables, so the scope, dedup and
+option handling are shared. It then reads both result tables, keeps the best score per
+subject, ranks, and fuses. `text:query` gained a rank output for the same purpose, the
+sixth slot of its subject list (F03). The plan shows one `HybridSearch` node whose
+counters are `textHits`, `vectorHits`, `vectorMethod` and `fused`. Results are not
+cached, as for vector searches. Tests in `crates/sparkles/tests/hybrid.rs` cover the
+fusion against hand-computed scores, subjects missing from one list, ties in each
+ranking and in the fused score, depths, limits and options, euclidean ranking, constant
+subjects, `GRAPH ?g`, subjects with several hits, the `maxHits` budget and every error.
+
+**Not built.** Quantization, and the rest of Phase 3: background catch-up of the graph with
+overlay inserts, keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…)
+LIMIT k`, and a compact datatype. A hybrid call with a variable vector query or with
+`candidates:join` is not built either.

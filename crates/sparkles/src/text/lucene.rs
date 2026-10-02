@@ -112,7 +112,12 @@ impl Matchers {
 
 /// Parse a `text:query` string into a query over `field`. Fuzzy terms are expanded
 /// against the terms of `searcher`.
-pub(super) fn parse(src: &str, searcher: &Searcher, field: Field) -> Res<Parsed> {
+pub(super) fn parse(
+    src: &str,
+    searcher: &Searcher,
+    field: Field,
+    analyzer: Option<super::Analyzer>,
+) -> Res<Parsed> {
     let toks = lex(src)?;
     let mut p = Parser { toks, pos: 0 };
     let ast = p.query(0)?;
@@ -131,6 +136,7 @@ pub(super) fn parse(src: &str, searcher: &Searcher, field: Field) -> Res<Parsed>
             .map_err(|e| e.to_string())?,
         matchers: Default::default(),
         positive: std::cell::Cell::new(true),
+        analyzer_of_field: analyzer,
     };
     if !ast.clauses.iter().any(|(o, _)| *o != Occur::MustNot) {
         return Err("the query needs a word that is not excluded".into());
@@ -653,6 +659,8 @@ struct Builder<'a> {
     matchers: std::cell::RefCell<Matchers>,
     /// whether the clause being built is not excluded (its words are highlighted)
     positive: std::cell::Cell<bool>,
+    /// the language analyzer of the field (`None`: the standard text)
+    analyzer_of_field: Option<super::Analyzer>,
 }
 
 impl Builder<'_> {
@@ -786,7 +794,7 @@ impl Builder<'_> {
                 let mut re = String::new();
                 let mut lit = String::new();
                 let flush = |lit: &mut String, re: &mut String| {
-                    re.push_str(&regex::escape(&normalize(lit)));
+                    re.push_str(&regex::escape(&normalize(lit, self.analyzer_of_field)));
                     lit.clear();
                 };
                 for &(c, escaped) in chars {
@@ -806,10 +814,10 @@ impl Builder<'_> {
                 self.mark_pattern(&re);
                 Some(self.regex(&re)?)
             }
-            Ast::Fuzzy(w, sim) => Some(self.fuzzy(&normalize(w), *sim)?),
+            Ast::Fuzzy(w, sim) => Some(self.fuzzy(&normalize(w, self.analyzer_of_field), *sim)?),
             Ast::Regex(r) => {
                 lucene_regex(r)?;
-                let r = normalize(r);
+                let r = normalize(r, self.analyzer_of_field);
                 let q = self.regex(&r)?;
                 self.mark_pattern(&r);
                 Some(q)
@@ -822,8 +830,8 @@ impl Builder<'_> {
             } => {
                 let bound = |b: &Option<String>, incl: bool| match b {
                     None => Bound::Unbounded,
-                    Some(b) if incl => Bound::Included(normalize(b)),
-                    Some(b) => Bound::Excluded(normalize(b)),
+                    Some(b) if incl => Bound::Included(normalize(b, self.analyzer_of_field)),
+                    Some(b) => Bound::Excluded(normalize(b, self.analyzer_of_field)),
                 };
                 let (lo, hi) = (bound(lo, *lo_incl), bound(hi, *hi_incl));
                 let term = |b: &Bound<String>| b.as_ref().map(|s| self.term(s));
@@ -904,13 +912,23 @@ impl Builder<'_> {
     }
 }
 
-/// Lowercase and ASCII-fold like the indexed tokens, without splitting.
-fn normalize(s: &str) -> String {
-    let mut a = super::imp::normalizer();
+/// Normalize a term that is not analyzed (a prefix, wildcard, fuzzy word, regular
+/// expression or range bound) like the indexed tokens of a field, without splitting:
+/// see [`super::imp::normalizer`]. German stems have no umlauts or ß, which the German
+/// stemmer replaces, so a German term is normalized as Lucene's German analyzer does.
+fn normalize(s: &str, analyzer: Option<super::Analyzer>) -> String {
+    let mut a = super::imp::normalizer(analyzer);
     let mut stream = a.token_stream(s);
     let mut out = String::new();
     while let Some(t) = stream.next() {
         out.push_str(&t.text);
+    }
+    if analyzer == Some(super::Analyzer::German) {
+        out = out
+            .replace('ä', "a")
+            .replace('ö', "o")
+            .replace('ü', "u")
+            .replace('ß', "ss");
     }
     out
 }
@@ -1090,7 +1108,10 @@ mod tests {
 
     #[test]
     fn normalizes_like_the_index() {
-        assert_eq!(normalize("Café"), "cafe");
-        assert_eq!(normalize("AL*"), "al*");
+        use super::super::Analyzer;
+        assert_eq!(normalize("Café", None), "cafe");
+        assert_eq!(normalize("Café", Some(Analyzer::French)), "café");
+        assert_eq!(normalize("Schö*", Some(Analyzer::German)), "scho*");
+        assert_eq!(normalize("AL*", None), "al*");
     }
 }
