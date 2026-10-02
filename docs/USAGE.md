@@ -1,8 +1,8 @@
 # Usage
 
 This guide covers operating the `sparkles` binary: running the server, the command-line
-tools, the formatter, backups, outbound requests, integrity checks, the MCP server,
-embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
+tools, automatic compaction, the formatter, backups, outbound requests, integrity checks,
+the MCP server, embedding the library, the Python package and deploying on NixOS. [API.md](API.md)
 specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and
 testing.
 
@@ -14,6 +14,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Endpoints and operations](#endpoints-and-operations)
   * [`serve` options](#serve-options)
 * [Command-line tools](#command-line-tools)
+* [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Backup repositories](#backup-repositories)
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
@@ -148,6 +149,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
 | `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
+| `--no-auto-compact` | | Never compact automatically. `POST /$/compact/{ds}` and `sparkles compact` still work. See [Automatic compaction](#automatic-compaction) for the `--auto-compact-*` flags. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
 | `--format-endpoint on\|authenticated\|off` | `on` | Who may use `POST /$/format` (see [API.md](API.md#formatting)). `on` admits every caller the server admits, `authenticated` every caller but the anonymous principal (`401`), and `off` nobody (`404`). A UI built with the formatter's WebAssembly module formats in the page and needs the endpoint only as a fallback. |
@@ -215,6 +217,7 @@ sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv,
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles compact --loc db                     # merge updates into a new generation
+sparkles compact --loc db --if-due            # only when the compaction policy says so (for cron)
 sparkles dump    --loc db > dump.nq
 sparkles dump    --loc db --out dump.nq.zst   # compression from the extension, or --compress
 sparkles backup  --loc db --out backups/      # zstd; --compress gzip --level 9, --threads 8
@@ -238,6 +241,7 @@ sparkles vector create --loc db --name emb --predicate http://example.org/emb --
 sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server URL --dataset NAME
 sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
+sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 ```
 
 `sparkles infer` updates the materialization that `reasoning.json` records when its
@@ -331,6 +335,8 @@ The other commands are:
 * `validation`, for write-time validation ([API](API.md#write-time-validation));
 * `snapshot`, for named snapshots and history retention;
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
+* `compaction`, for a dataset's automatic compaction settings, locally or on a `--server`
+  ([below](#automatic-compaction));
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
   ([below](#backup-repositories));
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
@@ -344,6 +350,51 @@ The other commands are:
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
 ([API.md](API.md#schema-discovery)).
+
+## Automatic compaction
+
+A server compacts each dataset in the background when its delta of updates grows large,
+and writes go on while it does. By default a dataset is compacted when its delta reaches
+10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
+its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
+after 5 minutes without a commit, and any change is compacted within a day. The build
+runs on a quarter of the cores at a lower priority, and at most one automatic compaction
+runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
+compaction waits and the status at `/$/compaction/{ds}`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
+| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
+| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
+| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
+| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
+| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
+| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
+| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
+| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
+| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
+| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
+| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
+
+A dataset can override every setting but the threads, the rate and the running limit.
+The settings are stored in `compaction.json` in its directory:
+
+```sh
+sparkles compaction --loc db                                  # the policy, the delta and the verdict
+sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
+sparkles compaction --loc db --set enabled=false              # off for this dataset
+sparkles compaction --loc db --default                        # back to the server's settings
+sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
+curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
+```
+
+A database that no server holds is never compacted on its own. `sparkles compact --loc db
+--if-due` compacts it only when its policy says so, which suits a cron job.
+
+Each compaction makes the next incremental backup upload the whole new generation, and a
+retention window keeps the old generation until its commits age out. Raise the ratio or
+the minimum interval for datasets where that costs too much.
 
 ## Formatting
 

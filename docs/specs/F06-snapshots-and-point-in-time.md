@@ -1353,3 +1353,15 @@ JSON and patches, long polling, server-sent events with `Last-Event-ID`, the bud
 **Still not built.** Sparkles writes RDF Patch but does not apply it, so there is no
 `/patch` endpoint. The feed is per dataset, not per graph. Clones into an in-memory
 dataset and Phase 3 remain later work.
+
+### Compaction during writes
+
+[C13](C13-automatic-compaction.md) changed how compactions meet. A compaction now builds
+from a snapshot while writes go on, and carries the commits made during the build into
+the new generation's log. The new generation's base then holds the commit at which the
+build started, which can be earlier than the end of the generation it replaces. §4.1's
+rule `base(G+1) = end(G)` becomes `base(G+1) ≤ end(G)`, and the commits in between are in
+both logs. The newest generation that covers a commit owns it, as before, so reads, pins,
+the retention window and diffs need no other change. The catalog keeps the generation a
+commit was made in. When a sealed generation has no commit of its own after its base,
+its end is read from its log.

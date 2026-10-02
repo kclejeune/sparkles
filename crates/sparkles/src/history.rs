@@ -904,15 +904,18 @@ pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Ve
         if no > current {
             continue;
         }
+        let dir = root.join(&name);
+        // a generation whose commits a compaction carried over has none of its own
         let end = recs
             .iter()
             .rev()
             .find(|c| c.generation == no)
-            .map_or(base.seq, |c| c.seq.max(base.seq));
+            .map(|c| c.seq.max(base.seq))
+            .unwrap_or_else(|| crate::store::wal_end(&dir, &base, fold_legacy));
         h.gens.insert(
             no,
             GenEntry {
-                dir: root.join(&name),
+                dir,
                 name,
                 base,
                 end,

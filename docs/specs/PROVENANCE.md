@@ -685,6 +685,30 @@ implementation landed.
   - holding the store's write transaction in the Python object, which needs its guard on
     one thread.
 
+## Automatic compaction
+
+- **Spec:** [`C13-automatic-compaction.md`](C13-automatic-compaction.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the [F05](F05-snapshot-repositories.md),
+    [F06](F06-snapshots-and-point-in-time.md) and
+    [C01](C01-observability-and-budgets.md) specs;
+  - QLever's `--rebuild-index-strategy` option and the comments of its `DeltaTriples.h`,
+    `IndexRebuilder.h` and `IndexSwap.h` headers (Apache-2.0), read for behaviour;
+  - LSM compaction in LevelDB and RocksDB, PostgreSQL's autovacuum thresholds and Jena
+    TDB2's compaction, cited from their public documentation and general knowledge.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. No code was copied
+  from QLever. **Dependencies:** none new. `libc`'s `setpriority`, already a dependency of
+  the engine on Unix, lowers the build threads' priority.
+- **Rejected** (spec §8):
+  - holding the writer lock for the whole automatic build;
+  - a thread per dataset;
+  - carrying the net delta instead of each commit;
+  - refusing writes during a build;
+  - a size-only or ratio-only trigger;
+  - compacting every idle period whatever the delta's size.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

@@ -46,6 +46,8 @@ running queries.
 **Storage and engine**
 * MVCC snapshots with a single writer and a crash-safe WAL. Compaction writes immutable
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
+* Automatic compaction in the background when a dataset's updates grow, with writes going
+  on during the build ([API](docs/API.md#automatic-compaction)).
 * Durable commit ids, point-in-time reads by commit (`?at=commit:N`), time or named
   snapshot, and diffs between any two readable commits, as JSON or RDF Patch
   ([API](docs/API.md#point-in-time-reads-and-snapshots)).
@@ -213,7 +215,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 |---|---|
 | `serve` | Run the SPARQL server with the web UI. |
 | `load`, `query`, `update`, `dump` | Bulk load, query and update, locally or on a `--server`. `dump` exports N-Quads. |
-| `compact`, `clone`, `stats`, `log`, `check` | Merge updates, copy a dataset, show statistics or the commit history, and verify a database. |
+| `compact`, `compaction`, `clone`, `stats`, `log`, `check` | Merge updates, set a dataset's automatic compaction, copy a dataset, show statistics or the commit history, and verify a database. |
 | `snapshot`, `diff` | Manage named snapshots, pin schedules, history retention and the commit catalog's horizon, and show the quads added and removed between two commits, also as RDF Patch. |
 | `backup`, `repo` | Write N-Quads dumps, and manage backup repositories on a file system or S3, restores and policies. |
 | `infer` | Materialize RDFS, OWL 2 RL or Jena rules. Report staleness and check for inconsistencies. |

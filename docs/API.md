@@ -113,6 +113,10 @@ JSON object per line.
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
 | `sparkles_validation_results_total` | counter. Results found by validated writes. ShEx counts nonconformant associations as `violation`. | `dataset`, `language`, `severity` = `violation` \| `warning` \| `info` |
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
+| `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
+| `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
+| `sparkles_compaction_lock_seconds_max` | gauge. The longest switch since the server started. | `dataset` |
+| `sparkles_compaction_running`, `sparkles_compaction_due` | gauge. A compaction runs, and the policy says one is due. | `dataset` |
 | `sparkles_geo_rows` | gauge. Rows of the spatial index. | `dataset`, `part` = `base` \| `overlay` \| `tail` |
 | `sparkles_geo_build_seconds` | gauge. Duration of the last build of the index's base. | `dataset` |
 | `sparkles_geo_candidates_total`, `sparkles_geo_refined_total`, `sparkles_geo_matches_total`, `sparkles_geo_rechecked_total` | counter. Summed over the spatial operators of queries, in order: rows the index found, exact geometry tests, rows that passed them, and candidates the index could not place. | `dataset` |
@@ -501,7 +505,10 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
-| POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
+| POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. |
+| GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
+| PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
+| DELETE | `/$/compaction/{ds}`         | *Extension.* Removes the dataset's own compaction settings, so the server's apply. Returns `CompactionStatus`. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
 | POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
@@ -555,6 +562,7 @@ type DatasetStats = {
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
+  compaction: CompactionStatus;  // automatic compaction (see Automatic compaction)
 };
 
 type DatasetQuota = {
@@ -586,7 +594,90 @@ spatial index builds, and N-Quads backups. The others wait as `queued`, in start
 and can be cancelled while they wait. Backup repository tasks (`backup-*` kinds) wait for
 their own `--backup-max-tasks` slots instead. Starting a task while 1000 already wait
 returns `503`. The task list keeps every queued and running task and the 200 most recent
-finished ones.
+finished ones. An automatic compaction starts only when a slot is free, and never waits as
+`queued`.
+
+### Automatic compaction
+
+The design and its rationale are in [C13 Automatic compaction](specs/C13-automatic-compaction.md).
+
+Updates go to a delta next to the sorted base index. Compaction merges the two into a
+new index generation. A server compacts each dataset on its own when the delta grows
+large, and `POST /$/compact/{ds}` still compacts on request. Both build the new
+generation from a snapshot while writes go on. The commits made during the build are
+carried into the new generation, and the writer lock is held only for the final switch,
+which takes a few milliseconds plus the spatial index's base, when the dataset has one.
+Queries see the same data before and after, and a query that started on the old
+generation finishes on it.
+
+**When.** A compaction is due when the first of these holds:
+
+| Setting | Default | Trigger |
+|---|---|---|
+| `minDeltaQuads` | 10,000 | The floor. The quad-count and idle triggers need a delta at least this large. |
+| `deltaRatio` | 0.05 | The delta (inserted plus deleted quads) reaches `minDeltaQuads + deltaRatio × base quads`. |
+| `maxDeltaQuads` | 1,000,000 | The delta reaches this size, whatever the base. |
+| `maxDeltaMb` | 512 | The delta and its new terms take about this many MiB of memory. |
+| `maxWalMb` | 1024 | The write-ahead log of the current generation passes this many MiB. |
+| `idleSeconds` | 300 | No commit for this long, with a delta of at least `minDeltaQuads`. |
+| `maxAgeSeconds` | 86,400 | The oldest commit not yet compacted is older than this, with any delta. |
+| `minIntervalSeconds` | 60 | No automatic compaction starts sooner than this after the previous one ended. |
+| `enabled` | `true` | Automatic compaction for the dataset. |
+
+A `0` turns off the size, idle and age triggers. The server's flags (`--auto-compact-*`,
+see [USAGE.md](USAGE.md#automatic-compaction)) give the defaults, and a dataset's own
+settings override them. `--no-auto-compact` turns it off for every dataset.
+
+**When not.** A due compaction waits while the previous one ended less than
+`minIntervalSeconds` ago, or after a failed one (one minute, doubling up to an hour). It
+also waits while one of these needs the dataset: a bulk load, a reasoning run, a clone, a
+backup that reads the current generation, or a restore. It waits when compacting would
+make the retention window drop a generation it covers, because the window already keeps
+`--history-max-generations` generations or its `maxBytes`. It waits when the file system
+lacks room for the new generation plus `--min-free-disk-mb`. At most
+`--auto-compact-max-running` automatic compactions run on the server at once, and each
+takes a `--max-tasks` slot only when one is free. Automatic compactions never queue
+behind other tasks. A manual compaction waits for none of these.
+
+**Settings.** `GET /$/compaction/{ds}` returns the status. `PUT` replaces the dataset's own
+settings with a JSON object of the settings above, and `DELETE` removes them. Both return
+the status. A persistent dataset keeps its settings in `compaction.json` in its
+directory, which backups and clones leave out. An in-memory dataset keeps them for as long
+as it exists. An unknown setting or a bad value is a `400`, and a read-only server answers
+the writes with `403`.
+
+```ts
+type CompactionStatus = {
+  dataset: string;
+  enabled: boolean;                // the server's switch, the dataset's own, and a writable server
+  serverEnabled: boolean;          // false under --no-auto-compact
+  policy: CompactionPolicy;        // the settings in effect
+  own: Partial<CompactionPolicy>;  // the settings the dataset overrides
+  state: "off" | "idle" | "due" | "deferred" | "running";
+  trigger?: string;                // e.g. "delta of 31012 quads reached 31000 (10000 + 0.02 x 1050240 base quads)"
+  triggerKind?: "max-delta" | "ratio" | "delta-bytes" | "wal-bytes" | "idle" | "age";
+  deferred?: "min-interval" | "backoff" | "bulk-load" | "reasoning" | "clone" | "backup" | "restore"
+           | "history" | "disk" | "running-limit" | "slots";
+  deferredDetail?: string;
+  task?: string;                   // the running compaction task
+  measures: { generation: string; baseQuads: number; deltaQuads: number; deltaBytes: number;
+              walBytes: number; idleSeconds: number | null; oldestChangeSeconds: number | null;
+              threshold: number };  // the delta size of the deltaRatio trigger
+  last?: { automatic: boolean; trigger?: string; startedAt: string; finishedAt: string;
+           seconds: number; outcome: "done" | "abandoned" | "cancelled" | "failed";
+           generation?: string; lockMs?: number; buildMs?: number; caughtUpCommits?: number;
+           error?: string };       // the last compaction since the server started
+  automaticRuns: number;
+  failures: number;                // consecutive failed automatic compactions
+};
+```
+
+`/$/stats/{ds}` includes the same object as `compaction`, and the dataset page of the UI
+shows it in its Storage panel. A compaction task's message starts with `auto:` when the
+policy started it, and names the trigger, the time, the commits it carried over and how
+long it held the writer lock. A compaction is cancellable with `DELETE /$/tasks/{id}`. A
+bulk commit during the build makes it moot, and it ends with `abandoned` in its message.
+An in-place restore cancels a running compaction of its dataset.
 
 ## Schema discovery
 
@@ -3767,7 +3858,9 @@ A write that adds quads is refused with `507` and `"budget": "dataset-bytes"` wh
 would take the dataset over its quota. Nothing is committed. Reads are never affected,
 and neither are writes that only delete, so a dataset over its quota can always shrink.
 Compaction is never refused, because it folds the write-ahead log into a new generation
-and usually makes the dataset smaller. The check works this way for each kind of write:
+and usually makes the dataset smaller. While a compaction builds its new generation, that
+directory is left out of the measured size, so a background compaction never makes the
+dataset refuse a write. The check works this way for each kind of write:
 
 | Write | How the quota applies |
 |---|---|
@@ -3900,8 +3993,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/compaction/{ds}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |

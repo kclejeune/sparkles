@@ -92,7 +92,7 @@ server and overridden per dataset.
 | Setting | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Automatic compaction for the dataset. `--no-auto-compact` turns it off for the whole server. |
-| `minDeltaQuads` | 10,000 | The floor. No quad-count, idle or age trigger fires with a smaller delta. |
+| `minDeltaQuads` | 10,000 | The floor. No quad-count or idle trigger fires with a smaller delta. |
 | `deltaRatio` | 0.05 | The relative trigger. It fires when the delta reaches `minDeltaQuads + deltaRatio × base quads`. |
 | `maxDeltaQuads` | 1,000,000 | The absolute trigger. It fires at this delta size whatever the base. |
 | `maxDeltaMb` | 512 | It fires when the estimated memory of the delta and its new terms passes this many MiB. |

@@ -222,6 +222,31 @@ fn a_reopen_replays_the_carried_commits() {
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(dump(&s), d);
+    // the integrity check finds nothing wrong, next to the open store too
+    let r = crate::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(r.errors, 0, "{}", r.to_text());
+    assert_eq!(r.head, Some(s.head_commit().seq));
+    // nor with a pinned generation whose carried-over commits are its last ones
+    s.create_snapshot("p", &At::Commit(head.seq - 1), None)
+        .unwrap();
+    s.set_failpoint("compact-built", Some(Arc::new(|st: &Store| churn(st, 101))));
+    s.compact().unwrap();
+    drop(s);
+    let r = crate::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(r.errors, 0, "{}", r.to_text());
+    let readable = crate::history::reconstructable_offline(
+        &root,
+        Store::open(&root, StoreOptions::default())
+            .unwrap()
+            .dataset_id(),
+    )
+    .unwrap();
+    assert!(
+        readable
+            .iter()
+            .any(|&(a, b)| a <= head.seq - 1 && head.seq + 1 <= b),
+        "{readable:?}"
+    );
 }
 
 #[test]
