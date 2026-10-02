@@ -753,6 +753,17 @@ const VALIDATION_STATUS: [&str; 7] = [
 const STRATEGIES: [&str; 2] = ["full", "incremental"];
 /// `severity` label values of `sparkles_validation_results_total`.
 const SEVERITIES: [&str; 3] = ["violation", "warning", "info"];
+/// `reason` label values of `sparkles_validation_fallbacks_total` (why a write, or a
+/// shape, was validated in full instead of incrementally).
+const FALLBACKS: [&str; 7] = [
+    "baseline",
+    "shapes",
+    "subclass",
+    "sparql",
+    "recursive",
+    "bulk",
+    "budget",
+];
 
 /// Write-time validation counters of one dataset, fed by its store's guard observer
 /// (every write path: HTTP, MCP, the reasoner) and read when scraped, like the cache
@@ -771,6 +782,8 @@ struct LanguageCounters {
     /// results found by validated writes, by severity (ShEx: nonconformant associations
     /// count as violations)
     results: [AtomicU64; 3],
+    /// validations that fell back to full validation, by reason
+    fallbacks: [AtomicU64; 7],
 }
 
 impl ValidationMetrics {
@@ -828,6 +841,13 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
             Strategy::None => return,
         };
         m.duration[strategy].observe(elapsed);
+        if let Some(i) = s
+            .fallback
+            .as_deref()
+            .and_then(|f| FALLBACKS.iter().position(|r| *r == f))
+        {
+            m.fallbacks[i].fetch_add(1, Ordering::Relaxed);
+        }
         let c = &s.by_severity;
         for (i, n) in [c.violation, c.warning, c.info].into_iter().enumerate() {
             m.results[i].fetch_add(n, Ordering::Relaxed);
@@ -880,6 +900,7 @@ struct ValidationTotals {
     /// cumulative buckets and the sum in nanoseconds, per strategy
     duration: [([u64; 17], u64); 2],
     results: [u64; 3],
+    fallbacks: [u64; 7],
 }
 
 /// Validation counters by dataset label and language, for the language of a dataset's
@@ -917,6 +938,9 @@ fn add_totals(t: &mut ValidationTotals, m: &LanguageCounters) {
         *sum += h.sum_nanos.load(Ordering::Relaxed);
     }
     for (a, c) in t.results.iter_mut().zip(&m.results) {
+        *a += c.load(Ordering::Relaxed);
+    }
+    for (a, c) in t.fallbacks.iter_mut().zip(&m.fallbacks) {
         *a += c.load(Ordering::Relaxed);
     }
 }
@@ -1244,6 +1268,21 @@ pub fn render_prometheus(st: &AppState) -> String {
             let _ = writeln!(
                 o,
                 "sparkles_validation_results_total{{dataset=\"{ds}\",language=\"{lang}\",severity=\"{severity}\"}} {n}"
+            );
+        }
+    }
+    family(
+        &mut o,
+        "sparkles_validation_fallbacks_total",
+        "counter",
+        "Validated writes that ran a full validation instead of an incremental one (or validated some shapes in full), by reason.",
+    );
+    for ((ds, lang), t) in &validation {
+        let ds = escape_label(ds);
+        for (reason, n) in FALLBACKS.iter().zip(t.fallbacks) {
+            let _ = writeln!(
+                o,
+                "sparkles_validation_fallbacks_total{{dataset=\"{ds}\",language=\"{lang}\",reason=\"{reason}\"}} {n}"
             );
         }
     }

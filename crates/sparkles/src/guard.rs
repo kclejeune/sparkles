@@ -264,6 +264,17 @@ pub struct ValidationSummary {
     pub results: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shapes_error: Option<String>,
+    /// grandfather mode: the blocking results the write introduced (those the state
+    /// before it did not have), which alone decide
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<u64>,
+    /// the focus nodes validated (an incremental validation lists the results of these
+    /// alone; the counts are those of the whole state)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_nodes: Option<u64>,
+    /// why the write, or some shape, was validated in full instead of incrementally
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
     /// the same results as a Turtle `sh:ValidationReport`, for rejections
     #[serde(skip)]
     pub report_turtle: Option<String>,
@@ -287,8 +298,17 @@ impl ValidationSummary {
             millis: 0,
             results: Vec::new(),
             shapes_error: None,
+            introduced: None,
+            focus_nodes: None,
+            fallback: None,
             report_turtle: None,
         }
+    }
+
+    /// Whether a ShEx or SHACL summary's results block in its mode: in grandfather mode
+    /// the introduced ones, otherwise any.
+    pub fn blocks(&self) -> bool {
+        self.introduced.unwrap_or(self.blocking) > 0
     }
 
     /// `Sparkles-Validation` header value (an RFC 9651 Dictionary). A ShEx guard's adds
@@ -308,8 +328,12 @@ impl ValidationSummary {
             GuardLanguage::Shacl => "",
             GuardLanguage::Shex => ", lang=shex",
         };
+        let introduced = match self.introduced {
+            Some(n) => format!(", introduced={n}"),
+            None => String::new(),
+        };
         format!(
-            "status={}, mode={}, strategy={}{lang}, blocking={}, total={}, violations={}, warnings={}, infos={}, ms={}",
+            "status={}, mode={}, strategy={}{lang}, blocking={}{introduced}, total={}, violations={}, warnings={}, infos={}, ms={}",
             self.status.name(),
             mode,
             strategy,
@@ -355,9 +379,18 @@ impl std::fmt::Display for Rejection {
             ),
             None => write!(
                 f,
-                "SHACL validation failed: {} blocking result{} (threshold {}); nothing was committed",
-                self.summary.blocking,
-                if self.summary.blocking == 1 { "" } else { "s" },
+                "SHACL validation failed: {} {}blocking result{} (threshold {}); nothing was committed",
+                self.summary.introduced.unwrap_or(self.summary.blocking),
+                if self.summary.introduced.is_some() {
+                    "new "
+                } else {
+                    ""
+                },
+                if self.summary.introduced.unwrap_or(self.summary.blocking) == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 match self.summary.threshold {
                     Severity::Violation => "violation",
                     Severity::Warning => "warning",

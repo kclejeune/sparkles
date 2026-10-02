@@ -80,7 +80,8 @@ running queries.
   pass (98/98 and 20/20) ([API](docs/API.md#shacl-validation)).
 * ShEx 2.1 with ShExC, ShExJ, ShExR and shape maps. It passes 99.9% of the shexTest
   validation tests ([API](docs/API.md#shex-validation)).
-* Write-time guards validate each commit with SHACL or ShEx before it is written
+* Write-time guards validate each commit with SHACL or ShEx before it is written. A
+  write re-validates only the focus nodes it can affect
   ([API](docs/API.md#write-time-validation)).
 
 **Search**

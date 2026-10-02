@@ -1745,3 +1745,80 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   const qs = p.toString();
   return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, { signal: opts.signal });
 }
+
+// ------------------------------------------------------ write-time validation ------
+
+export type GuardStatusName = 'passed' | 'warned' | 'rejected' | 'skipped' | 'bypassed';
+
+/** One validated write (`lastCheck`, `recentRejections`). */
+export type ValidationCheck = {
+  time: string;
+  kind: string;
+  status: GuardStatusName;
+  strategy: 'full' | 'incremental' | 'none';
+  blocking: number;
+  /** grandfather mode: the blocking results the write introduced */
+  introduced?: number;
+  total: number;
+  focusNodes?: number;
+  /** why the write, or some shape, was validated in full */
+  fallback?: string;
+  millis: number;
+  /** the first result: a SHACL result or a ShEx result-map entry, as JSON */
+  first?: Record<string, unknown>;
+};
+
+/** The validation state of the head (`null` conforms: unknown). */
+export type ValidationBaseline = {
+  commit: number;
+  conforms: boolean | null;
+  blocking: number;
+  total: number;
+  bySeverity: { violation: number; warning: number; info: number };
+  millis: number;
+};
+
+export type WriteValidationStatus = {
+  mode: 'reject' | 'warn' | 'off';
+  shapeCount: number;
+  /** ShEx: the associations of the shape map at the last validation */
+  associations?: number | null;
+  baseline: ValidationBaseline | null;
+  lastFullMillis: number | null;
+  counters: Record<GuardStatusName, number>;
+  warnings: string[];
+  /** SHACL: how shapes are validated on a write */
+  incremental?: { localShapes: number; fullShapes: { shape: string; reason: string }[] };
+  lastCheck?: ValidationCheck | null;
+  recentRejections?: ValidationCheck[];
+};
+
+export type WriteValidation = {
+  language: 'shacl' | 'shex';
+  config: {
+    mode: 'reject' | 'warn' | 'off';
+    threshold?: 'violation' | 'warning' | 'info';
+    baseline?: 'strict' | 'grandfather';
+    includeInferences?: boolean;
+    dataGraph?: string | string[];
+    shapes?: { graphs?: string[]; file?: string };
+    timeoutSeconds?: number;
+    updated?: string;
+  };
+  status: WriteValidationStatus;
+};
+
+/**
+ * `GET /$/validation/{ds}`: the dataset's write-time validation and its status, or null
+ * when validation is off.
+ */
+export async function writeValidation(
+  ds: string,
+  signal?: AbortSignal,
+): Promise<WriteValidation | null> {
+  const body = await json<WriteValidation | { config: null }>(`/$/validation/${enc(ds)}`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body && body.config ? (body as WriteValidation) : null;
+}

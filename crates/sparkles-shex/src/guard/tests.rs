@@ -240,7 +240,7 @@ fn reject_mode_over_the_acceptance_example() {
         r.to_string()
             .starts_with("ShEx validation failed: 1 nonconformant association;")
     );
-    // a conforming write is validated
+    // a conforming write is validated, on the associations it affects
     let sum = summary(
         &upd(
             &s,
@@ -250,7 +250,7 @@ fn reject_mode_over_the_acceptance_example() {
     );
     assert_eq!(
         (sum.status, sum.strategy, sum.total),
-        (GuardStatus::Passed, Strategy::Full, 4)
+        (GuardStatus::Passed, Strategy::Incremental, 4)
     );
     // a named graph outside the data graph: skipped
     let sum = summary(&upd(&s, "INSERT DATA { GRAPH ex:g { ex:erin a ex:Person } }").unwrap());
@@ -736,4 +736,132 @@ fn sparql_selectors_are_refused() {
     assert!(format!("{e:#}").starts_with("shapeMap: line 1"), "{e:#}");
     assert!(s.guard().is_none() && !s.guard_required());
     assert!(!exists(&root, CONFIG_FILE));
+}
+
+// ------------------------------------------------- incremental validation --------
+
+/// Recursion through `ex:s` and an inverse reference, negation, value sets, and a node
+/// that is never in the base data (`ex:n9`).
+const INC_SCHEMA: &str =
+    "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+ex:S { ex:p @ex:T * ; ^ex:q @ex:S ? ; a [ex:C] ? }
+ex:T { ex:p [ex:n1 ex:n2 ex:n9] ? ; ex:q xsd:integer * ; ex:s @ex:S ? }
+ex:U NOT @ex:S
+ex:V [ex:n0 ex:n3 ex:n9]";
+
+fn label_key(l: &crate::ShapeLabel) -> String {
+    match l {
+        crate::ShapeLabel::Iri(s) | crate::ShapeLabel::BNode(s) => s.clone(),
+        crate::ShapeLabel::Start => "null".into(),
+    }
+}
+
+fn term_key(t: &Term) -> String {
+    match t {
+        Term::NamedNode(n) => n.as_str().to_string(),
+        Term::BlankNode(b) => b.as_str().to_string(),
+        Term::Literal(l) => l.value().to_string(),
+        Term::Triple(t) => t.to_string(),
+    }
+}
+
+/// The nonconformant associations of a state, as `node|shape`.
+fn nonconformant(v: &[(Term, crate::ShapeLabel, Status)]) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .iter()
+        .filter(|(_, _, s)| *s == Status::Nonconformant)
+        .map(|(n, l, _)| format!("{}|{}", term_key(n), label_key(l)))
+        .collect();
+    out.sort();
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Every write's counts are those of a full validation, and every association the
+    /// write makes nonconformant is listed, whether the guard validated incrementally
+    /// or in full.
+    #[test]
+    fn incremental_counts_equal_full_validation(
+        base in proptest::collection::vec(triple(), 0..24),
+        writes in proptest::collection::vec(proptest::collection::vec(change(), 1..5), 1..8),
+        closed in any::<bool>(),
+    ) {
+        let s = Store::in_memory(StoreOptions::default());
+        write(&s, &base.iter().map(|t| (true, *t)).collect::<Vec<_>>()).unwrap();
+        // a CLOSED shape makes every predicate read
+        let schema = if closed {
+            format!("{INC_SCHEMA}\nex:W CLOSED {{ ex:p . * }}")
+        } else {
+            INC_SCHEMA.to_string()
+        };
+        let map = format!("{SKIP_MAP}, ex:n2@ex:W");
+        let map = if closed { map.as_str() } else { SKIP_MAP };
+        let (g, _) = installed(set_config(&s, Some(cfg("warn", &schema, map)), &NoImports).unwrap());
+        for w in &writes {
+            let before = verdicts(&g, &s.snapshot());
+            let r = write(&s, w).unwrap();
+            let Some(v) = r.validation else { continue };
+            let after = verdicts(&g, &s.snapshot());
+            if v.status == GuardStatus::Skipped {
+                prop_assert_eq!(&after, &before);
+                continue;
+            }
+            let (nb, na) = (nonconformant(&before), nonconformant(&after));
+            prop_assert_eq!(v.blocking as usize, na.len());
+            prop_assert_eq!(v.total as usize, after.len());
+            prop_assert_eq!(g.status().baseline.unwrap().blocking as usize, na.len());
+            let listed: Vec<String> = v
+                .results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["node"]["value"].as_str().unwrap_or_default(),
+                        r["shape"]["value"].as_str().unwrap_or("null")
+                    )
+                })
+                .collect();
+            for x in &listed {
+                prop_assert!(na.contains(x), "listed {} is not nonconformant", x);
+            }
+            for x in na.iter().filter(|x| !nb.contains(x)) {
+                prop_assert!(listed.contains(x), "new {} not listed ({:?})", x, v.strategy);
+            }
+        }
+    }
+}
+
+/// Writes after enabling are incremental; the state survives a restart; a bulk load
+/// and an unknown state fall back to a full validation.
+#[test]
+fn writes_are_validated_incrementally() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = loaded(&root);
+    let (_, sum) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.total), (1, 3));
+    let v = summary(&upd(&s, "INSERT DATA { ex:dave a ex:Person }").unwrap());
+    assert_eq!(
+        (v.strategy, v.blocking, v.total, v.focus_nodes),
+        (Strategy::Incremental, 2, 4, Some(1))
+    );
+    // bob knows dave, who does not conform: bob, and alice who knows bob, are revalidated
+    let v = summary(&upd(&s, "INSERT DATA { ex:bob foaf:knows ex:dave }").unwrap());
+    assert_eq!((v.strategy, v.blocking), (Strategy::Incremental, 4));
+    assert!(v.focus_nodes.unwrap() >= 2, "{v:?}");
+    drop(s);
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(g.status().baseline.unwrap().blocking, 4);
+    let v = summary(&upd(&s, "INSERT DATA { ex:dave foaf:name \"Dave\" }").unwrap());
+    assert_eq!((v.strategy, v.blocking), (Strategy::Incremental, 1));
+    // an unknown state: the next write is validated in full
+    g.bypassed();
+    let v = summary(&upd(&s, "INSERT DATA { ex:erin a ex:Person ; foaf:name \"E\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.fallback.as_deref(), v.blocking),
+        (Strategy::Full, Some("baseline"), 1)
+    );
 }

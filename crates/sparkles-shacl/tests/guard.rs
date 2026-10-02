@@ -29,6 +29,7 @@ fn cfg(mode: GuardMode) -> ValidationConfig {
         data_graph: DataGraphSel::Named("default".into()),
         include_inferences: false,
         threshold: Severity::Violation,
+        baseline: Default::default(),
         timeout_seconds: 10.0,
         report_limit: 100,
         updated: None,
@@ -218,7 +219,12 @@ fn bulk_loads_are_validated_before_the_switch() {
         .load_as(&[src(&fixed)], sparkles::commit::CommitKind::Load)
         .unwrap();
     assert!(r.commit.bulk);
-    assert_eq!(r.validation.unwrap().status, GuardStatus::Passed);
+    let v = r.validation.unwrap();
+    // a rebuilt generation renumbers terms: validated in full
+    assert_eq!(
+        (v.status, v.fallback.as_deref()),
+        (GuardStatus::Passed, Some("bulk"))
+    );
 }
 
 #[test]
@@ -327,4 +333,187 @@ fn configurations_are_written_as_format_2_and_format_1_still_reads() {
         upd(&s, "INSERT DATA { ex:b a ex:Person }"),
         Err(Error::Rejected(_))
     ));
+}
+
+const UNIQUE: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://ex.org/> .
+ex:EmailUnique a sh:NodeShape ; sh:targetObjectsOf ex:email ;
+  sh:property [ sh:path [ sh:inversePath ex:email ] ; sh:maxCount 1 ] .
+"#;
+
+fn inline(mode: GuardMode, shapes: &str) -> ValidationConfig {
+    let mut c = cfg(mode);
+    c.shapes = ShapesSource {
+        inline: Some(shapes.into()),
+        ..Default::default()
+    };
+    c
+}
+
+fn summary(st: sparkles::sparql::update::UpdateStats) -> sparkles::guard::ValidationSummary {
+    (*st.commit.unwrap().validation.unwrap()).clone()
+}
+
+#[test]
+fn writes_validate_only_the_focus_nodes_they_affect() {
+    use sparkles::guard::Strategy;
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..2000 {
+        data.push_str(&format!("ex:p{i} ex:email \"p{i}@ex.org\" .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    enable(&s, inline(GuardMode::Reject, UNIQUE));
+    // A16: one new email is one focus node, validated incrementally
+    let v = summary(upd(&s, "INSERT DATA { ex:q ex:email \"q@ex.org\" }").unwrap());
+    assert_eq!(
+        (v.status, v.strategy, v.focus_nodes),
+        (GuardStatus::Passed, Strategy::Incremental, Some(1))
+    );
+    // a duplicate is rejected, with the result at the shared value
+    let Err(Error::Rejected(r)) = upd(&s, "INSERT DATA { ex:z ex:email \"p7@ex.org\" }") else {
+        panic!("rejected")
+    };
+    assert_eq!(r.summary.strategy, Strategy::Incremental);
+    assert_eq!(r.summary.results[0]["focusNode"]["value"], "p7@ex.org");
+    // a write no shape reads is skipped
+    let v = summary(upd(&s, "INSERT DATA { ex:q ex:name \"Q\" }").unwrap());
+    assert_eq!(
+        (v.status, v.strategy),
+        (GuardStatus::Skipped, Strategy::None)
+    );
+    // deleting an email affects its value, which is no longer a focus node
+    let v = summary(upd(&s, "DELETE DATA { ex:p3 ex:email \"p3@ex.org\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes),
+        (Strategy::Incremental, Some(0))
+    );
+}
+
+#[test]
+fn warn_mode_keeps_exact_counts_across_writes() {
+    use sparkles::guard::Strategy;
+    let s = store_with_shapes(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { ex:a a ex:Person . ex:b a ex:Person ; ex:age 200 }",
+    )
+    .unwrap();
+    enable(&s, cfg(GuardMode::Warn));
+    // two missing names and one warning; the new person adds a third violation
+    let v = summary(upd(&s, "INSERT DATA { ex:c a ex:Person }").unwrap());
+    assert_eq!(v.strategy, Strategy::Incremental);
+    assert_eq!(
+        (v.status, v.blocking, v.by_severity.warning, v.results.len()),
+        (GuardStatus::Warned, 3, 1, 1)
+    );
+    // naming two of them leaves one
+    let v = summary(
+        upd(
+            &s,
+            "INSERT DATA { ex:a ex:name \"A\" . ex:c ex:name \"C\" }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.blocking, v.total, v.strategy),
+        (1, 2, Strategy::Incremental)
+    );
+    let b = match guard::set_config(&s, Some(cfg(GuardMode::Warn))).unwrap() {
+        SetOutcome::Installed(_, sum) => sum,
+        _ => panic!("installed"),
+    };
+    assert_eq!((b.blocking, b.total), (1, 2));
+}
+
+#[test]
+fn the_state_of_the_head_survives_a_restart() {
+    use sparkles::guard::Strategy;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        enable(&s, inline(GuardMode::Warn, SHAPES));
+        upd(&s, "INSERT DATA { ex:a a ex:Person }").unwrap();
+    }
+    assert!(root.join(guard::STATUS_FILE).exists());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let g = guard::install(&s).unwrap().unwrap();
+    let b = g.status().baseline.unwrap();
+    assert_eq!((b.conforms, b.blocking), (Some(false), 1));
+    // known: the first write after the restart is incremental
+    let v = summary(upd(&s, "INSERT DATA { ex:b a ex:Person }").unwrap());
+    assert_eq!((v.strategy, v.blocking), (Strategy::Incremental, 2));
+    drop((g, s));
+    // a commit the status file does not record leaves the state unknown
+    let s = Store::open(
+        &root,
+        StoreOptions {
+            unvalidated_writes: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    upd(&s, "INSERT DATA { ex:c a ex:Person }").unwrap();
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let g = guard::install(&s).unwrap().unwrap();
+    assert!(g.status().baseline.is_none());
+    let v = summary(upd(&s, "INSERT DATA { ex:d a ex:Person }").unwrap());
+    assert_eq!(
+        (v.strategy, v.fallback.as_deref(), v.blocking),
+        (Strategy::Full, Some("baseline"), 4)
+    );
+    // turning validation off removes the state
+    guard::set_config(&s, None).unwrap();
+    assert!(!root.join(guard::STATUS_FILE).exists());
+}
+
+#[test]
+fn grandfather_mode_blocks_only_new_results() {
+    use sparkles::guard::Strategy;
+    use sparkles_shacl::guard::BaselinePolicy;
+    let s = store_with_shapes(StoreOptions::default());
+    upd(&s, "INSERT DATA { ex:a a ex:Person }").unwrap();
+    let mut c = cfg(GuardMode::Reject);
+    c.baseline = BaselinePolicy::Grandfather;
+    // reject is enabled on a head that does not conform
+    let sum = match guard::set_config(&s, Some(c)).unwrap() {
+        SetOutcome::Installed(_, sum) => sum,
+        _ => panic!("installed"),
+    };
+    assert_eq!(
+        (sum.status, sum.blocking, sum.introduced),
+        (GuardStatus::Passed, 1, Some(0))
+    );
+    // an unrelated write passes although ex:a still has no name
+    let v = summary(upd(&s, "INSERT DATA { ex:b a ex:Person ; ex:name \"B\" }").unwrap());
+    assert_eq!(
+        (v.status, v.strategy, v.blocking, v.introduced),
+        (GuardStatus::Passed, Strategy::Incremental, 1, Some(0))
+    );
+    // a write that adds a violation is rejected, and says so
+    let Err(Error::Rejected(r)) = upd(&s, "INSERT DATA { ex:c a ex:Person }") else {
+        panic!("rejected")
+    };
+    assert_eq!((r.summary.blocking, r.summary.introduced), (2, Some(1)));
+    assert!(r.to_string().contains("1 new blocking result"), "{r}");
+    assert_eq!(
+        r.summary.results[0]["focusNode"]["value"],
+        "http://ex.org/c"
+    );
+    // a shapes change compares with the results the old shapes gave
+    let add = "INSERT DATA { GRAPH <urn:shapes> { ex:PersonShape <http://www.w3.org/ns/shacl#property> [ <http://www.w3.org/ns/shacl#path> ex:email ; <http://www.w3.org/ns/shacl#minCount> 1 ] } }";
+    let Err(Error::Rejected(r)) = upd(&s, add) else {
+        panic!("rejected")
+    };
+    assert_eq!(
+        (r.summary.strategy, r.summary.introduced),
+        (Strategy::Full, Some(2))
+    );
 }

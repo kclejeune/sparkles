@@ -4,9 +4,10 @@
 >
 > **Phases:** Phase 1 shipped. It covers the store's write guard, full SHACL validation of
 > every write's post-state, `/$/validation/{ds}`, `sparkles validation`, metrics, logs and
-> `bench:shacl-write`. Phase 2 was not built: incremental validation, the persisted
-> baseline, grandfather mode and the UI panel. ShEx later became a second guard language
-> ([G02](G02-shex.md)).
+> `bench:shacl-write`. Phase 2 shipped in most parts: the predicate relevance filter,
+> incremental validation with its fallbacks, the persisted baseline, grandfather mode and
+> a status panel on the dataset page. Phase 3 was not started. ShEx later became a second
+> guard language ([G02](G02-shex.md)), and its guard is incremental too.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
 > [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
@@ -1120,14 +1121,62 @@ SHACL suite (98/98 Core, 20/20 SPARQL) stayed green.
   - The ShEx guard also skips writes whose predicates no shape reads. That relevance skip
     is finer than SHACL's, which works per graph.
 
-**Cost.** Every validated write runs a full validation of the data graph. For SHACL that
-takes about 160 ms at 1M triples ([docs/API.md](../API.md#write-time-validation)).
-Skipped writes are free. The standalone validator's numbers are in
+**Cost at Phase 1.** Every validated write ran a full validation of the data graph. For
+SHACL that took about 160 ms at 1M triples. Skipped writes were free. The standalone
+validator's numbers are in
 [BENCHMARKS: Other measurements](../BENCHMARKS.md#other-measurements).
 
-**Not built.** None of Phase 2 was built: the predicate relevance filter, incremental
-focus-node validation with its fallbacks (§6.2), the persisted baseline, grandfather
-mode, and the validation panel on the dataset page. The UI's Validate panel runs
-on-demand checks only. Phase 3 has not started. It covers localizable SHACL-SPARQL,
-`sh:targetWhere`, the `unvalidated` catalog flag, `serve --validate` and mixed shapes
-sources. The open questions of §10 keep their Phase 1 defaults.
+**Phase 2 shipped on 2026-10-02.**
+
+- **Exact counts instead of a conforming baseline.** The guard keeps the result counts
+  of the head by severity. A full validation sets them, and every validated write moves
+  them by the results of the affected focus nodes, validated in the states before and
+  after the write. Counts, `blocking` and the decision therefore equal those of a full
+  validation whether or not the head conforms. The summary lists the results of the
+  focus nodes it validated, gains `focusNodes` and `fallback`, and gains `introduced` in
+  grandfather mode. F1 applies in strict `reject` mode only, because `warn` stays exact
+  on a head that does not conform.
+- **Affected focus nodes (§6.2.2).** Dependencies come from the shapes as designed,
+  with inverses pushed down to predicates. Target reads are dependencies at the focus
+  node, so the target delta needs no separate rule. A node of `sh:targetNode` that a
+  write adds to the store is matched by its term in the state before the write.
+- **Fallbacks (§6.2.3).** F1 to F7 are built. F2 also covers bulk loads from sources,
+  which may change the shapes graph. F4 and F5 validate only the shapes concerned in
+  full, and their counts before the write are remembered per shape. F6 also covers the
+  bulk path of a transaction (`Changes::Rebuilt`), because the rebuilt generation
+  renumbers terms. The F7 share rule applies only once a shape has more than 512
+  affected focus nodes. Each fallback sets `fallback` in the summary and counts in
+  `sparkles_validation_fallbacks_total{reason}`.
+- **The relevance filter (§6.2.1)** skips a write when no shape reads any predicate it
+  changes and the state of the head is known.
+- **The persisted baseline (§5.4)** is `validation-status.json`, with the counts by
+  severity. It is written after the commit without an fsync, because only a file that
+  names the head and the current `validation.json` is trusted. Clones and backups do not
+  copy it.
+- **Grandfather mode (§6.2.5)** is `"baseline": "grandfather"` in the configuration and
+  `--grandfather` in the CLI. A shapes change compares with the results the old shapes
+  gave.
+- **UI.** The dataset page has a Write-time validation panel with the mode, the result
+  counts of the head, the shapes validated in full, the last validated write, the
+  counters and the last ten rejected writes. `GET /$/validation/{ds}` gained
+  `lastCheck`, `recentRejections` and, for SHACL, `incremental`.
+- **Tests.** A15 runs random shapes over every path form and the core components,
+  including SHACL-SPARQL and recursive shapes, with random data and writes in `warn`,
+  strict `reject` and grandfather `reject`. Each write's decision and counts are checked
+  against full validations of the states before and after it, and every new result must
+  be listed. At landing, 180 scenarios with 23,550 writes in all passed. They hit every
+  fallback reason except `shapes` and `bulk`, which unit tests cover. CI runs a smaller
+  set. A16 is a unit test that checks one focus node and the incremental strategy.
+- **Cost.** `bench:shacl-write` gained a write that touches a person, which the shapes
+  read through a sequence path and `sh:class`. It also gained `TIMEOUT`, because a full
+  validation of 10.5M triples can exceed the default budget of 10 s. On a machine busy
+  with other builds, `warn` and `reject` writes took 12 to 37 ms at 1.05M triples, about
+  as long as with validation off, against 1.3 to 4.4 s before. At 10.5M triples they took
+  9 to 20 ms, against 9.8 to 14.8 s before.
+
+**Not built.** The `sparkles_validation_focus_nodes` histogram was not added. Summaries
+carry `focusNodes` instead. The panel has no configuration form, and the query page shows
+a `422` as an error rather than a results table. Phase 3 has not started. It covers
+localizable SHACL-SPARQL, `sh:targetWhere`, the refinement of F3, the `unvalidated`
+catalog flag, `serve --validate` and mixed shapes sources. The open questions of §10 keep
+their Phase 1 defaults.
