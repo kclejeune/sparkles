@@ -2,7 +2,6 @@
 //! writes the store runs without the GIL.
 
 use crate::errors::{EngineResult, invalid, new_err};
-use crate::interrupt;
 use crate::io::{
     Output, codec_from_py, format_from_py, format_of_output, output_from_py, serialize_quads,
     source_from_py, write_output,
@@ -13,6 +12,7 @@ use crate::terms::{
     subject_from_py, term_from_py,
 };
 use crate::txn::{PyTransaction, WriterSlot};
+use crate::{admin, interrupt};
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
@@ -35,6 +35,8 @@ pub struct PyDataset {
     inner: RwLock<Option<sparkles::Dataset>>,
     path: Option<String>,
     writer: WriterSlot,
+    /// the write-time validation installed through this handle
+    guard: Mutex<Option<admin::Guard>>,
 }
 
 /// Arguments shared by the query methods of datasets and transactions.
@@ -154,6 +156,7 @@ impl PyDataset {
             inner: RwLock::new(Some(ds)),
             path,
             writer: Arc::new(Mutex::new(None)),
+            guard: Mutex::new(None),
         }
     }
 
@@ -166,7 +169,26 @@ impl PyDataset {
         let ds = py
             .detach(|| sparkles::Dataset::open_with(&path, opts))
             .py(py)?;
-        Ok(PyDataset::from_dataset(ds, Some(shown)))
+        // the write-time validation the database sets up, as the server installs it;
+        // when it cannot be loaded, writes stay refused
+        let guard = match py.detach(|| admin::install(ds.store())) {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = format!(
+                    "{shown}: write-time validation could not be loaded, so writes are refused: {e:#}"
+                );
+                PyErr::warn(
+                    py,
+                    &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                    &std::ffi::CString::new(msg).unwrap_or_default(),
+                    1,
+                )?;
+                None
+            }
+        };
+        let d = PyDataset::from_dataset(ds, Some(shown));
+        *d.guard.lock().unwrap() = guard;
+        Ok(d)
     }
 
     fn in_memory(union_default_graph: bool) -> PyDataset {
@@ -349,6 +371,36 @@ impl PyDataset {
         lenient: bool,
     ) -> PyResult<u64> {
         let graph = opt(to_graph, iri_from_py)?;
+        if let Some(i) = input.filter(|i| !i.is_none())
+            && path.is_none()
+            && crate::io::is_file_object(i)?
+        {
+            // a file object streams into one transaction as it is read
+            let mut stream = crate::io::quad_stream(
+                py,
+                Some(i),
+                format,
+                None,
+                base_iri,
+                graph,
+                compression,
+                lenient,
+            )?;
+            let ds = self.ds_for_write(py)?;
+            return py
+                .detach(|| {
+                    let n = ds.transaction(|tx| {
+                        let mut n = 0;
+                        for q in stream.by_ref() {
+                            n += tx.insert(q?.as_ref())? as u64;
+                        }
+                        Ok(n)
+                    })?;
+                    ds.store().add_prefixes(stream.prefixes())?;
+                    Ok(n)
+                })
+                .py(py);
+        }
         let src = source_from_py(
             py,
             input,
@@ -874,5 +926,219 @@ impl PyDataset {
             data_graph,
             include_inferred,
         )
+    }
+
+    // ------------------------------------------------------- history, snapshots ----
+
+    /// The latest commit.
+    #[getter]
+    fn head_commit(&self, py: Python<'_>) -> PyResult<admin::PyCommit> {
+        Ok(admin::head_commit(&self.ds(py)?))
+    }
+
+    /// Commits, newest first, or oldest first with `after`.
+    #[pyo3(signature = (limit = 100, *, before = None, after = None))]
+    fn commits(
+        &self,
+        py: Python<'_>,
+        limit: usize,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> PyResult<Vec<admin::PyCommit>> {
+        admin::commits(py, &self.ds(py)?, limit, before, after)
+    }
+
+    /// Keep a commit readable under a name (`at="snapshot:<name>"`).
+    #[pyo3(signature = (name, at = None, *, note = None, expires_ms = None))]
+    fn create_snapshot(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        at: Option<&Bound<'_, PyAny>>,
+        note: Option<String>,
+        expires_ms: Option<i64>,
+    ) -> PyResult<admin::PySnapshot> {
+        let at = opt(at, at_from_py)?.unwrap_or(At::Head);
+        admin::create_snapshot(py, &self.ds(py)?, name, at, note, expires_ms)
+    }
+
+    /// The named snapshots.
+    fn snapshots(&self, py: Python<'_>) -> PyResult<Vec<admin::PySnapshot>> {
+        Ok(admin::snapshots(&self.ds(py)?))
+    }
+
+    /// Remove a named snapshot; true if it existed.
+    fn delete_snapshot(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        admin::delete_snapshot(py, &self.ds(py)?, name)
+    }
+
+    /// What the dataset's history holds: the head, the readable commit ranges, the
+    /// retention window and the number of snapshots.
+    fn history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        admin::history(py, &self.ds(py)?)
+    }
+
+    /// Keep past states readable for the last `keep_commits` commits or `keep_age`
+    /// seconds, in at most `max_bytes` of disk; returns `history()`.
+    #[pyo3(signature = (*, keep_commits = None, keep_age = None, max_bytes = None))]
+    fn set_retention<'py>(
+        &self,
+        py: Python<'py>,
+        keep_commits: Option<u64>,
+        keep_age: Option<f64>,
+        max_bytes: Option<u64>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        admin::set_retention(py, &self.ds(py)?, keep_commits, keep_age, max_bytes)
+    }
+
+    /// Copy the dataset, or its state `at`, into a new database directory with a new
+    /// dataset id; returns a report.
+    #[pyo3(signature = (directory, *, at = None, exclude_graphs = None))]
+    fn clone_to<'py>(
+        &self,
+        py: Python<'py>,
+        directory: PathBuf,
+        at: Option<&Bound<'py, PyAny>>,
+        exclude_graphs: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let at = opt(at, at_from_py)?;
+        let exclude = match exclude_graphs {
+            None => Vec::new(),
+            Some(g) => g
+                .try_iter()?
+                .map(|g| iri_from_py(&g?))
+                .collect::<PyResult<_>>()?,
+        };
+        admin::clone_to(py, &self.ds(py)?, directory, at, exclude)
+    }
+
+    // --------------------------------------------------------- text and vectors ----
+
+    /// Enable (or reconfigure) full-text search, as a dict like `text.json`, and build
+    /// the index; returns its status.
+    #[pyo3(signature = (config = None))]
+    fn enable_text<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::enable_text(py, &ds, config);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = (ds, config);
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// Rebuild the full-text index from the current state; returns its status.
+    fn rebuild_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::rebuild_text(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// Turn full-text search off and remove the index.
+    fn disable_text(&self, py: Python<'_>) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::disable_text(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// The full-text index's status, or `None` when it is off.
+    fn text_status<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let ds = self.ds(py)?;
+        #[cfg(feature = "text")]
+        return admin::text_status(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Ok(None)
+        }
+    }
+
+    /// Create or replace a vector index over the embeddings of `predicate`, and start
+    /// building it in the background; true when it was created. `options` holds more of
+    /// the configuration (`metric`, `model`, `hnsw`, `exactThreshold`).
+    #[pyo3(signature = (name, predicate, dimension, *, options = None))]
+    fn create_vector_index(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        predicate: &Bound<'_, PyAny>,
+        dimension: usize,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let predicate = iri_from_py(predicate)?;
+        let ds = self.ds_for_write(py)?;
+        admin::create_vector_index(py, &ds, name, predicate, dimension, options)
+    }
+
+    /// Remove a vector index.
+    fn drop_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.store().drop_vector_index(name)).py(py)
+    }
+
+    /// Rebuild a vector index in the background.
+    fn rebuild_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.store().rebuild_vector_index(name)).py(py)
+    }
+
+    /// The status of a vector index, or `None`; with `wait`, once its build is done.
+    #[pyo3(signature = (name, *, wait = false))]
+    fn vector_index<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        wait: bool,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        admin::vector_index(py, &self.ds(py)?, name, wait)
+    }
+
+    /// The status of every vector index.
+    fn vector_indexes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        admin::vector_indexes(py, &self.ds(py)?)
+    }
+
+    // ---------------------------------------------------------- write validation ----
+
+    /// Set, replace or (with `None`) remove write-time validation, from a dict like
+    /// `validation.json` with the shapes or schema given inline. Returns the outcome
+    /// and the validation of the current state.
+    #[pyo3(signature = (config))]
+    fn set_write_validation<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let ds = self.ds_for_write(py)?;
+        let (out, guard) = admin::set_write_validation(py, &ds, config)?;
+        if let Some(g) = guard {
+            *self.guard.lock().unwrap() = g;
+        }
+        Ok(out)
+    }
+
+    /// The installed write-time validation's configuration and status, or `None`.
+    fn write_validation<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        self.ds(py)?;
+        let g = self.guard.lock().unwrap();
+        g.as_ref().map(|g| admin::guard_status(py, g)).transpose()
     }
 }

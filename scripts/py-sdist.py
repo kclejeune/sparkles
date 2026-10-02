@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import os
 import subprocess
 import sys
 import tarfile
@@ -33,6 +34,8 @@ def main() -> None:
         subprocess.run(
             ["maturin", "sdist", "--manifest-path", str(ROOT / "crates/sparkles-py/Cargo.toml"), "--out", tmp],
             check=True,
+            # cargo's package listing would otherwise make crates/sparkles-py/target
+            env={**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")},
         )
         (built,) = Path(tmp).glob("*.tar.gz")
         target = out / built.name

@@ -1,15 +1,17 @@
 //! Iterators over quads and query results. Terms become Python objects one at a time;
 //! the work that reads the store runs in batches without the GIL.
 
-use crate::errors::EngineResult;
+use crate::errors::{EngineResult, invalid};
+use crate::io::{format_from_py, format_of_output, output_from_py, serialize_quads, write_output};
 use crate::terms::{PyVariable, quad_to_py, term_to_py, triple_to_py};
 use oxrdf::{Quad, Term, Triple};
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use sparkles::QuadIter;
 use sparkles::sparql::QueryResult;
-use std::collections::VecDeque;
+use sparkles::sparql::results::SolutionsFormat;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Items decoded per batch without the GIL.
@@ -18,16 +20,20 @@ const BATCH: usize = 1024;
 // ------------------------------------------------------------------------- quads ----
 
 enum QuadSource {
-    /// already in memory (parse, transactions)
+    /// already in memory (transactions)
     List(std::vec::IntoIter<Quad>),
     /// read from the store in batches
     Scan(Box<QuadIter>),
+    /// parsed as the input is read (parse)
+    Stream(Box<dyn Iterator<Item = sparkles::Result<Quad>> + Send>),
 }
 
 struct QuadState {
     source: QuadSource,
     buf: VecDeque<Quad>,
     done: bool,
+    /// the error that ended the source, raised after the quads read before it
+    error: Option<sparkles::Error>,
 }
 
 /// An iterator of `Quad`.
@@ -45,12 +51,19 @@ impl PyQuadIterator {
         PyQuadIterator::new(QuadSource::Scan(Box::new(it)))
     }
 
+    pub fn from_stream(
+        it: Box<dyn Iterator<Item = sparkles::Result<Quad>> + Send>,
+    ) -> PyQuadIterator {
+        PyQuadIterator::new(QuadSource::Stream(it))
+    }
+
     fn new(source: QuadSource) -> PyQuadIterator {
         PyQuadIterator {
             state: Mutex::new(QuadState {
                 source,
                 buf: VecDeque::new(),
                 done: false,
+                error: None,
             }),
         }
     }
@@ -68,17 +81,26 @@ impl PyQuadIterator {
                 let mut st = self.state.lock().unwrap();
                 let st = &mut *st;
                 if st.buf.is_empty() && !st.done {
-                    match &mut st.source {
-                        QuadSource::List(it) => st.buf.extend(it.by_ref().take(BATCH)),
-                        QuadSource::Scan(it) => {
-                            for q in it.by_ref().take(BATCH) {
-                                match q {
-                                    Ok(q) => st.buf.push_back(q),
-                                    Err(e) => {
-                                        st.done = true;
-                                        return Err(e);
-                                    }
+                    let fallible: &mut dyn Iterator<Item = sparkles::Result<Quad>> =
+                        match &mut st.source {
+                            QuadSource::List(it) => {
+                                st.buf.extend(it.by_ref().take(BATCH));
+                                if st.buf.is_empty() {
+                                    st.done = true;
                                 }
+                                return Ok(st.buf.pop_front());
+                            }
+                            QuadSource::Scan(it) => it.as_mut(),
+                            QuadSource::Stream(it) => it.as_mut(),
+                        };
+                    for q in fallible.take(BATCH) {
+                        match q {
+                            Ok(q) => st.buf.push_back(q),
+                            Err(e) => {
+                                // the quads before the error come first
+                                st.done = true;
+                                st.error = Some(e);
+                                break;
                             }
                         }
                     }
@@ -86,7 +108,10 @@ impl PyQuadIterator {
                         st.done = true;
                     }
                 }
-                Ok(st.buf.pop_front())
+                match st.buf.pop_front() {
+                    Some(q) => Ok(Some(q)),
+                    None => st.error.take().map_or(Ok(None), Err),
+                }
             })
             .py(py)?;
         next.map(|q| quad_to_py(py, q)).transpose()
@@ -96,7 +121,8 @@ impl PyQuadIterator {
 // --------------------------------------------------------------------- solutions ----
 
 struct SolState {
-    result: QueryResult,
+    /// `None` once `serialize` has written the solutions
+    result: Option<QueryResult>,
     row: usize,
     buf: VecDeque<Vec<Option<Term>>>,
 }
@@ -113,7 +139,7 @@ impl PyQuerySolutions {
         PyQuerySolutions {
             vars: result.vars.clone().into(),
             state: Mutex::new(SolState {
-                result,
+                result: Some(result),
                 row: 0,
                 buf: VecDeque::new(),
             }),
@@ -140,8 +166,9 @@ impl PyQuerySolutions {
         let values = py.detach(|| {
             let mut st = self.state.lock().unwrap();
             let st = &mut *st;
-            if st.buf.is_empty() {
-                let r = &st.result;
+            if st.buf.is_empty()
+                && let Some(r) = &st.result
+            {
                 let end = (st.row + BATCH).min(r.table.len());
                 for i in st.row..end {
                     st.buf.push_back(
@@ -157,6 +184,38 @@ impl PyQuerySolutions {
         Some(PyQuerySolution {
             vars: self.vars.clone(),
             values,
+        })
+    }
+
+    /// Write the solutions as SPARQL results in `format` (`json`, `xml`, `csv` or `tsv`,
+    /// or a media type). Returns bytes when `output` is `None`, writes a file for a path,
+    /// and writes to a binary file object otherwise. It consumes the solutions, and it
+    /// must come before any are iterated.
+    #[pyo3(signature = (output = None, format = "json"))]
+    fn serialize<'py>(
+        &self,
+        py: Python<'py>,
+        output: Option<&Bound<'py, PyAny>>,
+        format: &str,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let Some(fmt) = SolutionsFormat::from_name(format) else {
+            return Err(PyValueError::new_err(format!(
+                "unknown SPARQL results format {format:?}: use json, xml, csv or tsv"
+            )));
+        };
+        let out = output_from_py(output)?;
+        let result = {
+            let mut st = self.state.lock().unwrap();
+            if st.row > 0 {
+                return Err(invalid(py, "serialize the solutions before iterating them"));
+            }
+            st.result.take()
+        };
+        let Some(result) = result else {
+            return Err(invalid(py, "the solutions have already been serialized"));
+        };
+        write_output(py, out, None, move |w| {
+            sparkles::sparql::results::write_solutions(&result, fmt, w, None).map(|_| 0)
         })
     }
 
@@ -306,6 +365,31 @@ impl PyQueryTriples {
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let next = self.triples.lock().unwrap().next();
         next.map(|t| triple_to_py(py, t)).transpose()
+    }
+
+    /// Write the triples not yet iterated in an RDF format (Turtle by default). Returns
+    /// bytes when `output` is `None`, writes a file for a path, and writes to a binary
+    /// file object otherwise. It consumes the triples.
+    #[pyo3(signature = (output = None, format = None, *, prefixes = None))]
+    fn serialize<'py>(
+        &self,
+        py: Python<'py>,
+        output: Option<&Bound<'py, PyAny>>,
+        format: Option<&Bound<'py, PyAny>>,
+        prefixes: Option<BTreeMap<String, String>>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let out = output_from_py(output)?;
+        let format = format_from_py(format)?
+            .or_else(|| format_of_output(&out))
+            .unwrap_or(oxrdfio::RdfFormat::Turtle);
+        let triples: Vec<Triple> = self.triples.lock().unwrap().by_ref().collect();
+        let prefixes = prefixes.unwrap_or_default();
+        write_output(py, out, None, move |w| {
+            let quads = triples
+                .into_iter()
+                .map(|t| Ok(t.in_graph(oxrdf::GraphName::DefaultGraph)));
+            serialize_quads(w, format, prefixes, quads, false)
+        })
     }
 }
 

@@ -2,6 +2,7 @@
 //! (spec `docs/specs/P01-python-bindings.md`). `python/sparkles/__init__.py` re-exports
 //! it and defines the exception classes.
 
+mod admin;
 mod dataset;
 mod errors;
 mod interrupt;
@@ -31,6 +32,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     io::register(m)?;
     results::register(m)?;
     validate::register(m)?;
+    admin::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
     m.add_class::<interrupt::PyCancelToken>()?;

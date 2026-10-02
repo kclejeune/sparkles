@@ -1,0 +1,188 @@
+"""History, snapshots and clones, the text and vector indexes, and write-time
+validation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from conftest import ex
+
+import sparkles
+from sparkles import Dataset, Literal, NamedNode, NotFoundError, Quad, Triple, WriteRejectedError
+
+
+def names(ds: Dataset, at: object = None) -> list[str]:
+    rows = ds.query("SELECT ?n WHERE { ?s <http://ex.org/name> ?n } ORDER BY ?n", at=at)
+    return [r["n"].value for r in rows]  # type: ignore[union-attr]
+
+
+# ------------------------------------------------------------------- history ----
+
+
+def test_commits_and_snapshots(tmp_path: Path) -> None:
+    ds = Dataset(tmp_path / "db")
+    assert ds.head_commit.seq == 0
+    ds.add(Triple(ex("a"), ex("name"), Literal("A")))
+    first = ds.head_commit
+    assert first.seq == 1 and first.inserted == 1 and first.quads == 1
+    assert first.timestamp.endswith("Z")
+    snap = ds.create_snapshot("v1", note="before b")
+    assert (snap.name, snap.seq, snap.note) == ("v1", 1, "before b")
+    ds.add(Triple(ex("b"), ex("name"), Literal("B")))
+    ds.update("DELETE DATA { <http://ex.org/a> <http://ex.org/name> 'A' }")
+    log = ds.commits()
+    assert [c.seq for c in log] == [3, 2, 1, 0]
+    assert [c.kind for c in log[:2]] == ["update", "transaction"] or log[0].kind == "update"
+    assert [c.seq for c in ds.commits(2, after=0)] == [1, 2]
+    assert [c.seq for c in ds.commits(before=2)] == [1, 0]
+    # point-in-time queries
+    assert names(ds) == ["B"]
+    assert names(ds, at="snapshot:v1") == ["A"]
+    assert names(ds, at=1) == ["A"]
+    assert names(ds, at="commit:2") == ["A", "B"]
+    assert [s.name for s in ds.snapshots()] == ["v1"]
+    h = ds.history()
+    assert h["head"] == 3 and h["snapshots"] == 1
+    assert ds.delete_snapshot("v1") is True
+    assert ds.delete_snapshot("v1") is False
+    ds.close()
+
+
+def test_retention_and_memory_history() -> None:
+    ds = Dataset()
+    h = ds.set_retention(keep_commits=10)
+    assert h["retention"]["keepCommits"] == 10
+    ds.add(Triple(ex("a"), ex("name"), Literal("A")))
+    ds.add(Triple(ex("b"), ex("name"), Literal("B")))
+    assert names(ds, at=1) == ["A"]
+    with pytest.raises(NotFoundError):
+        names(ds, at=99)
+    # without a window or a snapshot, an in-memory dataset keeps no past states
+    other = Dataset()
+    other.add(Triple(ex("a"), ex("name"), Literal("A")))
+    other.add(Triple(ex("b"), ex("name"), Literal("B")))
+    with pytest.raises(NotFoundError, match="no longer reconstructable"):
+        names(other, at=1)
+
+
+def test_clone(tmp_path: Path) -> None:
+    ds = Dataset(tmp_path / "db")
+    ds.add(Triple(ex("a"), ex("name"), Literal("A")))
+    ds.add(Quad(ex("a"), ex("p"), Literal(1), ex("g")))
+    ds.create_snapshot("one")
+    ds.add(Triple(ex("b"), ex("name"), Literal("B")))
+    report = ds.clone_to(tmp_path / "copy", exclude_graphs=[ex("g")])
+    assert report["quads"] == 2 and report["source_quads"] == 3
+    old = ds.clone_to(tmp_path / "old", at="snapshot:one")
+    assert old["commit"] == 2
+    ds.close()
+    with Dataset(tmp_path / "copy") as copy:
+        assert names(copy) == ["A", "B"]
+        assert copy.named_graphs() == []
+    with Dataset(tmp_path / "old") as copy:
+        assert names(copy) == ["A"]
+
+
+# ----------------------------------------------------------- text and vectors ----
+
+
+@pytest.mark.skipif("text" not in sparkles.FEATURES, reason="built without text")
+def test_text_index() -> None:
+    ds = Dataset()
+    ds.extend(
+        [
+            Triple(ex("a"), ex("label"), Literal("the quick brown fox")),
+            Triple(ex("b"), ex("label"), Literal("a lazy dog")),
+        ]
+    )
+    assert ds.text_status() is None
+    status = ds.enable_text({"predicates": ["http://ex.org/label"]})
+    assert status["enabled"] is True and status["docs"] == 2
+    q = "PREFIX text: <http://jena.apache.org/text#> SELECT ?s WHERE { ?s text:query 'fox' }"
+    assert [r["s"] for r in ds.query(q)] == [ex("a")]
+    ds.add(Triple(ex("c"), ex("label"), Literal("another fox")))
+    assert {r["s"] for r in ds.query(q)} == {ex("a"), ex("c")}
+    assert ds.rebuild_text()["docs"] == 3
+    with pytest.raises(ValueError):
+        ds.enable_text({"predicates": 5})
+    ds.disable_text()
+    assert ds.text_status() is None
+
+
+def test_vector_index() -> None:
+    ds = Dataset()
+    vec = NamedNode("urn:x-sparkles:vector")
+    vectors = {"a": "[1.0,0.0,0.0]", "b": "[0.0,1.0,0.0]", "c": "[0.9,0.1,0.0]"}
+    ds.extend(Triple(ex(k), ex("emb"), Literal(v, datatype=vec)) for k, v in vectors.items())
+    assert ds.create_vector_index("emb", ex("emb"), 3, options={"metric": "cosine"}) is True
+    status = ds.vector_index("emb", wait=True)
+    assert status is not None and status["name"] == "emb"
+    assert [s["name"] for s in ds.vector_indexes()] == ["emb"]
+    q = """PREFIX spk: <urn:x-sparkles:>
+    SELECT ?s WHERE { (?s ?score) spk:vectorSearch (<http://ex.org/emb> "[1.0,0.0,0.0]"^^spk:vector 2) }
+    ORDER BY DESC(?score)"""
+    assert [r["s"] for r in ds.query(q)] == [ex("a"), ex("c")]
+    with pytest.raises(ValueError):
+        ds.create_vector_index("bad", ex("emb2"), 3, options={"metric": "nonsense"})
+    ds.rebuild_vector_index("emb")
+    ds.drop_vector_index("emb")
+    assert ds.vector_indexes() == []
+    assert ds.vector_index("emb") is None
+
+
+# ------------------------------------------------------------ write validation ----
+
+SHAPES = """
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://ex.org/> .
+ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+"""
+RDF_TYPE = NamedNode("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+
+
+@pytest.mark.skipif("shacl" not in sparkles.FEATURES, reason="built without shacl")
+def test_shacl_write_validation(tmp_path: Path) -> None:
+    ds = Dataset(tmp_path / "db")
+    ds.extend([Triple(ex("alice"), RDF_TYPE, ex("Person")), Triple(ex("alice"), ex("name"), Literal("Alice"))])
+    out = ds.set_write_validation({"mode": "reject", "shapes": {"inline": SHAPES}})
+    assert out["status"] == "installed"
+    assert out["summary"]["conforms"] is True
+    status = ds.write_validation()
+    assert status is not None and status["language"] == "shacl" and status["config"]["mode"] == "reject"
+    with pytest.raises(WriteRejectedError):
+        ds.add(Triple(ex("bob"), RDF_TYPE, ex("Person")))
+    ds.extend([Triple(ex("bob"), RDF_TYPE, ex("Person")), Triple(ex("bob"), ex("name"), Literal("Bob"))])
+    ds.close()
+    # a reopened database validates its writes again
+    ds = Dataset(tmp_path / "db")
+    assert ds.write_validation() is not None
+    with pytest.raises(WriteRejectedError):
+        ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
+    assert ds.set_write_validation(None)["status"] == "removed"
+    assert ds.write_validation() is None
+    ds.add(Triple(ex("carol"), RDF_TYPE, ex("Person")))
+    # a configuration the data does not meet is refused in reject mode
+    out = ds.set_write_validation({"mode": "reject", "shapes": {"inline": SHAPES}})
+    assert out["status"] == "not-conforming"
+    with pytest.raises(ValueError):
+        ds.set_write_validation({"mode": "reject", "shapez": {}})
+
+
+@pytest.mark.skipif("shex" not in sparkles.FEATURES, reason="built without shex")
+def test_shex_write_validation() -> None:
+    ds = Dataset()
+    schema = "PREFIX ex: <http://ex.org/> ex:Person { ex:name . }"
+    out = ds.set_write_validation(
+        {
+            "language": "shex",
+            "mode": "reject",
+            "schema": {"inline": schema},
+            "shapeMap": "{FOCUS a <http://ex.org/Person>}@<http://ex.org/Person>",
+        }
+    )
+    assert out["status"] == "installed"
+    assert ds.write_validation()["language"] == "shex"  # type: ignore[index]
+    with pytest.raises(WriteRejectedError):
+        ds.add(Triple(ex("bob"), RDF_TYPE, ex("Person")))

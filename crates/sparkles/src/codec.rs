@@ -251,6 +251,36 @@ impl Codec {
         })
     }
 
+    /// [`reader`](Self::reader) for a reader that may move between threads, such as
+    /// one an iterator keeps.
+    pub fn reader_send<'a>(
+        self,
+        r: impl Read + Send + 'a,
+        limit: Option<u64>,
+    ) -> Result<Box<dyn Read + Send + 'a>> {
+        let r: Box<dyn Read + Send + 'a> = match self {
+            Codec::None => Box::new(r),
+            Codec::Gzip => Box::new(flate2::read::MultiGzDecoder::new(io::BufReader::new(r))),
+            Codec::Lz4 => Box::new(Lz4Frames(Some(lz4_flex::frame::FrameDecoder::new(
+                io::BufReader::new(r),
+            )))),
+            #[cfg(feature = "zstd")]
+            Codec::Zstd => Box::new(zstd::stream::read::Decoder::new(r)?),
+            #[cfg(feature = "brotli")]
+            Codec::Brotli => Box::new(brotli::Decompressor::new(r, 64 << 10)),
+            #[allow(unreachable_patterns)]
+            c => return Err(c.unsupported()),
+        };
+        Ok(match limit {
+            Some(limit) => Box::new(LimitedRead {
+                inner: r,
+                read: 0,
+                limit,
+            }),
+            None => r,
+        })
+    }
+
     /// A compressing writer at `level` (the codec's default if `None`); zstd uses
     /// `threads` workers when more than one.
     pub fn writer<'a>(
