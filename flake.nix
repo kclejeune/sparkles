@@ -140,6 +140,32 @@
             '';
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # Jena's own HTTP clients against the server (`mise run test:jena-clients`)
+            jena-clients =
+              let
+                src = lib.fileset.toSource {
+                  root = ./.;
+                  fileset = lib.fileset.unions [
+                    ./scripts/test-jena-clients.sh
+                    ./testsuite/jena-clients
+                  ];
+                };
+              in
+              pkgs.runCommand "sparkles-jena-clients"
+                {
+                  nativeBuildInputs = [
+                    pkgs.bash
+                    pkgs.curl
+                  ];
+                }
+                ''
+                  export HOME="$TMPDIR"
+                  SPARKLES_BIN=${lib.getExe self'.packages.sparkles-cli} \
+                  JENA_HOME=${pkgs.apache-jena} \
+                  JAVA=${pkgs.jdk}/bin/java \
+                    bash ${src}/scripts/test-jena-clients.sh
+                  touch $out
+                '';
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });
             # the Playwright UI tests against the release binary, in nixpkgs' Chromium
             ui-e2e = pkgs.callPackage ./nix/ui-e2e.nix {

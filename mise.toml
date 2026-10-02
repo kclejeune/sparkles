@@ -188,6 +188,10 @@ run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 description = "shexTest conformance (syntax, negative syntax and structure, representation, validation)"
 run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
+[tasks."test:jena-clients"]
+description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP, QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against a debug server on a temporary directory; Jena and a JDK come from nixpkgs unless JENA_HOME and JAVA are set (not part of ci; also the flake's jena-clients check)"
+run = "scripts/test-jena-clients.sh"
+
 [tasks.ci]
 description = "Everything CI should run: formatting, lints, the formatter's browser build, Rust and UI tests, third-party license notices up to date"
 depends = ["fmt:check", "lint", "lint:features", "fmt:wasm", "test", "ui:test", "licenses:check"]
