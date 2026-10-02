@@ -2329,6 +2329,9 @@ async fn clone_dataset(
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            if let Some(a) = v["at"].as_str() {
+                params.0.push(("at".into(), a.to_string()));
+            }
             let get = |k: &str| v[k].as_str().or_else(|| params.get(k)).map(str::to_string);
             (get("name"), get("inferences"), get("type"))
         } else {
@@ -2336,6 +2339,12 @@ async fn clone_dataset(
             let get = |k: &str| params.get(k).map(str::to_string);
             (get("name"), get("inferences"), get("type"))
         };
+    // a past state: checked (and materialized) before the task starts
+    let at = history::at_param(&params)?;
+    if let Some(a) = at.clone() {
+        let src = src.clone();
+        blocking(move || Ok(src.store.snapshot_at(&a, &Default::default()).map(|_| ())?)).await?;
+    }
     let name = name.unwrap_or_default().trim_start_matches('/').to_string();
     if !crate::state::valid_name(&name) {
         return Err(err(
@@ -2378,7 +2387,7 @@ async fn clone_dataset(
         let progress: sparkles::store::ProgressFn =
             Arc::new(move |p, msg: &str| h2.progress(p * 0.95, msg));
         let reasoning = src.reasoning.read().clone();
-        let rep = crate::clone::clone_into(
+        let rep = crate::clone::clone_into_at(
             &src.store,
             &src.name,
             reasoning,
@@ -2387,6 +2396,7 @@ async fn clone_dataset(
             inferences,
             Some(progress),
             Some(h.cancel_flag()),
+            at,
         )?;
         // the clone is in place: registering it is no longer undone by a cancel
         h.set_cancellable(false);
@@ -2423,11 +2433,14 @@ async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
     }
 }
 
-async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
+async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let reasoning = crate::reasoning::status_json(&st, &ds);
+    let params = Params::from_query(&uri);
+    let at = history::at_param(&params)?;
+    let opts = query_options(&st, &ds, &params);
     blocking(move || {
-        let snap = ds.store.snapshot();
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let gen_ = &snap.generation;
         let term = |id: u64| {
             snap.term(Id(id)).map(|t| match t {
@@ -2491,8 +2504,17 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             .collect();
         let cache = ds.store.cache();
         let rcache = ds.store.result_cache();
-        Ok(Json(json!({
+        let h = ds.store.history();
+        let resp = Json(json!({
             "name": ds.name,
+            "commit": snap.commit,
+            "at": resolved.as_ref().map(|r| r.at.to_string()),
+            "history": {
+                "bytes": h.bytes,
+                "generations": h.generations.iter().filter(|g| !g.current).count(),
+                "snapshots": h.snapshots,
+                "oldestReconstructable": h.oldest_reconstructable(),
+            },
             "quads": snap.len(),
             "baseQuads": gen_.meta.quads,
             "deltaInserts": snap.delta.inserts(),
@@ -2519,7 +2541,9 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
                 "misses": rcache.misses(),
             },
         }))
-        .into_response())
+        .into_response();
+        let resp = with_commit(resp, &ds, snap.commit);
+        Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await
 }
@@ -2727,6 +2751,20 @@ async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult 
         None => Codec::dump_default(),
     };
     let level = backup_level(codec, params.get("level"))?.map(Level);
+    // a past state: resolved (and checked readable) before the task starts
+    let at = match history::at_param(&params)? {
+        Some(a) => {
+            let ds = ds.clone();
+            Some(
+                blocking(move || {
+                    let (_, r) = ds.store.snapshot_at(&a, &Default::default())?;
+                    Ok(sparkles::history::At::Commit(r.commit.seq))
+                })
+                .await?,
+            )
+        }
+        None => None,
+    };
     task_start_check(&st, Some("backup"), &name)?;
     let dir = st.data_dir.join("backups");
     let reserve = st.limits.min_free_disk_bytes;
@@ -2754,7 +2792,11 @@ async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult 
         let t = std::time::Instant::now();
         std::fs::create_dir_all(&dir)?;
         let ts = sparkles::builder::now_rfc3339().replace(':', "-");
-        let path = dir.join(format!("{}_{ts}.nq{}", ds.name, codec.extension()));
+        let at_part = match &at {
+            Some(sparkles::history::At::Commit(n)) => format!("_commit-{n}"),
+            _ => String::new(),
+        };
+        let path = dir.join(format!("{}_{ts}{at_part}.nq{}", ds.name, codec.extension()));
         // written under a temporary name, so a failed backup leaves no partial file
         let tmp = tempfile::Builder::new()
             .prefix(".backup-")
@@ -2768,7 +2810,10 @@ async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult 
         };
         let written = (|| -> sparkles::Result<()> {
             let mut w = codec.writer(out, level, threads)?;
-            ds.store.dump_nquads(&mut w)?;
+            match &at {
+                Some(a) => ds.store.dump_nquads_at(a, &mut w)?,
+                None => ds.store.dump_nquads(&mut w)?,
+            };
             w.finish()?;
             Ok(())
         })();
@@ -3194,6 +3239,7 @@ async fn shacl(
     let use_inferred = params.get("reasoning").is_none_or(|v| v != "false");
     let has_inferred = ds.reasoning.read().is_some();
     let timeout = timeout_param(&st, &params);
+    let at = history::at_param(&params)?;
     // a client that disconnects stops the validation at its next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     let max_bytes = st.limits.max_result_bytes;
@@ -3211,7 +3257,12 @@ async fn shacl(
             .map_err(|_| err(StatusCode::BAD_REQUEST, "shapes graph is not UTF-8"))?;
         let shapes = sparkles_shacl::Shapes::parse(text, format, None)
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-        let snap = ds.store.snapshot();
+        let past = QueryOptions {
+            timeout: Some(timeout),
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &past)?;
         if let GraphParam::Named(iri) = &graph
             && !crate::validation_common::graph_exists(&snap, iri)
         {
@@ -3256,6 +3307,7 @@ async fn shacl(
         }
         let resp = ([(header::CONTENT_TYPE, rfmt.media_type())], buf).into_response();
         let resp = with_commit(resp, &ds, snap.commit);
+        let resp = history::history_headers(resp, resolved.as_ref(), &uri);
         Ok(with_inferences(
             resp,
             &ds,

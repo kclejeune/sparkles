@@ -444,3 +444,147 @@ async fn in_memory_datasets_keep_history() {
         serde_json::json!([{ "from": 2, "to": 4 }])
     );
 }
+
+async fn wait_task(st: &AppState, id: &str) -> crate::state::Task {
+    let t0 = std::time::Instant::now();
+    loop {
+        let t = st
+            .tasks
+            .lock()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .unwrap();
+        if t.state != "running" {
+            return t;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "task {id} did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn stats_and_schema_at_a_commit() {
+    let s = server(|_| {}).await;
+    let r = get(&s.app, "/$/stats/h?at=1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (j["quads"].as_u64(), j["commit"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(j["at"], "commit:1");
+    assert_eq!(r.header("sparkles-commit").as_deref(), Some("1"));
+    assert!(r.header("memento-datetime").is_some());
+    let j = get(&s.app, "/$/stats/h").await.json();
+    assert_eq!(
+        (j["quads"].as_u64(), j["commit"].as_u64()),
+        (Some(2), Some(4))
+    );
+    assert_eq!(j["history"]["oldestReconstructable"], 0);
+    assert_eq!(
+        get(&s.app, "/$/stats/h?at=99").await.status,
+        StatusCode::NOT_FOUND
+    );
+    // schema discovery of a past state
+    let preds = |j: &J| j["predicates"]["items"].as_array().map_or(0, Vec::len);
+    let r = get(&s.app, "/$/schema/h?at=0").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(preds(&r.json()), 0);
+    let r = get(&s.app, "/$/schema/h?at=1").await;
+    assert_eq!(preds(&r.json()), 1, "{}", r.text());
+    assert_eq!(
+        get(&s.app, "/$/schema/h?at=abc").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_at_a_commit() {
+    let s = server(|_| {}).await;
+    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        <urn:S> a sh:NodeShape ; sh:targetSubjectsOf <urn:p> ;
+          sh:property [ sh:path <urn:p> ; sh:datatype xsd:integer ] .";
+    let validate = |at: &'static str| {
+        let app = s.app.clone();
+        async move {
+            send(
+                &app,
+                Request::post(format!("/h/shacl?{at}"))
+                    .header(header::CONTENT_TYPE, "text/turtle")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::from(shapes))
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    // the head has "three", not an integer
+    let r = validate("").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("\"conforms\":false"), "{}", r.text());
+    let r = validate("at=commit:1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("\"conforms\":true"), "{}", r.text());
+    assert_eq!(r.header("sparkles-commit").as_deref(), Some("1"));
+    assert_eq!(r.header("sparkles-at").as_deref(), Some("commit:1"));
+}
+
+#[tokio::test]
+async fn clone_and_backup_at_a_commit() {
+    let s = server(|_| {}).await;
+    let r = send(
+        &s.app,
+        Request::post("/$/datasets/h/clone")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":"h2","at":"commit:1"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let task = r.json()["id"].as_str().unwrap().to_string();
+    let t = wait_task(&s.state, &task).await;
+    assert_eq!(t.state, "done", "{t:?}");
+    let r = get(&s.app, "/h2/data").await;
+    assert!(
+        r.text().contains("urn:a") && !r.text().contains("urn:c"),
+        "{}",
+        r.text()
+    );
+    let j = get(&s.app, "/$/datasets/h2").await.json();
+    assert_eq!(j["forkedFrom"]["seq"], 1, "{j}");
+    // a commit that cannot be read is refused before a task starts
+    let r = send(
+        &s.app,
+        Request::post("/$/datasets/h/clone?name=h3&at=99")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    // a backup of a past state
+    let r = send(
+        &s.app,
+        Request::post("/$/backup/h?at=2&compression=none")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let task = r.json()["id"].as_str().unwrap().to_string();
+    let t = wait_task(&s.state, &task).await;
+    assert_eq!(t.state, "done", "{t:?}");
+    let file = std::fs::read_dir(s._dir.path().join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains("_commit-2"))
+        .expect("a backup named after its commit");
+    let nq = std::fs::read_to_string(file).unwrap();
+    assert_eq!(nq.lines().count(), 2, "{nq}");
+    assert!(nq.contains("urn:g1") && !nq.contains("urn:c"));
+}

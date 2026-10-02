@@ -58,6 +58,8 @@ struct Request {
     limit: usize,
     cursor: Option<Cursor>,
     timeout: Duration,
+    /// a past state (`at`)
+    at: Option<sparkles::history::At>,
 }
 
 fn bad(msg: impl Into<String>) -> ApiError {
@@ -115,6 +117,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
         .filter(|c| !c.is_empty())
         .map(|c| Cursor::decode(c).ok_or_else(|| bad("malformed cursor")))
         .transpose()?;
+    let at = super::history::at_param(&params)?;
     let declared_name = declared_graph.as_ref().unwrap_or(&graph).name().to_string();
     let selection = fnv(&format!(
         "{}\n{declared_name}\n{reasoning}\n{declared_all}",
@@ -136,6 +139,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
         limit,
         cursor,
         timeout,
+        at,
     })
 }
 
@@ -158,8 +162,28 @@ fn schema_error(e: SchemaError, timeout: Duration) -> ApiError {
 /// The report the request is answered from: the cached one when it matches the cursor
 /// or the current snapshot, otherwise a fresh one (which replaces the cache).
 fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
-    let snap = ds.store.snapshot();
-    let current = schema::snapshot_identity(&snap);
+    let (snap, current) = match &req.at {
+        None => {
+            let snap = ds.store.snapshot();
+            let id = schema::snapshot_identity(&snap);
+            (snap, id)
+        }
+        Some(at) => {
+            let o = sparkles::history::HistoryOptions {
+                cancel: None,
+                deadline: Some(Instant::now() + req.timeout),
+            };
+            let (snap, r) = ds.store.snapshot_at(at, &o)?;
+            // a past state never changes: its identity is its commit (live versions are
+            // small counters, so the high bit keeps the two apart)
+            let id = if r.historical {
+                (1 << 63) | r.commit.seq
+            } else {
+                schema::snapshot_identity(&snap)
+            };
+            (snap, id)
+        }
+    };
     let wanted = match &req.cursor {
         Some(c) if c.h != req.selection => {
             return Err(bad(

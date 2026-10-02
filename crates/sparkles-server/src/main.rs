@@ -1001,6 +1001,9 @@ enum Cmd {
         /// `copy` the materialized inferences and reasoning status, or `drop` them
         #[arg(long, default_value = "copy")]
         inferences: String,
+        /// clone a past state: N, commit:N, time:<RFC 3339>, snapshot:NAME
+        #[arg(long)]
+        at: Option<String>,
     },
     /// Print database statistics
     Stats {
@@ -2239,7 +2242,9 @@ fn run() -> Result<()> {
             loc,
             to,
             inferences,
+            at,
         } => {
+            let at: Option<sparkles::history::At> = at.as_deref().map(str::parse).transpose()?;
             let inferences = clone::Inferences::parse(&inferences).with_context(|| {
                 format!("--inferences must be copy or drop, not '{inferences}'")
             })?;
@@ -2253,7 +2258,7 @@ fn run() -> Result<()> {
             let t = Instant::now();
             let mut tmp = to.as_os_str().to_owned();
             tmp.push(format!(".clone-tmp-{}", std::process::id()));
-            let r = clone::clone_into(
+            let r = clone::clone_into_at(
                 &store,
                 &loc.display().to_string(),
                 state::read_reasoning_file(&loc),
@@ -2262,6 +2267,7 @@ fn run() -> Result<()> {
                 inferences,
                 None,
                 None,
+                at,
             )?;
             eprintln!(
                 "cloned {} (commit {}, {} quads, {} graph{}) to {} in {:.2}s",

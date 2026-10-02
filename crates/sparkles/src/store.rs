@@ -2797,6 +2797,17 @@ impl Store {
             let w = self.writer.lock();
             (self.snapshot(), w.next_bnode)
         };
+        // a past state: its blank nodes are older than the counter, which never decreases
+        let snap = match &opts.at {
+            Some(at) => {
+                let o = crate::history::HistoryOptions {
+                    cancel: opts.cancel.clone(),
+                    deadline: None,
+                };
+                self.snapshot_at(at, &o)?.0
+            }
+            None => snap,
+        };
         std::fs::create_dir_all(dir)?;
         let mut guard = CleanDir {
             dir,
@@ -3101,6 +3112,8 @@ pub struct CloneOptions {
     /// set to `true` to cancel (checked every 65536 quads)
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<ProgressFn>,
+    /// clone the state at this commit instead of the head (it must be readable)
+    pub at: Option<crate::history::At>,
 }
 
 /// Progress callback: (fraction done in `[0, 1]`, message).
