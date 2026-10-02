@@ -37,17 +37,26 @@ class AppState {
     else document.documentElement.dataset.theme = t;
   }
 
-  async refreshDatasets() {
+  #datasetsJson = '';
+
+  /** Loads the dataset list; true when it changed since the last load. */
+  async refreshDatasets(): Promise<boolean> {
     try {
-      this.datasets = await api.listDatasets();
+      const list = await api.listDatasets();
+      const json = JSON.stringify(list);
+      const changed = json !== this.#datasetsJson;
+      this.#datasetsJson = json;
+      if (changed || this.datasetsError) this.datasets = list;
       this.datasetsError = null;
       if (!this.current || !this.datasets.some((d) => d.name === this.current)) {
         this.setDataset(this.datasets[0]?.name ?? null);
       } else if (!this.prefixMaps[this.current]) {
         void this.loadPrefixes(this.current);
       }
+      return changed;
     } catch (e) {
       this.datasetsError = api.errorMessage(e);
+      return false;
     } finally {
       this.datasetsLoaded = true;
     }

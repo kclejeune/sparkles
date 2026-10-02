@@ -498,6 +498,23 @@ export async function ping(signal?: AbortSignal): Promise<string> {
 
 export const serverInfo = () => json<ServerInfo>('/$/server');
 
+let serverInfoCache: { at: number; info: Promise<ServerInfo> } | null = null;
+
+/**
+ * `GET /$/server` for callers that need only its settled parts (read-only mode, the map
+ * style): one request serves every caller for `maxAgeMs`.
+ */
+export function cachedServerInfo(maxAgeMs = 60_000): Promise<ServerInfo> {
+  if (!serverInfoCache || Date.now() - serverInfoCache.at > maxAgeMs) {
+    const info = serverInfo();
+    serverInfoCache = { at: Date.now(), info };
+    info.catch(() => {
+      if (serverInfoCache?.info === info) serverInfoCache = null;
+    });
+  }
+  return serverInfoCache.info;
+}
+
 /** Readiness; resolves with the document for `503` (not ready) as well. */
 export async function ready(signal?: AbortSignal): Promise<ReadyInfo> {
   let res: Response;

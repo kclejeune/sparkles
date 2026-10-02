@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { cancelTask } from '$lib/backups';
   import { fmtRelative } from '$lib/format';
+  import { followTasks, taskActive, taskFeed } from '$lib/tasks.svelte';
 
   let {
     dataset,
@@ -26,22 +27,14 @@
     empty?: string;
   } = $props();
 
-  let tasks = $state<api.Task[]>([]);
-  let error = $state<string | null>(null);
-  let loaded = $state(false);
   let now = $state(Date.now());
-  const running = new Set<string>();
-  /** Every task id listed so far. */
-  const seen = new Set<string>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let alive = true;
 
   const shown = $derived(
-    tasks
+    taskFeed.tasks
       .filter((t) => (!dataset || t.dataset === dataset) && (!filter || filter(t)))
       .slice(0, limit),
   );
-  const active = (t: api.Task) => t.state === 'running' || t.state === 'queued';
+  const active = taskActive;
   /** Cancelling needs admin on the task's dataset, or server-admin for server tasks. */
   const mayCancel = (t: api.Task) =>
     t.cancellable === true &&
@@ -54,7 +47,7 @@
     try {
       await cancelTask(t.id);
       toasts.push('info', `Cancelling ${t.kind}`, `Task ${t.id}`);
-      await poll();
+      await taskFeed.refresh();
     } catch (e) {
       toasts.error(`Could not cancel task ${t.id}`, e);
     } finally {
@@ -62,51 +55,34 @@
     }
   }
 
-  async function poll() {
-    clearTimeout(timer);
-    try {
-      const list = await api.listTasks();
-      list.sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
-      for (const t of list) {
-        if (active(t)) running.add(t.id);
-        else if (
-          running.has(t.id) ||
-          // a task of ours that started and finished between two polls
-          (loaded && !seen.has(t.id) && (!dataset || t.dataset === dataset))
-        ) {
-          running.delete(t.id);
-          ondone?.(t);
-        }
-        seen.add(t.id);
-      }
-      tasks = list;
-      error = null;
-    } catch (e) {
-      error = api.errorMessage(e);
-    } finally {
-      loaded = true;
-      now = Date.now();
-      const busy = tasks.some(active);
-      if (alive) timer = setTimeout(poll, busy ? 700 : 5000);
-    }
-  }
-
+  // the list comes from the one poller of /$/tasks (lib/tasks.svelte.ts); a bump of
+  // refreshKey loads it now
+  let lastKey = untrack(() => refreshKey);
   $effect(() => {
-    void refreshKey;
-    poll();
+    if (refreshKey === lastKey) return;
+    lastKey = refreshKey;
+    void taskFeed.refresh();
   });
 
-  onMount(() => () => {
-    alive = false;
-    clearTimeout(timer);
+  onMount(() => {
+    const unfollow = followTasks(
+      (t) => ondone?.(t),
+      (t) => !dataset || t.dataset === dataset,
+    );
+    // relative times only: no request
+    const tick = setInterval(() => (now = Date.now()), 15_000);
+    return () => {
+      unfollow();
+      clearInterval(tick);
+    };
   });
 </script>
 
-{#if error}
+{#if taskFeed.error}
   <div class="error-box">
-    <strong>Could not load tasks.</strong> <span class="muted">{error}</span>
+    <strong>Could not load tasks.</strong> <span class="muted">{taskFeed.error}</span>
   </div>
-{:else if loaded && shown.length === 0}
+{:else if taskFeed.loaded && shown.length === 0}
   <p class="faint none">{empty}</p>
 {:else}
   <ul class="tasks">

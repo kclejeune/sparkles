@@ -11,6 +11,7 @@
   import { displayIri, type PrefixMap } from '$lib/rdf';
   import { LatestRun } from '$lib/supersede';
   import { parsePredicateList } from '$lib/textsearch';
+  import { poll } from '$lib/poll';
   import Icon from './Icon.svelte';
   import MapView, { type MapFeature } from './MapView.svelte';
   import Modal from './Modal.svelte';
@@ -75,13 +76,22 @@
 
   const status = $derived(loaded?.kind === 'enabled' ? loaded.status : null);
 
+  let panel = $state<HTMLElement>();
+
   onMount(() => {
-    const t = setInterval(() => {
-      now = Date.now();
-      // follow a build
-      if (status?.state === 'building') void load();
-    }, 2000);
-    return () => clearInterval(t);
+    // relative times only: no request
+    const t = setInterval(() => (now = Date.now()), 2000);
+    // follow a build while the panel is on screen
+    const p = poll(load, {
+      interval: 2000,
+      when: () => status?.state === 'building',
+      target: () => panel,
+      immediate: false,
+    });
+    return () => {
+      clearInterval(t);
+      p.stop();
+    };
   });
 
   const stateClass = (s: api.GeoState) =>
@@ -238,7 +248,7 @@
   {/if}
 {/snippet}
 
-<section class="panel">
+<section class="panel" bind:this={panel}>
   <div class="panel-head">
     <h2>Spatial index</h2>
     <span class="spacer"></span>
