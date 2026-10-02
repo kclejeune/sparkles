@@ -187,8 +187,10 @@ authentication.
   decoded.
 * **Columnar execution and planning.** Execution is column-major. The planner orders joins
   with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
-  sort order, and merge joins run on sorted scans. Groups too large for the program are
-  planned in rounds or greedily, as described under join ordering on cost summaries below.
+  sort order, and merge joins run on sorted scans. A hash join's output keeps the order of
+  the input it probes, so a merge join above it reads it as sorted. Groups too large for
+  the program are planned in rounds or greedily, as described under join ordering on cost
+  summaries below.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
 * **Result cache.** Executed subtrees are cached under a canonical plan key and the
   snapshot version, so updates invalidate entries without extra work. Results with
@@ -198,8 +200,11 @@ authentication.
   come from runs in the blocks; the scan is never materialized.
 * **Planner details.** Filters are placed as soon as their variables are bound. Scan sizes
   are exact from block metadata (at most two block decodes). Join estimates use
-  per-predicate distinct subject and object counts with QLever's 0.7 correction factor.
-  Merge joins gallop through skewed inputs. `COUNT(*)` over one pattern comes from index
+  per-predicate distinct subject and object counts with QLever's 0.7 correction factor. A
+  pattern with a single free subject, predicate or object has a distinct value of it per
+  row. Costs are counted in rows read by a scan. A hash join costs 48 of them for each row
+  of its smaller input, which goes into a hash table at 40 to 100 ns a row, and one for
+  each row of the larger input that probes it. Merge joins gallop through skewed inputs. `COUNT(*)` over one pattern comes from index
   metadata. Transitive paths traverse from the bound side, with index lookups per
   frontier node, instead of materializing the closure.
 * **Executed-plan feedback.** Every query returns a runtime-information tree (estimated
@@ -329,14 +334,21 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   key ranges, and ranges in adjacent blocks are read in one scan: scattered keys cost a
   seek per region, dense keys one sweep. Each input row then joins its key's rows, so the
   input's order and duplicates are kept. The planner offers this next to merge and hash
-  joins when probing (seeks, blocks touched, rows) is estimated at under half the cost of
-  scanning the pattern. EXPLAIN counts the keys, seeks, blocks and rows read
+  joins. A probe takes 160 to 270 ns per key where a scan reads a row in 1.3 to 1.6 ns,
+  so each key costs 140 scanned rows, plus 6 for each doubling of the pattern's rows per
+  key. Each block the keys touch costs 256 and each row read 8. These figures were
+  measured on stores of 1.05M and 10.5M triples by the ignored tests in
+  `sparql/costcal_tests.rs`. Probing then wins when the input has up to about 1 or 2% as
+  many keys as the pattern has rows, against a merge join, and more against a hash join
+  with a large input to build. It is not offered when it would cost more than twice the
+  scan of the pattern. EXPLAIN counts the keys, seeks, blocks and rows read
   (`batched_join`).
 * **Fused stars.** Index joins on one subject over constant predicates (`?p ex:worksFor
   ex:org7 ; foaf:name ?n ; foaf:age ?a`) run as one operator (`StarJoin`). It walks each
   subject's SPO run once and picks out the star's predicates, or probes each pattern's own
   permutation, whichever touches fewer blocks, and builds the output once instead of
-  through intermediate tables (`star_fusion`).
+  through intermediate tables (`star_fusion`). The planner costs a star as its separate
+  index joins, since a fused star still spends about as long per key and pattern.
 * **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
   every row passes the graph filter (one pass over the graph column), so default-graph
   queries avoid row-by-row filtering.

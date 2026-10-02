@@ -467,7 +467,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 ..
             }
     ) {
-        if !table.sorted.is_empty() && table.sorted != n.sorted {
+        // the planner's order holds when the rows are sorted on it, perhaps on more
+        if table.sorted.starts_with(&n.sorted) {
+            table.sorted.truncate(n.sorted.len());
+        } else {
             table.sorted.clear();
         }
     } else {
@@ -2028,11 +2031,47 @@ fn unpack(
     Ok(out)
 }
 
-fn join_tables(ctx: &Ctx, l: &Table, r: &Table, _keys: &[VarId], merge: bool) -> Result<Table> {
+pub(super) fn join_tables(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    _keys: &[VarId],
+    merge: bool,
+) -> Result<Table> {
     let lay = layout(l, r);
     let pairs = join_pairs(ctx, l, r, &lay, merge)?;
     ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
-    Ok(materialize(l, r, &lay, &pairs))
+    let mut t = materialize(l, r, &lay, &pairs);
+    t.sorted = kept_order(l, r, &lay, &pairs);
+    Ok(t)
+}
+
+/// The sort order that joined rows keep from an input. A hash join emits its pairs in
+/// the order of the side it probes, so that side's sort variables stay sorted, up to the
+/// first one shared with the other side where the side holds unbound values (the other
+/// side fills them).
+fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> Vec<VarId> {
+    let (t, left) = if pairs.windows(2).all(|w| w[0].0 <= w[1].0) {
+        (l, true)
+    } else if pairs.windows(2).all(|w| w[0].1 <= w[1].1) {
+        (r, false)
+    } else {
+        return Vec::new();
+    };
+    t.sorted
+        .iter()
+        .take_while(|v| {
+            let Some(c) = t.col_of(**v) else {
+                return false;
+            };
+            let shared = lay
+                .shared
+                .iter()
+                .any(|&(lc, rc)| if left { lc == c } else { rc == c });
+            !shared || !has_undef(t, c)
+        })
+        .copied()
+        .collect()
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {

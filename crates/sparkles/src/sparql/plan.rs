@@ -1692,9 +1692,13 @@ impl<'a> Planner<'a> {
                 _ => None,
             };
             let quads = snap.len().max(1) as f64;
+            // a pattern with one free subject, predicate or object column has a value of it
+            // per triple
+            let free_spo = cols.iter().filter(|(kc, _)| order[*kc] != G).count();
             for &(kc, v) in &cols {
                 let comp = order[kc];
                 let d = match (comp, pstat.as_ref()) {
+                    (S | P | O, _) if free_spo == 1 => est,
                     (S, Some(ps)) if pstat.is_some() => {
                         ps.distinct_subjects as f64 * est / ps.count.max(1) as f64
                     }
@@ -2357,6 +2361,17 @@ pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
     (a_est * b_est / denom * 0.7).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
 }
 
+/// A hash join builds a table of the smaller input, keyed on the join variables, and
+/// probes it with each row of the larger one. Inserting a row takes 40 to 100 ns (a list
+/// is allocated per key), about as long as scanning 48 rows; a probe takes about one.
+const HASH_BUILD_COST: f64 = 48.0;
+
+/// The cost of hash joining inputs of `a_est` and `b_est` rows, besides the inputs and
+/// the output rows.
+pub(super) fn hash_base(a_est: f64, b_est: f64) -> f64 {
+    HASH_BUILD_COST * a_est.min(b_est) + a_est.max(b_est)
+}
+
 pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
@@ -2389,7 +2404,7 @@ fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64) 
     };
     let base = match algo {
         JoinAlgo::Merge => a.est + b.est,
-        JoinAlgo::Hash => 2.0 * a.est.min(b.est) + a.est.max(b.est),
+        JoinAlgo::Hash => hash_base(a.est, b.est),
         JoinAlgo::Cross => a.est * b.est,
     };
     let cost = a.cost + b.cost + base + est + extra_cost;
