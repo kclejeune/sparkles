@@ -10,8 +10,17 @@ die() {
   log "error: $*"
   exit 1
 }
-nixbin() { # nixbin <pkg> <bin>
-  if command -v "$2" > /dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
+# nixbin <pkg> <bin>: the binary on PATH, or from nixpkgs. The build's out-link in
+# WORK/gcroots is a garbage-collector root, so a `nix store gc` during a long run cannot
+# remove the binary.
+nixbin() {
+  if command -v "$2" > /dev/null; then
+    command -v "$2"
+  else
+    mkdir -p "$WORK/gcroots"
+    nix build "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
+    echo "$WORK/gcroots/$1/bin/$2"
+  fi
 }
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 
@@ -52,8 +61,12 @@ resolve_tools() {
 }
 # GNU time (not the shell keyword), for the peak RSS of loads
 gnu_time() {
-  type -P gtime || { [ -x /usr/bin/time ] && echo /usr/bin/time; } ||
-    echo "$(nix build nixpkgs#time --no-link --print-out-paths | tail -1)/bin/time"
+  type -P gtime && return
+  [ -x /usr/bin/time ] && echo /usr/bin/time && return
+  # not nixbin: `command -v time` finds the shell keyword
+  mkdir -p "$WORK/gcroots"
+  nix build nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
+  echo "$WORK/gcroots/time/bin/time"
 }
 
 # ------------------------------------------------------------------------- engines
