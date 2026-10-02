@@ -2380,7 +2380,7 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
     );
     println!("head            {head}");
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => reasoning::up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE ({n} commit{} since)", if n == 1 { "" } else { "s" })
         }

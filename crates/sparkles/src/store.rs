@@ -741,6 +741,16 @@ struct BulkCommit {
     net_del: u64,
     /// quads in the committed snapshot the transaction started from
     start_len: u64,
+    /// the commit may change the default graph
+    default_graph: bool,
+}
+
+/// Whether loading `sources` may write to the default graph: a quad format may hold
+/// default-graph quads, a triple format writes there unless a target graph is set.
+fn sources_reach_default_graph(sources: &[Source]) -> bool {
+    sources
+        .iter()
+        .any(|s| s.graph.is_none() || s.format.supports_datasets())
 }
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -832,6 +842,7 @@ impl Store {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let store = Store {
             root: None,
@@ -909,6 +920,7 @@ impl Store {
                 bulk: false,
                 exact: true,
                 reconstructed: false,
+                default_graph: true,
             };
             write_synced(
                 &dir.join("commit.json"),
@@ -974,6 +986,7 @@ impl Store {
                     // counts relative to an earlier commit are unknown
                     exact: prev.is_none(),
                     reconstructed: false,
+                    default_graph: true,
                 };
                 (c, true)
             }
@@ -1605,6 +1618,14 @@ impl Store {
         self.catalog.lock().get(seq)
     }
 
+    /// Whether a commit after `after`, up to and including `at`, may have changed the
+    /// default graph. Commits that changed named graphs alone do not count. A commit
+    /// whose record is no longer retained, or was written before the flag existed,
+    /// counts as a change.
+    pub fn default_graph_changed(&self, after: u64, at: u64) -> bool {
+        self.catalog.lock().default_graph_changed(after, at)
+    }
+
     /// A page of the commit catalog.
     pub fn commits(&self, range: CommitRange, limit: usize) -> CommitPage {
         self.catalog.lock().page(range, limit)
@@ -2155,6 +2176,7 @@ impl Store {
                 kind,
                 net_del: 0,
                 start_len: snap.len(),
+                default_graph: sources_reach_default_graph(sources),
             };
             let check = Some((crate::guard::Changes::Unknown, o));
             Ok(self
@@ -2292,6 +2314,8 @@ impl Store {
             kind,
             net_del: dropped,
             start_len,
+            default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
+                || sources_reach_default_graph(sources),
         };
         let check = Some((crate::guard::Changes::Unknown, o));
         let (_, r) =
@@ -2445,6 +2469,7 @@ impl Store {
                 bulk: true,
                 exact: b.net_del == 0,
                 reconstructed: false,
+                default_graph: b.default_graph,
             },
             None => w.head,
         };
@@ -2650,6 +2675,7 @@ impl Store {
             bulk: true,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let forked_from = ForkedFrom {
             id: self.dataset_id,
@@ -3235,6 +3261,8 @@ impl WriteTxn<'_> {
             kind: self.kind,
             net_del: self.net_del,
             start_len: self.base.len(),
+            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH)
+                || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
         };
         let log = std::mem::take(&mut self.log);
         let check = Some((
@@ -3295,6 +3323,7 @@ impl WriteTxn<'_> {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH),
         };
         let next_bnode = self.guard.next_bnode;
         if let Some(wal) = self.guard.wal.as_mut() {
@@ -3718,6 +3747,7 @@ pub(crate) fn replay_wal(
                     Vec::new()
                 };
                 let before = out.commits.len();
+                let default_graph = pending.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH);
                 for (op, q) in pending.drain(..) {
                     let k = Perm::Spo.to_key(&q);
                     let in_base = probe.perm(Perm::Spo).contains(cache, &k)?;
@@ -3759,6 +3789,7 @@ pub(crate) fn replay_wal(
                             bulk: false,
                             exact: true,
                             reconstructed: false,
+                            default_graph,
                         });
                     }
                     // a legacy commit record: folded into the baseline when the
@@ -3775,6 +3806,7 @@ pub(crate) fn replay_wal(
                         bulk: false,
                         exact: true,
                         reconstructed: true,
+                        default_graph,
                     }),
                 }
                 if from.keep_touched && out.commits.len() > before {

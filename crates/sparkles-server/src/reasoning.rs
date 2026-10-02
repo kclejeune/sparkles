@@ -3,8 +3,9 @@
 //!
 //! A materialization records the commit (`seq`) it wrote, or the unchanged head it read
 //! when it changed nothing, together with the dataset id. The inferences are fresh while
-//! the head is still that commit; every later commit makes them stale (conservatively:
-//! also commits that touch only named graphs the reasoner does not read).
+//! no later commit changed the default graph, which is all the reasoner reads. Commits
+//! to named graphs, the inferred graph included, leave them fresh; `commitsSince` still
+//! counts every commit.
 
 use crate::state::{AppState, Dataset, ReasoningInfo};
 use axum::http::HeaderValue;
@@ -59,6 +60,15 @@ pub fn freshness(info: &ReasoningInfo, store: &Store, at: u64) -> Freshness {
         },
         std::cmp::Ordering::Greater => {
             let n = at - commit;
+            // the reasoner reads the default graph alone: commits to named graphs,
+            // the inferred graph included, leave the inferences fresh
+            if !store.default_graph_changed(commit, at) {
+                return Freshness {
+                    stale: Some(false),
+                    commits_since: Some(n),
+                    reason: None,
+                };
+            }
             Freshness {
                 stale: Some(true),
                 commits_since: Some(n),
@@ -147,6 +157,17 @@ fn profile_text(info: &ReasoningInfo) -> String {
     s
 }
 
+/// "up to date", noting the later commits that left the default graph unchanged.
+pub fn up_to_date(commits_since: Option<u64>) -> String {
+    match commits_since {
+        Some(n) if n > 0 => format!(
+            "up to date; {n} later commit{} left the default graph unchanged",
+            if n == 1 { "" } else { "s" }
+        ),
+        _ => "up to date".to_string(),
+    }
+}
+
 /// One line for the CLI: `owl-rl, 1234 inferred at commit 40 (STALE: 3 commits since)`.
 pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
     let f = freshness(info, store, store.head_commit().seq);
@@ -155,7 +176,7 @@ pub fn status_line(info: &ReasoningInfo, store: &Store) -> String {
         None => format!("at {}", info.at),
     };
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE: {n} commit{} since", if n == 1 { "" } else { "s" })
         }

@@ -195,6 +195,63 @@ async fn inference_freshness_lifecycle() {
 }
 
 #[tokio::test]
+async fn only_default_graph_commits_make_inferences_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let auto = || Some(AutoReason::new(Duration::ZERO, None));
+    let st = open(dir.path(), auto(), false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    let c = get_json(&app, "/$/reason/t").await["commit"]
+        .as_u64()
+        .unwrap();
+
+    // a named graph, and the inferred graph itself: still fresh
+    update(&app, "t", "INSERT DATA { GRAPH ex:g { ex:y a ex:C } }").await;
+    update(
+        &app,
+        "t",
+        "INSERT DATA { GRAPH <urn:x-sparkles:inferred> { ex:z a ex:B } }",
+    )
+    .await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], false, "{s}");
+    assert_eq!(s["commitsSince"], 2);
+    assert_eq!(s["head"], c + 2);
+    assert!(s.get("staleReason").is_none());
+    let (_, hdr) = b_instances(&app, "t").await;
+    assert_eq!(hdr, None);
+    assert_eq!(
+        get_json(&app, "/$/datasets/t").await["reasoning"]["stale"],
+        false
+    );
+    // so automatic mode has nothing to do
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    assert_eq!(st.tasks.lock().len(), 1);
+
+    // the same after a restart, when the flags come from the WAL and the catalog
+    drop(app);
+    drop(st);
+    let st = open(dir.path(), auto(), false);
+    let app = router(st.clone());
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], false);
+
+    // a change to the default graph makes them stale, counting every commit since
+    update(&app, "t", "INSERT DATA { ex:w a ex:C }").await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], true);
+    assert_eq!(s["commitsSince"], 3);
+    let (_, hdr) = b_instances(&app, "t").await;
+    assert_eq!(hdr.as_deref(), Some("stale; commits-since=3"));
+    crate::reasoning::auto_reason_tick(&st, Instant::now() + Duration::from_secs(60));
+    wait_tasks(&st).await;
+    assert_eq!(st.tasks.lock().len(), 1, "an automatic run");
+    assert_eq!(get_json(&app, "/$/reason/t").await["stale"], false);
+}
+
+#[tokio::test]
 async fn legacy_or_foreign_status_is_unknown() {
     let dir = tempfile::tempdir().unwrap();
     {

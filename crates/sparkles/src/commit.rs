@@ -130,6 +130,9 @@ pub struct CommitInfo {
     pub exact: bool,
     /// rebuilt from a WAL record without commit metadata
     pub reconstructed: bool,
+    /// the commit may have changed the default graph (`false` only when it is known to
+    /// have changed named graphs alone)
+    pub default_graph: bool,
 }
 
 impl CommitInfo {
@@ -547,6 +550,13 @@ struct CommitJson {
     exact: bool,
     #[serde(default)]
     reconstructed: bool,
+    /// absent in files written before the flag existed: assume the default graph changed
+    #[serde(default = "yes")]
+    default_graph: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitInfo) -> Vec<u8> {
@@ -566,6 +576,7 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             bulk: c.bulk,
             exact: c.exact,
             reconstructed: c.reconstructed,
+            default_graph: c.default_graph,
         },
     })
     .unwrap()
@@ -596,6 +607,7 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
             bulk: c.bulk,
             exact: c.exact,
             reconstructed: c.reconstructed,
+            default_graph: c.default_graph,
         },
         f.origin,
     )))
@@ -623,7 +635,12 @@ fn encode_record(c: &CommitInfo) -> [u8; REC] {
     r[32..40].copy_from_slice(&c.quads.to_le_bytes());
     r[40..44].copy_from_slice(&c.generation.to_le_bytes());
     r[44] = c.kind.code();
-    r[45] = c.exact as u8 | (c.bulk as u8) << 1 | (c.reconstructed as u8) << 2;
+    // bit 3 is set when the default graph is known to be unchanged, so records written
+    // before the flag existed read as "may have changed it"
+    r[45] = c.exact as u8
+        | (c.bulk as u8) << 1
+        | (c.reconstructed as u8) << 2
+        | (!c.default_graph as u8) << 3;
     let crc = crc32(&[&r[..60]]);
     r[60..64].copy_from_slice(&crc.to_le_bytes());
     r
@@ -646,6 +663,7 @@ pub(crate) fn decode_record(r: &[u8]) -> Option<CommitInfo> {
         exact: r[45] & 1 != 0,
         bulk: r[45] & 2 != 0,
         reconstructed: r[45] & 4 != 0,
+        default_graph: r[45] & 8 == 0,
     })
 }
 
@@ -709,6 +727,9 @@ pub(crate) struct Catalog {
     /// records not yet written to the file after a write error
     pending: Vec<CommitInfo>,
     ring: Option<usize>,
+    /// the newest commit that may have changed the default graph: exact while the
+    /// records reach back to it, otherwise the commit before the first record
+    last_default: u64,
     /// test hook: appends to the file fail
     #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fail_writes: bool,
@@ -723,6 +744,7 @@ impl Catalog {
             records: [root].into(),
             pending: Vec::new(),
             ring: Some(ring.max(1)),
+            last_default: root.seq,
             #[cfg(any(test, feature = "failpoints"))]
             fail_writes: false,
         }
@@ -815,6 +837,11 @@ impl Catalog {
             crate::store::write_synced(path, &buf)?;
         }
         let file = OpenOptions::new().append(true).open(path)?;
+        let last_default = records
+            .iter()
+            .rev()
+            .find(|c| c.default_graph)
+            .map_or(first.saturating_sub(1), |c| c.seq);
         Ok(Catalog {
             path: Some(path.to_path_buf()),
             file: Some(file),
@@ -822,6 +849,7 @@ impl Catalog {
             records: records.into(),
             pending: Vec::new(),
             ring: None,
+            last_default,
             #[cfg(any(test, feature = "failpoints"))]
             fail_writes: false,
         })
@@ -837,6 +865,9 @@ impl Catalog {
     /// Append a commit (called with the writer lock held, after the commit is durable).
     /// A file error is logged and retried with the next append; it never fails the commit.
     pub fn append(&mut self, c: CommitInfo) {
+        if c.default_graph {
+            self.last_default = c.seq;
+        }
         self.records.push_back(c);
         if let Some(ring) = self.ring
             && self.records.len() > ring
@@ -915,6 +946,18 @@ impl Catalog {
             Some(f) => Ok(f.metadata()?.len()),
             None => Err(Error::unsupported("the commit catalog has no file")),
         }
+    }
+
+    /// Whether a commit after `after`, up to `at`, may have changed the default graph. A
+    /// commit the catalog no longer holds counts as a change.
+    pub fn default_graph_changed(&self, after: u64, at: u64) -> bool {
+        if self.last_default <= after {
+            return false;
+        }
+        if self.last_default <= at {
+            return true;
+        }
+        (after + 1..=at).any(|s| self.get(s).is_none_or(|c| c.default_graph))
     }
 
     pub fn get(&self, seq: u64) -> Option<CommitInfo> {
@@ -1049,9 +1092,17 @@ mod tests {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let mut r = encode_record(&c);
         assert_eq!(decode_record(&r), Some(c));
+        // a record without the flag bit (older versions) may have changed the default graph
+        assert_eq!(r[45] & 8, 0);
+        let named_only = CommitInfo {
+            default_graph: false,
+            ..c
+        };
+        assert_eq!(decode_record(&encode_record(&named_only)), Some(named_only));
         r[20] ^= 1;
         assert_eq!(decode_record(&r), None);
         for k in CommitKind::ALL {
