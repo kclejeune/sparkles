@@ -35,6 +35,9 @@ mod inline;
 mod jena_formats;
 mod queries;
 mod schema;
+pub(crate) use schema::constraints::ShapesRequest;
+#[cfg(feature = "mcp")]
+pub(crate) use schema::constraints::build as constraints_layer;
 mod sd;
 mod shex;
 mod stream;
@@ -102,6 +105,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/classes", get(schema::classes))
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
         .route("/$/schema/{ds}/shapes", get(schema::shapes))
+        .route("/$/schema/{ds}/constraints", get(schema::constraints))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(

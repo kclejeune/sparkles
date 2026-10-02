@@ -198,7 +198,86 @@ export type Schema = {
   selection: api.SchemaSummary['selection'];
   totals: api.SchemaSummary['totals'];
   cycles: string[][];
+  /** The SHACL constraints of the report, one line per class and property shape. */
+  constraints: ConstraintLine[];
 };
+
+/** One property shape of the constraints layer, with the class it applies to. */
+export type ConstraintLine = {
+  class: string;
+  source: api.ConstraintSource['kind'];
+  constraint: api.PropertyConstraint;
+};
+
+/** The constraints layer as one line per class and property shape. */
+export function constraintLines(layer?: api.ConstraintsLayer): ConstraintLine[] {
+  return (layer?.sources ?? []).flatMap((src) =>
+    src.classes.flatMap((c) =>
+      c.properties.map((constraint) => ({ class: c.class, source: src.kind, constraint })),
+    ),
+  );
+}
+
+const ENFORCEMENT: Record<api.Enforcement, { text: string; title: string }> = {
+  'reject-on-write': {
+    text: 'enforced on write',
+    title: 'Write-time validation refuses a write that breaks this constraint.',
+  },
+  'warn-on-write': {
+    text: 'reported on write',
+    title: 'Write-time validation commits a write that breaks this constraint and reports it.',
+  },
+  'validated-on-request': {
+    text: 'checked on request',
+    title: 'Nothing checks this constraint until the data is validated.',
+  },
+};
+
+/** How a constraint is enforced, in words. */
+export function enforcementText(e: api.Enforcement): { text: string; title: string } {
+  return ENFORCEMENT[e];
+}
+
+/**
+ * `min 1 · max 1 · datatype xsd:string · class ex:Org` for one property shape, with IRIs
+ * shortened by `short`.
+ */
+export function constraintSummary(
+  c: api.PropertyConstraint,
+  short: (iri: string) => string,
+): string {
+  const parts: string[] = [];
+  if (c.minCount != null) parts.push(`min ${c.minCount}`);
+  if (c.maxCount != null) parts.push(`max ${c.maxCount}`);
+  if (c.datatype) parts.push(`datatype ${short(c.datatype)}`);
+  for (const k of c.class ?? []) parts.push(`class ${short(k)}`);
+  if (c.nodeKind) parts.push(`nodeKind ${short(c.nodeKind)}`);
+  for (const o of c.other ?? [])
+    parts.push(`+${o.replace(/^.*[#/]/, '').replace(/ConstraintComponent$/, '')}`);
+  return parts.length ? parts.join(' · ') : 'no constraints';
+}
+
+/**
+ * The declared SHACL chips of a property: one per class whose shapes constrain it. They
+ * are separate from the observed and declared cardinality chips and never merged with
+ * them.
+ */
+export function constraintChips(
+  lines: ConstraintLine[],
+  predicate: string,
+  short: (iri: string) => string,
+): { text: string; title: string; enforcement: api.Enforcement }[] {
+  return lines
+    .filter((l) => l.constraint.path === predicate)
+    .map((l) => {
+      const e = enforcementText(l.constraint.enforcement);
+      return {
+        text: `SHACL ${constraintSummary(l.constraint, short)}`,
+        title: `Declared by a SHACL shape of ${short(l.class)}, ${e.text}. ${e.title}`,
+        enforcement: l.constraint.enforcement,
+      };
+    });
+}
 
 /**
  * Drop super classes implied by other super classes (A ⊂ B ⊂ C and A ⊂ C: keep only B),
@@ -358,6 +437,7 @@ export function schemaFromSummary(s: api.SchemaSummary): Schema {
     selection: s.selection,
     totals: s.totals,
     cycles: s.hierarchy.cycles,
+    constraints: constraintLines(s.constraints),
   };
 }
 

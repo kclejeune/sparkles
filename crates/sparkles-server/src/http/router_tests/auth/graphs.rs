@@ -606,6 +606,58 @@ async fn drafted_shapes_cover_the_view() {
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 }
 
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn constraints_cover_the_view() {
+    let s = server();
+    let ds = s.state.datasets.read().get("graphs").cloned().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+<http://ex/a/shapes> { ex:S a sh:NodeShape ; sh:targetClass ex:T ;
+    sh:property [ sh:path ex:p ; sh:maxCount 1 ] . }
+<http://ex/b/shapes> { ex:H a sh:NodeShape ; sh:targetClass ex:Hidden ;
+    sh:property [ sh:path ex:p ; sh:minCount 1 ] . }"#
+                .to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move { call(&app, "GET", u, &[("authorization", &b(user))], "").await }
+    };
+    let a = "/$/schema/graphs/constraints?shapes=http%3A%2F%2Fex%2Fa%2Fshapes";
+    let hidden = "/$/schema/graphs/constraints?shapes=http%3A%2F%2Fex%2Fb%2Fshapes";
+    let r = get(a, "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        r.json()["constraints"]["sources"][0]["classes"][0]["class"],
+        "http://ex/T"
+    );
+    assert_eq!(get(hidden, "gra").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(get(hidden, "gfull").await.status, StatusCode::OK);
+
+    // the guard's shapes reach only callers that may read its shapes graphs
+    let cfg: sparkles_shacl::guard::ValidationConfig = serde_json::from_value(serde_json::json!({
+        "mode": "warn", "shapes": { "graphs": ["http://ex/b/shapes"] }
+    }))
+    .unwrap();
+    match sparkles_shacl::guard::set_config(&ds.store, Some(cfg)).unwrap() {
+        sparkles_shacl::guard::SetOutcome::Installed(g, _) => {
+            *ds.validation.write() = Some(crate::state::Validation::Shacl(g));
+        }
+        _ => panic!("guard not installed"),
+    }
+    let j = get("/$/schema/graphs/constraints", "gfull").await.json();
+    assert_eq!(j["constraints"]["sources"][0]["kind"], "guard", "{j}");
+    let r = get("/$/schema/graphs/constraints", "gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Hidden"), "{}", r.text());
+    let r = get("/$/schema/graphs/constraints?shapes=guard", "gra").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn stored_queries_run_on_the_view() {
     let s = server();

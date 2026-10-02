@@ -27,6 +27,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod constraints;
 mod data;
 pub mod guard;
 pub mod incremental;

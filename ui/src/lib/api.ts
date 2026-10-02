@@ -745,6 +745,10 @@ export type SchemaPredicate = {
       tripleTerm?: KindCount;
       literals: LiteralGroup[];
     };
+    /** With `detail: ['subjectClasses']`: the classes of the subjects, by class IRI. */
+    subjectClasses?: { class: string; triples: number; subjects: number }[];
+    /** With `detail: ['subjectClasses']`: subjects without an IRI class. */
+    untypedSubjects?: { triples: number; subjects: number };
   };
   declared: {
     types: string[];
@@ -758,6 +762,52 @@ export type SchemaPredicate = {
 };
 
 export type Page<T> = { items: T[]; total: number; next: string | null };
+
+/**
+ * What checks a SHACL constraint: write-time validation that refuses a write breaking
+ * it, write-time validation that commits the write and reports it, or nothing until
+ * the data is validated on request.
+ */
+export type Enforcement = 'reject-on-write' | 'warn-on-write' | 'validated-on-request';
+
+/** One property shape with a predicate path. */
+export type PropertyConstraint = {
+  path: string;
+  shape?: string;
+  severity: string;
+  enforcement: Enforcement;
+  minCount?: number;
+  maxCount?: number;
+  datatype?: string;
+  class?: string[];
+  nodeKind?: string;
+  /** Constraint components of the shape's other constraints. */
+  other?: string[];
+};
+
+export type ClassConstraints = {
+  class: string;
+  shapes: string[];
+  closed: boolean;
+  properties: PropertyConstraint[];
+  /** Property shapes whose path is not a single predicate (not listed). */
+  otherPaths: number;
+};
+
+export type ConstraintSource = {
+  /** `guard`: the write-time validation's shapes; `graphs`: shapes graphs named by the request. */
+  kind: 'guard' | 'graphs';
+  graphs: string[];
+  file?: boolean;
+  mode?: string;
+  threshold?: string;
+  shapes: number;
+  otherTargets: number;
+  classes: ClassConstraints[];
+};
+
+/** The SHACL constraints layer of the schema report: declared, never observed. */
+export type ConstraintsLayer = { sources: ConstraintSource[] };
 
 export type SchemaSummary = {
   schemaFormat: 1;
@@ -780,6 +830,8 @@ export type SchemaSummary = {
   hierarchy: { roots: string[]; cycles: string[][] };
   classes: Page<SchemaClass>;
   predicates: Page<SchemaPredicate>;
+  /** The write-time validation's SHACL shapes by default, or the sources of `shapes`. */
+  constraints?: ConstraintsLayer;
 };
 
 export type SchemaOptions = {
@@ -790,6 +842,10 @@ export type SchemaOptions = {
   /** Count materialized inferences (server default: yes, when present). */
   reasoning?: boolean;
   declared?: 'asserted' | 'all';
+  /** Shapes of the constraints layer: `guard`, `default`, `none` or graph IRIs. */
+  shapes?: string[];
+  /** Extra per-predicate details, at extra cost. */
+  detail?: 'subjectClasses'[];
   /** Page size (1–10000). */
   limit?: number;
   timeout?: number;
@@ -802,6 +858,8 @@ function schemaParams(opts: SchemaOptions, cursor?: string): string {
   if (opts.declaredGraph) p.set('declaredGraph', opts.declaredGraph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   if (opts.declared) p.set('declared', opts.declared);
+  for (const s of opts.shapes ?? []) p.append('shapes', s);
+  if (opts.detail?.length) p.set('detail', opts.detail.join(','));
   if (opts.limit != null) p.set('limit', String(opts.limit));
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
   if (cursor) p.set('cursor', cursor);

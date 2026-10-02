@@ -1326,6 +1326,14 @@ enum Cmd {
         /// Largest number of classes, and of predicates
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
+        /// List, for each predicate, the classes of its subjects with their triples
+        #[arg(long, conflicts_with = "draft_shapes")]
+        subject_classes: bool,
+        /// SHACL shapes for the constraints layer: `guard` (the database's write-time
+        /// validation), `default`, a graph IRI, or `none` (repeatable; default: the
+        /// write-time validation's shapes, if it has SHACL validation)
+        #[arg(long, value_name = "SOURCE", conflicts_with = "draft_shapes")]
+        shapes: Vec<String>,
         /// Draft SHACL shapes (or, with --format shexc, a ShEx schema) from the data
         /// instead of printing the schema; --format is then turtle, shexc or json
         #[arg(long)]
@@ -2931,6 +2939,8 @@ fn run() -> Result<()> {
             format,
             timeout,
             max_entries,
+            subject_classes,
+            shapes,
             draft_shapes,
             support,
             closed,
@@ -2999,6 +3009,7 @@ fn run() -> Result<()> {
                 max_entries,
                 term_totals: void.is_some(),
                 graphs: None,
+                subject_classes,
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -3007,6 +3018,11 @@ fn run() -> Result<()> {
                     std::process::exit(2);
                 }
                 Err(e) => return Err(e.into()),
+            };
+            // the constraints layer, for the JSON and text reports
+            let constraints = match void {
+                None => schema_constraints(&store, &snap, &shapes)?,
+                Some(_) => None,
             };
             let mut out = std::io::stdout().lock();
             if let Some(declarations) = void {
@@ -3035,10 +3051,14 @@ fn run() -> Result<()> {
                         next: None,
                     },
                 );
+                let summary = summary.with_constraints(constraints.as_ref());
                 serde_json::to_writer_pretty(&mut out, &summary)?;
                 writeln!(out)?;
             } else {
                 print_schema(&mut out, &report)?;
+                if let Some(c) = &constraints {
+                    print_constraints(&mut out, c)?;
+                }
             }
             out.flush()?;
             Ok(())
@@ -3083,6 +3103,120 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The constraints layer of `sparkles schema`: the sources of `--shapes`, or else the
+/// shapes of the database's write-time SHACL validation, if any.
+fn schema_constraints(
+    store: &sparkles::store::Store,
+    snap: &sparkles::store::Snapshot,
+    shapes: &[String],
+) -> Result<Option<sparkles::schema::ConstraintsLayer>> {
+    let req = http::ShapesRequest::from_values(shapes).map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "shacl")]
+    {
+        use sparkles_shacl::constraints::{configured_source, graphs_source};
+        let mut layer = sparkles::schema::ConstraintsLayer::default();
+        if req.guard != Some(false) {
+            match sparkles_shacl::guard::configured_shapes(store)? {
+                Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
+                None if req.guard == Some(true) => {
+                    bail!("the database has no write-time SHACL validation")
+                }
+                None => {}
+            }
+        }
+        for g in req.graphs.iter().filter(|g| *g != "default") {
+            if !validation_common::graph_exists(snap, g) {
+                bail!("no such graph: <{g}>");
+            }
+        }
+        if !req.graphs.is_empty() {
+            layer.sources.push(graphs_source(snap, &req.graphs)?);
+        }
+        Ok((!layer.is_empty()).then_some(layer))
+    }
+    #[cfg(not(feature = "shacl"))]
+    {
+        let _ = (store, snap);
+        if req.guard == Some(true) || !req.graphs.is_empty() {
+            bail!("built without the `shacl` feature");
+        }
+        Ok(None)
+    }
+}
+
+/// `sparkles schema --format text`: the constraints layer, one line per property shape.
+fn print_constraints(
+    out: &mut impl Write,
+    layer: &sparkles::schema::ConstraintsLayer,
+) -> Result<()> {
+    use sparkles::schema::constraints::SourceKind;
+    let short = |i: &str| {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let sh = "http://www.w3.org/ns/shacl#";
+        match (i.strip_prefix(xsd), i.strip_prefix(sh)) {
+            (Some(l), _) => format!("xsd:{l}"),
+            (_, Some(l)) => format!("sh:{l}"),
+            _ => format!("<{i}>"),
+        }
+    };
+    for src in &layer.sources {
+        let mut from: Vec<String> = src
+            .graphs
+            .iter()
+            .map(|g| match g.as_str() {
+                "default" => "the default graph".to_string(),
+                g => format!("<{g}>"),
+            })
+            .collect();
+        if src.file {
+            from.push("a shapes file".into());
+        }
+        let what = match src.kind {
+            SourceKind::Guard => format!(
+                "write-time validation ({}, threshold {})",
+                src.mode.as_deref().unwrap_or("?"),
+                src.threshold.as_deref().unwrap_or("?")
+            ),
+            SourceKind::Graphs => "shapes graphs, validated on request".to_string(),
+        };
+        writeln!(
+            out,
+            "
+constraints from {what}: {} · {} shapes · {} classes",
+            from.join(", "),
+            src.shapes,
+            src.classes.len()
+        )?;
+        for c in &src.classes {
+            write!(out, "  <{}>", c.class)?;
+            if c.closed {
+                write!(out, "  closed")?;
+            }
+            if c.other_paths > 0 {
+                write!(out, "  (+{} other paths)", c.other_paths)?;
+            }
+            writeln!(out)?;
+            for p in &c.properties {
+                writeln!(
+                    out,
+                    "    <{}>  {}  [{}]",
+                    p.path,
+                    p.summary(short),
+                    p.enforcement.name()
+                )?;
+            }
+        }
+        if src.other_targets > 0 {
+            writeln!(
+                out,
+                "  {} shapes with other targets are not listed",
+                src.other_targets
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// `sparkles schema --format text`: one line per class and per predicate.
@@ -3156,6 +3290,16 @@ fn print_schema(out: &mut impl Write, r: &sparkles::schema::SchemaReport) -> Res
                 format!("  [{}]", kinds.join(", "))
             }
         )?;
+        if let Some(classes) = &o.subject_classes {
+            let mut parts: Vec<String> = classes
+                .iter()
+                .map(|c| format!("<{}> {}", c.class, c.triples))
+                .collect();
+            if let Some(u) = o.untyped_subjects.filter(|u| u.triples > 0) {
+                parts.push(format!("untyped {}", u.triples));
+            }
+            writeln!(out, "    subjects: {}", parts.join(", "))?;
+        }
     }
     Ok(())
 }

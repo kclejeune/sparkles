@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { SchemaClass, SchemaPredicate, SchemaSummary, Term } from './api';
+import type { ConstraintsLayer, SchemaClass, SchemaPredicate, SchemaSummary, Term } from './api';
 import {
   cardinalityChips,
+  constraintChips,
+  constraintLines,
+  constraintSummary,
+  enforcementText,
   hierarchyRoots,
   objectSegments,
   OWL_FUNCTIONAL,
@@ -371,6 +375,93 @@ describe('cardinalityChips', () => {
   it('never calls the observation functional', () => {
     for (const c of info(1, 5))
       expect(c.text.toLowerCase()).not.toMatch(/functional|single|scalar/);
+  });
+});
+
+describe('constraints layer', () => {
+  const layer: ConstraintsLayer = {
+    sources: [
+      {
+        kind: 'guard',
+        graphs: [EX + 'shapes'],
+        mode: 'reject',
+        threshold: 'violation',
+        shapes: 3,
+        otherTargets: 0,
+        classes: [
+          {
+            class: EX + 'Person',
+            shapes: [EX + 'PersonShape'],
+            closed: false,
+            otherPaths: 0,
+            properties: [
+              {
+                path: EX + 'name',
+                severity: 'http://www.w3.org/ns/shacl#Violation',
+                enforcement: 'reject-on-write',
+                minCount: 1,
+                maxCount: 1,
+                datatype: XSD + 'string',
+                other: ['http://www.w3.org/ns/shacl#PatternConstraintComponent'],
+              },
+            ],
+          },
+        ],
+      },
+      {
+        kind: 'graphs',
+        graphs: [EX + 'more'],
+        shapes: 1,
+        otherTargets: 0,
+        classes: [
+          {
+            class: EX + 'Org',
+            shapes: [],
+            closed: false,
+            otherPaths: 0,
+            properties: [
+              {
+                path: EX + 'name',
+                severity: 'http://www.w3.org/ns/shacl#Violation',
+                enforcement: 'validated-on-request',
+                class: [EX + 'Name'],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const short = (iri: string) => iri.replace(EX, 'ex:').replace(XSD, 'xsd:');
+
+  it('flattens the sources to one line per class and property shape', () => {
+    const s = schemaFromSummary({ ...summary([], [prop(EX + 'name')]), constraints: layer });
+    expect(s.constraints.map((l) => [l.class, l.source, l.constraint.path])).toEqual([
+      [EX + 'Person', 'guard', EX + 'name'],
+      [EX + 'Org', 'graphs', EX + 'name'],
+    ]);
+    expect(schemaFromSummary(summary([])).constraints).toEqual([]);
+    expect(constraintLines(undefined)).toEqual([]);
+  });
+
+  it('summarizes a property shape', () => {
+    const [l] = constraintLines(layer);
+    expect(constraintSummary(l.constraint, short)).toBe(
+      'min 1 · max 1 · datatype xsd:string · +Pattern',
+    );
+  });
+
+  it('gives each constraining class its own chip, apart from the observations', () => {
+    const chips = constraintChips(constraintLines(layer), EX + 'name', short);
+    expect(chips.map((c) => [c.text, c.enforcement])).toEqual([
+      ['SHACL min 1 · max 1 · datatype xsd:string · +Pattern', 'reject-on-write'],
+      ['SHACL class ex:Name', 'validated-on-request'],
+    ]);
+    expect(chips[0].title).toContain('ex:Person');
+    expect(chips[0].title).toContain('refuses a write');
+    expect(chips[1].title).toContain('until the data is validated');
+    expect(constraintChips(constraintLines(layer), EX + 'other', short)).toEqual([]);
+    expect(enforcementText('warn-on-write').text).toBe('reported on write');
   });
 });
 

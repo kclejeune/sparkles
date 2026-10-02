@@ -424,6 +424,28 @@ in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server a
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
 ([API.md](API.md#schema-discovery)).
 
+### Constraints next to the counts
+
+The schema report keeps what the data shows apart from what its SHACL shapes require.
+When a database has write-time SHACL validation, `sparkles schema` ends with the
+constraints of its shapes per class, and each line says whether a write that breaks the
+constraint is refused, committed with a warning, or not checked at all. `--shapes` names
+other shapes graphs to read, and `--shapes none` leaves the constraints out.
+`--subject-classes` adds, under each predicate, the classes of its subjects with their
+triple counts:
+
+```sh
+sparkles schema --loc db                                     # counts, then the guard's constraints
+sparkles schema --loc db --shapes http://example.org/shapes  # constraints of a shapes graph
+sparkles schema --loc db --subject-classes                   # which classes use each predicate
+```
+
+An observed `max/subject 1` only describes the current data. A constraint such as
+`max 1  [reject-on-write]` is what stops the next write from adding a second value. The
+server gives the same layer in `GET /$/schema/{ds}` and `GET /$/schema/{ds}/constraints`,
+and the UI's schema browser shows it as SHACL chips next to the observed counts
+([API](API.md#constraints-layer)).
+
 ### File tools
 
 These commands work on files and endpoints rather than databases. They match Jena's
@@ -920,7 +942,9 @@ does the same:
 The tools are read-only unless the operator turns on the write tool:
 
 * `list_datasets`, `describe_schema`, `sparql_query`, `explain_query`,
-  `describe_resource` and `list_commits`.
+  `describe_resource` and `list_commits`. `describe_schema` with
+  `section: "constraints"` lists the SHACL constraints per class, and with
+  `subjectClasses: true` it names the classes that use each predicate.
 * `draft_shapes` drafts SHACL shapes or a ShEx schema from the data, with the number of
   instances each constraint would exclude.
 * Each stored query of a dataset is a tool of its own, `<dataset>__<query>`, whose

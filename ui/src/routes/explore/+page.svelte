@@ -476,6 +476,10 @@
       range: schema.properties.filter((p) => p.ranges.includes(cls.iri)),
     };
   });
+  const clsConstraints = $derived(
+    cls && schema ? schema.constraints.filter((l) => l.class === cls.iri) : [],
+  );
+  const short = (iri: string) => shortLabel(iri, prefixes);
   const kindName = (k: string) => shortLabel(k, prefixes).replace(/^owl:|^rdf:/, '');
 
   function classLabel(iri: string) {
@@ -1040,6 +1044,11 @@
                             title={c.title}>{c.text}</span
                           >
                         {/each}
+                        {#each ex.constraintChips(schema.constraints, p.iri, short) as c, i (i)}<span
+                            class="badge shacl {c.enforcement}"
+                            title={c.title}>{c.text}</span
+                          >
+                        {/each}
                       </td>
                       <td>
                         {#each p.domains as d (d)}
@@ -1139,6 +1148,21 @@
                   >{classLabel(s)}</button
                 >{:else}<span class="faint">None</span>{/each}
             </div>
+            {#if clsConstraints.length}
+              <h3 class="sub">
+                Constraints <span class="faint small">declared by SHACL shapes</span>
+              </h3>
+              {#each clsConstraints as l, i (i)}
+                {@const e = ex.enforcementText(l.constraint.enforcement)}
+                <div class="prop-line">
+                  <span class="t-iri mono">{displayIri(l.constraint.path, prefixes)}</span>
+                  <span class="small">{ex.constraintSummary(l.constraint, short)}</span>
+                  <span class="badge shacl {l.constraint.enforcement}" title={e.title}
+                    >{e.text}</span
+                  >
+                </div>
+              {/each}
+            {/if}
             <h3 class="sub">
               Properties with this domain <span class="faint">{clsProps.domain.length}</span>
             </h3>
@@ -1580,6 +1604,16 @@
   .lang {
     font-family: var(--font-mono);
     color: var(--literal);
+  }
+  /* declared by a SHACL shape: solid when write-time validation enforces it */
+  .badge.shacl {
+    background: var(--spark-soft);
+    color: var(--spark-ink);
+    font-weight: 500;
+  }
+  .badge.shacl.validated-on-request {
+    background: transparent;
+    border: 1px solid var(--spark-ink);
   }
   /* an observation of the current data, not a declared constraint */
   .badge.measure {
