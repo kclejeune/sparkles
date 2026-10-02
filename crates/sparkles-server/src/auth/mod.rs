@@ -42,8 +42,8 @@ mod store;
 mod tokens;
 
 pub use api::{
-    PrincipalKeyer, cors_layer, flush, load, proxy_host_warning, render_metrics, restrict, routes,
-    server_json, spawn_reload_on_sighup, throttle,
+    PrincipalKeyer, cors_layer, flush, load, proxy_host_warning, public_url, render_metrics,
+    restrict, routes, server_json, spawn_reload_on_sighup, throttle,
 };
 pub use proxy::Peer;
 #[cfg(feature = "mcp")]

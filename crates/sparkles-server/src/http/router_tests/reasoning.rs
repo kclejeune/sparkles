@@ -905,3 +905,56 @@ async fn a_waiting_write_supersedes_an_automatic_run() {
     let id = st.tasks.lock()[2].id.clone();
     let _ = st.cancel_task(&id);
 }
+
+/// The service description names the entailment regime of the materialized
+/// inferences, and leaves the default graph's count out, since the inferences are part
+/// of it.
+#[tokio::test]
+async fn the_service_description_names_the_materialized_regime() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    let describe = || async {
+        let r = send(
+            &app,
+            Request::get("/t/sparql")
+                .header(header::ACCEPT, "application/n-triples")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.text()
+    };
+    let regime = "<http://www.w3.org/ns/sparql-service-description#defaultEntailmentRegime>";
+    let nt = describe().await;
+    assert!(
+        nt.contains(&format!(
+            "{regime} <http://www.w3.org/ns/entailment/Simple>"
+        )),
+        "{nt}"
+    );
+    assert!(nt.contains("void#triples"), "{nt}");
+    let r = post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    wait_tasks(&st).await;
+    let nt = describe().await;
+    assert!(
+        nt.contains(&format!("{regime} <http://www.w3.org/ns/entailment/RDFS>")),
+        "{nt}"
+    );
+    assert!(
+        nt.contains("materialized into <urn:x-sparkles:inferred>"),
+        "{nt}"
+    );
+    // the inferred graph is a named graph with a count; the default graph has none
+    assert!(
+        nt.contains(
+            "<http://www.w3.org/ns/sparql-service-description#name> <urn:x-sparkles:inferred>"
+        ),
+        "{nt}"
+    );
+    assert_eq!(nt.matches("void#triples").count(), 1, "{nt}");
+}

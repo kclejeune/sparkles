@@ -31,6 +31,7 @@ mod mcp;
 mod open;
 #[cfg(feature = "reasoning")]
 mod reasoning;
+mod sd;
 mod tasks;
 
 const DATA: &str = r#"
