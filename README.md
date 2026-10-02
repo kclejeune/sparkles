@@ -85,7 +85,10 @@ running queries.
   ([API](docs/API.md#write-time-validation)).
 
 **Search**
-* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy ([API](docs/API.md#full-text-search)).
+* Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
+  language ([API](docs/API.md#full-text-search)).
+* Hybrid search that fuses a full-text and a vector ranking by reciprocal rank fusion
+  ([API](docs/API.md#hybrid-text-and-vector-search)).
 * Vector similarity search over `spk:vector` literals, exact or through an HNSW index that
   sees every write at once ([API](docs/API.md#vector-similarity)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`

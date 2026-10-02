@@ -51,8 +51,12 @@ implementation landed.
   - the SPARQL 1.1 Query §4.2.3 collections syntax, BCP 47 and RFC 4647.
 
   Fluree was not consulted.
-- **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`
-  and `lz4-compression`. That set avoids zstd's C code. Tantivy is behind the optional
+- **Adopted:** `tantivy` 0.26.2 (MIT) with default features off, plus `mmap`, `stemmer`,
+  `stopwords` and `lz4-compression`. That set avoids zstd's C code. The `stemmer` feature
+  links `rust-stemmers` 1.2.0 (MIT OR BSD-3-Clause), the Snowball stemmers that the
+  per-language analyzers use. The `stopwords` feature adds no crate. Its lists are part of
+  Tantivy's source. The English list is Lucene's, and the others are the Snowball
+  project's (BSD-3-Clause, the license `rust-stemmers` already carries). Tantivy is behind the optional
   `text` feature of `sparkles`, which the server enables by default.
 - **Rejected** (spec §8):
   - a home-grown inverted index;
