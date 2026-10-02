@@ -16,6 +16,7 @@ pub mod io;
 pub mod nesting;
 pub mod outbound;
 pub mod patch;
+pub mod preview;
 pub mod querybuilder;
 pub mod schema;
 pub mod sparql;

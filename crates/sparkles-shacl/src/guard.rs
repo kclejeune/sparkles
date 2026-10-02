@@ -512,7 +512,9 @@ impl ShaclGuard {
             None => vec![false; listed.len()],
         });
         let ms = t0.elapsed().as_millis() as u64;
-        self.last_full.store(ms, Ordering::Relaxed);
+        if o.dry_run.is_none() {
+            self.last_full.store(ms, Ordering::Relaxed);
+        }
         let summary = summarize(
             &self.cfg,
             listed,
@@ -652,8 +654,15 @@ impl ShaclGuard {
         }))
     }
 
-    /// A write that cannot change the results: the state of the head carries over.
-    fn skipped(&self, seq: u64) -> ValidationSummary {
+    /// A write that cannot change the results: the state of the head carries over
+    /// (unless the write is a dry run, which records nothing).
+    fn skipped(&self, seq: u64, live: bool) -> ValidationSummary {
+        if !live {
+            let mut s =
+                ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, self.cfg.threshold);
+            s.limit = self.cfg.report_limit;
+            return s;
+        }
         self.count(GuardStatus::Skipped);
         let baseline = self
             .baseline
@@ -977,6 +986,9 @@ fn baseline_of(s: &ValidationSummary, commit: u64) -> Baseline {
 impl CommitGuard for ShaclGuard {
     fn check(&self, c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
         let seq = c.base.commit + 1;
+        // a dry run validates like a write and records nothing: no counters, no history,
+        // no state for the next commit
+        let live = c.opts.dry_run.is_none();
         // relevance: a write that touches neither the data graph nor the shapes cannot
         // change the report
         let (mut data, mut shapes_changed) = (false, false);
@@ -991,7 +1003,7 @@ impl CommitGuard for ShaclGuard {
             None => (data, shapes_changed) = (true, !self.cfg.shapes_graphs().is_empty()),
         }
         if !data && !shapes_changed {
-            return Ok(self.skipped(seq));
+            return Ok(self.skipped(seq, live));
         }
         let loaded = self.loaded.read().clone();
         let (checked, new_loaded) = if shapes_changed {
@@ -1003,7 +1015,6 @@ impl CommitGuard for ShaclGuard {
             ) {
                 Ok(s) => Loaded::new(s),
                 Err(e) => {
-                    self.count(GuardStatus::Rejected);
                     let mut s = ValidationSummary::empty(
                         GuardStatus::Rejected,
                         self.cfg.mode,
@@ -1011,7 +1022,10 @@ impl CommitGuard for ShaclGuard {
                     );
                     s.limit = self.cfg.report_limit;
                     s.shapes_error = Some(format!("{e:#}"));
-                    self.history.record(c.kind, &s);
+                    if live {
+                        self.count(GuardStatus::Rejected);
+                        self.history.record(c.kind, &s);
+                    }
                     return Ok(s);
                 }
             };
@@ -1037,11 +1051,14 @@ impl CommitGuard for ShaclGuard {
                 .as_ref()
                 .is_some_and(|e| e.commit == c.base.commit);
             if known && !self.reads_changes(c, &loaded) {
-                return Ok(self.skipped(seq));
+                return Ok(self.skipped(seq, live));
             }
             (self.check_data(c, &loaded)?, None)
         };
         let summary = checked.summary;
+        if !live {
+            return Ok(summary);
+        }
         self.count(summary.status);
         self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {

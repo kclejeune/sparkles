@@ -1004,3 +1004,94 @@ fn writes_are_validated_incrementally() {
         (Strategy::Full, Some("baseline"), 1)
     );
 }
+
+/// Write previews (dry runs) report the summary the write gets and leave the guard as it
+/// was: a store that previews each write first ends where a store that only makes the
+/// writes ends, with the same summaries and the same typing on the way. Writes the guard
+/// skips follow previews too, which would apply a preview's state if the guard kept it.
+#[test]
+fn dry_runs_report_the_write_and_leave_the_guard_alone() {
+    use sparkles::preview::{self, DryRun};
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for k in ["millis", "lastFullMillis", "time", "ms"] {
+                    m.remove(k);
+                }
+                m.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let status = |g: &ShexGuard| {
+        let mut v = serde_json::to_value(g.status()).unwrap();
+        strip(&mut v);
+        v
+    };
+    let outcome = |r: sparkles::Result<UpdateStats>| {
+        let (rejected, s) = match r {
+            Ok(st) => (false, st.commit.unwrap().validation.map(|v| (*v).clone())),
+            Err(Error::Rejected(r)) => (true, Some(r.summary)),
+            Err(e) => panic!("{e}"),
+        };
+        let mut v = serde_json::to_value(s).unwrap();
+        strip(&mut v);
+        (rejected, v)
+    };
+    let dry = |s: &Store, u: &str| {
+        let opts = QueryOptions {
+            write: sparkles::guard::WriteOptions {
+                dry_run: Some(DryRun::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        preview::catch(update(s, &format!("{P}{u}"), &opts)).unwrap()
+    };
+    let writes = [
+        "INSERT DATA { ex:dave a ex:Person ; foaf:name \"Dave\" }",
+        "INSERT DATA { ex:erin a ex:Person }",
+        "INSERT DATA { ex:x ex:unrelated 1 }",
+        "DELETE DATA { ex:bob foaf:name \"Bob\" }",
+        "INSERT DATA { ex:y ex:unrelated 2 }",
+        "INSERT DATA { ex:bob foaf:name \"Bob\" ; foaf:knows ex:dave }",
+        "DELETE WHERE { ex:carol ?p ?o }",
+        "INSERT DATA { ex:dave foaf:knows ex:erin }",
+    ];
+    for (mode, grandfather, carol) in [
+        ("reject", false, false),
+        ("warn", false, true),
+        ("reject", true, true),
+    ] {
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let mut stores = Vec::new();
+        let mut guards = Vec::new();
+        for d in &dirs {
+            let s = loaded(d.path());
+            if !carol {
+                upd(&s, "DELETE WHERE { ex:carol ?p ?o }").unwrap();
+            }
+            let mut c = cfg(mode, SCHEMA, MAP);
+            if grandfather {
+                c.baseline = sparkles::guard::config::BaselinePolicy::Grandfather;
+            }
+            let (g, _) = installed(set_config(&s, Some(c), &NoImports).unwrap());
+            stores.push(s);
+            guards.push(g);
+        }
+        for (i, w) in writes.iter().enumerate() {
+            let before = status(&guards[0]);
+            let p = dry(&stores[0], w);
+            dry(&stores[0], writes[(i + 1) % writes.len()]);
+            assert_eq!(status(&guards[0]), before, "{mode} {w}");
+            let a = outcome(upd(&stores[0], w));
+            let b = outcome(upd(&stores[1], w));
+            assert_eq!(a, b, "{mode} {w}");
+            let mut pv = serde_json::to_value(p.validation.as_deref()).unwrap();
+            strip(&mut pv);
+            assert_eq!((p.rejected(), pv), a, "{mode} {w}");
+            assert_eq!(status(&guards[0]), status(&guards[1]), "{mode} {w}");
+        }
+    }
+}
