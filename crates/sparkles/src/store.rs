@@ -66,6 +66,8 @@ pub struct Generation {
     pub geo: crate::geo::GenerationGeo,
     /// counts from the statistics without the quads of graphs a query does not read
     pub counts: crate::sparql::stats::CountCache,
+    /// the characteristic sets of the statistics by predicate, built on first use
+    pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
 }
 
 impl Generation {
@@ -83,6 +85,7 @@ impl Generation {
             vectors: Default::default(),
             geo: Default::default(),
             counts: Default::default(),
+            charsets: Default::default(),
         }
     }
 
@@ -133,6 +136,7 @@ impl Generation {
             vectors: Default::default(),
             geo: Default::default(),
             counts: Default::default(),
+            charsets: Default::default(),
         })
     }
 

@@ -248,6 +248,9 @@ struct Offer<'p> {
     filter: Vec<Expr>,
     key: VarId,
     est: f64,
+    /// the key with the share of the product of its distinct values the join keeps, when
+    /// the characteristic sets estimate it
+    star: Option<(VarId, f64)>,
     cost: f64,
     sorted: Vec<VarId>,
     desc: String,
@@ -284,7 +287,7 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
             .iter()
             .filter(|v| **v != key && drive.vars.contains(v)),
     );
-    let est = super::plan::join_est(drive, probe, &keys);
+    let (est, star) = super::plan::join_est_with(drive, probe, &keys, ctx);
     // the input's order is kept, except where a shared variable unbound in the input
     // takes the pattern's value
     let sorted = drive
@@ -309,6 +312,7 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx) -> Option<Offer<'p>> {
         filter,
         key,
         est,
+        star,
         cost,
         sorted,
         desc,
@@ -327,7 +331,7 @@ impl Offer<'_> {
                 certain.push(v);
             }
         }
-        let dist = super::plan::merge_dist(&drive, probe, self.est);
+        let dist = super::plan::merge_dist(&drive, probe, self.est, self.star);
         Node {
             kind: Kind::IndexJoin(Box::new(IndexJoinSpec {
                 key: self.key,

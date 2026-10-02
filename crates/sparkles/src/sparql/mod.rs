@@ -2,6 +2,7 @@
 
 pub mod aggext;
 pub mod cache;
+pub mod charsets;
 pub mod ctx;
 pub mod depth;
 pub mod exec;
@@ -715,6 +716,8 @@ fn describe(ctx: &Ctx, t: &Table) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+#[cfg(test)]
+mod charsets_tests;
 #[cfg(test)]
 mod costcal_tests;
 #[cfg(test)]

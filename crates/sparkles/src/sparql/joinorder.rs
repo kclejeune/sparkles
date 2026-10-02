@@ -108,8 +108,13 @@ struct Cand {
     how: How,
 }
 
-/// The estimated rows of joining `a` and `b`, the same for every way of joining them.
-fn pair_est(a: &Sum, b: &Sum, shared: &[Shared]) -> f64 {
+/// The estimated rows of joining `a` and `b`, the same for every way of joining them:
+/// from the characteristic sets when `star` holds the share of the product of their rows
+/// that the join keeps (see [`super::charsets`]), else from the distinct values.
+fn pair_est(a: &Sum, b: &Sum, shared: &[Shared], star: Option<(f64, f64)>) -> f64 {
+    if let Some((rr, _)) = star {
+        return plan::star_est(a.est, b.est, rr);
+    }
     let denom = shared.iter().map(|s| s.da.max(s.db)).fold(1.0f64, f64::max);
     plan::join_est_from(a.est, b.est, denom)
 }
@@ -292,6 +297,9 @@ struct Group {
     /// per input, its variables as local indices
     item_vars: Vec<Vec<u32>>,
     filters: Vec<FilterInfo>,
+    /// per input, the star masks of its patterns by join variable index (see
+    /// [`super::charsets`])
+    stars: Vec<Vec<(u32, u64)>>,
 }
 
 impl Group {
@@ -342,6 +350,22 @@ impl Group {
                 }
             })
             .collect();
+        let mut stars = Vec::with_capacity(items.len());
+        for it in items {
+            let mut masks = Vec::new();
+            if ctx.opt.characteristic_sets {
+                super::charsets::of_node(ctx, &it[0], &mut masks);
+            }
+            stars.push(
+                masks
+                    .into_iter()
+                    .filter_map(|(v, m)| {
+                        let j = join[*idx.get(&v)? as usize];
+                        (j != u32::MAX).then_some((j, m))
+                    })
+                    .collect(),
+            );
+        }
         Group {
             vars,
             idx,
@@ -349,8 +373,49 @@ impl Group {
             jvars,
             item_vars,
             filters,
+            stars,
         }
     }
+
+    /// The star mask of join variable `j` over the inputs `inputs`.
+    fn star_mask(&self, inputs: impl Iterator<Item = usize>, j: u32) -> u64 {
+        let mut m = 0;
+        for i in inputs {
+            for &(x, s) in &self.stars[i] {
+                if x == j {
+                    m = super::charsets::merge(m, s);
+                }
+            }
+        }
+        m
+    }
+
+    /// The characteristic-set factors of joining the inputs `a` and `b` that share only
+    /// join variable `j`.
+    fn star_factor(
+        &self,
+        ctx: &Ctx,
+        a: impl Iterator<Item = usize>,
+        b: impl Iterator<Item = usize>,
+        j: u32,
+    ) -> Option<(f64, f64)> {
+        let (qa, qb) = (self.star_mask(a, j), self.star_mask(b, j));
+        if qa == 0 || qb == 0 {
+            return None;
+        }
+        super::charsets::factor(ctx, self.vars[self.jvars[j as usize] as usize], qa, qb)
+    }
+}
+
+/// The set bits of `m`.
+fn bits_of(mut m: u32) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (m != 0).then(|| {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            i
+        })
+    })
 }
 
 /// The plan for a connected group of inputs (each with its access paths), placing the
@@ -413,6 +478,18 @@ impl Bits {
     fn intersects(&self, o: &Bits) -> bool {
         self.0.iter().zip(&o.0).any(|(a, b)| a & b != 0)
     }
+    fn ones(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &x)| {
+            let mut x = x;
+            std::iter::from_fn(move || {
+                (x != 0).then(|| {
+                    let i = x.trailing_zeros() as usize;
+                    x &= x - 1;
+                    w * 64 + i
+                })
+            })
+        })
+    }
 }
 
 enum From {
@@ -423,6 +500,8 @@ enum From {
 /// A plan of the greedy ordering.
 struct Unit {
     sum: Sum,
+    /// the inputs it joins
+    inputs: Bits,
     /// variables in the order of the plan's columns, as local indices
     vars: Vec<u32>,
     has: Bits,
@@ -451,6 +530,9 @@ struct Pair {
     b: u32,
     how: How,
     sorted: Option<VarId>,
+    /// the join variable with the share of the product of its distinct values the join
+    /// keeps, when the characteristic sets estimate it
+    star: Option<(u32, f64)>,
 }
 
 impl PartialEq for Pair {
@@ -538,8 +620,11 @@ impl Greedy {
                 }
             }
             d.sort_unstable_by_key(|x| x.0);
+            let mut inputs = Bits::new(items.len());
+            inputs.set(i as u32);
             units.push(Unit {
                 sum: Sum::of(&node),
+                inputs,
                 vars,
                 has,
                 certain,
@@ -565,7 +650,7 @@ impl Greedy {
         let mut shared = Vec::new();
         for b in 0..gr.units.len() {
             for a in 0..b {
-                gr.push_pair(g, a, b, batched, &mut heap, &mut cands, &mut shared);
+                gr.push_pair(g, a, b, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
         }
         let mut dead = vec![false; gr.units.len()];
@@ -583,7 +668,7 @@ impl Greedy {
             gr.alive.retain(|&u| u != p.a as usize && u != p.b as usize);
             for i in 0..gr.alive.len() {
                 let u = gr.alive[i];
-                gr.push_pair(g, u, w, batched, &mut heap, &mut cands, &mut shared);
+                gr.push_pair(g, u, w, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
             gr.alive.push(w);
         }
@@ -598,6 +683,7 @@ impl Greedy {
         a: usize,
         b: usize,
         batched: bool,
+        ctx: &Ctx,
         heap: &mut BinaryHeap<Pair>,
         cands: &mut Vec<Cand>,
         shared: &mut Vec<Shared>,
@@ -619,7 +705,15 @@ impl Greedy {
                 });
             }
         }
-        let est = pair_est(&ua.sum, &ub.sum, shared);
+        let star = match shared.as_slice() {
+            [s] => {
+                let j = g.join[g.idx[&s.v] as usize];
+                g.star_factor(ctx, ua.inputs.ones(), ub.inputs.ones(), j)
+                    .map(|f| (j, f))
+            }
+            _ => None,
+        };
+        let est = pair_est(&ua.sum, &ub.sum, shared, star.map(|(_, f)| f));
         joins(
             &ua.sum,
             ua.probe.as_ref(),
@@ -644,6 +738,7 @@ impl Greedy {
             b: b as u32,
             how: best.how,
             sorted: best.sorted,
+            star: star.map(|(j, (_, rd))| (j, rd)),
         });
     }
 
@@ -670,7 +765,10 @@ impl Greedy {
                 (Some(&(ja, da)), Some(&(jb, db))) if ja == jb => {
                     i += 1;
                     k += 1;
-                    (ja, da.min(db))
+                    match p.star {
+                        Some((j, rd)) if j == ja => (ja, super::charsets::distinct(da, db, rd)),
+                        _ => (ja, da.min(db)),
+                    }
                 }
                 (Some(&(ja, da)), Some(&(jb, _))) if ja < jb => {
                     i += 1;
@@ -688,6 +786,7 @@ impl Greedy {
             };
             d.push((x.0, x.1.min(p.est).max(1.0)));
         }
+        let inputs = a.inputs.or(&b.inputs);
         let mut sum = Sum::new(p.cost, p.est, p.sorted);
         let now: Vec<usize> = (0..filters.len())
             .filter(|&f| {
@@ -714,6 +813,7 @@ impl Greedy {
         }
         self.units.push(Unit {
             sum,
+            inputs,
             vars,
             has,
             certain,
@@ -810,6 +910,9 @@ struct Best {
     how: How,
     a: u32,
     b: u32,
+    /// the join variable with the share of the product of its distinct values the join
+    /// keeps, when the characteristic sets estimate it
+    star: Option<(u32, f64)>,
 }
 
 /// What the program plans with: an input, or a plan of several inputs fixed by an
@@ -843,6 +946,8 @@ struct Dp {
     cached: Vec<Option<(VarId, u32)>>,
     /// filter (the first 64) → its selectivity measured on a sample
     fsel: Vec<Option<f64>>,
+    /// per input, the star masks of its patterns by join variable index
+    stars: Vec<Vec<(u32, u64)>>,
     ents: Vec<Ent>,
     dval: Vec<f64>,
 }
@@ -947,6 +1052,7 @@ impl Dp {
             jidx,
             cached,
             fsel,
+            stars: g.stars.clone(),
             ents: Vec::new(),
             dval: Vec::new(),
         })
@@ -1183,7 +1289,7 @@ impl Dp {
             // splits (sub, rest) with sub < rest, in the exhaustive program's order
             let mut sub = low;
             while sub != 0 {
-                self.split(r, m, sub, m ^ sub, ub, batched, &mut cur, &mut scratch);
+                self.split(r, m, sub, m ^ sub, ub, batched, ctx, &mut cur, &mut scratch);
                 sub = (sub - 1) & low;
             }
             self.finish(r, m, &mut cur);
@@ -1200,6 +1306,7 @@ impl Dp {
         rest: u32,
         ub: f64,
         batched: bool,
+        ctx: &Ctx,
         cur: &mut Vec<Best>,
         sc: &mut Scratch,
     ) {
@@ -1222,6 +1329,30 @@ impl Dp {
         if floor(leaf_a, r.minc[sub as usize]) + floor(leaf_b, r.minc[rest as usize]) > ub {
             return;
         }
+        // a join on one variable of patterns on it as a subject: from the characteristic
+        // sets
+        let star = if sh.count_ones() == 1 && !self.stars.iter().all(Vec::is_empty) {
+            let j = sh.trailing_zeros();
+            let mask = |inputs: u32| {
+                let mut m = 0;
+                for i in bits_of(inputs) {
+                    for &(x, s) in &self.stars[i] {
+                        if x == j {
+                            m = super::charsets::merge(m, s);
+                        }
+                    }
+                }
+                m
+            };
+            let (qa, qb) = (mask(ia), mask(ib));
+            if qa == 0 || qb == 0 {
+                None
+            } else {
+                super::charsets::factor(ctx, self.jvar[j as usize], qa, qb).map(|f| (j, f))
+            }
+        } else {
+            None
+        };
         let (ba, bb) = (self.bnd(ia), self.bnd(ib));
         let (ca, cb) = (self.cm[ia as usize], self.cm[ib as usize]);
         sc.shared.clear();
@@ -1274,7 +1405,7 @@ impl Dp {
                     s.da = self.dval[(a.d + pa) as usize];
                     s.db = self.dval[(b.d + pb) as usize];
                 }
-                let est = pair_est(&a.sum, &b.sum, shared);
+                let est = pair_est(&a.sum, &b.sum, shared, star.map(|(_, f)| f));
                 let probe_a = batched && a.probe.is_some();
                 let probe_b = batched && b.probe.is_some();
                 let mut floor = pair_floor(&a.sum, probe_a, &b.sum, probe_b, est);
@@ -1326,6 +1457,7 @@ impl Dp {
                         how: c.how,
                         a: ea,
                         b: eb,
+                        star: star.map(|(j, (_, rd))| (j, rd)),
                     };
                     match cur.iter_mut().find(|x| x.sorted == c.sorted) {
                         Some(x) if x.cost <= cost => {}
@@ -1354,7 +1486,10 @@ impl Dp {
                 let da = (ja >> j & 1 == 1).then(|| self.dval[(ea.d + rank(ba, j)) as usize]);
                 let db = (jbm >> j & 1 == 1).then(|| self.dval[(eb.d + rank(bb, j)) as usize]);
                 let x = match (da, db) {
-                    (Some(x), Some(y)) => x.min(y),
+                    (Some(x), Some(y)) => match b.star {
+                        Some((s, rd)) if s == j => super::charsets::distinct(x, y, rd),
+                        _ => x.min(y),
+                    },
                     (Some(x), None) | (None, Some(x)) => x,
                     (None, None) => unreachable!("a join variable of neither input"),
                 };

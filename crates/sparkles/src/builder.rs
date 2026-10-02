@@ -77,7 +77,33 @@ pub struct Stats {
     pub graphs: Vec<(u64, u64)>,
     /// (class id, distinct instances) for `rdf:type`
     pub classes: Vec<(u64, u64)>,
+    /// the characteristic sets of the subjects, most subjects first (see [`CharSet`])
+    #[serde(default)]
+    pub charsets: Vec<CharSet>,
+    /// subjects whose characteristic set is not in `charsets` (rare sets beyond
+    /// [`MAX_CHARSETS`])
+    #[serde(default)]
+    pub charset_others: u64,
 }
+
+/// A characteristic set (Neumann and Moerkotte, ICDE 2011): a set of predicates, the
+/// number of subjects whose predicates are exactly these, and the number of triples each
+/// predicate has over those subjects.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CharSet {
+    /// sorted
+    pub preds: Vec<u64>,
+    pub subjects: u64,
+    /// per predicate of `preds`
+    pub triples: Vec<u64>,
+}
+
+/// Characteristic sets kept in the statistics at most, those of the most subjects.
+pub const MAX_CHARSETS: usize = 10_000;
+
+/// Distinct characteristic sets counted while a build streams SPO at most; the subjects
+/// of sets found after that are counted as others.
+const MAX_CHARSETS_SEEN: usize = 1 << 20;
 
 impl Stats {
     pub fn predicate(&self, p: u64) -> Option<&PredicateStat> {
@@ -660,6 +686,12 @@ struct StatsCollector {
     // rdf:type classes in POS: (class, distinct subjects)
     classes: Vec<(u64, u64)>,
     class_cur: Option<(u64, u64, u64)>, // (class, n, last subject)
+    // characteristic sets in SPO: the current subject's (predicate, triples), and per
+    // set of predicates (subjects, triples per predicate)
+    cs_cur: Vec<(u64, u64)>,
+    cs_preds: Vec<u64>,
+    charsets: FxHashMap<Box<[u64]>, (u64, Vec<u64>)>,
+    cs_others: u64,
 }
 
 impl StatsCollector {
@@ -674,7 +706,37 @@ impl StatsCollector {
             out: Vec::new(),
             classes: Vec::new(),
             class_cur: None,
+            cs_cur: Vec::new(),
+            cs_preds: Vec::new(),
+            charsets: FxHashMap::default(),
+            cs_others: 0,
         }
+    }
+
+    /// Count the finished subject's characteristic set.
+    fn charset_done(&mut self) {
+        if self.cs_cur.is_empty() {
+            return;
+        }
+        self.cs_preds.clear();
+        self.cs_preds.extend(self.cs_cur.iter().map(|&(p, _)| p));
+        let room = self.charsets.len() < MAX_CHARSETS_SEEN;
+        match self.charsets.get_mut(&self.cs_preds[..]) {
+            Some((n, t)) => {
+                *n += 1;
+                for (x, &(_, c)) in t.iter_mut().zip(&self.cs_cur) {
+                    *x += c;
+                }
+            }
+            None if room => {
+                self.charsets.insert(
+                    self.cs_preds.clone().into_boxed_slice(),
+                    (1, self.cs_cur.iter().map(|&(_, c)| c).collect()),
+                );
+            }
+            None => self.cs_others += 1,
+        }
+        self.cs_cur.clear();
     }
 
     #[inline]
@@ -692,6 +754,16 @@ impl StatsCollector {
             self.run_distinct1 += 1;
         }
         self.run_count += 1;
+        if self.perm == Perm::Spo {
+            // key = (subject, predicate, object, graph)
+            if new0 {
+                self.charset_done();
+            }
+            match self.cs_cur.last_mut() {
+                Some((p, c)) if *p == k[1] => *c += 1,
+                _ => self.cs_cur.push((k[1], 1)),
+            }
+        }
         if self.perm == Perm::Pos && Some(k[0]) == self.rdf_type {
             // key = (type, class, subject, g)
             match &mut self.class_cur {
@@ -719,8 +791,28 @@ impl StatsCollector {
         if let Some((c, n, _)) = self.class_cur.take() {
             self.classes.push((c, n));
         }
+        self.charset_done();
         match self.perm {
-            Perm::Spo => stats.distinct_subjects = self.distinct0,
+            Perm::Spo => {
+                stats.distinct_subjects = self.distinct0;
+                let mut sets: Vec<CharSet> = std::mem::take(&mut self.charsets)
+                    .into_iter()
+                    .map(|(preds, (subjects, triples))| CharSet {
+                        preds: preds.into_vec(),
+                        subjects,
+                        triples,
+                    })
+                    .collect();
+                sets.sort_unstable_by(|a, b| {
+                    b.subjects
+                        .cmp(&a.subjects)
+                        .then_with(|| a.preds.cmp(&b.preds))
+                });
+                let others: u64 = sets.iter().skip(MAX_CHARSETS).map(|c| c.subjects).sum();
+                sets.truncate(MAX_CHARSETS);
+                stats.charsets = sets;
+                stats.charset_others = self.cs_others + others;
+            }
             Perm::Osp => stats.distinct_objects = self.distinct0,
             Perm::Pso => {
                 stats.distinct_predicates = self.distinct0;

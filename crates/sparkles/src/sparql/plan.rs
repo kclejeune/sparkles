@@ -1836,6 +1836,16 @@ impl<'a> Planner<'a> {
         if self.ctx.opt.sampled_filters && !filters.is_empty() {
             super::sample::prepare(self.ctx, &leaves, &filters);
         }
+        if self.ctx.opt.characteristic_sets {
+            let stars: Vec<(VarId, u64)> = triples
+                .iter()
+                .filter_map(|t| match (t.t[0], t.t[1], t.t[2]) {
+                    (PT::V(v), PT::C(p), PT::V(_)) => Some((v, p.0)),
+                    _ => None,
+                })
+                .collect();
+            super::charsets::register(self.ctx, &stars);
+        }
         // searches that read the rest of the group are attached to it at the end
         let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
             .into_iter()
@@ -2333,11 +2343,22 @@ impl<'a> Planner<'a> {
 // node constructors (with estimates)
 // ------------------------------------------------------------------------------
 
-pub(super) fn merge_dist(a: &Node, b: &Node, est: f64) -> FxHashMap<VarId, f64> {
+/// The distinct-value estimates of the join of `a` and `b` into `est` rows; `star` is the
+/// join variable with the share of the product of its distinct values that the join
+/// keeps, when the characteristic sets estimate it.
+pub(super) fn merge_dist(
+    a: &Node,
+    b: &Node,
+    est: f64,
+    star: Option<(VarId, f64)>,
+) -> FxHashMap<VarId, f64> {
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
         let x = match (a.vars.contains(v), b.vars.contains(v)) {
-            (true, true) => a.d(*v).min(b.d(*v)),
+            (true, true) => match star {
+                Some((s, rd)) if s == *v => super::charsets::distinct(a.d(*v), b.d(*v), rd),
+                _ => a.d(*v).min(b.d(*v)),
+            },
             (true, false) => a.d(*v),
             _ => b.d(*v),
         };
@@ -2355,6 +2376,38 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
         .map(|v| a.d(*v).max(b.d(*v)))
         .fold(1.0f64, f64::max);
     join_est_from(a.est, b.est, denom)
+}
+
+/// The estimated rows of joining `a` and `b` on `keys`, and, when the characteristic sets
+/// estimate the join, its variable with the share of the product of its distinct values
+/// that the join keeps.
+pub(super) fn join_est_with(
+    a: &Node,
+    b: &Node,
+    keys: &[VarId],
+    ctx: &Ctx,
+) -> (f64, Option<(VarId, f64)>) {
+    if let [v] = keys
+        && ctx.opt.characteristic_sets
+    {
+        let (mut qa, mut qb) = (Vec::new(), Vec::new());
+        super::charsets::of_node(ctx, a, &mut qa);
+        super::charsets::of_node(ctx, b, &mut qb);
+        let (qa, qb) = (
+            super::charsets::mask_of(&qa, *v),
+            super::charsets::mask_of(&qb, *v),
+        );
+        if let Some((rr, rd)) = super::charsets::factor(ctx, *v, qa, qb) {
+            return (star_est(a.est, b.est, rr), Some((*v, rd)));
+        }
+    }
+    (join_est(a, b, keys), None)
+}
+
+/// The estimated rows of joining `a_est` and `b_est` rows that keeps the share `rr` of
+/// their product (see [`super::charsets`]).
+pub(super) fn star_est(a_est: f64, b_est: f64, rr: f64) -> f64 {
+    (a_est * b_est * rr).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
 }
 
 /// The estimated rows of joining `a_est` and `b_est` rows where the join variables take
@@ -2379,8 +2432,8 @@ pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
 
-fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64) -> Node {
-    let est = join_est(&a, &b, &keys);
+fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64, ctx: &Ctx) -> Node {
+    let (est, star) = join_est_with(&a, &b, &keys, ctx);
     let mut vars = a.vars.clone();
     for v in &b.vars {
         if !vars.contains(v) {
@@ -2411,7 +2464,7 @@ fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, extra_cost: f64) 
         JoinAlgo::Cross => a.est * b.est,
     };
     let cost = a.cost + b.cost + base + est + extra_cost;
-    let dist = merge_dist(&a, &b, est);
+    let dist = merge_dist(&a, &b, est, star);
     let desc = format!(
         "on {}",
         if keys.is_empty() {
@@ -2488,7 +2541,7 @@ pub(super) fn merge_join(a: Node, b: Node, v: VarId, keys: &[VarId], ctx: &Ctx) 
     let (x, y) = (sort_node(a, v), sort_node(b, v));
     let mut k = vec![v];
     k.extend(keys.iter().filter(|x| **x != v));
-    let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0);
+    let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0, ctx);
     j.desc = format!("on ?{}", ctx.var_name(v));
     j
 }
@@ -2502,7 +2555,7 @@ pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, 0.0);
+    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, 0.0, ctx);
     h.desc = desc;
     h
 }
@@ -2521,7 +2574,7 @@ pub fn join(a: Node, b: Node, ctx: &Ctx) -> Node {
         return a;
     }
     if !a.vars.iter().any(|v| b.vars.contains(v)) {
-        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), 0.0);
+        let mut j = mk_join(a, b, JoinAlgo::Cross, Vec::new(), 0.0, ctx);
         j.desc = "cross product".into();
         return j;
     }
@@ -2554,7 +2607,7 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
                 .join(" ")
         ),
     };
-    let dist = merge_dist(&l, &r, est);
+    let dist = merge_dist(&l, &r, est, None);
     Node {
         kind: Kind::LeftJoin { expr },
         vars,

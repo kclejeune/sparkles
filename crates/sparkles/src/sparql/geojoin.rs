@@ -420,7 +420,7 @@ mod on {
         vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
         let mut certain = l.certain.clone();
         certain.extend(r.certain.iter().filter(|v| !l.certain.contains(v)));
-        let dist = merge_dist(&l, &r, est);
+        let dist = merge_dist(&l, &r, est, None);
         // packing or probing the boxes, and the exact test of each candidate
         let mut cost = (n + m) * (n.min(m) + 2.0).log2() + cands;
         let mut children = Vec::new();

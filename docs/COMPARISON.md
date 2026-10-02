@@ -265,6 +265,23 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   the 50,000 rows that pass and merges them with the ages. The query runs in 12 ms
   instead of 21 ms. Sampling adds 0.02 to 0.08 ms to planning a filter when the blocks are
   cached, and 0.3 to 0.6 ms when one has to be decoded.
+* **Star estimates from characteristic sets** (`characteristic_sets`). A join on a
+  variable estimated from distinct values assumes that the values of the side with fewer
+  are all among the other side's. For patterns on one subject this holds only when every
+  subject with the rarer predicate has the others. In WatDiv, where users have most
+  predicates independently of each other, it overestimated a star of six patterns
+  tenfold. A bulk load or compaction now counts the characteristic sets of the subjects,
+  after Neumann and Moerkotte: each set of predicates some subject has exactly, with its
+  subjects and the triples of each predicate. The statistics keep the 10,000 sets with
+  the most subjects. A join on a subject variable of patterns `?s p ?o`, with a constant
+  predicate and a variable object, is then estimated from the sets that hold the
+  predicates of both sides, including the number of triples per subject of each
+  predicate within those sets. Whatever else restricts an input is taken to be
+  independent of the predicates. Patterns with a constant object, predicates that the
+  kept sets cover poorly, and stores loaded before this change keep the estimate from
+  distinct values. On WatDiv at 1.1M triples, the joins of the C3 star are estimated
+  exactly, and C3 runs in 0.76 ms instead of 1.5 ms. C2 runs in 0.04 ms instead of
+  0.30 ms.
 * **Key ranges for a fixed start** (`filter_key_ranges`). Under a `STRSTARTS`, or a
   `REGEX` anchored on a literal start (`^abc` with no flag other than `s` and no
   alternation), the two operators above read only the base-vocabulary ids of the keys

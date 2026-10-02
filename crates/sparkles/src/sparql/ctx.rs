@@ -102,10 +102,13 @@ pub struct Optimizations {
     /// of the pattern's rows, whose share that passes is the planner's estimate of the
     /// share of its input it keeps (instead of 30%)
     pub sampled_filters: bool,
+    /// joins on a subject variable of patterns with constant predicates are estimated
+    /// from the characteristic sets in the statistics
+    pub characteristic_sets: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 23] = [
+    pub const NAMES: [&str; 24] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -129,6 +132,7 @@ impl Optimizations {
         "filter_scan_runs",
         "filter_key_ranges",
         "sampled_filters",
+        "characteristic_sets",
     ];
 
     /// Everything on.
@@ -156,6 +160,7 @@ impl Optimizations {
         filter_scan_runs: true,
         filter_key_ranges: true,
         sampled_filters: true,
+        characteristic_sets: true,
     };
 
     /// Everything off: the generic operators only.
@@ -183,6 +188,7 @@ impl Optimizations {
         filter_scan_runs: false,
         filter_key_ranges: false,
         sampled_filters: false,
+        characteristic_sets: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -210,6 +216,7 @@ impl Optimizations {
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "filter_key_ranges" => &mut self.filter_key_ranges,
             "sampled_filters" => &mut self.sampled_filters,
+            "characteristic_sets" => &mut self.characteristic_sets,
             _ => return None,
         })
     }
@@ -301,6 +308,8 @@ pub struct Ctx {
     warnings: parking_lot::Mutex<Vec<PlanWarning>>,
     /// FILTER selectivities measured on samples for this query, by conjunct text
     sampled: parking_lot::Mutex<FxHashMap<String, super::sample::Sampled>>,
+    /// the star predicates registered per subject variable (see [`super::charsets`])
+    pub(super) stars: parking_lot::Mutex<FxHashMap<VarId, super::charsets::StarVar>>,
 }
 
 impl Ctx {
@@ -334,6 +343,7 @@ impl Ctx {
             geo: Default::default(),
             warnings: Default::default(),
             sampled: Default::default(),
+            stars: Default::default(),
         }
     }
 
