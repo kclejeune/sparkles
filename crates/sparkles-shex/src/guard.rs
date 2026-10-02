@@ -20,6 +20,14 @@
 //! constraint and no `{FOCUS p …}` selector mentions (a neighbourhood holds only the arcs
 //! of the predicates its shape mentions; a CLOSED shape reads every outgoing arc, so a
 //! schema with one is always validated).
+//!
+//! The guard knows the exact counts of the head's result map (after a full validation,
+//! kept up to date by every validated write and persisted in `validation-status.json`).
+//! A write then validates only the associations whose result it can change (see
+//! [`incremental`]), in the states before and after it, and moves the counts by the
+//! difference. It validates in full when the state of the head is unknown, in `reject`
+//! mode when the head does not conform, for bulk writes, for a map with a SPARQL
+//! selector, and when too many nodes are affected.
 
 use crate::ast::Schema;
 use crate::ir::Ir;
@@ -35,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use sparkles::commit::CommitKind;
 use sparkles::guard::config::{
     Baseline, CONFIG_FILE, CheckHistory, CheckRecord, Counters, DataGraphSel, DecisionCounts,
-    sha256_hex, write_atomic,
+    STATUS_FILE, StatusFile, sha256_hex, write_atomic,
 };
 use sparkles::guard::{
     Candidate, Changes, CommitGuard, GuardLanguage, GuardMode, GuardStatus, Severity,
@@ -43,8 +51,9 @@ use sparkles::guard::{
 };
 use sparkles::id::Id;
 use sparkles::store::{Snapshot, Store};
+use sparkles::validation::DataGraph;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -174,6 +183,27 @@ pub struct ShexValidationStatus {
     pub recent_rejections: Vec<CheckRecord>,
 }
 
+mod incremental;
+
+/// Affected nodes past which a write is validated in full.
+const MAX_FOCUS: usize = 50_000;
+/// Nodes the walk from the changed triples may visit before a write is validated in full.
+const MAX_VISIT: usize = 100_000;
+
+/// The exact counts of the result map of a commit.
+#[derive(Clone, Copy, Debug)]
+struct Exact {
+    commit: u64,
+    nonconformant: u64,
+    total: u64,
+}
+
+struct Pending {
+    seq: u64,
+    baseline: Baseline,
+    exact: Option<Exact>,
+}
+
 /// Write-time ShEx validation of one store.
 pub struct ShexGuard {
     cfg: ShexValidationConfig,
@@ -182,8 +212,14 @@ pub struct ShexGuard {
     shape_count: usize,
     /// the predicates a validation can read (see [`read_predicates`])
     reads: Option<Vec<String>>,
-    pending: Mutex<Option<(u64, Baseline)>>,
+    /// what a write can affect
+    plan: incremental::Plan,
+    pending: Mutex<Option<Pending>>,
     baseline: Mutex<Option<Baseline>>,
+    exact: Mutex<Option<Exact>>,
+    /// the database directory and the SHA-256 of its `validation.json`, where the state
+    /// of each validated commit is kept
+    persist: Option<(PathBuf, String)>,
     counters: DecisionCounts,
     last_full: AtomicU64,
     /// associations of the last validation (`u64::MAX`: none yet)
@@ -194,9 +230,17 @@ pub struct ShexGuard {
 }
 
 impl ShexGuard {
-    fn new(cfg: ShexValidationConfig, loaded: Loaded, map: ShapeMap) -> ShexGuard {
+    fn new(
+        cfg: ShexValidationConfig,
+        loaded: Loaded,
+        map: ShapeMap,
+        persist: Option<(PathBuf, String)>,
+    ) -> ShexGuard {
         ShexGuard {
             reads: read_predicates(loaded.compiled.ir(), &map),
+            plan: incremental::Plan::new(loaded.compiled.ir(), &map),
+            exact: Mutex::new(None),
+            persist,
             cfg,
             schema: Arc::new(loaded.compiled),
             map,
@@ -251,11 +295,7 @@ impl ShexGuard {
             .report_limit
             .unwrap_or(self.cfg.report_limit)
             .clamp(1, 10_000);
-        let Some(graphs) = self
-            .cfg
-            .data_graph
-            .graphs(view, self.cfg.include_inferences, &[])
-        else {
+        let Some(vo) = self.options(view, o, self.deadline(t0, o)) else {
             // none of the listed data graphs exists: nothing to validate
             self.associations.store(0, Ordering::Relaxed);
             let empty = ResultMap {
@@ -264,11 +304,32 @@ impl ShexGuard {
             };
             return Ok(self.summarize(empty, limit, 0));
         };
-        let mut deadline = t0 + Duration::from_secs_f64(self.cfg.timeout_seconds);
-        if let Some(d) = o.deadline {
-            deadline = deadline.min(d);
-        }
-        let vo = ValidateOptions {
+        let rm = crate::validate(view, &self.schema, &self.map, &vo).map_err(engine_error)?;
+        let ms = t0.elapsed().as_millis() as u64;
+        self.last_full.store(ms, Ordering::Relaxed);
+        self.associations
+            .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
+        *self.warnings.lock() = rm.warnings.clone();
+        Ok(self.summarize(rm, limit, ms))
+    }
+
+    fn deadline(&self, t0: Instant, o: &WriteOptions) -> Instant {
+        let d = t0 + Duration::from_secs_f64(self.cfg.timeout_seconds);
+        o.deadline.map_or(d, |x| d.min(x))
+    }
+
+    /// Validation options over `snap` (`None`: none of the listed data graphs exists).
+    fn options(
+        &self,
+        snap: &Snapshot,
+        o: &WriteOptions,
+        deadline: Instant,
+    ) -> Option<ValidateOptions> {
+        let graphs = self
+            .cfg
+            .data_graph
+            .graphs(snap, self.cfg.include_inferences, &[])?;
+        Some(ValidateOptions {
             data_graph: graphs.data_graph,
             extra_graphs: graphs.extra_graphs,
             exclude_graphs: graphs.exclude_graphs,
@@ -281,14 +342,144 @@ impl ShexGuard {
                 ..Default::default()
             }),
             ..Default::default()
+        })
+    }
+
+    /// Validate in full, saying why it is not incremental.
+    fn full(
+        &self,
+        c: &Candidate<'_>,
+        reason: &str,
+    ) -> sparkles::Result<(ValidationSummary, Exact)> {
+        let mut s = self.validate_state(&c.view, c.opts)?;
+        s.fallback = Some(reason.to_string());
+        s.focus_nodes = Some(s.total);
+        let exact = Exact {
+            commit: c.base.commit + 1,
+            nonconformant: s.blocking,
+            total: s.total,
         };
-        let rm = crate::validate(view, &self.schema, &self.map, &vo).map_err(engine_error)?;
-        let ms = t0.elapsed().as_millis() as u64;
-        self.last_full.store(ms, Ordering::Relaxed);
-        self.associations
-            .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
-        *self.warnings.lock() = rm.warnings.clone();
-        Ok(self.summarize(rm, limit, ms))
+        Ok((s, exact))
+    }
+
+    /// Validate a write to the data graph: the associations it can affect when the
+    /// counts of the head are known, everything otherwise.
+    fn check_data(&self, c: &Candidate<'_>) -> sparkles::Result<(ValidationSummary, Exact)> {
+        let t0 = Instant::now();
+        let Changes::Log(log) = c.changes else {
+            return self.full(c, "bulk");
+        };
+        if self.plan.sparql {
+            return self.full(c, "sparql");
+        }
+        let exact = *self.exact.lock();
+        let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
+            return self.full(c, "baseline");
+        };
+        if self.cfg.mode == GuardMode::Reject && exact.nonconformant > 0 {
+            // the report must show the associations that block every write
+            return self.full(c, "baseline");
+        }
+        let mut graphs: FxHashMap<u64, bool> = FxHashMap::default();
+        let mut seen: FxHashSet<[Id; 3]> = FxHashSet::default();
+        let mut changes = Vec::new();
+        for (_, q) in log.iter() {
+            let data = *graphs.entry(q[3].0).or_insert_with(|| {
+                self.cfg
+                    .data_graph
+                    .touches(&c.view, q[3].0, self.cfg.include_inferences, &[])
+            });
+            if data && seen.insert([q[0], q[1], q[2]]) {
+                changes.push([q[0], q[1], q[2]]);
+            }
+        }
+        let deadline = self.deadline(t0, c.opts);
+        let base = Arc::new(c.base.clone());
+        let state =
+            |snap: &Arc<Snapshot>| -> sparkles::Result<Option<(ValidateOptions, DataGraph)>> {
+                let Some(vo) = self.options(snap, c.opts, deadline) else {
+                    return Ok(None);
+                };
+                let data = DataGraph::new(
+                    snap.clone(),
+                    vo.data_graph.as_deref(),
+                    &vo.extra_graphs,
+                    &vo.exclude_graphs,
+                )?;
+                Ok(Some((vo, data)))
+            };
+        let post = state(&c.view)?;
+        let pre = state(&base)?;
+        let affected = self.plan.affected(
+            &c.view,
+            [post.as_ref().map(|s| &s.1), pre.as_ref().map(|s| &s.1)],
+            &changes,
+            MAX_VISIT,
+        )?;
+        let Some(affected) = affected.filter(|a| a.len() <= MAX_FOCUS) else {
+            return self.full(c, "budget");
+        };
+        let nodes: Vec<(Id, oxrdf::Term)> = affected
+            .into_iter()
+            .filter_map(|id| c.view.term(id).map(|t| (id, t)))
+            .collect();
+        let run = |snap: &Arc<Snapshot>, st: &Option<(ValidateOptions, DataGraph)>| {
+            let map =
+                incremental::associations(&self.map, &c.view, st.as_ref().map(|s| &s.1), &nodes)?;
+            match st {
+                Some((vo, _)) if !map.0.is_empty() => {
+                    crate::validate(snap, &self.schema, &map, vo).map_err(engine_error)
+                }
+                _ => Ok(ResultMap {
+                    conforms: true,
+                    ..Default::default()
+                }),
+            }
+        };
+        let after = run(&c.view, &post)?;
+        let before = run(&base, &pre)?;
+        // the associations elsewhere are unchanged: move the counts by the difference
+        let move_by =
+            |n: u64, minus: usize, plus: usize| (n + plus as u64).checked_sub(minus as u64);
+        let (Some(nonconformant), Some(total)) = (
+            move_by(
+                exact.nonconformant,
+                before.nonconformant,
+                after.nonconformant,
+            ),
+            move_by(
+                exact.total,
+                before.conformant + before.nonconformant,
+                after.conformant + after.nonconformant,
+            ),
+        ) else {
+            return self.full(c, "baseline");
+        };
+        let focus = (after.conformant + after.nonconformant) as u64;
+        let limit = c
+            .opts
+            .report_limit
+            .unwrap_or(self.cfg.report_limit)
+            .clamp(1, 10_000);
+        let mut s = self.summarize(after, limit, t0.elapsed().as_millis() as u64);
+        s.strategy = Strategy::Incremental;
+        s.blocking = nonconformant;
+        s.total = total;
+        s.by_severity.violation = nonconformant;
+        s.conforms = nonconformant == 0;
+        s.status = match (nonconformant > 0, self.cfg.mode) {
+            (true, GuardMode::Reject) => GuardStatus::Rejected,
+            (true, _) => GuardStatus::Warned,
+            (false, _) => GuardStatus::Passed,
+        };
+        s.focus_nodes = Some(focus);
+        self.associations.store(total, Ordering::Relaxed);
+        let exact = Exact {
+            commit: c.base.commit + 1,
+            nonconformant,
+            total,
+        };
+        Ok((s, exact))
     }
 
     /// Count and bound the results, and decide: every nonconformant association blocks.
@@ -403,8 +594,13 @@ impl CommitGuard for ShexGuard {
                 .lock()
                 .clone()
                 .map(|b| Baseline { commit: seq, ..b });
-            if let Some(b) = baseline {
-                *self.pending.lock() = Some((seq, b));
+            let exact = self.exact.lock().map(|e| Exact { commit: seq, ..e });
+            if let Some(baseline) = baseline {
+                *self.pending.lock() = Some(Pending {
+                    seq,
+                    baseline,
+                    exact,
+                });
             }
             let mut s =
                 ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, Severity::Violation);
@@ -412,11 +608,15 @@ impl CommitGuard for ShexGuard {
             s.limit = self.cfg.report_limit;
             return Ok(s);
         }
-        let summary = self.validate_state(&c.view, c.opts)?;
+        let (summary, exact) = self.check_data(c)?;
         self.counters.count(summary.status);
         self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {
-            *self.pending.lock() = Some((seq, baseline_of(&summary, seq)));
+            *self.pending.lock() = Some(Pending {
+                seq,
+                baseline: baseline_of(&summary, seq),
+                exact: Some(exact),
+            });
         }
         Ok(summary)
     }
@@ -424,13 +624,22 @@ impl CommitGuard for ShexGuard {
     fn committed(&self, seq: u64) {
         let p = self.pending.lock().take();
         match p {
-            Some((s, b)) if s == seq => *self.baseline.lock() = Some(b),
+            Some(p) if p.seq == seq => {
+                if let (Some((root, hash)), Some(_)) = (&self.persist, &p.exact)
+                    && let Err(e) = StatusFile::of(&p.baseline, hash).write(root)
+                {
+                    tracing::warn!("cannot write {STATUS_FILE}: {e}");
+                }
+                *self.baseline.lock() = Some(p.baseline);
+                *self.exact.lock() = p.exact;
+            }
             // a commit the guard did not judge: the state is unknown
             _ => {
                 if let Some(b) = self.baseline.lock().as_mut() {
                     b.commit = seq;
                     b.conforms = None;
                 }
+                *self.exact.lock() = None;
             }
         }
     }
@@ -440,6 +649,7 @@ impl CommitGuard for ShexGuard {
         if let Some(b) = self.baseline.lock().as_mut() {
             b.conforms = None;
         }
+        *self.exact.lock() = None;
     }
 
     fn describe(&self) -> String {
@@ -603,6 +813,11 @@ fn parse_map(src: &MapSource, schema: &CompiledSchema) -> Result<ShapeMap> {
 /// The ShEx configuration of a database, if `validation.json` is one (`None` without a
 /// file; an error for a SHACL configuration or one that does not parse).
 pub fn read_config(root: &Path) -> Result<Option<ShexValidationConfig>> {
+    Ok(read_config_hashed(root)?.map(|(c, _)| c))
+}
+
+/// [`read_config`], and the SHA-256 of the file.
+fn read_config_hashed(root: &Path) -> Result<Option<(ShexValidationConfig, String)>> {
     let path = root.join(CONFIG_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -612,7 +827,7 @@ pub fn read_config(root: &Path) -> Result<Option<ShexValidationConfig>> {
     let cfg: ShexValidationConfig =
         serde_json::from_slice(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     cfg.check()?;
-    Ok(Some(cfg))
+    Ok(Some((cfg, sha256_hex(&bytes))))
 }
 
 /// Install the guard of a persistent store from its ShEx `validation.json` (after
@@ -623,7 +838,7 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     let Some(root) = store.root() else {
         return Ok(None);
     };
-    let Some(cfg) = read_config(root)? else {
+    let Some((cfg, hash)) = read_config_hashed(root)? else {
         return Ok(None);
     };
     if cfg.mode == GuardMode::Off {
@@ -632,7 +847,23 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
     }
     let loaded = load_copy(&cfg, root)?;
     let map = parse_map(&cfg.shape_map, &loaded.compiled)?;
-    let g = Arc::new(ShexGuard::new(cfg, loaded, map));
+    let g = Arc::new(ShexGuard::new(
+        cfg,
+        loaded,
+        map,
+        Some((root.to_path_buf(), hash.clone())),
+    ));
+    // the state of the head, when the status file records it for this configuration
+    let head = store.head_commit().seq;
+    if let Some(b) = StatusFile::read(root, head, &hash) {
+        *g.exact.lock() = Some(Exact {
+            commit: head,
+            nonconformant: b.blocking,
+            total: b.total,
+        });
+        g.associations.store(b.total, Ordering::Relaxed);
+        *g.baseline.lock() = Some(b);
+    }
     store.set_guard(Some(g.clone()));
     store.set_guard_required(true);
     Ok(Some(g))
@@ -667,6 +898,7 @@ pub fn set_config(
         store.set_guard_required(false);
         if let Some(r) = &root {
             sparkles::guard::config::remove_files(r, &[])?;
+            StatusFile::remove(r)?;
         }
         drop(txn);
         return Ok(SetOutcome::Removed);
@@ -702,23 +934,33 @@ pub fn set_config(
     }
     let file = loaded.file;
     let text = std::mem::take(&mut loaded.text);
-    let guard = Arc::new(ShexGuard::new(cfg, loaded, map));
+    let mut guard = ShexGuard::new(cfg, loaded, map, None);
 
     let view = Arc::new(txn.view());
     let summary = guard.validate_state(&view, &WriteOptions::default())?;
     if guard.cfg.mode == GuardMode::Reject && summary.blocking > 0 {
         return Ok(SetOutcome::NotConforming(summary));
     }
+    let head = txn.base().commit;
+    let baseline = baseline_of(&summary, head);
     if let Some(r) = &root {
         // a configuration of either language this one replaces leaves nothing behind
         sparkles::guard::config::remove_files(r, &[CONFIG_FILE, file])?;
+        StatusFile::remove(r)?;
         write_atomic(&r.join(file), text.as_bytes())?;
-        write_atomic(
-            &r.join(CONFIG_FILE),
-            &serde_json::to_vec_pretty(&guard.cfg)?,
-        )?;
+        let bytes = serde_json::to_vec_pretty(&guard.cfg)?;
+        write_atomic(&r.join(CONFIG_FILE), &bytes)?;
+        let hash = sha256_hex(&bytes);
+        StatusFile::of(&baseline, &hash).write(r)?;
+        guard.persist = Some((r.clone(), hash));
     }
-    *guard.baseline.lock() = Some(baseline_of(&summary, view.commit));
+    *guard.exact.lock() = Some(Exact {
+        commit: head,
+        nonconformant: summary.blocking,
+        total: summary.total,
+    });
+    *guard.baseline.lock() = Some(baseline);
+    let guard = Arc::new(guard);
     store.set_guard(Some(guard.clone()));
     store.set_guard_required(true);
     drop(txn);
