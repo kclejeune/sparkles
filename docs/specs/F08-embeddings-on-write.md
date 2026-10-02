@@ -1,6 +1,11 @@
 # F08: Embeddings computed on write
 
-> **Status:** designed, not built
+> **Status:** implemented in part
+>
+> **Phases:** Phase 1 shipped: the configuration, the worker, the input record, full
+> passes, `reembed`, status, text queries, the HTTP, CLI, Python and UI surfaces, and tests
+> with a mock provider. Phase 2 (chunking, metrics, a token-based rate limit) is not
+> built.
 >
 > **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
@@ -491,4 +496,93 @@ text's bytes, with an index `docs` on `ex:emb`, dimension 8, embedding `rdfs:lab
 
 ## Outcome
 
-Not built yet.
+**Delivered** on 2026-10-02, as Phase 1.
+
+* **Configuration.** `VectorIndexConfig` has an optional `embedding` object with the
+  fields of §2.1, validated with the index and stored in `vector.json`. The index's
+  predicate cannot be a source, a query source cannot also set `classes` or `languages`,
+  and changing the object keeps the index's build. The engine code is in
+  `crates/sparkles/src/vector/embed/` (configuration, client, worker state and a mock
+  endpoint) and `crates/sparkles/src/store/embed.rs` (scheduling, passes, the prepare and
+  apply steps, status and text queries).
+* **Scheduling.** `publish_log` calls a hook after it publishes a commit. The hook
+  matches the commit's log against the source predicates and `rdf:type` with a listed
+  class, and queues the (subject, graph) pairs as vocabulary keys, or schedules a full
+  pass past 10,000 pairs. Commits of the new kind `embed` (code 11) schedule nothing. A
+  bulk commit, a store's opening, a new embedding configuration and `reembed` schedule a
+  full pass.
+* **Record.** Each index keeps a map from a 64-bit FNV-1a hash of the pair's keys to a
+  hash of its sorted inputs in `embed/<name>.log`. The file has a header with the provider
+  identity and 16-byte records appended after each batch, and it is rewritten when it
+  holds more than twice as many records as pairs. A pair needs work when its inputs hash
+  differs from the record, or when its vector count differs from its distinct inputs.
+* **Worker.** `Store::embed_prepare`, `Batch::run` and `Store::embed_apply` are the three
+  steps, and `vector::embed::run_worker` loops over them with a closure that reaches the
+  store. The server starts one worker thread per dataset with an embedding index, from a
+  supervisor that looks every second and from the `PUT` and `reembed` handlers. The
+  thread holds only a weak reference to its dataset between steps. Indexes of one
+  dataset take turns, one batch at a time. The apply step skips the check of a batch's
+  inputs when no commit came between the prepare step and the write.
+* **Client.** Requests go through a new `outbound::post_json`, which uses the policy's
+  checked resolver, redirect checks, timeouts and response ceiling. Retries follow
+  §4.7. `Retry-After` is read as seconds. A batch rejected with another `4xx` is split
+  in halves. The last 4096 inputs and query texts are cached per dataset, shared by the
+  worker and the searches, and `reembed` clears the cache.
+* **Server and CLI.** The server gained `serve --embedding-secret NAME=env:VAR|file:PATH`
+  and `--no-embedding`, the route `POST /$/vector/{ds}/{name}/reembed`, and the
+  `embedding` status in `GET /$/vector/{ds}/{name}`. `sparkles vector create` gained the
+  `--embed-*` flags, and `vector embed` and `vector reembed` run the worker on a local
+  database until nothing is left. A read-only server starts no worker.
+* **Python.** The package gained `Dataset.embed(timeout=, allow_private=, secrets=)` and
+  `Dataset.reembed_vector_index(name)`, and `create_vector_index` takes the `embedding`
+  object in its options.
+* **UI.** The index card shows the worker's state, model, endpoint, progress, counts and
+  last error, and has a "Re-embed" action for administrators. The create and edit
+  dialog takes the `embedding` object as JSON and keeps it when an index is edited. The
+  mock server reports a worker that drains a backlog.
+
+**Deviations.**
+* A query source schedules a full pass after any commit that is not an `embed` commit,
+  not only after commits that touch a predicate the query names (§4.2). The passes are
+  still at least a second apart.
+* The status also returns the `embedding` object as `config`, so that the UI can edit
+  it. URLs with credentials are refused, so the object never holds a secret.
+* The status is `paused` whenever work waits and no worker runs, which includes the
+  pass every store owes when it is opened by a local command.
+* The cache holds 4096 entries per dataset, not 1024 query texts per index, and it
+  holds stored inputs as well.
+* A batch takes up to `batchSize` pairs. Their inputs go out in requests of at most
+  `batchSize` inputs each.
+* `vector embed` and the local `vector reembed` take `--embed-timeout` and the local
+  `--outbound-*` flags.
+* Backups and clones do not hold the record, because it could be newer than the
+  backup's commit. A restored or cloned dataset embeds its text again when its worker
+  first runs.
+
+**Decisions on the open questions (§9).** The worker owns the index's predicate.
+Embedding commits make materialized inferences stale like any commit to a watched graph.
+Query texts have no quota of their own beyond the rate limits.
+
+**Tests at landing.**
+* `crates/sparkles/tests/embeddings.rs`: inserts, changes and deletions, languages,
+  classes, graphs and combined inputs, query sources, outages and backoff, rejected
+  inputs, restarts with the record, `reembed` and a new model, bulk loads, text
+  searches, secrets, the outbound policy, `--no-embedding`, configuration errors, and
+  text that changes while its request is out. They run against the mock endpoint in
+  `vector::embed::mock`.
+* Unit tests of the configuration, the language ranges and the response parsing in
+  `vector/embed/`.
+* The server's router tests (`http/router_tests/embeddings.rs`) cover the API's key and
+  policy checks, the worker the server starts, text searches and `reembed`.
+  `crates/sparkles-server/tests/cli_vector.rs` covers the CLI. The Python suite runs a
+  small embeddings server in Python. The UI has Vitest tests for the dialog's JSON and
+  the status text.
+
+**Performance.** Not measured against a real provider. The commit hook adds a few
+lookups per commit and one hash check per changed quad, and a full pass reads every
+selected literal once.
+
+**Not built.** Phase 2: chunking, metrics in `/$/metrics`, and a token-based rate
+limit. The NixOS module has no vector settings, so it gained no embedding options, and
+`--embedding-secret` goes through its `extraArgs`. The Similar page and the MCP tool
+`similar_entities` do not search with text.

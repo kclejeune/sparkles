@@ -1514,7 +1514,7 @@ type Commit = {
   seq: number; parent: number | null; ref: string;   // "commit:42"
   timestamp: string;             // RFC 3339 UTC with milliseconds, never decreasing
   kind: "create" | "baseline" | "update" | "gsp-put" | "gsp-post" | "gsp-delete"
-      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "unknown";
+      | "upload" | "load" | "reason" | "reason-clear" | "transaction" | "embed" | "unknown";
   inserted: number; deleted: number;   // net change relative to the parent
   quads: number;                        // dataset size after the commit
   generation: string;                   // index generation it was made in
@@ -2690,7 +2690,9 @@ matched.
 
   * The first argument is the embedding predicate.
   * The query is a vector literal, an entity whose single vector under that predicate is
-    used, or a variable that the rest of the group binds to either.
+    used, or a variable that the rest of the group binds to either. When the predicate's
+    index computes its vectors, the query can also be a text, which is embedded with the
+    same model ([Embeddings on write](#embeddings-on-write)).
   * `k` defaults to 10 (at most 10000).
   * Options are string literals after `k`:
 
@@ -2779,7 +2781,7 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
 rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
 `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
@@ -2800,6 +2802,147 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Embeddings on write
+
+The design and its rationale are in [F08 Embeddings computed on write](specs/F08-embeddings-on-write.md).
+
+A vector index can compute its own vectors. Its configuration then names the literals to
+embed and an embeddings endpoint that speaks OpenAI's `POST /v1/embeddings` protocol.
+OpenAI, Ollama, vLLM, LM Studio, llama.cpp's server, Hugging Face's Text Embeddings
+Inference and most gateways serve that protocol. After each commit, a background worker
+sends the selected text to the endpoint and writes the returned vectors as `spk:vector`
+literals under the index's predicate, in the literal's graph. Everything else in this
+section about searches and indexes then applies to those vectors unchanged.
+
+```json
+PUT /$/vector/ds/docs
+{
+  "predicate": "http://example.org/embedding",
+  "dimension": 768,
+  "embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings",
+    "model": "nomic-embed-text",
+    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"],
+    "languages": ["en", ""],
+    "inputPrefix": "search_document: ",
+    "queryPrefix": "search_query: "
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `url` | required | The endpoint, an `http` or `https` URL without credentials. |
+| `model` | required | The `model` of each request. |
+| `apiKey` | none | `{"secret": NAME}`, a secret the server defines with `--embedding-secret`. The local CLI and the libraries also accept `{"env": VAR}` and `{"file": PATH}`. Without it, requests carry no `Authorization` header. |
+| `sendDimensions` | `false` | Sends the index's dimension as `dimensions`, for models that shorten their output on request. |
+| `predicates` | — | The predicates whose `xsd:string` and language-tagged literals are embedded. One of `predicates` and `query` is required. |
+| `languages` | all | Language ranges a literal's tag must match, by RFC 4647 basic filtering. `""` matches literals without a tag. |
+| `classes` | all | The subject must have one of these types in the literal's graph. |
+| `query` | — | A SELECT that binds `?s` and `?text`, and optionally `?g`, instead of `predicates`. Rows without `?g` write to the default graph. |
+| `combine` | `false` | Embeds a subject's selected texts in one graph as one input, joined by newlines. Without it, each literal gets its own vector. |
+| `inputPrefix`, `queryPrefix` | `""` | Text put before stored inputs and before query texts, for models trained with instructions. |
+| `queryText` | `true` | Whether searches may pass text for this index. |
+| `batchSize` | 64 | Inputs per request, 1 to 2048. |
+| `maxInputChars` | 8000 | Inputs are cut at this many characters. |
+| `requestsPerMinute` | 0 | A ceiling on requests per minute. 0 sets none. |
+| `maxRetries` | 5 | Retries after a network error, a timeout, `429` or `5xx`, with exponential backoff from 1 s to 60 s, or after the provider's `Retry-After`. |
+| `timeoutSecs` | 60 | The time one request may take, within the outbound timeout. |
+
+The index's predicate cannot also be a source predicate. Changing the `embedding` object
+keeps the index's build.
+
+* **What the worker writes.** It owns the index's predicate. After it reconciles a
+  subject in a graph, the subject's vectors there are exactly the vectors of its current
+  inputs. A changed literal gets a new vector, and a deleted one loses its vector. A
+  vector written by hand under the predicate is replaced when the subject's text changes
+  and removed when the subject has no selected text. The worker's commits have the kind
+  `embed` and the message `embeddings of vector index NAME`, and they go through
+  write-time validation, the quota and the disk reserve like any other commit.
+* **Consistency.** Embeddings are eventually consistent, and writes never wait for
+  them. A query sees the vectors committed in its snapshot. A subject whose text is new
+  has no vector until the worker reconciles it, a changed text keeps its old vector until
+  then, and deleted text keeps its vector for that long too. `appliedSeq` in the status
+  is the newest commit whose text has all been embedded or has failed. A client that
+  needs its own write in vector search waits until `appliedSeq` reaches the `seq` of its
+  commit receipt.
+* **Catching up.** A commit notes the subjects whose selected text it touched. A bulk
+  load, the start of a worker, `reembed` and, for a `query` source, any commit run a full
+  pass instead, which compares every subject's inputs with a record of what was embedded
+  and sends only those that differ. The record is kept in `embed/NAME.log` in the
+  database directory, so a restart sends nothing for text that did not change, and
+  commits made while no worker ran (from `sparkles update --loc`, say) are caught up. A
+  new `model`, dimension, `sendDimensions` or `combine` embeds everything again, and a new
+  URL or key does not. Backups and clones do not hold the record, so a restored or cloned
+  dataset embeds its text again when its worker first runs.
+* **Failures.** A provider outage never blocks a write. After its retries the worker
+  keeps the batch, waits a minute (five after `401` or `403`) and tries again while the
+  backlog grows. A batch that gets another `4xx` is split until the inputs at fault fail
+  alone. A failed input, or a vector of the wrong dimension, counts as `failed` and is not
+  sent again until its text changes or a full pass runs.
+* **Searching with text.** `(?s ?score) spk:vectorSearch (ex:embedding "rivers of
+  southern France" 10)` embeds `queryPrefix` and the text with the index's provider and
+  searches with the result. A variable bound to a string works the same way, and so does
+  the vector list of `spk:hybridSearch`. The last 4096 inputs and query texts are cached
+  per dataset. A predicate without an embedding index, or with `queryText: false`, gives
+  `400`, and a provider failure gives `502`, as a failed SERVICE call does.
+* **Memory.** The record takes about 32 bytes per subject and graph, a waiting subject
+  about 100 bytes, and the cache up to 4096 vectors (12 MiB at 768 dimensions). This
+  memory buys restarts and repeated texts that send nothing to the provider.
+
+| Method | Path | Result |
+|---|---|---|
+| POST | `/$/vector/{ds}/{name}/reembed` | Embeds every selected text of the index again, for example after the model behind a name changed. Answers `202` and the index's status. Needs `admin`. |
+
+The status of an index that computes its vectors has an `embedding` object:
+
+```ts
+type EmbeddingStatus = {
+  state: "idle" | "scanning" | "embedding" | "backoff" | "paused" | "disabled";
+  model: string; endpoint: string;          // the URL without query
+  backlog: number;                          // subjects (per graph) waiting
+  scan?: { done: number; total: number };   // a full pass in progress
+  appliedSeq: number; headSeq: number;
+  embedded: number; requests: number; failed: number;   // since the store was opened
+  lastError?: { at: string; message: string; subject?: string };
+  retryAt?: string; lastBatch?: { at: string; inputs: number; ms: number };
+  config: EmbeddingConfig;                  // the embedding object, which holds no keys
+};
+```
+
+`paused` means that no worker runs for the dataset, as on a read-only server or a store
+opened by a local command. `disabled` means the server runs with `--no-embedding`.
+
+**Data egress.** Sparkles sends text to a provider only for an index whose configuration
+names one, and only the selected literals and the texts of searches. Every request goes
+through the server's outbound policy (`--outbound-*`, see
+[USAGE](USAGE.md#outbound-requests-service-and-load)), so a server refuses a provider on a loopback or
+private address unless that policy allows it. `PUT` refuses a URL the policy refuses
+outright. Through the API, an `apiKey` can only name an operator's secret, because a
+dataset administrator could otherwise send any environment variable or file of the server
+to an endpoint of their choice. Keys are read when a request is made, never stored in
+`vector.json`, and never returned.
+
+`PUT` answers `400` for an invalid `embedding` object, an `apiKey` with `env` or `file`,
+an unknown secret name, a URL with credentials, or a URL the outbound policy refuses.
+
+The CLI:
+
+```sh
+sparkles vector create  --loc DB --name NAME --predicate IRI --dim D --embed-url URL --embed-model MODEL
+                        (--embed-from IRI … | --embed-query SPARQL) [--embed-lang RANGE …] [--embed-class IRI …]
+                        [--embed-api-key-env VAR | --embed-api-key-file PATH | --embed-secret NAME]
+                        [--embed-config FILE|JSON]
+sparkles vector embed   --loc DB [--name NAME] [--embed-timeout 3600] [--embedding-secret NAME=env:VAR]
+sparkles vector reembed --loc DB --name NAME     # or --server URL --dataset NAME
+sparkles serve --embedding-secret openai=env:OPENAI_API_KEY [--no-embedding]
+```
+
+`--embed-config` reads the whole `embedding` object, and the other `--embed-*` flags
+override its fields. `vector embed` and a local `vector reembed` run the worker until
+nothing is left and use the local outbound policy, which allows private addresses unless
+`--outbound-block-private`. They exit with an error when the provider keeps failing.
 
 ### Hybrid text and vector search
 
@@ -2836,7 +2979,8 @@ SELECT ?s ?score ?textRank ?vectorRank WHERE {
 * **Fusion.** A subject's score is the sum of `weight / (k + rank)` over the lists that
   hold it. The best `limit` subjects are returned, and ties break by term id.
 * **Restrictions.** The text list takes no `highlight:` option. The vector query must be
-  a vector literal or an entity, and `candidates:join` is refused. Errors follow the two
+  a vector literal, an entity or a text for an index that computes its vectors, and
+  `candidates:join` is refused. Errors follow the two
   searches, and malformed calls and options give `400`. The call needs the `text`
   feature and a full-text index.
 

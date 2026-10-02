@@ -534,28 +534,33 @@ impl Batch {
         }
         let mut requests = 0;
         let sent = todo.len() as u64;
-        let r = if todo.is_empty() {
-            Ok(vectors)
-        } else {
-            client::embed(
+        // at most `batchSize` inputs per request: a pair can have several
+        let mut r = Ok(());
+        for chunk in todo.chunks(self.emb.batch_size.max(1)) {
+            match client::embed(
                 &self.env,
                 &self.emb,
                 self.dimension,
-                &todo,
+                chunk,
                 &Waits { sleep },
                 &mut requests,
-            )
-            .map(|got| {
-                for (input, v) in todo.into_iter().zip(got) {
-                    let v = v.map(Arc::<[f32]>::from);
-                    if let Ok(v) = &v {
-                        self.cache.cache.insert(identity, input.clone(), v.clone());
+            ) {
+                Ok(got) => {
+                    for (input, v) in chunk.iter().zip(got) {
+                        let v = v.map(Arc::<[f32]>::from);
+                        if let Ok(v) = &v {
+                            self.cache.cache.insert(identity, input.clone(), v.clone());
+                        }
+                        vectors.insert(input.clone(), v);
                     }
-                    vectors.insert(input, v);
                 }
-                vectors
-            })
-        };
+                Err(e) => {
+                    r = Err(e);
+                    break;
+                }
+            }
+        }
+        let r = r.map(|()| vectors);
         Embedded {
             vectors: r,
             requests,
