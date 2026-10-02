@@ -226,6 +226,7 @@ export type TaskKind =
   | 'clone'
   | 'text-rebuild'
   | 'geo-index'
+  | 'vector-index'
   | 'backup-create'
   | 'backup-restore'
   | 'backup-verify'
@@ -1578,6 +1579,132 @@ export const disableText = (ds: string) =>
 /** Rebuild the index from the current data (`409` while a rebuild runs). */
 export const rebuildText = (ds: string) =>
   json<Task>(`/$/text/${enc(ds)}/rebuild`, { method: 'POST' });
+
+// --- vector indexes ----------------------------------------------------------------
+
+export type VectorMetric = 'cosine' | 'dot' | 'euclidean';
+export type VectorIndexState = 'ready' | 'building' | 'failed' | 'over-budget';
+
+/** The HNSW settings of an index (the defaults are 16, 128 and 128). */
+export type HnswConfig = { m?: number; efConstruction?: number; efSearch?: number };
+
+/** The body of `PUT /$/vector/{ds}/{name}`. */
+export type VectorIndexConfig = {
+  predicate: string;
+  dimension: number;
+  /** Default cosine. */
+  metric?: VectorMetric;
+  /** A label of the embedding model, not interpreted. */
+  model?: string;
+  /** `false` keeps only the packed vectors, which are searched exactly. */
+  hnsw?: HnswConfig | false;
+  /** Searches over at most this many rows are exact; default 10000. */
+  exactThreshold?: number;
+};
+
+export type VectorIndexStatus = {
+  name: string;
+  predicate: string;
+  dimension: number;
+  metric: VectorMetric;
+  model?: string;
+  state: VectorIndexState;
+  /** Build progress (0–1) while building. */
+  progress?: number;
+  message?: string;
+  /** The generation the index was built for. */
+  generation: string;
+  /** Vectors in the generation's base (the packed rows). */
+  rows: number;
+  /** Changes since the base that searches add exactly. */
+  overlay: { inserts: number; deletes: number };
+  skipped: { malformed: number; wrongDimension: number; zeroNorm: number };
+  /** `residency`: `heap` (built in this process) or `mmap` (read in place from the file). */
+  memory: { segmentBytes: number; hnswBytes: number; residency: string };
+  /** Null for an index that is searched exactly. */
+  hnsw: {
+    m: number;
+    efConstruction: number;
+    efSearch: number;
+    nodes: number;
+    layers: number;
+  } | null;
+  exactThreshold: number;
+  /** The index file of a persistent store; `opened`: read from it, not built. */
+  files?: { bytes: number; opened: boolean };
+  lastBuild?: { at: string; ms: number; rows: number };
+};
+
+/** `GET /$/vector/{ds}`. */
+export type VectorStatus = {
+  budgetBytes: number;
+  usedBytes: number;
+  generation: string;
+  indexes: VectorIndexStatus[];
+  /** Predicates packed without an index (on their first search). */
+  predicates: {
+    predicate: string;
+    bytes: number;
+    malformed: number;
+    dimensions: { dimension: number; vectors: number }[];
+  }[];
+};
+
+/** `POST /$/vector/{ds}/{name}/recall`: recall@k of the graph against the exact search. */
+export type VectorRecall = {
+  k: number;
+  samples: number;
+  ef: number;
+  /** 0–1. */
+  recall: number;
+  /** Mean milliseconds per search. */
+  hnswMs: number;
+  exactMs: number;
+};
+
+const vectorPath = (ds: string, name?: string) =>
+  `/$/vector/${enc(ds)}${name == null ? '' : `/${enc(name)}`}`;
+
+/**
+ * The vector indexes and packed predicates of a dataset. Servers that predate vector
+ * indexes answer 404.
+ */
+export const vectorStatus = (ds: string, signal?: AbortSignal) =>
+  json<VectorStatus>(vectorPath(ds), { signal, cache: 'no-store' });
+
+/** Create or replace an index. Its build is the returned task, and `409` means another index has the predicate. */
+export const putVectorIndex = (ds: string, name: string, config: VectorIndexConfig) =>
+  json<{ index: VectorIndexStatus; task: Task }>(vectorPath(ds, name), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+
+/** Drop an index and its files. */
+export const dropVectorIndex = (ds: string, name: string) =>
+  json<unknown>(vectorPath(ds, name), { method: 'DELETE' });
+
+/** Build an index again from RDF. */
+export const rebuildVectorIndex = (ds: string, name: string) =>
+  json<Task>(`${vectorPath(ds, name)}/rebuild`, { method: 'POST' });
+
+/** Measure recall@k against the exact search, with stored vectors as the queries. */
+export function vectorRecall(
+  ds: string,
+  name: string,
+  opts: { samples?: number; k?: number; ef?: number } = {},
+  signal?: AbortSignal,
+) {
+  const p = new URLSearchParams();
+  if (opts.samples != null) p.set('samples', String(opts.samples));
+  if (opts.k != null) p.set('k', String(opts.k));
+  if (opts.ef != null) p.set('ef', String(opts.ef));
+  const q = p.toString();
+  return json<VectorRecall>(`${vectorPath(ds, name)}/recall${q ? `?${q}` : ''}`, {
+    method: 'POST',
+    signal,
+  });
+}
 
 // --- point-in-time reads, named snapshots and diffs ------------------------------
 

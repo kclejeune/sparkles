@@ -102,12 +102,27 @@
   );
   const href = (target: string) =>
     `${resolve('/explore')}?ds=${encodeURIComponent(ds)}&iri=${encodeURIComponent(target)}`;
+  const similarHref = $derived(
+    `${resolve('/similar')}?${new URLSearchParams({
+      ds,
+      ...(predicate ? { predicate } : {}),
+      iri,
+      ...(metric !== 'cosine' ? { metric } : {}),
+      ...(k !== 10 ? { k: String(k) } : {}),
+    })}`,
+  );
 </script>
 
 {#if preds.length}
   <h3 class="sub head">
     Similar
     {#if loading}<span class="spinner"></span>{/if}
+    <a
+      class="more"
+      href={similarHref}
+      title="Search with ef, exact and other vectors on the Similar page"
+      >Open in Similar <Icon name="external" size={12} /></a
+    >
   </h3>
   <div class="controls">
     {#if preds.length > 1}
@@ -208,6 +223,19 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .more {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-weight: 400;
+    font-size: var(--fs-xs);
+    color: var(--iri);
+    text-decoration: none;
+  }
+  .more:hover {
+    text-decoration: underline;
   }
   .sub {
     margin: 14px 0 6px;

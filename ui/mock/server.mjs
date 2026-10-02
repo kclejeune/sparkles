@@ -12,6 +12,7 @@ import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
+import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
 
 const PORT = Number(process.env.PORT ?? 3030);
@@ -139,6 +140,7 @@ function seedHistory(ds) {
   scratch.store.load(scratchTurtle, { format: 'text/turtle' });
   scratch.baseQuads = scratch.store.size;
   addCommit(scratch, 'upload', scratch.store.size, 0, { bulk: true });
+  seedVectors(datasets);
 }
 
 // ---------------------------------------------------------------------------
@@ -899,12 +901,19 @@ function runVectorSearch(ds, call) {
   if (pred?.kind !== 'iri' || !q)
     throw new QueryError(400, 'spk:vectorSearch: expected (predicate query [k] [options])');
   let k = 10;
-  let metric = 'cosine';
+  let metric = null;
+  let ef = null;
+  let exact = false;
   for (const o of opts) {
     if (o.kind === 'number') k = o.value;
     else if (o.kind === 'literal' && o.value.startsWith('metric:')) metric = o.value.slice(7);
+    else if (o.kind === 'literal' && o.value.startsWith('ef:')) {
+      ef = Number(o.value.slice(3));
+      if (!Number.isInteger(ef) || ef < 1 || ef > 10000)
+        throw new QueryError(400, 'spk:vectorSearch: ef must be 1..=10000');
+    } else if (o.kind === 'literal' && o.value === 'exact:true') exact = true;
   }
-  if (!METRIC_FNS[metric])
+  if (metric != null && !METRIC_FNS[metric])
     throw new QueryError(400, `spk:vectorSearch: unknown metric "${metric}"`);
   const rows = ds.store
     .match(null, ox.namedNode(pred.value), null, null)
@@ -926,6 +935,16 @@ function runVectorSearch(ds, call) {
     query = parseVec(own[0]);
     if (!query) throw new QueryError(400, "the entity's vector is not a valid spk:vector");
   }
+  // an index decides the default metric, the accepted dimension and the plan counters
+  const index = vectorIndexFor(ds, pred.value, query.length, { metric, ef, exact, k });
+  if (index?.error) throw new QueryError(400, index.error);
+  if (!index) touchPacked(ds, pred.value);
+  metric ??= index?.metric ?? 'cosine';
+  call.counters = index?.counters ?? {
+    method: 'exact',
+    rows: rows.length,
+    scored: rows.length,
+  };
   const vectors = rows.map((x) => ({ x, v: parseVec(x.object.value) })).filter((r) => r.v);
   const same = vectors.filter((r) => r.v.length === query.length);
   if (vectors.length && !same.length) {
@@ -1015,6 +1034,7 @@ function handleSearchQuery(req, res, ds, p, query) {
           timeMs: +execMs.toFixed(3),
           cached: false,
           children: [],
+          ...(call.counters ? { counters: call.counters } : {}),
         },
         commit: headCommit(ds).seq,
         datasetId: ds.id,
@@ -1723,6 +1743,17 @@ const server = http.createServer(async (req, res) => {
         makeDataset,
         addCommit,
         headCommit,
+        send,
+        readBody,
+      })
+    )
+      return;
+    // vector indexes (mock/vector.mjs)
+    if (
+      await handleVector(req, res, url, seg, {
+        datasets,
+        tasks,
+        nextTaskId: () => String(taskSeq++),
         send,
         readBody,
       })
