@@ -227,6 +227,24 @@ fn a_generation_switch_during_the_copy() {
     // the lease is gone, and with it the old generation
     assert_eq!(gens(&root).len(), 1);
     assert_ne!(gens(&root)[0], rep.generation);
+
+    // a compaction (C13) during the copy, likewise
+    let want = dump(&src);
+    src.set_failpoint(
+        "clone-captured",
+        Some(Arc::new(|s: &Store| {
+            upd(s, "INSERT DATA { <urn:late> <urn:p> 1 }");
+            s.compact().unwrap();
+        })),
+    );
+    let out = dir.path().join("dst2");
+    let rep = src.clone_to(&out, &CloneOptions::default()).unwrap();
+    src.set_failpoint("clone-captured", None);
+    assert_ne!(rep.method, CloneMethod::Rebuild);
+    assert_eq!(dump(&checked(&out)), want);
+    assert_eq!(dump(&src).len(), want.len() + 1);
+    assert_eq!(gens(&root).len(), 1);
+    assert_ne!(gens(&root)[0], rep.generation);
 }
 
 /// Blank nodes made and deleted again since the base was built are never handed out
