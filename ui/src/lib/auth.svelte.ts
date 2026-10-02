@@ -30,7 +30,7 @@ class AuthStore {
   constructor() {
     setAuthHooks({
       csrf: () => this.who?.csrfToken,
-      unauthorized: () => this.toLogin(),
+      unauthorized: () => void this.unauthorized(),
       ready: () => this.ensure(),
     });
   }
@@ -70,6 +70,25 @@ class AuthStore {
     } finally {
       this.loaded = true;
     }
+  }
+
+  #recheck: Promise<void> | null = null;
+
+  /**
+   * A request was refused with 401. The caller is loaded again before anything else,
+   * since the session may have ended (it expired, or the user signed out elsewhere), and
+   * the sign-in page decides from that state. Without the reload it would see the caller
+   * still signed in and send the user straight back to a page that gets 401 again, in a
+   * loop. When the server still knows the caller as signed in, the 401 was about
+   * something else and the page stays where it is.
+   */
+  async unauthorized() {
+    if (!this.enabled) return;
+    const wasSignedIn = signedIn(this.who);
+    this.#recheck ??= this.load().finally(() => (this.#recheck = null));
+    await this.#recheck;
+    if (wasSignedIn && signedIn(this.who)) return;
+    this.toLogin();
   }
 
   /** Go to the sign-in page (and come back here afterwards). */
