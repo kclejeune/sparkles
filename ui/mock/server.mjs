@@ -1266,6 +1266,50 @@ const EXT_FORMATS = {
   n3: 'text/n3',
 };
 
+// CSV and TSV tables (spec C05): the default mapping makes `<base{key or row}>
+// <base{column}> "cell"` triples. A CSVW mapping or CONSTRUCT template is accepted but not
+// run: the mock maps the table with the default mapping, under a stand-in base when none is
+// given. The real server's tests cover the mappings.
+const TABLE = /\.(csv|tsv|tab)(\.(gz|zst|br|lz4))?$/i;
+
+function splitRow(line, sep) {
+  if (sep === '\t') return line.split('\t');
+  const cells = [];
+  let cur = '';
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quoted && c === '"' && line[i + 1] === '"') {
+      cur += '"';
+      i++;
+    } else if (c === '"') quoted = !quoted;
+    else if (c === ',' && !quoted) {
+      cells.push(cur);
+      cur = '';
+    } else cur += c;
+  }
+  cells.push(cur);
+  return cells;
+}
+
+function tableToNTriples(text, sep, base, key) {
+  const lines = text.split(/\r?\n/).filter((l) => l.length);
+  const header = splitRow(lines.shift() ?? '', sep);
+  if (key && !header.includes(key)) throw new Error(`key column '${key}' is not in the header`);
+  const iri = (s) => `<${base}${encodeURIComponent(s)}>`;
+  const lit = (s) => JSON.stringify(s);
+  const out = [];
+  lines.forEach((line, i) => {
+    const cells = splitRow(line, sep);
+    const subject = iri(key ? cells[header.indexOf(key)] : `row${i + 1}`);
+    header.forEach((col, j) => {
+      if (cells[j] !== undefined && cells[j] !== '')
+        out.push(`${subject} ${iri(col)} ${lit(cells[j])} .`);
+    });
+  });
+  return { nt: out.join('\n'), rows: lines.length, triples: out.length };
+}
+
 async function handleUpload(req, res, ds, url) {
   const before = quadSet(ds);
   const body = await readBody(req);
@@ -1274,8 +1318,48 @@ async function handleUpload(req, res, ds, url) {
     .find((x) => x.name === 'graph' && !x.filename)
     ?.data.toString('utf8')
     .trim();
+  const mapped = parts.some((x) => x.name === 'mapping' || x.name === 'template');
+  const base = url.searchParams.get('base');
+  const key = url.searchParams.get('key');
+  const files = parts.filter((x) => x.filename && x.name !== 'mapping' && x.name !== 'template');
+  const tableFiles = files.filter((x) => TABLE.test(x.filename));
+  if (!tableFiles.length && mapped)
+    return fail(res, 400, 'a mapping or template was given, but no file named .csv or .tsv');
+  if (tableFiles.length && key && mapped)
+    return fail(
+      res,
+      400,
+      'key applies to the default mapping only, not with a mapping or template',
+    );
+  if (tableFiles.length && !mapped && !base)
+    return fail(
+      res,
+      400,
+      `${tableFiles[0].filename}: the default mapping needs a base IRI (base=)`,
+    );
+  const tables = [];
   let count = 0;
-  for (const part of parts.filter((x) => x.filename)) {
+  for (const part of files) {
+    if (TABLE.test(part.filename)) {
+      const sep = /\.csv/i.test(part.filename) ? ',' : '\t';
+      let t;
+      try {
+        t = tableToNTriples(
+          part.data.toString('utf8'),
+          sep,
+          base ?? 'http://example.org/table/',
+          key,
+        );
+      } catch (e) {
+        return fail(res, 400, `${part.filename}: ${e.message}`);
+      }
+      ds.store.load(t.nt, {
+        format: 'application/n-triples',
+        ...(graph ? { to_graph_name: ox.namedNode(graph) } : {}),
+      });
+      tables.push({ file: part.filename, rows: t.rows, triples: t.triples, warnings: [] });
+      continue;
+    }
     const ext = part.filename.split('.').pop()?.toLowerCase() ?? '';
     const format = EXT_FORMATS[ext] ?? part.type;
     if (!format) return fail(res, 400, `Unknown RDF format for ${part.filename}`);
@@ -1291,7 +1375,7 @@ async function handleUpload(req, res, ds, url) {
   const receipt = commitWrite(ds, 'upload', before, { bulk: true });
   count = receipt.committed ? receipt.commit.inserted : 0;
   ds.deltaInserts += count;
-  const out = { count, tripleCount: count, quadCount: count };
+  const out = { count, tripleCount: count, quadCount: count, ...(tables.length ? { tables } : {}) };
   const headers = commitHeaders(ds, receipt.commit.seq);
   if (wantsReceipt(req, url.searchParams))
     return send(res, 200, { ...out, ...receipt }, 'application/x-sparkles+json', headers);

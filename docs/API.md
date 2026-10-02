@@ -1257,7 +1257,8 @@ number of cells, a bad mapping or a refused template answers `400` with the file
 column, and nothing is committed. The N-Triples written for the tables count against
 `--max-decompressed-mb` (`413`) and the free-disk reserve (`507`). A template runs with
 the server's query memory and row budgets. Dry runs and timeouts work as for any upload.
-The Graph Store endpoint does not read CSV.
+The Graph Store endpoint does not read CSV. The web UI's upload form shows these options
+once a CSV or TSV file is chosen, and sends `base` and `key` in the query string.
 
 ### Service description
 

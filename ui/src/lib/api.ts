@@ -3,6 +3,7 @@
 
 import { CSRF_HEADER, needsCsrf, type Level } from './auth';
 import { fmtBytes, fmtInt } from './format';
+import { mappingPart, tableParams } from './upload';
 
 export type DatasetType = 'persistent' | 'mem';
 
@@ -1228,26 +1229,38 @@ export type UploadResult = {
   count?: number;
   tripleCount?: number;
   quadCount?: number;
+  /** The CSV and TSV tables mapped to triples, one report each. */
+  tables?: { file: string; rows: number; triples: number; warnings?: string[] }[];
   /** The commit the upload produced (absent on servers that predate commits). */
   receipt?: Receipt;
 };
 
 /**
  * Multipart upload to /{ds}/upload with progress reporting (XHR, since fetch has no upload
- * progress). Asks for a commit receipt (`receipt=true`).
+ * progress). Asks for a commit receipt (`receipt=true`). `tables` maps the CSV and TSV
+ * files: `base` and `key` go in the query string, and a mapping or template file in the
+ * part the server reads it from.
  */
 export async function upload(
   ds: string,
   files: File[],
-  opts: { graph?: string; onProgress?: (p: UploadProgress) => void; signal?: AbortSignal } = {},
+  opts: {
+    graph?: string;
+    tables?: { base?: string; key?: string; mapping?: File | null };
+    onProgress?: (p: UploadProgress) => void;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<UploadResult | string> {
   const csrf = await csrfFor('POST');
   return new Promise((resolve, reject) => {
     const form = new FormData();
     if (opts.graph) form.append('graph', opts.graph);
+    const mapping = opts.tables?.mapping;
+    if (mapping) form.append(mappingPart(mapping.name), mapping, mapping.name);
     for (const f of files) form.append('file', f, f.name);
+    const params = opts.tables ? tableParams(opts.tables) : '';
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/${enc(ds)}/upload?receipt=true`);
+    xhr.open('POST', `/${enc(ds)}/upload?receipt=true${params ? `&${params}` : ''}`);
     xhr.setRequestHeader('Accept', 'application/json');
     if (csrf) xhr.setRequestHeader(CSRF_HEADER, csrf);
     xhr.upload.onprogress = (e) =>

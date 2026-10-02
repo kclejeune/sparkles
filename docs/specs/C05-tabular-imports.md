@@ -565,6 +565,15 @@ file takes about five times the table's size on disk until the load ends.
 foreign-key checks, templates over the target dataset, Tarql's extension functions, CSV
 in the Graph Store protocol, mappings stored on the server, and CSV loading in the Python
 package (`Dataset.load`) were not built. Python was left out because it needs a new
-method, its type stubs and tests, and the CLI covers the use until then. The UI's upload
-form was not changed. It sends no `base`, `mapping` or `template`, so a CSV file uploaded
-from it is refused with `400`.
+method, its type stubs and tests, and the CLI covers the use until then.
+
+**Later.** The UI's upload form at first sent no `base`, `mapping` or `template`, so a
+CSV file uploaded from it was refused with `400`. Once a CSV or TSV file is chosen, the
+form now shows a base IRI, an optional key column and an optional mapping or template
+file. The base IRI and key go in the query string, a `.rq` or `.sparql` file goes in the
+`template` part and any other file in the `mapping` part. The form explains what the
+server would refuse, such as the default mapping without a base IRI or a key column next
+to a mapping, and keeps the Upload button disabled until it is fixed. It remembers the
+base IRI per dataset. `ui/src/lib/upload.test.ts` tests the checks and the parameters,
+and `ui/tests/mock/upload-csv.spec.ts` runs the form against the mock server, which maps
+tables with the default mapping.
