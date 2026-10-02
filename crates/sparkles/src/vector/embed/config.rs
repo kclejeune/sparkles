@@ -98,6 +98,12 @@ pub struct EmbeddingConfig {
     pub timeout_secs: f64,
 }
 
+impl Default for EmbeddingConfig {
+    fn default() -> EmbeddingConfig {
+        EmbeddingConfig::new("", "")
+    }
+}
+
 impl EmbeddingConfig {
     /// A configuration with the defaults and no source yet.
     pub fn new(url: &str, model: &str) -> EmbeddingConfig {
@@ -133,6 +139,9 @@ impl EmbeddingConfig {
     pub fn validate(&self, index_predicate: &str) -> Result<()> {
         let bad = |m: String| Err(Error::invalid(format!("embedding.{m}")));
         match reqwest::Url::parse(&self.url) {
+            Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+                return bad("url: credentials go in apiKey, not in the URL".into());
+            }
             Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => {}
             _ => return bad(format!("url: {:?} is not an http(s) URL", self.url)),
         }

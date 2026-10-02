@@ -435,6 +435,7 @@ impl Store {
             last_error: w.stats.last_error.clone(),
             retry_at: backoff.map(|(_, ms)| crate::commit::rfc3339_ms(ms)),
             last_batch: w.stats.last_batch.clone(),
+            config: w.emb.clone(),
         })
     }
 

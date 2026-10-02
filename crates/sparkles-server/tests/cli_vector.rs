@@ -254,3 +254,101 @@ fn vector_index_on_a_server() {
         serde_json::json!([])
     );
 }
+
+/// `vector create --embed-*`, `vector embed` and `vector reembed` against a mock
+/// embeddings endpoint, with the API key from an environment variable.
+#[test]
+fn embeddings_from_the_command_line() {
+    use sparkles::vector::embed::mock::MockProvider;
+    let mock = MockProvider::start(8);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.nt");
+    std::fs::write(
+        &data,
+        "<urn:a> <http://www.w3.org/2000/01/rdf-schema#label> \"alpha\" .\n\
+         <urn:b> <http://www.w3.org/2000/01/rdf-schema#label> \"beta\"@en .\n",
+    )
+    .unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    expect(&["load", "--loc", &db, data.to_str().unwrap()], 0);
+    let url = mock.url();
+    let run = |args: &[&str], code: i32| {
+        let o = Command::new(BIN)
+            .args(args)
+            .env("MOCK_KEY", "sk-cli")
+            .env_remove("SPARKLES_SERVER")
+            .output()
+            .unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(code),
+            "{args:?}\nstderr: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    run(
+        &[
+            "vector",
+            "create",
+            "--loc",
+            &db,
+            "--name",
+            "names",
+            "--predicate",
+            "urn:emb",
+            "--dim",
+            "8",
+            "--embed-url",
+            &url,
+            "--embed-model",
+            "mock-model",
+            "--embed-from",
+            "http://www.w3.org/2000/01/rdf-schema#label",
+            "--embed-api-key-env",
+            "MOCK_KEY",
+        ],
+        0,
+    );
+    // creating an index sends nothing; `vector embed` does
+    assert_eq!(mock.state().requests, 0);
+    let err = run(&["vector", "embed", "--loc", &db], 0);
+    assert!(
+        err.contains("2 vectors written, 0 failed, 0 waiting"),
+        "{err}"
+    );
+    assert_eq!(
+        mock.state().auth.last().unwrap().as_deref(),
+        Some("Bearer sk-cli")
+    );
+    let o = expect(&["vector", "list", "--loc", &db], 0);
+    let out = String::from_utf8_lossy(&o.stdout);
+    // a store opened without a worker owes a pass: the list says nobody embeds here
+    assert!(out.contains("paused (0 waiting)"), "{out}");
+    let o = expect(&["vector", "status", "--loc", &db, "--name", "names"], 0);
+    let j: J = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["embedding"]["model"], "mock-model");
+    assert_eq!(j["overlay"]["inserts"], 2, "{j}");
+    // again: nothing is sent
+    run(&["vector", "embed", "--loc", &db], 0);
+    assert_eq!(mock.state().inputs.len(), 2);
+    let err = run(&["vector", "reembed", "--loc", &db, "--name", "names"], 0);
+    assert!(err.contains("vector index names:"), "{err}");
+    assert_eq!(mock.state().inputs.len(), 4);
+    // a provider that fails ends the run with an error and keeps the work
+    mock.state().fail = Some(503);
+    run(
+        &[
+            "vector",
+            "reembed",
+            "--loc",
+            &db,
+            "--name",
+            "names",
+            "--embed-timeout",
+            "2",
+        ],
+        1,
+    );
+    let _ = Path::new(&db);
+}

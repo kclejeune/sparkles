@@ -138,6 +138,9 @@ pub struct EmbeddingStatus {
     pub retry_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_batch: Option<EmbeddingBatch>,
+    /// the index's embedding configuration (it names secrets, never holds keys)
+    #[serde(default)]
+    pub config: EmbeddingConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
