@@ -11,6 +11,7 @@
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny } from '$lib/fmt-wasm';
   import { formatFailure } from '$lib/fmt-view';
+  import { compactionSummary, lastCompaction } from '$lib/compaction';
   import { fmtBytes, fmtCompact, fmtInt, fmtMs, fmtRelative, fmtTime } from '$lib/format';
   import { displayIri, localName, WELL_KNOWN } from '$lib/rdf';
   import { readLang, validateLangKey, type ValidateLang } from '$lib/shex';
@@ -97,6 +98,19 @@
       taskKick++;
     } catch (e) {
       toasts.error(`${label} failed`, e);
+    } finally {
+      acting = null;
+    }
+  }
+
+  /** Turn the dataset's automatic compaction off or on, keeping its other settings. */
+  async function toggleAutoCompaction(c: api.CompactionStatus) {
+    acting = 'Automatic compaction';
+    try {
+      await api.setCompaction(name, { ...c.own, enabled: !c.policy.enabled });
+      await loadStats();
+    } catch (e) {
+      toasts.error('Changing automatic compaction failed', e);
     } finally {
       acting = null;
     }
@@ -626,6 +640,30 @@ ex:PersonShape a sh:NodeShape ;
               </p>
             {/if}
             <div class="caches">
+              {#if stats.compaction && !stats.at}
+                {@const c = stats.compaction}
+                {@const sum = compactionSummary(c)}
+                {@const last = lastCompaction(c)}
+                <div class="cache" data-testid="auto-compaction">
+                  <span class="cname">Auto-compaction</span>
+                  <span><strong>{sum.label}</strong></span>
+                  <span class="faint">{sum.detail}</span>
+                  {#if last}<span class="faint">{last}</span>{/if}
+                  <span class="spacer"></span>
+                  {#if auth.can(name, 'admin') && !readOnly && c.serverEnabled}
+                    <button
+                      class="btn sm"
+                      onclick={() => toggleAutoCompaction(c)}
+                      disabled={acting != null}
+                      title={c.policy.enabled
+                        ? 'Stop compacting this dataset automatically'
+                        : 'Compact this dataset automatically when its delta grows'}
+                    >
+                      {c.policy.enabled ? 'Turn off' : 'Turn on'}
+                    </button>
+                  {/if}
+                </div>
+              {/if}
               {#if stats.resultCache}
                 {@const rc = stats.resultCache}
                 <div class="cache">

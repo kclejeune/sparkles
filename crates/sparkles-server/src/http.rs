@@ -183,6 +183,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::geo::routes());
     // Fuseki's admin routes that Sparkles has no route of its own for
     let app = app.merge(fuseki::routes());
+    // automatic compaction (`/$/compaction`)
+    let app = app.merge(crate::compaction::routes());
     // vector indexes (`/$/vector`)
     let app = app.merge(crate::vector::routes());
     // RDFS on read (`/$/rdfs`)
@@ -3385,6 +3387,7 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
             "reasoning": reasoning,
             "datasets": fuseki,
             "geo": crate::geo::status_json(&ds),
+            "compaction": crate::compaction::status_json(&st, &ds),
             "cache": {
                 "entries": cache.entries(),
                 "bytes": cache.bytes(),
@@ -3517,14 +3520,7 @@ async fn compact(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult
         }
     }
     task_start_check(&st, Some("compact"), &name)?;
-    let task = st.start_task("compact", &name, move |h| {
-        h.progress(0.1, "rebuilding index");
-        ds.store.compact()?;
-        Ok(format!(
-            "compacted to {}",
-            ds.store.snapshot().generation.name
-        ))
-    });
+    let task = crate::compaction::start_compaction(&st, ds, None);
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 

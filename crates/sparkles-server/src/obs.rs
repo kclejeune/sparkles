@@ -1410,6 +1410,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     #[cfg(feature = "backup")]
     crate::backup::metrics::render(st, &mut o);
     crate::geo::metrics(st, &mut o);
+    crate::compaction::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(

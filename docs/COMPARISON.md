@@ -109,9 +109,10 @@ Sparkles is ahead on:
 * **GeoSPARQL and validation.** The GeoSPARQL 1.1 functions with a spatial index and
   spatial joins, and ShEx next to SHACL.
 * **Index design.** Fluree keeps 4 index orders, Sparkles 7. Fluree's planner is greedy;
-  Sparkles uses dynamic programming. Fluree indexes in the background once uncommitted
-  changes pass a threshold; Sparkles keeps updates in an in-memory delta and compacts on
-  request.
+  Sparkles uses dynamic programming. Both index in the background once uncommitted
+  changes pass a threshold. Sparkles keeps updates in an in-memory delta and compacts it
+  into a new generation when it passes a share of the base index, a size or an age
+  ([C13](specs/C13-automatic-compaction.md)).
 
 [BENCHMARKS.md](BENCHMARKS.md) has the head-to-head numbers.
 
@@ -178,6 +179,7 @@ or web UI.
 | `serve` listens on `127.0.0.1` by default. Without `--auth-config` it refuses a non-loopback address unless `--allow-open-network` (or `SPARKLES_ALLOW_OPEN_NETWORK=1`) is given. Fuseki listens on all interfaces. | Without authentication every caller can read, write and administer everything, so exposing that must be explicit. The override logs a warning, as does a network listener without rate limits. |
 | Without `--auth-config`, `serve` sends no CORS headers unless `--cors-origin` names an origin, refuses cross-site writes (`Origin`, `Sec-Fetch-Site`), and accepts only IP addresses, `localhost`, `--host` and `--public-host` names in `Host`. Fuseki answers CORS from any origin. | Every caller of an open server is its administrator. Without these checks, any web page the operator opens could read, write and `LOAD` local files through the browser, directly or by rebinding its DNS name. |
 | `--max-export-mb` defaults to `0` (unlimited), while query responses are capped at 1 GiB (`--max-result-mb`) | A Graph Store GET of a graph or dataset is the export path, streamed from one snapshot, and a finite default would cut off legitimate dumps. The cost is that any reader can make the server stream the whole dataset (CPU and bandwidth, not memory). Deployments that expose reads to untrusted clients should set `--max-export-mb` and rate-limit the `query` class. |
+| Compaction runs on its own (`--no-auto-compact` turns it off). A dataset is compacted when its delta reaches 10,000 quads plus 5% of the base index, a million quads, 512 MiB or a day's age, or after five quiet minutes. Writes go on during the build. TDB2 compacts only on request and blocks writers meanwhile. | Statistics, characteristic sets and block skipping are exact only on the base index, and a large delta slows scans and costs memory, so a long-running server needs compaction without an operator. Writes wait only for the final switch, which takes milliseconds. The cost is a full rebuild per compaction, CPU and I/O that the build limits to a quarter of the cores at a lower priority, and a full upload at the next incremental backup. |
 | A client's `timeout=` is capped at `--max-timeout` (default 1800 s, `0` for no cap) for queries, updates and Graph Store writes. The default query timeout is 60 s. Writes have no default deadline (`--update-timeout 0`) but are cancelled when their client disconnects. | A request may ask for more than the default but cannot hold a worker forever. A long load is not cut off by a default it did not ask for, and a disconnected load stops (its rate-limit concurrency slot stays taken until it has). |
 
 ### GeoSPARQL
@@ -219,6 +221,13 @@ and Shiro authentication.
   version. A scan merges the delta into the blocks it changes. It finds the base rows
   between two delta keys by binary search, and only those blocks have every column
   decoded.
+* **Rebuilds in the background.** Like QLever's index rebuild, a compaction builds the
+  new index from a snapshot while updates continue, then carries the updates made since
+  the snapshot into the new index with their ids remapped. Sparkles carries each commit
+  into the new generation's log, so the commits made during the build stay readable at
+  `?at=`. The automatic trigger takes QLever's `min`, `max` and `fraction` form
+  (`--rebuild-index-strategy automatic:min:max:fraction`), adds the size of the log, age
+  and idle time, and waits for bulk loads, backups and the retention window.
 * **Columnar execution and planning.** Execution is column-major. The planner orders joins
   with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
   sort order, and merge joins run on sorted scans. A hash join's output keeps the order of

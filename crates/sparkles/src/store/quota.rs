@@ -66,6 +66,9 @@ pub(crate) struct Quota {
     used: AtomicU64,
     /// when `used` was last measured by a walk (`None`: never, or invalidated)
     measured: Mutex<Option<Instant>>,
+    /// a generation a background compaction is building: not counted, so that a
+    /// compaction never makes the dataset refuse writes
+    excluded: Mutex<Option<PathBuf>>,
 }
 
 impl Quota {
@@ -82,6 +85,7 @@ impl Quota {
             own: RwLock::new(own),
             used: AtomicU64::new(0),
             measured: Mutex::new(None),
+            excluded: Mutex::new(None),
         })
     }
 
@@ -100,10 +104,19 @@ impl Quota {
         let Some(root) = &self.root else { return 0 };
         let mut m = self.measured.lock();
         if m.is_none_or(|t| t.elapsed() >= MAX_AGE) {
-            self.used.store(dir_size(root), Ordering::Relaxed);
+            let building = self.excluded.lock().as_deref().map_or(0, dir_size);
+            self.used
+                .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
             *m = Some(Instant::now());
         }
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// Leave `dir` (a generation being built in the background) out of the measured
+    /// size, or stop leaving one out (`None`).
+    pub(crate) fn exclude(&self, dir: Option<&Path>) {
+        *self.excluded.lock() = dir.map(Path::to_path_buf);
+        self.invalidate();
     }
 
     /// The next [`used`](Self::used) walks the directory (after a rebuild).
@@ -149,7 +162,8 @@ impl Quota {
         let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
             return Ok(());
         };
-        let now = dir_size(root);
+        let building = self.excluded.lock().as_deref().map_or(0, dir_size);
+        let now = dir_size(root).saturating_sub(building);
         let before = now.saturating_sub(dir_size(new));
         let projected = now.saturating_sub(old.map_or(0, dir_size));
         if projected > limit && projected > before {

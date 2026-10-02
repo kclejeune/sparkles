@@ -12,6 +12,9 @@
 
 mod backup;
 mod changes;
+mod compaction;
+#[cfg(test)]
+mod compaction_tests;
 mod diff;
 mod geo;
 mod mem_history;
@@ -25,6 +28,10 @@ pub use backup::{
     MemoryCaptureOptions,
 };
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
+pub use compaction::{
+    Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
+    CompactionSettings, SETTING_NAMES, Trigger, TriggerKind,
+};
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions};
 pub use quota::{QUOTA_FILE, QuotaSource, QuotaStatus};
 
@@ -878,6 +885,8 @@ struct WriterState {
     poisoned: bool,
     /// the store is being dropped: a backup lease released later must not collect
     closed: bool,
+    /// while a compaction runs: each commit's changes, for it to carry over
+    tap: Option<Vec<compaction::TapCommit>>,
 }
 
 /// Commit metadata for a transaction that is committed by rebuilding the generation.
@@ -957,6 +966,8 @@ pub struct Store {
     commits: tokio::sync::watch::Sender<u64>,
     /// the storage quota and the measured size of the directory
     quota: quota::Quota,
+    /// what the compaction policy looks at, and the dataset's own compaction settings
+    compaction: compaction::Track,
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
@@ -1044,6 +1055,7 @@ impl Store {
                 head: root,
                 poisoned: false,
                 closed: false,
+                tap: None,
             })),
             cache,
             results,
@@ -1064,6 +1076,7 @@ impl Store {
             writers_waiting: Default::default(),
             commits: tokio::sync::watch::Sender::new(0),
             quota: quota::Quota::open(None, None).expect("no file to read in memory"),
+            compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
@@ -1236,7 +1249,12 @@ impl Store {
             let bytes = commit::dataset_file_bytes(dataset_id, "baseline", base.timestamp_ms);
             write_atomic(&root.join("dataset.json"), &bytes)?;
         }
-        let head = replayed.last().copied().unwrap_or(base);
+        // the catalog's record of the head: a commit that a compaction carried into this
+        // generation's log keeps the generation it was made in
+        let head = replayed
+            .last()
+            .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
+            .unwrap_or(base);
         let wal = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1271,6 +1289,7 @@ impl Store {
                 head,
                 poisoned: false,
                 closed: false,
+                tap: None,
             })),
             cache,
             results,
@@ -1291,10 +1310,16 @@ impl Store {
             writers_waiting: Default::default(),
             commits: tokio::sync::watch::Sender::new(head.seq),
             quota: quota::Quota::open(Some(root), opts.max_disk_bytes)?,
+            compaction: compaction::Track::new(
+                base.seq,
+                replayed.first().map(|c| c.timestamp_ms),
+                Some(head.timestamp_ms),
+            ),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
             opts,
         };
+        *store.compaction.settings.lock() = compaction::read_settings(root)?;
         store.collect_history(gen_no, head.seq);
         store.open_text(&wal_text)?;
         store.open_geo();
@@ -1329,7 +1354,23 @@ impl Store {
     /// Collect unneeded generations; call with the writer lock held (or at open).
     /// Lock order: writer, then history, then catalog.
     fn collect_locked(&self, h: &mut crate::history::HistoryState, current: u32, head: u64) {
-        let Some(root) = &self.root else { return };
+        for dir in self.retire_locked(h, current, head) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Like [`collect_locked`](Self::collect_locked), but the unneeded generations are
+    /// only renamed: the caller deletes the returned directories, after it released the
+    /// writer lock.
+    fn retire_locked(
+        &self,
+        h: &mut crate::history::HistoryState,
+        current: u32,
+        head: u64,
+    ) -> Vec<PathBuf> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
         collect_generations(
             root,
             self.now_ms(),
@@ -1338,7 +1379,7 @@ impl Store {
             current,
             head,
             self.opts.history_max_generations,
-        );
+        )
     }
 
     /// What a backup lease guard needs to collect history after it drops the lease.
@@ -2983,14 +3024,10 @@ impl Store {
     }
 
     /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
-    /// neither does the head commit.
+    /// neither does the head commit. Writes go on during the build (see
+    /// [`compact_with`](Self::compact_with)).
     pub fn compact(&self) -> Result<()> {
-        let mut w = self.writer.lock();
-        if w.poisoned {
-            return Err(Error::Poisoned);
-        }
-        let snap = self.snapshot();
-        self.rebuild_locked(&mut w, &snap, &[], &[], &[], None, None)?;
+        self.compact_with(&CompactOptions::default())?;
         Ok(())
     }
 
@@ -3010,6 +3047,14 @@ impl Store {
         check: Option<(crate::guard::Changes<'_>, &crate::guard::WriteOptions)>,
     ) -> Result<(u64, Receipt)> {
         let before = snap.len();
+        // a running compaction gives up: this rebuild makes a new generation itself
+        w.tap = None;
+        if bulk.is_some() {
+            self.compaction.rebuilding.store(true, Ordering::Relaxed);
+        }
+        let _rebuilding = bulk
+            .is_some()
+            .then(|| compaction::Rebuilding(&self.compaction.rebuilding));
         let message = match (&bulk, check.as_ref().and_then(|(_, o)| o.message.as_ref())) {
             (Some(_), Some(m)) => crate::annotations::validate_message(m)?,
             _ => None,
@@ -3031,12 +3076,14 @@ impl Store {
         }
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
+                // above a number a background compaction is building in
                 let n: u32 = snap
                     .generation
                     .name
                     .strip_prefix("gen-")
                     .and_then(|x| x.parse().ok())
                     .unwrap_or(0)
+                    .max(self.compaction.reserved.load(Ordering::Relaxed))
                     + 1;
                 let name = format!("gen-{n:04}");
                 let dir = root.join(&name);
@@ -3223,6 +3270,7 @@ impl Store {
             self.catalog.lock().append(head);
             self.forget_annotations();
         }
+        self.compaction.bulk_committed(head.seq, head.timestamp_ms);
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
             return Err(e);
@@ -4244,9 +4292,17 @@ impl WriteTxn<'_> {
                 });
             }
         }
+        if let Some(tap) = self.guard.tap.as_mut() {
+            tap.push(compaction::TapCommit {
+                info: c,
+                next_bnode,
+                changes: self.log.clone(),
+            });
+        }
         self.guard.head = c;
         self.store.catalog.lock().append(c);
         self.store.forget_annotations();
+        self.store.compaction.committed(c.timestamp_ms);
         let version = self.base.version + 1;
         let mut snap = Snapshot {
             generation: gen_.clone(),
@@ -4435,8 +4491,9 @@ fn delta_bytes(d: &Delta) -> u64 {
     (d.inserts() + d.deletes()) as u64 * DELTA_QUAD_BYTES
 }
 
-/// Remove the generations history no longer needs (`current` is the current generation
-/// and `head` the latest commit); call with the writer lock held.
+/// Retire the generations history no longer needs (`current` is the current generation
+/// and `head` the latest commit); call with the writer lock held. They are renamed to
+/// `*.deleting`, and the caller deletes the returned directories.
 fn collect_generations(
     root: &Path,
     now_ms: i64,
@@ -4445,7 +4502,7 @@ fn collect_generations(
     current: u32,
     head: u64,
     max_gens: usize,
-) {
+) -> Vec<PathBuf> {
     let needed = {
         let ts = |s: u64| cat.get(s).map(|c| c.timestamp_ms);
         h.needed(current, head, now_ms, &ts, max_gens)
@@ -4456,16 +4513,19 @@ fn collect_generations(
         .filter(|(no, _)| **no != current && !needed.contains_key(no))
         .map(|(no, g)| (*no, g.dir.clone()))
         .collect();
+    let mut retired = Vec::new();
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
-        match crate::history::delete_generation(root, &dir) {
-            Ok(()) => {
+        match crate::history::retire_generation(root, &dir) {
+            Ok(d) => {
                 h.gens.remove(&no);
+                retired.extend(d);
             }
             Err(e) => tracing::warn!("could not remove {}: {e}", dir.display()),
         }
     }
+    retired
 }
 
 /// A persistent store's history collection, held weakly (by backup lease guards): it
@@ -4515,7 +4575,7 @@ impl Collector {
         let cur = commit::generation_number(&current.load().generation.name);
         // lock order: writer, history, catalog
         let mut h = history.lock();
-        collect_generations(
+        let retired = collect_generations(
             &self.root,
             now,
             &catalog.lock(),
@@ -4524,6 +4584,9 @@ impl Collector {
             w.head.seq,
             self.max_gens,
         );
+        for dir in retired {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -4548,6 +4611,7 @@ fn open_history(
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
+    compaction::remove_interrupted(root, dataset_id, current);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
     h.schedules = cfg.schedules;
