@@ -385,18 +385,21 @@ fn setting(
         .json("200", &format!("The new {noun}."), status)
         .errors(&[400, 409]),
     );
-    p.add(
-        op(
-            DELETE,
-            route,
-            &format!("delete{id}"),
-            tag,
-            &format!("Remove the {noun}"),
-        )
-        .see(anchor)
-        .json("200", &format!("The {noun} after the removal."), status)
-        .no_content("Removed."),
-    );
+    let delete = op(
+        DELETE,
+        route,
+        &format!("delete{id}"),
+        tag,
+        &format!("Remove the {noun}"),
+    )
+    .see(anchor);
+    // write-time validation answers 204; the others answer with the status after it
+    let delete = if route == "/$/validation/{ds}" {
+        delete.no_content("Removed.")
+    } else {
+        delete.json("200", &format!("The {noun} after the removal."), status)
+    };
+    p.add(delete);
 }
 
 pub(super) fn add_all(p: &mut Paths) {
@@ -549,7 +552,7 @@ fn datasets(p: &mut Paths) {
             .doc("Fuseki's dataset state. An offline dataset answers `503` on its own endpoints. The state is not persisted.")
             .see("datasets-admin")
             .query_req("state", json!({ "type": "string", "enum": ["offline", "active"] }), "The new state.")
-            .json("200", "The dataset.", "DatasetInfo")
+            .resp("200", "The state was set.", None)
             .errors(&[400]),
     );
     p.add(
@@ -562,8 +565,7 @@ fn datasets(p: &mut Paths) {
         )
         .doc("Removes the dataset and its files.")
         .see("datasets-admin")
-        .resp("200", "Deleted.", None)
-        .no_content("Deleted."),
+        .resp("200", "Deleted.", None),
     );
     p.add(
         op(POST, "/$/datasets/{ds}/clone", "cloneDataset", "Datasets", "Clone a dataset")
@@ -1591,8 +1593,7 @@ fn format_and_mcp(p: &mut Paths) {
             "End an MCP session",
             "Ends a legacy session.",
         )
-        .resp("200", "Ended.", None)
-        .no_content("Ended."),
+        .resp("202", "Ended.", None),
     );
 }
 
@@ -2076,26 +2077,34 @@ fn auth(p: &mut Paths) {
         .json_inline("200", "The pending login.", json!({ "type": "object" }))
         .errors(&[429]),
     );
-    for (route, id, summary) in [
-        (
-            "/$/auth/device/{user_code}/approve",
-            "approveDeviceLogin",
-            "Approve a device login",
-        ),
-        (
+    p.add(
+        op(POST, "/$/auth/device/{user_code}/approve", "approveDeviceLogin", tag, "Approve a device login")
+            .doc("Mints the CLI's token. The body may narrow its scope, as for `POST /$/auth/tokens`.")
+            .see("cli-logins")
+            .json_body(false, "TokenRequest")
+            .json_inline(
+                "200",
+                "Approved.",
+                json!({ "type": "object", "properties": { "approved": { "const": true }, "tokenId": { "type": "string" } } }),
+            )
+            .errors(&[400, 429]),
+    );
+    p.add(
+        op(
+            POST,
             "/$/auth/device/{user_code}/deny",
             "denyDeviceLogin",
+            tag,
             "Deny a device login",
-        ),
-    ] {
-        p.add(
-            op(POST, route, id, tag, summary)
-                .see("cli-logins")
-                .resp("200", "Done.", None)
-                .no_content("Done.")
-                .errors(&[429]),
-        );
-    }
+        )
+        .see("cli-logins")
+        .json_inline(
+            "200",
+            "Denied.",
+            json!({ "type": "object", "properties": { "denied": { "const": true } } }),
+        )
+        .errors(&[429]),
+    );
     p.add(
         op(
             POST,
@@ -2104,12 +2113,32 @@ fn auth(p: &mut Paths) {
             tag,
             "Approve a browser CLI login",
         )
-        .doc("Issues the one-time code the browser hands to the CLI's loopback listener.")
+        .doc("Mints the CLI's token and issues the one-time code the browser hands to the CLI's loopback listener. The body may narrow the token's scope, as for `POST /$/auth/tokens`.")
         .see("cli-logins")
+        .body(
+            true,
+            "The CLI's listener and PKCE challenge.",
+            json!({ "application/json": { "schema": {
+                "allOf": [
+                    sref("TokenRequest"),
+                    {
+                        "type": "object",
+                        "required": ["port", "state", "code_challenge"],
+                        "properties": {
+                            "port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+                            "state": { "type": "string", "maxLength": 256 },
+                            "code_challenge": { "type": "string", "description": "The S256 challenge, 43 base64url characters." },
+                            "label": { "type": "string" },
+                            "hostname": { "type": "string" },
+                        },
+                    },
+                ],
+            } } }),
+        )
         .json_inline(
             "200",
             "Where to send the browser.",
-            json!({ "type": "object" }),
+            json!({ "type": "object", "properties": { "redirect": { "type": "string" } } }),
         )
         .errors(&[400]),
     );

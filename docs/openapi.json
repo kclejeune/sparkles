@@ -3471,16 +3471,65 @@
   "paths": {
     "/$/auth/cli/authorize": {
       "post": {
-        "description": "Issues the one-time code the browser hands to the CLI's loopback listener.",
+        "description": "Mints the CLI's token and issues the one-time code the browser hands to the CLI's loopback listener. The body may narrow the token's scope, as for `POST /$/auth/tokens`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#cli-logins"
         },
         "operationId": "authorizeCli",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/TokenRequest"
+                  },
+                  {
+                    "properties": {
+                      "code_challenge": {
+                        "description": "The S256 challenge, 43 base64url characters.",
+                        "type": "string"
+                      },
+                      "hostname": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1024,
+                        "type": "integer"
+                      },
+                      "state": {
+                        "maxLength": 256,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "port",
+                      "state",
+                      "code_challenge"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "The CLI's listener and PKCE challenge.",
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
+                  "properties": {
+                    "redirect": {
+                      "type": "string"
+                    }
+                  },
                   "type": "object"
                 }
               }
@@ -3669,6 +3718,7 @@
     },
     "/$/auth/device/{user_code}/approve": {
       "post": {
+        "description": "Mints the CLI's token. The body may narrow its scope, as for `POST /$/auth/tokens`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#cli-logins"
         },
@@ -3678,12 +3728,38 @@
             "$ref": "#/components/parameters/user_code"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
         "responses": {
           "200": {
-            "description": "Done."
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "approved": {
+                      "const": true
+                    },
+                    "tokenId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Approved."
           },
-          "204": {
-            "description": "Done."
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3727,10 +3803,19 @@
         ],
         "responses": {
           "200": {
-            "description": "Done."
-          },
-          "204": {
-            "description": "Done."
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "denied": {
+                      "const": true
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Denied."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -5688,9 +5773,6 @@
             },
             "description": "The automatic compaction settings after the removal."
           },
-          "204": {
-            "description": "Removed."
-          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -6037,9 +6119,6 @@
           "200": {
             "description": "Deleted."
           },
-          "204": {
-            "description": "Deleted."
-          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -6143,14 +6222,7 @@
         ],
         "responses": {
           "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DatasetInfo"
-                }
-              }
-            },
-            "description": "The dataset."
+            "description": "The state was set."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -6997,10 +7069,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Ended."
-          },
-          "204": {
+          "202": {
             "description": "Ended."
           },
           "400": {
@@ -7858,9 +7927,6 @@
             },
             "description": "The storage quota after the removal."
           },
-          "204": {
-            "description": "Removed."
-          },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
@@ -8035,9 +8101,6 @@
               }
             },
             "description": "The RDFS-on-read setting after the removal."
-          },
-          "204": {
-            "description": "Removed."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -11563,16 +11626,6 @@
           }
         ],
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ValidationStatus"
-                }
-              }
-            },
-            "description": "The write-time validation after the removal."
-          },
           "204": {
             "description": "Removed."
           },

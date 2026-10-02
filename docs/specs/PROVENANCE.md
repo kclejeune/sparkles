@@ -1076,6 +1076,34 @@ implementation landed.
   - encrypting only the vocabulary;
   - a 7-day default rotation of data keys.
 
+## OpenAPI description, shell completions and man pages
+
+- **Spec:** [`X03-openapi-and-completions.md`](X03-openapi-and-completions.md), written on
+  2026-10-02 independently from:
+  - the OpenAPI Specification 3.1.1 and JSON Schema 2020-12;
+  - YAML 1.2.2, for the emitter's scalar and block rules;
+  - the SPARQL 1.1 Protocol, the Graph Store HTTP Protocol, RFC 9110, RFC 6265,
+    RFC 7617, RFC 6750 and RFC 9512;
+  - the docs.rs documentation of `clap_complete` and `clap_mangen`, and the nixpkgs
+    manual on `installShellFiles`;
+  - the Sparkles code and `docs/API.md`.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The document is
+  built by Sparkles' own code, and the YAML emitter is its own. `utoipa` and `schemars`
+  were considered and not used (spec §2.1). **Dependencies:**
+  - `clap_complete` 4.6.11 (MIT OR Apache-2.0), for `sparkles completions`;
+  - `clap_mangen` 0.2.33 and `roff` 1.1.1 (MIT OR Apache-2.0), for `sparkles man`.
+
+  All three are linked into the `sparkles` binary.
+- **Checked with** (not linked or shipped): Redocly CLI (MIT), `openapi-typescript`
+  (MIT) and `yq` (MIT), each run once by hand at landing.
+- **Rejected** (spec §1 and §2.1):
+  - per-handler `utoipa` attributes and `schemars` derives;
+  - a hand-written YAML file as the source;
+  - a bundled Swagger UI or Redoc;
+  - Nushell completions, which need another crate.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

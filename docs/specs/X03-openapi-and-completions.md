@@ -1,11 +1,12 @@
 # X03: OpenAPI description, shell completions and man pages
 
-> **Status:** specified
+> **Status:** implemented in part
 >
-> **Phases:** Phase 1 covers the OpenAPI 3.1 description at `GET /$/openapi.json` and
-> `GET /$/openapi.yaml`, its checked-in copy, the test that keeps it in step with the
-> route table, `sparkles openapi`, shell completions, man pages and their installation
-> by the Nix package. Phase 2 describes the remaining admin types field by field.
+> **Phases:** Phase 1 shipped. It covers the OpenAPI 3.1 description at
+> `GET /$/openapi.json` and `GET /$/openapi.yaml`, its checked-in copy, the test that
+> keeps it in step with the route table, `sparkles openapi`, shell completions, man pages
+> and their installation by the Nix package. Phase 2, which describes the remaining admin
+> types field by field, was not built.
 >
 > **User docs:** [API: OpenAPI description](../API.md#openapi-description) ·
 > [Usage: Shell completions and man pages](../USAGE.md#shell-completions-and-man-pages) ·
@@ -330,4 +331,70 @@ would keep them honest.
 
 ## Outcome
 
-To be written when the feature lands.
+**Delivered.** Phase 1 landed on 2026-10-02.
+- `crates/sparkles-server/src/openapi/` builds the document. `paths.rs` describes 174
+  operations on 105 paths, which is every API template of `auth::ROUTES`. `schemas.rs`
+  has 110 schemas. 52 are described member by member, and 58 are open objects that link
+  to their section of `docs/API.md`. `yaml.rs` is the YAML emitter of §2.3.
+- `GET /$/openapi.json` and `GET /$/openapi.yaml` are public routes of the route table.
+  The document is built on the first request and kept, with an ETag for each form.
+- `docs/openapi.json` is the checked-in copy, and `mise run openapi` rewrites it.
+- `sparkles openapi [--format json|yaml]`, `sparkles completions <shell>` and
+  `sparkles man [--dir DIR]` are new subcommands, in `openapi` and `cli_docs.rs`.
+- `nix/package.nix` installs the bash, zsh and fish completions, a man page per
+  subcommand (96 pages) and `share/doc/sparkles/openapi.json`.
+- The UI's Server page links both forms of the description from its Endpoints panel.
+  API.md has an OpenAPI section, and USAGE.md a section on completions and man pages.
+
+**Deviations and decisions.**
+- An operation lists `security` only when it differs from the document's. The document's
+  default is every scheme with the session cookie alone, which is what a safe operation
+  that needs a permission accepts. Public operations, operations open to any caller,
+  web-session operations and every unsafe operation list their own. Repeating the
+  default on each of the 174 operations made up a sixth of the file.
+- The repeated responses and bodies became shared components. They are the responses
+  `QueryResults`, `GraphRead`, `WriteDone` and `TaskStarted`, and the request bodies
+  `RdfData` and `SparqlQuery`.
+- Unions of open objects use `anyOf`, not `oneOf`. An update's statistics, a receipt and
+  a dry-run report all allow any member, so one body can match several of them, and
+  `oneOf` would reject it. `oneOf` remains where the choices exclude each other, such as
+  `null` or an object.
+- `HEAD` is a separate operation where the route table lists it (`/{ds}/get`) and on the
+  Graph Store routes, where it matters for entity tags. On `/{ds}/sparql` and
+  `/{ds}/query` the GET operation says that HEAD works the same way.
+- `auth::need` and `auth::Need` are now exported outside tests, since the description
+  calls them at run time.
+- `sparkles man` without `--dir` prints only `sparkles.1`. The Nix package installs
+  elvish and PowerShell completions nowhere, because nixpkgs has no standard place for
+  them. `sparkles completions elvish` and `powershell` print them for manual setup.
+- Writes to stdout ignore a closed pipe, so `sparkles completions zsh | head` exits
+  quietly.
+
+**Tests.**
+- `openapi::tests` checks:
+  - the paths and methods against `auth::ROUTES`, in both directions;
+  - that every `$ref` resolves, `operationId`s are unique lower camel case, every tag is
+    defined and used, path parameters match the template, and no parameter repeats;
+  - security and `x-sparkles-permission` for public, metrics, write, signed-in,
+    web-session and server-admin routes;
+  - that every link into `docs/API.md` names a heading that exists;
+  - the checked-in copy, and that the YAML form names every operation.
+- `yaml::tests` covers the scalar rules and the block layout.
+- `router_tests::auth::openapi_is_public` fetches both forms anonymously from a server
+  with auth on, revalidates with the ETag (`304`), and checks that invalid credentials
+  still get `401`.
+- `tests/cli_docs.rs` runs `completions` for every shell, `man --dir` and `openapi`
+  against the binary.
+
+The document was also checked outside the test suite at landing. Redocly CLI's
+`lint` with its recommended rules found it valid, with 9 warnings for public operations
+that have no 4xx response, such as `/$/ping`. `openapi-typescript` 7 generated types
+from it without errors. The YAML form, read back with `yq`, equals the JSON form.
+
+**Measurements.** The JSON copy is 454 KB and the YAML form 317 KB. Building the
+document takes about a millisecond and happens once per process.
+
+**Not built.** Phase 2's schemas for backups, the search indexes, reasoning, write-time
+validation, history and the other open objects, and the response-validation test that
+would keep them honest. A "try it" page in the UI, and a bundled Swagger UI. Dynamic
+completion of dataset names, and Nushell completions.
