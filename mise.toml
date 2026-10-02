@@ -283,7 +283,7 @@ flag "--warmup <n>" default="2" help="warm-up runs per query"
 flag "--skip-load" help="reuse the stores and text indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines and rebuild the summary"
 flag "--engines <list>" default="sparkles jena qlever" help="engines to (re-)measure; others' results are kept"
-flag "--queries <list>" help="only these queries (default: all 5)"
+flag "--queries <list>" help="only these queries (default: all 6)"
 flag "--data <file>" help="reuse a generated dataset, e.g. target/bench/data.nt"
 flag "--port-base <n>" default="3940" help="the servers listen on the three ports after it"
 '''

@@ -726,5 +726,21 @@ problems, which this change fixed.
   from about 30 ms to about 9 ms. The `docstoreCompression` setting is still accepted, but
   it no longer changes the index size.
 
-**Not built.** `/{ds}/text` with snippets, `highlight:`, stemming, online rebuilds with a
-journal, `text` on dataset creation, and the rest of Phase 3.
+**Highlighting (2026-10-02).** Jena's `highlight:` argument works, with Jena's options
+and defaults (`m:`, `z:`, `s:`, `e:`, `f:`, `jh:` and `jf:`). Sparkles does not use
+Tantivy's `SnippetGenerator`, because it returns a single fragment and does not see the
+terms of prefix, wildcard and fuzzy queries. `text/highlight.rs` follows Lucene's
+`Highlighter` with a `SimpleFragmenter` instead. It cuts fragments at the same tokens,
+scores them by their distinct query words, keeps the best, merges adjacent ones, and marks
+a phrase only where it occurs. The query parser records what each word that is not
+excluded matches, including the terms a fuzzy word expanded to. The literal's text comes
+from the store's dictionary, so the index stores no text, and a search without
+`highlight:` reads none. On the benchmark data, 14 highlighted queries returned the same
+literals as Jena, fragments and marks included. One difference is deliberate. Jena drops
+the language tag of a highlighted literal unless its index has a language field, while
+Sparkles always keeps it. `GET /{ds}/text` from §2.2 returns ranked hits with HTML
+snippets, escaped by Sparkles with the matches in `<mark>`. The full-text benchmark has a
+sixth query for highlighting, on which Fuseki also runs.
+
+**Not built.** Stemming, online rebuilds with a journal, `text` on dataset creation, and
+the rest of Phase 3.

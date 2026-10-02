@@ -273,6 +273,12 @@ add text-join set \
 add conjunction set \
   "SELECT ?s ?lit WHERE { (?s ?score ?lit) text:query (foaf:name \"ada AND lovelace\" $ALL) }" \
   "SELECT ?s ?lit WHERE { $(qtext 'ada lovelace' foaf:name) }"
+# 6. the hits of the common word with their literals highlighted (Jena's "highlight:"
+# option, which Sparkles implements too). QLever has no highlighting, so its form returns
+# the plain literals and only the hit counts are compared.
+add highlight count \
+  "SELECT ?s ?lit WHERE { (?s ?score ?lit) text:query (foaf:name \"ada\" $ALL \"highlight:\") }" \
+  "SELECT ?s ?lit WHERE { $(qtext ada foaf:name) }"
 # There is no prefix query. All three engines take al*, but QLever returns a row per
 # matching word, so "Alan Allen" counts twice.
 

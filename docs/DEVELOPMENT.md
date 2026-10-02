@@ -143,11 +143,13 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   The script loads each store without timing it, then times each text index build and
   records the index size on disk. Sparkles and Jena index `foaf:name`, `ex:title` and
   `rdfs:label`. QLever indexes every literal, since its text index cannot be limited to
-  predicates, so its queries join the matching literal with the predicate. There are five
+  predicates, so its queries join the matching literal with the predicate. There are six
   queries. Two take the top 10 by score, one for a rare word and one for a common word.
   The third counts all hits of the common word, the fourth joins them with a structural
-  pattern, and the fifth asks for two words that must both occur. Before timing, the script compares every engine's hit counts and hit
-  sets with `scripts/bench-answers.py`. Scores and their order are never compared,
+  pattern, and the fifth asks for two words that must both occur. The sixth returns the
+  hits of the common word with highlighted literals, which QLever cannot produce, so its
+  form returns plain literals and only the counts are compared. Before timing, the script
+  compares every engine's hit counts and hit sets with `scripts/bench-answers.py`. Scores and their order are never compared,
   because the engines rank differently. QLever builds its index with explicit scoring,
   because its BM25 and TF-IDF scoring fail on language-tagged literals in version 0.5.48.
 

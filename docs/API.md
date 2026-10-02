@@ -1468,8 +1468,21 @@ SELECT ?s ?score ?label WHERE {
 
 * **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
   subject is optional. A constant subject restricts the search to that subject.
-* **Object.** A query string, or `(predicate* "query" limit "lang:xx")`. A language tag
-  on the query string acts as `lang:`.
+* **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
+  The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
+  query string acts as `lang:`.
+* **Highlighting.** With a `"highlight:…"` argument, as in Jena, `?literal` becomes the
+  best fragments of the matched literal with the matching words marked. It keeps the
+  literal's language tag. The options follow `highlight:` and are separated by `|`.
+  `m:` is the most fragments kept (3), `z:` the fragment size in characters (128), `s:`
+  and `e:` the marks around a match (↦ and ↤), and `f:` the text between fragments (∣).
+  `jh:n` marks each word of a phrase on its own, and `jf:n` keeps adjacent fragments
+  apart and keeps fragments without a match. For example,
+  `"highlight:s:<em> | e:</em> | z:150"` gives `the quick <em>brown fox</em> jumped`.
+  Fragments follow Lucene's highlighter. A fragment starts after the word that crosses a
+  multiple of the fragment size, the best fragments come first, and a phrase is marked
+  only where it occurs. A literal with no match to mark is returned unchanged. Without
+  `highlight:` the search never reads the text of a literal.
 * **Query syntax.** Query strings use Lucene's classic query syntax, as jena-text does,
   with OR as the default operator. A query string matches the same literals as in Jena
   when both analyzers produce the same tokens. These forms are supported:
@@ -1536,6 +1549,7 @@ SELECT ?s ?score ?label WHERE {
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
 | POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts
 type TextConfig = {
@@ -1551,6 +1565,15 @@ type TextStatus = {
   epoch: number; diskBytes: number; segments: number;
   config: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
+};
+type TextHits = {
+  dataset: string; commit: number;
+  limited: boolean;                    // as many hits as the limit
+  hits: {
+    s: Term; score: number; p: Term; g: Term;   // Term as in SPARQL JSON results
+    literal: Term;                     // the literal, or with highlighting its fragments
+    snippet?: string;                  // HTML: the fragments, escaped, matches in <mark>
+  }[];
 };
 ```
 
