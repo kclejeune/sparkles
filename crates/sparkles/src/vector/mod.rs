@@ -246,6 +246,7 @@ pub fn from_key(key: &[u8]) -> Option<Vec<f32>> {
 }
 
 pub mod config;
+pub mod embed;
 pub mod hnsw;
 mod index;
 pub mod persist;

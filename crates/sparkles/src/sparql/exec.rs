@@ -3992,6 +3992,34 @@ fn entity_vector(
 /// Distinct query vectors a variable query may bind.
 const MAX_QUERY_VECTORS: usize = 1000;
 
+/// The IRI of a search's predicate.
+fn pred_iri(ctx: &Ctx, pred: Id) -> Option<String> {
+    match ctx.snap.term(pred) {
+        Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
+    }
+}
+
+/// Whether the index of `pred` embeds query text.
+fn text_queries(ctx: &Ctx, pred: Id) -> bool {
+    pred_iri(ctx, pred).is_some_and(|iri| {
+        ctx.snap
+            .generation
+            .vectors
+            .configured()
+            .values()
+            .any(|c| c.predicate == iri && c.embedding.as_ref().is_some_and(|e| e.query_text))
+    })
+}
+
+/// The vector of a search's text, from the provider of the predicate's index.
+fn text_vector(ctx: &Ctx, pred: Id, text: &str) -> Result<std::sync::Arc<[f32]>> {
+    ctx.check()?;
+    let iri = pred_iri(ctx, pred)
+        .ok_or_else(|| Error::invalid("spk:vectorSearch: the predicate is not an IRI"))?;
+    crate::store::embed_query_text(&ctx.snap, &iri, text)
+}
+
 /// Top-k vector search (`spk:vectorSearch`). With `input` (a variable query or
 /// `candidates:join`), the search runs once per distinct query and joins with the input
 /// rows; else it is a leaf.
@@ -4014,6 +4042,14 @@ pub(super) fn vector_search(
     let mut runs: Vec<(Option<Vec<f32>>, Vec<usize>)> = Vec::new();
     match (&spec.query, &input) {
         (VectorQuery::Vector(v), None) => runs.push((Some(v.to_vec()), Vec::new())),
+        (VectorQuery::Text(t), inp) => {
+            let v = text_vector(ctx, pred, t)?;
+            let rows = match inp {
+                Some(inp) => input_rows(&mut (0..inp.len())),
+                None => Vec::new(),
+            };
+            runs.push((Some(v.to_vec()), rows));
+        }
         (VectorQuery::Entity(e), None) => {
             runs.push((entity_vector(ctx, spec, pred, *e)?, Vec::new()))
         }
@@ -4053,6 +4089,13 @@ pub(super) fn vector_search(
             for id in order {
                 ctx.check()?;
                 let v = match ctx.term(id) {
+                    Some(oxrdf::Term::Literal(l))
+                        if (l.datatype() == oxrdf::vocab::xsd::STRING
+                            || l.datatype() == oxrdf::vocab::rdf::LANG_STRING)
+                            && text_queries(ctx, pred) =>
+                    {
+                        Some(text_vector(ctx, pred, l.value())?.to_vec())
+                    }
                     Some(oxrdf::Term::Literal(l)) => {
                         match (l.datatype().as_str() == vector::DATATYPE)
                             .then(|| vector::parse(l.value()).ok())

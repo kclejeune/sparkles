@@ -16,12 +16,14 @@ mod compaction;
 #[cfg(test)]
 mod compaction_tests;
 mod diff;
+mod embed;
 mod geo;
 mod mem_history;
 mod preview;
 mod quota;
 mod schedule;
 mod vector;
+pub(crate) use embed::embed_query_text;
 pub(crate) mod wal;
 pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
@@ -950,6 +952,8 @@ pub struct Store {
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
     /// configured vector indexes (`vector.json`)
     vector: Arc<vector::VectorRegistry>,
+    /// embeddings computed on write: the work of the indexes that name a provider
+    embed: Arc<crate::vector::embed::Embedder>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
@@ -1068,6 +1072,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
+            embed: Default::default(),
             history: None,
             mem_history: Some(Mutex::new(Default::default())),
             guard: parking_lot::RwLock::new(None),
@@ -1302,6 +1307,7 @@ impl Store {
             text: Default::default(),
             geo: Default::default(),
             vector: Default::default(),
+            embed: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             mem_history: None,
             guard: parking_lot::RwLock::new(None),
@@ -3310,6 +3316,10 @@ impl Store {
         self.commits.send_replace(head.seq);
         // and its own vector indexes, built in the background
         self.vectors_switched(snap);
+        if bulk.is_some() {
+            // a bulk commit has no log to schedule embeddings from
+            self.embed_bulk(head.seq);
+        }
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -4323,8 +4333,11 @@ impl WriteTxn<'_> {
         self.store.maintain_text(&mut snap, &self.log);
         self.store.maintain_geo(&mut snap, &self.log);
         self.store.remember_past(c.seq);
-        self.store.current.store(Arc::new(snap));
+        let snap = Arc::new(snap);
+        self.store.current.store(snap.clone());
         self.store.commits.send_replace(c.seq);
+        // after the publication: a worker that takes these pairs reads this state
+        self.store.embed_noted(&snap, &self.log, c.seq, self.kind);
         if validation.is_some() {
             self.store.guard_committed(c.seq);
         }
@@ -4595,6 +4608,7 @@ impl Drop for Store {
         // a lease guard outliving the store must not collect in a directory that another
         // process (or a restore's swap) may own next
         self.writer.lock().closed = true;
+        self.embed.close();
     }
 }
 

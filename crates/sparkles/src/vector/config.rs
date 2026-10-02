@@ -115,6 +115,9 @@ pub struct VectorIndexConfig {
     /// searches over at most this many rows are exact
     #[serde(default = "default_exact_threshold")]
     pub exact_threshold: usize,
+    /// compute the vectors from the dataset's text with an embeddings endpoint (F08)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<super::embed::EmbeddingConfig>,
 }
 
 impl VectorIndexConfig {
@@ -127,6 +130,7 @@ impl VectorIndexConfig {
             model: None,
             hnsw: default_hnsw(),
             exact_threshold: default_exact_threshold(),
+            embedding: None,
         }
     }
 
@@ -152,6 +156,9 @@ impl VectorIndexConfig {
         }
         if self.model.as_ref().is_some_and(|m| m.len() > 256) {
             return bad("model: at most 256 bytes".into());
+        }
+        if let Some(e) = &self.embedding {
+            e.validate(&self.predicate)?;
         }
         Ok(())
     }
@@ -292,6 +299,9 @@ pub struct VectorIndexStatus {
     pub files: Option<VectorFiles>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_build: Option<VectorBuild>,
+    /// the embedding worker's state, for an index that computes its vectors
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<super::embed::EmbeddingStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -742,6 +742,54 @@ pub fn fetch_text(
     String::from_utf8(bytes).map_err(|_| failed("the response is not UTF-8".into()))
 }
 
+/// The answer of [`post_json`]: the status, the `Retry-After` header and the body.
+pub(crate) struct Posted {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// POST `body` (JSON) to `url` through `policy`, with `headers`, within `timeout` (at
+/// most the policy's), and read the whole response body under the policy's ceiling. Any
+/// status is an answer; only a refused destination, a network failure, a timeout or an
+/// oversized body is a [`Failure`].
+pub(crate) fn post_json(
+    policy: &OutboundPolicy,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    timeout: Duration,
+) -> Result<Posted, Failure> {
+    let budget = RequestBudget::new(policy);
+    let resp = policy.send(&budget, url, timeout, |client, u| {
+        let mut rb = client
+            .post(u)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.body(body)
+    })?;
+    let retry_after = resp
+        .body
+        .resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let status = resp.status;
+    let mut bytes = Vec::new();
+    let mut b = resp.body;
+    b.read_to_end(&mut bytes)
+        .map_err(|e| Failure::Failed(e.to_string()))?;
+    Ok(Posted {
+        status,
+        retry_after,
+        body: bytes,
+    })
+}
+
 /// A response whose headers are in.
 pub(crate) struct Response {
     pub status: reqwest::StatusCode,

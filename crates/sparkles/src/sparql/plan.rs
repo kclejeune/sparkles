@@ -159,6 +159,8 @@ pub enum VectorQuery {
     Entity(Id),
     /// bound by the rest of the group: a vector literal or an entity per input row
     Var(VarId),
+    /// a text, embedded with the provider of the predicate's index when the search runs
+    Text(Arc<str>),
 }
 
 /// A `spk:vectorSearch` call planned as a leaf (exact top-k similarity search).
@@ -1118,8 +1120,10 @@ impl<'a> Planner<'a> {
         };
         let (score, vector_var) = (var_slot("the score")?, var_slot("the vector")?);
         let mut args = args.into_iter();
-        let pred = match args.next() {
-            Some(TermPattern::NamedNode(p)) => self.ctx.snap.lookup_iri(p.as_str()),
+        let (pred, args_pred) = match args.next() {
+            Some(TermPattern::NamedNode(p)) => {
+                (self.ctx.snap.lookup_iri(p.as_str()), p.as_str().to_string())
+            }
             _ => return Err(shape()),
         };
         let query = match args.next() {
@@ -1127,8 +1131,18 @@ impl<'a> Planner<'a> {
                 let v = vector::parse(l.value()).map_err(Error::invalid)?;
                 VectorQuery::Vector(v.into())
             }
+            Some(TermPattern::Literal(l))
+                if l.datatype() == oxrdf::vocab::xsd::STRING
+                    || l.datatype() == oxrdf::vocab::rdf::LANG_STRING =>
+            {
+                // a text: the predicate's index must name an embedding provider
+                self.check_text_query(&args_pred)?;
+                VectorQuery::Text(l.value().into())
+            }
             Some(TermPattern::Literal(_)) => {
-                return Err(bad("the query must be an spk:vector literal or an entity"));
+                return Err(bad(
+                    "the query must be an spk:vector literal, a text or an entity",
+                ));
             }
             Some(
                 t @ (TermPattern::NamedNode(_)
@@ -1236,6 +1250,8 @@ impl<'a> Planner<'a> {
                 VectorQuery::Vector(v) => format!(" dim={}", v.len()),
                 VectorQuery::Entity(e) => format!(" like {}", self.pt_str(&PT::C(*e))),
                 VectorQuery::Var(v) => format!(" like ?{}", self.ctx.var_name(*v)),
+                VectorQuery::Text(t) =>
+                    format!(" text {:?}", t.chars().take(40).collect::<String>()),
             } + if mode.exact { " exact" } else { "" }
                 + &mode.ef.map_or(String::new(), |e| format!(" ef={e}"))
                 + if distinct_subject {
@@ -1263,6 +1279,25 @@ impl<'a> Planner<'a> {
         let mut n = Node::leaf(Kind::VectorSearch(Box::new(spec)), vars, k as f64, desc);
         n.cost = k as f64 * 16.0;
         Ok(n)
+    }
+
+    /// A text query needs an index on `pred` with an embedding provider that embeds
+    /// query text.
+    fn check_text_query(&self, pred: &str) -> Result<()> {
+        let configured = self.ctx.snap.generation.vectors.configured();
+        let emb = configured
+            .values()
+            .find(|c| c.predicate == pred)
+            .and_then(|c| c.embedding.as_ref());
+        match emb {
+            None => Err(Error::invalid(format!(
+                "spk:vectorSearch: <{pred}> has no embedding provider; pass an spk:vector literal"
+            ))),
+            Some(e) if !e.query_text => Err(Error::invalid(format!(
+                "spk:vectorSearch: the index of <{pred}> does not embed query text (queryText is false)"
+            ))),
+            Some(_) => Ok(()),
+        }
     }
 
     /// A search that reads the rest of its group (`left`): a variable query bound there,
