@@ -118,47 +118,157 @@ impl ServerPerm {
 
 /// `*` matches any run (possibly empty) of characters; everything else matches itself.
 pub fn glob(pattern: &str, name: &str) -> bool {
-    let (p, n) = (pattern.as_bytes(), name.as_bytes());
-    // iterative wildcard matching with backtracking to the last `*`
-    let (mut i, mut j) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while j < n.len() {
-        if i < p.len() && p[i] == b'*' {
-            star = Some((i, j));
-            i += 1;
-        } else if i < p.len() && p[i] == n[j] {
-            i += 1;
-            j += 1;
-        } else if let Some((si, sj)) = star {
-            i = si + 1;
-            j = sj + 1;
-            star = Some((si, sj + 1));
-        } else {
-            return false;
+    sparkles::access::glob(pattern, name)
+}
+
+/// A service of a dataset that a grant may be limited to (Fuseki's operation names,
+/// and a few of Sparkles').
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Endpoint {
+    /// SPARQL queries, explain, `/{ds}/text`, `/{ds}/geo`, the MCP query tools
+    Query,
+    /// SPARQL Update, the MCP update tool
+    Update,
+    /// Graph Store reads
+    GspR,
+    /// Graph Store reads and writes
+    GspRw,
+    Upload,
+    Shacl,
+    Shex,
+    Diff,
+    /// every other route that reads (or, for prefixes, writes) the dataset's description
+    Info,
+}
+
+impl Endpoint {
+    pub const ALL: [Endpoint; 9] = [
+        Endpoint::Query,
+        Endpoint::Update,
+        Endpoint::GspR,
+        Endpoint::GspRw,
+        Endpoint::Upload,
+        Endpoint::Shacl,
+        Endpoint::Shex,
+        Endpoint::Diff,
+        Endpoint::Info,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Endpoint::Query => "query",
+            Endpoint::Update => "update",
+            Endpoint::GspR => "gsp-r",
+            Endpoint::GspRw => "gsp-rw",
+            Endpoint::Upload => "upload",
+            Endpoint::Shacl => "shacl",
+            Endpoint::Shex => "shex",
+            Endpoint::Diff => "diff",
+            Endpoint::Info => "info",
         }
     }
-    p[i..].iter().all(|&c| c == b'*')
+
+    pub fn parse(s: &str) -> Option<Endpoint> {
+        Endpoint::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+
+    /// Whether a grant for this endpoint covers a request to `e` (`gsp-rw` includes
+    /// the reads of `gsp-r`, as in Fuseki).
+    pub fn covers(self, e: Endpoint) -> bool {
+        self == e || self == Endpoint::GspRw && e == Endpoint::GspR
+    }
 }
+
+/// A dataset grant limited to some graphs, some endpoints, or both (never `admin`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restricted {
+    /// dataset name or `*` pattern
+    pub dataset: String,
+    pub level: Level,
+    /// graph names and IRI patterns; `None` is every graph
+    pub graphs: Option<Vec<String>>,
+    /// `None` is every endpoint
+    pub endpoints: Option<Vec<Endpoint>>,
+}
+
+impl Restricted {
+    fn applies(&self, ds: &str, e: Option<Endpoint>) -> bool {
+        glob(&self.dataset, ds)
+            && match (e, &self.endpoints) {
+                (_, None) | (None, Some(_)) => true,
+                (Some(e), Some(es)) => es.iter().any(|x| x.covers(e)),
+            }
+    }
+
+    fn graphs(&self) -> sparkles::access::Graphs {
+        match &self.graphs {
+            None => sparkles::access::Graphs::All,
+            Some(g) => sparkles::access::Graphs::Only(sparkles::access::GraphRule::new(
+                g,
+                &[INFERRED_GRAPH],
+            )),
+        }
+    }
+}
+
+/// The graph of materialized inferences: covered only by grants that name it exactly.
+pub const INFERRED_GRAPH: &str = crate::http::INFERRED_GRAPH;
 
 /// Dataset grants by pattern and server permissions; roles are already flattened in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
     pub datasets: Vec<(String, Level)>,
     pub server: Vec<ServerPerm>,
+    /// grants limited to some graphs or endpoints
+    pub restricted: Vec<Restricted>,
 }
 
 impl Grants {
     /// The highest level any matching pattern grants (independent of whether the
     /// dataset exists); `admin` everywhere with `server-admin`.
+    #[cfg(test)]
     pub fn level(&self, ds: &str) -> Option<Level> {
+        self.level_for(ds, None)
+    }
+
+    /// [`level`](Self::level) through endpoint `e` (any endpoint when `None`).
+    pub fn level_for(&self, ds: &str, e: Option<Endpoint>) -> Option<Level> {
         if self.server.contains(&ServerPerm::ServerAdmin) {
             return Some(Level::Admin);
         }
-        self.datasets
+        let full = self
+            .datasets
             .iter()
             .filter(|(p, _)| glob(p, ds))
-            .map(|(_, l)| *l)
-            .max()
+            .map(|(_, l)| *l);
+        let restricted = self
+            .restricted
+            .iter()
+            .filter(|r| r.applies(ds, e))
+            .map(|r| r.level);
+        full.chain(restricted).max()
+    }
+
+    /// The graphs of `ds` that the grants of at least `min` reach through endpoint `e`:
+    /// a union, where a grant without a graph list covers every graph.
+    pub fn graphs(&self, ds: &str, e: Endpoint, min: Level) -> sparkles::access::Graphs {
+        use sparkles::access::Graphs;
+        if self.server.contains(&ServerPerm::ServerAdmin)
+            || self.datasets.iter().any(|(p, l)| *l >= min && glob(p, ds))
+        {
+            return Graphs::All;
+        }
+        let mut g = Graphs::none();
+        for r in &self.restricted {
+            if r.level >= min && r.applies(ds, Some(e)) {
+                g = g.union(&r.graphs());
+                if g.is_all() {
+                    break;
+                }
+            }
+        }
+        g
     }
 
     pub fn has(&self, p: ServerPerm) -> bool {
@@ -170,6 +280,11 @@ impl Grants {
         for g in &other.datasets {
             if !self.datasets.contains(g) {
                 self.datasets.push(g.clone());
+            }
+        }
+        for r in &other.restricted {
+            if !self.restricted.contains(r) {
+                self.restricted.push(r.clone());
             }
         }
         for s in &other.server {
@@ -253,11 +368,32 @@ impl Access {
     }
 
     pub fn level(&self, ds: &str) -> Option<Level> {
-        let mut l = self.grants.level(ds)?;
+        self.level_for(ds, None)
+    }
+
+    /// [`level`](Self::level) through endpoint `e` (any endpoint when `None`).
+    pub fn level_for(&self, ds: &str, e: Option<Endpoint>) -> Option<Level> {
+        let mut l = self.grants.level_for(ds, e)?;
         for s in &self.scopes {
             l = l.min(s.level(ds)?);
         }
         Some(l)
+    }
+
+    /// The graph view of `ds` through endpoint `e`: `None` when it covers every graph
+    /// the level allows (or nothing is allowed).
+    pub fn view(&self, ds: &str, e: Endpoint) -> Option<sparkles::access::GraphAccess> {
+        let l = self.level_for(ds, Some(e))?;
+        let read = self.grants.graphs(ds, e, Level::Read);
+        let write = if l >= Level::Write {
+            self.grants.graphs(ds, e, Level::Write)
+        } else {
+            sparkles::access::Graphs::none()
+        };
+        if read.is_all() && (l < Level::Write || write.is_all()) {
+            return None;
+        }
+        Some(sparkles::access::GraphAccess { read, write })
     }
 
     pub fn has(&self, p: ServerPerm) -> bool {
@@ -388,8 +524,8 @@ impl Principal {
             name: "".into(),
             scheme: Scheme::None,
             access: Arc::new(Access::of(Grants {
-                datasets: Vec::new(),
                 server: vec![ServerPerm::ServerAdmin],
+                ..Default::default()
             })),
             info: Arc::default(),
         });
@@ -436,6 +572,49 @@ impl Principal {
 
     pub fn can(&self, ds: &str, need: Level) -> bool {
         self.level(ds).is_some_and(|l| l >= need)
+    }
+
+    /// The level granted on `ds` through endpoint `e`.
+    pub fn level_at(&self, ds: &str, e: Endpoint) -> Option<Level> {
+        self.access.level_for(ds, Some(e))
+    }
+
+    /// Whether `need` is granted on `ds` through endpoint `e`.
+    pub fn can_at(&self, ds: &str, e: Endpoint, need: Level) -> bool {
+        self.level_at(ds, e).is_some_and(|l| l >= need)
+    }
+
+    /// The graphs of `ds` this principal reads and writes through endpoint `e`, when
+    /// its grants do not cover every graph (`None` otherwise, and always without auth).
+    pub fn view(&self, ds: &str, e: Endpoint) -> Option<Arc<sparkles::access::GraphAccess>> {
+        if self.is_local() {
+            return None;
+        }
+        self.access.view(ds, e).map(Arc::new)
+    }
+
+    /// Whether some endpoint of `ds` shows this principal only some of its graphs.
+    pub fn restricted(&self, ds: &str) -> bool {
+        !self.is_local()
+            && Endpoint::ALL
+                .into_iter()
+                .any(|e| self.view(ds, e).is_some())
+    }
+
+    /// How this principal's grants limit `ds`, for `whoami`: whether some endpoint sees
+    /// only some graphs, and the endpoints it may use when not all of them. `None` when
+    /// nothing is limited.
+    pub fn limits(&self, ds: &str) -> Option<(bool, Option<Vec<Endpoint>>)> {
+        if self.is_local() {
+            return None;
+        }
+        let allowed: Vec<Endpoint> = Endpoint::ALL
+            .into_iter()
+            .filter(|e| self.can_at(ds, *e, Level::Read))
+            .collect();
+        let graphs = allowed.iter().any(|e| self.view(ds, *e).is_some());
+        let endpoints = (allowed.len() < Endpoint::ALL.len()).then_some(allowed);
+        (graphs || endpoints.is_some()).then_some((graphs, endpoints))
     }
 
     /// `server-admin` implies every server permission.
@@ -522,6 +701,7 @@ mod tests {
                 ("team-a".into(), Level::Admin),
             ],
             server: vec![ServerPerm::Metrics],
+            ..Default::default()
         };
         assert_eq!(g.level("wiki"), Some(Level::Write));
         assert_eq!(g.level("team-a"), Some(Level::Admin));
@@ -534,6 +714,7 @@ mod tests {
         let admin = Grants {
             datasets: vec![],
             server: vec![ServerPerm::ServerAdmin],
+            ..Default::default()
         };
         assert_eq!(admin.level("anything"), Some(Level::Admin));
         assert!(admin.has(ServerPerm::Federate));

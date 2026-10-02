@@ -1,6 +1,6 @@
 //! The route table and the authorization middleware.
 
-use super::{Level, Principal, Scheme, ServerPerm};
+use super::{Endpoint, Level, Principal, Scheme, ServerPerm};
 use crate::state::AppState;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
@@ -283,6 +283,70 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
     })
 }
 
+/// The endpoint of a request that needs a level on a dataset, for grants limited to some
+/// endpoints; `None` for routes that need `admin`, which only unlimited grants give.
+pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<Endpoint> {
+    let get = matches!(*method, Method::GET | Method::HEAD);
+    Some(match route {
+        "/{ds}/sparql" | "/{ds}/query" | "/{ds}/explain" | "/{ds}/text" | "/{ds}/geo" => {
+            Endpoint::Query
+        }
+        "/{ds}/update" => Endpoint::Update,
+        "/{ds}/get" => Endpoint::GspR,
+        "/{ds}/data" if get => Endpoint::GspR,
+        "/{ds}/data" => Endpoint::GspRw,
+        "/{ds}/upload" => Endpoint::Upload,
+        "/{ds}/shacl" => Endpoint::Shacl,
+        "/{ds}/shex" => Endpoint::Shex,
+        "/{ds}/diff" => Endpoint::Diff,
+        "/{ds}" => {
+            let ct = media_type(headers);
+            if has_param(uri, "update") || ct == "application/sparql-update" {
+                Endpoint::Update
+            } else if has_param(uri, "query")
+                || ct == "application/sparql-query"
+                // the body may hold `update=`: `dataset_root` re-checks
+                || (*method == Method::POST && ct == "application/x-www-form-urlencoded")
+            {
+                Endpoint::Query
+            } else if get || *method == Method::OPTIONS {
+                Endpoint::GspR
+            } else {
+                Endpoint::GspRw
+            }
+        }
+        r if r.contains("{ds}") => match need(route, method, uri, headers) {
+            Some(Need::Dataset(Level::Read | Level::Write)) => Endpoint::Info,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Routes that read or change the whole dataset at once (statistics, index status,
+/// reasoning diagnostics, backups, validation, prefix changes), which a caller limited to
+/// some graphs may not use.
+pub fn whole_dataset(route: &str, method: &Method) -> bool {
+    let get = matches!(*method, Method::GET | Method::HEAD);
+    match route {
+        "/$/stats/{ds}"
+        | "/$/reason/{ds}/diagnostics"
+        | "/$/vector/{ds}"
+        | "/$/vector/{ds}/{name}/recall"
+        | "/{ds}/shacl"
+        | "/{ds}/shex" => true,
+        "/$/reason/{ds}"
+        | "/$/text/{ds}"
+        | "/$/geo/{ds}"
+        | "/$/vector/{ds}/{name}"
+        | "/$/backups/{ds}"
+        | "/$/backups/{ds}/{repo}/{backup}"
+        | "/$/quota/{ds}" => get,
+        "/{ds}/prefixes" => !get,
+        _ => false,
+    }
+}
+
 /// The origin of `public_url`, or else the request's own (`X-Forwarded-Proto` or either
 /// scheme, and `Host`).
 fn own_origin(origin: &str, h: &HeaderMap, public_url: Option<&str>) -> bool {
@@ -553,9 +617,10 @@ pub fn dataset_denial(
     headers: &HeaderMap,
     ds: &str,
     lvl: Level,
+    e: Endpoint,
 ) -> Option<Response> {
     let have = p.level(ds);
-    if have.is_some_and(|h| h >= lvl) {
+    if p.level_at(ds, e).is_some_and(|h| h >= lvl) {
         return None;
     }
     if p.is_anonymous() {
@@ -565,10 +630,17 @@ pub fn dataset_denial(
         let r = json_error(StatusCode::NOT_FOUND, &format!("no such dataset: /{ds}"));
         return Some(with_report(r, report_of(p, Some(Denied::Hidden))));
     }
-    Some(forbidden(
-        p,
-        &format!("{} access to /{ds} required", lvl.as_str()),
-    ))
+    Some(forbidden(p, &denial_message(ds, lvl, e, have)))
+}
+
+/// The 403 of a caller below `lvl` on `ds` through endpoint `e`: the endpoint is named
+/// when another endpoint would have given the level.
+fn denial_message(ds: &str, lvl: Level, e: Endpoint, have: Option<Level>) -> String {
+    if have.is_some_and(|h| h >= lvl) {
+        format!("the {} endpoint of /{ds} is not allowed", e.as_str())
+    } else {
+        format!("{} access to /{ds} required", lvl.as_str())
+    }
 }
 
 /// The `401` with the server's challenges, for an anonymous caller that must sign in
@@ -855,7 +927,13 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         Need::Dataset(lvl) => {
             let ds = ds_of(&route, req.uri()).unwrap_or_default();
             let have = p.level(&ds);
-            if have.is_none_or(|h| h < lvl) {
+            // through the route's endpoint, for grants limited to some endpoints
+            let e = endpoint(&route, &method, req.uri(), req.headers());
+            let through = match e {
+                Some(e) => p.level_at(&ds, e),
+                None => have,
+            };
+            if through.is_none_or(|h| h < lvl) {
                 if p.is_anonymous() {
                     return finish(deny(Denied::Unauthenticated, unauth(req.headers()), &p));
                 }
@@ -866,7 +944,23 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     return finish(deny(Denied::Hidden, r, &p));
                 }
                 count(Denied::Forbidden);
-                let msg = format!("{} access to /{ds} required", lvl.as_str());
+                let msg = match e {
+                    Some(e) => denial_message(&ds, lvl, e, have),
+                    None => format!("{} access to /{ds} required", lvl.as_str()),
+                };
+                return finish(forbidden(&p, &msg));
+            }
+            // routes that report on, or change, every graph at once refuse a caller whose
+            // grants cover only some graphs
+            if let Some(e) = e
+                && whole_dataset(&route, &method)
+                && p.view(&ds, e).is_some()
+            {
+                count(Denied::Forbidden);
+                let msg = format!(
+                    "{} covers every graph of /{ds}, and your access is limited to some graphs",
+                    route.replace("{ds}", &ds)
+                );
                 return finish(forbidden(&p, &msg));
             }
         }

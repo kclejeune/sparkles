@@ -146,7 +146,12 @@ async fn rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
 
 /// `GET /{ds}/geo?bbox=minLon,minLat,maxLon,maxLat&graph=&predicate=&limit=&tolerance=`:
 /// the indexed geometries meeting a CRS84 box as a GeoJSON `FeatureCollection`.
-async fn features(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
+async fn features(
+    State(st): St,
+    Path(name): Path<String>,
+    axum::Extension(p): axum::Extension<crate::auth::Principal>,
+    uri: Uri,
+) -> ApiResult {
     if !cfg!(feature = "geo") {
         return Err(not_built());
     }
@@ -154,10 +159,12 @@ async fn features(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResul
     #[cfg(feature = "geo")]
     {
         let q = box_query(&uri)?;
+        let graphs = p.view(&ds.name, crate::auth::Endpoint::Query);
         let fc = blocking(move || {
-            Ok(sparkles::geo::map::features_in_box(
+            Ok(sparkles::geo::map::features_in_box_of(
                 &ds.store.snapshot(),
                 &q,
+                graphs.as_deref(),
             )?)
         })
         .await?;
@@ -169,7 +176,7 @@ async fn features(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResul
     }
     #[cfg(not(feature = "geo"))]
     {
-        let _ = (ds, uri);
+        let _ = (ds, uri, p);
         Err(not_built())
     }
 }

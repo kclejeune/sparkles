@@ -329,7 +329,12 @@ mod enabled {
         // SPARQL selectors: the request's row and memory budgets (SERVICE is refused
         // when the map is parsed, and the caller's permissions apply all the same)
         let mut selector_query = query_options(&st, &ds, &query);
-        crate::auth::restrict(&mut selector_query, &principal);
+        crate::auth::restrict(
+            &mut selector_query,
+            &principal,
+            &ds.name,
+            crate::auth::Endpoint::Shex,
+        );
         let ct = content_type(&headers);
         let has_inferred = ds.reasoning.read().is_some();
         // a client that disconnects stops the validation at its next check

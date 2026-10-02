@@ -148,7 +148,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         // the query string and options become literals serialized by oxrdf (escaped),
         // the predicates validated IRIs
@@ -268,7 +274,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         let fetch = k + usize::from(exclude_self);
         let order = if metric == Metric::Euclidean {

@@ -119,7 +119,13 @@ impl Tools<'_> {
         let t0 = Instant::now();
         let deadline = self.call.arrived + timeout;
         let mut opts = self
-            .query_options(false, deadline, &prefix_map)
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Update,
+                false,
+                deadline,
+                &prefix_map,
+            )
             .map_err(|e| ctx.engine(e))?;
         // the engine refuses LOAD too, should the check above not have parsed the update
         opts.forbid_remote_load = true;
@@ -132,10 +138,20 @@ impl Tools<'_> {
             message: message.clone(),
             precondition: None,
             no_wait: false,
+            graphs: opts.graphs.clone(),
         };
+        // a caller limited to some graphs learns that the guard refused, not its results
+        let restricted = opts.graphs.is_some();
         let stats =
             sparkles::sparql::update::update_as(&ds.store, &a.update, &opts, CommitKind::Update)
-                .map_err(|e| ctx.engine(e))?;
+                .map_err(|e| match e {
+                    sparkles::Error::Rejected(_) if restricted => ToolError::new(
+                        "validation-failed",
+                        422,
+                        "the update does not conform to the dataset's validation guard; nothing was written",
+                    ),
+                    e => ctx.engine(e),
+                })?;
         let Some(receipt) = stats.commit else {
             return Err(ToolError::internal(&self.call.request_id));
         };
@@ -154,6 +170,7 @@ impl Tools<'_> {
         if let Some(v) = receipt
             .validation
             .as_deref()
+            .filter(|_| !restricted)
             .and_then(|v| serde_json::to_value(v).ok())
         {
             out["validation"] = v;
