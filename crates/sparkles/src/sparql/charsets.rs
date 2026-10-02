@@ -53,6 +53,10 @@ const MAX_PREDS: usize = 63;
 /// A predicate is used when the sets kept hold at least this share of its triples.
 const COVERAGE: f64 = 0.95;
 
+/// The sets holding an item, by index into the statistics' list, with the item's triples
+/// in each.
+type Postings = Arc<[(u32, f64)]>;
+
 /// The characteristic sets of a generation's statistics by predicate.
 pub struct CharIndex {
     /// the base id of `rdf:type`
@@ -61,7 +65,7 @@ pub struct CharIndex {
     subjects: Vec<f64>,
     /// item → the sets holding it, by index into the statistics' list, with its triples
     /// in each; found on first use
-    postings: Mutex<FxHashMap<u64, Arc<[(u32, f64)]>>>,
+    postings: Mutex<FxHashMap<u64, Postings>>,
     /// the sets summed by the predicates of a list registered for a variable, kept for
     /// later queries
     groups: Mutex<FxHashMap<Vec<u64>, Arc<[Group]>>>,
@@ -127,7 +131,7 @@ impl CharIndex {
     }
 
     /// The sets holding item `p`, with its triples in each.
-    fn postings(&self, stats: &Stats, p: u64) -> Arc<[(u32, f64)]> {
+    fn postings(&self, stats: &Stats, p: u64) -> Postings {
         if let Some(x) = self.postings.lock().get(&p) {
             return x.clone();
         }
@@ -152,7 +156,7 @@ impl CharIndex {
         if let Some(g) = self.groups.lock().get(preds) {
             return g.clone();
         }
-        let lists: Vec<Arc<[(u32, f64)]>> = (0..preds.len())
+        let lists: Vec<Postings> = (0..preds.len())
             .map(|i| {
                 if usable & (1 << i) == 0 {
                     Arc::from(Vec::new())

@@ -164,16 +164,26 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
                 return Ok(None);
             };
             let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
-            let mut mask = bound_cols(&lo, &hi) | 1 << kc;
+            let mut mask = 1 << kc;
             for &(a, b) in &spec.eqs {
                 mask |= 1 << a | 1 << b;
             }
-            mask |= 1 << spec.graph_col;
+            if spec.graph != super::plan::GraphFilter::All {
+                mask |= 1 << spec.graph_col;
+            }
             // a pattern whose blocks are not cached yet is left to a later query, after
-            // this one has read them
+            // this one has read them (the columns of the range are read only for the
+            // blocks at its ends)
             let base = ctx.snap.perm(spec.perm);
             let (b0, b1) = base.key_block_range(&lo, &hi);
-            if (b0..b1).any(|b| !ctx.snap.cache.has_cols(base, b, mask)) {
+            let bounds = bound_cols(&lo, &hi);
+            if (b0..b1).any(|b| {
+                let m = &base.blocks[b];
+                let whole = m.first >= lo && m.last <= hi;
+                !ctx.snap
+                    .cache
+                    .has_cols(base, b, if whole { mask } else { mask | bounds })
+            }) {
                 return Ok(None);
             }
             let limit = 4 * SOURCE_ROWS as usize;
@@ -336,8 +346,9 @@ fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id], budget: &mut usize) -> Resul
 
 /// The rows of the pattern `spec` (sorted on the probed variable) for each of the sorted
 /// `keys`, reading each block of the pattern at most once and counting the blocks wholly
-/// inside a key's range from their metadata. `None` when the blocks to read that the
-/// cache does not hold are more than `budget`, which the ones read are taken from.
+/// inside a key's range from their metadata. `None`, before anything is read, when the
+/// blocks to read that the cache does not hold are more than `budget`, which the ones
+/// read are taken from.
 fn count_keys(
     snap: &Snapshot,
     spec: &ScanSpec,
@@ -354,13 +365,52 @@ fn count_keys(
         || Delta::range(&snap.delta.del[pi], &spec.prefix)
             .next()
             .is_some();
+    // the key column, the one after the pattern's constants
+    let kc = spec.prefix.len();
+    let (plo, phi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
+    // the blocks to read for each key, with the columns to read: within the pattern's
+    // range the constants are the same in every row and only the key column is read,
+    // which the scans and joins of the pattern read too
+    let reads = |k: Id, prefix: &mut Vec<u64>| {
+        *prefix.last_mut().unwrap() = k.0;
+        let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
+        let (b0, b1) = base.key_block_range(&lo, &hi);
+        (b0..b1).filter_map(move |b| {
+            let m = &base.blocks[b];
+            if m.first >= lo && m.last <= hi {
+                return None;
+            }
+            let inside = m.first >= plo && m.last <= phi;
+            Some((
+                b,
+                inside,
+                if inside {
+                    1 << kc
+                } else {
+                    bound_cols(&lo, &hi)
+                },
+            ))
+        })
+    };
+    // first, from the metadata alone, whether the blocks outside the cache fit the budget
+    let mut cold: Vec<usize> = Vec::new();
+    for &k in keys {
+        for (b, _, mask) in reads(k, &mut prefix) {
+            if !cold.contains(&b) && !snap.cache.has_cols(base, b, mask) {
+                cold.push(b);
+            }
+        }
+    }
+    if cold.len() > *budget {
+        return Ok(None);
+    }
+    *budget -= cold.len();
     let mut cur: Option<(usize, crate::index::Block)> = None;
     let mut out = Vec::with_capacity(keys.len());
     for &k in keys {
         *prefix.last_mut().unwrap() = k.0;
         let (lo, hi) = (pad(&prefix, 0), pad(&prefix, u64::MAX));
         let (b0, b1) = base.key_block_range(&lo, &hi);
-        let mask = bound_cols(&lo, &hi);
         let mut c = 0u64;
         for b in b0..b1 {
             let m = &base.blocks[b];
@@ -368,18 +418,24 @@ fn count_keys(
                 c += m.rows as u64;
                 continue;
             }
+            let inside = m.first >= plo && m.last <= phi;
+            let mask = if inside {
+                1 << kc
+            } else {
+                bound_cols(&lo, &hi)
+            };
             if cur.as_ref().is_none_or(|x| x.0 != b) {
-                if !snap.cache.has_cols(base, b, mask) {
-                    if *budget == 0 {
-                        return Ok(None);
-                    }
-                    *budget -= 1;
-                }
                 cur = Some((b, snap.cache.get_cols(base, b, mask)?));
             }
             let blk = &cur.as_ref().unwrap().1;
-            let (s, e) = blk.key_range(&lo, &hi);
-            c += (e - s) as u64;
+            c += if inside {
+                let col = &blk.cols[kc];
+                let s = col.partition_point(|&x| x < k.0);
+                (col[s..].partition_point(|&x| x == k.0)) as u64
+            } else {
+                let (s, e) = blk.key_range(&lo, &hi);
+                (e - s) as u64
+            };
         }
         if delta {
             // the updates since the base was built, counted exactly
