@@ -133,8 +133,10 @@ running queries.
 * A SvelteKit web UI, embedded in the binary. It has a query editor, results as a table,
   graph, plan or map, a resource explorer, a schema browser, vector similarity search and
   index management, validation and backups ([screenshots](#web-ui)).
-* Authentication with Basic, API tokens, OIDC or trusted proxies, access control per
-  dataset, named graph and endpoint, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
+* Authentication with Basic, API tokens, OIDC (UI sign-in and the provider's access
+  tokens), Cloudflare Access or trusted proxies, access control per dataset, named graph
+  and endpoint, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
+  The server can serve HTTPS itself ([TLS](docs/USAGE.md#tls)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces
   ([features](docs/FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)).
 * Storage quotas per dataset, and a shutdown that lets requests in flight finish within

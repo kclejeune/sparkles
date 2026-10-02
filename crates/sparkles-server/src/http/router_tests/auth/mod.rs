@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod cli_grants;
 pub(super) mod graphs;
+mod idp;
 mod limits;
 mod oidc;
 mod proxy;
@@ -1716,7 +1717,8 @@ fn hashes_and_tokens() {
         crate::auth::load(
             Some(std::path::Path::new("/nonexistent/auth.toml")),
             std::path::Path::new("/nonexistent"),
-            "127.0.0.1"
+            "127.0.0.1",
+            false
         )
         .is_err()
     );

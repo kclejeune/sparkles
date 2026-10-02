@@ -23,6 +23,7 @@ server=(
   mcp
   backup
   fmt
+  tls
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"

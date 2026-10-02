@@ -58,7 +58,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, most of Phase 2, Phase 4) |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them incrementally, and inconsistency diagnostics | implemented (Phases 1–3) |
-| [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC, trusted proxies, CLI logins) and per-dataset permissions | implemented in part (Phase 1, part of Phase 2, Phase 3 as C12) |
+| [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC with access tokens and back-channel logout, trusted proxies, Cloudflare Access, CLI logins, native TLS) and per-dataset permissions | implemented (Phases 1 and 2, Phase 3 as C12) |
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phases 1–3) |
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |

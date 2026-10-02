@@ -261,7 +261,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         crate::obs::observe,
     ))
     .layer(axum::middleware::from_fn(crate::alloc::track))
+    .layer(axum::middleware::map_request(authority_host))
     .with_state(state)
+}
+
+/// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
+/// copied into `Host` when that is absent, so that the checks that read `Host` (the
+/// server's own origin, the names an open server answers) see it for both versions.
+async fn authority_host(mut req: axum::extract::Request) -> axum::extract::Request {
+    if !req.headers().contains_key(header::HOST)
+        && let Some(v) = req
+            .uri()
+            .authority()
+            .and_then(|a| header::HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(header::HOST, v);
+    }
+    req
 }
 
 // ------------------------------------------------------------------ errors ------

@@ -1,21 +1,24 @@
-//! OpenID Connect relying party: discovery, the authorization code flow with PKCE, and
-//! ID token validation (signature against the provider's JWKS, `iss`, `aud`, `azp`,
-//! `exp`, `iat` and `nonce`).
+//! OpenID Connect relying party: discovery, the authorization code flow with PKCE, ID
+//! token validation (signature against the provider's JWKS, `iss`, `aud`, `azp`, `exp`,
+//! `iat` and `nonce`), the provider's access tokens on the API (`iss`, `aud`, `exp`,
+//! `nbf` and required scopes) and back-channel logout tokens (OpenID Connect
+//! Back-Channel Logout 1.0).
 //!
-//! Signatures are checked by `jsonwebtoken`; everything else (discovery, the token
-//! request, claim checks) is here. Only asymmetric algorithms can be configured.
+//! Signatures are checked by `jsonwebtoken` through [`super::jwt`]; everything else
+//! (discovery, the token request, claim checks) is here. Only asymmetric algorithms can
+//! be configured.
 
 use super::crypto;
+use super::jwt::{self, Expect, JwtError};
 use anyhow::{Context, Result, anyhow, bail};
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::Algorithm;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Map, Value as J};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::OnceCell;
 
 /// An asymmetric JWS algorithm by name (`RS256`, `ES256`, …); HMAC and `none` are
 /// refused.
@@ -35,11 +38,14 @@ pub fn parse_algorithm(name: &str) -> Result<Algorithm> {
 }
 
 /// Clock skew tolerated on `exp`, `nbf` and `iat`.
-const LEEWAY_SECS: u64 = 60;
-/// A JWKS refresh for an unknown key id happens at most this often, and the whole set
-/// is refreshed after this long.
-const JWKS_MIN_REFRESH: Duration = Duration::from_secs(300);
-const JWKS_MAX_AGE: Duration = Duration::from_secs(3600);
+const LEEWAY_SECS: u64 = jwt::LEEWAY_SECS;
+/// The event a back-channel logout token carries.
+pub const BACKCHANNEL_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+/// A logout token issued longer ago than this is refused (and its `jti` is remembered
+/// twice as long).
+pub const LOGOUT_TOKEN_MAX_AGE: i64 = 600;
+/// Logout token ids remembered at most.
+const MAX_SEEN_JTI: usize = 10_000;
 /// After a failed discovery, logins fail fast for this long.
 const DISCOVERY_BACKOFF: Duration = Duration::from_secs(30);
 /// Pending logins: at most this many, each valid this long (seconds).
@@ -56,6 +62,10 @@ pub struct OidcSettings {
     pub redirect_url: String,
     pub scopes: Vec<String>,
     pub algorithms: Vec<Algorithm>,
+    /// audiences of access tokens accepted on the API; empty: none are
+    pub api_audiences: Vec<String>,
+    /// scopes an API access token must all grant
+    pub api_scopes: Vec<String>,
 }
 
 /// The parts of the provider's discovery document the flow uses.
@@ -82,7 +92,10 @@ pub struct Oidc {
     http: reqwest::Client,
     metadata: OnceCell<Metadata>,
     discovery_failed: Mutex<Option<Instant>>,
-    jwks: RwLock<Option<(JwkSet, Instant)>>,
+    keys: jwt::Jwks,
+    /// ids of the logout tokens seen recently, with when they were seen (a replay is
+    /// refused)
+    seen_jti: Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Deserialize)]
@@ -121,10 +134,11 @@ impl Oidc {
             .build()?;
         Ok(Oidc {
             settings,
+            keys: jwt::Jwks::new(http.clone()),
             http,
             metadata: OnceCell::new(),
             discovery_failed: Mutex::new(None),
-            jwks: RwLock::new(None),
+            seen_jti: Mutex::new(HashMap::new()),
         })
     }
 
@@ -178,19 +192,7 @@ impl Oidc {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let r = self
-            .http
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = r.status();
-        let body = r.bytes().await?;
-        if !status.is_success() {
-            bail!("GET {url}: {status}");
-        }
-        serde_json::from_slice(&body).with_context(|| format!("GET {url}: invalid JSON"))
+        jwt::get_json(&self.http, url).await
     }
 
     /// The URL that starts a login at the provider.
@@ -303,27 +305,11 @@ impl Oidc {
         Ok(serde_json::from_slice(&body)?)
     }
 
-    async fn jwks(&self, refresh: bool) -> Result<JwkSet> {
-        if let Some((set, at)) = &*self.jwks.read().await
-            && at.elapsed() < JWKS_MAX_AGE
-            && (!refresh || at.elapsed() < JWKS_MIN_REFRESH)
-        {
-            return Ok(set.clone());
-        }
-        let m = self.metadata().await?;
-        let set: JwkSet = self.get_json(&m.jwks_uri).await.context("OIDC JWKS")?;
-        *self.jwks.write().await = Some((set.clone(), Instant::now()));
-        Ok(set)
-    }
-
     /// Validate an ID token (OpenID Connect Core 1.0, section 3.1.3.7) and return its
     /// claims.
     pub async fn verify_id_token(&self, token: &str, nonce: &str) -> Result<Map<String, J>> {
         let m = self.metadata().await?;
         let header = jsonwebtoken::decode_header(token).context("malformed ID token")?;
-        if !self.settings.algorithms.contains(&header.alg) {
-            bail!("ID token algorithm {:?} is not accepted", header.alg);
-        }
         let alg_name = serde_json::to_value(header.alg)?;
         if !m.id_token_signing_alg_values_supported.is_empty()
             && !m
@@ -333,30 +319,128 @@ impl Oidc {
         {
             bail!("ID token algorithm {alg_name} is not advertised by the provider");
         }
-        let pick = |set: &JwkSet| match &header.kid {
-            Some(kid) => set.find(kid).cloned(),
-            None => {
-                let usable: Vec<_> = set.keys.iter().filter(|k| k.is_supported()).collect();
-                (usable.len() == 1).then(|| usable[0].clone())
-            }
-        };
-        let jwk = match pick(&self.jwks(false).await?) {
-            Some(k) => k,
-            // keys rotate: refetch once for an unknown key id
-            None => pick(&self.jwks(true).await?)
-                .ok_or_else(|| anyhow!("no key in the provider's JWKS matches the ID token"))?,
-        };
-        let key = DecodingKey::from_jwk(&jwk).context("unusable JWKS key")?;
-        let mut v = Validation::new(header.alg);
-        v.leeway = LEEWAY_SECS;
-        v.set_issuer(&[&m.issuer]);
-        v.set_audience(&[&self.settings.client_id]);
-        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        let data = jsonwebtoken::decode::<Map<String, J>>(token, &key, &v)
-            .map_err(|e| anyhow!("invalid ID token: {e}"))?;
-        let claims = data.claims;
+        let claims = jwt::verify(
+            token,
+            &self.keys,
+            &m.jwks_uri,
+            &Expect {
+                issuer: &m.issuer,
+                audiences: std::slice::from_ref(&self.settings.client_id),
+                algorithms: &self.settings.algorithms,
+                required: &["exp", "sub"],
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("ID token: {e}"))?;
         check_claims(&claims, &self.settings.client_id, nonce)?;
         Ok(claims)
+    }
+
+    /// Whether access tokens of the provider are accepted on the API.
+    pub fn accepts_access_tokens(&self) -> bool {
+        !self.settings.api_audiences.is_empty()
+    }
+
+    /// Validate an access token presented as `Authorization: Bearer` (RFC 7519 §7.2,
+    /// shaped by RFC 9068): the signature, `iss`, an `aud` of `api_audience`, `exp` and
+    /// `nbf` with leeway, and the required scopes. Returns its claims.
+    pub async fn verify_access_token(&self, token: &str) -> Result<Map<String, J>, JwtError> {
+        if !self.accepts_access_tokens() {
+            return Err(JwtError::Invalid("access tokens are not accepted".into()));
+        }
+        let m = self
+            .metadata()
+            .await
+            .map_err(|e| JwtError::Unavailable(format!("{e:#}")))?;
+        let claims = jwt::verify(
+            token,
+            &self.keys,
+            &m.jwks_uri,
+            &Expect {
+                issuer: &m.issuer,
+                audiences: &self.settings.api_audiences,
+                algorithms: &self.settings.algorithms,
+                required: &["exp"],
+            },
+        )
+        .await?;
+        let granted = jwt::scopes(&claims);
+        if let Some(missing) = self
+            .settings
+            .api_scopes
+            .iter()
+            .find(|s| !granted.contains(s))
+        {
+            return Err(JwtError::Invalid(format!("scope {missing} not granted")));
+        }
+        Ok(claims)
+    }
+
+    /// Validate a back-channel logout token (OpenID Connect Back-Channel Logout 1.0,
+    /// section 2.6): the signature, `iss`, `aud` naming this client, a recent `iat`, the
+    /// logout event, `sid` or `sub`, no `nonce`, and a `jti` not seen before. Returns
+    /// `(sid, sub)`.
+    pub async fn verify_logout_token(
+        &self,
+        token: &str,
+        now: i64,
+    ) -> Result<(Option<String>, Option<String>), JwtError> {
+        let m = self
+            .metadata()
+            .await
+            .map_err(|e| JwtError::Unavailable(format!("{e:#}")))?;
+        let claims = jwt::verify(
+            token,
+            &self.keys,
+            &m.jwks_uri,
+            &Expect {
+                issuer: &m.issuer,
+                audiences: std::slice::from_ref(&self.settings.client_id),
+                algorithms: &self.settings.algorithms,
+                required: &[],
+            },
+        )
+        .await?;
+        let bad = |why: &str| Err(JwtError::Invalid(why.into()));
+        match claims.get("iat").and_then(J::as_f64) {
+            Some(iat) if (iat as i64) >= now - LOGOUT_TOKEN_MAX_AGE => {}
+            Some(_) => return bad("logout token issued too long ago"),
+            None => return bad("logout token has no iat"),
+        }
+        let has_event = claims
+            .get("events")
+            .and_then(J::as_object)
+            .is_some_and(|e| e.get(BACKCHANNEL_EVENT).is_some_and(J::is_object));
+        if !has_event {
+            return bad("not a back-channel logout token");
+        }
+        if claims.contains_key("nonce") {
+            return bad("a logout token must not carry a nonce");
+        }
+        let text = |k: &str| {
+            claims
+                .get(k)
+                .and_then(J::as_str)
+                .filter(|v| !v.is_empty() && v.len() <= 256)
+                .map(str::to_string)
+        };
+        let (sid, sub) = (text("sid"), text("sub"));
+        if sid.is_none() && sub.is_none() {
+            return bad("a logout token needs sid or sub");
+        }
+        let Some(jti) = text("jti") else {
+            return bad("a logout token needs a jti");
+        };
+        let mut seen = self.seen_jti.lock();
+        seen.retain(|_, at| *at >= now - 2 * LOGOUT_TOKEN_MAX_AGE);
+        if seen.contains_key(&jti) {
+            return bad("a replayed logout token");
+        }
+        if seen.len() >= MAX_SEEN_JTI {
+            return Err(JwtError::Unavailable("too many logout tokens".into()));
+        }
+        seen.insert(jti, now);
+        Ok((sid, sub))
     }
 
     /// Where to send the browser after a local logout, when the provider supports
@@ -406,6 +490,8 @@ fn settings_of(p: &super::policy::Policy) -> Result<Option<OidcSettings>> {
             .iter()
             .map(|a| parse_algorithm(a))
             .collect::<Result<_>>()?,
+        api_audiences: o.api_audience.clone(),
+        api_scopes: o.api_scopes.clone(),
     }))
 }
 
@@ -425,12 +511,14 @@ impl OidcState {
         let settings = settings_of(p)?;
         let key = settings.as_ref().map(|s| {
             format!(
-                "{}|{}|{}|{:?}|{:?}|{}",
+                "{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}",
                 s.issuer,
                 s.client_id,
                 s.redirect_url,
                 s.scopes,
                 s.algorithms,
+                s.api_audiences,
+                s.api_scopes,
                 s.client_secret.as_deref().map_or("", |x| x)
             )
         });

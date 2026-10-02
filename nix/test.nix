@@ -1,7 +1,8 @@
 # NixOS VM test: the service starts, serves a declared dataset through nginx, keeps
 # data across restarts, serves the embedded UI, and backs a dataset up into an `fs`
-# repository of its backup config and restores it; with authentication (node `authed`),
-# it tells clients behind nginx apart for the failed-login budget.
+# repository of its backup config and restores it; with authentication and native TLS
+# (node `authed`), it serves HTTP/1.1 and HTTP/2 over TLS, nginx proxies to it over https,
+# and it tells clients behind nginx apart for the failed-login budget.
 { self }:
 {
   name = "sparkles";
@@ -42,7 +43,8 @@
       virtualisation.diskSize = 3072;
     };
 
-  # the same behind nginx, with authentication
+  # the same behind nginx, with authentication and native TLS (the test certificate of the
+  # server's unit tests, issued for localhost and 127.0.0.1)
   nodes.authed =
     { ... }:
     {
@@ -56,6 +58,18 @@
         };
         # anonymous callers keep full access; alice signs in with a password
         auth.configFile = "/etc/sparkles/auth.toml";
+        tls = {
+          certFile = "/etc/sparkles/tls/cert.pem";
+          keyFile = "/etc/sparkles/tls/key.pem";
+        };
+      };
+      environment.etc."sparkles/tls/ca.pem".source = ../crates/sparkles-server/src/tls/testdata/ca.pem;
+      environment.etc."sparkles/tls/cert.pem".source =
+        ../crates/sparkles-server/src/tls/testdata/cert-a.pem;
+      environment.etc."sparkles/tls/key.pem" = {
+        source = ../crates/sparkles-server/src/tls/testdata/key-a.pem;
+        mode = "0440";
+        user = "sparkles";
       };
       environment.etc."sparkles/auth.toml" = {
         mode = "0440";
@@ -173,6 +187,17 @@
     authed.wait_for_open_port(3030)
     authed.wait_for_unit("nginx.service")
     ask = f"'{base}/demo/sparql?query=ASK%7B%7D'"
+
+    # the server speaks TLS itself: HTTP/2 and HTTP/1.1 through ALPN, nothing in clear
+    tls = "--cacert /etc/sparkles/tls/ca.pem https://localhost:3030/\\$/ping"
+    v = authed.succeed(f"curl -sf -o /dev/null -w '%{{http_version}}' --http2 {tls}")
+    assert v.strip() == "2", v
+    v = authed.succeed(f"curl -sf -o /dev/null -w '%{{http_version}}' --http1.1 {tls}")
+    assert v.strip() == "1.1", v
+    authed.fail("curl -sf http://127.0.0.1:3030/\\$/ping")
+    # a reload re-reads the certificate and keeps serving
+    authed.succeed("systemctl reload sparkles.service")
+    authed.succeed(f"curl -sf {tls}")
 
     def status(args):
         return authed.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' {args}").strip()

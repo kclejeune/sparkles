@@ -309,6 +309,53 @@ pub struct OidcCfg {
     pub display_name: String,
     #[serde(default = "default_algorithms")]
     pub algorithms: Vec<String>,
+    /// The audience (or audiences) of the provider's access tokens that the API accepts
+    /// as `Authorization: Bearer`; absent: none are accepted
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub api_audience: Vec<String>,
+    /// scopes an API access token must all grant (`scope` or `scp`)
+    #[serde(default)]
+    pub api_scopes: Vec<String>,
+    /// the claim that names the account of an access token (default: `name_claim`);
+    /// `client_id` or `azp` name the client of a client-credentials grant
+    #[serde(default)]
+    pub api_name_claim: Option<String>,
+}
+
+impl OidcCfg {
+    /// The claim that names the account of an API access token.
+    pub fn api_name_claim(&self) -> &str {
+        self.api_name_claim.as_deref().unwrap_or(&self.name_claim)
+    }
+}
+
+/// A string or a list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// Cloudflare Access: the signed assertion its edge adds to every request
+/// (`Cf-Access-Jwt-Assertion`), verified against the team's keys.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudflareAccessCfg {
+    /// `https://<team>.cloudflareaccess.com`
+    pub team_domain: String,
+    /// the Access application's AUD tag (or tags)
+    #[serde(deserialize_with = "one_or_many")]
+    pub audience: Vec<String>,
+    /// a claim of the assertion that lists the user's groups; absent: no groups
+    #[serde(default)]
+    pub groups_claim: Option<String>,
 }
 
 fn default_scopes() -> Vec<String> {
@@ -346,8 +393,12 @@ pub struct ExternalCfg {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCfg {
+    /// the longest a session lasts, used or not
     #[serde(default = "session_ttl")]
     pub ttl: String,
+    /// a session not used for this long ends (sliding); absent: only `ttl` ends it
+    #[serde(default)]
+    pub idle_timeout: Option<String>,
     /// default `<data>/auth/session.key`, created on first start
     #[serde(default)]
     pub key_file: Option<String>,
@@ -357,6 +408,7 @@ impl Default for SessionCfg {
     fn default() -> Self {
         SessionCfg {
             ttl: session_ttl(),
+            idle_timeout: None,
             key_file: None,
         }
     }
@@ -442,6 +494,8 @@ pub struct FileConfig {
     pub session: SessionCfg,
     #[serde(default)]
     pub proxy: Option<ProxyCfg>,
+    #[serde(default)]
+    pub cloudflare_access: Option<CloudflareAccessCfg>,
     #[serde(default)]
     pub cors: CorsCfg,
 }
@@ -682,7 +736,13 @@ impl FileConfig {
             bail!("tokens_policy.max_active_per_owner must be at least 1");
         }
         parse_mint_rate(&self.tokens_policy.mint_rate)?;
-        parse_duration(&self.session.ttl).context("session.ttl")?;
+        let ttl = parse_duration(&self.session.ttl).context("session.ttl")?;
+        if let Some(idle) = &self.session.idle_timeout {
+            let idle = parse_duration(idle).context("session.idle_timeout")?;
+            if idle > ttl {
+                bail!("session.idle_timeout must not exceed session.ttl");
+            }
+        }
         let ext = &self.external;
         for r in ext
             .default_roles
@@ -713,6 +773,42 @@ impl FileConfig {
             }
             for a in &o.algorithms {
                 super::oidc::parse_algorithm(a)?;
+            }
+            if o.api_audience.iter().any(|a| a.is_empty()) {
+                bail!("oidc.api_audience has an empty audience");
+            }
+            if !o.api_scopes.is_empty() && o.api_audience.is_empty() {
+                bail!("oidc.api_scopes needs oidc.api_audience");
+            }
+            if let Some(c) = &o.api_name_claim
+                && !matches!(
+                    c.as_str(),
+                    "email" | "preferred_username" | "sub" | "client_id" | "azp"
+                )
+            {
+                bail!(
+                    "oidc.api_name_claim must be email, preferred_username, sub, client_id or azp"
+                );
+            }
+        }
+        if let Some(c) = &self.cloudflare_access {
+            check_public_url(&c.team_domain).map_err(|_| {
+                anyhow::anyhow!(
+                    "cloudflare_access.team_domain must be https://<team>.cloudflareaccess.com"
+                )
+            })?;
+            if c.audience.is_empty() || c.audience.iter().any(|a| a.is_empty()) {
+                bail!("cloudflare_access.audience needs the application's AUD tag");
+            }
+            if self
+                .proxy
+                .as_ref()
+                .is_some_and(|p| p.preset.as_deref() == Some("cloudflare-access"))
+            {
+                bail!(
+                    "[cloudflare_access] verifies Access's signed assertion: drop the \
+                     cloudflare-access proxy preset, which trusts its unsigned email header"
+                );
             }
         }
         if let Some(p) = &self.proxy {
@@ -798,7 +894,16 @@ impl FileConfig {
             w.push("anonymous holds write, admin or a server permission".into());
         }
         let ext = &self.external;
-        if (self.oidc.is_some() || self.proxy.is_some())
+        if let Some(o) = &self.oidc
+            && o.api_audience.contains(&o.client_id)
+        {
+            w.push(
+                "oidc.api_audience includes the client_id: access tokens should name the API \
+                 as their audience, distinct from the UI client's ID tokens"
+                    .into(),
+            );
+        }
+        if (self.oidc.is_some() || self.proxy.is_some() || self.cloudflare_access.is_some())
             && ext.allowed_users.is_empty()
             && ext.allowed_groups.is_empty()
             && !ext.default_roles.is_empty()

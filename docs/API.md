@@ -4659,25 +4659,29 @@ pass. So does the server's own UI.
 
 Each request resolves to one principal. The first applicable source wins:
 
-1. **`Authorization`.** `Bearer spk_…` with an API token, or `Basic` with a configured
-   user and password. `Basic` also accepts a token as the password, with any user name,
-   for Basic-only clients such as Jena. Invalid credentials are `401`, never treated as
-   anonymous.
+1. **`Authorization`.** `Bearer spk_…` with an API token, `Bearer` with an access token
+   (a JWT) of the OIDC provider when `oidc.api_audience` is set, or `Basic` with a
+   configured user and password. `Basic` also accepts a token as the password, with any
+   user name, for Basic-only clients such as Jena. Invalid credentials are `401`, never
+   treated as anonymous.
 2. **The session cookie** of the web UI, `__Host-sparkles_session` over https or
-   `sparkles_session` on http://localhost. A bad, expired or revoked cookie is ignored and
-   cleared.
-3. **Trusted proxy headers** (`Remote-User`, `X-Forwarded-User`, …), only from a peer in
+   `sparkles_session` on http://localhost. A bad, expired, idle or revoked cookie is
+   ignored and cleared.
+3. **Cloudflare Access's assertion** (`Cf-Access-Jwt-Assertion`) when
+   `[cloudflare_access]` is set. Its signature is checked, so it is honored from any
+   peer, and an invalid one is `401`.
+4. **Trusted proxy headers** (`Remote-User`, `X-Forwarded-User`, …), only from a peer in
    `proxy.trusted`. An entry there is a CIDR, or `unix` for `--unix-socket`. From any
    other peer the headers are ignored and counted in
    `sparkles_auth_untrusted_proxy_headers_total`.
-4. **Anonymous**, with the grants of `[anonymous]` (none by default).
+5. **Anonymous**, with the grants of `[anonymous]` (none by default).
 
 | Principal | Log name | From |
 |---|---|---|
 | user | `user:bob` | `[[users]]` (argon2id password) |
 | token | `token:tok_…`, `token:cfg-NAME` | minted tokens, and static `[[tokens]]` |
-| oidc | `oidc:alice@example.org` | a web UI login through the OIDC provider |
-| proxy | `proxy:dave` | trusted headers of a forward-auth proxy |
+| oidc | `oidc:alice@example.org` | a web UI login through the OIDC provider, or the provider's access token |
+| proxy | `proxy:dave` | trusted headers of a forward-auth proxy, or a Cloudflare Access assertion |
 | anonymous | `anonymous` | nothing else applied |
 
 ### Permissions
@@ -4715,6 +4719,16 @@ intersected with its owner's current grants, or with its parent token's grants f
 token minted by a token. Removing a grant or a role mapping shrinks every token at its
 next request.
 
+The owner of a token minted by an OIDC or proxy identity is recorded with its groups.
+Whenever the provider or proxy asserts that identity's groups again, at a web UI login,
+with an access token or Cloudflare Access assertion that carries the groups claim, or in
+the proxy's groups header, the server records the new groups in the identity's tokens
+and sessions. A token therefore loses what a group gave it once its owner leaves the
+group and signs in again, and it stops working when the owner is no longer admitted.
+It also gains what a new group gives, within its scope. A proxy request without the
+groups header leaves the recorded groups alone. The audit event `groups_refreshed` names
+the owner and the number of tokens and sessions that changed.
+
 ### Status codes
 
 | Caller's level on `{ds}` | Caller | Dataset exists | Answer |
@@ -4726,7 +4740,9 @@ next request.
 | too low | signed in | yes | `403 {"error":"write access to /ds required"}` |
 
 Invalid credentials get `401 {"error":"invalid credentials"}`, or `token expired`, with
-`WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"`. Browser navigations,
+`WWW-Authenticate: Bearer realm="sparkles", error="invalid_token"`. When the identity
+provider's keys cannot be fetched to check a JWT, the answer is
+`503 {"error":"identity provider unavailable"}` with `Retry-After`. Browser navigations,
 and non-browser clients when users are configured, also get a `Basic` challenge. Missing
 server permissions give `401` to anonymous callers and `403`
 (`{"error":"metrics permission required"}`) to others. A clone needs `admin` on the source
@@ -4739,7 +4755,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | Route | Method | Needs |
 |---|---|---|
 | `/ui/*`, `/$/ping`, `/$/ready` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
-| `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*`, `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
+| `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
@@ -4944,7 +4960,7 @@ type Whoami = {
   datasets: Record<string, "read" | "write" | "admin">;   // existing datasets only
   // datasets where the caller's grants cover only some graphs or endpoints
   restricted: Record<string, { graphs: boolean; endpoints?: string[] }>;
-  canMintTokens: boolean;
+  canMintTokens: boolean;  // false for static tokens and the provider's access tokens
   logout: boolean;
   tokensPolicy?: { defaultTtlSeconds: number; maxTtlSeconds: number };
 };
@@ -4974,7 +4990,27 @@ routes return `404`.
   to `return_to` with a session cookie. Failures go to
   `/ui/login?error=state|idp|idp_unavailable|not_allowed`.
 * `POST /$/auth/logout` returns `{"redirect": url | null}`. The URL is the provider's
-  end-session URL for OIDC sessions, and `proxy.logout_url` for proxy users.
+  end-session URL for OIDC sessions, and `proxy.logout_url` for proxy users, or
+  `/cdn-cgi/access/logout` with `[cloudflare_access]`.
+* `POST /$/auth/oidc/backchannel-logout` takes the provider's logout token as the form
+  field `logout_token` (OpenID Connect Back-Channel Logout 1.0). Register
+  `{public_url}/$/auth/oidc/backchannel-logout` at the provider. The token must be
+  signed with a key of the provider and name the provider as `iss` and `client_id` in
+  `aud`. Its `iat` must be at most 10 minutes old, and it must carry the back-channel
+  logout event, a `jti` not seen before, `sid` or `sub`, and no `nonce`. A token with
+  `sid` ends the session the provider opened under that id. A token with only `sub` ends
+  every session of that subject. The answer is `200` with `Cache-Control: no-store`, or
+  `400 {"error":"invalid_request"}`. API tokens minted from those sessions stay valid,
+  because they belong to the account rather than the session. Sessions opened by an
+  older version of the server recorded no `sid` or `sub`, so the provider cannot end
+  them.
+
+A session lasts `session.ttl` (12 h by default) after the login. With
+`session.idle_timeout`, it also ends once it has not been used for that long, and each
+request moves that deadline. `whoami`'s `expires` is the earlier of the two. The time of
+last use is kept in memory and written to the session store with its next write, hourly
+and at shutdown, so after a crash a session may end up to an hour of use earlier than it
+would have.
 
 Sessions are kept in `<data>/auth/sessions.json`, with hashed ids and mode 0600, and
 survive restarts. Replacing `<data>/auth/session.key` signs everyone out. An owner keeps
@@ -4982,6 +5018,61 @@ at most 50 sessions, and a new session ends the owner's oldest. An owner is a us
 OIDC or proxy identity. A token login counts for the token's owner. The server keeps at
 most 10,000 sessions. When it is full, the owner that holds the most loses its oldest
 session, so that no one can sign the others out by opening sessions.
+
+### Access tokens of the identity provider
+
+With `oidc.api_audience` set, an API client may send an access token issued by the OIDC
+provider as `Authorization: Bearer <JWT>`. A client credentials grant of a CI job and a
+token a single-page app obtained for its user both work. The server checks the token
+against RFC 7519:
+
+* The signature must verify with a key of the provider's JWKS, found by `kid`, under
+  one of `oidc.algorithms`. `none`, HMAC algorithms, a key embedded in the token
+  (`jwk`, `jku`, `x5u`, `x5c`), a `crit` header and an encrypted token are refused.
+* `iss` must be the provider's issuer, and `aud` must contain one of `api_audience`.
+* `exp` is required. `exp`, `nbf` and `iat` allow 60 seconds of clock skew.
+* Every scope of `api_scopes` must be in `scope` (space-separated) or `scp`.
+
+The account comes from `api_name_claim`, which defaults to `name_claim`. `client_id` or
+`azp` name the client of a client credentials grant. The principal is
+`oidc:{name}` with the groups of `groups_claim`. It is admitted and mapped to roles by
+`[external]` exactly like a web UI login, so the provider must put the groups claim into
+access tokens as well as ID tokens. A token that does not identify a person at the UI
+cannot mint Sparkles tokens, and `POST /$/auth/tokens` answers `403`.
+
+The JWKS is fetched on first use and kept for an hour. When a token names a key id that
+the cached set lacks, the set is fetched again, at most once every five minutes, so
+rotated keys are picked up and random key ids cause no extra requests. Concurrent
+requests share one fetch. While the provider is unreachable, the keys fetched before
+keep verifying. Without any keys the answer is `503`.
+
+Choose an `api_audience` that names the API, not the web UI's `client_id`, so that an
+ID token cannot stand in for an access token. The server warns when the list contains
+the `client_id`.
+
+### Cloudflare Access
+
+Behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/), the
+`[cloudflare_access]` section verifies the `Cf-Access-Jwt-Assertion` header that Access
+adds to every request it lets through. This replaces the `cloudflare-access` proxy
+preset, which trusts the unsigned `Cf-Access-Authenticated-User-Email` header, and the
+two cannot be combined.
+
+```toml
+[cloudflare_access]
+team_domain = "https://example.cloudflareaccess.com"
+audience = "<the AUD tag of the Access application>"   # a string or a list
+# groups_claim = "groups"   # a claim of the assertion with the user's groups
+```
+
+The assertion must be signed with RS256 by a key of `{team_domain}/cdn-cgi/access/certs`,
+name `team_domain` as `iss` and one of `audience` in `aud`, and be unexpired. A user's
+assertion names the account by `email`, and the principal is `proxy:{email}`. The edge
+attaches the assertion to every request of the browser, so the CSRF rules of proxy
+principals apply. A service token's assertion names the account by `common_name`, the
+token's client id. Such a principal acts like a bearer token, needs no CSRF token and
+cannot mint tokens. Both are admitted and mapped to roles by `[external]`. Since the
+signature is checked, the assertion is honored from any peer.
 
 ### API tokens
 
@@ -5021,6 +5112,13 @@ their SHA-256, in `<data>/auth/tokens.json` with mode 0600.
   `{access_token, token_type: "Bearer", expires_in, token_id, principal}` once. At most
   1000 logins can be pending. A session may fail 20 code lookups per 10 minutes, and then
   gets `429`.
+
+Device logins survive a restart of the server. `<data>/auth/device-grants.json` (mode
+0600) keeps each pending or decided login with the SHA-256 of its device code, never the
+code itself or a token. When a login was approved before a restart and the CLI had not
+yet fetched its token, the next poll gets a new secret for the token minted at approval.
+That token keeps its id, scope and expiry, and the audit log records `token_reissued`.
+Loopback codes of the browser flow live in memory and last two minutes.
 
 Approval needs a web UI session or proxy identity. Bearer and Basic callers get
 `403 this action requires signing in to the web UI`.
@@ -5074,6 +5172,10 @@ name_claim = "email"                         # or preferred_username, sub
 groups_claim = "groups"
 display_name = "Example SSO"
 algorithms = ["RS256", "ES256"]
+# the provider's access tokens on the API (Authorization: Bearer <JWT>)
+# api_audience = "https://sparql.example.org"   # a string or a list
+# api_scopes = ["sparkles"]                     # all required
+# api_name_claim = "email"                      # default: name_claim; or client_id, azp
 
 [external]                                   # OIDC and proxy identities
 allowed_groups = ["sparkles"]                # empty lists admit everyone
@@ -5086,7 +5188,8 @@ default_roles = []
 "alice@example.org" = ["admins"]
 
 [session]
-ttl = "12h"
+ttl = "12h"                                  # the longest a session lasts
+# idle_timeout = "30m"                       # a session unused this long ends
 # key_file = "/var/lib/sparkles/auth/session.key"
 
 [proxy]                                      # off unless present
@@ -5097,12 +5200,17 @@ groups_separator = ","
 name_from = "user"                           # or "email"
 logout_url = "https://auth.example.org/logout"
 
+# [cloudflare_access]                        # instead of the cloudflare-access preset
+# team_domain = "https://example.cloudflareaccess.com"
+# audience = "<the application's AUD tag>"
+
 [cors]
 origins = ["https://yasgui.example.org"]     # default: none
 ```
 
 The OIDC redirect URI to register at the provider is
-`{public_url}/$/auth/oidc/callback`.
+`{public_url}/$/auth/oidc/callback`, and the back-channel logout URI is
+`{public_url}/$/auth/oidc/backchannel-logout`.
 
 **Forward-auth proxies.** The proxy must overwrite or strip client-supplied identity
 headers on every route, including routes it lets through without authentication. Trust
@@ -5123,8 +5231,10 @@ clients use to reach the proxy with `--public-host` or `server.public_url`. The 
 warns at startup when it knows no such name, and the NixOS module passes its virtual
 host.
 
-Credentials travel as bearer secrets, so terminate TLS in front of the server. The server
-warns when auth is on and it listens beyond loopback.
+Credentials travel as bearer secrets, so terminate TLS in front of the server, or let it
+serve HTTPS itself with `--tls-cert` and `--tls-key` (see
+[TLS](USAGE.md#tls)). The server warns when auth is on and it listens beyond loopback
+without TLS.
 
 **Command line.** These commands handle authentication:
 
@@ -5177,8 +5287,9 @@ keeps a single network from filling the queue for everyone.
 `sparkles_auth_password_verifications_running`, `sparkles_auth_password_verifications_waiting`,
 `sparkles_auth_untrusted_proxy_headers_total`, `sparkles_auth_reloads_total{result}`, and
 the policy sizes `sparkles_auth_policy_{users,tokens,roles}`. Audit events are logged at
-INFO under `sparkles::audit`. They cover logins, logouts, minted and revoked tokens,
-device approvals and reloads.
+INFO under `sparkles::audit`. They cover logins, logouts, back-channel logouts, minted,
+reissued and revoked tokens, refreshed groups, device approvals and reloads. A failure to
+fetch the identity provider's keys counts as `reason="idp"`.
 
 ## MCP server
 

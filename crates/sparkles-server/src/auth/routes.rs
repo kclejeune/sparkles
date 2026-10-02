@@ -118,6 +118,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/auth/logout", &["POST"]),
     ("/$/auth/oidc/login", &["GET"]),
     ("/$/auth/oidc/callback", &["GET"]),
+    ("/$/auth/oidc/backchannel-logout", &["POST"]),
     ("/$/auth/tokens", &["GET", "POST", "DELETE"]),
     ("/$/auth/tokens/{id}", &["DELETE"]),
     ("/$/auth/device", &["POST"]),
@@ -182,6 +183,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/auth/login"
         | "/$/auth/oidc/login"
         | "/$/auth/oidc/callback"
+        | "/$/auth/oidc/backchannel-logout"
         | "/$/auth/device"
         | "/$/auth/token" => Public,
         "/$/auth/logout" => Caller,
@@ -838,6 +840,16 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
                     let mut r = json_error(StatusCode::SERVICE_UNAVAILABLE, "authentication busy");
                     r.headers_mut()
                         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    r
+                }
+                // the identity provider's keys could not be fetched to check a JWT
+                Failure::Idp => {
+                    let mut r = json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "identity provider unavailable",
+                    );
+                    r.headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
                     r
                 }
                 Failure::NotAllowed => {

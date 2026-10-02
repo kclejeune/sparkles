@@ -9,25 +9,50 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-const PUBLIC: &str = "https://sparql.example.org";
+pub(super) const PUBLIC: &str = "https://sparql.example.org";
 const SECRET: &str = "s3cret";
 
 /// How the mock provider misbehaves, and the claims it issues.
 #[derive(Clone, Default)]
-struct Behavior {
-    claims: serde_json::Map<String, J>,
-    userinfo: serde_json::Map<String, J>,
-    wrong_nonce: bool,
-    wrong_aud: bool,
-    expired: bool,
+pub(super) struct Behavior {
+    pub claims: serde_json::Map<String, J>,
+    pub userinfo: serde_json::Map<String, J>,
+    pub wrong_nonce: bool,
+    pub wrong_aud: bool,
+    pub expired: bool,
+    /// the key set answers 500
+    pub jwks_down: bool,
 }
 
-struct Mock {
-    issuer: String,
-    key: EncodingKey,
-    jwks: J,
+pub(super) struct Mock {
+    pub issuer: String,
+    pub key: EncodingKey,
+    /// the key set served (rotation replaces it)
+    pub jwks: parking_lot::Mutex<J>,
+    pub jwks_fetches: std::sync::atomic::AtomicUsize,
     codes: parking_lot::Mutex<HashMap<String, (String, String)>>,
-    behavior: parking_lot::Mutex<Behavior>,
+    pub behavior: parking_lot::Mutex<Behavior>,
+}
+
+impl Mock {
+    /// A JWT over `claims`, signed with `key` under key id `kid`.
+    pub fn sign_with(&self, key: &EncodingKey, kid: &str, claims: &J) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        jsonwebtoken::encode(&header, claims, key).unwrap()
+    }
+
+    /// A JWT over `claims` signed with the provider's key `k1`.
+    pub fn sign(&self, claims: &J) -> String {
+        self.sign_with(&self.key, "k1", claims)
+    }
+}
+
+/// The JWK of `key` under key id `kid`.
+pub(super) fn jwk_of(key: &EncodingKey, kid: &str) -> J {
+    let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(key, Algorithm::RS256).unwrap();
+    jwk.common.key_id = Some(kid.into());
+    serde_json::to_value(jwk).unwrap()
 }
 
 /// A PKCS#1 `RSAPrivateKey` from a PKCS#8 `PrivateKeyInfo` (DER).
@@ -52,14 +77,22 @@ fn pkcs1_of(pkcs8: &[u8]) -> Vec<u8> {
     key.to_vec()
 }
 
-/// One RSA key per test binary.
-fn test_key() -> &'static Vec<u8> {
+fn new_rsa_key() -> Vec<u8> {
+    use aws_lc_rs::encoding::AsDer;
+    let k = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+    pkcs1_of(k.as_der().unwrap().as_ref())
+}
+
+/// One RSA key per test binary (the provider's).
+pub(super) fn test_key() -> &'static Vec<u8> {
     static KEY: OnceLock<Vec<u8>> = OnceLock::new();
-    KEY.get_or_init(|| {
-        use aws_lc_rs::encoding::AsDer;
-        let k = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-        pkcs1_of(k.as_der().unwrap().as_ref())
-    })
+    KEY.get_or_init(new_rsa_key)
+}
+
+/// Another RSA key (a rotated key, or an attacker's).
+pub(super) fn other_key() -> &'static Vec<u8> {
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    KEY.get_or_init(new_rsa_key)
 }
 
 async fn discovery(AxState(m): AxState<Arc<Mock>>) -> impl IntoResponse {
@@ -136,9 +169,7 @@ async fn token(
     for (k, v) in b.claims {
         claims[k] = v;
     }
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some("k1".into());
-    let id_token = jsonwebtoken::encode(&header, &claims, &m.key).unwrap();
+    let id_token = m.sign(&claims);
     axum::Json(serde_json::json!({
         "id_token": id_token,
         "access_token": "at-1",
@@ -147,8 +178,13 @@ async fn token(
     .into_response()
 }
 
-async fn jwks_endpoint(AxState(m): AxState<Arc<Mock>>) -> impl IntoResponse {
-    axum::Json(m.jwks.clone())
+async fn jwks_endpoint(AxState(m): AxState<Arc<Mock>>) -> axum::response::Response {
+    m.jwks_fetches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if m.behavior.lock().jwks_down {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    axum::Json(m.jwks.lock().clone()).into_response()
 }
 
 async fn userinfo(AxState(m): AxState<Arc<Mock>>) -> impl IntoResponse {
@@ -158,13 +194,11 @@ async fn userinfo(AxState(m): AxState<Arc<Mock>>) -> impl IntoResponse {
 }
 
 /// Start the mock provider; returns it and its issuer URL.
-async fn start_mock() -> Arc<Mock> {
+pub(super) async fn start_mock() -> Arc<Mock> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let issuer = format!("http://{}", listener.local_addr().unwrap());
     let key = EncodingKey::from_rsa_der(test_key());
-    let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(&key, Algorithm::RS256).unwrap();
-    jwk.common.key_id = Some("k1".into());
-    let jwks = serde_json::json!({ "keys": [jwk] });
+    let jwks = serde_json::json!({ "keys": [jwk_of(&key, "k1")] });
     let mut behavior = Behavior::default();
     behavior
         .claims
@@ -177,7 +211,8 @@ async fn start_mock() -> Arc<Mock> {
     let m = Arc::new(Mock {
         issuer,
         key,
-        jwks,
+        jwks: parking_lot::Mutex::new(jwks),
+        jwks_fetches: Default::default(),
         codes: Default::default(),
         behavior: parking_lot::Mutex::new(behavior),
     });
@@ -189,6 +224,8 @@ async fn start_mock() -> Arc<Mock> {
         .route("/authorize", axum::routing::get(authorize))
         .route("/token", axum::routing::post(token))
         .route("/jwks", axum::routing::get(jwks_endpoint))
+        // Cloudflare Access's key set (the mock serves as a team domain too)
+        .route("/cdn-cgi/access/certs", axum::routing::get(jwks_endpoint))
         .route("/userinfo", axum::routing::get(userinfo))
         .with_state(m.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -196,6 +233,11 @@ async fn start_mock() -> Arc<Mock> {
 }
 
 async fn oidc_server() -> (AuthServer, Arc<Mock>) {
+    oidc_server_with("").await
+}
+
+/// An OIDC server with more `[oidc]` settings (`api_audience = …`) and sections after.
+pub(super) async fn oidc_server_with(more: &str) -> (AuthServer, Arc<Mock>) {
     let m = start_mock().await;
     let dir_secret = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(dir_secret.path(), format!("{SECRET}\n")).unwrap();
@@ -211,9 +253,11 @@ client_secret_file = "{}"
 scopes = ["openid", "email", "groups"]
 display_name = "Mock SSO"
 algorithms = ["RS256"]
+{}
 "#,
             m.issuer,
-            secret_path.display()
+            secret_path.display(),
+            more
         ),
         ..Default::default()
     });
@@ -226,7 +270,7 @@ fn query_of(url: &str) -> HashMap<String, String> {
 }
 
 /// Start a login; returns the provider URL and the login cookie (`name=value`).
-async fn begin(s: &AuthServer, return_to: &str) -> (String, String, R) {
+pub(super) async fn begin(s: &AuthServer, return_to: &str) -> (String, String, R) {
     let r = call(
         &s.app,
         "GET",
@@ -241,7 +285,7 @@ async fn begin(s: &AuthServer, return_to: &str) -> (String, String, R) {
 }
 
 /// Let the provider answer: the callback path and query it redirects to.
-async fn provider(url: &str) -> String {
+pub(super) async fn provider(url: &str) -> String {
     let c = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -252,12 +296,12 @@ async fn provider(url: &str) -> String {
     loc.strip_prefix(PUBLIC).unwrap().to_string()
 }
 
-async fn callback(s: &AuthServer, path: &str, cookie: &str) -> R {
+pub(super) async fn callback(s: &AuthServer, path: &str, cookie: &str) -> R {
     call(&s.app, "GET", path, &[("cookie", cookie)], "").await
 }
 
 /// A full login; returns the session cookie.
-async fn full_login(s: &AuthServer) -> (R, String) {
+pub(super) async fn full_login(s: &AuthServer) -> (R, String) {
     let (url, cookie, _) = begin(s, "/ui/datasets").await;
     let path = provider(&url).await;
     let r = callback(s, &path, &cookie).await;
