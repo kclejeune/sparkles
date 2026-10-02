@@ -228,6 +228,8 @@ pub struct HistoryStatus {
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,
+    /// time spent materializing past states
+    pub materialize_seconds: f64,
 }
 
 impl HistoryStatus {
@@ -430,6 +432,7 @@ pub(crate) struct HistoryState {
     pub hits: u64,
     pub misses: u64,
     pub materializations: u64,
+    pub materialize_nanos: u64,
 }
 
 impl HistoryState {
@@ -446,6 +449,7 @@ impl HistoryState {
             hits: 0,
             misses: 0,
             materializations: 0,
+            materialize_nanos: 0,
         }
     }
 
@@ -776,6 +780,42 @@ pub fn retained_offline(
     };
     let max_gens = crate::store::StoreOptions::default().history_max_generations;
     Ok(h.needed(current, head, commit::now_ms(), &ts, max_gens))
+}
+
+/// The readable commits of a database, from its files alone (no lock): the ranges of
+/// the current generation and of the older ones still on disk. A generation that the
+/// next collection would remove still counts.
+pub fn reconstructable_offline(root: &Path, dataset_id: uuid::Uuid) -> Result<Vec<(u64, u64)>> {
+    let current = std::fs::read_to_string(root.join("CURRENT"))
+        .map(|s| commit::generation_number(s.trim()))
+        .unwrap_or(0);
+    let recs = commit::read_catalog(&root.join("commits.bin"))?
+        .map(|(_, r)| r)
+        .unwrap_or_default();
+    let head = recs.last().map_or(0, |c| c.seq);
+    let mut h = HistoryState::new(BTreeMap::new(), Retention::default());
+    for (no, name, base, fold_legacy) in scan_generations(root, dataset_id)? {
+        if no > current {
+            continue;
+        }
+        let end = recs
+            .iter()
+            .rev()
+            .find(|c| c.generation == no)
+            .map_or(base.seq, |c| c.seq.max(base.seq));
+        h.gens.insert(
+            no,
+            GenEntry {
+                dir: root.join(&name),
+                name,
+                base,
+                end,
+                fold_legacy,
+                bytes: 0,
+            },
+        );
+    }
+    Ok(h.reconstructable(current, head))
 }
 
 /// Finish interrupted collections: remove `gen-*.deleting` directories.

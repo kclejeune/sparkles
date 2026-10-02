@@ -1370,6 +1370,7 @@ impl Store {
             g
         };
         let budget = self.opts.history_cache_bytes;
+        let t0 = std::time::Instant::now();
         let delta = if seq == entry.base.seq {
             Delta::default()
         } else {
@@ -1413,6 +1414,7 @@ impl Store {
             rep.delta
         };
         h.materializations += 1;
+        h.materialize_nanos += t0.elapsed().as_nanos() as u64;
         let bytes = delta_bytes(&delta);
         let dvocab_len = generation.dvocab.len();
         let snap = Arc::new(Snapshot {
@@ -1661,6 +1663,7 @@ impl Store {
                 hits: m.as_ref().map_or(0, |m| m.hits),
                 misses: 0,
                 materializations: 0,
+                materialize_seconds: 0.0,
             };
         };
         let h = hist.lock();
@@ -1704,6 +1707,7 @@ impl Store {
             hits: h.hits,
             misses: h.misses,
             materializations: h.materializations,
+            materialize_seconds: h.materialize_nanos as f64 / 1e9,
         }
     }
 

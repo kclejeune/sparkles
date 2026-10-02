@@ -131,7 +131,7 @@ pub fn classify(
     }
     match r {
         "/{ds}/sparql" | "/{ds}/query" | "/{ds}/get" | "/{ds}/explain" | "/{ds}/shacl"
-        | "/{ds}/shex" => Some(Class::Query),
+        | "/{ds}/shex" | "/{ds}/diff" => Some(Class::Query),
         "/{ds}/update" | "/{ds}/upload" => Some(Class::Update),
         "/{ds}/data" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}" => {

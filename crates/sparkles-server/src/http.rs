@@ -23,9 +23,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 mod conditional;
+mod diff;
 #[cfg(feature = "fmt")]
 mod format;
-mod history;
+pub(crate) mod history;
 mod schema;
 mod shex;
 mod stream;
@@ -46,6 +47,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
+        header::HeaderName::from_static("sparkles-diff-from"),
+        header::HeaderName::from_static("sparkles-diff-to"),
+        header::HeaderName::from_static("sparkles-diff-added"),
+        header::HeaderName::from_static("sparkles-diff-removed"),
+        header::CONTENT_LOCATION,
+        header::VARY,
         header::LINK,
         header::ETAG,
         header::RETRY_AFTER,
@@ -110,6 +117,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/{ds}/explain", get(explain).post(explain))
+        .route("/{ds}/diff", get(diff::diff))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
         .route("/$/vector/{ds}", get(vector_status))
@@ -1786,10 +1794,19 @@ async fn gsp(
             let head = method == Method::HEAD;
             // resolve the graph (or 404) before the response starts
             let at = history::at_param(&params)?;
+            // without `at`, the resource is its own Memento TimeGate (RFC 7089)
+            let datetime = match at {
+                None => history::accept_datetime(&headers)?,
+                Some(_) => None,
+            };
             let opts = query_options(&st, &ds, &params);
             let (snap, g, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
+                    let at = match datetime {
+                        Some(ms) => Some(history::negotiate_datetime(&ds, ms)?),
+                        None => at,
+                    };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
                     let g = match &target {
                         Target::Default => Some(Id::DEFAULT_GRAPH),
@@ -1828,7 +1845,19 @@ async fn gsp(
                 }
             };
             let resp = with_commit(conditional::with_etag(resp, &tag, negotiated), &ds, seq);
-            Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
+            let resp = match (&resolved, datetime) {
+                (Some(r), Some(_)) => history::memento_headers(resp, r, &uri),
+                (None, _) => {
+                    let mut resp = resp;
+                    resp.headers_mut().append(
+                        header::VARY,
+                        header::HeaderValue::from_static("accept-datetime"),
+                    );
+                    resp
+                }
+                (Some(_), None) => history::history_headers(resp, resolved.as_ref(), &uri),
+            };
+            Ok(report.attach(resp))
         }
         Method::PUT | Method::POST => {
             if st.read_only {
@@ -3247,6 +3276,8 @@ async fn shacl() -> ApiResult {
 
 #[cfg(test)]
 mod compress_tests;
+#[cfg(test)]
+mod diff_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

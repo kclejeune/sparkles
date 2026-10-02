@@ -110,6 +110,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/get", &["GET", "HEAD"]),
     ("/{ds}/upload", &["POST"]),
     ("/{ds}/explain", &["GET", "POST"]),
+    ("/{ds}/diff", &["GET"]),
     ("/{ds}/shacl", &["POST"]),
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
@@ -185,6 +186,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
+        | "/{ds}/diff"
         | "/{ds}/get"
         | "/{ds}/shacl"
         | "/{ds}/shex"
