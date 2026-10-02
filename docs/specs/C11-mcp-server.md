@@ -1539,3 +1539,13 @@ revisit them.
 retained commits, `dryRun` and `ifHead` for `sparql_update`, `subscriptions/listen`, the
 tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measurements in
 [BENCHMARKS](../BENCHMARKS.md).
+
+**Later additions (2026-10-02).** Two features of other specs added tools.
+
+- `draft_shapes` drafts SHACL shapes or a ShEx schema from a dataset's data
+  ([C02 §11](C02-schema-discovery.md#11-phase-4-shapes-drafted-from-the-data)). It counts
+  as the `info` endpoint of C12 and reads the caller's visible graphs.
+- Each stored query that a caller may run becomes a tool named `<dataset>__<query>`,
+  with a JSON Schema of its parameters ([C16](C16-stored-queries.md)). The tool set is
+  therefore no longer fixed, so `tools/list` may be cached for a minute instead of an
+  hour. The server does not send `notifications/tools/list_changed`.

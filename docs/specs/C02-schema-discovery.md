@@ -4,10 +4,15 @@
 >
 > **Phases:** Phase 1 shipped: the `sparkles::schema` library, `GET /$/schema/{ds}` with
 > paginated class and predicate listings, `sparkles schema`, and the UI schema browser.
-> From Phase 2, the VoID/Turtle export shipped. The SHACL constraints layer, subject
-> classes per predicate and Phase 3 are not built.
+> From Phase 2, the VoID/Turtle export shipped. Phase 4 shipped on 2026-10-02: shapes
+> drafted from the data, as `GET /$/schema/{ds}/shapes`, `sparkles schema
+> --draft-shapes`, the MCP tool `draft_shapes` and the schema browser's Draft shapes
+> dialog. The SHACL constraints layer, subject classes per predicate and Phase 3 are not
+> built.
 >
 > **User docs:** [API: Schema discovery](../API.md#schema-discovery) ·
+> [API: Drafted shapes](../API.md#drafted-shapes) ·
+> [Usage: Drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
 > [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -867,6 +872,60 @@ may revisit them.
 
 **Not built.** The rest of Phase 2 was not built: the SHACL constraints layer,
 `detail=subjectClasses`, the GSPO-driven scan for small named graphs, and `/$/stats` class
-counts from the same pass. Phase 3 was not built either:
-per-class property profiles, anonymous class expressions, schema diffs and incremental
-maintenance.
+counts from the same pass. Phase 3 was not built either: per-class property profiles
+as a listing, anonymous class expressions, schema diffs and incremental maintenance.
+Phase 4 computes per-class profiles for its drafts, but no endpoint lists them.
+
+**Phase 4 landed on 2026-10-02**, as §11 designed it.
+
+- `sparkles::schema::draft::draft_shapes` computes the SHACL instances from one pass over
+  `PSO[rdf:type]` and one over `PSO[rdfs:subClassOf]`, with each subject mapped to an
+  interned set of classes closed under the superclasses. Per predicate, a pass over
+  `POS[p]` classifies the literal objects in sorted vocabulary batches, and a pass over
+  `PSO[p]` summarizes each subject's values and adds the summary to the profile of each
+  drafted class of the subject. The decisions of §11.3 and the Turtle and ShExC renderers
+  live in the same module.
+- `GET /$/schema/{ds}/shapes`, `sparkles schema --draft-shapes`, the MCP tool
+  `draft_shapes` and the schema browser's **Draft shapes** dialog are built on it. The
+  dialog opens the draft in the dataset page's SHACL or ShEx editor, or installs it with
+  `PUT /$/validation/{ds}` in `warn` mode after a confirmation.
+
+**Choices made during implementation.**
+
+- The Turtle lists each rejected candidate as a comment inside its property shape, such
+  as `# not drafted: sh:maxCount 1  (32 of 33 instances, would exclude 1)`, so a reader
+  sees why a constraint is missing.
+- `sh:in` is drafted for IRIs and literals only. An instance with a blank node or triple
+  term value can satisfy no `sh:in`, and neither can one with more than 64 values.
+- The CLI's flag for inferences is `--with-inferences`, because `--no-inferences` already
+  means the opposite default of the schema report.
+- The MCP tool answers with one language per call and a compact summary of each shape:
+  its counts and the constraints that exclude instances, with the draft's text.
+- The dialog has no class filter, although the endpoint takes `class`.
+
+**Tests at landing.**
+
+- `sparkles-shacl/tests/draft.rs` validates drafts of a fixture with several types per
+  node, subclasses, mixed kinds and datatypes, an ill-formed integer, language tags, a
+  misspelt enumeration value, blank nodes and triple terms, open and closed. It also
+  generates 60 random datasets with random subclass graphs. Each draft at support 1
+  conforms, open and closed. For each of 4 classes at supports 0.95, 0.8 and 0.6, the
+  distinct focus nodes that validation reports per path and component equal the
+  `excluded` counts the draft gave.
+- `sparkles-shex/tests/draft.rs` validates the ShEx drafts of the same fixture and of the
+  60 random datasets with their shape maps. Every association conforms at support 1, and
+  below 1 only excluded instances fail.
+- `http::schema::tests::drafted_shapes` covers the parameters, the three formats, the
+  errors, a draft that `/{ds}/shacl` reports as conforming, and its installation as a
+  `warn` guard. `router_tests::auth::graphs::drafted_shapes_cover_the_view` checks that a
+  reader of some graphs gets a draft of those graphs only, and
+  `mcp::tests::draft_shapes_tool` covers the tool. The UI's pure helpers have Vitest
+  tests, and the phone-width Playwright test opens the dialog.
+
+**Cost.** On 1.18M triples of generated people, employees and organisations, with 8
+predicates, measured with the release build on a machine with a load average of about
+30 from other builds: `sparkles schema --format json` took a median of 0.09 s, and a
+draft took 0.45 s (minimum 0.24 s). A closed ShEx draft at support 0.95 took 0.35 s.
+A draft costs about five schema reports, mostly for the per-subject summaries and the
+map of typed subjects.
+

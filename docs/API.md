@@ -324,7 +324,7 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format`, and MCP tool calls and resource reads at `/$/mcp` |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, Graph Store `GET`/`HEAD`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/reason/{ds}/diagnostics`, `/$/format`, and MCP tool calls and resource reads at `/$/mcp` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`/`HEAD` and `POST /$/format`. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
@@ -751,6 +751,84 @@ declarations. The command exits with status 2 when the timeout or the entry cap 
 exceeded. The Rust API is `sparkles::schema::discover`, and
 `sparkles::schema::void_text` renders a report as VoID.
 
+### Drafted shapes
+
+The design and its rationale are in
+[C02 §11, Phase 4](specs/C02-schema-discovery.md#11-phase-4-shapes-drafted-from-the-data).
+
+`GET /$/schema/{ds}/shapes` drafts SHACL shapes and a ShEx schema from the data, as a
+starting point for [write-time validation](#write-time-validation). Each class with
+instances gets one node shape with `sh:targetClass`, and each predicate its instances
+use gets a property shape. The instances of a class are its SHACL instances: the
+subjects typed with the class or with one of its subclasses in the selected graphs.
+
+A property shape may get these constraints, each when the share of the instances it
+applies to that satisfy it reaches `support`:
+
+| Constraint | Drafted from |
+|---|---|
+| `sh:minCount` | the largest number of values that enough instances have, counted over every instance of the class |
+| `sh:maxCount` | the smallest number of values that enough instances keep to, up to `maxCount` |
+| `sh:nodeKind` | the most specific node kind of the values |
+| `sh:datatype` | the datatype of the values, when they are well-formed literals of one datatype |
+| `sh:class` | a class all the values belong to, outside the `rdf:`, `rdfs:`, `owl:`, `xsd:` and `sh:` namespaces |
+| `sh:in` | the most used values, at most `maxIn`, each used by two instances or more (not for booleans) |
+| `sh:languageIn`, `sh:uniqueLang` | the language tags of the values, and whether an instance repeats one |
+
+Every constraint other than `sh:minCount` applies to the instances that have a value. At
+`support=1`, the default, the current data conforms to the draft. Below 1, each drafted
+constraint reports how many instances it excludes, and the best candidate that missed
+the threshold is listed as rejected with the same counts.
+
+| Param | Default | Meaning |
+|---|---|---|
+| `graph` | `default` | As for `/$/schema/{ds}`. |
+| `reasoning` | `false` | Include the inferred graph, as write-time validation's `includeInferences` does. |
+| `support` | `1` | The threshold, in (0, 1]. |
+| `class` | every class with instances outside the built-in namespaces | Draft these classes only (repeatable IRIs). |
+| `minInstances` | `1` | Skip classes with fewer instances. |
+| `maxIn` | `10` | The largest `sh:in` list, at most 64. `0` drafts none. |
+| `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
+| `closed` | `false` | Draft closed shapes, with `sh:ignoredProperties ( rdf:type )`. |
+| `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
+| `format` | `json` | `json`, `turtle` (the SHACL shapes) or `shexc` (the ShEx schema). `Accept: text/turtle` and `Accept: text/shex` choose them too. |
+| `timeout`, `at` | | As for queries. |
+
+```ts
+type ShapesDraft = {
+  draftFormat: 1; dataset: string;
+  snapshot: { version: number; generation: string; computedAt: string };
+  selection: { graph: string; reasoning: boolean };
+  options: { support: number; minInstances: number; maxIn: number; maxCount: number;
+             closed: boolean; base: string; classes: string[] };
+  totals: { shapes: number; propertyShapes: number; constraints: number; rejected: number;
+            skippedClasses: number };
+  shapes: { shape: string; class: string; instances: number; closed: boolean;
+            properties: { path: string; instances: number; maxValues: number;
+                          constraints: Constraint[]; rejected: Constraint[] }[] }[];
+  shacl: string;      // the shapes graph in Turtle, with the counts as comments
+  shex: string;       // the ShEx schema in ShExC
+  shapeMap: string;   // {FOCUS rdf:type <C>}@<shape>, … for the ShEx schema
+};
+type Constraint = { component: "minCount" | "maxCount" | "nodeKind" | "datatype" | "class"
+                               | "in" | "languageIn" | "uniqueLang";
+                    value: number | string | string[] | boolean;  // terms in N-Triples syntax
+                    applicable: number; satisfied: number; excluded: number };
+```
+
+The ShEx schema carries the same constraints. ShEx applies no RDFS, so its class tests
+list the class and its subclasses, `EXTRA rdf:type { rdf:type [ex:C ex:Sub] + }`, and
+the shape map selects the direct instances of each class. `sh:uniqueLang` has no ShEx
+counterpart and is left out of it. The draft reads only the graphs the caller may read,
+and the errors are those of `/$/schema/{ds}`. Installing a draft is a separate step: send
+the Turtle to `PUT /$/validation/{ds}` with `mode: "warn"`, or use the schema browser's
+**Draft shapes** dialog.
+
+`sparkles schema --loc DB --draft-shapes [--support S] [--closed] [--max-in N]
+[--max-count N] [--class IRI]… [--min-instances N] [--with-inferences]
+[--format turtle|shexc|json]` prints the draft, and the MCP tool `draft_shapes` returns
+it to an agent. The Rust API is `sparkles::schema::draft_shapes`.
+
 ### Clone
 
 The design and its rationale are in [C06 Clone-to-sandbox](specs/C06-clone-to-sandbox.md).
@@ -905,6 +983,88 @@ RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag ne
 matches. Sparkles compares the commit a tag names instead. Its tags identify the data
 exactly, even though they cannot promise identical bytes, and that is what a concurrency
 check needs.
+
+## Stored queries
+
+The design and its rationale are in [C16 Stored queries](specs/C16-stored-queries.md).
+
+A dataset can keep named SPARQL queries with typed parameters. Clients run them by name,
+and the MCP server offers each one as a tool. The definitions are kept in the database
+directory as `queries.json`, which backups and clones include. An in-memory dataset keeps
+them in memory.
+
+```json
+{
+  "query": "PREFIX ex: <http://ex.org/>\nSELECT ?name WHERE { ?p ex:age ?age ; ex:name ?name FILTER(?age >= ?minAge) }",
+  "description": "People at least minAge years old",
+  "parameters": { "minAge": { "type": "integer", "default": 18, "description": "Youngest age" } },
+  "results": "json"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `query` | One `SELECT`, `ASK`, `CONSTRUCT` or `DESCRIBE` query. It declares its own prefixes. Updates are refused. |
+| `description` | Shown in listings, in the UI and as the MCP tool's description. |
+| `parameters` | The parameters by variable name, without `?`. |
+| `results` | The format of runs that ask for none: `json`, `xml`, `csv` or `tsv`, or `turtle`, `ntriples`, `jsonld` or `rdfxml` for graphs. |
+| `mcp` | `false` keeps the query out of the MCP tools. The default is `true`. |
+
+A parameter has a `type`, and optionally a `description`, a `default`, `required`
+(which defaults to `true` without a default), and `enum`, the values a run may give.
+
+| `type` | Value | Bound as |
+|---|---|---|
+| `iri` | an absolute IRI, `<iri>`, or a prefixed name of the dataset | an IRI |
+| `string` | any text | a plain literal, or with `language` a language-tagged one |
+| `integer`, `decimal`, `double`, `boolean`, `date`, `dateTime` | a lexical form of the XSD type | a typed literal |
+| `literal` | a literal in SPARQL syntax, such as `"x"@en` or `"5"^^xsd:int`, or with `datatype` the lexical form of that datatype | a literal |
+| `term` | an IRI, a prefixed name or a literal in SPARQL syntax | an IRI or a literal |
+
+A value is checked against its type and becomes one RDF term, which replaces the
+variable everywhere in the parsed query, as Jena's `QueryExec.substitution` does. A
+projected parameter reports its value. The value never becomes query text, so it cannot
+change the query: `Ann" } UNION { ?s ?p ?o } #` given as a string is one literal that
+matches nothing. A definition is refused (`400`) when the query is an update or does not
+parse, when a parameter is not a variable of the query, when the query assigns it itself
+(`BIND`, `VALUES` or `AS`), when its name is one of the request parameters below, or
+when its default or allowed values do not fit its type. A name has 1 to 64 characters
+from `[A-Za-z0-9_-]` and starts with a letter or digit.
+
+| Method | Path | Needs | Description |
+|---|---|---|---|
+| GET | `/$/queries/{ds}` | `read` | `{dataset, queries: [...]}`: each definition without its text, with `name`, `kind` and `version`. |
+| GET | `/$/queries/{ds}/{name}` | `read` | The definition with `name`, `dataset`, `kind` and `version`. `?version=N` reads an older version while it is kept. `ETag: "v<N>"`. |
+| GET | `/$/queries/{ds}/{name}/versions` | `read` | The kept versions, newest first. |
+| PUT | `/$/queries/{ds}/{name}` | `admin` | Stores the JSON definition as the next version. The body may also carry `message`, or the request a `Sparkles-Commit-Message` header. `201` for a new query, `200` otherwise, with `changed: false` when the definition was already current. `If-Match: "v<N>"` stores only over version N, and `If-None-Match: *` only when the query does not exist, otherwise `412`. A `GET` answer can be sent back as is. |
+| DELETE | `/$/queries/{ds}/{name}` | `admin` | Removes the query and its versions (`204`). `If-Match` applies. |
+| GET, POST | `/{ds}/queries/{name}` | `read` | Runs the query. |
+
+Each version records `version`, `parent`, `created`, `author` (the caller's name),
+`message`, `datasetCommit` (the dataset's head when it was saved) and `digest`, a hex
+SHA-256 of the parent's digest and the definition. The last 100 versions of a query are
+kept. A `--read-only` server refuses changes with `403`. If `queries.json` cannot be
+read when the dataset opens, the server logs the error, lists no queries and refuses
+changes with `409` until the file is fixed or removed.
+
+**Running.** `GET /{ds}/queries/{name}?minAge=40` runs the query with `?minAge` bound to
+`40`. Values come from the query string, from a form body, or from a JSON object body
+(`Content-Type: application/json`), where numbers and booleans may be JSON values.
+`$minAge=40` is the same as `minAge=40`. The run has the request parameters of
+`/{ds}/sparql`: `format`, `timeout`, `reasoning`, `nocache`, `at`, `send` and the budget
+overrides, plus `version` to run an older version. These names, and `query`, `update`,
+`output`, `results`, `receipt`, `default-graph-uri` and `named-graph-uri`, are reserved
+and cannot name a parameter. The query runs as one sent to `/{ds}/sparql` would, with the
+same content negotiation, budgets, timeouts, rate-limit class, metrics, commit and
+history headers, and the caller's graph view. When the request names no format and its
+`Accept` is missing or `*/*`, the definition's `results` decides. The response carries
+`Sparkles-Query-Version`. A value that does not fit its type, a missing required value,
+an unknown parameter and a parameter given twice are `400`, and the message names the
+parameter. An unknown query is `404`.
+
+`sparkles queries --loc DB list|get|versions|put|delete|run` manages and runs the
+stored queries of a database directory (see [Usage](USAGE.md#stored-queries)). The Rust
+API is `sparkles::stored`.
 
 ## Commits
 
@@ -3900,14 +4060,14 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
 | `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
-| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
+| `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
 | `/$/mcp` | any | Any caller. Each tool call needs `read` on its dataset, and `sparql_update` needs `write`. An anonymous caller that can read no dataset gets `401`. See [HTTP endpoint](#http-endpoint-mcp). |
@@ -3969,14 +4129,14 @@ granted only under `datasets`.
 
 | Endpoint | Requests |
 |---|---|
-| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
 | `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
 | `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
 | `shacl`, `shex` | `/{ds}/shacl`, `/{ds}/shex`, and the MCP validation tools |
 | `diff` | `/{ds}/diff` and the change feed `/{ds}/changes` |
-| `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema` and resources count as `info`. |
+| `info` | The dataset's other routes that need `read` or `write`: its description, schema, prefixes, commits, index and reasoning status, snapshots, history and validation settings, and backups. MCP's `list_commits`, `describe_schema`, `draft_shapes` and resources count as `info`, and so do the stored-query definitions under `/$/queries/{ds}`. |
 
 A request through an endpoint that no grant names gets
 `403 {"error":"the query endpoint of /wiki is not allowed"}`. The dataset stays visible to
@@ -4351,7 +4511,7 @@ runs as the HTTP request's caller (see [HTTP endpoint](#http-endpoint-mcp)).
 sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
-             [--disable-tool NAME]... [--schema-max-entries N] [--text]
+             [--disable-tool NAME]... [--no-stored-queries] [--schema-max-entries N] [--text]
 ```
 
 | Flag | Default | Meaning |
@@ -4368,6 +4528,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
 | `--allow-service` | off | Allows `SERVICE` in queries. |
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
+| `--no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
 
@@ -4375,10 +4536,11 @@ The process exits 0 when stdin closes and 1 on a startup error. Logs go to stder
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses
 `server/discover`, and each request carries the protocol version and client capabilities
 in its `_meta`. An unknown revision gets `-32022` with `data.supported`. The capabilities
-are `{"tools": {}, "resources": {}, "prompts": {}}`. `server/discover` and `tools/list`
-are cacheable for an hour (`ttlMs: 3600000`), because the tool set is fixed for the life
-of the process. Their `cacheScope` is `public`, except on an HTTP server with
-authentication, where tool listings differ between callers and the scope is `private`.
+are `{"tools": {}, "resources": {}, "prompts": {}}`. `server/discover` is cacheable for
+an hour (`ttlMs: 3600000`). `tools/list` is cacheable for a minute (`ttlMs: 60000`),
+because stored queries come and go as tools. Their `cacheScope` is `public`, except on
+an HTTP server with authentication, where tool listings differ between callers and the
+scope is `private`.
 `notifications/cancelled` stops the referenced call, and no response is sent for that
 call. The server's `instructions` describe the workflow
 (`list_datasets` → `describe_schema` → `sparql_query`) and say that tool results are
@@ -4403,6 +4565,7 @@ open-world when SERVICE is allowed. The common arguments are:
 |---|---|---|
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. |
+| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. |
@@ -4417,6 +4580,19 @@ open-world when SERVICE is allowed. The common arguments are:
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
 has the complete JSON Schemas.
+
+**Stored queries.** After the tools above, `tools/list` has one tool per
+[stored query](#stored-queries) that the caller may run and whose `mcp` is not `false`.
+The tool is named `<dataset>__<query>`, with characters outside `[A-Za-z0-9_-]` turned
+into `_`. A name longer than 64 characters is cut and ends with a short hash, and two
+queries that would get the same name are both left out. The description is the query's
+description, followed by its kind, dataset and version. The input schema has one
+property per parameter, with JSON type `integer`, `number`, `boolean` or `string`, its
+description, default and `enum`, and lists the required ones. It also has `format`,
+`maxRows`, `offset`, `atCommit` and `timeoutSeconds` from `sparql_query`, unless a
+parameter has the same name. A call binds its arguments as a run over HTTP does and
+answers like `sparql_query`. A value that does not fit is `bad-argument`, and the
+message names the parameter.
 
 **Validation tools.** `validate_shacl` and `validate_shex` read one snapshot, and take
 `atCommit` and `reasoning` like the other tools. They write nothing and fetch nothing.
@@ -4526,6 +4702,7 @@ dataset name, its prefixes and the user's question are filled in.
 | `--mcp-query-memory-mb N` | `2048` | Memory budget of a call's queries. `--query-memory-mb` caps it. |
 | `--mcp-max-concurrent N` | `4` | Tool calls running at once. Further calls wait, and their timeout runs while they wait. |
 | `--mcp-disable-tool NAME` | | Does not offer the tool (repeatable). |
+| `--mcp-no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
 | `--mcp-max-sessions N` | `256` | Sessions of legacy clients open at once. `0` serves those clients without sessions. |
 
 A call may ask for a `timeoutSeconds` up to the server's `--timeout`, and calls default

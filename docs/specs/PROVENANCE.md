@@ -208,6 +208,58 @@ implementation landed.
   - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
     vocabulary.
 
+## Shapes drafted from the data
+
+- **Spec:** Phase 4 of [`C02-schema-discovery.md`](C02-schema-discovery.md#11-phase-4-shapes-drafted-from-the-data),
+  written on 2026-10-02 independently from:
+  - W3C SHACL (targets of `sh:targetClass` as SHACL instances, the value-type,
+    cardinality, value-range, string-based and closed-shape components) and ShEx 2.1
+    (triple constraints, node constraints, value sets, `EXTRA`, `CLOSED`, query shape
+    maps), cited from working knowledge;
+  - published shape-extraction work, cited from working knowledge: QSE (Rabbani,
+    Lissandrini and Hose, PVLDB 2023) for the entity-to-types map and support pruning,
+    sheXer (Fernández-Álvarez, Labra Gayo and Gayo-Avello, Knowledge-Based Systems 2022)
+    for a trust threshold per constraint, and ABSTAT (Spahiu et al., 2016) for type
+    patterns with cardinality statistics. No code of these projects was read or used;
+  - the Sparkles code and specs C02, C10, C11 and C12.
+
+  Fluree was not consulted.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02), in
+  `sparkles::schema::draft` and the server's schema, MCP and CLI code.
+  - **Dependencies:** none added.
+- **Rejected** (C02 §11.7):
+  - SPARQL `GROUP BY` queries per class instead of index passes;
+  - sampling;
+  - support counted over every instance for value constraints;
+  - `sh:or` of datatypes and `sh:node` references between class shapes;
+  - writing drafts into a shapes graph of the dataset.
+
+## Stored, parameterized queries
+
+- **Spec:** [`C16-stored-queries.md`](C16-stored-queries.md), written on 2026-10-02
+  independently from:
+  - W3C SPARQL 1.1 Query and Protocol, cited from working knowledge;
+  - Apache Jena's documentation (Apache-2.0) of `ParameterizedSparqlString` and of query
+    execution with substitutions, cited from working knowledge;
+  - the public documentation of Stardog's stored queries and of Ontotext GraphDB's saved
+    queries, cited from working knowledge;
+  - the OpenAPI Specification's typed operation parameters and the MCP specification's
+    tool input schemas, cited from working knowledge;
+  - the Sparkles code and specs CI, C01, C09, C11 and C12.
+
+  Fluree was not consulted.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The catalog,
+  the parameter types and the binding are in `sparkles::stored`. The admin API, runs, MCP
+  tools and the `sparkles queries` command are in `sparkles-server`.
+  - **Dependencies:** none added.
+- **Rejected** (spec §8):
+  - text substitution with escaping;
+  - a trailing `VALUES` clause;
+  - `$name` parameters only;
+  - a reserved graph for the definitions;
+  - one generic MCP tool for every stored query;
+  - per-user saved queries.
+
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on

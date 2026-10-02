@@ -1,6 +1,10 @@
 # C16: Stored, parameterized queries
 
-> **Status:** designed, not built
+> **Status:** implemented
+>
+> **Phases:** Shipped on 2026-10-02 as one phase: the `sparkles::stored` catalog, the
+> admin API and runs over HTTP, `sparkles queries`, the MCP tools and the query page's
+> saved queries.
 >
 > **User docs:** [API: Stored queries](../API.md#stored-queries) ·
 > [Usage: Stored queries](../USAGE.md#stored-queries) ·
@@ -306,4 +310,71 @@ variables.
 
 ## Outcome
 
-Not built yet.
+**Delivered on 2026-10-02**, as designed in one phase.
+
+- `sparkles::stored` holds the catalog. `Definition::check` parses the query without
+  predeclared prefixes, refuses updates, and checks each parameter: its name, that the
+  query mentions it as a whole variable, that no `Extend`, `Values` or aggregate of the
+  algebra assigns it, and that its default and allowed values convert. `Definition::bind`
+  turns request values into terms. `literal` and `term` values are parsed as the single
+  term of a `VALUES` block, and the parse is accepted only when the algebra is exactly one
+  variable with one IRI or literal. `Catalog` keeps the versions in memory and writes
+  `queries.json` atomically after each change, and backups and clones include the file.
+- The server's `http::queries` module serves `/$/queries/{ds}`, `/$/queries/{ds}/{name}`,
+  `…/versions` and `/{ds}/queries/{name}`. The query endpoint's body after the query text
+  became `run_query`, which both share. It sets the bindings as
+  `QueryOptions::initial_bindings` and keys the quick-query memory by the bindings too.
+  The run route counts as the `query` endpoint of C12, the `query` rate-limit class and
+  `op="query"` in the metrics.
+- `mcp::stored` lists and runs the tools. A call becomes the arguments of `sparql_query`
+  plus the bindings, so it pages, caps and renders like `sparql_query`.
+- The UI's query page has a **Saved** menu, a parameter bar for a tab opened from a
+  stored query, and a save dialog for admins.
+
+**Deviations and additions.**
+
+- A `queries.json` that cannot be read does not stop the dataset from opening. The
+  server logs the error, lists no queries, and refuses changes with `409` until the file
+  is fixed or removed, so a broken file is never overwritten.
+- `If-None-Match: *` creates only, and `If-Match: *` requires the query to exist, as in
+  HTTP. `ETag` is `"v<version>"`.
+- The CLI gained `sparkles queries versions`. It works on a database directory only,
+  with no `--server` mode. `put` and `delete` take the database's lock, so they refuse a
+  database a server holds, and the author of a CLI version is `$USER`.
+- `serve --mcp-no-stored-queries` and `sparkles mcp --no-stored-queries` leave the
+  tools out. An MCP tool needs the caller's `query` endpoint as well as `read`. The
+  MCP rate limit charges a stored-query call to the dataset named in its tool name.
+- A stored query run through MCP keeps `sparql_query`'s limit of 65,536 characters on
+  the query text.
+- The UI's save dialog sets each parameter's type and default. Descriptions per
+  parameter, `enum`, `results` and `mcp` are set through the API or the CLI's `--json`.
+
+**Tests at landing.**
+
+- `sparkles::stored::tests` checks binding by type, values that try to break out of a
+  literal or a term, defaults, allowed values, the definition checks, versions with
+  their digests and preconditions, persistence, and the cap of 100 versions.
+- `http::queries::tests` runs definitions over HTTP: creation and runs with defaults,
+  query-string, `$name`, form and JSON values, type errors, injection attempts, missing
+  and unknown parameters, versions and `If-Match`, deletion, the definition's result
+  format for solutions and graphs, and a clone that keeps the queries.
+- `router_tests::auth::graphs::stored_queries_run_on_the_view` runs a stored query as a
+  full reader and as a reader of some graphs, and checks the endpoint and `admin`
+  refusals.
+- `mcp::tests::stored_queries_are_tools` checks the tool listing, input schema, calls,
+  argument errors and a query kept out with `mcp: false`. `stored_tool_names_fit_clients`
+  checks the names.
+- The UI's Vitest tests cover variable extraction, parameter forms and the save checks,
+  and a Playwright test against the mock server saves a query and reopens it.
+- Crate and server tests, Clippy over all targets, `mise run lint:features` and
+  `mise run ci` pass.
+
+**Cost.** A run parses its values and then follows the query endpoint's path. On 1.18M
+triples, with the release build on a machine with a load average of about 30, a stored
+query that filters by two parameters and returns 100 rows took a minimum of 7.7 ms over
+HTTP, against 6.8 ms for the same query with constants sent to `/{ds}/sparql`. Both
+results bypassed the result cache. The medians were too noisy on that machine to compare.
+
+**Not built.** Stored updates, parameters that bind several values, per-user queries, a
+`--server` mode for `sparkles queries`, and `notifications/tools/list_changed` were not
+built.
