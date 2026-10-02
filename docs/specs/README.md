@@ -36,7 +36,7 @@ behaviour, and the Outcome explains the difference.
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
 | `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
-| `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
+| `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads, and encryption. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx and the command-line tools. |
 | `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs and the formatter. |
@@ -69,6 +69,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [F04](F04-vector-search.md) | `spk:vector` literals, similarity functions and exact top-k `spk:vectorSearch` | implemented in part (Phase 1) |
 | [F05](F05-snapshot-repositories.md) | Incremental, deduplicated backups to a file system or S3, restore, verification, policies and GC | implemented in part (Phase 1, most of Phase 2) |
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
+| [F07](F07-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
 | [G05](G05-command-line-tools.md) | `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfdiff`), `iri`, `langtag`, `rsparql`, `rupdate` and `rset`, and IRI and language-tag warnings in `convert --check`, `load --check` and `/$/validate/iri` | implemented |
