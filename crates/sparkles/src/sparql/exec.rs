@@ -690,6 +690,9 @@ fn count_filter_scan(
     Ok((n, note))
 }
 
+/// Rows of an index block read by one parallel task of the filters on runs.
+const PIECE: usize = 8192;
+
 /// All keys of a scan.
 fn whole_range(spec: &ScanSpec) -> (Key, Key) {
     (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX))
@@ -772,44 +775,48 @@ fn par_count_on_keys(
         return Ok(None);
     }
     let vocab = &ctx.snap.generation.vocab;
-    let parts =
-        ctx.snap
-            .par_blocks_in_ranges(spec.perm, ranges, run_mask(ctx, spec), |b, s, e| {
-                // threads sharing a regular expression contend for its match caches
-                let kf = kf.clone();
-                let mut out = KeyCount::default();
-                let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
-                block_runs(spec, b, s, e, |k, n| {
-                    if Id(k).tag() == crate::id::Tag::Vocab {
-                        ids.push(Id(k).payload());
-                        counts.push(n);
-                    } else {
-                        out.other.push((Id(k), n));
-                    }
-                });
-                let mut pass = vec![false; ids.len()];
-                let mut j = 0;
-                vocab.get_sorted(&ids, |p, key| {
-                    while ids[j] != p {
-                        j += 1;
-                    }
-                    pass[j] = kf.test(key);
-                });
-                for (h, n) in pass.iter().zip(&counts) {
-                    if *h {
-                        out.rows += n;
-                        out.passed += 1;
-                    }
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            // threads sharing a regular expression contend for its match caches
+            let kf = kf.clone();
+            let mut out = KeyCount::default();
+            let (mut ids, mut counts): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+            block_runs(spec, b, s, e, |k, n| {
+                if Id(k).tag() == crate::id::Tag::Vocab {
+                    ids.push(Id(k).payload());
+                    counts.push(n);
+                } else {
+                    out.other.push((Id(k), n));
                 }
-                out.tested = ids.len() as u64;
-                let raw = |i: usize| Id::vocab(ids[i]).0;
-                if !ids.is_empty() {
-                    out.first = Some((raw(0), pass[0]));
-                    out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
+            });
+            let mut pass = vec![false; ids.len()];
+            let mut j = 0;
+            vocab.get_sorted(&ids, |p, key| {
+                while ids[j] != p {
+                    j += 1;
                 }
-                ctx.check()?;
-                Ok(out)
-            })?;
+                pass[j] = kf.test(key);
+            });
+            for (h, n) in pass.iter().zip(&counts) {
+                if *h {
+                    out.rows += n;
+                    out.passed += 1;
+                }
+            }
+            out.tested = ids.len() as u64;
+            let raw = |i: usize| Id::vocab(ids[i]).0;
+            if !ids.is_empty() {
+                out.first = Some((raw(0), pass[0]));
+                out.last = Some((raw(ids.len() - 1), pass[ids.len() - 1]));
+            }
+            ctx.check()?;
+            Ok(out)
+        },
+    )?;
     let Some(parts) = parts else {
         return Ok(None);
     };
@@ -924,56 +931,60 @@ fn filter_scan_runs(
     drop(counts);
     let passed = hit.iter().filter(|h| **h).count();
     let width = spec.cols.len();
-    let parts =
-        ctx.snap
-            .par_blocks_in_ranges(spec.perm, &ranges, scan_mask(ctx, spec), |b, s, e| {
-                let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
-                if s >= e {
-                    return Ok(cols);
-                }
-                let col = &b.cols[kc];
-                // the block's values among the runs, and whether any of them passed
-                let j0 = keys.partition_point(|k| k.0 < col[s]);
-                let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
-                if !hit[j0..j1].iter().any(|h| *h) {
-                    return Ok(cols);
-                }
-                let mut j = j0;
-                if block_passes(spec, b, s, e) {
-                    let mut i = s;
-                    while i < e {
-                        let run = run_len(&col[i..e], col[i]);
-                        while keys[j].0 < col[i] {
-                            j += 1;
-                        }
-                        if hit[j] {
-                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
-                                cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
-                            }
-                        }
-                        i += run;
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        &ranges,
+        scan_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
+            if s >= e {
+                return Ok(cols);
+            }
+            let col = &b.cols[kc];
+            // the block's values among the runs, and whether any of them passed
+            let j0 = keys.partition_point(|k| k.0 < col[s]);
+            let j1 = keys.partition_point(|k| k.0 <= col[e - 1]);
+            if !hit[j0..j1].iter().any(|h| *h) {
+                return Ok(cols);
+            }
+            let mut j = j0;
+            if block_passes(spec, b, s, e) {
+                let mut i = s;
+                while i < e {
+                    let run = run_len(&col[i..e], col[i]);
+                    while keys[j].0 < col[i] {
+                        j += 1;
                     }
-                } else {
-                    for i in s..e {
-                        let k = b.key(i);
-                        if !spec.graph.accepts(k[spec.graph_col])
-                            || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
-                        {
-                            continue;
-                        }
-                        while keys[j].0 < k[kc] {
-                            j += 1;
-                        }
-                        if hit[j] {
-                            for (c, &(kc, _)) in spec.cols.iter().enumerate() {
-                                cols[c].push(Id(k[kc]));
-                            }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].extend(b.cols[kc][i..i + run].iter().map(|&x| Id(x)));
                         }
                     }
+                    i += run;
                 }
-                ctx.check()?;
-                Ok(cols)
-            })?;
+            } else {
+                for i in s..e {
+                    let k = b.key(i);
+                    if !spec.graph.accepts(k[spec.graph_col])
+                        || spec.eqs.iter().any(|&(a, b)| k[a] != k[b])
+                    {
+                        continue;
+                    }
+                    while keys[j].0 < k[kc] {
+                        j += 1;
+                    }
+                    if hit[j] {
+                        for (c, &(kc, _)) in spec.cols.iter().enumerate() {
+                            cols[c].push(Id(k[kc]));
+                        }
+                    }
+                }
+            }
+            ctx.check()?;
+            Ok(cols)
+        },
+    )?;
     let Some(parts) = parts else {
         return Ok(None);
     };
@@ -1016,18 +1027,22 @@ fn par_key_runs(
     if spec.dedup {
         return Ok(None);
     }
-    let parts =
-        ctx.snap
-            .par_blocks_in_ranges(spec.perm, ranges, run_mask(ctx, spec), |b, s, e| {
-                let mut keys: Vec<Id> = Vec::new();
-                let mut counts: Vec<u64> = Vec::new();
-                block_runs(spec, b, s, e, |k, n| {
-                    keys.push(Id(k));
-                    counts.push(n);
-                });
-                ctx.check()?;
-                Ok((keys, counts))
-            })?;
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        run_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut keys: Vec<Id> = Vec::new();
+            let mut counts: Vec<u64> = Vec::new();
+            block_runs(spec, b, s, e, |k, n| {
+                keys.push(Id(k));
+                counts.push(n);
+            });
+            ctx.check()?;
+            Ok((keys, counts))
+        },
+    )?;
     let Some(parts) = parts else {
         return Ok(None);
     };
