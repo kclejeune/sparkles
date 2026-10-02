@@ -79,7 +79,13 @@ datasets = {{ hr = "read" }}
 name = "tcarol"
 password = "{tcarol}"
 datasets = {{ hr = "read" }}
+
+[[tokens]]
+name = "tcarol"
+hash = "{token}"
+datasets = {{ hr = "read" }}
 "#,
+        token = token_hash(&tok('W')),
         tadmin = h("tadmin-pw"),
         tstaff = h("tstaff-pw"),
         thr = h("thr-pw"),
@@ -153,6 +159,23 @@ async fn queries_see_what_the_protections_leave() {
     assert_eq!(
         rows(&s.app, "tcarol", SUBJECTS).await,
         ["http://ex/InPatient", "http://ex/alice", "http://ex/d1"]
+    );
+    // a static token's name is its ?user
+    let r = call(
+        &s.app,
+        "GET",
+        &format!("/hr/sparql?query={}", enc(SUBJECTS)),
+        &[
+            ("authorization", &bearer(&tok('W'))),
+            ("accept", "text/csv"),
+        ],
+        "",
+    )
+    .await;
+    assert!(
+        r.text().contains("http://ex/d1") && !r.text().contains("http://ex/d2"),
+        "{}",
+        r.text()
     );
     let pay = "SELECT ?s ?v { ?s <http://ex/salary> ?v }";
     assert!(rows(&s.app, "tstaff", pay).await.is_empty());

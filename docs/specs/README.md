@@ -62,6 +62,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 | [C10](C10-write-time-validation.md) | A per-dataset SHACL guard that validates the state after each write before the write commits | implemented in part (Phases 1–3) |
 | [C11](C11-mcp-server.md) | `sparkles mcp`, a Model Context Protocol server with read-only query, schema, search, validation and formatting tools | implemented in part (Phase 1, part of Phase 2) |
 | [C12](C12-graph-access-control.md) | Grants limited to some named graphs or endpoints of a dataset, enforced by a filtered dataset view in the engine | implemented |
+| [C12b](C12b-triple-access-control.md) | C12 Phase 2: protections that hide triples by predicate, subject class or a SPARQL pattern with the caller bound, lifted by grants and enforced by a masked snapshot in the engine | implemented |
 | [C15](C15-write-previews.md) | Dry runs of updates, Graph Store writes, uploads and the MCP write tool, which report the commit, the changes, validation, quota and preconditions and roll back | implemented |
 | [C16](C16-stored-queries.md) | Named queries per dataset with typed parameters bound as terms, versions, runs by name, MCP tools and the UI's saved queries | implemented |
 | [F03](F03-full-text-search.md) | BM25 full-text search over literals with Tantivy, through Jena's `text:query` | implemented in part (Phase 1, part of Phase 2) |

@@ -929,6 +929,24 @@ impl FileConfig {
     /// Problems worth a WARN that do not stop the server.
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
+        let lifted: BTreeSet<&str> = self
+            .anonymous
+            .grants
+            .iter()
+            .chain(self.roles.values().flat_map(|r| &r.grants))
+            .chain(self.users.iter().flat_map(|u| &u.grants))
+            .chain(self.tokens.iter().flat_map(|t| &t.grants))
+            .flat_map(|g| &g.lifts)
+            .map(String::as_str)
+            .collect();
+        for p in &self.protections {
+            if !lifted.contains(p.name.as_str()) {
+                w.push(format!(
+                    "protection '{}' is lifted by no grant: only admins see its triples",
+                    p.name
+                ));
+            }
+        }
         for u in &self.users {
             if let Some((m, t, p)) = argon2id_params(&u.password)
                 && (m < OWASP_M || t < OWASP_T || p < OWASP_P)

@@ -5,6 +5,8 @@
 > **Phases:** Phase 1 shipped on 2026-10-02: graph grants for reads and writes, endpoint
 > permissions, every read and write path of the server and the MCP server, and the
 > engine's filtered dataset view.
+> Phase 2, protections of triples by predicate, class and pattern, is specified and
+> shipped in [C12b](C12b-triple-access-control.md).
 >
 > **User docs:** [API: Graph-level access control](../API.md#graph-level-access-control) ·
 > [Usage: Restricting users to some graphs](../USAGE.md#restricting-users-to-some-graphs) ·

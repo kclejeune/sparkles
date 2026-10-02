@@ -156,6 +156,46 @@ and the other tenants' graphs behave as if they did not exist. Its writes may ch
 grants. [API.md](API.md#graph-level-access-control) describes every rule and maps
 Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 
+### Hiding some triples from some users
+
+A protection hides some triples of a dataset from everyone whose grants do not lift it.
+It can match triples by predicate, by the class of their subject, or by a SPARQL pattern
+that sees the caller's name and roles:
+
+```toml
+# only HR reads and writes salaries
+[[protections]]
+name = "salaries"
+dataset = "staff"
+predicates = ["https://example.org/salary"]
+
+[[roles.hr.grants]]
+dataset = "staff"
+level = "write"
+lifts = ["salaries"]
+
+# expense reports are visible to their submitter and to finance
+[[protections]]
+name = "expenses"
+dataset = "staff"
+classes = ["https://example.org/ExpenseReport"]
+pattern = "?s ex:submittedBy ?user"
+prefixes = { ex = "https://example.org/" }
+
+[[roles.finance.grants]]
+dataset = "staff"
+level = "read"
+lifts = ["expenses"]
+```
+
+Everyone with `staff = "read"` reads the dataset without salaries and without other
+people's expense reports. A member of `hr` also reads and writes salaries. The triples
+stay hidden in every answer, including counts, searches, schema pages, exports and diffs,
+and writing a protected triple without the protection lifted fails with `403`.
+`sparkles auth check --config FILE` validates the protections and their patterns.
+[API.md](API.md#protections-of-triples) describes the rules, the caller variables, what
+happens to materialized inferences, and the limits.
+
 ### `serve` options
 
 | Flag | Default | Meaning |

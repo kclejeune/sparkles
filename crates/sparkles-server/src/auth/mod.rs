@@ -712,12 +712,15 @@ impl Principal {
     pub fn caller(&self) -> sparkles::access::Caller {
         let user = match self.kind {
             Kind::Local | Kind::Anonymous => None,
-            Kind::Token => Some(
-                self.info
-                    .owner
-                    .as_ref()
-                    .map_or_else(|| self.name.to_string(), |o| o.name.clone()),
-            ),
+            // a minted token acts for its owner; a static token's id is `cfg-<name>`
+            Kind::Token => Some(match &self.info.owner {
+                Some(o) => o.name.clone(),
+                None => self
+                    .name
+                    .strip_prefix("cfg-")
+                    .unwrap_or(&self.name)
+                    .to_string(),
+            }),
             _ => Some(self.name.to_string()),
         };
         let mut roles = self.access.grants.roles.clone();
