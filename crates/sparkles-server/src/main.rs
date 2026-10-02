@@ -359,8 +359,8 @@ fn diff_cmd(
     opts: StoreOptions,
 ) -> Result<()> {
     use sparkles::store::{DiffOp, DiffOptions};
-    if !matches!(format, "diff" | "json" | "count") {
-        bail!("unknown format {format:?}: use diff, json or count");
+    if !matches!(format, "diff" | "json" | "count" | "patch" | "patch-binary") {
+        bail!("unknown format {format:?}: use diff, json, count, patch or patch-binary");
     }
     let store = Store::open(loc, opts)?;
     let graph = match graph {
@@ -417,6 +417,18 @@ fn diff_cmd(
             });
             serde_json::to_writer_pretty(&mut out, &j)?;
             writeln!(out)?;
+        }
+        "patch" | "patch-binary" => {
+            use sparkles::patch::{PatchWriter, commit_iri, write_patch};
+            let id = store.dataset_id();
+            let quads: Vec<(DiffOp, oxrdf::Quad)> = d.iter().collect();
+            let mut w = PatchWriter::new(&mut out, format == "patch-binary");
+            write_patch(
+                &mut w,
+                &commit_iri(id, d.to.commit.seq),
+                Some(&commit_iri(id, d.from.commit.seq)),
+                quads.iter().map(|(op, q)| (*op, q)),
+            )?;
         }
         _ => {
             for (op, q) in d.iter() {
@@ -1063,7 +1075,8 @@ enum Cmd {
         /// only this graph (an IRI, or `default`)
         #[arg(long)]
         graph: Option<String>,
-        /// diff (lines marked + and -), json, or count
+        /// diff (lines marked + and -), json, count, patch (RDF Patch) or
+        /// patch-binary (RDF Patch in RDF Thrift)
         #[arg(long, default_value = "diff")]
         format: String,
     },
