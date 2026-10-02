@@ -3606,8 +3606,8 @@ and `Accept: application/json, text/event-stream`.
   server-to-client stream, and DELETE ends the session. An unknown or ended session is
   `404`. A session closes after 5 minutes without traffic.
 - A notification or response from the client gets `202` with no body.
-- A body that is not JSON gets `400` with `-32700`. A body over 4 MiB gets `413`. Other
-  methods than POST, GET and DELETE get `405`.
+- A body that is not JSON gets `400` with `-32700`, and a body over 4 MiB gets `413`.
+  Methods other than POST, GET and DELETE get `405`.
 
 **Who calls.** Every message runs as the request's principal, authenticated as on every
 other route by HTTP Basic, an API token, a web UI session or trusted proxy headers.

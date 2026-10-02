@@ -727,6 +727,47 @@ async fn server_budgets_cap_mcp_calls() {
     assert_eq!(tool_error(&r), "bad-argument");
 }
 
+/// A24: closing the connection of a stateless call stops its query, so the call's slot
+/// is free for the next one long before the first call's timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a24_disconnect_cancels_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.limits.query_memory_bytes = None;
+    st.mcp = Some(conf(&st, &["--mcp-max-concurrent", "1"]));
+    let state = Arc::new(st);
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..5000 {
+        ttl.push_str(&format!("ex:s{i} ex:v {i} .\n"));
+    }
+    load(&state, "t", &ttl);
+    let app = router(state.clone());
+    let slow = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            tool(
+                &app,
+                "sparql_query",
+                json!({"query": "SELECT ?a ?b WHERE { ?a ex:v ?x . ?b ex:v ?y }", "timeoutSeconds": 30}),
+                &[],
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!slow.is_finished(), "the query is running");
+    slow.abort();
+    let t = std::time::Instant::now();
+    let r = tool(&app, "sparql_query", json!({"query": "ASK {}"}), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "the slot was held for {:?}",
+        t.elapsed()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dataset_flag_limits_what_mcp_sees() {
     let dir = tempfile::tempdir().unwrap();
@@ -995,7 +1036,11 @@ mod auth {
             .iter()
             .map(|d| d["name"].as_str().unwrap().to_string())
             .collect();
+        assert!(names.contains(&"wiki".into()), "{names:?}");
         assert!(!names.contains(&"secret".into()), "{names:?}");
+        // and a call without credentials in bob's session is refused, not run as bob
+        let r = tool(&s.app, "list_datasets", json!({}), &[]).await;
+        assert_eq!(r["structuredContent"]["datasets"][0]["name"], "public");
     }
 
     #[tokio::test(flavor = "multi_thread")]
