@@ -37,6 +37,27 @@ if [ -n "${SERVER_MEM_MAX:-}" ]; then
   }
   CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
 fi
+# hyperfine and its curl processes run on one CPU, a performance core when the machine has
+# two kinds, so curl's start-up time does not change with the core it lands on (as in
+# scripts/bench-lib.sh). CLIENT_CPU picks another CPU, and CLIENT_CPU=none turns it off.
+client_cpu() {
+  if [ -n "${CLIENT_CPU:-}" ]; then
+    [ "$CLIENT_CPU" != none ] && echo "$CLIENT_CPU"
+    return 0
+  fi
+  command -v taskset > /dev/null || return 0
+  local list
+  if [ -r /sys/devices/cpu_core/cpus ]; then
+    list=$(cat /sys/devices/cpu_core/cpus)
+  elif [ -r /sys/devices/system/cpu/online ]; then
+    list=$(cat /sys/devices/system/cpu/online)
+  else
+    return 0
+  fi
+  echo "${list##*[,-]}"
+}
+CLIENT=()
+if cpu=$(client_cpu) && [ -n "$cpu" ]; then CLIENT=(taskset -c "$cpu"); fi
 
 N=${1:-100000}
 WORK=${2:-/tmp/sparkles-bench-text}
@@ -342,7 +363,7 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
       ARGS+=(--command-name "${NAME[$e]}"
         "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@$(qfile "$e" "$n") ${URL[$e]}")
     done
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
+    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
       "${ARGS[@]}" --export-json "results/text-$n.new.json"
     merge "results/text-$n.new.json" "results/text-$n.json"
   done
