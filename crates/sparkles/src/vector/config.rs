@@ -37,7 +37,7 @@ fn default_ef_construction() -> usize {
     128
 }
 fn default_ef_search() -> usize {
-    64
+    128
 }
 
 impl Default for HnswConfig {
@@ -386,7 +386,7 @@ mod tests {
             serde_json::from_str(r#"{"predicate":"http://x/emb","dimension":3,"hnsw":{"m":8}}"#)
                 .unwrap();
         assert_eq!(some.hnsw.unwrap().m, 8);
-        assert_eq!(some.hnsw.unwrap().ef_search, 64);
+        assert_eq!(some.hnsw.unwrap().ef_search, 128);
         assert!(
             serde_json::from_str::<VectorIndexConfig>(
                 r#"{"predicate":"http://x/emb","dimension":3,"metric":"hamming"}"#

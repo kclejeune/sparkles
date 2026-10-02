@@ -1876,7 +1876,7 @@ misses.
 | `model` | none | A label of the embedding model. Sparkles does not interpret it. |
 | `hnsw.m` | 16 | Links per node, and twice as many on the bottom layer. More links raise recall, memory and build time. |
 | `hnsw.efConstruction` | 128 | Candidates kept while a node is inserted. More raise recall and build time. |
-| `hnsw.efSearch` | 64 | Candidates kept by a search. A query can override it with `ef:N`. |
+| `hnsw.efSearch` | 128 | Candidates kept by a search. A query can override it with `ef:N`. |
 | `exactThreshold` | 10000 | Searches over at most this many rows are exact. |
 
 With `"hnsw": false` the index keeps only the packed vectors, which are searched

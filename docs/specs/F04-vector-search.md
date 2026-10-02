@@ -955,8 +955,9 @@ clustered (1000 centres, Gaussian noise), cosine, with M = 16, efConstruction = 
 | 1M × 768 | 332 s | 2,956 + 134 MB | 90.8 ms | 0.774 at 2.01 ms | 0.895 at 2.23 ms | 0.963 at 2.87 ms | 0.993 at 3.98 ms |
 
 Each cell after the exact search gives recall@10 and the median latency. The exact search
-runs in parallel on every core. At 1M vectors the default `efSearch` of 64 gives a recall
-of 0.89 to 0.94 on this data, and `ef:256` gives 0.993 at 1.5 to 4 ms, still 25 to 40
+runs in parallel on every core. At 1M vectors an `efSearch` of 64 gives a recall of 0.89
+to 0.94 on this data, so the default was raised to 128 after this measurement. That gives
+0.96 to 0.975 at 1.2 to 2.9 ms, and `ef:256` gives 0.993 at 1.5 to 4 ms, still 25 to 40
 times faster than the exact search. USearch, measured on the same kind of data at 1M ×
 384 outside Sparkles, reached a recall of 0.908 at ef = 64 and 0.992 at ef = 256, so the
 lower recall at 1M comes from the data, not the graph. USearch built its index 2.5 times
