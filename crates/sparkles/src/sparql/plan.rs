@@ -1793,7 +1793,7 @@ impl<'a> Planner<'a> {
         Ok(out)
     }
 
-    fn pt_str(&self, x: &PT) -> String {
+    pub(super) fn pt_str(&self, x: &PT) -> String {
         match x {
             PT::V(v) => {
                 let n = self.ctx.var_name(*v);
@@ -1878,9 +1878,12 @@ impl<'a> Planner<'a> {
             super::charsets::register(self.ctx, &stars);
         }
         // searches that read the rest of the group are attached to it at the end
-        let (dependent, nodes): (Vec<Node>, Vec<Node>) = nodes
-            .into_iter()
-            .partition(|n| matches!(&n.kind, Kind::VectorSearch(s) if s.needs_input()));
+        let (dependent, nodes): (Vec<Node>, Vec<Node>) =
+            nodes.into_iter().partition(|n| match &n.kind {
+                Kind::VectorSearch(s) => s.needs_input(),
+                Kind::SpatialPf(s) => s.needs_input(),
+                _ => false,
+            });
         for n in nodes {
             leaves.push(vec![n]);
         }
@@ -1933,7 +1936,11 @@ impl<'a> Planner<'a> {
             }
         }
         for d in dependent {
-            result = self.attach_vector(result, d)?;
+            result = if matches!(d.kind, Kind::SpatialPf(_)) {
+                super::geopf::attach_spatial(self, result, d)?
+            } else {
+                self.attach_vector(result, d)?
+            };
             let (now, later): (Vec<Expr>, Vec<Expr>) =
                 std::mem::take(&mut filters).into_iter().partition(|f| {
                     !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))

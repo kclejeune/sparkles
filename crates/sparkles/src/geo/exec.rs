@@ -574,8 +574,155 @@ pub fn spatial_scan(
 
 // -------------------------------------------------------------------- SpatialPf --
 
-/// A `spatial:` property function.
-pub fn spatial_pf(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Table, Counters)> {
+/// Distinct bindings of a call's variable arguments, each one search.
+const MAX_ARGUMENT_BINDINGS: usize = 100_000;
+
+/// A `spatial:` property function: a search leaf, or with `input` (the rest of its
+/// group, binding its variable arguments) one search per distinct binding of the
+/// arguments, joined with the input rows that have it.
+///
+/// A binding that does not make valid arguments (a latitude out of range, a literal that
+/// is not a geometry, an unknown unit) matches nothing, as a function error fails a
+/// FILTER. Constant arguments were checked when the query was planned.
+pub fn spatial_pf(
+    ctx: &Ctx,
+    spec: &SpatialPfSpec,
+    input: Option<Table>,
+    vars: &[VarId],
+) -> Result<(Table, Counters)> {
+    let (Some(slots), Some(inp)) = (spec.deferred.as_deref(), input) else {
+        return spatial_pf_once(ctx, spec, vars);
+    };
+    let cols: Vec<Option<usize>> = slots
+        .iter()
+        .map(|s| match s {
+            PathEnd::Var(v) => inp.col_of(*v),
+            PathEnd::Const(_) => None,
+        })
+        .collect();
+    // input rows by the values of the arguments, in the order they first appear
+    let mut groups: FxHashMap<Vec<Id>, Vec<usize>> = FxHashMap::default();
+    let mut order: Vec<Vec<Id>> = Vec::new();
+    'rows: for r in 0..inp.len() {
+        let mut key = Vec::with_capacity(slots.len());
+        for (s, c) in slots.iter().zip(&cols) {
+            let id = match (s, c) {
+                (PathEnd::Const(id), _) => *id,
+                (PathEnd::Var(_), Some(c)) => inp.get(r, *c),
+                (PathEnd::Var(_), None) => Id::UNDEF,
+            };
+            if id == Id::UNDEF {
+                // an unbound argument: no search, no match
+                continue 'rows;
+            }
+            key.push(id);
+        }
+        groups
+            .entry(key)
+            .or_insert_with_key(|k| {
+                order.push(k.clone());
+                Vec::new()
+            })
+            .push(r);
+    }
+    if order.len() > MAX_ARGUMENT_BINDINGS {
+        return Err(Error::BudgetExceeded(crate::Budget {
+            kind: crate::BudgetKind::Rows,
+            limit: MAX_ARGUMENT_BINDINGS as u64,
+            requested: order.len() as u64,
+        }));
+    }
+    let cfg = config(ctx);
+    // the search's own columns: the feature and the graph
+    let mut own: Vec<VarId> = Vec::new();
+    for v in [
+        match spec.subject {
+            PathEnd::Var(v) => Some(v),
+            PathEnd::Const(_) => None,
+        },
+        spec.graph_var,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !own.contains(&v) {
+            own.push(v);
+        }
+    }
+    // where each input and search column goes, and the columns both have
+    let place = |from: &[VarId]| -> Vec<Option<usize>> {
+        from.iter()
+            .map(|v| vars.iter().position(|x| x == v))
+            .collect()
+    };
+    let (in_place, own_place) = (place(&inp.vars), place(&own));
+    let mut t = Table::new(vars.to_vec());
+    let mut row = vec![Id::UNDEF; vars.len()];
+    let mut total = Counters::new();
+    let mut searches = 0u64;
+    for key in order {
+        ctx.check()?;
+        let rows = groups.remove(&key).unwrap_or_default();
+        let Some(vals) = key
+            .iter()
+            .map(|id| ctx.value(*id))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let Ok(a) = crate::sparql::geopf::decode_values(spec.func, &vals, &cfg) else {
+            continue;
+        };
+        if a.empty {
+            continue;
+        }
+        let one = SpatialPfSpec {
+            query: Arc::new(a.query),
+            radius_m: a.radius_m,
+            limit: a.limit,
+            deferred: None,
+            ..spec.clone()
+        };
+        let (found, c) = spatial_pf_once(ctx, &one, &own)?;
+        searches += 1;
+        for (k, v) in c {
+            match (total.get_mut(&k), v.as_u64()) {
+                (Some(serde_json::Value::Number(n)), Some(x)) => {
+                    *n = (n.as_u64().unwrap_or(0) + x).into();
+                }
+                (None, _) => {
+                    total.insert(k, v);
+                }
+                _ => {}
+            }
+        }
+        for &r in &rows {
+            'found: for f in 0..found.len() {
+                row.fill(Id::UNDEF);
+                for (i, p) in in_place.iter().enumerate() {
+                    if let Some(p) = p {
+                        row[*p] = inp.get(r, i);
+                    }
+                }
+                for (i, p) in own_place.iter().enumerate() {
+                    let Some(p) = *p else { continue };
+                    let v = found.get(f, i);
+                    if row[p] != Id::UNDEF && row[p] != v {
+                        continue 'found;
+                    }
+                    row[p] = v;
+                }
+                t.push_row(&row);
+            }
+            ctx.check_output(t.len(), vars.len())?;
+        }
+    }
+    total.insert("searches".into(), searches.into());
+    Ok((t, total))
+}
+
+/// One search of a `spatial:` property function with decoded arguments.
+fn spatial_pf_once(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(Table, Counters)> {
     use SpatialPfKind::*;
     let cfg = config(ctx);
     let state = state(ctx);
