@@ -43,6 +43,8 @@ behaviour, and the Outcome explains the difference.
 
 Numbers are stable. Gaps in the numbering are roadmap items without a spec: a Cypher
 frontend and property-graph view, a GraphQL adapter and a Datalog frontend. G01 replaced the narrower geospatial item on that list.
+frontend and property-graph view, tabular imports and a Datalog frontend. G01 replaced
+the narrower geospatial item on that list.
 
 ## Specs
 
@@ -57,6 +59,8 @@ there is no code yet.
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, most of Phase 2, Phase 4) |
 | [C05](C05-tabular-imports.md) | CSV and TSV imports with a default mapping, W3C CSVW metadata or Tarql-style CONSTRUCT templates, in `sparkles load`, `sparkles csv` and uploads | implemented |
+| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, VoID export, Phase 4) |
+| [C03](C03-graphql.md) | A read-only GraphQL endpoint per dataset, with a schema mapped to classes and predicates by `@rdf` directives and drafted from SHACL shapes or the data, compiled to batched SPARQL algebra under the caller's view and budgets | specified |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them incrementally, and inconsistency diagnostics | implemented (Phases 1–3) |
 | [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC with access tokens and back-channel logout, trusted proxies, Cloudflare Access, CLI logins, native TLS) and per-dataset permissions | implemented (Phases 1 and 2, Phase 3 as C12) |

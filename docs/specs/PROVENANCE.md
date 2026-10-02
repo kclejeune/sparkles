@@ -282,6 +282,54 @@ implementation landed.
   - one generic MCP tool for every stored query;
   - per-user saved queries.
 
+## GraphQL read adapter
+
+- **Spec:** [`C03-graphql.md`](C03-graphql.md), written on 2026-10-02 independently
+  from:
+  - the GraphQL specification, October 2021 edition and the current working draft, the
+    GraphQL over HTTP working draft and the GraphQL Cursor Connections specification,
+    fetched 2026-10-02;
+  - GraphQL-LD (Taelman, Vander Sande and Verborgh, ISWC 2018 demo), cited from working
+    knowledge, and the README of `graphql-to-sparql` (MIT). No code was used;
+  - HyperGraphQL's README (Apache-2.0), the public documentation of Stardog's GraphQL
+    support and of Ontotext's Semantic Objects (SOML queries and properties), Hasura's
+    filter documentation and GitHub's GraphQL API limits, fetched 2026-10-02;
+  - PostGraphile's and Apollo Server's conventions, cited from working knowledge;
+  - the W3C Bridging GraphQL and RDF Community Group's charter page;
+  - Hartig and Pérez, "Semantics and Complexity of GraphQL" (WWW 2018), and Cha et al.,
+    "A Principled Approach to GraphQL Query Cost Analysis" (ESEC/FSE 2020), cited from
+    working knowledge;
+  - the crates.io and docs.rs pages of `apollo-compiler`, `apollo-parser`,
+    `async-graphql` and `juniper`, and the npm records of `cm6-graphql`, `graphql` and
+    `graphiql`;
+  - the Sparkles code and specs C01, C02, C09, C10, C11, C12, C16 and F06.
+
+  Fluree was not consulted, and no description of Fluree's GraphQL support was used.
+- **Implementation:** not built.
+  - **Planned dependencies:** `apollo-compiler` 1.33 and `apollo-parser` 0.8 (MIT OR
+    Apache-2.0), in a new `sparkles-graphql` crate. They bring crates that `Cargo.lock`
+    does not have yet: `ariadne`, `typed-arena`, `memoffset` and `jsonpath-rust` (MIT),
+    and `rowan`, `serde_json_bytes`, `triomphe`, `countme`, `text-size`, `ahash`,
+    `yansi` and `pest` (MIT OR Apache-2.0). The list will be confirmed from `Cargo.lock`
+    when the crate is added.
+    The repository has no `cargo-deny` configuration, so these were checked against the
+    licenses `THIRD_PARTY_LICENSES.md` already lists, which are all permissive. The UI
+    would add `cm6-graphql` 0.2 and `graphql` 17 (MIT).
+- **Rejected** (spec §17):
+  - one SPARQL query per document with nested `OPTIONAL`s, as GraphQL-LD builds;
+  - a resolver per field with `juniper` (BSD-2-Clause) or `async-graphql`'s dynamic
+    schemas (MIT OR Apache-2.0);
+  - a schema that follows the data, as Stardog's automatic schema does;
+  - generating SPARQL text instead of algebra;
+  - keyset cursors for every order, and cursors at the head;
+  - compacted identifiers;
+  - a schema per principal;
+  - embedding GraphiQL (MIT, React);
+  - Hasura's `_eq` operator names;
+  - Apollo's automatic persisted queries;
+  - a SPARQL passthrough field;
+  - mutations, for the reasons of spec §12.
+
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on
