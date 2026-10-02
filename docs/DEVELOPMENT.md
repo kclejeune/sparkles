@@ -60,6 +60,7 @@ mise run docs:screenshots # the README's screenshots (docs/images) from the demo
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
 mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
+mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
@@ -199,6 +200,36 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   literals as values, so latitudes written with different precision that round to the
   same float are one triple there and two in Sparkles and QLever (3 triples at `50m`):
   `count-all` and `predicate-counts` then have no majority answer and are not ranked.
+* `scripts/bench-watdiv.sh` (`mise run bench:watdiv [scale] [workdir]`) runs the five
+  engines of `scripts/bench.sh` on WatDiv, the Waterloo SPARQL Diversity Test Suite. Its
+  20 basic query templates cover linear, star, snowflake and complex query shapes. Scale
+  factor 1 generates about 112,000 triples. The default of 100 generates 11.0 million,
+  of which 10.9 million are distinct. The workdir defaults to `target/bench-watdiv`.
+
+  WatDiv's generator is a C++ program, and its source is not part of this repository.
+  The script builds it with Nix from the WatDiv v0.6 release, which
+  `scripts/bench-watdiv/watdiv.nix` pins by checksum, against the nixpkgs revision in
+  `flake.lock`. The release seeds its random generators from the clock and reads the
+  system word list, so the build patches it to use a fixed seed and a pinned word list.
+  The same scale and seed always produce the same data and the same queries. The seed is
+  `WATDIV_SEED` and defaults to 1. The generator, the data and the queries are cached in
+  the workdir.
+
+  The generator often draws the same query instance more than once. The script keeps the
+  first five distinct instances of each template, and `--instances` changes the count.
+  The three complex templates have no parameters, so each of them has a single instance.
+  The engines load and serve the data exactly as in `scripts/bench.sh`, and every
+  engine's answer to every instance is compared before anything is timed.
+
+  `results/summary.md` gives each template's geometric mean over its instances. It then
+  gives the geometric mean of each category and of all templates. These rows only use
+  the templates that every engine answered correctly, so all engines are measured on the
+  same queries. `results/instances.md` lists every instance with its row count and
+  times. `ENGINES=""` only generates the data and the queries.
+
+  WatDiv may be used freely on the condition that publications cite G. Aluç, O. Hartig,
+  M. T. Özsu and K. Daudjee, "Diversified Stress Testing of RDF Data Management
+  Systems", ISWC 2014.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.
