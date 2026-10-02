@@ -1,4 +1,4 @@
-# F07: Encryption at rest and encrypted backups
+# F11: Encryption at rest and encrypted backups
 
 > **Status:** specified
 >

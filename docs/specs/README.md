@@ -35,18 +35,14 @@ behaviour, and the Outcome explains the difference.
 | Prefix | Group |
 |---|---|
 | `CI` | Durable commit identity. The commit sequence, dataset ids and receipts that most later features build on. |
-| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
-| `F` | Larger data features: full-text and vector search, backups to object storage, retained history and point-in-time reads. |
+| `C` | Smaller server and engine capabilities: observability and budgets, schema discovery, a GraphQL adapter, CSV and TSV imports, cloning, inference freshness, access control, write-time validation, the MCP server, automatic compaction, write previews and stored queries. |
+| `F` | Larger data features: a Cypher frontend, full-text and vector search, backups to object storage, retained history and point-in-time reads, branches and merges, replication, and encryption at rest. |
 | `G` | Gaps against Apache Jena that were out of scope for the first version: GeoSPARQL, ShEx, the SHACL Compact Syntax and the command-line tools. |
 | `P` | Bindings that embed the engine in other languages: Python. |
 | `X` | Internal engineering that does not derive from any other database product: compression codecs and the formatter. |
 
-Numbers are stable. Gaps in the numbering are roadmap items without a spec: a Cypher
-frontend and property-graph view, a GraphQL adapter and a Datalog frontend. G01 replaced the narrower geospatial item on that list.
-frontend and property-graph view, tabular imports and a Datalog frontend. G01 replaced
-the narrower geospatial item on that list.
-Numbers are stable. Gaps in the numbering are roadmap items without a spec: Cypher
-writes over the property-graph view, a GraphQL adapter, tabular imports and a Datalog
+Numbers are stable. Gaps in the numbering are roadmap items without a spec: writes and a
+property-graph representation for the Cypher frontend, path search and a Datalog
 frontend. G01 replaced the narrower geospatial item on that list.
 
 ## Specs
@@ -61,9 +57,8 @@ there is no code yet.
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log` | implemented in part (Phases 1–2) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
 | [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, most of Phase 2, Phase 4) |
-| [C05](C05-tabular-imports.md) | CSV and TSV imports with a default mapping, W3C CSVW metadata or Tarql-style CONSTRUCT templates, in `sparkles load`, `sparkles csv` and uploads | implemented |
-| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, VoID export, Phase 4) |
 | [C03](C03-graphql.md) | A read-only GraphQL endpoint per dataset, with a schema mapped to classes and predicates by `@rdf` directives and drafted from SHACL shapes or the data, compiled to batched SPARQL algebra under the caller's view and budgets | specified |
+| [C05](C05-tabular-imports.md) | CSV and TSV imports with a default mapping, W3C CSVW metadata or Tarql-style CONSTRUCT templates, in `sparkles load`, `sparkles csv` and uploads | implemented |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them incrementally, and inconsistency diagnostics | implemented (Phases 1–3) |
 | [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC with access tokens and back-channel logout, trusted proxies, Cloudflare Access, CLI logins, native TLS) and per-dataset permissions | implemented (Phases 1 and 2, Phase 3 as C12) |
@@ -80,7 +75,7 @@ there is no code yet.
 | [F06](F06-snapshots-and-point-in-time.md) | Point-in-time reads with `?at=`, named snapshots, a retention window and diffs between commits | implemented in part (Phases 1 and 2) |
 | [F09](F09-branches-and-merges.md) | Branches that share their parent's index until they compact, `?branch=` and `/{ds}@{branch}`, three-way merges of quad sets with cell conflicts and resolutions, protected branches, and clones of branches | specified |
 | [F10](F10-replication.md) | Applying RDF Patch through Fuseki's `patch` operation, with `H prev` as a concurrency check, then read replicas that pull commits as RDF Patch, keep the primary's commit ids, bootstrap from a generation copy or a backup, and are promoted by hand | specified |
-| [F07](F07-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |
+| [F11](F11-encryption-at-rest.md) | Client-side encrypted backup repositories with keyed blob ids, content-defined chunking, and AES-256-GCM encryption at rest for dataset files under KMS-wrapped per-dataset keys | specified |
 | [G01](G01-geosparql.md) | GeoSPARQL 1.1 functions, Jena's spatial extensions, a spatial index, spatial joins and the UI's maps | implemented in part (Phases 1–2) |
 | [G02](G02-shex.md) | ShEx 2.1 validation: ShExC, ShExJ and ShExR, shape maps, `POST /{ds}/shex` and write-time ShEx | implemented in part (Phases 1–2, Phase 3 in part) |
 | [G03](G03-shaclc.md) | The SHACL Compact Syntax (`text/shaclc`) read and written wherever shapes go in or come out, and the SHACL 1.2 list constraints | implemented in part (Phase 1) |

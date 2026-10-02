@@ -1043,7 +1043,7 @@ implementation landed.
 
 ## Encryption at rest and encrypted backups
 
-- **Spec:** [`F07-encryption-at-rest.md`](F07-encryption-at-rest.md), written on
+- **Spec:** [`F11-encryption-at-rest.md`](F11-encryption-at-rest.md), written on
   2026-10-02 independently from:
   - the Sparkles code, the file layout of a database built with the release binary, and
     the [F05](F05-snapshot-repositories.md), [C13](C13-automatic-compaction.md) and

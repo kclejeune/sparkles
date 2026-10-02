@@ -1856,10 +1856,10 @@ languages, and policy runs.
 
 **Not built:** the items listed under Phases at the top.
 
-**Follow-up: Phase 3 encryption and chunking are specified in F07.** Client-side
+**Follow-up: Phase 3 encryption and chunking are specified in F11.** Client-side
 encryption and content-defined chunking now have their own design in
-[F07](F07-encryption-at-rest.md), which replaces the sketch in §7 Phase 3. Its Phase 1
-is the encrypted repository of [F07 §5](F07-encryption-at-rest.md#5-encrypted-backup-repositories-phase-1).
+[F11](F11-encryption-at-rest.md), which replaces the sketch in §7 Phase 3. Its Phase 1
+is the encrypted repository of [F11 §5](F11-encryption-at-rest.md#5-encrypted-backup-repositories-phase-1).
 Blob ids become HMAC-SHA256 under a repository key, blobs and manifests are sealed with
 AES-256-GCM, and key slots wrap a repository master key. That answers open question 11.
 Its Phase 2 adds FastCDC for `vocab.dat` behind the 30% gate of §5.4, which answers open
