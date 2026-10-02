@@ -96,7 +96,9 @@ async fn page(ds: &Arc<Dataset>, ask: &Ask) -> ApiResult<ChangePage> {
     }
 }
 
-/// Wait until the head passes `after`, `until` passes or the server begins to drain.
+/// Wait until the published state passes `after`, `until` passes or the server begins
+/// to drain. The live snapshot is read without a lock, so a long write holding the
+/// writer lock never blocks the runtime here.
 async fn wait_for_commit(
     st: &AppState,
     ds: &Dataset,
@@ -105,7 +107,7 @@ async fn wait_for_commit(
     until: Instant,
 ) {
     loop {
-        if ds.store.head_commit().seq > after
+        if ds.store.snapshot().commit > after
             || Instant::now() >= until
             || st.phase() == crate::obs::Phase::Draining
         {

@@ -33,7 +33,7 @@ full feature list is in [FEATURES.md](FEATURES.md).
 | SPARQL extensions | Property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, the full `afn:`/`fn:` library | ✗ (the common `fn:`, `afn:` and `math:` functions only) |
 | SPARQL parser | JavaCC grammar | `spargebra` 0.4.7, vendored with fixes for the W3C tests it failed ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD only) |
-| Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` | ✗ |
+| Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` | RDF Patch output, as text and as RDF Thrift, for diffs between commits and for a change feed with long polling and server-sent events. Sparkles writes patches but does not apply them, so it has no `/patch` endpoint. |
 | Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix endpoints | Basic and Bearer tokens, OIDC sign-in for the UI and trusted proxy headers, with per-dataset access levels; no per-graph ACLs. Prometheus `/$/metrics` with Sparkles metric names, plus Fuseki's `fuseki_requests*` names with `--metrics-fuseki-names`, and no JVM metrics. Datasets are configured by CLI flags and the admin API. Prefixes through `/{ds}/prefixes`. |
 | SERVICE | Bulk, batched and cached SERVICE (serviceenhancer) | Plain SERVICE only |
 | Transactions over HTTP | — | — (as in Fuseki, one request is one transaction) |
@@ -68,7 +68,7 @@ time, and this comparison draws on its public documentation.
 
 | Area | Fluree | Sparkles |
 |---|---|---|
-| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. Diffs between any two readable commits. No history queries across commits, branches or merges. |
+| History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog that can be pruned past a horizon. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. Diffs between any two readable commits, as JSON or RDF Patch, and a change feed that resumes from any readable commit. No history queries across commits, branches or merges. |
 | Security | Access policies stored in the ledger, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | Per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers. No policy language, signed requests or encryption at rest. |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher with Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, an MCP server | SPARQL, the Rust API and an MCP server over stdio and HTTP. JSON-LD is an RDF format only. |
 | Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), vector search (`spk:vectorSearch`) with an HNSW index or exactly, and GeoSPARQL with a spatial index. Vector indexes have no quantization. |
@@ -164,8 +164,8 @@ or web UI.
 
 JavaScript functions, RDF Thrift/Protobuf/TriX, jena-ontapi object mapping, jena-text's
 Lucene index format and assembler configuration (Sparkles implements `text:query` itself),
-SHACL-AF rules (also absent from Jena), RDF Patch, backward-chaining (LP) rules and Shiro
-authentication.
+SHACL-AF rules (also absent from Jena), applying RDF Patch, backward-chaining (LP) rules
+and Shiro authentication.
 
 ## Optimizations adopted from QLever
 

@@ -1020,7 +1020,10 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
 
 Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
 beyond it) and by the request timeout. Results are cached, and one materialization runs
-at a time.
+at a time. A state starts from the nearest known state of its generation in the
+write-ahead log: the generation's base, a cached past state before or after it, or the
+live state. Later states replay the log forward, and earlier ones undo it backward, so a
+read near the head or near a cached commit replays only the commits in between.
 
 ### Diffs between commits
 
@@ -1035,6 +1038,8 @@ the selectors of `at`. `to` defaults to the head and `from` to the commit before
 |---|---|---|
 | JSON (default) | `Accept: application/json` or `format=json` | Counts, and the quads with `quads=true`. |
 | Diff lines | `Accept: text/x-sparkles-diff` or `format=diff` | One N-Quads line per change, marked `+ ` or `- `. |
+| RDF Patch | `Accept: application/rdf-patch` (or `text/rdf-patch`) or `format=patch` | A patch that turns the state at `from` into the state at `to`. |
+| RDF Patch, binary | `Accept: application/rdf-patch+thrift` or `format=patch-binary` | The same patch as RDF Thrift rows. |
 
 ```json
 { "dataset": "ds", "datasetId": "3f1c9a2e-…",
@@ -1064,25 +1069,113 @@ between two `commit:` selectors never changes, so it gets a weak entity tag and 
 effect, so the net change is the symmetric difference of the changes between the two
 commits. Within the retained generations Sparkles reads only those log records,
 compactions included, and its memory grows with the quads that changed. That is
-`"log"`. A bulk commit has no log records, and a collected generation leaves a gap. Those
-stretches are compared state against state with a sorted merge, which reads both states
-in full. That is `"compare"`, and in-memory datasets always use it.
+`"log"`. A sparse index of each log says where every 1,024th commit ends, so a diff
+starts reading near its first commit. A bulk commit has no log records, and a collected
+generation leaves a gap. Those stretches are compared state against state with a sorted
+merge, which reads both states in full. That is `"compare"`, and in-memory datasets
+always use it.
+
+**RDF Patch.** The patch formats follow Apache Jena's RDF Patch, which Jena's
+`jena-rdfpatch` module, Fuseki's patch endpoint and RDF Delta read. A patch names the
+two states in its header, deletes with `D` rows and adds with `A` rows inside one
+transaction:
+
+```
+H id <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:4> .
+H prev <urn:uuid:3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa#commit:1> .
+TX .
+D <urn:a> <urn:p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+A <urn:c> <urn:p> "three" .
+A <urn:b> <urn:p> "2"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g1> .
+TC .
+```
+
+`id` is the IRI of the `to` commit and `prev` that of the `from` commit. A commit's IRI is
+`urn:uuid:` with the dataset id, then `#commit:` and its number. A quad in the default
+graph has three terms. Blank nodes are written `<_:label>`, the form Jena's reader keeps
+labels in. The binary form is a sequence of `RDF_Patch_Row` structs of Jena's RDF Thrift
+schema in the Thrift compact protocol. Its literals carry the base direction of
+directional language strings, which Jena's binary reader ignores. A patch always lists
+every change, so `limit` with a patch format is `400`.
+
+### Change feed
+
+`GET /{ds}/changes?after=SEL` lists the commits after a commit, oldest first, each with
+the quads it added and removed relative to its parent. It needs read permission on the
+dataset. `after` takes the selectors of `at` and defaults to the head, so a request
+without it waits for the next commit. Resuming is simple: a client that applied commit
+`n` asks for the commits after `n`. That works from any readable commit, as for diffs.
+
+| Parameter | Meaning |
+|---|---|
+| `after` | The commit to start after (`N`, `commit:N`, `time:…`, `snapshot:NAME`, `head`). |
+| `limit` | The most commits listed, 1 to 1,000 (default 100). |
+| `wait` | Seconds to wait for a commit when there is none after `after`, at most 60 (default 0). |
+| `format` | `json` (default), `patch` or `patch-binary`, in place of `Accept`. |
+
+The JSON body lists the commits with their changes. `next` and the `Sparkles-Changes-Next`
+header name the commit to ask after next, and `Sparkles-Head` carries the head:
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "after": 2, "next": 4, "head": { "seq": 4, … },
+  "commits": [
+    { "commit": { "seq": 3, "message": "…", … }, "added": 0, "removed": 1, "complete": true,
+      "changes": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+                     "object": "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>", "graph": null } ] },
+    … ] }
+```
+
+With `Accept: application/rdf-patch` or `application/rdf-patch+thrift` the body is one
+patch per commit, one after another. Each patch's `id` names its commit and its `prev`
+names the parent, so the patches chain.
+
+A page lists at most `--max-rows` changes, all its commits together. It ends before the
+commit that would pass that, and the next page starts with it. A commit whose changes
+alone pass the budget is listed with its counts and `"complete": false`, without
+`changes`, and a client reads the state at that commit instead. A patch cannot leave
+changes out, so a patch page that would start with such a commit is `507` with
+`code: "changes-too-large"` and the commit's number. A body over `--max-export-mb` is cut
+off as for other streamed bodies.
+
+A commit past the head is `404`. A commit whose state is no longer kept is
+`410 history-gone`, and so is the first commit after a gap in the readable history: its
+changes need the state before it. A page ends where the readable history does, so the
+next request reports the commit that cannot be read.
+
+**Long polling.** With `wait=N`, a request that finds no commit after `after` waits up to
+N seconds for one and then answers, with an empty list if none came. The server wakes
+waiting requests as soon as a commit is published, and ends the wait when it begins to
+shut down.
+
+**Server-sent events.** With `Accept: text/event-stream` the response is an event stream.
+Each commit is a `commit` event whose `id` is the commit's number and whose data is the
+commit's JSON object, or its text patch with `format=patch`. The stream sends the commits
+after `after`, then new commits as they are made, with a comment every 15 seconds to keep
+the connection open. It ends after five minutes and when the server shuts down. A client
+that reconnects sends `Last-Event-ID`, as browsers' `EventSource` does, and the stream
+resumes after that commit. An error ends the stream with an `error` event that carries
+the error's JSON body.
+
+```sh
+curl -N -H 'Accept: text/event-stream' 'http://localhost:3030/ds/changes?after=41'
+```
 
 ### Named snapshots and retention
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized (see below). Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | GET | `/$/history/{ds}` | `HistoryStatus` |
-| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules? }`. `schedules` replaces the pin schedules when it is present. |
+| PUT | `/$/history/{ds}` | Sets the retention window and returns `HistoryStatus`. The body is `{ keepCommits?, keepAge?, maxBytes?, schedules?, catalog? }`. `schedules` replaces the pin schedules when it is present, and `catalog` replaces the catalog horizon (`null` turns it off). |
 
 ```ts
 type NamedSnapshot = { name: string; ref: string; seq: number; commit: Commit | null;
   created: string; expires: string | null; note: string | null;
-  generation: string | null; reconstructable: boolean };
+  generation: string | null; reconstructable: boolean;
+  warm: boolean };                                   // kept materialized
 type Retention = { keepCommits: number | null;      // the last N commits
   keepAge: string | null;                            // "7d", or seconds
   maxBytes: number | null };                         // a number, or "10GiB" in a PUT
@@ -1093,6 +1186,8 @@ type HistoryStatus = { dataset: string; datasetId: string; head: number;
   generations: { name: string; baseSeq: number; endSeq: number; bytes: number;
                  current: boolean; heldBy: string[] }[];   // "head", "snapshot:NAME", "retention"
   retention: Retention; schedules: Schedule[]; snapshots: number;
+  catalog: { keepCommits: number | null; keepAge: string | null;   // the catalog horizon
+             firstRetained: number };                              // the oldest commit listed
   cache: { entries: number; bytes: number; hits: number; misses: number; materializations: number } };
 ```
 
@@ -1105,6 +1200,24 @@ is finished at the next open. `GET /$/commits/{ds}` adds `oldestReconstructable`
 `maxBytes` caps the disk used by generations that only the retention window keeps. When
 the kept generations together exceed it, the oldest window-only generations are removed
 first. Pins and backups in progress always keep their generations.
+
+A **warm** pin keeps its state materialized. The state is built when the pin is made and
+by the history upkeep, so it is ready again within a minute of a restart. The history
+cache evicts warm states last, only when they alone pass `--history-cache-mb`, so a read
+at a warm pin costs no replay. A pin at the head needs no warming, and an in-memory
+dataset keeps every pinned state in memory anyway.
+
+The **catalog horizon** bounds the commit catalog. Without one, `/$/commits` and
+`sparkles log` keep every commit's metadata forever, at 64 bytes a commit. With
+`catalog: { keepCommits: 100000, keepAge: "90d" }`, the catalog drops the records, messages
+and digests of commits that are older than both the oldest readable commit and the
+horizon. A commit is kept if either limit keeps it. The history upkeep prunes once at
+least 1,024 records, and an eighth of the catalog, can go. Setting the horizon prunes at
+once, and so does `sparkles snapshot gc`. Commit numbers never repeat, because the head is
+never pruned. A pruned commit answers `410` in `/$/commits/{ds}/{ref}`, and
+`firstRetained` moves up. Pruning writes a new `commits.bin` and `annotations.bin` that
+replace the old files atomically. Backups, restores, `sparkles check` and the dataset
+quota handle the shorter files like any others.
 
 A **schedule** pins the head every `every` (at least a minute) as `PREFIX` followed by the
 UTC time, for example `daily-20261002T140311Z`. It skips a pin when its newest one
@@ -1129,14 +1242,17 @@ and `sparkles_history_cache_entries` per dataset. It also reports the counters
 
 **CLI.** The history commands are these:
 
-* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d]`
+* `sparkles snapshot create --loc DB NAME [--at SEL] [--note TEXT] [--expires 7d] [--warm]`
 * `sparkles snapshot list|history --loc DB [--format json]`
 * `sparkles snapshot delete --loc DB NAME`
 * `sparkles snapshot retain --loc DB [--keep-commits N] [--keep-age 7d] [--max-bytes 10GiB] [--off]`
 * `sparkles snapshot schedule --loc DB --prefix daily- --every 1d [--keep-last 7]`, or
   `--remove PREFIX`, or no options to list the schedules
-* `sparkles snapshot gc --loc DB`, which runs the history upkeep once
-* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count]`
+* `sparkles snapshot gc --loc DB`, which runs the history upkeep once and prunes the
+  commit catalog
+* `sparkles snapshot catalog --loc DB [--keep-commits N] [--keep-age 90d] [--off]`, which
+  sets the catalog horizon and prunes
+* `sparkles diff --loc DB FROM [TO] [--graph IRI|default] [--format diff|json|count|patch|patch-binary]`
 * `sparkles query --loc DB --at SEL …`, `sparkles dump --loc DB --at SEL` and
   `sparkles clone --loc DB --to DIR --at SEL`
 

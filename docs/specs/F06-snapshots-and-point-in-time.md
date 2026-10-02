@@ -1234,3 +1234,122 @@ selector parsing, the result label and diff formatting.
 and the sparse offset index), `warm` pins, and clones into an in-memory dataset are not
 built. Nor is Phase 3: a generation-independent change log, full-text search at pins,
 history queries and pin rebasing.
+
+### Replay speedups, RDF Patch and the change feed
+
+These landed on 2026-10-02, after Phase 2. They build the three speedups of §5.3 and
+`warm` pins, answer open question 3 with RDF Patch output, and add a change feed. The
+catalog horizon that prunes old commit records is in the
+[CI Outcome](CI-commit-identity.md#outcome).
+
+**Sparse offset index.** Each generation keeps, in memory, where every 1,024th commit
+ends in its write-ahead log, and also the first commit after each further MiB of log, so
+large transactions do not spread the entries out. An entry holds the commit's number,
+the byte offset after its last record, and whether legacy records still fold into the
+base there. The current generation's index is filled by the replay at open and kept up
+by each commit after its WAL write. A sealed generation's index is built the first time
+a read or diff needs it, by reading its log's records once without probing the base
+index. The index stops at damage, because it only says where to start reading, and the
+reader that reaches the damage reports it. The index is not written to disk. Rebuilding
+it costs one pass over a log, which is much cheaper than the replay that a read needed
+before, so there is no new file for backups, restores, `sparkles check` or the quota to
+handle.
+
+**Materialization.** A past state starts from the known state of its generation that is
+nearest in the log: the base, a cached past state on either side, or the live state of
+the current generation. It replays the log forward from an earlier state, or undoes it
+backward from a later one. Every logged change took effect, so applying the inverse
+change to the delta, transaction by transaction in reverse, is exact. The backward path
+reads the range from its end in 4 MiB chunks and verifies each transaction's checksum
+before undoing it. A legacy transaction has no number in the log, so a range that holds
+one is replayed forward from the base instead. Cached states remember where their commit
+ends, so a later read can start from them. The replay at open no longer clones the delta
+after each commit to count it. It notes, per transaction, whether each changed quad was
+present when the transaction began.
+
+**Diffs** read the log from the index entry nearest their first commit instead of from
+the generation's base.
+
+**Warm pins.** `SnapshotOptions::warm`, `"warm": true` in `POST /$/snapshots/{ds}` and
+`sparkles snapshot create --warm` mark a pin warm. Its state is built when the pin is
+made and by the history upkeep, so after a restart within a minute. The history cache
+evicts warm states last, only when they alone pass `--history-cache-mb`. `history.json`
+records the flag.
+
+**RDF Patch.** `sparkles::patch` writes Apache Jena's RDF Patch as text
+(`application/rdf-patch`, also offered as `text/rdf-patch`) and as RDF Thrift
+(`application/rdf-patch+thrift`), the `RDF_Patch_Row` structs of Jena's
+`BinaryRDF.thrift` in the Thrift compact protocol. `GET /{ds}/diff` negotiates them, and
+`format=patch|patch-binary` and `sparkles diff --format patch|patch-binary` ask for
+them. A patch has `H id` with the `to` commit's IRI and `H prev` with the `from`
+commit's, then `TX`, the `D` rows, the `A` rows and `TC`. A commit's IRI is
+`urn:uuid:<dataset id>#commit:<seq>`. Blank nodes are written `<_:label>`, because
+Jena's text reader drops the first character of a `_:label` but keeps the bracketed
+form. Jena 6.2's `rdfpatch` command read the text patches of a test database with blank
+nodes, a blank graph name, triple terms, directional and tagged literals and escapes,
+and its binary reader read the same changes. The binary reader drops the base direction
+of a directional literal, which Sparkles writes in the IDL's `baseDirection` field. A
+patch lists every change, so `limit` with a patch format is refused.
+
+**Change feed.** `Store::changes(after, options)` lists the commits after `after`, each
+with its net changes relative to its parent, in pages bounded by `max_commits` and
+`max_quads`. Within the logs one walk reads every commit of a page, and a bulk commit's
+changes come from comparing its two states. A page stays within one readable range, so
+the commit after a gap answers `410`. `Store::subscribe_commits` is a watch channel that
+each published commit updates. `GET /{ds}/changes?after=SEL&limit=&wait=` serves pages as
+JSON or as one patch per commit, needs read permission, and caps a page at
+`--max-rows` changes. A commit whose changes alone pass that is listed with its counts
+and `complete: false` in JSON, and is `507 changes-too-large` at the start of a patch
+page. `wait` long-polls for up to 60 seconds. `Accept: text/event-stream` streams
+`commit` events whose ids are commit numbers, so `Last-Event-ID` resumes a stream. A
+stream lasts at most five minutes and ends when the server drains.
+
+**Performance.** Two measurements were taken on a machine that other builds were using,
+so they vary by tens of percent. `history_performance` in
+`crates/sparkles/tests/history.rs` repeats the setup of A23 in the engine with a
+1,000,000-quad base and 50,000 single-quad commits in one generation, reading with
+`snapshot_at`. A release build gave:
+
+| Case | Before | After |
+|---|---:|---:|
+| First read in the middle (base + 25,000) | 212 ms | 91 ms |
+| A neighbour of a cached state (+1) | 169 ms | 0.37 ms |
+| 5,000 commits after a cached state | 231 ms | 18 ms |
+| 100 commits before the head | 400 ms | 0.68 ms |
+| One-commit diff at the head | 2.9 ms | 0.52 ms |
+| Reopen (replays 50,000 commits) | 421 ms | 104 ms |
+
+The benchmark of [Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
+at the same smaller scale (1,000,000 triples, 50,000 single-quad commits over 4 HTTP
+connections, timed by single `curl` requests) gave:
+
+| Request | Before | After |
+|---|---:|---:|
+| `COUNT(*)` at base + 25,000, first | 213 ms | 67 ms |
+| The same, second and later | 1.1–1.4 ms | 1.2–1.6 ms |
+| `COUNT(*)` at base + 25,001 | 285 ms | 2.1 ms |
+| `COUNT(*)` at head − 100 | 486 ms | 2.7 ms |
+| `COUNT(*)` at base + 12,500, cold | 108 ms | 31 ms |
+| Diff of one commit at the head | 2.3–3.9 ms | 0.6–2.0 ms |
+| Diff of the last 100 commits | 3.9 ms | 1.6 ms |
+| After a restart, at base + 25,000 | 177 ms | 69 ms |
+
+`diff_performance` (1,000,000 quads, then 20,000 commits of 5 inserts) gave 2.0 ms →
+0.08 ms for one commit, 4.6 ms → 0.70 ms for the last 100 commits, 224 ms → 153 ms for
+all 20,000 and 47 ms → 24 ms across a compaction. The first diff in a sealed generation
+builds its index by reading that log once.
+
+**Tests.** `history.rs` checks 1,300 random commits with deletes of base quads,
+re-inserts and changes undone within a transaction: every sampled past state, read in
+an order that exercises the base, cached states on both sides, the live state and a
+cache of one entry, equals the dump taken when the commit was made, in the current
+generation and after it is sealed. It also covers warm pins across a restart. `diff.rs`
+follows the change feed in pages of several sizes and budgets over random histories with
+compactions and bulk commits, checks each commit against its one-commit diff, and checks
+gaps and the commit watch. `http/diff_tests.rs` covers the patch formats, the feed as
+JSON and patches, long polling, server-sent events with `Last-Event-ID`, the budget,
+`410` and warm pins over HTTP. Unit tests cover the index and the Thrift encoding.
+
+**Still not built.** Sparkles writes RDF Patch but does not apply it, so there is no
+`/patch` endpoint. The feed is per dataset, not per graph. Clones into an in-memory
+dataset and Phase 3 remain later work.
