@@ -103,7 +103,8 @@ running queries.
   ([features](docs/FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)).
 * Storage quotas per dataset, and a shutdown that lets requests in flight finish within
   a grace period ([API](docs/API.md#storage-quotas)).
-* An MCP server for LLM agents. Its tools are read-only and run within query budgets
+* An MCP server for LLM agents, over stdio or at `/$/mcp` on the server. Each call runs as
+  its caller, within query budgets, and the write tool is opt-in
   ([usage](docs/USAGE.md#mcp-server-llm-agents)).
 
 [docs/FEATURES.md](docs/FEATURES.md) lists every feature and what is not there yet.
@@ -210,7 +211,7 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `schema` | List classes and predicates with exact counts and their declarations. |
 | `text-index`, `geo-index` | Manage the full-text and spatial indexes. |
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |
-| `mcp` | Run the MCP server for LLM agents over stdio. |
+| `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP. |
 | `fmt`, `lsp` | Run the formatter or its language server. |
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.

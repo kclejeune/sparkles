@@ -1,20 +1,29 @@
-//! The `rmcp` adapter: the only file that knows the MCP SDK.
+//! The `rmcp` adapter: with `http.rs`, the only code that knows the MCP SDK.
 //!
 //! rmcp serves both protocol eras: `2026-07-28` (stateless, `server/discover`, the
 //! protocol version and client capabilities in every request's `_meta`) and the legacy
 //! `initialize` handshake of `2025-11-25` and `2025-06-18`. This file declares the
-//! server's identity, capabilities and instructions, lists the tools, turns tool
-//! outcomes into results, and bridges `notifications/cancelled` to the engine's cancel
-//! flag.
+//! server's identity, capabilities and instructions, lists the tools, resources and
+//! prompts, turns tool outcomes into results, and bridges `notifications/cancelled` to
+//! the engine's cancel flag.
+//!
+//! Over HTTP, every request names its caller: the auth layer's [`Principal`], which
+//! rmcp hands over in the request's `http::request::Parts`. Listings and calls follow
+//! that principal's permissions.
 
+use super::context::{ContextError, PROMPTS, templates};
 use super::errors::{ERROR_META, ToolError};
 use super::{Call, McpServer, Outcome, UnknownTool};
+use crate::auth::Principal;
 use parking_lot::Mutex;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    CustomRequest, CustomResult, DiscoverResult, Implementation, JsonObject, ListToolsResult,
-    MetaObject, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    CustomRequest, CustomResult, DiscoverResult, GetPromptRequestParams, GetPromptResponse,
+    GetPromptResult, Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams, Prompt,
+    PromptArgument, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer, ServerInitializeError};
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
@@ -34,16 +43,29 @@ pub const INSTRUCTIONS: &str = "Sparkles is a SPARQL 1.1 database. Workflow: lis
 /// for the life of the process).
 const LIST_TTL_MS: u64 = 3_600_000;
 
+/// How long clients may cache a resource (it holds data).
+const RESOURCE_TTL_MS: u64 = 30_000;
+
 const SUPPORTED: [ProtocolVersion; 3] = [
     ProtocolVersion::V_2026_07_28,
     ProtocolVersion::V_2025_11_25,
     ProtocolVersion::V_2025_06_18,
 ];
 
+/// Where requests come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// stdin and stdout: every call runs as the local principal
+    Stdio,
+    /// `/$/mcp`: every call runs as the HTTP request's principal
+    Http,
+}
+
 #[derive(Clone)]
 pub struct Adapter {
     server: McpServer,
     tools: Arc<Vec<Tool>>,
+    transport: Transport,
 }
 
 fn implementation() -> Implementation {
@@ -71,6 +93,10 @@ fn set_server_info(meta: &mut MetaObject) {
 
 impl Adapter {
     pub fn new(server: McpServer) -> Adapter {
+        Adapter::with_transport(server, Transport::Stdio)
+    }
+
+    pub fn with_transport(server: McpServer, transport: Transport) -> Adapter {
         let tools = server
             .tools()
             .iter()
@@ -81,18 +107,60 @@ impl Adapter {
                 tool.description = Some(Cow::Borrowed(t.description));
                 tool.input_schema = object(&t.input);
                 tool.output_schema = t.output.as_ref().map(object);
-                tool.annotations = Some(
-                    ToolAnnotations::new()
-                        .read_only(t.read_only)
-                        .open_world(t.open_world),
-                );
+                let mut a = ToolAnnotations::new()
+                    .read_only(t.read_only)
+                    .open_world(t.open_world);
+                if t.destructive {
+                    a = a.destructive(true).idempotent(false);
+                }
+                tool.annotations = Some(a);
                 tool
             })
             .collect();
         Adapter {
             server,
             tools: Arc::new(tools),
+            transport,
         }
+    }
+
+    /// Listings vary by caller once the server has auth: clients must not share them.
+    fn scope(&self) -> CacheScope {
+        if self.transport == Transport::Http && self.server.state.auth.is_some() {
+            CacheScope::Private
+        } else {
+            CacheScope::Public
+        }
+    }
+
+    /// The caller of a request. Over HTTP the auth layer always names one; a request
+    /// without one is refused rather than run as the local principal.
+    fn principal(&self, ctx: &RequestContext<RoleServer>) -> Result<Principal, McpError> {
+        if self.transport == Transport::Stdio {
+            return Ok(Principal::local());
+        }
+        ctx.extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>().cloned())
+            .ok_or_else(|| McpError::internal_error("request without a caller", None))
+    }
+
+    /// A call of the request's caller.
+    fn call(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Call, McpError> {
+        let principal = self.principal(ctx)?;
+        let parts = ctx.extensions.get::<axum::http::request::Parts>();
+        Ok(Call {
+            arrived: Instant::now(),
+            cancel,
+            request_id: ctx.id.to_string(),
+            principal,
+            headers: parts.map(|p| p.headers.clone()),
+            held: parts.and_then(|p| p.extensions.get::<super::http::HeldShare>().cloned()),
+        })
     }
 }
 
@@ -109,13 +177,26 @@ fn result(outcome: Result<Outcome, ToolError>) -> CallToolResult {
     }
 }
 
+fn context_error(e: ContextError) -> McpError {
+    match e {
+        ContextError::InvalidParams(m) => McpError::invalid_params(m, None),
+        ContextError::Tool(t) => McpError::internal_error(t.text(), Some(t.meta())),
+    }
+}
+
 impl ServerHandler for Adapter {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(implementation())
-            .with_instructions(INSTRUCTIONS)
-            // the newest version with an `initialize` handshake
-            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(implementation())
+        .with_instructions(INSTRUCTIONS)
+        // the newest version with an `initialize` handshake
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -126,7 +207,7 @@ impl ServerHandler for Adapter {
         Ok(
             DiscoverResult::from_server_info(SUPPORTED.to_vec(), self.get_info())
                 .with_ttl_ms(LIST_TTL_MS)
-                .with_cache_scope(CacheScope::Public),
+                .with_cache_scope(self.scope()),
         )
     }
 
@@ -135,14 +216,143 @@ impl ServerHandler for Adapter {
         _request: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut r = ListToolsResult::with_all_items((*self.tools).clone());
+        let p = self.principal(&ctx)?;
+        let names: Vec<&str> = self.server.tools_for(&p).iter().map(|t| t.name).collect();
+        let tools = self
+            .tools
+            .iter()
+            .filter(|t| names.contains(&t.name.as_ref()))
+            .cloned()
+            .collect();
+        let mut r = ListToolsResult::with_all_items(tools);
+        if modern(&ctx) {
+            r = r.with_ttl_ms(LIST_TTL_MS).with_cache_scope(self.scope());
+            set_server_info(r.meta.get_or_insert_with(MetaObject::default));
+        }
+        Ok(r)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let call = self.call(&ctx, Arc::default())?;
+        let resources = self
+            .server
+            .resources(&call)
+            .into_iter()
+            .map(|r| {
+                Resource::new(r.uri, r.name)
+                    .with_title(r.kind.title())
+                    .with_description(r.kind.description())
+                    .with_mime_type(r.kind.mime_type())
+            })
+            .collect();
+        let mut r = ListResourcesResult::with_all_items(resources);
+        if modern(&ctx) {
+            r = r
+                .with_ttl_ms(RESOURCE_TTL_MS)
+                .with_cache_scope(CacheScope::Private);
+        }
+        Ok(r)
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let list = templates()
+            .into_iter()
+            .map(|(uri, name, kind)| {
+                ResourceTemplate::new(uri, name)
+                    .with_title(kind.title())
+                    .with_description(kind.description())
+                    .with_mime_type(kind.mime_type())
+            })
+            .collect();
+        let mut r = ListResourceTemplatesResult::with_all_items(list);
         if modern(&ctx) {
             r = r
                 .with_ttl_ms(LIST_TTL_MS)
                 .with_cache_scope(CacheScope::Public);
-            set_server_info(r.meta.get_or_insert_with(MetaObject::default));
         }
         Ok(r)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let call = self.call(&ctx, cancel.clone())?;
+        let work = self.server.read_resource(&request.uri, call);
+        tokio::pin!(work);
+        let read = tokio::select! {
+            r = &mut work => r,
+            () = ctx.ct.cancelled() => {
+                cancel.store(true, Ordering::Relaxed);
+                work.await
+            }
+        };
+        let (kind, text) = read.map_err(context_error)?;
+        let contents = vec![
+            ResourceContents::text(text, request.uri.clone()).with_mime_type(kind.mime_type()),
+        ];
+        // resources hold data: fresh for 30 s, and only for this caller
+        Ok(ReadResourceResult::new(contents)
+            .with_ttl_ms(RESOURCE_TTL_MS)
+            .with_cache_scope(CacheScope::Private)
+            .into())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let prompts = PROMPTS
+            .iter()
+            .map(|p| {
+                let args = p
+                    .arguments
+                    .iter()
+                    .map(|(name, description)| {
+                        PromptArgument::new(*name)
+                            .with_description(*description)
+                            .with_required(true)
+                    })
+                    .collect();
+                Prompt::new(p.name, Some(p.description), Some(args)).with_title(p.title)
+            })
+            .collect();
+        let mut r = ListPromptsResult::with_all_items(prompts);
+        if modern(&ctx) {
+            r = r
+                .with_ttl_ms(LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Public);
+        }
+        Ok(r)
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let call = self.call(&ctx, Arc::default())?;
+        let args = request.arguments.unwrap_or_default();
+        let (description, text) = self
+            .server
+            .prompt(&request.name, &args, &call)
+            .map_err(context_error)?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)])
+                .with_description(description)
+                .into(),
+        )
     }
 
     /// rmcp hands over a request whose parameters do not parse as a custom request:
@@ -152,7 +362,17 @@ impl ServerHandler for Adapter {
         request: CustomRequest,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
-        const KNOWN: [&str; 4] = ["initialize", "server/discover", "tools/list", "tools/call"];
+        const KNOWN: [&str; 9] = [
+            "initialize",
+            "server/discover",
+            "tools/list",
+            "tools/call",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "prompts/list",
+            "prompts/get",
+        ];
         if KNOWN.contains(&request.method.as_str()) {
             let hint = if request.method == "tools/call" {
                 ": `name` must be a string and `arguments` an object"
@@ -178,16 +398,13 @@ impl ServerHandler for Adapter {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let cancel = Arc::new(AtomicBool::new(false));
-        let call = Call {
-            arrived: Instant::now(),
-            cancel: cancel.clone(),
-            request_id: ctx.id.to_string(),
-        };
+        let call = self.call(&ctx, cancel.clone())?;
         let args = request.arguments.unwrap_or_default();
         let work = self.server.call(&request.name, args, call);
         tokio::pin!(work);
-        // `notifications/cancelled` cancels the request's token: stop the engine at its
-        // next check. rmcp sends no response for a cancelled request.
+        // `notifications/cancelled` (stdio, legacy sessions) and a closed connection
+        // (stateless HTTP) cancel the request's token: stop the engine at its next
+        // check. rmcp sends no response for a cancelled request.
         let outcome = tokio::select! {
             r = &mut work => r,
             () = ctx.ct.cancelled() => {

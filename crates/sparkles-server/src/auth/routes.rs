@@ -72,6 +72,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
     ("/$/format", &["POST"]),
+    // MCP (`serve --mcp`): every message is checked against the caller's datasets
+    ("/$/mcp", &["*"]),
     // backup repositories (feature `backup`)
     ("/$/repositories", &["GET", "POST"]),
     ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
@@ -168,6 +170,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/server" | "/$/tasks" | "/$/tasks/{id}" => Caller,
         // reads no dataset; `--format-endpoint authenticated|off` is the handler's
         "/$/format" => Caller,
+        // each tool call reads or writes the datasets its caller may (`mcp::http`)
+        "/$/mcp" => Caller,
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
@@ -546,18 +550,7 @@ pub fn dataset_denial(
         return None;
     }
     if p.is_anonymous() {
-        #[cfg(feature = "auth")]
-        let (realm, basic) = match &st.auth {
-            Some(a) => {
-                let policy = a.policy();
-                (policy.realm.clone(), policy.has_users())
-            }
-            None => ("sparkles".to_string(), false),
-        };
-        #[cfg(not(feature = "auth"))]
-        let (realm, basic) = ("sparkles".to_string(), false);
-        let r = unauthorized(&realm, headers, "authentication required", None, basic);
-        return Some(with_report(r, report_of(p, Some(Denied::Unauthenticated))));
+        return Some(authentication_required(st, p, headers));
     }
     if have.is_none() || st.get(ds).is_none() {
         let r = json_error(StatusCode::NOT_FOUND, &format!("no such dataset: /{ds}"));
@@ -567,6 +560,26 @@ pub fn dataset_denial(
         p,
         &format!("{} access to /{ds} required", lvl.as_str()),
     ))
+}
+
+/// The `401` with the server's challenges, for an anonymous caller that must sign in
+/// (the MCP endpoint, when anonymous callers can read no dataset).
+pub fn authentication_required(st: &AppState, p: &Principal, headers: &HeaderMap) -> Response {
+    #[cfg(feature = "auth")]
+    let (realm, basic) = match &st.auth {
+        Some(a) => {
+            let policy = a.policy();
+            (policy.realm.clone(), policy.has_users())
+        }
+        None => ("sparkles".to_string(), false),
+    };
+    #[cfg(not(feature = "auth"))]
+    let (realm, basic) = {
+        let _ = st;
+        ("sparkles".to_string(), false)
+    };
+    let r = unauthorized(&realm, headers, "authentication required", None, basic);
+    with_report(r, report_of(p, Some(Denied::Unauthenticated)))
 }
 
 /// The `{ds}` segment of the request path.

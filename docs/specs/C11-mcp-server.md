@@ -4,9 +4,10 @@
 >
 > **Phases:** Phase 1 shipped: `sparkles mcp` over stdio with six read-only tools,
 > snapshot pins and cancellation. Phase 2's `search_text` and `similar_entities` shipped
-> with it, and `validate_shacl`, `validate_shex` and `format` were added later. Phase
-> 2's HTTP transport (`/$/mcp`), `sparql_update`, resources and prompts were not built,
-> and neither was Phase 3.
+> with it, and `validate_shacl`, `validate_shex` and `format` were added later. The rest
+> of Phase 2 shipped on 2026-10-02: the HTTP transport (`/$/mcp`), `sparql_update`,
+> resources and prompts. The auth integration of §4.9 shipped with it. The other Phase 3
+> items were not built.
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
@@ -1485,12 +1486,56 @@ feature, which is on by default.
 Tests drive the server with JSON-RPC lines over an in-memory stream. An end-to-end test
 runs a session against the built binary.
 
-**Deviations.** The CLI has no `--allow-update` or `--allow-load`, because there is no
-write tool. It gained `--schema-max-entries` and `--text`. The defaults are those of §2.1:
-100 rows / 64 KiB per call, and at most 1000 rows / 1 MiB.
+**Deviations of Phase 1.** The CLI gained `--schema-max-entries` and `--text`. The
+defaults are those of §2.1: 100 rows / 64 KiB per call, and at most 1000 rows / 1 MiB.
 
-**Not built.** The rest of Phase 2 was not built: the Streamable HTTP endpoint `/$/mcp`
-with its `--mcp*` flags, `sparql_update`, resources and prompts. Phase 3 was not built
-either. Authentication arrived separately with [C09](C09-dataset-access-control.md).
-Because there is no HTTP transport, the auth integration of §4.9 has not been needed. MCP
-has no measurements in [BENCHMARKS](../BENCHMARKS.md).
+**Phase 2 shipped on 2026-10-02**, together with the auth integration of §4.9.
+
+- `sparkles serve --mcp` mounts rmcp's Streamable HTTP service at `/$/mcp`, behind the
+  server's own layers. The access log and the request metrics count its messages as
+  `operation=mcp`. The flags of §2.1 are there except `--mcp-allowed-origin`.
+  `--mcp-disable-tool`, `--mcp-dataset` and `--mcp-max-sessions` were added.
+- Every message runs as the HTTP request's principal from [C09](C09-dataset-access-control.md).
+  The tools, resources and prompts see only the datasets it may read, and a hidden dataset
+  is `unknown-dataset`. `sparql_update` needs `write` on its dataset, and `tools/list`
+  leaves it out for a caller that can write nowhere. With auth, `server/discover` and
+  `tools/list` use `cacheScope: "private"`. An anonymous caller that can read no dataset
+  gets `401` with the server's challenges.
+- Tool calls are charged to the `query` rate limit of their dataset, and `sparql_update`
+  to the `update` limit, with the same client key as the SPARQL endpoints. The concurrency
+  permits are held until the tool's work ends. A call's memory budget is the smaller of
+  `--mcp-query-memory-mb` and `--query-memory-mb`, and its largest timeout is the server's
+  `--timeout`.
+- `sparql_update` runs with write-time validation. It takes a `message` for the commit,
+  and an HTTP request's `Sparkles-Commit-Message` supplies one when the call has none. The
+  receipt adds `message` and the validation summary. `LOAD` is always refused.
+  `sparkles mcp --allow-update` offers the tool over stdio.
+- Resources and prompts follow §3.10 and §3.11, on both transports. The capabilities
+  are `{"tools": {}, "resources": {}, "prompts": {}}`.
+
+**Deviations of Phase 2.** Five choices differ from the design, and the maintainer may
+revisit them.
+
+1. Legacy clients get sessions, because some hosts of the `initialize` era expect them.
+   A session is bound to the principal that opened it, and another caller's use of its
+   id is `404`. `--mcp-max-sessions` caps them at 256, and `0` gives the stateless
+   legacy mode of §5.1. Requests in a session are answered with a short SSE stream, and
+   modern requests with JSON.
+2. There is no `--mcp-allowed-origin`. The endpoint passes the same Origin and Host checks
+   as every route, so `--cors-origin` and `cors.origins` admit browser origins, and a
+   foreign `Origin` is `403`. rmcp's own Host check is off, because it accepts only
+   localhost names.
+3. OAuth protected-resource metadata, audience validation and scope challenges were not
+   built. The server accepts only its own API tokens, which its OIDC provider does not
+   issue, so metadata would send clients to an authorization server whose tokens are
+   refused. Clients send an API token as a bearer header, and the token's dataset grants
+   act as its scopes.
+4. A body that is not JSON gets `400` with `-32700` from the endpoint, ahead of rmcp's
+   `415`.
+5. There is no `--allow-load`, and the `sparkles_mcp_tool_*` metrics and the access log's
+   `mcp_tool` field were not built.
+
+**Not built.** The Phase 3 items other than auth were not built: `atCommit` over
+retained commits, `dryRun` and `ifHead` for `sparql_update`, `subscriptions/listen`, the
+tasks extension, completions and the stdio-to-HTTP bridge. MCP has no measurements in
+[BENCHMARKS](../BENCHMARKS.md).

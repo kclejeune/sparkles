@@ -182,7 +182,10 @@ async fn a01_discover() {
         res["supportedVersions"],
         json!(["2026-07-28", "2025-11-25", "2025-06-18"])
     );
-    assert_eq!(res["capabilities"], json!({"tools": {}}));
+    assert_eq!(
+        res["capabilities"],
+        json!({"tools": {}, "resources": {}, "prompts": {}})
+    );
     assert!(
         res["instructions"]
             .as_str()
@@ -211,7 +214,10 @@ async fn a02_legacy_handshake() {
         .await;
     let res = &r["result"];
     assert_eq!(res["protocolVersion"], "2025-11-25");
-    assert_eq!(res["capabilities"], json!({"tools": {}}));
+    assert_eq!(
+        res["capabilities"],
+        json!({"tools": {}, "resources": {}, "prompts": {}})
+    );
     assert_eq!(
         res["serverInfo"],
         json!({"name": "sparkles", "version": env!("CARGO_PKG_VERSION")})
@@ -1427,4 +1433,51 @@ async fn stray_first_messages() {
     c.w.write_all(b"this is not json\n").await.unwrap();
     let r = c.request(4, "tools/list", json!({"_meta": m()})).await;
     assert!(r["result"]["tools"].is_array());
+}
+
+/// `sparkles mcp --allow-update`: the write tool over stdio, as the local principal.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_over_stdio() {
+    let cfg = McpConfig {
+        allow_update: true,
+        ..McpConfig::default()
+    };
+    // on a read-only server the flag offers nothing
+    let mut c = Client::start(server_with(&[("t", &[FIXTURE])], cfg.clone()));
+    let r = c.request(1, "tools/list", json!({"_meta": m()})).await;
+    let names: Vec<&str> = r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.contains(&"sparql_update"), "{names:?}");
+    // writable
+    let mut st = AppState::standalone(StoreOptions::default(), cfg.max_timeout);
+    st.read_only = false;
+    let st = Arc::new(st);
+    let ds = st.attach("t", DbType::Mem, None).unwrap();
+    load(&ds, FIXTURE);
+    let server = McpServer::new(st, cfg);
+    let mut c = Client::start(server.clone());
+    let out = c
+        .structured(
+            "sparql_update",
+            json!({"update": "INSERT DATA { ex:carol a ex:Person }", "message": "carol"}),
+        )
+        .await;
+    assert_eq!(out["commit"], 2);
+    assert_eq!(out["inserted"], 1);
+    assert_eq!(out["message"], "carol");
+    assert_eq!(head(&server, "t"), 2);
+    let (_, e) = c
+        .error(
+            "sparql_update",
+            json!({"update": "LOAD <file:///etc/passwd>"}),
+        )
+        .await;
+    assert_eq!(e, json!({"code": "load-disabled", "status": 403}));
+    let ds = c.structured("list_datasets", json!({})).await;
+    assert_eq!(ds["datasets"][0]["writable"], true);
+    assert_eq!(ds["limits"]["updates"], true);
 }

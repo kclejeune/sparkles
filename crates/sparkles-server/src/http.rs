@@ -53,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static("ratelimit"),
         header::HeaderName::from_static("ratelimit-policy"),
         header::HeaderName::from_static("traceresponse"),
+        header::HeaderName::from_static("mcp-session-id"),
     ];
     #[cfg(feature = "fmt")]
     exposed.push(header::HeaderName::from_static(
@@ -152,6 +153,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the formatter, with its own body limit
     #[cfg(feature = "fmt")]
     let app = app.merge(format::routes(&state));
+    // the MCP endpoint (`serve --mcp`)
+    #[cfg(feature = "mcp")]
+    let app = match crate::mcp::http::route(&state) {
+        Some(r) => app.route("/$/mcp", r),
+        None => app,
+    };
     let app = app
         // a dataset being replaced in place answers 503 (inside the auth layer, so a
         // hidden dataset stays a 404)
@@ -1301,6 +1308,17 @@ fn with_commit(mut r: Response, ds: &Dataset, seq: u64) -> Response {
 
 /// The client asked for a commit receipt: `receipt=true`, or an `Accept` that names the
 /// Sparkles media type (`*/*` does not count).
+/// The `Sparkles-Commit-Message` of a request, or why it is invalid (MCP writes).
+#[cfg(feature = "mcp")]
+pub(crate) fn commit_message_header(h: &HeaderMap) -> Result<Option<Arc<str>>, String> {
+    conditional::commit_message(h).map_err(|e| {
+        e.1["error"]
+            .as_str()
+            .unwrap_or("invalid Sparkles-Commit-Message")
+            .to_string()
+    })
+}
+
 fn receipt_wanted(params: &Params, headers: &HeaderMap) -> bool {
     params.get("receipt").is_some_and(truthy) || params_wants_sparkles(headers)
 }

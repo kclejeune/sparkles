@@ -116,7 +116,8 @@ pub fn classify(
     let read = matches!(*method, Method::GET | Method::HEAD);
     let r = route?;
     if let Some(admin) = r.strip_prefix("/$/") {
-        if admin == "ping" || admin == "metrics" || admin.starts_with("ready") {
+        // MCP charges each message by its tool and dataset (`mcp::http`)
+        if admin == "ping" || admin == "metrics" || admin.starts_with("ready") || admin == "mcp" {
             return None;
         }
         // reads that run queries over a dataset, and formatting (cheap, read-like work)
@@ -1817,10 +1818,27 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
     let Some(class) = classify(route, req.method(), req.uri(), req.headers()) else {
         return next.run(req).await;
     };
-    let inner = rl.inner.load_full();
     let dataset = dataset_of(route, req.uri());
+    limit_as(&rl, class, dataset, req, |req| next.run(req)).await
+}
+
+/// [`limit`] for a request whose class and dataset its route does not tell (an MCP
+/// message names them in its body): charge `class` on `dataset`, then `run` the request
+/// inside the permits (see [`hold`]).
+pub async fn limit_as<F, Fut>(
+    rl: &RateLimiter,
+    class: Class,
+    dataset: Option<String>,
+    req: Request,
+    run: F,
+) -> Response
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: std::future::Future<Output = Response>,
+{
+    let inner = rl.inner.load_full();
     let Some(pi) = inner.policy(class, dataset.as_deref()) else {
-        return next.run(req).await;
+        return run(req).await;
     };
     let p = &inner.policies[pi as usize];
     let slot = p.needs_slot().then(|| {
@@ -1866,9 +1884,9 @@ pub async fn limit(State(rl): State<Arc<RateLimiter>>, req: Request, next: Next)
     let held = permits.server.is_some() || permits.client.is_some();
     let permits = Arc::new(permits);
     let mut resp = if held {
-        HELD.scope(permits.clone(), next.run(req)).await
+        HELD.scope(permits.clone(), run(req)).await
     } else {
-        next.run(req).await
+        run(req).await
     };
     if let Some(a) = admitted {
         let (mut remaining, mut reset) = (a.remaining, a.reset_secs);
