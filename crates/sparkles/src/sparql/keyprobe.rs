@@ -23,11 +23,14 @@
 //! small input's values are a subset the sets know nothing of, and the probes come
 //! first. Other joins keep the estimate from distinct values.
 //!
-//! A count reads at most two blocks of the pattern. A probe of a value whose blocks are
-//! not in the block cache counts against a budget per pattern, so that planning decodes
-//! few blocks, and a pattern of which too few values could be probed is not used.
-//! Measurements are kept with the snapshot, so later queries at the same commit reuse
-//! them.
+//! The values are counted in order, so each block of a pattern is read at most once, and
+//! blocks wholly inside one value's range are counted from their metadata. The blocks to
+//! read that the block cache does not hold count against a budget of [`DECODES`] per
+//! group, so that planning decodes few blocks; a pattern that would exceed it is not
+//! probed. A small pattern whose blocks the cache does not hold is not read for its
+//! values at all: the query that plans with the other estimates reads them, and later
+//! queries probe. Measurements are kept with the snapshot, so later queries at the same
+//! commit reuse them.
 
 use super::ctx::Ctx;
 use super::plan::{Kind, Node, ScanSpec};
@@ -35,16 +38,15 @@ use super::table::{Table, VarId};
 use crate::error::Result;
 use crate::id::Id;
 use crate::index::{Key, Perm, bound_cols, pad};
-use crate::store::Chunk;
+use crate::store::{Chunk, Delta, Snapshot};
 use std::hash::{Hash, Hasher};
 
 /// A triple pattern of at most this many rows is a small input.
 const SOURCE_ROWS: f64 = 1024.0;
 /// Rows of the small input whose values are probed at most.
-const KEYS: usize = 64;
-/// Values probed per pattern at least, for the pattern to be used.
-const MIN_KEYS: usize = 8;
-/// Blocks outside the block cache a pattern's probes may decode.
+const KEYS: usize = 32;
+/// Blocks outside the block cache that the probes of a group may decode, at about 50 to
+/// 200 µs each.
 const DECODES: usize = 2;
 
 /// What probing a pattern for the values of a small input measured.
@@ -128,11 +130,12 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>]) {
         .filter(|c| c.len() > 1)
         .map(|c| c[0])
         .collect();
+    let mut budget = DECODES;
     for v in shared {
         if ctx.probes.lock().contains_key(&v) {
             continue;
         }
-        match probe_var(ctx, leaves, v) {
+        match probe_var(ctx, leaves, v, &mut budget) {
             Ok(Some(p)) => {
                 ctx.probes.lock().insert(v, p);
             }
@@ -166,6 +169,13 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
                 mask |= 1 << a | 1 << b;
             }
             mask |= 1 << spec.graph_col;
+            // a pattern whose blocks are not cached yet is left to a later query, after
+            // this one has read them
+            let base = ctx.snap.perm(spec.perm);
+            let (b0, b1) = base.key_block_range(&lo, &hi);
+            if (b0..b1).any(|b| !ctx.snap.cache.has_cols(base, b, mask)) {
+                return Ok(None);
+            }
             let limit = 4 * SOURCE_ROWS as usize;
             let mut out = Vec::new();
             let keep = |k: &Key| {
@@ -200,7 +210,12 @@ fn source_values(ctx: &Ctx, src: &Node, v: VarId) -> Result<Option<Vec<Id>>> {
     Ok(Some(vals))
 }
 
-fn probe_var(ctx: &Ctx, leaves: &[Vec<Node>], v: VarId) -> Result<Option<VarProbe>> {
+fn probe_var(
+    ctx: &Ctx,
+    leaves: &[Vec<Node>],
+    v: VarId,
+    budget: &mut usize,
+) -> Result<Option<VarProbe>> {
     // the small input: the VALUES table or the pattern of fewest rows that always binds v
     let small = leaves
         .iter()
@@ -257,7 +272,7 @@ fn probe_var(ctx: &Ctx, leaves: &[Vec<Node>], v: VarId) -> Result<Option<VarProb
         }) else {
             continue;
         };
-        if let Some(m) = measure(ctx, spec, &keys)? {
+        if let Some(m) = measure(ctx, spec, &keys, budget)? {
             let sigs = opts
                 .iter()
                 .filter_map(|o| match &o.kind {
@@ -287,9 +302,9 @@ fn probe_var(ctx: &Ctx, leaves: &[Vec<Node>], v: VarId) -> Result<Option<VarProb
     }))
 }
 
-/// Count the rows of the pattern `spec` (sorted on `v`) for each of `keys`, within the
-/// budget of blocks to decode.
-fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id]) -> Result<Option<Measure>> {
+/// Count the rows of the pattern `spec` (sorted on the probed variable) for each of
+/// `keys`, within the `budget` of blocks to decode.
+fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id], budget: &mut usize) -> Result<Option<Measure>> {
     // the pattern's range and the values probed decide the measure
     let mut h = rustc_hash::FxHasher::default();
     keys.hash(&mut h);
@@ -304,44 +319,75 @@ fn measure(ctx: &Ctx, spec: &ScanSpec, keys: &[Id]) -> Result<Option<Measure>> {
     if let Some(m) = ctx.snap.counts.probed(&key) {
         return Ok(m);
     }
-    let base = ctx.snap.perm(spec.perm);
-    let mut prefix = spec.prefix.clone();
-    prefix.push(0);
-    let mut budget = DECODES;
-    let (mut n, mut sum, mut hit) = (0usize, 0u64, 0usize);
-    for &k in keys {
-        *prefix.last_mut().unwrap() = k.0;
-        let (lo, hi) = (pad(&prefix, 0), pad(&prefix, u64::MAX));
-        let (b0, b1) = base.key_block_range(&lo, &hi);
-        let mask = bound_cols(&lo, &hi);
-        // blocks wholly inside the range are counted from their metadata
-        let cold = (b0..b1)
-            .filter(|&b| {
-                let m = &base.blocks[b];
-                !(m.first >= lo && m.last <= hi) && !ctx.snap.cache.has_cols(base, b, mask)
-            })
-            .count();
-        if cold > budget {
-            continue;
-        }
-        budget -= cold;
-        let c = ctx.snap.count(spec.perm, &prefix)?;
-        n += 1;
-        sum += c;
-        hit += usize::from(c > 0);
-    }
-    if n < MIN_KEYS.min(keys.len()) {
+    let Some(counts) = count_keys(&ctx.snap, spec, keys, budget)? else {
         // too many blocks to decode now; they may be cached for a later query
         return Ok(None);
-    }
+    };
+    let n = counts.len() as f64;
     let m = Some(Measure {
-        m: sum as f64 / n as f64,
-        f: hit as f64 / n as f64,
+        m: counts.iter().sum::<u64>() as f64 / n,
+        f: counts.iter().filter(|&&c| c > 0).count() as f64 / n,
         rows: 0.0,
         d: 0.0,
     });
     ctx.snap.counts.set_probed(key, m);
     Ok(m)
+}
+
+/// The rows of the pattern `spec` (sorted on the probed variable) for each of the sorted
+/// `keys`, reading each block of the pattern at most once and counting the blocks wholly
+/// inside a key's range from their metadata. `None` when the blocks to read that the
+/// cache does not hold are more than `budget`, which the ones read are taken from.
+fn count_keys(
+    snap: &Snapshot,
+    spec: &ScanSpec,
+    keys: &[Id],
+    budget: &mut usize,
+) -> Result<Option<Vec<u64>>> {
+    let base = snap.perm(spec.perm);
+    let pi = spec.perm.index();
+    let mut prefix = spec.prefix.clone();
+    prefix.push(0);
+    let delta = Delta::range(&snap.delta.ins[pi], &spec.prefix)
+        .next()
+        .is_some()
+        || Delta::range(&snap.delta.del[pi], &spec.prefix)
+            .next()
+            .is_some();
+    let mut cur: Option<(usize, crate::index::Block)> = None;
+    let mut out = Vec::with_capacity(keys.len());
+    for &k in keys {
+        *prefix.last_mut().unwrap() = k.0;
+        let (lo, hi) = (pad(&prefix, 0), pad(&prefix, u64::MAX));
+        let (b0, b1) = base.key_block_range(&lo, &hi);
+        let mask = bound_cols(&lo, &hi);
+        let mut c = 0u64;
+        for b in b0..b1 {
+            let m = &base.blocks[b];
+            if m.first >= lo && m.last <= hi {
+                c += m.rows as u64;
+                continue;
+            }
+            if cur.as_ref().is_none_or(|x| x.0 != b) {
+                if !snap.cache.has_cols(base, b, mask) {
+                    if *budget == 0 {
+                        return Ok(None);
+                    }
+                    *budget -= 1;
+                }
+                cur = Some((b, snap.cache.get_cols(base, b, mask)?));
+            }
+            let blk = &cur.as_ref().unwrap().1;
+            let (s, e) = blk.key_range(&lo, &hi);
+            c += (e - s) as u64;
+        }
+        if delta {
+            // the updates since the base was built, counted exactly
+            c = snap.count(spec.perm, &prefix)?;
+        }
+        out.push(c);
+    }
+    Ok(Some(out))
 }
 
 /// How plan `n` holds the leaves on `v`, the variable of `p`.

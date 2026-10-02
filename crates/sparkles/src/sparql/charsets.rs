@@ -36,6 +36,7 @@
 use super::ctx::Ctx;
 use super::plan::{Kind, Node, ScanSpec};
 use super::table::VarId;
+use crate::builder::Stats;
 use crate::index::{O, P, S};
 use crate::store::Generation;
 use parking_lot::Mutex;
@@ -58,11 +59,9 @@ pub struct CharIndex {
     rdf_type: Option<u64>,
     /// the subjects of each set kept
     subjects: Vec<f64>,
-    /// predicate → the sets holding it, by index into the statistics' list, with its
-    /// triples in each
-    by_pred: FxHashMap<u64, Vec<(u32, f64)>>,
-    /// predicate → its triples over the sets kept
-    covered: FxHashMap<u64, u64>,
+    /// item → the sets holding it, by index into the statistics' list, with its triples
+    /// in each; found on first use
+    postings: Mutex<FxHashMap<u64, Arc<[(u32, f64)]>>>,
     /// the sets summed by the predicates of a list registered for a variable, kept for
     /// later queries
     groups: Mutex<FxHashMap<Vec<u64>, Arc<[Group]>>>,
@@ -79,42 +78,90 @@ impl CharIndex {
             .find(&crate::id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
             .ok()
             .map(|i| crate::id::Id::vocab(i).0);
-        let mut by_pred: FxHashMap<u64, Vec<(u32, f64)>> = FxHashMap::default();
-        let mut covered: FxHashMap<u64, u64> = FxHashMap::default();
-        for (i, c) in stats.charsets.iter().enumerate() {
-            for (&p, &t) in c.preds.iter().zip(&c.triples) {
-                by_pred.entry(p).or_default().push((i as u32, t as f64));
-                *covered.entry(p).or_default() += t;
-            }
-        }
         CharIndex {
             rdf_type,
             subjects: stats.charsets.iter().map(|c| c.subjects as f64).collect(),
-            by_pred,
-            covered,
+            postings: Default::default(),
             groups: Default::default(),
         }
     }
 
-    /// Drop the sums kept for later queries (to time planning without them).
+    /// Find the sets holding each of `items` not found before, in one pass over the sets.
+    fn find(&self, stats: &Stats, items: &[u64]) {
+        let mut new: Vec<u64> = {
+            let kept = self.postings.lock();
+            items
+                .iter()
+                .copied()
+                .filter(|p| !kept.contains_key(p))
+                .collect()
+        };
+        new.sort_unstable();
+        new.dedup();
+        if new.is_empty() {
+            return;
+        }
+        let mut lists: Vec<Vec<(u32, f64)>> = vec![Vec::new(); new.len()];
+        for (i, c) in stats.charsets.iter().enumerate() {
+            // both sorted: walk them together
+            let (mut a, mut b) = (0, 0);
+            while a < c.preds.len() && b < new.len() {
+                match c.preds[a].cmp(&new[b]) {
+                    std::cmp::Ordering::Less => a += 1,
+                    std::cmp::Ordering::Greater => b += 1,
+                    std::cmp::Ordering::Equal => {
+                        lists[b].push((i as u32, c.triples[a] as f64));
+                        a += 1;
+                        b += 1;
+                    }
+                }
+            }
+        }
+        let mut kept = self.postings.lock();
+        if kept.len() + new.len() > Self::KEPT {
+            kept.clear();
+        }
+        for (p, l) in new.into_iter().zip(lists) {
+            kept.insert(p, l.into());
+        }
+    }
+
+    /// The sets holding item `p`, with its triples in each.
+    fn postings(&self, stats: &Stats, p: u64) -> Arc<[(u32, f64)]> {
+        if let Some(x) = self.postings.lock().get(&p) {
+            return x.clone();
+        }
+        self.find(stats, &[p]);
+        self.postings
+            .lock()
+            .get(&p)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(Vec::new()))
+    }
+
+    /// Drop the postings and sums kept for later queries (to time planning without them).
     #[cfg(test)]
     pub(super) fn forget(&self) {
         self.groups.lock().clear();
+        self.postings.lock().clear();
     }
 
     /// The sets summed by which of the predicates `preds` they hold, of those whose bit
     /// is in `usable`.
-    fn groups(&self, preds: &[u64], usable: u64) -> Arc<[Group]> {
+    fn groups(&self, stats: &Stats, preds: &[u64], usable: u64) -> Arc<[Group]> {
         if let Some(g) = self.groups.lock().get(preds) {
             return g.clone();
         }
-        let none: &[(u32, f64)] = &[];
-        let posting = |i: usize| -> &[(u32, f64)] {
-            if usable & (1 << i) == 0 {
-                return none;
-            }
-            self.by_pred.get(&preds[i]).map_or(none, |v| &v[..])
-        };
+        let lists: Vec<Arc<[(u32, f64)]>> = (0..preds.len())
+            .map(|i| {
+                if usable & (1 << i) == 0 {
+                    Arc::from(Vec::new())
+                } else {
+                    self.postings(stats, preds[i])
+                }
+            })
+            .collect();
+        let posting = |i: usize| -> &[(u32, f64)] { &lists[i] };
         let mut mask = vec![0u64; self.subjects.len()];
         let mut touched: Vec<u32> = Vec::new();
         for i in 0..preds.len() {
@@ -226,6 +273,11 @@ pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64, Option<u64>)]) {
     let idx = generation
         .charsets
         .get_or_init(|| CharIndex::new(generation));
+    let items: Vec<u64> = stars
+        .iter()
+        .filter_map(|&(_, p, o)| item(p, o, idx.rdf_type))
+        .collect();
+    idx.find(stats, &items);
     let mut reg = ctx.stars.lock();
     let mut changed: Vec<VarId> = Vec::new();
     for &(v, p, o) in stars {
@@ -242,8 +294,8 @@ pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64, Option<u64>)]) {
             Some(c) => stats.classes.iter().find(|x| x.0 == c).map_or(0, |x| x.1),
             None => stats.predicate(p).map_or(0, |s| s.count),
         };
-        let covered = idx.covered.get(&p).copied().unwrap_or(0);
-        if count > 0 && covered as f64 >= COVERAGE * count as f64 {
+        let covered: f64 = idx.postings(stats, p).iter().map(|x| x.1).sum();
+        if count > 0 && covered >= COVERAGE * count as f64 {
             sv.usable |= 1 << bit;
         }
         if !changed.contains(&v) {
@@ -252,7 +304,7 @@ pub(super) fn register(ctx: &Ctx, stars: &[(VarId, u64, Option<u64>)]) {
     }
     for v in changed {
         if let Some(sv) = reg.get_mut(&v) {
-            sv.groups = Some(idx.groups(&sv.preds, sv.usable));
+            sv.groups = Some(idx.groups(stats, &sv.preds, sv.usable));
             sv.memo.clear();
         }
     }

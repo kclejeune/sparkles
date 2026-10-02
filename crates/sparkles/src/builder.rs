@@ -106,7 +106,7 @@ pub const MAX_CHARSETS: usize = 10_000;
 /// The item standing for class `class` (a base vocabulary id) in a characteristic set: its
 /// payload under a tag no term has, so that it sorts after every predicate.
 pub fn class_item(class: u64) -> Option<u64> {
-    (Id(class).tag() == Tag::Vocab).then(|| 0xF << id::PAYLOAD_BITS | (class & id::PAYLOAD_MASK))
+    (Id(class).tag() == Tag::Vocab).then_some(0xF << id::PAYLOAD_BITS | (class & id::PAYLOAD_MASK))
 }
 
 /// The class a characteristic set item stands for, if it is one.
