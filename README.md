@@ -53,6 +53,9 @@ running queries.
   long polling and server-sent events ([API](docs/API.md#change-feed)).
 * Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
   writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
+* Dry runs of updates, Graph Store writes and uploads. A dry run reports the commit, the
+  changes per graph, the validation result and the quota effect, and writes nothing
+  ([API](docs/API.md#write-previews)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
 * Parallel bulk loading with external sort.
 * N-Quads dumps, and incremental, deduplicated backups of persistent and in-memory

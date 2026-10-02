@@ -1,6 +1,10 @@
 # C15: Write previews (dry runs)
 
-> **Status:** designed, not built.
+> **Status:** implemented.
+>
+> **Phases:** One phase shipped on 2026-10-02. It added dry runs of updates, Graph Store
+> writes, uploads and the MCP update tool, and made Graph Store `PUT` log only the
+> difference.
 >
 > **User docs:** [API: Write previews](../API.md#write-previews) ·
 > [Usage: Previewing a write](../USAGE.md#previewing-a-write) ·
@@ -617,3 +621,99 @@ writes one WAL insert record, and its receipt says `inserted: 1, deleted: 0`.
   RFC 4918, RFC 6648, RFC 7240, Apache Jena's RDF Patch documentation, RDF4J's SHACL
   validation at `prepare()`.
 * **Not consulted**: Fluree in any form, including its code, docs, tests, site and talks.
+
+## Outcome
+
+**Delivered on 2026-10-02** in three commits after the spec. `49472ed` changed the
+engine and the two guards. `b544fbb` changed the server and the MCP tool. `cd29e75` made
+Graph Store `PUT` log only the difference, as §6 decided. A fourth commit updated the
+documentation.
+
+* **Engine.** `sparkles::preview` holds `DryRun`, `Preview`, `GraphChange`,
+  `StorageCheck`, `Outcome` and `catch`. `WriteOptions::dry_run` turns a write into a
+  dry run, which ends with `Error::DryRun`. On the WAL path the preview is assembled in
+  `WriteTxn::commit` where `publish_log` would run. The storage checks and the commit's
+  arithmetic moved into `check_storage` and `next_commit`, which the commit and the
+  preview share. On the bulk path `rebuild_locked` takes the dry-run branch after the
+  guard has run on the candidate generation, then deletes the generation and drops the
+  quota's cached measurement. `WriteTxn::preview` previews a transaction directly.
+* **Rollback.** `DeltaVocab::mark` and `rollback` remove the terms a dry run interned.
+  The vocabulary file keeps its logical length. A rollback takes the write buffer's bytes
+  out with `BufWriter::into_parts`, which does not flush them, and keeps those before the
+  mark. When the buffer had already spilled past the mark, the file is truncated back to
+  it. `WriteTxn` records the mark and the blank-node counter when it begins, and its new
+  `Drop` restores both for a dry run, however the transaction ended.
+* **Guards.** The SHACL and ShEx guards check `opts.dry_run` and then record no counters,
+  no history entry, no pending state, no last full time, and, for ShEx, no association
+  count or warnings. The store calls neither the guard observer nor `bypassed` for a dry
+  run.
+* **Server.** `http/dry_run.rs` parses the flags in `validation::write_options`, which
+  every write already calls, and renders the preview. The update, Graph Store and upload
+  handlers match `Error::DryRun` before they map errors. CORS exposes `Sparkles-Dry-Run`
+  and `Sparkles-Dry-Run-Outcome` and allows the request header.
+* **MCP.** `sparql_update` takes `dryRun` and `changes`, and its output schema lists the
+  preview's members.
+
+**Deviations from the design.**
+
+- `Preview` has a `kind` member, and `changes_total` is `None` when no listing was asked
+  for, because counting the changes of a bulk write needs the state comparison. The
+  design's `refusal()` became `error()`, `rejected()`, `rejection()` and
+  `receipt_commit()`, which are what the server needed. The library preview's commit
+  carries the timestamp it would get at the moment of the dry run. The HTTP preview
+  leaves it out.
+- The status of a dry run follows the real order of the checks as designed, and on the
+  bulk path the storage check comes before the guard. The preview evaluates the guard
+  even when the storage check failed, so both are reported.
+- MCP's `changes` without `dryRun` is a `bad-argument` error. The design did not say.
+  The MCP result also has `prefixes`, for the rendered terms, and `message`.
+- The access log records a dry run's `Sparkles-Validation` status, and a dry run that
+  validation would reject counts as a `rejected` request in `sparkles_requests_total`.
+  The `sparkles_validation_*` series count no dry run, since they come from the guard
+  observer.
+- A dry run's `RequestReport` counts the changed quads as its rows, as a write does.
+
+**Tests at landing.**
+
+- `crates/sparkles/tests/dry_run.rs` previews 600 random updates on in-memory and
+  persistent stores, before and after a compaction, then makes each one. The update
+  mixes `INSERT DATA`, `DELETE DATA`, `DELETE … INSERT … WHERE`, `DELETE WHERE`,
+  `CLEAR`, copies between graphs, new terms and blank nodes. For each, the head, the
+  published snapshot and the data are unchanged after the preview, the preview's commit
+  equals the receipt apart from the time, the per-graph counts add up to the receipt's,
+  and the listed changes equal the difference of the states before and after. 400 more
+  run under a test guard in reject and warn mode, where the rejections must match too.
+  The file also checks that 200 dry runs, one that spills the vocabulary file's buffer,
+  and two bulk dry runs leave every file of the database byte for byte as it was, that a
+  reopen and `sparkles check` find the database sound, that terms and blank-node ids are
+  rolled back, the reporting of preconditions, rejections, bypasses and quotas, bulk
+  previews of loads, replaces and a transaction with a bulk batch against their receipts,
+  the bound on full listings, the full-text index, and the `PUT` change of §6.
+- `crates/sparkles-shacl/tests/dry_run.rs` and a unit test of the ShEx guard run the
+  same writes on two stores, one of which previews every write and the next one first.
+  In strict `reject`, `warn` and grandfather `reject` mode, the summaries of the two
+  stores and the previews agree at every step, and the guard's status, counters and
+  history are unchanged by the previews. The writes include writes the guard skips right
+  after previews, which would have applied a preview's pending state. Making the guards
+  record dry runs fails both tests.
+- `http/dry_run_tests.rs` previews 60 random updates and every Graph Store method and
+  uploads, on the WAL path and the bulk path, and compares each with the receipt of the
+  write made right after it, and the dataset directory with its state before. It also
+  covers the preview document, the form, header and empty-value flags, the refusal of
+  misspelt flags, RDF Patch in both forms, `412`, `422` with the guard's status
+  unchanged, `507`, read-only servers and the change feed. `router_tests::auth::graphs`
+  covers a reader, a write outside the caller's graphs, and the redactions of a limited
+  caller. `router_tests::mcp` covers the tool's dry runs, its argument errors and a
+  rejected dry run. `router_tests::reasoning` checks that a dry run leaves inferences
+  fresh and starts no automatic run.
+- Crate and server tests, Clippy over all targets, `mise run lint:features`, the W3C
+  suites (SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update 157/157, 1.2 269/269) and
+  `mise run ci` pass.
+
+**Cost.** A dry run costs what its write costs, without the WAL fsync. Its listing adds
+a sort of the transaction's log on the WAL path, and a state comparison on the bulk
+path. No separate benchmark was run.
+
+**Not built.** The open questions of §9 keep their defaults: dry runs are refused on
+read-only servers, a bulk dry run builds its generation, only dry runs roll their
+vocabulary back, and the CLI has no `--dry-run`. The UI does not offer previews.

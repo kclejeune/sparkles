@@ -86,6 +86,39 @@ nothing ([API.md](API.md#shutdown)). `/$/metrics` serves Prometheus metrics.
 Every response carries an `X-Request-Id`, and each request is logged once under the
 `sparkles::access` target.
 
+### Previewing a write
+
+Add `dryRun=true` to an update, a Graph Store write or an upload to see what it would do
+without doing it. The write runs against the current data, passes the dataset's
+validation and quota checks, and rolls back. The response gives the commit it would
+create, its counts per graph, the validation result and whether it fits the quota, and
+its status is the one the write would get. `changes=N` lists up to `N` changed quads:
+
+```sh
+curl 'localhost:3030/ds/update?dryRun=true&changes=20' \
+  -H 'Content-Type: application/sparql-update' --data-binary @migration.ru
+```
+
+A preview of a migration answers `422` if the dataset's SHACL or ShEx guard would reject
+it, and `507` if it would go over the storage quota, so a script can stop there. A
+Graph Store write can then be made only if nothing changed since the preview, by sending
+it with `If-Match: W/"<datasetId>:<head>:ttl"`, built from the `datasetId` and `head`
+of the preview. With `Accept: application/rdf-patch`, the preview is the change as an
+RDF Patch. The MCP `sparql_update` tool takes `dryRun: true` too.
+[API.md](API.md#write-previews) describes the response.
+
+Sparkles has no upsert verb. To replace the values of some properties, delete the old
+values and insert the new ones in one update, which commits atomically:
+
+```sparql
+DELETE { GRAPH <urn:g> { ?s ?p ?o } }
+WHERE  { VALUES (?s ?p) { (<urn:a> <urn:title>) (<urn:b> <urn:title>) } GRAPH <urn:g> { ?s ?p ?o } } ;
+INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:title> "A" . <urn:b> <urn:title> "B" } }
+```
+
+To make a graph equal to a file, `PUT` the file to `/ds/data?graph=…`. The commit records
+only the quads that changed.
+
 ### Restricting users to some graphs
 
 With `--auth-config`, a grant can cover only some named graphs of a dataset, or only some
