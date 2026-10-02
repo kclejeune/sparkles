@@ -99,7 +99,10 @@ running queries.
 
 **Validation**
 * SHACL Core and SHACL-SPARQL, with Fuseki's `/{ds}/shacl` endpoint. Both W3C suites
-  pass (98/98 and 20/20) ([API](docs/API.md#shacl-validation)).
+  pass (98/98 and 20/20) ([API](docs/API.md#shacl-validation)). SHACL 1.2's list
+  constraints are checked too.
+* Shapes can be written in the SHACL Compact Syntax (SHACLC) wherever they are accepted,
+  and drafted shapes can be shown in it ([API](docs/API.md#shacl-compact-syntax-shaclc)).
 * ShEx 2.1 with ShExC, ShExJ, ShExR and shape maps. It passes 99.9% of the shexTest
   validation tests ([API](docs/API.md#shex-validation)).
 * Write-time guards validate each commit with SHACL or ShEx before it is written. A

@@ -730,6 +730,22 @@ implementation landed.
     list constraints and tests, read for behaviour. No code was copied.
 
   Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. Fluree was not
+  consulted.
+  - The lexer and parser (`compact/lex.rs`, `compact/read.rs`) are hand-written from the
+    grammar and production rules of the Compact Syntax drafts. Jena's JavaCC grammar and
+    `ShaclCompactParser.java` were read for the extensions and the datatype rule. No
+    code was copied.
+  - The writer (`compact/write.rs`) is written from spec §5. It does not follow Jena's
+    writer, which works from the parsed shapes.
+  - The list constraints follow the SHACL 1.2 Core draft's textual definitions and its
+    definition of a SHACL list. Jena's `List*` constraint classes were read for behaviour.
+  - **Dependencies:** none new. `sparkles-shacl` now uses `oxiri`, already in the
+    workspace.
+  - **Test data:** the eight SHACL 1.2 list tests are vendored in
+    `crates/sparkles-shacl/tests/shacl12/` under the W3C Software and Document License,
+    with a README. The SHACLC test pairs and Jena's syntax tests are read from the Jena
+    checkout, not vendored.
 - **Rejected** (spec §10):
   - writing SHACLC from the parsed shapes model;
   - skipping what cannot be written;

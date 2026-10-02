@@ -929,3 +929,9 @@ draft took 0.45 s (minimum 0.24 s). A closed ShEx draft at support 0.95 took 0.3
 A draft costs about five schema reports, mostly for the per-subject summaries and the
 map of typed subjects.
 
+**SHACLC drafts (2026-10-02, with [G03](G03-shaclc.md)).** The draft is also rendered in
+the SHACL Compact Syntax, with the same counts as comments. The JSON gains a `shaclc`
+field, `format=shaclc` and `Accept: text/shaclc` select it, `sparkles schema
+--draft-shapes --format shaclc` prints it, and the UI's dialog has a SHACLC tab.
+`tests/draft.rs` of `sparkles-shacl` checks that every drafted SHACLC reads to the same
+graph as the drafted Turtle.

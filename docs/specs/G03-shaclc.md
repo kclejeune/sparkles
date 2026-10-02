@@ -1,11 +1,15 @@
 # G03: SHACL Compact Syntax and SHACL 1.2 list constraints
 
-> **Status:** designed, not built
+> **Status:** implemented (Phase 1)
 >
 > **Phases:** Phase 1 is the SHACLC reader and writer in `sparkles-shacl`, SHACLC wherever
-> shapes are read or shown, and the four SHACL 1.2 list constraint components.
+> shapes are read or shown, and the four SHACL 1.2 list constraint components. The later
+> items of §9 are not built.
 >
-> **User docs:** none yet.
+> **User docs:** [API: SHACL Compact Syntax](../API.md#shacl-compact-syntax-shaclc) ·
+> [API: SHACL validation](../API.md#shacl-validation) ·
+> [Usage: drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
+> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -412,4 +416,53 @@ also left for later, unless a generic `shacl parse` command appears first.
 
 ## Outcome
 
-To be written when the feature lands.
+**Delivered.** The spec was written on 2026-10-02, and Phase 1 landed the same day as
+designed in §2–§7. The reader and the writer are in `sparkles_shacl::compact`, with
+`ShapesSyntax` and the conversion helpers in `sparkles_shacl::syntax`. `Shapes::parse` and
+`Shapes::read_graph` take any syntax, so their callers compile unchanged. The list
+components are in the validator, the report has `sh:detail`, and incremental write-time
+validation reads the lists. The only new dependency is `oxiri` for `sparkles-shacl`. It
+was already a workspace dependency.
+
+**Deviations from the spec.**
+* **The Python bindings** gained `Dataset.validate_shacl(..., format="shaclc")`, which §2.1
+  did not list. The MCP tool `draft_shapes` still returns Turtle or ShExC only.
+* **The writer's order of atoms.** A property line is written as its path, the node kind,
+  the type, the count, shape references, parameters, `!` and `|`, and nested bodies last.
+  This follows the Note's examples (`ex:ssn xsd:string [0..1] pattern=…`). §5 did not fix
+  an order.
+* **The UI** offers the syntax as a select next to the Format button rather than as tabs.
+  Switching the syntax does not convert the editor's text. It only swaps the example
+  shapes when they are untouched. The Format button is disabled for SHACLC, because the
+  formatter has no SHACLC.
+* **The test harness** compares results without `sh:detail`, and so does the guard's
+  differential test, because the guard matches results without their details. Unit tests
+  in `tests/components.rs` check the details.
+
+**Chosen during implementation** (open to revision).
+* An unknown `format` of inline shapes in a write-time configuration is now an error.
+  It used to be read as Turtle.
+* `sparkles validation --shapes` takes the syntax from the file name, so a JSON-LD or
+  RDF/XML file is now read in its own syntax too. A compressed file is still not
+  decompressed by that command, as before.
+* A count in SHACLC follows the production rule exactly: `[0..0]` produces
+  `sh:maxCount 0`, which Jena leaves out.
+* Each list constraint walks the list again, without a cache shared between the
+  components of one shape. A list longer than 2²⁴ members counts as ill-formed.
+
+**Conformance at landing.** All 32 test pairs of the Working Group's SHACLC suite (Jena's
+copy, and the copy in the SHACL 1.2 Compact Syntax draft's directory) read to isomorphic
+graphs, and each `.ttl` graph writes as SHACLC and reads back to an isomorphic graph.
+Jena's `nodeParams.shc` and `propertyParams.shc` round-trip and `nodeParam-bad-01.shc`
+fails. The eight SHACL 1.2 list tests pass. SHACL Core and SHACL-SPARQL stay at 98/98
+and 20/20. Every drafted shapes graph of `tests/draft.rs`, 60 random datasets included,
+reads the same from its SHACLC as from its Turtle. The guard's differential test runs
+twelve more scenarios with list shapes and list data, in `warn` and grandfather `reject`
+mode, and the incremental results equal full validation's.
+
+**Performance.** Not measured. Parsing and writing SHACLC are linear in the document.
+A list constraint costs two index scans per list cell and value node.
+
+**Not built.** A comment-preserving SHACLC formatter for `sparkles fmt`, `POST /$/format`
+and the editor. A CLI command that converts shapes between syntaxes, like Jena's `shacl
+parse --out=compact`. SHACLC output from the MCP tool `draft_shapes`.
