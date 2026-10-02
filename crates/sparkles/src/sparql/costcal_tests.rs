@@ -15,7 +15,10 @@
 //! `cal_tables` times hash joins (with the flat table and with a list per key), left
 //! joins, merge joins and sorts of generated tables.
 //! `cal_plan` times the planning of every query of `SPARKLES_CAL_QUERIES` with the
-//! estimates from samples and characteristic sets on and off.
+//! estimates from samples, characteristic sets and probed values on and off. The queries
+//! of `scripts/bench-estimates` exercise those estimates on the data of
+//! `scripts/gen-data.py`: filters over joins, and VALUES stars that `values-stars.py`
+//! writes for a number of people.
 //! `SPARKLES_CAL_MODES` limits the modes that run, `SPARKLES_CAL_RUNS` sets the timed
 //! runs (default 7) after one warm-up, and `SPARKLES_CAL_DISABLE` switches off
 //! optimizations by name, as `SPARKLES_DISABLE_OPTIMIZATIONS` does for the server.
@@ -467,8 +470,8 @@ fn cal_tables() {
 }
 
 /// Planning time of every `.rq` file of `SPARKLES_CAL_QUERIES` (or `SPARKLES_CAL_ONLY`),
-/// with the estimates from samples and characteristic sets on and off (or the
-/// optimizations `SPARKLES_CAL_OFF` names). Each run plans on a copy of the snapshot
+/// with the estimates from samples, characteristic sets and probed values on and off (or
+/// the optimizations `SPARKLES_CAL_OFF` names). Each run plans on a copy of the snapshot
 /// without the estimates kept from earlier runs, with the block cache kept (`warm`) or
 /// empty (`cold`, the decoded blocks are read again from the page cache).
 #[test]
@@ -494,8 +497,9 @@ fn cal_plan() {
             continue;
         }
         let q = std::fs::read_to_string(&f).unwrap();
-        let off = std::env::var("SPARKLES_CAL_OFF")
-            .unwrap_or_else(|_| "sampled_filters,characteristic_sets".into());
+        let off = std::env::var("SPARKLES_CAL_OFF").unwrap_or_else(|_| {
+            "sampled_filters,characteristic_sets,probed_keys,fused_star_costs".into()
+        });
         for (mode, opt) in [
             ("on", optimizations()),
             (
