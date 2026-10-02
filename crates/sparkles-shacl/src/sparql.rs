@@ -454,7 +454,7 @@ impl Engine<'_> {
             for (name, t) in binds {
                 let id = match t {
                     Term::NamedNode(g) if *name == "shapesGraph" => ctx.graph_id(g.as_str()),
-                    t => ctx.intern_term(t),
+                    t => ctx.intern_outside_term(t),
                 };
                 planner.subst.insert(ctx.var(name), id);
             }

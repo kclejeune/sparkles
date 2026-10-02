@@ -388,15 +388,43 @@ pub fn term_key(term: &Term) -> Vec<u8> {
     out
 }
 
+/// The label of a blank node id's payload. A blank node of the store is `b<hex>`. One that
+/// a query minted (`BNODE()`, a CONSTRUCT template, a SERVICE result), whose payload has
+/// [`Id::LOCAL_BNODE_BIT`] set, is `q<hex>`, so it never reads as a stored node's label.
+/// The hex digits are lowercase without leading zeros.
+pub fn bnode_label(payload: u64) -> String {
+    if payload & Id::LOCAL_BNODE_BIT != 0 {
+        format!("q{:x}", payload & !Id::LOCAL_BNODE_BIT)
+    } else {
+        format!("b{payload:x}")
+    }
+}
+
+/// The payload of a label exactly as [`bnode_label`] writes it, and `None` for any other
+/// label: other spellings of the same number (`b01f`, `b1F`) and numbers too large for
+/// the payload name nothing.
+pub fn parse_bnode_payload(label: &str) -> Option<u64> {
+    let (minted, hex) = match label.as_bytes().first()? {
+        b'b' => (false, &label[1..]),
+        b'q' => (true, &label[1..]),
+        _ => return None,
+    };
+    let canonical = !hex.is_empty()
+        && hex.len() <= 15
+        && (hex == "0" || !hex.starts_with('0'))
+        && hex.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    let v = u64::from_str_radix(hex, 16)
+        .ok()
+        .filter(|&v| canonical && v < Id::LOCAL_BNODE_BIT)?;
+    Some(if minted { v | Id::LOCAL_BNODE_BIT } else { v })
+}
+
 /// Blank node → id used inside triple-term keys when no store scope is available:
-/// labels minted by the store (`b<hex>`) map back to their id, other labels hash.
+/// labels from [`bnode_label`] map back to their id, other labels hash into the space
+/// of minted blank nodes, which the store never holds.
 pub fn default_bnode_id(b: &BlankNode) -> u64 {
-    if let Some(id) = b
-        .as_str()
-        .strip_prefix('b')
-        .and_then(|h| u64::from_str_radix(h, 16).ok())
-    {
-        return id & PAYLOAD_MASK;
+    if let Some(id) = parse_bnode_payload(b.as_str()) {
+        return id;
     }
     let h = b.as_str().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, c| {
         (h ^ c as u64).wrapping_mul(0x100_0000_01b3)
@@ -503,7 +531,7 @@ pub fn key_to_term(key: &[u8]) -> Term {
         }
         Some(b'_') if key.len() == 9 => {
             let id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-            Term::BlankNode(BlankNode::new_unchecked(format!("b{id:x}")))
+            Term::BlankNode(BlankNode::new_unchecked(bnode_label(id & PAYLOAD_MASK)))
         }
         Some(b'(') => {
             let mut pos = 1;

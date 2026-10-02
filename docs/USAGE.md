@@ -851,7 +851,9 @@ threads wait.
 A blank node read from the dataset has a label like `_:b1f` that names the stored node,
 so it works in later patterns, removals and bindings. Any other label, such as
 `BlankNode("x")`, names a new node in each write. The same label within one `extend` or
-transaction names one node. pyoxigraph keeps a label's node across writes.
+transaction names one node. pyoxigraph keeps a label's node across writes. A blank node
+that a query makes, such as with `BNODE()`, has a label like `_:q0`. It is not stored,
+so a later pattern finds nothing for it and a query binding takes it for a new node.
 
 ### Output, maintenance, reasoning and validation
 

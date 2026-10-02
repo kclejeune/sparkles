@@ -4263,6 +4263,8 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
     // parsed as it streams in, under the policy's byte ceiling and deadline
     let parser = sparesults::QueryResultsParser::from_format(fmt);
     let mut t = Table::new(vars.to_vec());
+    // the endpoint's blank nodes are its own: new ones here, one per label of the result
+    let mut bnodes = FxHashMap::default();
     let failed = |e: sparesults::QueryResultsParseError| match e {
         // a spent budget, or the body's own words (timeout, size, connection)
         sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
@@ -4279,7 +4281,7 @@ fn service(ctx: &Ctx, endpoint: &PathEnd, query: &str, vars: &[VarId]) -> Result
                     .iter()
                     .map(|v| {
                         sol.get(ctx.var_name(*v).as_str())
-                            .map_or(Id::UNDEF, |term| ctx.intern_term(term))
+                            .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
                     })
                     .collect();
                 t.push_row(&row);

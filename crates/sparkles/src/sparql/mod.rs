@@ -85,7 +85,8 @@ pub struct QueryOptions {
     pub no_cache: bool,
     /// Pre-bound variables (Jena `QueryExec.substitution`): every occurrence of the
     /// variable is replaced by the term; projected variables report the bound value.
-    /// Blank nodes produced by this store (`_:b…` labels) resolve to their stored node.
+    /// A blank node with a stored node's label (`_:b…`) is that stored node. Any other
+    /// label, such as a node a query minted (`_:q…`), is a new blank node of this query.
     pub initial_bindings: Vec<(String, Term)>,
     /// prefixes made available to the query (Fuseki doesn't do this; the CLI does)
     pub prefixes: Vec<(String, String)>,
@@ -472,7 +473,7 @@ fn execute_parsed(
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
     for (name, term) in &opts.initial_bindings {
         let v = ctx.var(name.trim_start_matches(['?', '$']));
-        let id = ctx.intern_term(term);
+        let id = ctx.intern_outside_term(term);
         planner.subst.insert(v, id);
         bound.push((v, id));
     }

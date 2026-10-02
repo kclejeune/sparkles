@@ -748,14 +748,19 @@ impl Snapshot {
     }
 }
 
+/// The blank node of an id, labelled by [`id::bnode_label`]: `b<hex>` for the store's
+/// blank nodes, `q<hex>` for ones a query minted.
 pub fn bnode_for(id: Id) -> BlankNode {
-    BlankNode::new_unchecked(format!("b{:x}", id.payload()))
+    BlankNode::new_unchecked(id::bnode_label(id.payload()))
 }
 
-/// Blank node labels produced by [`bnode_for`] map back to the same id.
+/// The stored blank node a label names: only a label exactly as [`bnode_for`] writes it
+/// for a stored node. Labels of blank nodes a query minted (`q<hex>`), other spellings of
+/// the same number and any other label name no stored node.
 pub fn parse_bnode_label(label: &str) -> Option<Id> {
-    let hex = label.strip_prefix('b')?;
-    u64::from_str_radix(hex, 16).ok().map(Id::bnode)
+    id::parse_bnode_payload(label)
+        .filter(|p| p & Id::LOCAL_BNODE_BIT == 0)
+        .map(Id::bnode)
 }
 
 // ===================================================================================
@@ -3433,18 +3438,33 @@ impl WriteTxn<'_> {
         &self.base
     }
 
-    /// Get or create the id for a term (new terms go to the delta vocabulary).
+    /// Get or create the id for a term (new terms go to the delta vocabulary). A blank
+    /// node, also inside a triple term, must be a stored one named by its label (see
+    /// [`parse_bnode_label`]). [`WriteTxn::intern_scoped`] and [`WriteTxn::new_bnode`]
+    /// make new ones.
     pub fn intern(&mut self, t: &Term) -> Result<Id> {
         crate::nesting::check_triple_term(t)?;
         if let Some(id) = id::inline_id(t) {
             return Ok(id);
         }
-        if let Term::BlankNode(b) = t
-            && let Some(id) = parse_bnode_label(b.as_str())
-        {
-            return Ok(id);
+        let mut foreign = None;
+        let mut key = Vec::new();
+        id::write_term_key_with(t, &mut key, &mut |b| match parse_bnode_label(b.as_str()) {
+            Some(id) => id.payload(),
+            None => {
+                foreign.get_or_insert_with(|| b.as_str().to_string());
+                0
+            }
+        });
+        if let Some(label) = foreign {
+            return Err(Error::invalid(format!(
+                "the blank node _:{label} is not a stored blank node and cannot be written as one"
+            )));
         }
-        self.intern_key(&id::term_key(t))
+        if let Term::BlankNode(b) = t {
+            return Ok(parse_bnode_label(b.as_str()).expect("checked above"));
+        }
+        self.intern_key(&key)
     }
 
     /// Intern a term whose blank nodes (including those inside RDF 1.2 triple terms) are
@@ -3549,9 +3569,10 @@ impl WriteTxn<'_> {
 
     /// Insert a quad; returns true if it was not present.
     pub fn insert(&mut self, q: [Id; 4]) -> Result<bool> {
-        if q.iter()
-            .any(|id| matches!(id.tag(), Tag::Local | Tag::Undef))
-        {
+        if q.iter().any(|id| {
+            matches!(id.tag(), Tag::Local | Tag::Undef)
+                || id.tag() == Tag::BNode && id.payload() & Id::LOCAL_BNODE_BIT != 0
+        }) {
             return Err(Error::invalid("cannot store query-local or unbound terms"));
         }
         if self.contains(&q)? {

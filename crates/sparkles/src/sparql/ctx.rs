@@ -304,6 +304,9 @@ pub struct Ctx {
     values: Vec<RwLock<FxHashMap<Id, Value>>>,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
+    /// blank nodes given to the query from outside (initial bindings) that are not
+    /// stored ones: a fresh blank node per label
+    outside_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
     pub dataset: DatasetSpec,
@@ -360,6 +363,7 @@ impl Ctx {
                 .collect(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
+            outside_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
@@ -578,18 +582,76 @@ impl Ctx {
 
     // ---------------------------------------------------------------- terms ------
 
-    /// The id of a term: stored id if the term exists in the store, else a local id.
+    /// The id of a term this query decoded from one of its own ids: stored id if the
+    /// term exists in the store, else a local id. A blank node label written by
+    /// [`bnode_for`] maps back to its id, a stored node's or one this query minted.
     pub fn intern_term(&self, t: &Term) -> Id {
-        if let Term::BlankNode(b) = t
-            && let Some(id) = parse_bnode_label(b.as_str())
-        {
-            return id;
+        if let Term::BlankNode(b) = t {
+            return match id::parse_bnode_payload(b.as_str()) {
+                Some(p) => Id::bnode(p),
+                None => self.outside_bnode(b.as_str()),
+            };
         }
         if let Some(id) = id::inline_id(t) {
             return id;
         }
         let key = id::term_key(t);
         self.intern_key(&key)
+    }
+
+    /// The id of a term given to the query from outside, such as an initial binding. A
+    /// blank node, also inside a triple term, names a stored node only by that node's
+    /// label (see [`parse_bnode_label`]). Any other label, a minted node's label from
+    /// an earlier result included, is a new blank node of this query, the same one for
+    /// the same label.
+    pub fn intern_outside_term(&self, t: &Term) -> Id {
+        self.intern_term(&self.map_bnodes(t, &mut |b| {
+            parse_bnode_label(b).unwrap_or_else(|| self.outside_bnode(b))
+        }))
+    }
+
+    /// The id of a term from a SERVICE result. Its blank nodes are the remote endpoint's,
+    /// so every label is a new blank node of this query, the same one for the same label
+    /// within `scope` (one result set).
+    pub fn intern_remote_term(&self, t: &Term, scope: &mut FxHashMap<String, Id>) -> Id {
+        self.intern_term(&self.map_bnodes(t, &mut |b| {
+            if let Some(&id) = scope.get(b) {
+                return id;
+            }
+            let id = self.fresh_bnode();
+            scope.insert(b.to_string(), id);
+            id
+        }))
+    }
+
+    /// `t` with each blank node, also inside triple terms, replaced by the node `f` picks
+    /// for its label.
+    fn map_bnodes(&self, t: &Term, f: &mut dyn FnMut(&str) -> Id) -> Term {
+        match t {
+            Term::BlankNode(b) => Term::BlankNode(bnode_for(f(b.as_str()))),
+            Term::Triple(tr) => {
+                let s = match self.map_bnodes(&tr.subject.clone().into(), f) {
+                    Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                    Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                    _ => unreachable!("a subject stays a subject"),
+                };
+                let o = self.map_bnodes(&tr.object, f);
+                Term::Triple(Box::new(oxrdf::Triple::new(s, tr.predicate.clone(), o)))
+            }
+            t => t.clone(),
+        }
+    }
+
+    /// A blank node of this query for a label from outside it.
+    fn outside_bnode(&self, label: &str) -> Id {
+        if let Some(&id) = self.outside_bnodes.lock().get(label) {
+            return id;
+        }
+        *self
+            .outside_bnodes
+            .lock()
+            .entry(label.to_string())
+            .or_insert_with(|| self.fresh_bnode())
     }
 
     /// Id for a graph name, mapping Jena's special default-graph IRI.

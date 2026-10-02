@@ -846,6 +846,29 @@ Query parameters beyond the standard protocol:
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
 
+### Blank nodes
+
+A stored blank node has a label made of `b` and its id in lowercase hex, such as `_:b1f`.
+The label stays the same from one request to the next. The Rust and Python dataset APIs
+and the MCP `describe_resource` tool accept it back, and so do query bindings, where it
+names the stored node. Only the label exactly as Sparkles writes it names the node, so
+`_:b01f` and `_:B1F` name nothing.
+
+A blank node that a query makes is not stored. `BNODE()` makes one, and so does a blank
+node in a CONSTRUCT template. Its label starts with `q`, such as `_:q0`, and it means
+something only within the result that holds it. When a later request is given such a
+label, it takes it for a new blank node of its own. That node matches no stored node and
+differs from every blank node the later request makes. Blank nodes in the results of a
+SERVICE call belong to the remote endpoint. Within one SERVICE result a label names one
+node, which is never a local stored node.
+
+In the text of a query, a blank node label such as `_:b1f` acts as a variable, as SPARQL
+specifies, so it does not name the stored node with that label. In an update, `INSERT
+DATA` makes a new stored node for each blank node label. `INSERT … WHERE` stores a new
+node for each blank node that the WHERE clause made, for example with
+`BIND(BNODE() AS ?b)`. That node gets a `_:b` label and is the same wherever the
+operation inserts it, inside triple terms too.
+
 ### Entity tags and conditional requests
 
 Graph Store `GET` and `HEAD` responses carry an `ETag` that names the commit the response
