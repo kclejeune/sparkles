@@ -270,6 +270,7 @@ impl Repository {
             index_format,
             files,
             lease,
+            in_memory,
             ..
         } = src;
         let mut files = files;
@@ -440,7 +441,7 @@ impl Repository {
             dataset: ManifestDataset {
                 name: o.dataset_name.clone(),
                 id: dataset_id,
-                kind: "persistent".to_string(),
+                kind: if in_memory { "mem" } else { "persistent" }.to_string(),
             },
             commit: ManifestCommit::from(&commit),
             generation,

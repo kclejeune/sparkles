@@ -507,7 +507,12 @@ ex:PersonShape a sh:NodeShape ;
       </div>
       <div>
         <dt>On disk</dt>
-        <dd>{info?.type === 'mem' ? 'in memory' : fmtBytes(stats.diskBytes)}</dd>
+        <dd>
+          {info?.type === 'mem'
+            ? 'in memory'
+            : fmtBytes(stats.diskBytes)}{#if stats.quota?.maxBytes}
+            of {fmtBytes(stats.quota.maxBytes)}{/if}
+        </dd>
       </div>
     </dl>
 

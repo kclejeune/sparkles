@@ -472,3 +472,65 @@ fn prefix_changes_persist_without_commits() {
         "a removed prefix stays removed: {p:?}"
     );
 }
+
+#[test]
+fn commits_record_whether_they_changed_the_default_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let opts = || StoreOptions {
+        bulk_threshold: 10,
+        ..Default::default()
+    };
+    let named = |n: usize| {
+        let mut s = ttl(n, "n");
+        s.graph = Some(oxrdf::NamedNode::new_unchecked("urn:g"));
+        s
+    };
+    let flags = |s: &Store| -> Vec<bool> {
+        let mut v: Vec<_> = s
+            .commits(CommitRange::Latest, 100)
+            .commits
+            .iter()
+            .map(|c| c.default_graph)
+            .collect();
+        v.reverse();
+        v
+    };
+    {
+        let s = Store::open(&root, opts()).unwrap();
+        // 1: the default graph; 2: a named graph; 3: a bulk load into a named graph
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        upd(&s, "INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> 1 } }");
+        let r = s.load_as(&[named(100)], CommitKind::Load).unwrap();
+        assert!(r.commit.bulk && !r.commit.default_graph);
+        // 4: a named graph through the WAL of the new generation
+        upd(&s, "DELETE DATA { GRAPH <urn:g> { <urn:a> <urn:p> 1 } }");
+        assert_eq!(flags(&s), [true, true, false, false, false]);
+        assert!(s.default_graph_changed(0, 4));
+        assert!(!s.default_graph_changed(1, 4));
+        assert!(!s.default_graph_changed(1, 2));
+        assert!(s.default_graph_changed(0, 1));
+        // 5: a bulk load into the default graph
+        s.load_as(&[ttl(100, "d")], CommitKind::Load).unwrap();
+        assert!(s.default_graph_changed(4, 5));
+        // a past position is answered from the records
+        assert!(!s.default_graph_changed(2, 4));
+        upd(&s, "INSERT DATA { GRAPH <urn:g> { <urn:b> <urn:p> 1 } }");
+    }
+    // replay and the catalog keep the flags, and so does compaction
+    let s = Store::open(&root, opts()).unwrap();
+    assert_eq!(flags(&s), [true, true, false, false, false, true, false]);
+    assert!(!s.default_graph_changed(5, 6));
+    s.compact().unwrap();
+    drop(s);
+    let s = Store::open(&root, opts()).unwrap();
+    assert_eq!(flags(&s), [true, true, false, false, false, true, false]);
+    assert!(!s.default_graph_changed(5, 6));
+    assert!(s.default_graph_changed(4, 6));
+    // in-memory stores track the same flag
+    let m = Store::in_memory(StoreOptions::default());
+    upd(&m, "INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> 1 } }");
+    assert!(!m.default_graph_changed(0, 1));
+    upd(&m, "INSERT DATA { <urn:a> <urn:p> 1 }");
+    assert!(m.default_graph_changed(1, 2));
+}

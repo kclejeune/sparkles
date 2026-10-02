@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How a captured file is stored in a backup repository.
@@ -186,7 +187,7 @@ pub struct BackupCapture {
     pub index_format: u32,
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
-    /// and when present `text.json`, `origin.json`, `validation.json`,
+    /// and when present `annotations.bin`, `text.json`, `origin.json`, `validation.json`,
     /// `validation-shapes.ttl`, `validation-schema.shex`, `validation-schema.json`).
     /// `reasoning.json` is the caller's to add (the server
     /// holds the current status and applies the "not after `s`" rule).
@@ -195,6 +196,9 @@ pub struct BackupCapture {
     pub lock_hold: Duration,
     /// keeps the generation until the upload ends
     pub lease: LeaseGuard,
+    /// a capture of an in-memory store ([`Store::memory_backup_capture`]): the files
+    /// are a temporary database built from its snapshot, removed with the lease
+    pub in_memory: bool,
 }
 
 impl BackupCapture {
@@ -242,6 +246,33 @@ impl BackupCapture {
     }
 }
 
+/// The name prefix of the temporary directory of an in-memory capture
+/// ([`Store::memory_backup_capture`]); a server removes leftovers at start.
+pub const MEMORY_CAPTURE_PREFIX: &str = "memory-backup-";
+
+/// Options of [`Store::memory_backup_capture`].
+#[derive(Clone, Default)]
+pub struct MemoryCaptureOptions {
+    /// where the temporary database is built (created if absent): a fresh
+    /// `memory-backup-*` directory inside it, removed with the capture's lease
+    pub tmp_dir: std::path::PathBuf,
+    /// free space to keep on the file system of `tmp_dir` while building
+    pub min_free_disk_bytes: Option<u64>,
+    /// set to `true` to cancel the build
+    pub cancel: Option<Arc<AtomicBool>>,
+    /// progress of the build: (fraction done in `[0, 1]`, message)
+    pub progress: Option<super::ProgressFn>,
+}
+
+impl std::fmt::Debug for MemoryCaptureOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryCaptureOptions")
+            .field("tmp_dir", &self.tmp_dir)
+            .field("min_free_disk_bytes", &self.min_free_disk_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A test hook run at a named point of the store's code (`Store::set_failpoint`).
 #[cfg(any(test, feature = "failpoints"))]
 pub type Failpoint = Arc<dyn Fn(&Store) + Send + Sync>;
@@ -251,7 +282,8 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 8] = [
+const OPTIONAL_META: [&str; 9] = [
+    crate::annotations::FILE,
     "text.json",
     "geo.json",
     "vector.json",
@@ -309,6 +341,168 @@ impl Store {
             drop(self);
         }));
         Ok(c)
+    }
+
+    /// Capture the current commit of an in-memory store for a backup labelled `label`.
+    ///
+    /// An in-memory store has no files to read, so the capture builds them: the
+    /// snapshot of the head commit is written as a new generation `gen-0001` (the bulk
+    /// builder, as a compaction does) in a fresh `memory-backup-*` directory inside
+    /// `o.tmp_dir`, next to an empty WAL, a commit catalog that holds only the head
+    /// commit, `dataset.json` with this store's dataset id, `prefixes.json`, and the
+    /// configurations of the full-text and spatial indexes. The result is the database
+    /// a persistent store with the same content and head would be, minus its earlier
+    /// commit records, so it opens with head `commit.seq`.
+    ///
+    /// Contract:
+    /// * in-memory stores only; a persistent store fails with `Error::Invalid` (use
+    ///   [`backup_capture`](Self::backup_capture));
+    /// * the writer mutex is held only to take the snapshot, so writes continue while
+    ///   the generation is built; the snapshot keeps the captured state in memory until
+    ///   the build ends;
+    /// * the build needs about as much disk space as a compacted generation of the
+    ///   dataset, and stops with `507` once the file system of `o.tmp_dir` would keep
+    ///   less than `o.min_free_disk_bytes` free;
+    /// * `o.cancel` is checked every 65536 quads (`Error::Cancelled`);
+    /// * the temporary directory is removed when the capture's lease is dropped, and on
+    ///   any error.
+    pub fn memory_backup_capture(
+        &self,
+        label: &str,
+        o: &MemoryCaptureOptions,
+    ) -> Result<BackupCapture> {
+        if self.root.is_some() {
+            return Err(Error::Invalid(
+                "a persistent store is captured with backup_capture".into(),
+            ));
+        }
+        let report = |f: f32, msg: &str| {
+            if let Some(p) = &o.progress {
+                p(f, msg);
+            }
+        };
+        let t0 = Instant::now();
+        let (snap, next_bnode, head, prefixes) = {
+            let w = self.writer.lock();
+            if w.poisoned {
+                return Err(Error::Poisoned);
+            }
+            (
+                self.snapshot().without_cache_fill(),
+                w.next_bnode,
+                w.head,
+                self.prefixes.lock().clone(),
+            )
+        };
+        let lock_hold = t0.elapsed();
+        std::fs::create_dir_all(&o.tmp_dir)?;
+        let tmp = tempfile::Builder::new()
+            .prefix(MEMORY_CAPTURE_PREFIX)
+            .tempdir_in(&o.tmp_dir)?;
+        let dir = tmp.path();
+        let generation = "gen-0001";
+        let gdir = dir.join(generation);
+        let total = snap.len().max(1);
+        let mut seen = 0u64;
+        report(0.0, "writing quads");
+        let meta = self.build_from_snapshot(
+            &gdir,
+            &snap,
+            next_bnode,
+            o.min_free_disk_bytes,
+            prefixes.clone(),
+            |_| {
+                seen += 1;
+                if seen.is_multiple_of(65_536) {
+                    if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        return Err(Error::Cancelled);
+                    }
+                    report(0.7 * seen as f32 / total as f32, "writing quads");
+                }
+                Ok(true)
+            },
+            || report(0.7, "building indexes"),
+        )?;
+        drop(snap);
+        // the head commit, held by the base of generation 1
+        let commit = CommitInfo {
+            generation: 1,
+            quads: meta.quads,
+            ..head
+        };
+        super::write_synced(
+            &gdir.join("commit.json"),
+            &crate::commit::gen_commit_bytes(self.dataset_id, "memory", &commit),
+        )?;
+        File::create(gdir.join("wal.log"))?.sync_all()?;
+        super::sync_dir(&gdir)?;
+        crate::commit::Catalog::create(&dir.join("commits.bin"), self.dataset_id, commit)?;
+        let mut files = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(&gdir)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type()?.is_file() && !name.ends_with(".tmp") {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            let f = File::open(gdir.join(&name))?;
+            let kind = if APPEND_FILES.contains(&name.as_str()) {
+                FileKind::Append
+            } else {
+                FileKind::Immutable
+            };
+            files.push(CapturedFile {
+                path: format!("{generation}/{name}"),
+                kind,
+                len: f.metadata()?.len(),
+                src: FileSource::File(f),
+            });
+        }
+        let catalog = File::open(dir.join("commits.bin"))?;
+        files.push(CapturedFile {
+            path: "commits.bin".into(),
+            kind: FileKind::Append,
+            len: catalog.metadata()?.len(),
+            src: FileSource::File(catalog),
+        });
+        let meta_file = |path: &str, bytes: Vec<u8>| CapturedFile {
+            path: path.to_string(),
+            kind: FileKind::Meta,
+            len: bytes.len() as u64,
+            src: FileSource::Bytes(bytes.into()),
+        };
+        files.push(meta_file("CURRENT", generation.as_bytes().to_vec()));
+        files.push(meta_file(
+            "dataset.json",
+            crate::commit::dataset_file_bytes(self.dataset_id, "memory", commit.timestamp_ms),
+        ));
+        files.push(meta_file(
+            "prefixes.json",
+            serde_json::to_vec_pretty(&prefixes).unwrap(),
+        ));
+        for (name, bytes) in self.index_config_files()? {
+            files.push(meta_file(name, bytes));
+        }
+        report(1.0, "built");
+        Ok(BackupCapture {
+            dataset_id: self.dataset_id,
+            commit,
+            generation: generation.to_string(),
+            index_format: meta.format_version,
+            files,
+            lock_hold,
+            lease: LeaseGuard {
+                generation: 1,
+                label: label.to_string(),
+                // the open handles keep reading after the directory is gone on Unix,
+                // but the upload has ended by the time the lease is dropped
+                release: Some(Box::new(move || drop(tmp))),
+            },
+            in_memory: true,
+        })
     }
 
     /// One capture attempt: `None` if `CURRENT` no longer names the captured generation
@@ -441,6 +635,7 @@ impl Store {
             files,
             lock_hold,
             lease,
+            in_memory: false,
         }))
     }
 
@@ -714,6 +909,117 @@ mod tests {
     fn in_memory_stores_are_unsupported() {
         let s = Store::in_memory(StoreOptions::default());
         assert!(matches!(s.backup_capture("b"), Err(Error::Unsupported(_))));
+    }
+
+    /// An in-memory capture is a database with the store's id, head and content; its
+    /// temporary directory goes with the lease.
+    #[test]
+    fn in_memory_captures_build_a_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::in_memory(StoreOptions::default());
+        ins(&s, 1);
+        ins(&s, 2);
+        update(
+            &s,
+            "INSERT DATA { GRAPH <urn:g> { _:b <urn:p> \"x\"@en } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        s.set_prefix("ex", "http://example.org/").unwrap();
+        #[cfg(feature = "text")]
+        s.enable_text(Default::default()).unwrap();
+        let o = MemoryCaptureOptions {
+            tmp_dir: tmp.path().join("scratch"),
+            ..Default::default()
+        };
+        let c = s.memory_backup_capture("b", &o).unwrap();
+        // the full-text index is rebuilt where the backup is restored
+        #[cfg(feature = "text")]
+        assert!(c.file("text.json").is_some());
+        assert!(c.in_memory);
+        assert_eq!(c.dataset_id, s.dataset_id());
+        assert_eq!(c.commit.seq, s.head_commit().seq);
+        assert_eq!(c.commit.quads, 3);
+        assert_eq!(c.generation, "gen-0001");
+        assert_eq!(c.lease.label(), "b");
+        let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();
+        for p in [
+            "gen-0001/wal.log",
+            "gen-0001/commit.json",
+            "commits.bin",
+            "CURRENT",
+            "dataset.json",
+            "prefixes.json",
+        ] {
+            assert!(paths.contains(&p), "{p} in {paths:?}");
+        }
+        // a write after the capture is not in it
+        ins(&s, 4);
+        let out = tmp.path().join("db");
+        c.write_to(&out).unwrap();
+        let scratch: Vec<_> = std::fs::read_dir(tmp.path().join("scratch"))
+            .unwrap()
+            .collect();
+        assert_eq!(scratch.len(), 1);
+        drop(c);
+        let scratch: Vec<_> = std::fs::read_dir(tmp.path().join("scratch"))
+            .unwrap()
+            .collect();
+        assert!(scratch.is_empty());
+        let report = crate::check::check(&out, &Default::default()).unwrap();
+        // a missing full-text index is only a warning: it is rebuilt on open
+        assert_eq!(report.errors, 0, "{report:?}");
+        let r = Store::open(&out, StoreOptions::default()).unwrap();
+        assert_eq!(r.dataset_id(), s.dataset_id());
+        assert_eq!(r.head_commit().seq, s.head_commit().seq - 1);
+        assert_eq!(r.snapshot().len(), 3);
+        assert_eq!(
+            r.prefixes().get("ex").map(String::as_str),
+            Some("http://example.org/")
+        );
+        // the restored database goes on with the next commit, and new blank nodes do
+        // not collide with the copied one
+        ins(&r, 4);
+        assert_eq!(r.head_commit().seq, s.head_commit().seq);
+        update(
+            &r,
+            "INSERT DATA { GRAPH <urn:g> { _:c <urn:p> \"y\" } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(r.snapshot().len(), 5);
+    }
+
+    #[test]
+    fn in_memory_captures_cancel_and_clean_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::in_memory(StoreOptions::default());
+        let mut u = String::from("INSERT DATA {");
+        for i in 0..70_000 {
+            u.push_str(&format!(" <urn:s{i}> <urn:p> {i} ."));
+        }
+        u.push('}');
+        update(&s, &u, &QueryOptions::default()).unwrap();
+        let o = MemoryCaptureOptions {
+            tmp_dir: tmp.path().to_path_buf(),
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.memory_backup_capture("b", &o),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // persistent stores use backup_capture
+        let p = Store::open(&tmp.path().join("db"), StoreOptions::default()).unwrap();
+        let o = MemoryCaptureOptions {
+            tmp_dir: tmp.path().join("scratch"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            p.memory_backup_capture("b", &o),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]

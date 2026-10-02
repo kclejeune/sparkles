@@ -379,9 +379,14 @@ async fn a_read_only_server_changes_no_registration_and_restores_nothing() {
         let r = call(&s.app, m, uri, None, body).await;
         expect(&r, StatusCode::FORBIDDEN, "server-read-only");
     }
-    // the others pass the server check (and reach the repository)
-    let r = post(&s.app, "/$/backups/mem", json!({"repository": "local"})).await;
-    expect(&r, StatusCode::NOT_IMPLEMENTED, "backup-unsupported");
+    // the others pass the server check (in-memory datasets too)
+    let r = post(
+        &s.app,
+        "/$/backups/mem",
+        json!({"repository": "local", "name": "no spaces"}),
+    )
+    .await;
+    expect(&r, StatusCode::BAD_REQUEST, "invalid-name");
 }
 
 #[tokio::test]
@@ -493,8 +498,6 @@ async fn backup_requests_are_checked_in_order() {
     expect(&r, StatusCode::NOT_FOUND, "no-such-repository");
     let r = post(&s.app, "/$/backups/ds", json!({"repository": "ro"})).await;
     expect(&r, StatusCode::CONFLICT, "repository-read-only");
-    let r = post(&s.app, "/$/backups/mem", json!({"repository": "local"})).await;
-    expect(&r, StatusCode::NOT_IMPLEMENTED, "backup-unsupported");
     let r = post(
         &s.app,
         "/$/backups/ds",
@@ -1190,6 +1193,138 @@ async fn e2e_backup_restore_delete_and_metrics() {
     for op in ["put", "get", "head", "list", "delete"] {
         assert!(requests(op) > 0, "no {op} requests counted in\n{text}");
     }
+}
+
+/// An in-memory dataset is backed up through a temporary copy, verified, and
+/// restored as a new persistent dataset with its validation and prefixes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_in_memory_datasets_back_up_and_restore() {
+    let (s, _repo) = with_local(false).await;
+    let mem = s.st.get("mem").unwrap();
+    for i in 0..20 {
+        update(
+            &s,
+            "mem",
+            &format!("INSERT DATA {{ <urn:m{i}> a <urn:T> ; <urn:p> {i} }}"),
+        );
+    }
+    mem.store.set_prefix("ex", "http://example.org/").unwrap();
+    #[cfg(feature = "shacl")]
+    {
+        let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+            <urn:S> a sh:NodeShape ; sh:targetClass <urn:T> ;\n\
+            sh:property [ sh:path <urn:p> ; sh:minCount 1 ] .";
+        let r = call(
+            &s.app,
+            "PUT",
+            "/$/validation/mem",
+            None,
+            json!({"mode": "reject", "shapes": {"inline": shapes}}),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    }
+    let head = mem.store.head_commit().seq;
+    let t = run(
+        &s,
+        "/$/backups/mem",
+        json!({"repository": "local", "name": "m1"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let d = t.detail.unwrap();
+    assert_eq!(d["commit"]["seq"], head);
+    assert_eq!(d["commit"]["quads"], 40);
+    assert_eq!(d["dataset"]["id"], mem.store.dataset_id().to_string());
+    let m = get(&s.app, "/$/backups/mem/local/m1").await.body;
+    assert_eq!(m["dataset"]["type"], "mem");
+    let files: Vec<&str> = m["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    for f in [
+        "CURRENT",
+        "commits.bin",
+        "prefixes.json",
+        "gen-0001/spo.dat",
+    ] {
+        assert!(files.contains(&f), "{f} in {files:?}");
+    }
+    #[cfg(feature = "shacl")]
+    assert!(files.contains(&"validation.json"), "{files:?}");
+    // the temporary copy is gone
+    let tmp = s.dir.path().join("tmp");
+    let left: Vec<_> = std::fs::read_dir(&tmp)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+    // listed under the dataset
+    let r = get(&s.app, "/$/backups/mem").await;
+    assert_eq!(r.body["backups"][0]["name"], "m1", "{}", r.body);
+    let t = run(
+        &s,
+        "/$/backups/mem/local/m1/verify",
+        json!({"level": "restore"}),
+    )
+    .await;
+    assert_eq!(t.detail.unwrap()["status"], "ok");
+    // the in-memory dataset cannot be replaced
+    let r = post(
+        &s.app,
+        "/$/backups/mem/local/m1/restore",
+        json!({"target": "mem", "replace": true}),
+    )
+    .await;
+    expect(&r, StatusCode::CONFLICT, "not-managed");
+    // a new persistent dataset; the live dataset has the id, so the copy gets a new one
+    let t = run(
+        &s,
+        "/$/backups/mem/local/m1/restore",
+        json!({"target": "mem-r"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let r = get(&s.app, "/$/datasets/mem-r").await;
+    assert_eq!(r.body["type"], "persistent", "{}", r.body);
+    assert_eq!(r.body["head"], head);
+    assert_eq!(
+        r.body["forkedFrom"],
+        json!({"id": mem.store.dataset_id(), "seq": head})
+    );
+    let restored = s.st.get("mem-r").unwrap();
+    assert_eq!(restored.store.snapshot().len(), 40);
+    assert_eq!(
+        restored.store.prefixes().get("ex").map(String::as_str),
+        Some("http://example.org/")
+    );
+    #[cfg(feature = "shacl")]
+    {
+        let r = get(&s.app, "/$/validation/mem-r").await;
+        assert_eq!(r.body["config"]["mode"], "reject", "{}", r.body);
+        let u = "INSERT DATA { <urn:bad> a <urn:T> }";
+        let r = sparkles::sparql::update::update(&restored.store, u, &QueryOptions::default());
+        assert!(r.is_err(), "the restored validation rejects a violation");
+    }
+    // a second, unchanged backup reuses the pieces of the first
+    let t = run(
+        &s,
+        "/$/backups/mem",
+        json!({"repository": "local", "name": "m2"}),
+    )
+    .await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
+    let d = t.detail.unwrap();
+    assert!(
+        d["addedBytes"].as_u64().unwrap() < d["logicalBytes"].as_u64().unwrap() / 2,
+        "{d}"
+    );
+    // the Fuseki-style N-Quads dump works on in-memory datasets too
+    let r = post(&s.app, "/$/backup/mem", J::Null).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+    let t = wait_task(&s.st, r.body["id"].as_str().unwrap()).await;
+    assert_eq!(t.state, "done", "{:?}", t.message);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

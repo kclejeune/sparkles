@@ -23,6 +23,7 @@ mod mcp;
 mod obs;
 mod otel;
 mod outbound;
+mod quota_cmd;
 mod ratelimit;
 mod reasoning;
 #[cfg(feature = "auth")]
@@ -30,6 +31,7 @@ mod remote;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod shex_cmd;
+mod shutdown;
 mod state;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
@@ -85,6 +87,10 @@ struct Cli {
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
+    /// Record a change digest with every commit of the databases this command opens
+    /// (a database keeps the setting once it is on)
+    #[arg(long, global = true)]
+    commit_digests: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -428,6 +434,15 @@ enum Cmd {
         /// Datasets with their own metric labels; the others share `$other`
         #[arg(long, default_value_t = 100)]
         metrics_max_datasets: usize,
+        /// Also expose Fuseki's metric names (fuseki_requests, fuseki_requests_good,
+        /// fuseki_requests_bad, ...) on /$/metrics, for dashboards built for Fuseki
+        #[arg(long, conflicts_with = "no_metrics")]
+        metrics_fuseki_names: bool,
+        /// Also serve /$/metrics on this address (HOST:PORT), under the same
+        /// authentication; a non-loopback address without --auth-config needs
+        /// --allow-open-network
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
+        metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
         /// (0: unlimited)
         #[arg(long, default_value_t = 8192)]
@@ -442,6 +457,10 @@ enum Cmd {
         /// Maximum number of rows of any intermediate result
         #[arg(long, default_value_t = 200_000_000)]
         max_rows: usize,
+        /// Budget for the rows all the operators of one query produce together (0:
+        /// unlimited); `max-rows-produced=` lowers it per request
+        #[arg(long, default_value_t = 0)]
+        max_rows_produced: u64,
         /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
@@ -496,6 +515,15 @@ enum Cmd {
         /// past it is refused with 507 (0: unlimited)
         #[arg(long, default_value_t = 4096)]
         max_mem_dataset_mb: u64,
+        /// Default storage quota of a persistent dataset, in MiB of its directory on
+        /// disk: a write that would take a dataset past it is refused with 507 (0:
+        /// unlimited); PUT /$/quota/{ds} or `sparkles quota` sets one per dataset
+        #[arg(long, default_value_t = 0)]
+        max_dataset_mb: u64,
+        /// On SIGTERM or SIGINT, seconds to let requests in flight finish before they
+        /// are cancelled (a cancelled write commits nothing)
+        #[arg(long, default_value_t = 20.0, value_name = "SECS")]
+        shutdown_grace: f64,
         /// Background tasks (compaction, clones, reasoning, full-text builds, N-Quads
         /// backups) that run at once; more wait, queued (0: no limit). Backup repository
         /// tasks have their own --backup-max-tasks
@@ -673,6 +701,9 @@ enum Cmd {
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
         lenient: bool,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -733,6 +764,9 @@ enum Cmd {
         #[arg(long)]
         update: Option<PathBuf>,
         text: Option<String>,
+        /// A message recorded with the commit (shown by `log` and in /$/commits)
+        #[arg(long)]
+        message: Option<String>,
         /// A server to send this to instead of a local database (with --dataset)
         #[arg(long, env = "SPARKLES_SERVER")]
         server: Option<String>,
@@ -763,6 +797,9 @@ enum Cmd {
     /// set, or turn off
     #[cfg(any(feature = "shacl", feature = "shex"))]
     Validation(validation_cmd::ValidationArgs),
+    /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
+    /// back to the default (--default)
+    Quota(quota_cmd::QuotaArgs),
     /// Named snapshots (pins that keep a commit readable) and history retention
     Snapshot {
         #[command(subcommand)]
@@ -886,7 +923,7 @@ enum Cmd {
         /// `subclass` (type tests follow rdfs:subClassOf*) or `none`
         #[arg(long, default_value = "subclass", requires = "check")]
         closure: String,
-        /// text or json
+        /// text or json (with --check also turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout of the checks in seconds
@@ -914,7 +951,8 @@ enum Cmd {
         /// Declarations to read: `asserted`, or `all` (including inferred ones)
         #[arg(long, default_value = "asserted")]
         declared: String,
-        /// Output format: text or json
+        /// Output format: text, json, void (the VoID description in Turtle) or turtle
+        /// (the VoID description and the declarations in Turtle)
         #[arg(long, default_value = "text")]
         format: String,
         /// Timeout in seconds
@@ -964,6 +1002,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
         max_prefixes: cli.max_prefixes,
+        commit_digests: cli.commit_digests,
         ..Default::default()
     }
 }
@@ -1082,6 +1121,7 @@ fn print_log(
     };
     let head = all.last().map_or(0, |c| c.seq);
     let first = all.first().map_or(0, |c| c.seq);
+    let notes = sparkles::annotations::read(loc)?;
     let pick: Vec<_> = if let Some(at) = at {
         let seq = match at {
             "head" => head,
@@ -1113,20 +1153,31 @@ fn print_log(
             "head": head,
             "firstRetained": first,
             "complete": true,
-            "commits": pick,
+            "commits": pick
+                .iter()
+                .map(|c| sparkles::commit::AnnotatedCommit {
+                    commit: c,
+                    annotation: notes.get(&c.seq),
+                })
+                .collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
     println!("dataset {id}  head {head}");
     println!(
-        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation",
+        "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  generation  message",
         "seq", "timestamp", "kind", "+inserted", "-deleted", "quads"
     );
     for c in pick {
         let approx = if c.exact { "" } else { "~" };
-        println!(
-            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {}",
+        let message = notes
+            .get(&c.seq)
+            .and_then(|a| a.message.as_deref())
+            .map(|m| format!("  {m}"))
+            .unwrap_or_default();
+        let line = format!(
+            "{:>6}  {:<24}  {:<12} {:>10} {:>10} {:>12}  {:<10}{message}",
             c.seq,
             c.timestamp(),
             c.kind.name(),
@@ -1135,6 +1186,7 @@ fn print_log(
             c.quads,
             c.generation_name()
         );
+        println!("{}", line.trim_end());
     }
     Ok(())
 }
@@ -1311,10 +1363,13 @@ fn run() -> Result<()> {
             no_access_log,
             no_metrics,
             metrics_max_datasets,
+            metrics_fuseki_names,
+            metrics_addr,
             query_memory_mb,
             max_result_mb,
             max_export_mb,
             max_rows,
+            max_rows_produced,
             update_timeout,
             allow_unvalidated_writes,
             auto_reason,
@@ -1330,6 +1385,8 @@ fn run() -> Result<()> {
             min_free_disk_mb,
             max_tasks,
             max_mem_dataset_mb,
+            max_dataset_mb,
+            shutdown_grace,
             auth_config,
             #[cfg(feature = "backup")]
             backup_config,
@@ -1359,6 +1416,9 @@ fn run() -> Result<()> {
                 auth_config.is_some(),
                 allow_open_network,
             )?;
+            if let Some(addr) = &metrics_addr {
+                exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
@@ -1376,6 +1436,11 @@ fn run() -> Result<()> {
             let mut opts = opts;
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
+            // persistent datasets without a quota of their own get this one
+            opts.max_disk_bytes = (max_dataset_mb > 0).then_some(max_dataset_mb << 20);
+            if !(shutdown_grace.is_finite() && shutdown_grace >= 0.0) {
+                bail!("--shutdown-grace expects a number of seconds");
+            }
             opts.geo_budget_bytes = geo_mb << 20;
             opts.geo_op_vertices = geo_op_vertices;
             opts.geo_query_rewrite = !no_geo_rewrite;
@@ -1413,6 +1478,7 @@ fn run() -> Result<()> {
             )?;
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
+            st.metrics.fuseki_names = metrics_fuseki_names;
             st.task_queue.set_max(max_tasks);
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
@@ -1420,6 +1486,8 @@ fn run() -> Result<()> {
                 max_result_bytes: mib(max_result_mb),
                 max_export_bytes: mib(max_export_mb),
                 max_rows,
+                max_rows_produced: (max_rows_produced > 0).then_some(max_rows_produced),
+                max_dataset_bytes: mib(max_dataset_mb),
                 update_timeout: (update_timeout.is_finite() && update_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(update_timeout)),
                 max_decompressed_bytes: mib(max_decompressed_mb),
@@ -1465,6 +1533,8 @@ fn run() -> Result<()> {
                     Duration::from_secs_f64(secs),
                     max,
                 ));
+            } else if cfg!(feature = "reasoning") {
+                st.auto_reason = Some(reasoning::AutoReason::per_dataset());
             }
             let limit_sources = ratelimit::Sources {
                 file: rate_limit_config,
@@ -1503,12 +1573,13 @@ fn run() -> Result<()> {
             let st = Arc::new(st);
             otel::register_metrics(&st);
             #[cfg(feature = "reasoning")]
-            if st.auto_reason.is_some() {
-                if st.read_only {
+            if st.read_only {
+                if st.auto_reason.is_some() {
                     tracing::warn!("--auto-reason has no effect on a read-only server");
-                } else {
-                    reasoning::spawn_auto_reason(st.clone());
                 }
+            } else {
+                // the loop also serves datasets that enable automatic runs themselves
+                reasoning::spawn_auto_reason(st.clone());
             }
             for m in mem {
                 st.attach(m.trim_start_matches('/'), state::DbType::Mem, None)?;
@@ -1535,6 +1606,8 @@ fn run() -> Result<()> {
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
+            let grace = Duration::from_secs_f64(shutdown_grace);
+            let st_after = st.clone();
             let served = rt.block_on(async move {
                 let addr = format!("{host}:{port}");
                 let tcp = match &unix_socket {
@@ -1545,6 +1618,20 @@ fn run() -> Result<()> {
                     ),
                     Some(_) => None,
                 };
+                // the metrics listener ends with the runtime, after the main one
+                if let Some(maddr) = &metrics_addr {
+                    let l = tokio::net::TcpListener::bind(maddr)
+                        .await
+                        .with_context(|| format!("binding --metrics-addr {maddr}"))?;
+                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let service = obs::metrics_router(st.clone())
+                        .into_make_service_with_connect_info::<auth::Peer>();
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(l, service).await {
+                            tracing::error!("metrics listener failed: {e}");
+                        }
+                    });
+                }
                 #[cfg(unix)]
                 let unix = match &unix_socket {
                     Some(path) => Some(bind_unix(path)?),
@@ -1579,30 +1666,50 @@ fn run() -> Result<()> {
                 auth::spawn_reload_on_sighup(&st);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
+                let (draining_tx, draining) = tokio::sync::oneshot::channel();
                 let shutdown = async move {
                     shutdown_signal().await;
                     st2.set_phase(obs::Phase::Draining);
-                    tracing::info!("shutting down: finishing requests in flight");
+                    tracing::info!(
+                        "shutting down: finishing requests in flight (up to {grace:?})"
+                    );
+                    let _ = draining_tx.send(());
                 };
                 // the peer address feeds trusted-proxy checks
                 let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                use std::future::IntoFuture;
                 #[cfg(unix)]
-                if let Some(l) = unix {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                    auth::flush(&st);
-                    return anyhow::Ok(());
+                let drained = match (unix, tcp) {
+                    (Some(l), _) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, Some(l)) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    (None, None) => shutdown::Drained::Finished,
+                };
+                #[cfg(not(unix))]
+                let drained = match tcp {
+                    Some(l) => {
+                        let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                        shutdown::drain(serve.into_future(), draining, grace).await?
+                    }
+                    None => shutdown::Drained::Finished,
+                };
+                if drained == shutdown::Drained::GraceElapsed {
+                    tracing::warn!(
+                        "shutdown grace of {grace:?} elapsed: cancelling the requests still in flight"
+                    );
                 }
-                if let Some(l) = tcp {
-                    axum::serve(l, service)
-                        .with_graceful_shutdown(shutdown)
-                        .await?;
-                }
-                auth::flush(&st);
                 anyhow::Ok(())
             });
-            drop(rt);
+            // cancels what still runs (dropping a request's future sets its cancel flag)
+            // and waits a little for it to stop; a write stops before its commit or
+            // finishes it
+            rt.shutdown_timeout(shutdown::CANCEL_WAIT);
+            auth::flush(&st_after);
             // flush spans and metrics of the last requests (bounded)
             otel_guard.shutdown();
             served
@@ -1620,10 +1727,16 @@ fn run() -> Result<()> {
             files,
             compression,
             lenient,
+            message,
             server,
             dataset,
             insecure_http,
         } => {
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
@@ -1636,6 +1749,7 @@ fn run() -> Result<()> {
                     ds,
                     graph.as_deref(),
                     &files,
+                    message.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
@@ -1662,7 +1776,11 @@ fn run() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             let t = Instant::now();
             let before = store.snapshot().len();
-            let r = store.load_as(&sources, sparkles::commit::CommitKind::Load)?;
+            let wopts = sparkles::guard::WriteOptions {
+                message,
+                ..Default::default()
+            };
+            let r = store.load_with(&sources, sparkles::commit::CommitKind::Load, &wopts)?;
             let after = store.snapshot().len();
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
@@ -1775,6 +1893,7 @@ fn run() -> Result<()> {
             loc,
             update,
             text,
+            message,
             server,
             dataset,
             insecure_http,
@@ -1785,10 +1904,21 @@ fn run() -> Result<()> {
                 (None, Some(t)) => t,
                 _ => bail!("no update given"),
             };
+            let message = message
+                .as_deref()
+                .map(sparkles::annotations::validate_message)
+                .transpose()?
+                .flatten();
             let Some(loc) = loc else {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 #[cfg(feature = "auth")]
-                return remote::client::update(server.as_deref(), insecure_http, ds, &u);
+                return remote::client::update(
+                    server.as_deref(),
+                    insecure_http,
+                    ds,
+                    &u,
+                    message.as_deref(),
+                );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(ds, insecure_http);
             };
@@ -1798,6 +1928,10 @@ fn run() -> Result<()> {
                 prefixes: store.prefixes().into_iter().collect(),
                 allow_service: true,
                 outbound,
+                write: sparkles::guard::WriteOptions {
+                    message,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;
@@ -1907,6 +2041,7 @@ fn run() -> Result<()> {
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
+        Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Compact { loc } => {
             let store = Store::open(&loc, opts)?;
             let t = Instant::now();
@@ -2105,11 +2240,11 @@ fn run() -> Result<()> {
                     &extras,
                     &Default::default(),
                 )?;
-                // lets `sparkles serve` pick the inferences up for this database
-                state::write_reasoning_file(
-                    &loc,
-                    Some(&reasoning::recorded(&profile, &extras, &r, &store)),
-                )?;
+                // lets `sparkles serve` pick the inferences up for this database, with
+                // the database's automatic re-run setting kept
+                let mut info = reasoning::recorded(&profile, &extras, &r, &store);
+                info.auto = state::read_reasoning_file(&loc).and_then(|i| i.auto);
+                state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(
                     "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",
                     r.inferred,
@@ -2154,6 +2289,18 @@ fn run() -> Result<()> {
                 };
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&j)?);
+            } else if format == "turtle" {
+                let inf = &j["scope"]["inferences"];
+                print!(
+                    "{}",
+                    report.to_turtle(&sparkles_reasoner::diagnostics::ReportContext {
+                        dataset: Some(&name),
+                        profile: inf["profile"].as_str(),
+                        stale: inf["stale"].as_bool(),
+                        commits_since: inf["commitsSince"].as_u64(),
+                        prefixes: &dopts.prefixes,
+                    })
+                );
             } else {
                 print_diagnostics(&report, &j);
             }
@@ -2176,10 +2323,13 @@ fn run() -> Result<()> {
         } => {
             use sparkles::index::Perm;
             use sparkles::schema::{GraphSelection, Page, SchemaError, SchemaOptions};
-            let json = match format.as_str() {
-                "json" => true,
-                "text" => false,
-                f => bail!("unknown format '{f}' (text or json)"),
+            // `void` is the VoID description, `turtle` the description and the declarations
+            let (json, void) = match format.as_str() {
+                "json" => (true, None),
+                "text" => (false, None),
+                "void" => (false, Some(false)),
+                "turtle" => (false, Some(true)),
+                f => bail!("unknown format '{f}' (text, json, void or turtle)"),
             };
             let declared_from_inferred = match declared.as_str() {
                 "asserted" => false,
@@ -2208,6 +2358,7 @@ fn run() -> Result<()> {
                 deadline: timeout.map(|t| Instant::now() + Duration::from_secs_f64(t)),
                 cancel: None,
                 max_entries,
+                term_totals: void.is_some(),
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,
@@ -2218,7 +2369,18 @@ fn run() -> Result<()> {
                 Err(e) => return Err(e.into()),
             };
             let mut out = std::io::stdout().lock();
-            if json {
+            if let Some(declarations) = void {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(store.prefixes());
+                let vopts = sparkles::schema::VoidOptions {
+                    dataset: &name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                let turtle = oxrdfio::RdfFormat::Turtle;
+                let text = sparkles::schema::void_text(&report, &vopts, turtle);
+                out.write_all(text.as_bytes())?;
+            } else if json {
                 // every item on one page
                 let summary = report.summary(
                     &name,
@@ -2385,7 +2547,7 @@ fn print_reasoning_status(loc: &std::path::Path, store: &Store, format: &str) ->
     );
     println!("head            {head}");
     let state = match (f.stale, f.commits_since) {
-        (Some(false), _) => "up to date".to_string(),
+        (Some(false), n) => reasoning::up_to_date(n),
         (Some(true), Some(n)) => {
             format!("STALE ({n} commit{} since)", if n == 1 { "" } else { "s" })
         }

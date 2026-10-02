@@ -82,6 +82,7 @@ pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         },
         generation: "gen-0001".into(),
         index_format: sparkles::builder::FORMAT_VERSION,
@@ -96,6 +97,7 @@ pub fn synthetic(files: Vec<(&str, FileKind, Vec<u8>)>) -> Source {
             .collect(),
         lock_hold: Duration::ZERO,
         lease: LeaseGuard::none(),
+        in_memory: false,
     }
 }
 

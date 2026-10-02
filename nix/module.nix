@@ -94,6 +94,8 @@ let
     (toString cfg.port)
     "--timeout"
     (toString cfg.queryTimeout)
+    "--shutdown-grace"
+    (toString cfg.shutdownGrace)
   ]
   ++ lib.optionals (cfg.auth.configFile != null) [
     "--auth-config"
@@ -135,6 +137,11 @@ let
   ++ lib.optional cfg.otel.logs "--otel-logs"
   ++ lib.optional cfg.otel.queryText "--otel-query-text"
   ++ lib.optional cfg.otel.planSpans "--otel-plan-spans"
+  ++ lib.optional cfg.metrics.fusekiNames "--metrics-fuseki-names"
+  ++ lib.optionals (cfg.metrics.listenAddress != null) [
+    "--metrics-addr"
+    cfg.metrics.listenAddress
+  ]
   ++ lib.optionals (rateLimits != null) [
     "--rate-limit-config"
     rateLimitsFile
@@ -277,6 +284,17 @@ in
       description = "Default query timeout in seconds (clients may ask for another with `timeout=`, up to `--max-timeout`, 1800 s by default).";
     };
 
+    shutdownGrace = mkOption {
+      type = types.ints.unsigned;
+      default = 20;
+      description = ''
+        Seconds that requests in flight get to finish when the service stops
+        (`--shutdown-grace`). Requests still running after that are cancelled, and a
+        cancelled write commits nothing. The unit's `TimeoutStopSec` is this plus 15
+        seconds, which covers the cancellation and the final flush.
+      '';
+    };
+
     loadDir = mkOption {
       type = types.nullOr types.path;
       default = null;
@@ -397,6 +415,21 @@ in
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
       description = "`RUST_LOG` filter for the service.";
+    };
+
+    metrics = {
+      fusekiNames = mkEnableOption "Fuseki's Prometheus metric names on `/$/metrics`, next to the Sparkles names";
+
+      listenAddress = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9464";
+        description = ''
+          Also serve `/$/metrics` on this `HOST:PORT`, with the same authentication as the
+          main listener. Without {option}`auth.configFile`, an address that is not
+          loopback needs {option}`allowOpenNetwork`. The firewall is not opened for it.
+        '';
+      };
     };
 
     otel = {
@@ -652,9 +685,9 @@ in
         ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
         Restart = "on-failure";
         RestartSec = 5;
-        # graceful shutdown flushes nothing extra (commits are durable), but give
-        # in-flight requests a moment
-        TimeoutStopSec = 30;
+        # the grace period for requests in flight, then up to 5 s for cancelled ones to
+        # stop and the final flush (commits are durable either way)
+        TimeoutStopSec = cfg.shutdownGrace + 15;
         LimitNOFILE = 65536;
 
         # hardening

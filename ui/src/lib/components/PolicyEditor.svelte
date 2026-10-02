@@ -136,9 +136,7 @@
   const inMemory = $derived(
     matched.filter((n) => datasets.find((d) => d.name === n)?.type === 'mem'),
   );
-  const sampleDs = $derived(
-    datasets.find((d) => matched.includes(d.name) && d.type !== 'mem') ?? null,
-  );
+  const sampleDs = $derived(datasets.find((d) => matched.includes(d.name)) ?? null);
   const sample = $derived(
     renderNameTemplate(nameTemplate, {
       policy: name || 'policy',
@@ -295,8 +293,9 @@
           {:else if matched.length === 0}
             No dataset matches now; datasets created later that match are included.
           {:else}
-            Matches now: <span class="mono">{matched.join(', ')}</span>{#if inMemory.length}.
-              In-memory datasets are skipped: <span class="mono">{inMemory.join(', ')}</span>{/if}.
+            Matches now: <span class="mono">{matched.join(', ')}</span>.{#if inMemory.length}
+              Each backup of an in-memory dataset first writes a temporary copy to disk:
+              <span class="mono">{inMemory.join(', ')}</span>.{/if}
           {/if}
         </p>
       </fieldset>

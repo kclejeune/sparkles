@@ -79,4 +79,11 @@ describe('backup requests', () => {
     expect(b.isActive(task('queued'))).toBe(true);
     expect(b.isActive(task('cancelled'))).toBe(false);
   });
+
+  it('tells backups of in-memory datasets apart', () => {
+    expect(b.fromMemory({ dataset: { name: 'm', id: 'x', type: 'mem' } })).toBe(true);
+    expect(b.fromMemory({ dataset: { name: 'd', id: 'y', type: 'persistent' } })).toBe(false);
+    // older servers send no type
+    expect(b.fromMemory({ dataset: { name: 'd', id: 'y' } })).toBe(false);
+  });
 });

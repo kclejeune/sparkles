@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Clippy (warnings are errors) over the feature combinations that `mise run lint` does not
 # build: the server with no optional feature, with each default feature on its own, and
-# with the pairs whose code is shared (the MCP validation tools), and the library crates
-# with their own features off. Code used only under some feature is gated on it, so an
-# item that is dead without it fails here.
+# with the pairs whose code is shared (the MCP validation and format tools), and the
+# library crates with their own features off. Code used only under some feature is gated
+# on it, so an item that is dead without it fails here.
 #
 # Usage: scripts/lint-features.sh [extra cargo clippy args]
 # `mise run lint:features`; every combination shares the workspace target directory.
@@ -25,6 +25,7 @@ server=(
   fmt
   "mcp,shacl"
   "mcp,shex"
+  "mcp,fmt"
 )
 
 failed=()

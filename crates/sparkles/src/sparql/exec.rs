@@ -124,6 +124,7 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         }
         let start = Instant::now();
         if let Some(t) = results.get(k, ctx)? {
+            ctx.produced(t.len())?;
             let mut info = describe(ctx, n);
             info.actual_rows = t.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -441,6 +442,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     // the inputs are gone (or became the output): only the output is alive now
     drop(held);
     ctx.check_output(table.len(), table.width())?;
+    ctx.produced(table.len())?;
     let info = PlanInfo {
         operator: n.operator().to_string(),
         description: match note {
@@ -716,6 +718,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
     ctx.check()?;
     let start = Instant::now();
     let finish = |t: Table, children: Vec<PlanInfo>, complete: bool| {
+        ctx.produced(t.len())?;
         let mut info = describe(ctx, n);
         info.children = children;
         info.actual_rows = t.len() as i64;

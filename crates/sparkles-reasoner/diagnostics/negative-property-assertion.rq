@@ -1,0 +1,13 @@
+# negative-property-assertion: a property assertion that a negative property assertion
+# denies (OWL 2 RL prp-npa1 for owl:targetIndividual, prp-npa2 for owl:targetValue).
+#
+# The target is matched as the same RDF term. The checker appends a LIMIT.
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?a ?x ?p ?t ?y WHERE {
+  VALUES ?t { owl:targetIndividual owl:targetValue }
+  ?a owl:sourceIndividual ?x ;
+     owl:assertionProperty ?p ;
+     ?t ?y .
+  ?x ?p ?y .
+}

@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::Span;
 
+mod fuseki;
+
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Dataset label of requests that name no existing dataset.
@@ -318,6 +320,7 @@ pub async fn observe(State(st): State<Arc<AppState>>, mut req: Request, next: Ne
         quiet(route.as_deref()),
     );
     pending.otel = otel;
+    pending.fuseki = fuseki::route(route.as_deref());
     let mut resp = next.run(req).await;
     let mut report = resp
         .extensions_mut()
@@ -360,6 +363,8 @@ struct Pending {
     done: bool,
     auth: Option<crate::auth::AuthReport>,
     otel: crate::otel::Req,
+    /// the Fuseki endpoint of the route, if it has one
+    fuseki: Option<fuseki::Route>,
 }
 
 impl Pending {
@@ -377,6 +382,7 @@ impl Pending {
             done: false,
             auth: None,
             otel: Default::default(),
+            fuseki: None,
         }
     }
 
@@ -397,6 +403,11 @@ impl Pending {
             self.st
                 .metrics
                 .record(dataset.as_deref(), op, outcome, elapsed, report);
+            if let Some(r) = self.fuseki {
+                let ok = outcome == Outcome::Ok;
+                let m = &self.st.metrics;
+                m.record_fuseki(dataset.as_deref(), r, op, ok, self.st.read_only);
+            }
         }
         crate::otel::on_response(
             &self.otel,
@@ -581,6 +592,8 @@ pub struct DsMetrics {
     rate_limited: [AtomicU64; crate::ratelimit::Class::COUNT],
     /// candidates, exact tests and matches of spatial operators
     geo_work: [AtomicU64; crate::geo::WORK.len()],
+    /// requests per Fuseki endpoint (`--metrics-fuseki-names`)
+    fuseki: fuseki::Counters,
 }
 
 fn budget_index(k: BudgetKind) -> usize {
@@ -591,11 +604,15 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::DecompressedBytes => 3,
         BudgetKind::OutboundBytes => 4,
         BudgetKind::ValidationWork => 5,
+        BudgetKind::RowsProduced => 6,
+        BudgetKind::DatasetBytes => 7,
     }
 }
 
 pub struct Metrics {
     pub enabled: bool,
+    /// also render Fuseki's metric names (`--metrics-fuseki-names`)
+    pub fuseki_names: bool,
     max_datasets: usize,
     datasets: RwLock<BTreeMap<String, Arc<DsMetrics>>>,
     /// in-flight requests per operation of the matched route (kept even when metrics
@@ -607,6 +624,7 @@ impl Metrics {
     pub fn new(enabled: bool, max_datasets: usize) -> Metrics {
         Metrics {
             enabled,
+            fuseki_names: false,
             max_datasets,
             datasets: RwLock::new(BTreeMap::new()),
             active: Default::default(),
@@ -904,6 +922,8 @@ struct DsGauges {
     delta_deletes: u64,
     wal_bytes: u64,
     disk_bytes: u64,
+    /// storage quotas (0: unlimited)
+    quota_bytes: u64,
     cache_bytes: u64,
     cache_capacity: u64,
     cache_entries: u64,
@@ -934,7 +954,10 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.delta_inserts += snap.delta.inserts() as u64;
         g.delta_deletes += snap.delta.deletes() as u64;
         g.wal_bytes += d.store.wal_bytes();
-        g.disk_bytes += d.store.disk_bytes();
+        // measured at most once a second, like the quota checks of commits
+        let quota = d.store.quota();
+        g.disk_bytes += quota.used_bytes;
+        g.quota_bytes += quota.max_bytes.unwrap_or(0);
         g.cache_bytes += c.bytes();
         g.cache_capacity += opts.cache_bytes;
         g.cache_entries += c.entries() as u64;
@@ -1219,7 +1242,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     }
 
     type Field = fn(&DsGauges) -> u64;
-    let per_dataset: [(&str, &str, &str, Field); 11] = [
+    let per_dataset: [(&str, &str, &str, Field); 12] = [
         (
             "sparkles_dataset_quads",
             "gauge",
@@ -1237,6 +1260,12 @@ pub fn render_prometheus(st: &AppState) -> String {
             "gauge",
             "Size of the database directory.",
             |g| g.disk_bytes,
+        ),
+        (
+            "sparkles_dataset_quota_bytes",
+            "gauge",
+            "Storage quota of the database directory (0: unlimited).",
+            |g| g.quota_bytes,
         ),
         (
             "sparkles_block_cache_bytes",
@@ -1328,6 +1357,9 @@ pub fn render_prometheus(st: &AppState) -> String {
             g.rcache_entries
         );
     }
+    if st.metrics.fuseki_names {
+        fuseki::render(&mut o, st, &series);
+    }
     crate::auth::render_metrics(st, &mut o);
     #[cfg(feature = "backup")]
     crate::backup::metrics::render(st, &mut o);
@@ -1410,6 +1442,7 @@ pub fn metrics_json(st: &AppState) -> J {
                 "deltaDeletes": g.delta_deletes,
                 "walBytes": g.wal_bytes,
                 "diskBytes": g.disk_bytes,
+                "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
                 "budgetExceeded": counters.get(&ds).map_or(J::Null, |c| c["budgetExceeded"].clone()),
                 "rateLimited": counters.get(&ds).map_or(J::Null, |c| c["rateLimited"].clone()),
@@ -1480,6 +1513,23 @@ pub async fn metrics_endpoint(State(st): State<Arc<AppState>>, uri: Uri) -> Resp
         body,
     )
         .into_response()
+}
+
+/// The router of `--metrics-addr`: `/$/metrics` alone, behind the same authentication,
+/// `metrics` permission and `Host` check as on the main listener. Its requests are not
+/// counted, as on the main listener.
+pub fn metrics_router(st: Arc<AppState>) -> axum::Router {
+    axum::Router::new()
+        .route("/$/metrics", axum::routing::get(metrics_endpoint))
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            crate::auth::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            st.rate_limit.clone(),
+            crate::ratelimit::admit,
+        ))
+        .with_state(st)
 }
 
 // ------------------------------------------------------------------ readiness ------

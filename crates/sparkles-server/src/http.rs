@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod budgets;
+mod conditional;
 #[cfg(feature = "fmt")]
 mod format;
 mod history;
@@ -46,6 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
         header::LINK,
+        header::ETAG,
         header::RETRY_AFTER,
         header::HeaderName::from_static("ratelimit"),
         header::HeaderName::from_static("ratelimit-policy"),
@@ -80,6 +83,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/reason/{ds}",
             get(reason_status).post(reason).delete(unreason),
         )
+        .route(
+            "/$/reason/{ds}/auto",
+            axum::routing::put(reason_auto_set).delete(reason_auto_clear),
+        )
         .route("/$/reason/{ds}/diagnostics", get(reason_diagnostics))
         .route("/$/tasks", get(list_tasks))
         .route("/$/tasks/{id}", get(get_task).delete(cancel_task))
@@ -90,6 +97,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(text_status).put(text_enable).delete(text_disable),
         )
         .route("/$/text/{ds}/rebuild", post(text_rebuild))
+        .route(
+            "/$/quota/{ds}",
+            get(budgets::get_quota)
+                .put(budgets::put_quota)
+                .delete(budgets::delete_quota),
+        )
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route("/{ds}", any(dataset_root))
@@ -108,6 +121,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/{ds}/explain", get(explain).post(explain))
+        .route("/{ds}/text", get(text_search).post(text_search))
         .route("/{ds}/shacl", post(shacl))
         .route("/{ds}/shex", post(shex::shex))
         .route("/{ds}/prefixes", any(dataset_prefixes))
@@ -392,6 +406,7 @@ impl From<Error> for ApiError {
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
@@ -400,6 +415,7 @@ impl From<Error> for ApiError {
             Error::Rejected(r) => return validation::rejection(&r),
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
             Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
+            Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -703,6 +719,7 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         timeout: Some(timeout),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),
@@ -824,12 +841,15 @@ async fn query_endpoint(
     }
     crate::obs::log_query_text(&query);
     let mut opts = query_options(&st, &ds, &params);
+    // budgets the request asked for, never above the server's
+    let asked = budgets::Overrides::parse(&params)?;
+    asked.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
-    let limit = st.limits.max_result_bytes;
+    let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
@@ -1069,6 +1089,151 @@ async fn text_rebuild(State(st): St, Path(name): Path<String>) -> ApiResult {
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
+/// Marks the engine puts around a match in a snippet, replaced by `<mark>` and `</mark>`
+/// once the text is HTML-escaped (private-use characters).
+#[cfg(feature = "text")]
+const MARK: (char, char) = ('\u{e000}', '\u{e001}');
+
+/// `GET` or `POST /{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=`: the best hits
+/// of a `text:query`, each with its subject, score, literal, predicate and graph, and,
+/// unless `highlight=false`, an HTML snippet of the literal with the matches in `<mark>`.
+#[cfg(feature = "text")]
+async fn text_search(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    method: Method,
+    uri: Uri,
+    QueryBody(body): QueryBody,
+) -> ApiResult {
+    use oxrdf::{Literal, NamedNode, Term};
+    let ds = dataset(&st, &name)?;
+    let mut params = Params::from_query(&uri);
+    if method == Method::POST {
+        params.extend_form(&body);
+    }
+    let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+    let q = params
+        .get("q")
+        .filter(|q| !q.trim().is_empty())
+        .ok_or_else(|| bad("q: required".into()))?
+        .to_string();
+    let limit = match params.get("limit") {
+        None => 20,
+        Some(l) => match l.parse::<usize>() {
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => return Err(bad("limit: between 1 and 1000".into())),
+        },
+    };
+    let iri = |k: &str, v: &str| {
+        NamedNode::new(v)
+            .map(|n| n.to_string())
+            .map_err(|_| bad(format!("{k}: {v:?} is not an IRI")))
+    };
+    // the call's arguments, serialized by oxrdf (escaped)
+    let mut args = params
+        .all("predicate")
+        .iter()
+        .map(|v| iri("predicate", v))
+        .collect::<ApiResult<Vec<String>>>()?;
+    args.push(Literal::new_simple_literal(q.as_str()).to_string());
+    args.push(limit.to_string());
+    if let Some(l) = params.get("lang") {
+        if l.is_empty() || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+            return Err(bad(format!("lang: {l:?} is not a language tag")));
+        }
+        args.push(Literal::new_simple_literal(format!("lang:{l}")).to_string());
+    }
+    let highlight = params.get("highlight").is_none_or(truthy);
+    if highlight {
+        args.push(
+            Literal::new_simple_literal(format!("highlight:s:{} | e:{} | f:…", MARK.0, MARK.1))
+                .to_string(),
+        );
+    }
+    let call = format!(
+        "(?s ?score ?lit ?g ?p) <http://jena.apache.org/text#query> ({})",
+        args.join(" ")
+    );
+    let pattern = match params.get("graph") {
+        Some(g) => format!("GRAPH {} {{ {call} }}", iri("graph", g)?),
+        None => call,
+    };
+    let query = format!("SELECT ?s ?score ?lit ?g ?p WHERE {{ {pattern} }} ORDER BY DESC(?score)");
+    let mut opts = query_options(&st, &ds, &params);
+    crate::auth::restrict(&mut opts, &p);
+    blocking(move || {
+        let snap = ds.store.snapshot();
+        let seq = snap.commit;
+        let r = sparkles::sparql::query(snap, &query, &opts)?;
+        let hits: Vec<J> = r
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let get = |i: usize| row.get(i).cloned().flatten();
+                let mut h = serde_json::Map::new();
+                if let Some(s) = get(0) {
+                    h.insert("s".into(), sparkles::sparql::results::term_json(&s));
+                }
+                if let Some(Term::Literal(sc)) = get(1) {
+                    h.insert("score".into(), json!(sc.value().parse::<f64>().ok()));
+                }
+                if let Some(Term::Literal(l)) = get(2) {
+                    let text = l.value();
+                    if highlight {
+                        let mut html = String::with_capacity(text.len() + 16);
+                        for c in text.chars() {
+                            match c {
+                                '&' => html.push_str("&amp;"),
+                                '<' => html.push_str("&lt;"),
+                                '>' => html.push_str("&gt;"),
+                                '"' => html.push_str("&quot;"),
+                                '\'' => html.push_str("&#39;"),
+                                c if c == MARK.0 => html.push_str("<mark>"),
+                                c if c == MARK.1 => html.push_str("</mark>"),
+                                c => html.push(c),
+                            }
+                        }
+                        h.insert("snippet".into(), html.into());
+                    }
+                    let plain: String = text
+                        .chars()
+                        .filter(|c| *c != MARK.0 && *c != MARK.1)
+                        .collect();
+                    let lit = match l.language() {
+                        Some(lang) => Literal::new_language_tagged_literal_unchecked(plain, lang),
+                        None => Literal::new_typed_literal(plain, l.datatype()),
+                    };
+                    h.insert(
+                        "literal".into(),
+                        sparkles::sparql::results::term_json(&Term::Literal(lit)),
+                    );
+                }
+                for (i, k) in [(3, "g"), (4, "p")] {
+                    if let Some(t) = get(i) {
+                        h.insert(k.into(), sparkles::sparql::results::term_json(&t));
+                    }
+                }
+                J::Object(h)
+            })
+            .collect();
+        let resp = Json(json!({
+            "dataset": ds.name,
+            "commit": seq,
+            "limited": hits.len() == limit,
+            "hits": hits,
+        }))
+        .into_response();
+        Ok(with_commit(resp, &ds, seq))
+    })
+    .await
+}
+
+#[cfg(not(feature = "text"))]
+async fn text_search() -> ApiResult {
+    Err(sparkles::text::not_built().into())
+}
+
 #[cfg(not(feature = "text"))]
 async fn text_status() -> ApiResult<Json<J>> {
     Err(sparkles::text::not_built().into())
@@ -1254,10 +1419,15 @@ async fn get_commit(
             format!("commit metadata before {} is no longer retained", seq + 1),
         )
     })?;
+    let note = ds.store.annotation(seq);
+    let commit = sparkles::commit::AnnotatedCommit {
+        commit: &c,
+        annotation: note.as_ref(),
+    };
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
-        "commit": c,
+        "commit": commit,
     })))
 }
 
@@ -1295,8 +1465,10 @@ async fn update_endpoint(
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        max_rows_produced: st.limits.max_rows_produced,
         ..Default::default()
     };
+    budgets::Overrides::parse(&params)?.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     // a client that disconnects drops this future: the update stops at its next check
@@ -1772,17 +1944,22 @@ async fn gsp(
                 operation: Some(Op::Gsp),
                 ..Default::default()
             };
-            let resp = if head {
-                ct.into_response()
-            } else {
-                let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
-                if let Some((bytes, quads)) = whole {
-                    report.response_bytes = Some(bytes);
-                    report.rows = Some(quads);
+            let id = ds.store.dataset_id();
+            let tag = conditional::etag(id, seq, fmt);
+            let negotiated = !params.has("format");
+            let resp = match conditional::check_read(&headers, id, seq, &tag)? {
+                conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
+                conditional::ReadOutcome::Send if head => ct.into_response(),
+                conditional::ReadOutcome::Send => {
+                    let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
+                    if let Some((bytes, quads)) = whole {
+                        report.response_bytes = Some(bytes);
+                        report.rows = Some(quads);
+                    }
+                    (ct, body).into_response()
                 }
-                (ct, body).into_response()
             };
-            let resp = with_commit(resp, &ds, seq);
+            let resp = with_commit(conditional::with_etag(resp, &tag, negotiated), &ds, seq);
             Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
         }
         Method::PUT | Method::POST => {
@@ -1801,7 +1978,9 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -1851,7 +2030,9 @@ async fn gsp(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -2425,6 +2606,7 @@ async fn stats(State(st): St, Path(name): Path<String>) -> ApiResult {
             "predicates": predicates,
             "classes": classes,
             "diskBytes": ds.store.disk_bytes(),
+            "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
             "reasoning": reasoning,
             "geo": crate::geo::status_json(&ds),
             "cache": {
@@ -2802,7 +2984,13 @@ async fn reason(
         })?
     };
     task_start_check(&st, None, &name)?;
-    let task = crate::reasoning::start_reason(&st, ds, profile, extras, false);
+    let task = crate::reasoning::start_reason(
+        &st,
+        ds,
+        profile,
+        extras,
+        crate::reasoning::Trigger::Request,
+    );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
@@ -2838,6 +3026,81 @@ async fn unreason() -> ApiResult {
     ))
 }
 
+/// `PUT /$/reason/{ds}/auto`: the dataset's own automatic re-run setting,
+/// `{"enabled": bool, "debounceSeconds"?: number, "maxDelaySeconds"?: number}`. Answers
+/// with the reasoning status.
+async fn reason_auto_set(
+    State(st): St,
+    Path(name): Path<String>,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Json<J>> {
+    let bad = |m: &str| err(StatusCode::BAD_REQUEST, m.to_string());
+    let v: J = serde_json::from_slice(&body).map_err(|e| bad(&e.to_string()))?;
+    let enabled = v["enabled"]
+        .as_bool()
+        .ok_or_else(|| bad("enabled must be true or false"))?;
+    let secs = |k: &str| match &v[k] {
+        J::Null => Ok(None),
+        x => x
+            .as_f64()
+            .filter(|s| s.is_finite() && (0.0..=86_400.0 * 365.0).contains(s))
+            .map(Some)
+            .ok_or_else(|| bad(&format!("{k} must be a number of seconds"))),
+    };
+    let setting = crate::state::AutoSetting {
+        enabled,
+        debounce_seconds: secs("debounceSeconds")?,
+        max_delay_seconds: secs("maxDelaySeconds")?,
+    };
+    set_auto(&st, &name, Some(setting)).await
+}
+
+/// `DELETE /$/reason/{ds}/auto`: the dataset follows the server's `--auto-reason`
+/// again.
+async fn reason_auto_clear(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+    set_auto(&st, &name, None).await
+}
+
+#[cfg(not(feature = "reasoning"))]
+async fn set_auto(
+    _: &Arc<AppState>,
+    _: &str,
+    _: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `reasoning` feature",
+    ))
+}
+
+#[cfg(feature = "reasoning")]
+async fn set_auto(
+    st: &Arc<AppState>,
+    name: &str,
+    auto: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    let ds = dataset(st, name)?;
+    let Some(mut info) = ds.reasoning.read().clone() else {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "no recorded reasoning: materialize inferences first",
+        ));
+    };
+    info.auto = auto;
+    let st2 = st.clone();
+    let ds2 = ds.clone();
+    blocking(move || {
+        ds2.set_reasoning(Some(info))?;
+        st2.save_registry()?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(crate::reasoning::status_json(st, &ds)))
+}
+
 /// `GET /$/reason/{ds}`: the reasoning status, with the freshness of the inferences.
 async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
@@ -2849,10 +3112,34 @@ async fn reason_status(State(st): St, Path(name): Path<String>) -> ApiResult<Jso
 
 /// `GET /$/reason/{ds}/diagnostics`: inconsistency checks over data (and inferences).
 #[cfg(feature = "reasoning")]
-async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
-    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
+async fn reason_diagnostics(
+    State(st): St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions, ReportContext};
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
+    // JSON unless `format=turtle` or an Accept header that prefers Turtle
+    const OFFERS: [&str; 2] = ["application/json", "text/turtle"];
+    let turtle = match params.get("format") {
+        Some("json") => false,
+        Some("turtle" | "ttl") => true,
+        Some(f) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown report format '{f}' (expected json or turtle)"),
+            ));
+        }
+        None => {
+            let accept = headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("*/*");
+            negotiate(accept, &OFFERS) == Some(1)
+        }
+    };
     let checks: Vec<String> = params
         .get("checks")
         .unwrap_or_default()
@@ -2902,12 +3189,23 @@ async fn reason_diagnostics(State(st): St, Path(name): Path<String>, uri: Uri) -
         prefixes,
     };
     blocking(move || {
-        let (_, j) = crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
-        Ok(with_commit(
-            Json(j.clone()).into_response(),
-            &ds,
-            j["commit"].as_u64().unwrap_or(0),
-        ))
+        let (report, j) =
+            crate::reasoning::diagnostics_json(&ds.name, &ds.store, info.as_ref(), &opts)?;
+        let seq = j["commit"].as_u64().unwrap_or(0);
+        let r = if turtle {
+            let inf = &j["scope"]["inferences"];
+            let ttl = report.to_turtle(&ReportContext {
+                dataset: Some(&ds.name),
+                profile: inf["profile"].as_str(),
+                stale: inf["stale"].as_bool(),
+                commits_since: inf["commitsSince"].as_u64(),
+                prefixes: &opts.prefixes,
+            });
+            ([(header::CONTENT_TYPE, "text/turtle; charset=utf-8")], ttl).into_response()
+        } else {
+            Json(j).into_response()
+        };
+        Ok(with_commit(r, &ds, seq))
     })
     .await
 }
@@ -3197,6 +3495,8 @@ async fn shacl() -> ApiResult {
 }
 
 #[cfg(test)]
+mod budgets_tests;
+#[cfg(test)]
 mod compress_tests;
 #[cfg(test)]
 mod history_tests;
@@ -3208,6 +3508,8 @@ mod nesting_tests;
 mod obs_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(all(test, feature = "text"))]
+mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
 mod validation_tests;
 

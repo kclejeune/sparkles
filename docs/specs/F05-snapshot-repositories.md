@@ -5,8 +5,8 @@
 > **Phases:** Phase 1 shipped: repositories, incremental backups, restore, verify, the
 > CLI, the server and the Backups panel. Most of Phase 2 shipped with it: lifecycle
 > policies, garbage collection, locks and the full Backups page, with `gcs` and `azure` as
-> experimental build features. These were not built: full backups of in-memory datasets,
-> "back up all datasets" as one request, the CLI's `--server` mode, offline
+> experimental build features. Full backups of in-memory datasets followed. These were not
+> built: "back up all datasets" as one request, the CLI's `--server` mode, offline
 > `backup policy run`, and all of Phase 3 (client-side encryption, content-defined
 > chunking, repository copy, server backups).
 >
@@ -1815,5 +1815,43 @@ commits took 0.34 s and added 55.3 KB (targets < 1 s and < 200 KB). A restore wi
 quick check took 0.79 s (target < 10 s), and a `data`-level verify 0.08 s. S3, cold
 caches and databases larger than memory are not measured yet.
 
+**Backups of in-memory datasets** were added later. An in-memory dataset is backed up
+through a temporary database that `Store::memory_backup_capture` builds in
+`<data>/tmp/memory-backup-*`. Under the writer lock it takes the head snapshot, then
+writes it as `gen-0001` with the bulk builder, as a compaction does. The upload goes
+through the normal path, and the lease of the capture removes the directory. A server
+removes leftovers at start. These choices differ from the sketch in §1:
+* **The dataset keeps its identity.** `clone_to` gives a copy a new id with `forkedFrom`,
+  so the capture does not use it. The temporary database has the dataset's id and its
+  head commit, which `gen-0001/commit.json` records with origin `memory`. Its
+  `commits.bin` holds only that commit, because the commit records an in-memory dataset
+  keeps are not tied to a generation on disk. The restored dataset's history therefore
+  starts at the backup's commit.
+* **The manifest's `dataset.type` is `mem`**, and backup summaries gained
+  `dataset.type`.
+* **Metadata.** The capture renders `prefixes.json`, `text.json` and `geo.json` from the
+  running store. The server adds `validation.json` with the shapes or schema copy that a
+  persistent dataset would keep. The ShEx guard of an in-memory dataset now keeps its
+  schema text for this. `reasoning.json` follows the same rule as for a persistent
+  dataset.
+* **Restore** works as for any backup and creates or replaces a persistent dataset. An
+  in-memory dataset cannot be replaced (`409 not-managed`).
+* **Policies back up matching in-memory datasets** instead of skipping them. Each server
+  start gives an in-memory dataset a new id, so retention counts the backups of each
+  server run separately. The API docs advise `expireAfter` with `minCount: 0` for such
+  policies.
+* **Cost.** The writer lock is held only for the snapshot. The snapshot keeps the
+  captured state in memory until the build ends. The temporary copy needs about as much
+  disk as a compacted generation. Its build checks `--min-free-disk-mb` as it writes and
+  fails with `507 insufficient-storage`. Every backup rebuilds the generation. An
+  unchanged dataset gives the same index files, so the repository deduplicates them, but
+  after a write most pieces differ.
+* `501 backup-unsupported` is no longer returned. `POST /$/backup/{ds}` already wrote
+  N-Quads dumps of in-memory datasets and is unchanged.
+
+Tests cover the capture (content, head, id, prefixes, the text index setting, cleanup,
+cancellation), a round trip through an `fs` repository with a `restore`-level verify, the
+server's create, verify and restore with SHACL validation, the validation files of both
+languages, and policy runs.
 
 **Not built:** the items listed under Phases at the top.

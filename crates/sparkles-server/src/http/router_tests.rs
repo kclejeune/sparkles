@@ -706,6 +706,7 @@ async fn writes_return_commits_and_reads_name_them() {
             "inserted",
             "memPeakBytes",
             "operations",
+            "rowsProduced",
             "timing"
         ]
     );

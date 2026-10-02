@@ -48,16 +48,19 @@ running queries.
   generations of 7 sorted, compressed permutations ([features](docs/FEATURES.md#storage-tdb2-equivalent)).
 * Durable commit ids, and point-in-time reads by commit (`?at=commit:N`), time or named
   snapshot ([API](docs/API.md#point-in-time-reads-and-snapshots)).
+* Commit messages, optional change digests, and Graph Store entity tags with `If-Match`
+  writes checked under the writer lock ([API](docs/API.md#entity-tags-and-conditional-requests)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
 * Parallel bulk loading with external sort.
-* N-Quads dumps, and incremental, deduplicated backups to a file system or S3
-  ([usage](docs/USAGE.md#backup-repositories)).
+* N-Quads dumps, and incremental, deduplicated backups of persistent and in-memory
+  datasets to a file system or S3 ([usage](docs/USAGE.md#backup-repositories)).
 
 **SPARQL**
 * SPARQL 1.1 Query and Update, and SPARQL 1.2 / RDF 1.2. Sparkles passes the W3C suites
   in full: SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update 157/157 and 1.2 269/269.
-* A cost-based DP planner over columnar operators, a result cache, and memory and row
-  budgets per query. Each result comes with its executed plan ([optimizations](docs/COMPARISON.md#optimizations-adopted-from-qlever)).
+* A cost-based DP planner over columnar operators, a result cache, and memory, row and
+  work budgets per query, which a request can lower. Each result comes with its executed
+  plan ([optimizations](docs/COMPARISON.md#optimizations-adopted-from-qlever)).
 * Federated `SERVICE` queries under an outbound network policy ([usage](docs/USAGE.md#outbound-requests-service-and-load)).
 
 **Server and CLI**
@@ -99,6 +102,8 @@ running queries.
   control, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces
   ([features](docs/FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)).
+* Storage quotas per dataset, and a shutdown that lets requests in flight finish within
+  a grace period ([API](docs/API.md#storage-quotas)).
 * An MCP server for LLM agents. Its tools are read-only and run within query budgets
   ([usage](docs/USAGE.md#mcp-server-llm-agents)).
 

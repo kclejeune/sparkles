@@ -1074,6 +1074,21 @@ async fn server_routes() {
     assert_eq!(names(&all).len(), 4);
     let secret = get_as(&s.app, "/$/ready/secret", Some(&b("bob"))).await;
     assert_eq!(secret.status, StatusCode::NOT_FOUND);
+    // the --metrics-addr listener asks for the same permission
+    let m = crate::obs::metrics_router(s.state.clone());
+    let status = |r: R| r.status;
+    assert_eq!(
+        status(get_as(&m, "/$/metrics", None).await),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(get_as(&m, "/$/metrics", Some(&b("bob"))).await),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(get_as(&m, "/$/metrics", Some(&bearer(&t_prom()))).await),
+        StatusCode::OK
+    );
 }
 
 // ---------------------------------------------------------------------------

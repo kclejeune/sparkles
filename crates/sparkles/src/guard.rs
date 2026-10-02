@@ -98,6 +98,38 @@ pub struct WriteOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// results carried in a summary (the guard's default if `None`)
     pub report_limit: Option<usize>,
+    /// the message recorded with the commit (see
+    /// [`annotations::validate_message`](crate::annotations::validate_message))
+    pub message: Option<Arc<str>>,
+    /// checked once the writer lock is held, before anything is written
+    pub precondition: Option<Precondition>,
+}
+
+/// A check of the committed state that a write depends on (an HTTP `If-Match`, say).
+/// The store runs it with the writer lock held, on the head snapshot, so no other
+/// commit can come between the check and the write. An `Err` (usually
+/// [`Error::PreconditionFailed`](crate::Error::PreconditionFailed)) stops the write
+/// before anything is written.
+#[derive(Clone)]
+pub struct Precondition(pub Arc<PreconditionFn>);
+
+/// The check a [`Precondition`] runs.
+pub type PreconditionFn = dyn Fn(&Snapshot) -> Result<()> + Send + Sync;
+
+impl Precondition {
+    pub fn new(f: impl Fn(&Snapshot) -> Result<()> + Send + Sync + 'static) -> Precondition {
+        Precondition(Arc::new(f))
+    }
+
+    pub fn check(&self, head: &Snapshot) -> Result<()> {
+        (self.0)(head)
+    }
+}
+
+impl std::fmt::Debug for Precondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Precondition")
+    }
 }
 
 impl WriteOptions {
@@ -288,17 +320,6 @@ impl ValidationSummary {
             self.by_severity.info,
             self.millis
         )
-    }
-}
-
-/// Serialize an optional shared summary (for [`crate::commit::Receipt`]).
-pub(crate) fn serialize_summary<S: serde::Serializer>(
-    v: &Option<Arc<ValidationSummary>>,
-    s: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    match v {
-        Some(v) => v.as_ref().serialize(s),
-        None => s.serialize_none(),
     }
 }
 

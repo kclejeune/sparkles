@@ -50,6 +50,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
+    ("/$/reason/{ds}/auto", &["PUT", "DELETE"]),
     ("/$/reason/{ds}/diagnostics", &["GET"]),
     ("/$/tasks", &["GET"]),
     // DELETE (cancel) checks admin on the task's dataset in the handler
@@ -71,6 +72,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/snapshots/{ds}/{name}", &["GET", "DELETE"]),
     ("/$/history/{ds}", &["GET", "PUT"]),
     ("/$/validation/{ds}", &["GET", "PUT", "DELETE"]),
+    ("/$/quota/{ds}", &["GET", "PUT", "DELETE"]),
     // the formatter (feature `fmt`); `serve --format-endpoint` is checked by the handler
     ("/$/format", &["POST"]),
     // backup repositories (feature `backup`)
@@ -113,6 +115,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/get", &["GET", "HEAD"]),
     ("/{ds}/upload", &["POST"]),
     ("/{ds}/explain", &["GET", "POST"]),
+    ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/shacl", &["POST"]),
     ("/{ds}/shex", &["POST"]),
     ("/{ds}/geo", &["GET"]),
@@ -189,6 +192,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
+        | "/{ds}/text"
         | "/{ds}/get"
         | "/{ds}/shacl"
         | "/{ds}/shex"
@@ -201,6 +205,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/snapshots/{ds}/{name}"
         | "/$/history/{ds}"
         | "/$/validation/{ds}"
+        | "/$/quota/{ds}"
         | "/{ds}/prefixes"
             if get =>
         {
@@ -208,7 +213,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         }
         // prefixes are dataset content; snapshots and history retention pin storage
         "/{ds}/prefixes" => Dataset(Write),
+        // a storage quota is the operator's limit on a dataset, not its admins'
+        "/$/quota/{ds}" => Server(ServerPerm::ServerAdmin),
         "/$/reason/{ds}"
+        | "/$/reason/{ds}/auto"
         | "/$/text/{ds}"
         | "/$/text/{ds}/rebuild"
         | "/$/geo/{ds}"
@@ -915,6 +923,15 @@ mod tests {
         for route in ["/{ds}/shacl", "/{ds}/shex"] {
             let n = need(route, &Method::POST, &"/ds/x".parse().unwrap(), &h(&[]));
             assert_eq!(n, Some(Need::Dataset(Level::Read)), "{route}");
+        }
+    }
+
+    #[test]
+    fn a_quota_is_read_by_readers_and_set_by_server_admins() {
+        let n = |m: Method| need("/$/quota/{ds}", &m, &"/x".parse().unwrap(), &h(&[]));
+        assert_eq!(n(Method::GET), Some(Need::Dataset(Level::Read)));
+        for m in [Method::PUT, Method::DELETE] {
+            assert_eq!(n(m), Some(Need::Server(ServerPerm::ServerAdmin)));
         }
     }
 

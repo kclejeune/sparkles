@@ -206,6 +206,70 @@ fn type_name(v: &toml::Value) -> &'static str {
     }
 }
 
+/// A bad entry of a JSON `options` object: the option's camelCase name (`None` when the
+/// object itself is wrong) and what is wrong with it.
+pub(crate) struct JsonOptionError {
+    pub option: Option<String>,
+    pub message: String,
+}
+
+/// Apply a JSON `options` object with camelCase keys (`POST /$/format`, the MCP `format`
+/// tool) to `o`. `null` values are skipped.
+pub(crate) fn json_options(v: &serde_json::Value, o: &mut Options) -> Result<(), JsonOptionError> {
+    use serde_json::Value as J;
+    let Some(obj) = v.as_object() else {
+        return Err(JsonOptionError {
+            option: None,
+            message: "`options` must be an object".into(),
+        });
+    };
+    let bad = |name: &str, message: String| JsonOptionError {
+        option: Some(name.to_string()),
+        message,
+    };
+    for (name, v) in obj {
+        let Some(key) = options::KEYS
+            .iter()
+            .find(|(_, camel)| camel == name)
+            .map(|(kebab, _)| *kebab)
+        else {
+            return Err(bad(name, "unknown option".into()));
+        };
+        let value = match v {
+            J::Null => continue,
+            J::Bool(b) => Value::Bool(*b),
+            J::Number(n) => match n.as_i64() {
+                Some(i) => Value::Int(i),
+                None => Value::Str(n.to_string()),
+            },
+            J::String(s) => Value::Str(s.clone()),
+            J::Array(groups) => {
+                let groups: Option<Vec<Vec<String>>> = groups
+                    .iter()
+                    .map(|g| {
+                        g.as_array()?
+                            .iter()
+                            .map(|l| l.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .collect();
+                match groups {
+                    Some(g) => Value::Groups(g),
+                    None => {
+                        return Err(bad(
+                            name,
+                            "expected an array of arrays of prefix labels".into(),
+                        ));
+                    }
+                }
+            }
+            J::Object(_) => Value::Str(v.to_string()),
+        };
+        options::set(o, key, value).map_err(|e| bad(name, e.message))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

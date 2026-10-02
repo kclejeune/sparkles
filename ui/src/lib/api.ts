@@ -59,6 +59,10 @@ export type Limits = {
   /** The serialized body of a Graph Store GET; absent on servers that predate it. */
   maxExportBytes?: number;
   maxRows: number;
+  /** Rows all the operators of one query produce; absent on servers that predate it. */
+  maxRowsProduced?: number;
+  /** The default storage quota of a persistent dataset; absent on servers that predate it. */
+  maxDatasetBytes?: number;
 };
 
 export type ServerInfo = {
@@ -117,7 +121,9 @@ export type BudgetKind =
   | 'memory'
   | 'result-bytes'
   | 'decompressed-bytes'
-  | 'outbound-bytes';
+  | 'outbound-bytes'
+  | 'rows-produced'
+  | 'dataset-bytes';
 
 type CacheStats = {
   bytes: number;
@@ -125,6 +131,16 @@ type CacheStats = {
   entries: number;
   hits: number;
   misses: number;
+};
+
+/** `GET /$/quota/{ds}`: a dataset's storage quota and the bytes it uses. */
+export type DatasetQuota = {
+  /** The quota in effect; null when unlimited. */
+  maxBytes: number | null;
+  /** `dataset`: set on the dataset; `default`: the server's `--max-dataset-mb`. */
+  source: 'dataset' | 'default';
+  defaultMaxBytes: number | null;
+  usedBytes: number;
 };
 
 /** `GET /$/metrics?format=json`: the metrics registry as JSON. */
@@ -180,6 +196,8 @@ export type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[];
   classes: { iri: string; instances: number }[];
   diskBytes: number;
+  /** Storage quota of a persistent dataset (null in memory); absent on servers that predate it. */
+  quota?: DatasetQuota | null;
   /** Decoded-block cache. */
   cache: { entries: number; bytes: number; hits: number; misses: number };
   /** Query (sub)result cache; absent on servers that predate it. */
@@ -327,7 +345,9 @@ function budgetOf(body: Record<string, unknown>): Budget | undefined {
     kind !== 'memory' &&
     kind !== 'result-bytes' &&
     kind !== 'decompressed-bytes' &&
-    kind !== 'outbound-bytes'
+    kind !== 'outbound-bytes' &&
+    kind !== 'rows-produced' &&
+    kind !== 'dataset-bytes'
   )
     return undefined;
   return { kind, limit: Number(body.limit ?? 0), requested: Number(body.requested ?? 0) };
@@ -346,6 +366,10 @@ export function budgetHint(b: Budget): string {
       return `The request body is too large once decompressed (limit ${fmtBytes(b.limit)}). Send less data per request.`;
     case 'outbound-bytes':
       return `SERVICE calls and LOADs downloaded too much in total (limit ${fmtBytes(b.limit)}). Fetch less remote data per request.`;
+    case 'rows-produced':
+      return `The query does too much work (limit ${fmtInt(b.limit)} rows produced). Narrow the query or make its patterns more selective.`;
+    case 'dataset-bytes':
+      return `The write would take the dataset over its storage quota (${fmtBytes(b.limit)}). Delete data, compact the dataset, or ask an administrator for a larger quota.`;
   }
 }
 
@@ -1107,7 +1131,14 @@ export type ReasoningStatus = {
   stale: boolean | null;
   commitsSince: number | null;
   staleReason?: string;
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string };
+  auto: {
+    enabled: boolean;
+    /** `server`: --auto-reason; `dataset`: the dataset's own setting */
+    source?: 'server' | 'dataset';
+    debounceSeconds?: number;
+    maxDelaySeconds?: number;
+    scheduledAt?: string;
+  };
   warnings: string[];
 };
 
@@ -1132,6 +1163,18 @@ export async function reasonStatus(ds: string): Promise<ReasoningStatus | null> 
   return body && 'profile' in body ? body : null;
 }
 
+/** The dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`). */
+export const setAutoReasoning = (ds: string, enabled: boolean) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+
+/** Drop the dataset's own setting: the server's `--auto-reason` applies again. */
+export const clearAutoReasoning = (ds: string) =>
+  json<ReasoningStatus>(`/$/reason/${enc(ds)}/auto`, { method: 'DELETE' });
+
 /** Re-run the recorded profile (including custom rules). */
 export const rerunReasoning = (ds: string) =>
   json<Task>(`/$/reason/${enc(ds)}`, jsonBody({ rerun: true }));
@@ -1140,8 +1183,17 @@ export const DIAGNOSTIC_CHECKS = [
   'nothing-member',
   'disjoint-classes',
   'all-disjoint-classes',
+  'complement-classes',
+  'max-cardinality-zero',
+  'max-qualified-cardinality-zero',
   'same-different',
+  'all-different',
   'functional-literal-conflict',
+  'irreflexive-property',
+  'asymmetric-property',
+  'disjoint-properties',
+  'all-disjoint-properties',
+  'negative-property-assertion',
   'thing-empty',
   'unsatisfiable-class',
 ] as const;

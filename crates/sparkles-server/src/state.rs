@@ -53,6 +53,22 @@ pub struct ReasoningInfo {
     /// copied from a clone source whose inferences were already stale
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_stale: bool,
+    /// this dataset's automatic re-runs; `None` follows the server's `--auto-reason`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoSetting>,
+}
+
+/// A dataset's own automatic re-run setting (`PUT /$/reason/{ds}/auto`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSetting {
+    pub enabled: bool,
+    /// seconds without a commit before a run; the server's, else 5
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_seconds: Option<f64>,
+    /// seconds after which a run starts even while writes continue; 12 × the debounce
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay_seconds: Option<f64>,
 }
 
 pub struct Dataset {
@@ -371,6 +387,11 @@ pub struct Limits {
     pub max_export_bytes: Option<u64>,
     /// rows of any intermediate result
     pub max_rows: usize,
+    /// rows produced by all the operators of one query, summed
+    pub max_rows_produced: Option<u64>,
+    /// the default storage quota of a persistent dataset (`--max-dataset-mb`; the
+    /// stores enforce it, this copy is for display)
+    pub max_dataset_bytes: Option<u64>,
     /// SPARQL updates without a `timeout` parameter (`None`: no limit, the default)
     pub update_timeout: Option<std::time::Duration>,
     /// decompressed size of a compressed request body or uploaded file
@@ -396,6 +417,8 @@ impl Default for Limits {
             max_result_bytes: Some(1 << 30),
             max_export_bytes: None,
             max_rows: 200_000_000,
+            max_rows_produced: None,
+            max_dataset_bytes: None,
             update_timeout: None,
             max_decompressed_bytes: Some(64 << 30),
             max_query_body_bytes: Some(16 << 20),
@@ -410,8 +433,8 @@ impl Default for Limits {
 
 impl Limits {
     /// `{timeoutSeconds, updateTimeoutSeconds, maxTimeoutSeconds, queryMemoryBytes,
-    /// maxResultBytes, maxExportBytes, maxRows, max…BodyBytes, maxUploadBytes}`; 0 means
-    /// unlimited.
+    /// maxResultBytes, maxExportBytes, maxRows, maxRowsProduced, maxDatasetBytes,
+    /// max…BodyBytes, maxUploadBytes}`; 0 means unlimited.
     pub fn json(&self, timeout: std::time::Duration) -> serde_json::Value {
         let secs = |t: Option<std::time::Duration>| t.map_or(0.0, |t| t.as_secs_f64());
         serde_json::json!({
@@ -422,6 +445,8 @@ impl Limits {
             "maxResultBytes": self.max_result_bytes.unwrap_or(0),
             "maxExportBytes": self.max_export_bytes.unwrap_or(0),
             "maxRows": self.max_rows,
+            "maxRowsProduced": self.max_rows_produced.unwrap_or(0),
+            "maxDatasetBytes": self.max_dataset_bytes.unwrap_or(0),
             "maxQueryBodyBytes": self.max_query_body_bytes.unwrap_or(0),
             "maxUpdateBodyBytes": self.max_update_body_bytes.unwrap_or(0),
             "maxAdminBodyBytes": self.max_admin_body_bytes.unwrap_or(0),

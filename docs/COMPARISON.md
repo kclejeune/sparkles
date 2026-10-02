@@ -25,16 +25,16 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | Jena / Fuseki | Sparkles |
 |---|---|---|
-| Full-text search | jena-text (Lucene), `text:query` | A `text:query` subset over string literals (Tantivy, BM25), updated on commit. No highlighting, per-language stemming or multi-field entity documents. |
+| Full-text search | jena-text (Lucene), `text:query` | `text:query` with Lucene's query syntax and Jena's highlighting over string literals (Tantivy, BM25), updated on commit. No per-language stemming or multi-field entity documents. |
 | Spatial | GeoSPARQL 1.0/1.1: `geof:` and `spatialF:` functions, `spatial:` property functions over a spatial index, query rewrite of the topological properties, RDFS entailment of the geometry hierarchy, GML and KML literals, EPSG CRSs through Apache SIS | The GeoSPARQL 1.1 `geof:` functions over WKT and GeoJSON literals in the built-in CRSs and the 120 UTM zones; Jena's `spatial:` property functions and `spatialF:` filter functions; a per-dataset spatial index used by FILTERs, property functions, spatial joins and nearest-neighbour ORDER BY; query rewrite (off by default) and RDFS entailment of the geometry hierarchy (`--vocab geosparql`). No geometry-type entailment, GML/KML literals or EPSG database ([AUDIT.md](AUDIT.md#5-explicit-non-goals-for-v1) §5). |
 | Shape languages | ShEx (jena-shex) | SHACL, and ShEx 2.1 (ShExC, ShExJ, ShExR, SPARQL selectors). No ShEx 2.2. |
-| Inference | On-the-fly `InfModel`, backward and hybrid rules (LP engine), OWL Micro/Mini/Full | Forward materialization only (RDFS, an OWL 2 RL subset, Jena forward rules). Not incremental: after an update the inferences are marked stale and recomputed in full, on request or automatically with `--auto-reason`. Inconsistency checks cover a fixed subset of the OWL 2 RL `false` rules (`owl:Nothing`, `disjointWith`, `AllDisjointClasses`, sameAs/differentFrom, functional literals), not full consistency. |
+| Inference | On-the-fly `InfModel`, backward and hybrid rules (LP engine), OWL Micro/Mini/Full | Forward materialization only (RDFS, an OWL 2 RL subset, Jena forward rules). Not incremental: after an update to the default graph the inferences are marked stale and recomputed in full, on request or automatically. Inconsistency checks cover the OWL 2 RL `false` rules except `dt-not-type`, which is not full consistency checking. |
 | Ontology API | jena-ontapi `OntModel` | ✗ (triples and SPARQL only) |
 | SPARQL extensions | Property functions (`list:member`, `apf:*`), `LET`, custom aggregates (`MEDIAN`, `MODE`, `FOLD`), `cdt:` list/map literals, JavaScript functions, the full `afn:`/`fn:` library | ✗ (the common `fn:`, `afn:` and `math:` functions only) |
 | SPARQL parser | JavaCC grammar | `spargebra` 0.4.7, vendored with fixes for the W3C tests it failed ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)) |
 | RDF formats | RDF Thrift, RDF Protobuf, TriX, RDF/JSON | ✗ (Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD only) |
 | Change logs | RDF Patch (jena-rdfpatch), Fuseki `/patch` | ✗ |
-| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix endpoints | Basic and Bearer tokens, OIDC sign-in for the UI and trusted proxy headers, with per-dataset access levels; no per-graph ACLs. Prometheus `/$/metrics` with Sparkles metric names (not `fuseki_requests_*`) and no JVM metrics. Datasets are configured by CLI flags and the admin API. Prefixes through `/{ds}/prefixes`. |
+| Fuseki operations | Shiro authentication, per-graph access control (fuseki-access), Prometheus `/$/metrics`, assembler (`config.ttl`) service definitions, `/$/validate/*`, prefix endpoints | Basic and Bearer tokens, OIDC sign-in for the UI and trusted proxy headers, with per-dataset access levels; no per-graph ACLs. Prometheus `/$/metrics` with Sparkles metric names, plus Fuseki's `fuseki_requests*` names with `--metrics-fuseki-names`, and no JVM metrics. Datasets are configured by CLI flags and the admin API. Prefixes through `/{ds}/prefixes`. |
 | SERVICE | Bulk, batched and cached SERVICE (serviceenhancer) | Plain SERVICE only |
 | Transactions over HTTP | — | — (as in Fuseki, one request is one transaction) |
 | Backups | `/$/backup/{ds}`: a gzipped N-Quads dump of the whole dataset in the server's directory, restored by loading it into a new dataset | The same dumps, zstd by default (`?compression=gzip` gives Fuseki's `.nq.gz`; brotli and LZ4 also work). Also backup repositories on a file system or S3: incremental, deduplicated backups that restore to a ready database without a reload, with verification, schedules and retention. |
@@ -185,8 +185,10 @@ authentication.
   version. A scan merges the delta into the blocks it changes. It finds the base rows
   between two delta keys by binary search, and only those blocks have every column
   decoded.
-* **Columnar execution and planning.** Execution is column-major. The planner is a DP over
-  interesting sort orders with a greedy fallback, and merge joins run on sorted scans.
+* **Columnar execution and planning.** Execution is column-major. The planner orders joins
+  with QLever's dynamic program, which keeps the cheapest plan per subset of patterns and
+  sort order, and merge joins run on sorted scans. Groups too large for the program are
+  planned in rounds or greedily, as described under join ordering on cost summaries below.
 * **Decoded-block cache.** A shared cache of decoded blocks, weighted by bytes.
 * **Result cache.** Executed subtrees are cached under a canonical plan key and the
   snapshot version, so updates invalidate entries without extra work. Results with
@@ -311,3 +313,20 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
 * **Whole-block scans under graph filters.** A block slice is copied column-wise whenever
   every row passes the graph filter (one pass over the graph column), so default-graph
   queries avoid row-by-row filtering.
+* **Join ordering on cost summaries** (`pruned_join_order`). The dynamic program runs on
+  small summaries of plans, which hold the cost, the estimated rows, the sort variable and
+  the distinct-value estimates that later joins read. The plan tree is built once, for the
+  chosen joins only. A greedy plan is made first, and a partial plan that costs more than
+  it is dropped, because it cannot be part of a cheaper plan. A plan sorted on a variable
+  that no later join reads is dropped when another plan of the same patterns has the same
+  estimates at no more cost. Only subsets whose patterns share variables are planned. Up to
+  ten patterns, the result is the exhaustive program's plan or one of equal cost, except in
+  rare cases where a dropped plan is the one that a later filter would have favored. Every
+  WatDiv and `scripts/bench.sh` query plans at the same cost as before, and a star of nine
+  patterns (WatDiv S1) plans in about a millisecond instead of 400 ms. A group whose
+  subsets have too many splits to enumerate in about a millisecond is planned in rounds.
+  Each round plans the subsets up to the size that fits, and the cheapest plan of that
+  size becomes one input of the next round. That plan never costs more than the greedy
+  one. Groups of more than 16 patterns keep the greedy plan, which costs each pair of
+  plans once. Switched off, the program builds every candidate plan tree for every split
+  of up to 12 patterns, and larger groups are planned greedily.

@@ -9,6 +9,8 @@
 
 mod adapter;
 mod errors;
+#[cfg(feature = "fmt")]
+mod format;
 mod pins;
 mod render;
 mod schemas;
@@ -73,6 +75,10 @@ pub struct McpArgs {
     /// Maximum number of rows of any intermediate result
     #[arg(long, value_name = "N", default_value_t = 200_000_000)]
     pub max_rows: usize,
+    /// Budget for the rows all the operators of a call's query produce together (0:
+    /// unlimited)
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub max_rows_produced: u64,
     /// Largest `maxRows` a sparql_query call may request
     #[arg(long, value_name = "N", default_value_t = 1000)]
     pub mcp_max_rows: usize,
@@ -317,6 +323,7 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         query_memory_bytes: memory,
         max_result_bytes: None,
         max_rows: args.max_rows,
+        max_rows_produced: (args.max_rows_produced > 0).then_some(args.max_rows_produced),
         update_timeout: None,
         ..Default::default()
     };

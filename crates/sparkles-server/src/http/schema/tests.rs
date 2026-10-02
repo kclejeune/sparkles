@@ -363,3 +363,148 @@ async fn inferences_follow_the_reasoning_parameter() {
     let c = find(&j["classes"], "http://ex.org/C");
     assert_eq!(c["declared"]["superClasses"].as_array().unwrap().len(), 2);
 }
+
+/// Status, content type and body of a GET with an `Accept` header.
+async fn get_accept(app: &Router, path: &str, accept: &str) -> (StatusCode, String, String) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header(header::ACCEPT, accept)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let ct = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, ct, String::from_utf8(body.to_vec()).unwrap())
+}
+
+const VOID: &str = "http://rdfs.org/ns/void#";
+
+/// The VoID dataset node and the integer value of each of its `void:` properties.
+fn void_numbers(
+    text: &str,
+    format: oxrdfio::RdfFormat,
+) -> (Vec<oxrdf::Triple>, Vec<(String, u64)>) {
+    let g: Vec<oxrdf::Triple> = oxrdfio::RdfParser::from_format(format)
+        .for_slice(text.as_bytes())
+        .map(|q| oxrdf::Triple::from(q.unwrap()))
+        .collect();
+    let dataset = g
+        .iter()
+        .find(|t| t.object.to_string() == format!("<{VOID}Dataset>"))
+        .unwrap_or_else(|| panic!("no void:Dataset in\n{text}"))
+        .subject
+        .clone();
+    let mut numbers: Vec<(String, u64)> = g
+        .iter()
+        .filter(|t| t.subject == dataset)
+        .filter_map(|t| {
+            let p = t.predicate.as_str().strip_prefix(VOID)?;
+            match &t.object {
+                oxrdf::Term::Literal(l) => Some((p.to_string(), l.value().parse().ok()?)),
+                _ => None,
+            }
+        })
+        .collect();
+    numbers.sort();
+    (g, numbers)
+}
+
+#[tokio::test]
+async fn void_by_content_negotiation() {
+    let s = server(
+        r#"ex:Person a owl:Class ; rdfs:label "Person" .
+           ex:alice a ex:Person ; ex:knows ex:bob .
+           ex:bob a ex:Person ."#,
+    );
+    // JSON first: the cached report has no term totals, and VoID computes them
+    let j = ok(&s.app, "/$/schema/t").await;
+    assert!(j["totals"].get("distinctSubjects").is_none());
+    let (status, ct, text) = get_accept(&s.app, "/$/schema/t", "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(ct.starts_with("text/turtle"), "{ct}");
+    assert!(text.contains("@prefix void:"), "{text}");
+    let (g, numbers) = void_numbers(&text, oxrdfio::RdfFormat::Turtle);
+    let expected = [
+        ("classes", 2),
+        ("distinctObjects", 4),
+        ("distinctSubjects", 3),
+        ("entities", 3),
+        ("properties", 3),
+        ("triples", 5),
+    ]
+    .map(|(p, n)| (p.to_string(), n));
+    assert_eq!(numbers, expected, "{text}");
+    let parts = |key: &str| {
+        g.iter()
+            .filter(|t| t.predicate.as_str() == format!("{VOID}{key}"))
+            .count()
+    };
+    assert_eq!(
+        (parts("classPartition"), parts("propertyPartition")),
+        (2, 3)
+    );
+    // the declarations follow, unless left out
+    let label = "http://www.w3.org/2000/01/rdf-schema#label";
+    assert!(g.iter().any(|t| t.predicate.as_str() == label), "{text}");
+    let (_, _, text) = get_accept(&s.app, "/$/schema/t?declarations=false", "text/turtle").await;
+    let (g, numbers) = void_numbers(&text, oxrdfio::RdfFormat::Turtle);
+    assert_eq!(numbers, expected);
+    assert!(!g.iter().any(|t| t.predicate.as_str() == label), "{text}");
+    // the other syntaxes, by Accept or format=
+    for (path, accept, ct, format) in [
+        (
+            "/$/schema/t",
+            "application/n-triples",
+            "application/n-triples",
+            oxrdfio::RdfFormat::NTriples,
+        ),
+        (
+            "/$/schema/t",
+            "application/rdf+xml;q=0.9, application/json;q=0.5",
+            "application/rdf+xml",
+            oxrdfio::RdfFormat::RdfXml,
+        ),
+        (
+            "/$/schema/t?format=nquads",
+            "*/*",
+            "application/n-quads",
+            oxrdfio::RdfFormat::NQuads,
+        ),
+    ] {
+        let (status, got, text) = get_accept(&s.app, path, accept).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(got, ct);
+        assert_eq!(void_numbers(&text, format).1, expected, "{accept}");
+    }
+    // JSON stays the default, and the JSON document has no term totals
+    for (path, accept) in [
+        ("/$/schema/t", "*/*"),
+        ("/$/schema/t", "application/json"),
+        ("/$/schema/t?format=json", "text/turtle"),
+    ] {
+        let (status, ct, text) = get_accept(&s.app, path, accept).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json", "{path} {accept}");
+        let j: J = serde_json::from_str(&text).unwrap();
+        assert_eq!(j["totals"]["triples"], 5);
+        assert!(j["totals"].get("distinctSubjects").is_none(), "{text}");
+    }
+    for path in [
+        "/$/schema/t?format=csv",
+        "/$/schema/t?format=turtle&declarations=maybe",
+    ] {
+        let (status, _, text) = get_accept(&s.app, path, "*/*").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+    }
+}

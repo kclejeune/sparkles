@@ -5,19 +5,24 @@
 //! Every page of a listing comes from one report computed at one snapshot. The cursor
 //! carries that snapshot's identity, a hash of the selection parameters and the last IRI
 //! served; the dataset keeps its last report so a listing can be finished after a write.
+//!
+//! The summary is also a VoID description in RDF (`Accept: text/turtle` and the other RDF
+//! syntaxes, or `format=`), followed by the declarations unless `declarations=false`.
 
 use super::{ApiError, ApiResult, INFERRED_GRAPH, Params, St, blocking, dataset, err};
 use crate::state::{AppState, Dataset, SchemaCacheEntry};
 use axum::Json;
 use axum::extract::Path;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use oxrdfio::RdfFormat;
 use serde::{Deserialize, Serialize};
 use sparkles::schema::{
-    self, GraphSelection, HasIri, Page, SchemaError, SchemaOptions, SchemaReport,
+    self, GraphSelection, HasIri, Page, SchemaError, SchemaOptions, SchemaReport, VoidOptions,
 };
+use sparkles::sparql::results;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -125,6 +130,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
             deadline: None,
             cancel: None,
             max_entries: st.schema_max_entries,
+            term_totals: false,
         },
         selection,
         limit,
@@ -166,6 +172,7 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
     if let Some(e) = ds.schema_cache.lock().as_ref()
         && e.identity == wanted
         && e.selection == req.selection
+        && (e.report.term_totals.is_some() || !req.opts.term_totals)
     {
         return Ok(e.report.clone());
     }
@@ -229,17 +236,71 @@ fn page<'a, T: HasIri>(
 #[derive(Clone, Copy)]
 enum What {
     Summary,
+    /// the summary as a VoID description, with the declarations or without
+    Void(RdfFormat, bool),
     Classes,
     Predicates,
+}
+
+/// The RDF syntax a summary request asks for with `format=` or `Accept`; `None` is the
+/// JSON document.
+fn rdf_format(params: &Params, headers: &HeaderMap) -> ApiResult<Option<RdfFormat>> {
+    if let Some(f) = params.get("format") {
+        if f == "json" {
+            return Ok(None);
+        }
+        return results::rdf_format_from_name(f).map(Some).ok_or_else(|| {
+            bad(format!(
+                "unknown format '{f}': json, turtle, ntriples, nquads, trig, rdfxml or jsonld"
+            ))
+        });
+    }
+    const OFFERS: [&str; 7] = [
+        "application/json",
+        "text/turtle",
+        "application/n-triples",
+        "application/ld+json",
+        "application/rdf+xml",
+        "application/trig",
+        "application/n-quads",
+    ];
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*/*");
+    Ok(match super::negotiate(accept, &OFFERS) {
+        None | Some(0) => None,
+        Some(i) => results::rdf_format_from_name(OFFERS[i]),
+    })
 }
 
 async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let mut req = parse(&st, &ds, &uri)?;
+    // VoID is always complete (no cursor), and reports the distinct subjects and objects
+    // of the selection as well
+    if matches!(what, What::Void(..)) {
+        req.opts.term_totals = true;
+        req.cursor = None;
+    }
     blocking(move || {
         let report = report(&ds, &mut req)?;
         let r = &*report;
         Ok(match what {
+            What::Void(format, declarations) => {
+                let mut prefixes = sparkles::io::standard_prefixes();
+                prefixes.extend(ds.store.prefixes());
+                let opts = VoidOptions {
+                    dataset: &ds.name,
+                    declarations,
+                    prefixes: prefixes.into_iter().collect(),
+                };
+                (
+                    [(header::CONTENT_TYPE, results::rdf_media_type(format))],
+                    schema::void_text(r, &opts, format),
+                )
+                    .into_response()
+            }
             // the summary always starts both lists at the top
             What::Summary => Json(r.summary(
                 &ds.name,
@@ -254,8 +315,29 @@ async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
     .await
 }
 
-pub(super) async fn summary(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult {
-    serve(st, name, uri, What::Summary).await
+pub(super) async fn summary(
+    st: St,
+    Path(name): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let params = Params::from_query(&uri);
+    let what = match rdf_format(&params, &headers)? {
+        None => What::Summary,
+        Some(f) => {
+            let declarations = match params.get("declarations") {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(v) => {
+                    return Err(bad(format!(
+                        "declarations must be true or false, not '{v}'"
+                    )));
+                }
+            };
+            What::Void(f, declarations)
+        }
+    };
+    serve(st, name, uri, what).await
 }
 
 pub(super) async fn classes(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult<Response> {

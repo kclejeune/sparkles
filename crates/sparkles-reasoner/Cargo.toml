@@ -9,6 +9,7 @@ license.workspace = true
 sparkles.workspace = true
 oxrdf.workspace = true
 oxsdatatypes.workspace = true
+oxttl.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 anyhow.workspace = true

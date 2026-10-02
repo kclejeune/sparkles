@@ -1,0 +1,12 @@
+# asymmetric-property: two individuals related in both directions by an asymmetric
+# property (OWL 2 RL prp-asyp). An individual related to itself is included.
+#
+# The checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?x ?p ?y WHERE {
+  ?p rdf:type owl:AsymmetricProperty .
+  ?x ?p ?y .
+  ?y ?p ?x .
+}

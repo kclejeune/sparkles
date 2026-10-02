@@ -7,8 +7,9 @@
 //! * `databases/.replaced-<ds>-<task>` next to a `databases/<ds>` is removed (the swap
 //!   finished before the crash). A copy kept on purpose (`keepReplaced`) is renamed
 //!   by the restore to `.kept-<ds>-<task>`, which this rule does not match;
-//! * `tmp/verify-*` (the scratch directory of a `restore`-level verification) is
-//!   removed.
+//! * `tmp/verify-*` (the scratch directory of a `restore`-level verification) and
+//!   `tmp/memory-backup-*` (the temporary copy of an in-memory dataset being backed
+//!   up) are removed.
 
 use anyhow::Context;
 use std::path::Path;
@@ -73,7 +74,10 @@ pub fn startup(data_dir: &Path) -> anyhow::Result<()> {
     }
     if let Ok(entries) = std::fs::read_dir(data_dir.join("tmp")) {
         for e in entries.flatten() {
-            if e.file_name().to_string_lossy().starts_with("verify-") {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("verify-")
+                || name.starts_with(sparkles::store::MEMORY_CAPTURE_PREFIX)
+            {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
@@ -110,6 +114,7 @@ mod tests {
         }
         std::fs::write(db.join(".replaced-b-6").join("marker"), b"old b").unwrap();
         std::fs::create_dir_all(dir.path().join("tmp").join("verify-9")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp").join("memory-backup-x1")).unwrap();
         startup(dir.path()).unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&db)
             .unwrap()
@@ -122,6 +127,7 @@ mod tests {
             b"old b"
         );
         assert!(!dir.path().join("tmp").join("verify-9").exists());
+        assert!(!dir.path().join("tmp").join("memory-backup-x1").exists());
         // nothing to do: fine, also without a databases directory
         startup(dir.path()).unwrap();
         startup(&dir.path().join("none")).unwrap();

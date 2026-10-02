@@ -77,7 +77,9 @@ A dataset `ds` has the Fuseki-style endpoints `/ds/sparql`, `/ds/update`, `/ds/d
 an in-memory dataset, and `--loc NAME=PATH` serves an existing database.
 
 `/$/ping` is the liveness check and `/$/ready` the readiness check. `/$/ready` returns
-`503` once shutdown starts on SIGINT or SIGTERM. `/$/metrics` serves Prometheus metrics.
+`503` once shutdown starts on SIGINT or SIGTERM. The requests in flight then get
+`--shutdown-grace` seconds to finish, after which the rest are cancelled and commit
+nothing ([API.md](API.md#shutdown)). `/$/metrics` serves Prometheus metrics.
 Every response carries an `X-Request-Id`, and each request is logged once under the
 `sparkles::access` target.
 
@@ -96,12 +98,15 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows in any intermediate result. |
+| `--max-rows-produced N` | `0` | Rows that all the operators of one query produce together; `0` means unlimited. It caps the work of a query independently of the machine's speed. |
 | `--max-query-body-mb N` | `16` | Largest SPARQL query body, which also covers explain and `/shacl` shapes; `0` means unlimited. A larger body gets `413`. |
 | `--max-update-body-mb N` | `256` | Largest SPARQL update body; `0` means unlimited. Bulk data goes through the Graph Store or `/upload`. |
 | `--max-admin-body-mb N` | `16` | Largest `/$/…` or prefix-change body; `0` means unlimited. `/$/auth/*` bodies are capped at 64 KiB. |
 | `--max-upload-mb N` | `4096` | Largest Graph Store write or upload body; `0` means unlimited. The body is streamed to a temporary file and counted after HTTP decompression. |
 | `--min-free-disk-mb N` | `1024` | Free disk space to keep; `0` turns the check off. The server refuses with `507` to spool a request body when the temporary directory's file system would keep less. It refuses to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) when the data directory's file system would keep less. |
 | `--max-mem-dataset-mb N` | `4096` | Largest in-memory dataset; `0` means unlimited. A commit that would grow one past it fails with `507`. |
+| `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
+| `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
@@ -117,6 +122,8 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--no-access-log` | | No per-request log lines. |
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
 | `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
+| `--metrics-fuseki-names` | off | Also expose Fuseki's metric names (`fuseki_requests`, `fuseki_requests_good`, `fuseki_requests_bad`) on `/$/metrics`, for dashboards built for Fuseki. See [API.md](API.md#fuseki-metric-names). |
+| `--metrics-addr HOST:PORT` | | Also serve `/$/metrics` on this address, with the same authentication. Without `--auth-config`, an address that is not loopback needs `--allow-open-network`. |
 | `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
 | `--otel-logs` | off | Export log events over OTLP as well. |
 | `--otel-query-text` | off | Record query text (`db.query.text`) and plan operator descriptions in spans. These may hold data. |
@@ -141,7 +148,9 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 `--map-style-url`, and the compression and schema limits.
 
 A request over budget fails with `507` and a JSON body that names the budget. The
-outbound total is named `outbound-bytes`. A query or write stops as soon as its client
+outbound total is named `outbound-bytes`. A query can lower its own budgets with the
+`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb` parameters, but never
+raise them ([API.md](API.md#budgets)). A query or write stops as soon as its client
 disconnects, and a write then commits nothing. `sparkles query --memory-mb N` applies the
 memory budget on the command line, where there is no limit by default.
 
@@ -175,12 +184,30 @@ sparkles vector create --loc db --name emb --predicate http://example.org/emb --
                                               # vector index with an HNSW graph: --metric, --m, --ef-construction,
                                               #   --ef-search, --exact-threshold, --no-hnsw
 sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server URL --dataset NAME
+sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes it, no flag prints it
+sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 ```
 
 `sparkles vector create` writes the index to `vector.json`, builds it, and waits for the
 build. Later openings of the database map the built index from its file. Every
 `sparkles vector` command also works against a server with `--server URL --dataset NAME`
 in place of `--loc` ([API](API.md#vector-indexes)).
+
+`sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
+commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the
+message travels in the `Sparkles-Commit-Message` header, and each file that `load` sends
+becomes its own commit with the same message. A message is at most 1024 bytes of UTF-8
+with no control characters.
+
+```sh
+sparkles update --loc db --message 'Fix the labels of ex:alice' 'DELETE … INSERT …'
+sparkles load   --server http://localhost:3030 --dataset ds --message 'Nightly import' data.ttl
+sparkles log    --loc db                      # the message follows each commit's columns
+```
+
+The global flag `--commit-digests` makes a command record a change digest with every
+commit of the databases it opens. A database keeps the setting once it is on, so later
+commands and servers record digests too. See [API: Commits](API.md#commits).
 
 `sparkles geo-index` enables the spatial index if it is off, with the defaults or the
 given options. It then builds the index and prints its status to stderr. When the index
@@ -193,6 +220,7 @@ The other commands are:
 * `schema`, `shacl` and `shex validate|parse`;
 * `validation`, for write-time validation;
 * `snapshot`, for named snapshots and history retention;
+* `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `repo` and `backup create|list|show|restore|verify|delete|policy`
   ([below](#backup-repositories));
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
@@ -201,6 +229,11 @@ The other commands are:
 * `fmt` and `lsp` ([below](#formatting)).
 
 `sparkles help COMMAND` describes each one.
+
+`sparkles schema --loc db --format void` prints the schema report as a VoID description
+in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
+`GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
+([API.md](API.md#schema-discovery)).
 
 ## Formatting
 
@@ -281,6 +314,16 @@ The UI formats in the page when it is built with the formatter's WebAssembly mod
 Backup repositories (see [API.md](API.md#backup-repositories)) also work offline, on a
 stopped database. A server's own datasets are backed up through its HTTP API or UI, or by
 its policies.
+
+In-memory datasets (`--mem`, or `dbType=mem`) are backed up by the server too. They have
+no files on disk, so each backup first writes the dataset's current state to a temporary
+index generation in `<data>/tmp`. That needs about as much free disk space as the
+compacted dataset, on top of the `--min-free-disk-mb` reserve. The copy is removed when
+the upload ends. A backup taken this way restores as a new persistent dataset, with the
+same content, prefixes, validation and index settings. Each server start gives an
+in-memory dataset a new id, and retention keeps `min_count` backups per id. A policy for
+such datasets should therefore set `expire_after` with `min_count = 0` (see
+[API.md](API.md#lifecycle-policies)).
 
 `--repo` takes either a name from the backup config file or a URL. The config file is
 `--backup-config FILE` or `$SPARKLES_BACKUP_CONFIG`, and defaults to
@@ -517,6 +560,9 @@ The tools are read-only:
 * `validate_shacl` and `validate_shex` check a shapes graph, or a ShEx schema with a
   shape map, against a snapshot. They return counts and the first 20 results with node,
   shape and reason. They do not follow imports.
+* `format` formats a SPARQL query or update, Turtle, TriG, N-Triples, N-Quads or JSON-LD
+  the way `sparkles fmt` does, and returns the text with any warnings. It reads no
+  dataset.
 
 [API.md](API.md#mcp-server) has the tool schemas. Results are sized for a model's
 context. Query rows come back as a compact table with the dataset's prefixes, up to 100
@@ -527,7 +573,8 @@ keeps a multi-call exploration on one snapshot. The server holds the last 4 comm
 per dataset for 10 minutes.
 
 Every call runs under the query timeout, a memory budget (`--query-memory-mb`, default
-2048) and the intermediate-row cap. The timeout is 30 s by default, and `--timeout` is
+2048), the intermediate-row cap and, with `--max-rows-produced`, a cap on the rows all of
+a query's operators produce. The timeout is 30 s by default, and `--timeout` is
 the maximum. At most `--max-concurrent` calls (4) run at a time. SERVICE is off unless
 `--allow-service` is given, because a prompt-injected model could otherwise send data to
 any URL. When allowed, SERVICE follows the
@@ -666,6 +713,10 @@ is the client.
 directory only. The service gets the directory read-only. It must not contain `dataDir`
 or lie under `/tmp`.
 
+`metrics.fusekiNames = true` passes `--metrics-fuseki-names`, and
+`metrics.listenAddress = "127.0.0.1:9464"` passes `--metrics-addr` for a scrape port of
+its own. The firewall is not opened for that port.
+
 With `auth.configFile`, the service starts with `--auth-config`, and
 `systemctl reload sparkles` re-reads the file (SIGHUP). Keep the file out of the Nix
 store (agenix, sops-nix), owned by the `sparkles` user. Do not also set nginx
@@ -686,6 +737,10 @@ services.sparkles.backup = {
   maxTasks = 1;
 };
 ```
+
+When the service stops, requests in flight get `shutdownGrace` seconds (default 20) to
+finish before they are cancelled. The unit's `TimeoutStopSec` is `shutdownGrace + 15`,
+which leaves time for the cancelled requests to stop and for the final flush.
 
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so stop the service before offline work such as `sparkles load` or

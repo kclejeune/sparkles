@@ -1114,7 +1114,14 @@ reads reuse the cached state and take 0.7–3.6 ms. Reading the base of a sealed
 generation takes 43 ms (target < 50 ms), or 89–93 ms right after a restart, when that
 generation's files must be opened first.
 
-**Not built.** None of Phase 2 is built: diffs, `Accept-Datetime` and ETags, `maxBytes`
+**Entity tags.** The Graph Store tags of Phase 2 came with
+[CI Phase 3](CI-commit-identity.md#outcome). A read with `at` gets the tag of the commit
+it read, `W/"<datasetId>:<seq>:<format>"`, and `If-None-Match` answers `304`. The format
+part keeps the tags of different serializations apart. `Cache-Control: immutable` is not
+sent. A dataset deleted and re-created under the same name starts its commits again at 0,
+so the URL of `at=commit:N` can later name a different state.
+
+**Not built.** The rest of Phase 2 is not built: diffs, `Accept-Datetime`, `maxBytes`
 retention, per-pin expiry and scheduled pins, history for in-memory datasets, `at` on
 schema, stats, SHACL, clone and backup, history metrics, and the UI's snapshot panel and
 `at` selector. Nor is Phase 3: a generation-independent change log, full-text search at

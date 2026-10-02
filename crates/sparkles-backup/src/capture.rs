@@ -25,8 +25,10 @@ pub struct Source {
     /// writer-lock hold time of the capture (zero for a closed directory)
     pub lock_hold: Duration,
     /// keeps the generation until the source is dropped (holds nothing for a closed
-    /// directory)
+    /// directory; for an in-memory dataset it removes the temporary database)
     pub lease: LeaseGuard,
+    /// the source is an in-memory dataset (the manifest's `dataset.type` is `mem`)
+    pub in_memory: bool,
 }
 
 impl From<BackupCapture> for Source {
@@ -39,6 +41,7 @@ impl From<BackupCapture> for Source {
             files: c.files,
             lock_hold: c.lock_hold,
             lease: c.lease,
+            in_memory: c.in_memory,
         }
     }
 }
@@ -164,6 +167,107 @@ mod tests {
                 .unwrap_err(),
         );
         assert_eq!(e.code(), Code::BackupUnsupported);
+    }
+
+    /// A backup of an in-memory dataset through an `fs` repository: verified, restored
+    /// as a persistent database with the same content, head and id, and backed up
+    /// again unchanged without new pieces.
+    #[test]
+    fn an_in_memory_dataset_round_trips() {
+        use crate::{
+            CreateOptions, OpenEnv, RepoConfig, Repository, RestoreOptions, VerifyLevel,
+            VerifyOptions,
+        };
+        use sparkles::store::MemoryCaptureOptions;
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Store::in_memory(StoreOptions::default());
+        for i in 0..50 {
+            let u = format!(
+                "INSERT DATA {{ GRAPH <urn:g{}> {{ <urn:s{i}> <urn:p> {i} }} }}",
+                i % 3
+            );
+            update(&s, &u, &QueryOptions::default()).unwrap();
+        }
+        s.set_prefix("ex", "http://example.org/").unwrap();
+        let mut want = Vec::new();
+        s.dump_nquads(&mut want).unwrap();
+        let head = s.head_commit();
+        let scratch = tmp.path().join("scratch");
+        let capture = |label: &str| {
+            let o = MemoryCaptureOptions {
+                tmp_dir: scratch.clone(),
+                ..Default::default()
+            };
+            Source::from(s.memory_backup_capture(label, &o).unwrap())
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let repo_dir = tmp.path().join("repo");
+            let url = format!("file://{}", repo_dir.display());
+            let cfg = RepoConfig::from_url("t", &url).unwrap();
+            let repo = Repository::open(&cfg, &OpenEnv::default()).await.unwrap();
+            let o = |name: &str| CreateOptions {
+                name: name.into(),
+                dataset_name: "mem".into(),
+                ..Default::default()
+            };
+            let b1 = repo.create(capture("b1"), &o("b1")).await.unwrap();
+            assert_eq!(b1.commit.seq, head.seq);
+            assert_eq!(b1.commit.quads, 50);
+            assert_eq!(b1.dataset.id, s.dataset_id());
+            let m = repo.manifest("b1").await.unwrap();
+            assert_eq!(m.dataset.kind, "mem");
+            // the temporary database is gone
+            assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+            // unchanged: the rebuilt generation has the same pieces
+            let b2 = repo.create(capture("b2"), &o("b2")).await.unwrap();
+            let m2 = repo.manifest("b2").await.unwrap();
+            let gen_bytes: u64 = m2
+                .files
+                .iter()
+                .filter(|f| f.path.starts_with("gen-") && !f.path.ends_with("commit.json"))
+                .map(|f| f.size)
+                .sum();
+            assert!(gen_bytes > 0);
+            assert!(
+                b2.added_bytes < gen_bytes / 2,
+                "{} added of {gen_bytes}",
+                b2.added_bytes
+            );
+            let vo = VerifyOptions {
+                level: VerifyLevel::Restore,
+                tmp_dir: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            };
+            let v = repo.verify(&["b1".to_string()], &vo).await.unwrap();
+            assert_eq!(v.status, crate::VerifyStatus::Ok, "{v:?}");
+            // a new persistent dataset; the live in-memory dataset has the id
+            let out = tmp.path().join("restored");
+            let ro = RestoreOptions {
+                id_in_use: std::sync::Arc::new(|_| false),
+                ..Default::default()
+            };
+            let r = repo.restore("b1", &out, &ro).await.unwrap();
+            assert_eq!(r.identity, "kept");
+            let restored = Store::open(&out, StoreOptions::default()).unwrap();
+            assert_eq!(restored.dataset_id(), s.dataset_id());
+            assert_eq!(restored.head_commit().seq, head.seq);
+            let mut got = Vec::new();
+            restored.dump_nquads(&mut got).unwrap();
+            let lines = |b: &[u8]| {
+                let mut v: Vec<&str> = std::str::from_utf8(b).unwrap().lines().collect();
+                v.sort_unstable();
+                v.join("\n")
+            };
+            assert_eq!(lines(&got), lines(&want));
+            assert_eq!(
+                restored.prefixes().get("ex").map(String::as_str),
+                Some("http://example.org/")
+            );
+        });
     }
 
     /// A compaction while a backup uploads: the upload reads the leased generation, the

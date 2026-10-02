@@ -1,14 +1,16 @@
 # CI: Durable commit identity and commit receipts
 
-> **Status:** Phases 1 and 2 are implemented. Phase 3 is not built.
+> **Status:** implemented (Phases 1, 2 and 3).
 >
 > **Phases:** Phase 1 added dataset ids, the commit sequence, WAL commit records, the
 > catalog, receipts, headers, `/$/commits` and `sparkles log`. Phase 2 added the UI history
 > and receipts, headers on explain and SHACL, `meta.commit`, `id`/`head`/`modified` on
-> datasets, `sparkles log --at` and the in-memory ring. Phase 3 (change digest, `ETag`,
-> commit messages) is not built.
+> datasets, `sparkles log --at` and the in-memory ring. Phase 3 added commit messages,
+> optional change digests, and entity tags with conditional Graph Store requests.
 >
-> **User docs:** [API: Commits](../API.md#commits) · [Features](../FEATURES.md#storage-tdb2-equivalent)
+> **User docs:** [API: Commits](../API.md#commits) ·
+> [API: Entity tags and conditional requests](../API.md#entity-tags-and-conditional-requests) ·
+> [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -799,7 +801,70 @@ counting, restart and replay, a lost catalog tail, a torn WAL tail, compaction a
 commits, migration, the monotone clock and the library API. Router tests cover receipts,
 headers, the catalog routes, paging and errors. The W3C SPARQL results did not change.
 
-**Not built.** Phase 3 is not built: the per-commit change digest, `ETag` and
-`If-None-Match` on Graph Store GET, and commit messages through a
-`Sparkles-Commit-Message` header. Catalog pruning and the long-poll change feed remain
-later work.
+**Phase 3** landed on 2026-10-02 in two commits. `8f9fb00` changed the engine. It
+added the annotation side-file, commit messages, change digests and write preconditions.
+`37961d8` changed the server and CLI. It added entity tags, conditional Graph Store
+requests, the `Sparkles-Commit-Message` header and `--message`.
+
+* **Annotations.** `<root>/annotations.bin` holds one record per annotated commit: the
+  seq, a flags byte, an optional 32-byte digest, an optional message and a CRC-32. A
+  32-byte header holds a magic, the format, a flag that turns digests on, and the dataset
+  id. The record is appended and synced before the commit point, which is the WAL fsync
+  or the `CURRENT` switch of a bulk commit. A record whose commit never became durable
+  has a seq above the head at the next open, which truncates it with any torn tail. A
+  record left by a commit that failed in the same process is cut off at once. Backups
+  carry the file, and a restore into a new lineage rewrites its dataset id.
+* **Messages.** `WriteOptions::message` carries a message to the commit.
+  `annotations::validate_message` trims it and accepts at most 1024 bytes of UTF-8 with
+  no control characters. A message that is empty after trimming is no message. The HTTP
+  header also accepts an RFC 8187 value (`UTF-8''…`), because browsers cannot send other
+  non-ASCII header values. Receipts, `/$/commits`, `/$/commits/{ds}/{ref}` and
+  `sparkles log` show it as `message`. A receipt without a commit shows the head's
+  message.
+* **Digests.** `StoreOptions::commit_digests`, or the CLI's global `--commit-digests`,
+  turns digests on. The flag in the side-file keeps them on for later openings. The
+  input to SHA-256 is the line `sparkles-commit-digest-v1`, then one line each for the
+  dataset id, the seq, the parent's digest in hex, the RFC 3339 timestamp and the kind
+  name. Then come `-` and the canonical N-Quads line of each deleted quad, sorted by
+  UTF-8 bytes, and `+` and the line of each inserted quad, sorted the same way. Every
+  line ends with `\n`, and a quad line ends with ` .`. Only net changes count, so a quad
+  inserted and deleted in one transaction is left out. The empty `create` root gets a
+  digest with a zero parent.
+* **Entity tags.** Graph Store `GET` and `HEAD` send `ETag: W/"<datasetId>:<seq>:<format>"`
+  and, when the format was negotiated, `Vary: Accept`. `If-None-Match` answers `304`.
+  `If-Match` and `If-None-Match` on `PUT`, `POST` and `DELETE` become a
+  `guard::Precondition` that the store checks on the head snapshot right after it takes
+  the writer lock. A failure is `Error::PreconditionFailed`, which the server sends as
+  `412` with `code: "precondition-failed"`. CORS allows the two request headers and the
+  message header, and exposes `ETag`.
+
+**Phase 3 deviations.**
+
+- The tag has a third part, the serialization, which §6 did not have. Turtle and
+  N-Triples of one commit then have different tags, so a cache that keeps both variants
+  cannot confuse them on revalidation (RFC 9111 §4.3.4).
+- The tag is weak, as §6 proposed, but `If-Match` still works with it. RFC 9110 asks
+  `If-Match` to use the strong comparison, under which a weak tag never matches. Sparkles
+  matches a tag when it names the current head in any serialization. A tag identifies
+  the data exactly, which is what a concurrency check needs. It cannot promise identical
+  bytes, because a compaction reorders the output and a prefix change rewrites Turtle.
+- Tags are per dataset, not per graph. The catalog does not record which graphs a commit
+  touched, and bulk commits do not know it cheaply, so any commit changes every graph's
+  tag.
+- Query responses get no tag, as §8 decided.
+- Bulk commits get no digest. This answers open question 3. A commit after one without
+  a digest chains from 32 zero bytes.
+- Messages are single lines. The rule against control characters rejects newlines in the
+  library as well as over HTTP, where a header cannot carry them.
+
+**Phase 3 tests.** `crates/sparkles/tests/annotations.rs` covers messages through
+updates, replaces and bulk loads, their survival across reopen, lost and torn
+annotations, digest values and chaining, the sticky setting, failed preconditions and
+concurrent writers with one precondition. `http/conditional_tests.rs` covers tags per
+commit and format, `304` on `GET` and `HEAD`, tags at `?at=`, `If-Match` on reads and
+writes, `If-None-Match: *` creation, concurrent `PUT`s with one tag, messages on updates,
+Graph Store writes and uploads, their rejection, and CORS.
+
+**Not built.** Catalog pruning and the long-poll change feed remain later work. The UI
+does not show messages. `/{ds}/update` takes no `If-Match`, because a tag names a
+representation of a graph and an update has none.

@@ -183,6 +183,12 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   `KEEP_SCRATCH=1` is set. The servers listen on five ports from `--port-base` (default
   3931), so runs with different bases can share a machine. Results merge per engine, so
   `--engines qlever` measures QLever again and keeps the other engines' numbers.
+
+  On a machine with less memory than the engines can use, set `SERVER_MEM_MAX` (for
+  example `SERVER_MEM_MAX=12G`). Each server then runs in a systemd scope with that memory
+  limit and no swap. An engine that exceeds it is killed on its own, and its remaining
+  queries are reported as errors. Without the limit, an engine that grows past the
+  machine's memory can make the whole machine stop responding.
 * `scripts/bench-text.sh` (`mise run bench:text [people] [workdir]`) compares full-text
   search on the same generated data. Sparkles and Jena Fuseki both answer `text:query`.
   Fuseki serves a TDB2 store wrapped in a jena-text dataset with a Lucene index, and QLever
@@ -193,17 +199,20 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   The script loads each store without timing it, then times each text index build and
   records the index size on disk. Sparkles and Jena index `foaf:name`, `ex:title` and
   `rdfs:label`. QLever indexes every literal, since its text index cannot be limited to
-  predicates, so its queries join the matching literal with the predicate. There are five
+  predicates, so its queries join the matching literal with the predicate. There are six
   queries. Two take the top 10 by score, one for a rare word and one for a common word.
   The third counts all hits of the common word, the fourth joins them with a structural
-  pattern, and the fifth asks for two words that must both occur. Before timing, the script compares every engine's hit counts and hit
-  sets with `scripts/bench-answers.py`. Scores and their order are never compared,
+  pattern, and the fifth asks for two words that must both occur. The sixth returns the
+  hits of the common word with highlighted literals, which QLever cannot produce, so its
+  form returns plain literals and only the counts are compared. Before timing, the script
+  compares every engine's hit counts and hit sets with `scripts/bench-answers.py`. Scores and their order are never compared,
   because the engines rank differently. QLever builds its index with explicit scoring,
   because its BM25 and TF-IDF scoring fail on language-tagged literals in version 0.5.48.
 
   The query words are ones that the Lucene standard analyzer, the Tantivy tokenizer in
   Sparkles and QLever split and lowercase the same way. A prefix query is left out because
-  Sparkles finds nothing for a single word followed by `*`. The script writes
+  QLever returns a row for each matching word, so a name with two matching words counts
+  twice. Sparkles and Jena both take `al*`. The script writes
   `results/text-summary.md` in the work directory. `DATA` reuses a dataset that
   `scripts/bench.sh` generated. `PORT_BASE` moves the three servers to the ports after
   it, and its default is 3940.

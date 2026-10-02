@@ -164,6 +164,10 @@ impl Client {
 #[path = "validate_tests.rs"]
 mod validate;
 
+#[cfg(feature = "fmt")]
+#[path = "format_tests.rs"]
+mod format;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -361,6 +365,15 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "timeoutSeconds": to,
                 "atCommit": at}}),
         ),
+        #[cfg(feature = "fmt")]
+        (
+            "format",
+            json!({"type":"object","additionalProperties":false,"required":["text"],"properties":{
+                "text": {"type":"string","minLength":1,"maxLength":1048576,"description":"The document to format"},
+                "language": {"enum":["sparql","turtle","trig","ntriples","nquads","jsonld"],"description":"Detected from the text when left out (N-Triples reads as Turtle)"},
+                "options": {"type":"object","description":"Style options, as in .sparklesfmt.toml but in camelCase: lineWidth, indentWidth, sort, prunePrefixes, directiveStyle, prefixGroups, typeShorthand, compactIris, quoteStyle, operatorPosition, turtleLayout, alignValues"},
+                "timeoutSeconds": to}}),
+        ),
     ]
 }
 
@@ -390,6 +403,8 @@ async fn a03_tool_list() {
             "validate_shacl",
             #[cfg(feature = "shex")]
             "validate_shex",
+            #[cfg(feature = "fmt")]
+            "format",
         ]
     );
     let expected = expected_input_schemas();

@@ -491,6 +491,7 @@ impl Tools<'_> {
             selector_query: Some(sparkles::sparql::QueryOptions {
                 max_rows: Some(limits.max_rows),
                 max_memory_bytes: self.cfg().query_memory_bytes,
+                max_rows_produced: limits.max_rows_produced,
                 forbid_service: true,
                 ..Default::default()
             }),

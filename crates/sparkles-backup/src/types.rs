@@ -311,6 +311,13 @@ pub struct TestReport {
 pub struct DatasetRef {
     pub name: String,
     pub id: Uuid,
+    /// `persistent`, or `mem` for a backup of an in-memory dataset
+    #[serde(rename = "type", default = "persistent")]
+    pub kind: String,
+}
+
+fn persistent() -> String {
+    "persistent".into()
 }
 
 /// The commit of a backup summary.
@@ -447,7 +454,7 @@ pub struct Backup {
 pub struct ManifestDataset {
     pub name: String,
     pub id: Uuid,
-    /// `persistent`
+    /// `persistent`, or `mem` for a backup of an in-memory dataset
     #[serde(rename = "type")]
     pub kind: String,
 }
@@ -546,6 +553,7 @@ impl Manifest {
             dataset: DatasetRef {
                 name: self.dataset.name.clone(),
                 id: self.dataset.id,
+                kind: self.dataset.kind.clone(),
             },
             commit: CommitRef {
                 seq: self.commit.seq,
@@ -1183,6 +1191,7 @@ mod tests {
             bulk: false,
             exact: true,
             reconstructed: false,
+            default_graph: true,
         };
         let m = ManifestCommit::from(&c);
         assert_eq!(

@@ -23,11 +23,11 @@ The design and its rationale are in [C01 Observability, readiness and budgets](s
 | GET    | `/$/server`   | `{ "version", "startedAt", "uptimeSeconds", "readOnly", "datasets": [DatasetInfo], "limits": Limits, "auth": { "enabled": boolean } }`. When auth is on, anonymous callers get no `version` or `limits`. |
 | GET    | `/$/whoami`   | The caller and its permissions. See [whoami](#whoami). |
 | POST   | `/$/format`   | Formats a SPARQL query or update. See [Formatting](#formatting). |
-| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. |
+| GET    | `/$/metrics`  | Prometheus text format 0.0.4 (`text/plain; version=0.0.4`). See [Metrics](#metrics). `?format=json` returns the same counters as a JSON `MetricsSnapshot`, which the UI uses. `404` when the server runs with `--no-metrics`. `--metrics-addr` serves it on a second address too. |
 
 ```ts
 type ReadyInfo = {
-  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM)
+  status: "starting" | "ready" | "draining";   // draining: shutting down (SIGINT / SIGTERM, see Shutdown)
   ready: boolean;
   uptimeSeconds: number;
   datasets: {
@@ -40,8 +40,21 @@ type ReadyInfo = {
 };
 
 // 0 means unlimited
-type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
+type Limits = { timeoutSeconds: number; updateTimeoutSeconds: number; maxTimeoutSeconds: number; queryMemoryBytes: number; maxResultBytes: number; maxExportBytes: number; maxRows: number; maxRowsProduced: number; maxDatasetBytes: number; maxQueryBodyBytes: number; maxUpdateBodyBytes: number; maxAdminBodyBytes: number; maxUploadBytes: number };
 ```
+
+### Shutdown
+
+On SIGTERM or SIGINT the server stops accepting connections, and `/$/ready` answers `503`
+with `"status": "draining"`. Requests in flight get `sparkles serve --shutdown-grace`
+seconds to finish (default 20). Requests still running after that are cancelled. A
+cancelled query stops at its next check. A cancelled write stops before its commit and
+commits nothing, while a write that has started to commit finishes the commit. The server
+waits up to 5 seconds for cancelled requests to stop. It then writes what it keeps in
+memory, such as the last-used times of API tokens, and exits. `--shutdown-grace 0`
+cancels the requests in flight at once. Background tasks, such as a compaction, are not
+waited for. Their commits are atomic, so a task cut short by the exit leaves the dataset
+as it was before the task.
 
 ### Request ids and the access log
 
@@ -90,6 +103,7 @@ JSON object per line.
 | `sparkles_result_rows_total` | counter | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
+| `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
 | `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
@@ -127,6 +141,56 @@ server ignores those headers.
 Backup repositories add the `sparkles_backup_*` families listed under
 [Backup repositories](#backup-metrics).
 
+#### Fuseki metric names
+
+`serve --metrics-fuseki-names` adds the gauges that Fuseki exports, so that dashboards
+built for Fuseki keep working. The Sparkles families stay as they are.
+
+| Name | Type | Labels | Value |
+|------|------|--------|-------|
+| `fuseki_requests` | gauge | `application="fuseki"`, `dataset`, `description`, `endpoint`, `operation` | Finished requests to the endpoint. |
+| `fuseki_requests_good` | gauge | the same | Requests with the `ok` outcome. |
+| `fuseki_requests_bad` | gauge | the same | Requests with any other outcome. |
+| `process_uptime_seconds`, `process_start_time_seconds` | gauge | `application="fuseki"` | The time since the server started, and the start time. |
+| `system_cpu_count` | gauge | `application="fuseki"` | Processors available to the server. |
+
+`dataset` is the dataset path as Fuseki writes it, such as `/ds`. The datasets past
+`--metrics-max-datasets` share `/$other`. Requests that name no existing dataset are not
+counted.
+`endpoint`, `operation` and `description` are Fuseki's names for the dataset's services.
+
+| Request | `endpoint` | `operation` | `description` |
+|---------|------------|-------------|---------------|
+| `/{ds}/sparql`, `/{ds}/query` | `sparql`, `query` | `query` | `SPARQL Query` |
+| `/{ds}/update` | `update` | `update` | `SPARQL Update` |
+| `/{ds}/data` | `data` | `gsp-rw`, or `gsp-r` on a read-only server | `Graph Store Protocol`, or `Graph Store Protocol (Read)` |
+| `/{ds}/get` | `get` | `gsp-r` | `Graph Store Protocol (Read)` |
+| `/{ds}/upload` | `upload` | `upload` | `File Upload` |
+| `/{ds}/shacl` | `shacl` | `SHACL` | `SHACL Validation` |
+| `/{ds}` | empty | `query`, `update`, `gsp-rw` or `gsp-r`, by the request | As above. |
+
+The good and bad counts split `sparkles_requests_total` for the same dataset and route.
+`good` is `outcome="ok"`, and `bad` is the sum of the other outcomes. Fuseki counts a
+request when it starts and its outcome when it ends, while Sparkles counts both when the
+request ends, so `fuseki_requests` always equals good plus bad. An endpoint's series
+appear after its first request, like the Sparkles series. Fuseki lists every configured
+endpoint from the start with zeros.
+
+Fuseki's other meters come from Micrometer's JVM and system binders, and Sparkles has no
+equivalent for them. They are the `jvm_*` memory, garbage collector, thread and class
+loader gauges, `process_files_*`, `process_cpu_usage`, `system_cpu_usage`,
+`system_load_average_1m`, `disk_free_bytes` and `disk_total_bytes`. `/{ds}/shex`,
+`/{ds}/explain`, `/{ds}/prefixes` and the `/$/` routes have no Fuseki endpoint, so only
+the Sparkles names count them.
+
+#### Metrics listener
+
+`serve --metrics-addr HOST:PORT` also serves `/$/metrics` on a second address, such as a
+port that only the Prometheus server can reach. That listener serves nothing else. It
+applies the same authentication, `metrics` permission and `Host` check as the main
+listener. The main listener keeps `/$/metrics`, because the UI's Server page reads it.
+Without `--auth-config`, an address that is not loopback needs `--allow-open-network`.
+
 ```ts
 type MetricsSnapshot = {
   formatVersion: 1;
@@ -144,8 +208,8 @@ type MetricsSnapshot = {
   }[];
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
-    walBytes: number; diskBytes: number; resultRows: number;
-    budgetExceeded: Record<"rows" | "memory" | "result-bytes", number> | null;
+    walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    budgetExceeded: Record<BudgetKind, number> | null;
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
     resultCache: { enabled: boolean; bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
@@ -428,18 +492,23 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset into a new persistent dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET    | `/$/stats/{ds}`              | `DatasetStats` |
-| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. See [Schema discovery](#schema-discovery). |
+| GET    | `/$/quota/{ds}`              | *Extension.* `DatasetQuota`: the storage quota in effect and the bytes the dataset uses. See [Storage quotas](#storage-quotas). |
+| PUT    | `/$/quota/{ds}`              | *Extension.* Gives a persistent dataset a quota of its own. The JSON body is `{ "maxBytes": number }` or `{ "maxMb": number }`, and `0` means unlimited. Returns `DatasetQuota`. Needs `server-admin`. `400` for an in-memory dataset or a malformed body. |
+| DELETE | `/$/quota/{ds}`              | *Extension.* Removes the dataset's own quota, so `--max-dataset-mb` applies again. Returns `DatasetQuota`. Needs `server-admin`. |
+| GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Returns a `Task`. `409` while a compaction of the dataset is queued or running. |
 | POST   | `/$/backup/{ds}`             | Writes an N-Quads dump to `<data>/backups/{ds}_{time}.nq.zst` with zstd level 3. A build without zstd writes gzip (`.nq.gz`). `?compression=gzip\|zstd\|brotli\|lz4\|none` and `?level=N` pick another codec. The extension follows the codec, so `compression=gzip` gives Fuseki's `.nq.gz`. Levels are 0–9 for gzip, 1–19 for zstd and 0–11 for brotli. lz4 and none take no level. Any other level is a `400`. Returns a cancellable `Task` whose message gives the size and time. `409` while a backup of the dataset is queued or running. `507` when the data directory's file system has less than `--min-free-disk-mb` free, and the task fails once writing would go below it. zstd uses at most 4 threads (a quarter of the cores). Incremental, deduplicated backups to a file system or S3 are described under [Backup repositories](#backup-repositories). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a `Task`. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules and extras, and returns `409` when nothing is recorded. `400` for an unknown profile or vocabulary. Returns a cancellable `Task`. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
+| PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
+| DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
 | GET    | `/$/reason/{ds}/diagnostics` | `DiagnosticsReport`: OWL 2 RL inconsistency checks. |
 | DELETE | `/$/reason/{ds}`             | Drops materialized inferences. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, or an N-Quads backup. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results. Returns `{ "cleared": number /* entries */, "bytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
@@ -478,10 +547,19 @@ type DatasetStats = {
   predicates: { iri: string; count: number; distinctSubjects: number; distinctObjects: number }[]; // top 100
   classes: { iri: string; instances: number }[];      // top 100 by rdf:type
   diskBytes: number;
+  quota: DatasetQuota | null;   // persistent datasets: the storage quota and its usage
   cache: { entries: number; bytes: number; hits: number; misses: number };        // decoded-block cache (--cache-mb)
   resultCache: { enabled: boolean; entries: number; bytes: number; hits: number; misses: number }; // query (sub)result cache (--result-cache-mb)
   reasoning: ReasoningStatus | null;
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
+};
+
+type DatasetQuota = {
+  dataset: string;
+  maxBytes: number | null;          // the quota in effect; null when unlimited
+  source: "dataset" | "default";    // set on the dataset, or the server's --max-dataset-mb
+  defaultMaxBytes: number | null;   // --max-dataset-mb; null when unlimited
+  usedBytes: number;                // on-disk bytes of the dataset directory
 };
 
 type Task = {
@@ -621,13 +699,54 @@ A report is never returned partially.
 The counts come from one ordered pass over the PSO index and one over the POS index per
 predicate, so a report costs about two sequential reads of the selected triples.
 
+**VoID export.** The summary is also served as RDF, as a description in the
+[VoID](https://www.w3.org/TR/void/) vocabulary. Ask for it with an RDF media type in
+`Accept`, or with the `format` parameter. The media types are `text/turtle`,
+`application/n-triples`, `application/ld+json`, `application/rdf+xml`,
+`application/trig` and `application/n-quads`. The `format` values are `turtle`,
+`ntriples`, `jsonld`, `rdfxml`, `trig` and `nquads`, and `format=json` asks for the JSON
+document, which stays the default. The selection parameters apply as above. `limit` and
+`cursor` do not, because the description is always complete.
+
+```turtle
+<urn:x-sparkles:schema:wiki:42> a void:Dataset ;
+    dcterms:title "wiki" ;
+    dcterms:created "2026-10-02T12:04:00Z"^^xsd:dateTime ;
+    void:triples 5 ;                # distinct triples in the selection
+    void:entities 3 ;               # distinct IRI subjects
+    void:classes 2 ;                # distinct rdf:type objects
+    void:properties 3 ;             # predicates with triples
+    void:distinctSubjects 3 ;
+    void:distinctObjects 4 ;
+    void:classPartition _:c1 , _:c2 ;
+    void:propertyPartition _:p1 , _:p2 , _:p3 .
+_:c1 void:class ex:Person ; void:entities 2 .   # instances
+_:c2 void:class owl:Class ; void:entities 1 .
+_:p1 void:property ex:knows ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+_:p2 void:property rdf:type ; void:triples 3 ; void:distinctSubjects 3 ; void:distinctObjects 2 .
+_:p3 void:property rdfs:label ; void:triples 1 ; void:distinctSubjects 1 ; void:distinctObjects 1 .
+```
+
+The node's IRI is `urn:x-sparkles:schema:<dataset>:<snapshot version>`. Every class with
+instances gets a class partition, and every predicate with triples a property
+partition. The partitions reuse the report's exact counts. `void:entities`,
+`void:distinctSubjects` and `void:distinctObjects` of the whole selection are not part of
+the JSON report. They cost one more pass over the SPO and OSP indexes, which only RDF
+requests make. The declarations follow the description as the triples that assert them:
+`rdf:type`, `rdfs:subClassOf`, `owl:equivalentClass`, `owl:disjointWith`, `rdfs:domain`,
+`rdfs:range`, `rdfs:subPropertyOf`, `owl:inverseOf`, labels, comments and the
+`owl:Ontology` headers. `declarations=false` leaves them out. Labels keep their language
+tags.
+
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json] [--timeout S]
-[--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the `SchemaSummary`
-with every item and `next: null`. `text` prints one line per class and per predicate. The
-command exits with status 2 when the timeout or the entry cap is exceeded. The Rust API is
-`sparkles::schema::discover`.
+[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
+[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
+`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
+predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
+declarations. The command exits with status 2 when the timeout or the entry cap is
+exceeded. The Rust API is `sparkles::schema::discover`, and
+`sparkles::schema::void_text` renders a report as VoID.
 
 ### Clone
 
@@ -723,6 +842,43 @@ Query parameters beyond the standard protocol:
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it.
 
+### Entity tags and conditional requests
+
+Graph Store `GET` and `HEAD` responses carry an `ETag` that names the commit the response
+was read at and its serialization:
+
+```
+ETag: W/"3f1c9a2e-7b4d-4c1e-9a55-0c2b8e61d7aa:42:ttl"
+```
+
+The last part is `ttl`, `nt`, `nq`, `trig`, `rdf` or `jsonld`. The tag is weak because
+the bytes of one commit's serialization can change without a commit. A compaction
+reorders the output, and a prefix change rewrites Turtle, while the data stays the same.
+The tag covers the whole dataset, so every commit changes the tag of every graph. A read
+with `at` gets the tag of the commit it read. Responses whose format was negotiated add
+`Vary: Accept`. Query responses get no tag, because `NOW()`, `RAND()` and `SERVICE` can
+change a result without a commit.
+
+| Header | Methods | Effect |
+|---|---|---|
+| `If-None-Match` | `GET`, `HEAD` | `304 Not Modified` when a listed tag equals the response's tag, or for `*`. Tags compare by the weak comparison. |
+| `If-Match` | `GET`, `HEAD` | `412` unless the value is `*` or a listed tag names the commit the response reads. |
+| `If-Match` | `PUT`, `POST`, `DELETE` | `412` unless the target exists and a listed tag names the current head. `*` only needs the target to exist. |
+| `If-None-Match` | `PUT`, `POST`, `DELETE` | `412` when the value is `*` and the target exists, or when a listed tag names the current head. |
+
+A write's preconditions are checked while the dataset's writer lock is held, so no other
+commit can come between the check and the write. Of several writers that send the same
+tag, one succeeds and the others get `412` with `code: "precondition-failed"`. A tag
+matches in any serialization, so a Turtle `GET` can be followed by a `PUT` of N-Triples.
+The default graph and the whole dataset always exist, and a named graph exists while it
+holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
+is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
+
+RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
+matches. Sparkles compares the commit a tag names instead. Its tags identify the data
+exactly, even though they cannot promise identical bytes, and that is what a concurrency
+check needs.
+
 ## Commits
 
 The design and its rationale are in [CI Durable commit identity](specs/CI-commit-identity.md).
@@ -764,8 +920,34 @@ type Commit = {
   generation: string;                   // index generation it was made in
   bulk: boolean;                        // made by rebuilding the index
   exact: boolean;                       // false: a bulk commit that also deleted
+  message?: string;                     // the writer's commit message
+  digest?: string;                      // change digest (hex SHA-256), when enabled
 };
 ```
+
+**Commit messages.** A write can carry a message in the `Sparkles-Commit-Message` request
+header. Updates, Graph Store `PUT`, `POST` and `DELETE`, and uploads accept it. The message
+is stored with the commit and appears as `message` in receipts, in `/$/commits` and in
+`sparkles log`. It must be UTF-8 text of at most 1024 bytes with no control characters,
+and surrounding whitespace is trimmed. A header that is empty after trimming sets no
+message. Clients that can only send ASCII headers, such as browsers, can send an RFC 8187
+extended value like `UTF-8''r%C3%A9%C3%A9crit`. A message that breaks these rules gets
+`400`, and nothing is written. A write with no net effect creates no commit and drops its
+message.
+
+The message is written and synced before the commit becomes durable, so every
+acknowledged commit keeps its message. Messages and digests live in `annotations.bin` in
+the database directory. Backups include the file, and clones start without it.
+
+**Change digests.** A dataset can record a SHA-256 digest of each commit's net changes,
+returned as `digest`. It is off by default. `--commit-digests` on any command that opens
+a database turns it on, and the database keeps the setting. The digest covers the dataset
+id, the seq, the parent's digest, the timestamp, the kind, and the deleted and inserted
+quads as sorted canonical N-Quads lines. Blank nodes appear with the store's internal
+labels, so equal digests from different databases mean nothing. Commits made by
+rebuilding the index, such as large loads, get no digest. The commit after one without a
+digest chains from 32 zero bytes. The exact input is defined in
+[CI Outcome](specs/CI-commit-identity.md#outcome).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -862,14 +1044,14 @@ The design and its rationale are in [F05 Backup repositories](specs/F05-snapshot
 `sparkles-server`, which is on by default. A **repository** holds deduplicated,
 content-addressed copies of dataset files. It is either a directory (`fs`, a local or
 mounted file system) or a bucket prefix (`s3`, AWS S3 or an S3-compatible service such as
-MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one persistent dataset at one commit,
-described by an immutable manifest.
+MinIO, Cloudflare R2 or Ceph RGW). A **backup** is one dataset at one commit, described
+by an immutable manifest. Persistent and in-memory datasets can both be backed up.
 
 Backups are made, listed, restored and verified per dataset under `/$/backups/{ds}`.
 Repositories are registered and maintained under `/$/repositories`. Lifecycle policies,
 which hold schedules and retention, live under `/$/backup-policies`. The web UI has a
 Backups page for all three. The older `POST /$/backup/{ds}`, which writes an N-Quads dump
-in the data directory, is unchanged.
+in the data directory, is unchanged and works for in-memory datasets too.
 
 **What a backup holds.** A backup contains:
 
@@ -885,8 +1067,30 @@ in the data directory, is unchanged.
 The full-text index is left out and rebuilt when the restored dataset opens
 (`derived.text.rebuildOnRestore`). Older index generations, named snapshots and the
 retention window (`history.json`) are left out too. Point-in-time reads of a restored
-dataset therefore reach back only to the start of the backup's generation. In-memory
-datasets cannot be backed up (`501 backup-unsupported`).
+dataset therefore reach back only to the start of the backup's generation.
+
+**In-memory datasets.** An in-memory dataset has no files to copy, so its backup builds
+them first. The task takes a snapshot of the head commit under the writer lock and writes
+it as a new index generation with the bulk builder, the same way a compaction does. The
+copy goes to a temporary directory under `<data>/tmp`. Next to the generation it holds an
+empty WAL, a commit catalog with only the head commit, and the dataset's id and prefixes.
+It also holds the settings of the full-text and spatial indexes and the write-time
+validation configuration, with the SHACL shapes or the ShEx schema. Vectors are literals
+in the data and need nothing extra. The upload then follows the normal path, and the
+manifest's `dataset.type` is `mem`. The temporary directory is removed when the upload
+ends. A server that stops during such a backup removes the directory at its next start.
+
+Writes continue while the copy is built, but the snapshot keeps the captured state in
+memory until the build ends. The copy needs about as much disk space as a compacted
+generation of the dataset. The build stops with `507 insufficient-storage` when the data
+directory's file system would keep less than `--min-free-disk-mb` free. Every backup
+rebuilds the whole generation. When the dataset has not changed, the index files come
+out the same, and only a few small files are uploaded again. After a write, most pieces
+of the index files differ and are uploaded again.
+
+An in-memory dataset gets a new dataset id each time the server starts. Its backups from
+an earlier run of the server therefore belong to another lineage (`sameLineage: false`),
+and a policy's retention counts them separately (see [Lifecycle policies](#lifecycle-policies)).
 
 **Capture.** A backup pins one commit, the head when the task starts, without blocking
 writers. Under the writer lock it only records the length of the append-only files and
@@ -971,7 +1175,7 @@ has started or been queued. Some also return a `Location`, as noted.
 | GET | `/$/repositories/{repo}/locks` | `server-admin` | `{locks: Lock[]}` |
 | DELETE | `/$/repositories/{repo}/locks/{id}` | `server-admin` | Breaks a lock (`204`). The action is audited. `404 no-such-lock`, `409 repository-read-only`. |
 | GET | `/$/backups/{ds}[?repository=R]` | `read` on `ds` | `{dataset, datasetId: string \| null /* the live dataset's */, backups: BackupSummary[]}`. Lists the dataset's backups in every repository, or in `R` only, newest first, with `sameLineage`. A repository that cannot be reached is left out. One found unreachable in the last minute is not tried again. |
-| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. `501 backup-unsupported` means an in-memory dataset. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less. |
+| POST | `/$/backups/{ds}` | `admin` on `ds` | Backs up now. The body is `{repository, name?, note?}`. Starts a `backup-create` task with `detail: BackupSummary` and `Location: /$/backups/{ds}/{repo}/{name}`. Errors are `404 no-such-dataset`, `404 no-such-repository`, `409 repository-read-only` and `409 backup-exists`. `409 backup-in-progress` (with `task`) means a backup of the dataset into that repository is already running; only one runs at a time. An in-memory dataset is first copied to a temporary generation on disk, as described above. `507 insufficient-storage` means an `fs` repository whose file system has less than `--min-free-disk-mb` free. The task also fails with it when a blob would leave less, or when the temporary copy of an in-memory dataset would leave the data directory's file system with less. |
 | GET | `/$/backups/{ds}/{repo}/{backup}` | `read` on `ds` | `Backup`: the summary plus the manifest's files, blobs and upload statistics. |
 | DELETE | `/$/backups/{ds}/{repo}/{backup}` | `admin` on `ds` | Deletes the backup's manifest (`204`). Its blobs go at the next GC. `409 backup-busy` (with `task`) while a restore or verification of the backup runs on this server. `409 repository-read-only`. |
 | POST | `/$/backups/{ds}/{repo}/{backup}/restore` | `admin` on `ds` and on the target | Restores the backup. The body is a `RestoreRequest`. Starts a `backup-restore` task with `Location: /$/datasets/{target}`. See [Restore](#restore). |
@@ -1037,6 +1241,14 @@ turns `false`. A restore also needs `admin` on the target name, or it fails with
 `{backup: BackupSummary, dataset, datasetId, identity: "kept" | "new", forkedFrom?: {id,
 seq}, check: object | null, millis}`.
 
+A backup of an in-memory dataset restores as a new persistent dataset or replaces a
+persistent one, like any other backup. The restored dataset's head has the backup's
+commit number, and its commit history starts at that commit. A restore cannot replace an
+in-memory dataset (`409 not-managed`), because it always produces a database directory.
+To get the data back into memory, create an in-memory dataset and load a dump of the
+restored one into it. While the in-memory source is still running, it holds the dataset
+id, so `identity: "auto"` gives the restored copy a new id with `forkedFrom`.
+
 ### Backup types
 
 ```ts
@@ -1089,7 +1301,7 @@ type TestReport = {
 type BackupSummary = {
   name: string;
   repository: string;        // the repository's name on this server
-  dataset: { name: string; id: string };
+  dataset: { name: string; id: string; type: "persistent" | "mem" };
   commit: { seq: number; timestamp: string; quads: number; ref: string /* commit:<seq> */ };
   created: string; completed: string; millis: number;
   logicalBytes: number;      // the size of its files
@@ -1145,7 +1357,7 @@ type Lock = {
 type PolicyConfig = {
   name: string;
   repository: string;
-  datasets?: string[];       // names or * globs; default ["*"] (in-memory datasets are skipped)
+  datasets?: string[];       // names or * globs, in-memory datasets included; default ["*"]
   schedule: string;          // cron, or "every <duration>"
   timezone?: string;         // IANA name; default UTC
   nameTemplate?: string;     // default "{policy}-{dataset}-{time}"
@@ -1181,7 +1393,8 @@ Timestamps are RFC 3339 in UTC with milliseconds. Sizes are in bytes.
 
 A policy backs up the datasets that match `datasets` into `repository` on a schedule, then
 applies its retention. It backs up one dataset after another. Each is a backup like
-`POST /$/backups/{ds}` and holds a task slot while it runs.
+`POST /$/backups/{ds}` and holds a task slot while it runs. In-memory datasets that match
+are backed up too, each through its temporary copy on disk.
 
 * **Schedules.** A schedule is a cron expression with 5 fields (minute hour day-of-month
   month day-of-week), or 6 fields with seconds first. `@daily`-style macros are not
@@ -1212,6 +1425,11 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   run. Deleting a backup removes its manifest, and GC removes the blobs. With
   `gcAfterRetention`, a run whose retention deleted something starts a `backup-gc` task,
   at most once per 24 h per repository.
+
+  An in-memory dataset gets a new id each time the server starts, so retention treats
+  the backups of each earlier server run as another dataset and keeps `minCount` of
+  them. A policy for such datasets can set `expireAfter` with a `minCount` of 0, or the
+  old backups can be deleted by hand.
 * **The scheduler** wakes at least once a minute. A new or rescheduled policy waits for
   its next instant. Instants missed while the server was down are covered by one run
   60 s after startup (`trigger: "catch-up"`). With `catchUp: "none"` they are recorded as
@@ -1226,7 +1444,7 @@ applies its retention. It backs up one dataset after another. Each is a backup l
   admitted the same way. When the queue is full, that GC is not started and is tried again
   after the next run's retention.
 * **Results.** A run is `ok` when every selected dataset was backed up or skipped
-  (`in-memory dataset`, `unchanged`). It is `partial` when some failed, and `failed` when
+  (`unchanged`). It is `partial` when some failed, and `failed` when
   none succeeded. `lastSuccess` and `consecutiveFailures` follow these results. The last
   1000 runs of all policies are kept.
 
@@ -1262,7 +1480,7 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`) |
 | 422 | `incompatible-repository` (a newer repository format, or encryption), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
-| 501 | `backup-unsupported` (an in-memory dataset), `not-implemented` |
+| 501 | `not-implemented` (backup repositories are not enabled on this server) |
 | 502 | `repository-unavailable`: a storage error after retries. The message never includes URL query strings. |
 | 503 | `catalog-lagging` (the commit catalog could not be flushed, so retry), `too-many-tasks`, `dataset-restoring` (with `Retry-After: 5`), `cancelled` (a cancelled task) |
 | 507 | `insufficient-storage`. A restore has no room for 1.1 × the backup's size plus the `--min-free-disk-mb` reserve, or a backup into an `fs` repository would leave its file system with less than the reserve. |
@@ -1468,11 +1686,50 @@ SELECT ?s ?score ?label WHERE {
 
 * **Subject list.** `(?s ?score ?literal ?graph ?predicate)`. Every slot after the
   subject is optional. A constant subject restricts the search to that subject.
-* **Object.** A query string, or `(predicate* "query" limit "lang:xx")`. A language tag
-  on the query string acts as `lang:`.
-* **Query syntax.** The syntax has terms, `"phrases"` (with `~slop`), `AND`/`OR` (OR by
-  default), `+required`/`-excluded`, parentheses, and phrase prefixes `"quick bro"*`. A
-  literal `:` is written `\:`.
+* **Object.** A query string, or `(predicate* "query" limit "lang:xx" "highlight:…")`.
+  The limit, `lang:` and `highlight:` arguments are each optional. A language tag on the
+  query string acts as `lang:`.
+* **Highlighting.** With a `"highlight:…"` argument, as in Jena, `?literal` becomes the
+  best fragments of the matched literal with the matching words marked. It keeps the
+  literal's language tag. The options follow `highlight:` and are separated by `|`.
+  `m:` is the most fragments kept (3), `z:` the fragment size in characters (128), `s:`
+  and `e:` the marks around a match (↦ and ↤), and `f:` the text between fragments (∣).
+  `jh:n` marks each word of a phrase on its own, and `jf:n` keeps adjacent fragments
+  apart and keeps fragments without a match. For example,
+  `"highlight:s:<em> | e:</em> | z:150"` gives `the quick <em>brown fox</em> jumped`.
+  Fragments follow Lucene's highlighter. A fragment starts after the word that crosses a
+  multiple of the fragment size, the best fragments come first, and a phrase is marked
+  only where it occurs. A literal with no match to mark is returned unchanged. Without
+  `highlight:` the search never reads the text of a literal.
+* **Query syntax.** Query strings use Lucene's classic query syntax, as jena-text does,
+  with OR as the default operator. A query string matches the same literals as in Jena
+  when both analyzers produce the same tokens. These forms are supported:
+  * Words such as `fox` and phrases such as `"brown fox"`. A phrase with a slop, such as
+    `"fox brown"~2`, matches its words within that many moves of each other, in either
+    order.
+  * `+word` and `-word`, `AND` or `&&`, `OR` or `||`, `NOT` or `!`, and parentheses. As in
+    Lucene, a clause after `AND` also makes the clause before it required.
+  * Prefixes such as `al*`, alone or inside a boolean query like `+ada +lov*`, and
+    wildcards such as `a?an` and `*lace`.
+  * Fuzzy words. `roam~` allows two edits, `roam~1` allows one, and `roam~0.8` allows the
+    number of edits Lucene derives from that similarity. As in Lucene, a fuzzy word matches
+    at most the 50 closest terms of the index.
+  * Regular expressions such as `/al(an|len)/`, term ranges such as `[ada TO alan]` and
+    `{ada TO alan}`, and boosts such as `ada^2`. A lone `*` matches every literal of the
+    call's predicates.
+
+  Prefixes, wildcards, fuzzy words, regular expressions and range bounds are lowercased
+  and ASCII-folded like the indexed text, but they are not split into words. A word that
+  the analyzer splits, such as `fei-fei`, becomes an OR of its parts, as in Lucene. Sparkles
+  reads `"quick bro"*` as a phrase whose last word is a prefix, while Jena reads it as the
+  phrase or any document. A literal `:` is written `\:`.
+* **Refused query strings.** A field name such as `name:ada` or `*:*` gives `400`, because
+  the call's predicates select what is searched. A query string whose words are all
+  excluded, such as `-ada`, gives `400`, and so does one in which no word is left after
+  analysis. Jena returns no results for these two. A phrase with a slop that repeats a
+  word, a fractional edit distance such as `ada~1.5`, and the regular expression operators
+  of Lucene that Tantivy reads differently (`@`, `#`, `<`, `>`, `&`, `~`, `^` and `$`) are
+  also refused.
 * **Results.** There is one solution per matching quad, so a subject with two matching
   literals appears twice. `?score` is an `xsd:float`. In a merged default graph (the union
   default graph, or several `FROM`s), identical triples from different graphs count once.
@@ -1494,9 +1751,15 @@ SELECT ?s ?score ?label WHERE {
   by a `text.dirty` file next to it, is checksum-verified and caught up from the WAL. The
   WAL also restores what was only staged. The index is rebuilt only if it is damaged or
   older than the WAL.
-* **Errors.** `400` for malformed calls, unparseable query strings, predicates that
-  are not indexed, and datasets without an index. `501` if the server was built without
-  the `text` feature.
+* **Errors.** `400` for malformed calls, unparseable or refused query strings, predicates
+  that are not indexed, and datasets without an index. `507` when a search matches more
+  than `maxHits` literals and has no limit, or a limit above `maxHits`. A limit of at most
+  `maxHits` keeps the best hits instead. `501` if the server was built without the `text`
+  feature.
+* **Cost.** A search reads the terms of its hits from columns of the index and looks each
+  distinct term up in the store's dictionary once. Later searches find the ids of terms
+  looked up before in a cache. A score or literal that the rest of the query never uses is
+  not produced, so a `COUNT` or a join on the subject never reads the literals.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1504,21 +1767,31 @@ SELECT ?s ?score ?label WHERE {
 | PUT | `/$/text/{ds}` | Enables or reconfigures the index. The body is a `TextConfig`, and an empty body means the defaults. Returns `202` with the build `Task` (`kind: "text-rebuild"`). |
 | DELETE | `/$/text/{ds}` | Disables and deletes the index (`204`). |
 | POST | `/$/text/{ds}/rebuild` | Rebuilds the index from the current data. Returns `202` with a `Task`, `409` if a rebuild is running, or `400` if the index is not enabled. |
+| GET, POST | `/{ds}/text?q=&predicate=&lang=&graph=&limit=&highlight=` | Searches the index and returns `TextHits` (below), best first. `q` is a query string, `predicate` may repeat, `graph` searches one named graph instead of the default graph, `limit` is 1 to 1000 (20 by default), and `highlight=false` leaves out the snippets. It needs `read` on the dataset. `400` for a missing `q` or a bad parameter, as for `text:query`. |
 
 ```ts
 type TextConfig = {
   predicates?: "all" | string[];                         // default "all"
   graphs?: { include?: "all" | string[]; exclude?: string[] };  // graph IRIs; urn:x-arq:DefaultGraph
   maxTextBytes?: number;                                // default 262144 (longer text is indexed truncated)
-  maxHits?: number;                                     // default 1000000 hits without a limit (then 507)
+  maxHits?: number;                                     // default 1000000 hits without a limit or above one (then 507)
   docstoreCompression?: "zstd" | "lz4" | "none";         // default zstd; a change rebuilds
 };
 type TextStatus = {
   enabled: true; state: "ready" | "stale"; docs: number;
   seq: number; storeSeq: number;       // ready when equal: the commit the index reflects
   epoch: number; diskBytes: number; segments: number;
-  config: TextConfig; formatVersion: 1;
+  config: TextConfig; formatVersion: 2;
   lastRebuild?: { at: string; ms: number; docs: number }; message?: string;
+};
+type TextHits = {
+  dataset: string; commit: number;
+  limited: boolean;                    // as many hits as the limit
+  hits: {
+    s: Term; score: number; p: Term; g: Term;   // Term as in SPARQL JSON results
+    literal: Term;                     // the literal, or with highlighting its fragments
+    snippet?: string;                  // HTML: the fragments, escaped, matches in <mark>
+  }[];
 };
 ```
 
@@ -2112,10 +2385,14 @@ The design and its rationale are in [C08 Inference freshness and diagnostics](sp
 
 Materialized inferences (`urn:x-sparkles:inferred`) are not maintained incrementally. A
 materialization records the dataset id and the commit it wrote. When it changed nothing,
-it records the head it read instead. Any later commit makes the inferences **stale**,
-including commits that only touch named graphs the reasoner does not read. Compaction and
-restarts do not. A status written by an older version, or recorded for another dataset
-id, has unknown freshness (`stale: null`).
+it records the head it read instead. A later commit that changes the default graph makes
+the inferences **stale**, because the default graph is all the reasoner reads. Commits
+that change only named graphs leave them fresh, and so do changes to the inferred graph
+itself. `commitsSince` still counts every commit. Compaction and restarts change nothing.
+Each commit records whether it may have changed the default graph. A commit recorded by
+an older version, or one whose record is no longer kept, counts as a change. A status
+written by an older version, or recorded for another dataset id, has unknown freshness
+(`stale: null`).
 
 ```ts
 type ReasoningStatus = {
@@ -2125,9 +2402,12 @@ type ReasoningStatus = {
   commit: number | null;       // commit the inferences were materialized at; null = unknown
   head: number;                // current head commit
   stale: boolean | null;       // null = unknown
-  commitsSince: number | null; // head − commit; null when unknown or not comparable
+  commitsSince: number | null; // head − commit, counting every commit; null when unknown
   staleReason?: string;        // "3 commits since materialization", "store position moved backwards", …
-  auto: { enabled: boolean; debounceSeconds?: number; scheduledAt?: string /* next planned run */ };
+  auto: { enabled: boolean;
+          source: "server" | "dataset"; // --auto-reason, or the dataset's own setting
+          debounceSeconds?: number; maxDelaySeconds?: number;
+          scheduledAt?: string /* next planned run */ };
   warnings: string[];          // the last run's warnings
   vocabularies?: string[];     // built-in vocabularies added to the profile ("geosparql")
   geoDefaultGeometry?: true;   // default geometries were materialized
@@ -2149,6 +2429,20 @@ attempt waits for the next commit. Runs never start for unknown freshness, nor o
 `--read-only` servers. Each run is a full recomputation that holds the dataset's writer
 lock, so updates wait while it runs.
 
+A dataset can have its own setting, which takes precedence over the server's.
+`PUT /$/reason/{ds}/auto` with `{"enabled": true}` turns automatic runs on for that
+dataset even without `--auto-reason`, and `{"enabled": false}` turns them off. Without
+`debounceSeconds`, the dataset uses the server's debounce, or 5 seconds when the server
+has none. The maximum delay defaults to 12 × the debounce. The setting is stored in the
+dataset's `reasoning.json`, survives re-runs and restarts, and goes away with
+`DELETE /$/reason/{ds}`. `sparkles infer` keeps it too.
+
+A write that waits for the writer lock supersedes an automatic run that started after
+the debounce. The run is cancelled at its next check, the task ends `cancelled`, and the
+write goes ahead. The next run starts after the next debounce. A run forced by the
+maximum delay is never superseded, so continuous writes cannot postpone it forever. A
+`DELETE /$/tasks/{id}` cancels any reasoning run, and a cancelled run changes nothing.
+
 **Diagnostics.** `GET /$/reason/{ds}/diagnostics` runs a fixed set of checks taken from
 the OWL 2 RL rules whose conclusion is `false` (OWL 2 Profiles §4.3). Each check is one
 SPARQL query over the default graph, plus the inferences when they are included. Those
@@ -2162,19 +2456,35 @@ establish OWL consistency.
 | `reasoning` | `true` if inferences exist | Includes `urn:x-sparkles:inferred`. |
 | `closure` | `subclass` | `subclass` makes type tests follow `rdfs:subClassOf*`. `none` uses stated types only. |
 | `timeout` | server query timeout | Time budget for the whole report. |
+| `format` | `json` | `json` or `turtle`. Without it, an `Accept: text/turtle` header selects Turtle. |
 
 | Check | Rules | Severity | Query |
 |---|---|---|---|
 | `nothing-member` | `cls-nothing2` (+`cax-sco`) | inconsistency | [nothing-member.rq](../crates/sparkles-reasoner/diagnostics/nothing-member.rq) |
 | `disjoint-classes` | `cax-dw` | inconsistency | [disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/disjoint-classes.rq) |
 | `all-disjoint-classes` | `cax-adc` | inconsistency | [all-disjoint-classes.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-classes.rq) |
+| `complement-classes` | `cls-com` (+`cax-sco`) | inconsistency | [complement-classes.rq](../crates/sparkles-reasoner/diagnostics/complement-classes.rq) |
+| `max-cardinality-zero` | `cls-maxc1` (+`cax-sco`) | inconsistency | [max-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-cardinality-zero.rq) |
+| `max-qualified-cardinality-zero` | `cls-maxqc1`, `cls-maxqc2` (+`cax-sco`) | inconsistency | [max-qualified-cardinality-zero.rq](../crates/sparkles-reasoner/diagnostics/max-qualified-cardinality-zero.rq) |
 | `same-different` | `eq-diff1` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [same-different.rq](../crates/sparkles-reasoner/diagnostics/same-different.rq) |
+| `all-different` | `eq-diff2`, `eq-diff3` (+`eq-ref`, `eq-sym`, `eq-trans`) | inconsistency | [all-different.rq](../crates/sparkles-reasoner/diagnostics/all-different.rq) |
 | `functional-literal-conflict` | `prp-fp`, `dt-diff`, `eq-diff1` | inconsistency | [functional-literal-conflict.rq](../crates/sparkles-reasoner/diagnostics/functional-literal-conflict.rq) |
+| `irreflexive-property` | `prp-irp` | inconsistency | [irreflexive-property.rq](../crates/sparkles-reasoner/diagnostics/irreflexive-property.rq) |
+| `asymmetric-property` | `prp-asyp` | inconsistency | [asymmetric-property.rq](../crates/sparkles-reasoner/diagnostics/asymmetric-property.rq) |
+| `disjoint-properties` | `prp-pdw` | inconsistency | [disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/disjoint-properties.rq) |
+| `all-disjoint-properties` | `prp-adp` | inconsistency | [all-disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-properties.rq) |
+| `negative-property-assertion` | `prp-npa1`, `prp-npa2` | inconsistency | [negative-property-assertion.rq](../crates/sparkles-reasoner/diagnostics/negative-property-assertion.rq) |
 | `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
 | `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
 
+A check that implements two rules reports the one that matched in each finding's `rule`.
+For example, `all-different` reports `eq-diff2` for `owl:members` and `eq-diff3` for
+`owl:distinctMembers`. Property assertions are matched as stated. A subproperty or
+inverse assertion counts only when the inferences are included and contain it.
+Cardinality restrictions match the value 0 of any numeric datatype.
+
 There is no unique name assumption. Two IRIs count as different individuals only through
-`owl:differentFrom`. Literal values of a functional property are compared with SPARQL
+`owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL
 `!=`, restricted to numbers, strings, language-tagged strings and booleans, so a pair it
 cannot compare is never reported. With inferences included, each finding is re-checked
 with the same bindings over the asserted data alone. `basis` is `asserted` when the
@@ -2202,12 +2512,27 @@ type DiagnosticsReport = {
 `status` is `violations-found` when an inconsistency check has findings. Otherwise it is
 `incomplete` when a check timed out or failed, and `none-found` when none did. Warnings
 never count. A timeout marks the remaining checks `timeout`, and the request does not
-fail with `408`. Errors are `400` for an unknown check id or a bad `limit` or `closure`,
-`404` for an unknown dataset, and `501` without the `reasoning` feature. Diagnostics are
-read-only and also work on `--read-only` servers.
+fail with `408`. Errors are `400` for an unknown check id or a bad `limit`, `closure` or
+`format`, `404` for an unknown dataset, and `501` without the `reasoning` feature.
+Diagnostics are read-only and also work on `--read-only` servers.
+
+The Turtle form describes one `spk:DiagnosticsReport`, where `spk:` is `urn:x-sparkles:`.
+Each finding is an `sh:result` with the SHACL result properties `sh:focusNode`,
+`sh:resultSeverity`, `sh:resultMessage` and `sh:sourceConstraintComponent`. The last one
+names the check, as in `spk:check:disjoint-classes`. The rule, the basis and the evidence
+are `spk:` properties, and evidence with several terms is an RDF list. The report has no
+`sh:conforms`, because finding nothing does not establish consistency.
+
+```turtle
+[] a spk:DiagnosticsReport ; spk:dataset "t" ; spk:status "violations-found" ;
+   sh:result [ a spk:Finding ; sh:focusNode ex:tom ; sh:resultSeverity sh:Violation ;
+               sh:sourceConstraintComponent <urn:x-sparkles:check:disjoint-classes> ;
+               spk:rule "cax-dw" ; spk:basis "asserted" ; spk:classes ( ex:Cat ex:Dog ) ;
+               sh:resultMessage "ex:tom is an instance of the disjoint classes ex:Cat and ex:Dog" ] .
+```
 
 In the CLI, `sparkles infer --loc DB --status` prints the status.
-`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json]`
+`sparkles infer --loc DB --check [--checks a,b] [--limit N] [--no-inferences] [--closure subclass|none] [--format text|json|turtle]`
 runs the checks, after materializing when `--profile` or `--rules` is given. It exits
 with 0 (`none-found`), 1 (`violations-found`) or 2 (`incomplete` or an error).
 `sparkles stats` shows a `reasoning` line.
@@ -2568,6 +2893,9 @@ module takes this endpoint's JSON and answers in the same shape. The UI calls
 load or run. `--format-endpoint authenticated` or `off` therefore does not stop such a UI
 from formatting. It limits only the endpoint.
 
+The MCP server offers the same formatter as its `format` tool, with the same options
+(see [MCP server](#mcp-server)).
+
 **JSON body.** The UI sends `Content-Type: application/json` with this body:
 
 ```ts
@@ -2676,6 +3004,7 @@ type SparklesResult = {
     timing: { parseMs: number; planMs: number; execMs: number; serializeMs: number; totalMs: number };
     plan: PlanNode;                        // executed operator tree
     memory: { peakBytes: number };         // peak estimated memory of intermediate results
+    rowsProduced: number;                  // rows produced by all operators, summed
   };
 };
 type Term =
@@ -2793,9 +3122,10 @@ which is about five times faster than gzip for a slightly larger file. `--compre
 (`?compression=gzip`) gives `.nq.gz`, as Fuseki writes. `sparkles dump --out FILE` goes by
 the file's extension, and writes uncompressed without one.
 
-**Full-text documents** are stored with zstd (level 3). `"docstoreCompression": "lz4"`
-or `"none"` in the text configuration picks another codec, and changing it rebuilds the
-index. Indexes built before zstd was available keep LZ4 until they are rebuilt.
+**Full-text documents** keep their terms in columns of the index since index format 2, so
+the Tantivy doc store holds no fields and its codec no longer changes the index size. The
+doc store still uses zstd (level 3) by default, and `"docstoreCompression": "lz4"` or
+`"none"` in the text configuration is still accepted. Changing it rebuilds the index.
 
 ## Errors
 
@@ -2810,6 +3140,8 @@ statuses are:
 * `405` for an update sent with GET
 * `408` for a timeout
 * `409` for a conflict
+* `412` for a failed `If-Match` or `If-None-Match`, with `{code: "precondition-failed"}`
+  (see [Entity tags and conditional requests](#entity-tags-and-conditional-requests))
 * `413` for a body over its ceiling, or a compressed body over `--max-decompressed-mb`
 * `415` for an unsupported content type or `Content-Encoding`
 * `429` for a request over a rate limit
@@ -2901,10 +3233,33 @@ fails the request with `507 Insufficient Storage` and a body like this:
   validation past either limit fails. It never becomes a nonconformant result.
 * `rows` (`--max-rows`, default 200,000,000) is the number of rows of any intermediate
   result.
+* `rows-produced` (`--max-rows-produced`, off by default) is the number of rows that all
+  the operators of a query produce, summed. It measures the work of a query rather than
+  its largest table, so a query that builds many medium-sized results passes the `rows`
+  budget and still fails this one. The WHERE clauses of one update share a single count.
+  It is off by default because the timeout already bounds the work of a query. Turn it on
+  for a limit that does not depend on how fast the machine is or how busy it is.
+* `dataset-bytes` is the storage quota of a persistent dataset (see
+  [Storage quotas](#storage-quotas)). A write that would take the dataset over its quota
+  fails with this budget before anything is committed.
 
-`limit` and `requested` are in bytes, or in rows for `rows`. The response of
-`/{ds}/update` includes `memPeakBytes`. `meta.memory.peakBytes` in
-`application/x-sparkles+json` reports the peak estimate of a query.
+`limit` and `requested` are in bytes, or in rows for `rows` and `rows-produced`. The
+response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
+`meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
+query's peak memory estimate and the rows its operators produced.
+
+**Budgets per request.** A query can ask for lower budgets than the server's with
+`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
+in a form body. An update takes the first three. Each value is a positive whole number,
+in MiB for `memory-mb` and `max-result-mb`. Anything else is a `400`. A value above the
+server's budget is clamped to it, so a request can lower a budget but never raise it. The
+error of a request over its budget reports the budget that applied as `limit`. The time
+budget is the `timeout` parameter, which may ask for more than the default, up to
+`--max-timeout`.
+
+```sh
+curl 'localhost:3030/ds/sparql?memory-mb=256&max-rows-produced=10000000' --data-urlencode 'query=…'
+```
 
 **Streaming.** Query and Graph Store GET bodies are serialized on a worker thread. A body
 of up to 1 MiB is sent whole, with `Content-Length`, and an error, including the
@@ -2920,6 +3275,42 @@ written to a temporary file as they arrive rather than held in memory. A large P
 estimated above the bulk threshold, replaces its graphs in one index rebuild that parses
 the body as a stream. Like every write it is atomic, so a parse error leaves the data as
 it was.
+
+### Storage quotas
+
+A persistent dataset can have a storage quota, a limit on the bytes its directory takes
+on disk. `sparkles serve --max-dataset-mb` sets the default for every persistent dataset,
+and it is off (`0`) by default. `PUT /$/quota/{ds}` gives a dataset a quota of its own,
+which can be higher or lower than the default, or unlimited. `DELETE /$/quota/{ds}`
+removes it. `sparkles quota` does the same on the command line. Changing a quota needs
+`server-admin`, because it limits what the dataset's own admins can store. In-memory
+datasets have `--max-mem-dataset-mb` instead.
+
+The size is everything in the dataset directory: the index generations, the write-ahead
+log, the vocabulary of uncompacted terms, the commit catalog, and the full-text and
+spatial indexes. Older generations kept for named snapshots, the history retention window
+or a running backup count too. The server measures the directory at most once a second
+while a quota is set, and again after every rebuild. Between two measurements, each
+commit adds the bytes it writes to the write-ahead log. `/$/quota/{ds}`, `quota` in
+`/$/stats/{ds}`, the `sparkles_disk_bytes` and `sparkles_dataset_quota_bytes` metrics
+and the UI's dataset page report the usage against the quota.
+
+A write that adds quads is refused with `507` and `"budget": "dataset-bytes"` when it
+would take the dataset over its quota. Nothing is committed. Reads are never affected,
+and neither are writes that only delete, so a dataset over its quota can always shrink.
+Compaction is never refused, because it folds the write-ahead log into a new generation
+and usually makes the dataset smaller. The check works this way for each kind of write:
+
+| Write | How the quota applies |
+|---|---|
+| SPARQL update, small Graph Store write or upload | The commit is checked before its write-ahead log record is written. It is refused when the measured size plus that record exceeds the quota. |
+| Bulk load, large upload or large Graph Store PUT | The new index generation is built, then checked before it is published: the directory with the new generation, less the generation it replaces. A refused build is removed. A PUT that leaves the dataset smaller goes through, even when the dataset is over its quota. |
+| Reasoning run | The inferred triples are a commit like any other. A run whose inferences would pass the quota fails, and the previous inferences stay. |
+| Clone | The clone gets the default quota. A copy larger than that is refused, and no dataset is created. |
+| Restore | A restore is never refused. A dataset restored in place keeps the quota of the dataset it replaces, and a dataset restored under a new name gets the default. A restored dataset over its quota refuses writes that add quads until it is back under. |
+
+The quota is kept in `quota.json` in the dataset directory, so it applies to local
+commands such as `sparkles load --loc` too. Backups leave it out.
 
 ## Authentication and access control
 
@@ -3039,12 +3430,13 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/quota/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |
 | `/$/repositories…` (other routes), `/$/backup-policies…` | | `server-admin` |
+| `/$/quota/{ds}` | PUT, DELETE | `server-admin`. The quota limits what the dataset's own admins can store. |
 | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/explain`, `/{ds}/get`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/data` (GET, HEAD) | | `read` |
 | `/{ds}/update`, `/{ds}/upload`, `/{ds}/data` (other methods), `/{ds}/prefixes` (other methods) | | `write` |
 | `/{ds}` | any | Depends on the operation. `update=` or `application/sparql-update` needs `write`, queries and GET need `read`, and other writes need `write`. |
@@ -3396,6 +3788,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
+| `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
@@ -3466,7 +3859,7 @@ is the equivalent HTTP status:
 | `invalid-shapes`, `invalid-schema` | 400 | Shapes the SHACL validator cannot use. A ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape), or a shape-map label it does not define. |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query`. |
 | `timeout` | 408 | The call's timeout passed. |
-| `budget-memory`, `budget-rows`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
+| `budget-memory`, `budget-rows`, `budget-rows-produced`, `budget-validation-work` | 507 | A query or validation budget was exceeded. |
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |
 | `unknown-commit` | 404 / 410 | `atCommit` is in the future (404) or no longer held (410). |
 | `stale-cursor` | 409 / 400 | A schema cursor whose snapshot is gone (409), or a malformed cursor (400). |

@@ -1,0 +1,18 @@
+# all-disjoint-properties: the same pair of individuals related by two members of an
+# owl:AllDisjointProperties axiom (OWL 2 RL prp-adp).
+#
+# The members are matched by list position, so a property listed twice is disjoint
+# with itself, as the rule says. The checker appends a LIMIT.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+
+SELECT DISTINCT ?d ?x ?y ?p1 ?p2 WHERE {
+  ?d rdf:type owl:AllDisjointProperties ;
+     owl:members ?list .
+  ?list rdf:rest* ?n1 .
+  ?n1 rdf:first ?p1 ;
+      rdf:rest+ ?n2 .
+  ?n2 rdf:first ?p2 .
+  ?x ?p1 ?y .
+  ?x ?p2 ?y .
+}

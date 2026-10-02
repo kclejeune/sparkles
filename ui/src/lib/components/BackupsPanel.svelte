@@ -69,7 +69,7 @@
   });
 
   const admin = $derived(auth.can(name, 'admin'));
-  const persistent = $derived(info?.type === 'persistent');
+  const inMemory = $derived(info?.type === 'mem');
   const list = $derived(loaded?.kind === 'ok' ? loaded.list.backups : []);
   const shown = $derived(showAll ? list : list.slice(0, SHOWN));
   const readonlyRepos = $derived(repositories.filter(b.isReadonly).map((r) => r.name));
@@ -110,10 +110,9 @@
         <button
           class="btn sm primary"
           onclick={backupNow}
-          disabled={!persistent}
-          title={persistent
-            ? 'Copy the dataset at its current commit into a backup repository'
-            : 'In-memory datasets cannot be backed up yet'}
+          title={inMemory
+            ? 'Write the dataset at its current commit to a temporary copy on disk, then copy that into a backup repository'
+            : 'Copy the dataset at its current commit into a backup repository'}
           ><Icon name="archive" size={13} /> Back up now</button
         >
       {/if}
@@ -134,7 +133,7 @@
       <p class="panel-body faint"><span class="spinner"></span> Loading…</p>
     {:else if list.length === 0}
       <p class="panel-body faint">
-        No backups of {name} yet{admin && persistent ? ': back it up into a repository.' : '.'}
+        No backups of {name} yet{admin ? ': back it up into a repository.' : '.'}
       </p>
     {:else}
       <div class="scroll-x">
