@@ -12,6 +12,7 @@ pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
 pub mod indexjoin;
+mod joinorder;
 mod keyfilter;
 pub mod plan;
 pub mod results;
@@ -704,6 +705,8 @@ mod exists_tests;
 mod exprcache_tests;
 #[cfg(test)]
 mod indexjoin_tests;
+#[cfg(test)]
+mod joinorder_tests;
 #[cfg(test)]
 mod opt_tests;
 #[cfg(test)]

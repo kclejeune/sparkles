@@ -491,7 +491,7 @@ struct PathItem {
     graph: ActiveGraph,
 }
 
-const FILTER_SELECTIVITY: f64 = 0.3;
+pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
 const DP_LIMIT: usize = 12;
 
 pub struct Planner<'a> {
@@ -1788,6 +1788,11 @@ impl<'a> Planner<'a> {
                     .unwrap();
                 *filters = rest;
                 best
+            } else if self.ctx.opt.pruned_join_order {
+                match super::joinorder::order(self, items, filters)? {
+                    Ok(plan) => plan,
+                    Err(items) => self.dp(items, filters)?,
+                }
             } else if items.len() <= DP_LIMIT {
                 self.dp(items, filters)?
             } else {
@@ -1808,7 +1813,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Apply (and remove) filters whose variables are all bound by `n`.
-    fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Node {
+    pub(super) fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Node {
         let (now, later): (Vec<Expr>, Vec<Expr>) =
             std::mem::take(filters).into_iter().partition(|f| {
                 !f.has_exists() && {
@@ -1889,7 +1894,11 @@ impl<'a> Planner<'a> {
                         }
                     }
                 }
-                table.insert(mask, best.into_values().collect());
+                // in order of the sort variable, so that ties break the same way in every
+                // run and in the join ordering on cost summaries
+                let mut best: Vec<(Option<VarId>, (Node, u64))> = best.into_iter().collect();
+                best.sort_unstable_by_key(|(k, _)| *k);
+                table.insert(mask, best.into_iter().map(|(_, c)| c).collect());
             }
         }
         let full = (1u32 << n) - 1;
@@ -1911,7 +1920,7 @@ impl<'a> Planner<'a> {
         Ok(best)
     }
 
-    fn apply_dp_filters(
+    pub(super) fn apply_dp_filters(
         &self,
         n: Node,
         applied: u64,
@@ -2168,11 +2177,17 @@ pub(super) fn join_est(a: &Node, b: &Node, keys: &[VarId]) -> f64 {
         .iter()
         .map(|v| a.d(*v).max(b.d(*v)))
         .fold(1.0f64, f64::max);
-    // QLever correction factor
-    (a.est * b.est / denom * 0.7).max(if a.est > 0.0 && b.est > 0.0 { 1.0 } else { 0.0 })
+    join_est_from(a.est, b.est, denom)
 }
 
-fn sort_cost(n: f64) -> f64 {
+/// The estimated rows of joining `a_est` and `b_est` rows where the join variables take
+/// at most `denom` distinct values on either side.
+pub(super) fn join_est_from(a_est: f64, b_est: f64, denom: f64) -> f64 {
+    // QLever correction factor
+    (a_est * b_est / denom * 0.7).max(if a_est > 0.0 && b_est > 0.0 { 1.0 } else { 0.0 })
+}
+
+pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
 
@@ -2257,28 +2272,51 @@ fn join_candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
         .collect();
     for &v in &certain_both {
         let (sa, sb) = (a.sorted.first() == Some(&v), b.sorted.first() == Some(&v));
-        let extra =
-            if sa { 0.0 } else { sort_cost(a.est) } + if sb { 0.0 } else { sort_cost(b.est) };
-        if sa && sb || extra < (a.est + b.est) * 4.0 {
-            let (x, y) = (sort_node(a.clone(), v), sort_node(b.clone(), v));
-            let mut k = vec![v];
-            k.extend(keys.iter().filter(|x| **x != v));
-            let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0);
-            j.desc = format!("on ?{}", ctx.var_name(v));
-            out.push(j);
+        if merge_offered(a.est, sa, b.est, sb) {
+            out.push(merge_join(a.clone(), b.clone(), v, &keys, ctx));
         }
     }
-    let mut h = mk_join(a.clone(), b.clone(), JoinAlgo::Hash, keys.clone(), 0.0);
-    h.desc = format!(
+    out.push(hash_join(a.clone(), b.clone(), keys, ctx));
+    out.extend(super::indexjoin::candidates(a, b, ctx));
+    out
+}
+
+/// Whether a merge join is worth offering for inputs of `a_est` and `b_est` rows, which
+/// are sorted on the key or not.
+pub(super) fn merge_offered(a_est: f64, a_sorted: bool, b_est: f64, b_sorted: bool) -> bool {
+    let extra = if a_sorted { 0.0 } else { sort_cost(a_est) }
+        + if b_sorted { 0.0 } else { sort_cost(b_est) };
+    merge_worth(extra, a_est, b_est, a_sorted && b_sorted)
+}
+
+/// Whether a merge join is worth offering when sorting its inputs costs `extra`.
+pub(super) fn merge_worth(extra: f64, a_est: f64, b_est: f64, both_sorted: bool) -> bool {
+    both_sorted || extra < (a_est + b_est) * 4.0
+}
+
+/// The merge join of `a` and `b` on `v`, sorting either input that is not sorted on it;
+/// `keys` are all the variables they share.
+pub(super) fn merge_join(a: Node, b: Node, v: VarId, keys: &[VarId], ctx: &Ctx) -> Node {
+    let (x, y) = (sort_node(a, v), sort_node(b, v));
+    let mut k = vec![v];
+    k.extend(keys.iter().filter(|x| **x != v));
+    let mut j = mk_join(x, y, JoinAlgo::Merge, k, 0.0);
+    j.desc = format!("on ?{}", ctx.var_name(v));
+    j
+}
+
+/// The hash join of `a` and `b` on the variables they share (`keys`).
+pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
+    let desc = format!(
         "on {}",
         keys.iter()
             .map(|v| format!("?{}", ctx.var_name(*v)))
             .collect::<Vec<_>>()
             .join(" ")
     );
-    out.push(h);
-    out.extend(super::indexjoin::candidates(a, b, ctx));
-    out
+    let mut h = mk_join(a, b, JoinAlgo::Hash, keys, 0.0);
+    h.desc = desc;
+    h
 }
 
 /// Best single join of two plans (used outside the DP).
