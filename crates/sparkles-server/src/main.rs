@@ -37,6 +37,8 @@ mod shacl;
 mod shex_cmd;
 mod shutdown;
 mod state;
+#[cfg(feature = "tls")]
+mod tls;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
@@ -854,6 +856,15 @@ enum Cmd {
         #[cfg(feature = "backup")]
         #[arg(long, default_value_t = 2)]
         backup_max_tasks: usize,
+        /// Serve HTTPS with this PEM certificate chain (the server's certificate first;
+        /// with --tls-key). HTTP/2 and HTTP/1.1 are negotiated through ALPN, and the files
+        /// are read again on SIGHUP and when they change. Most deployments terminate TLS
+        /// at a reverse proxy instead
+        #[arg(long, value_name = "FILE", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// The PEM private key of --tls-cert (PKCS#8, PKCS#1 or SEC1)
+        #[arg(long, value_name = "FILE", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
         /// Listen on this Unix socket (mode 0660) instead of TCP; with auth, trusted
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
@@ -1814,6 +1825,8 @@ fn run() -> Result<()> {
             #[cfg(feature = "backup")]
             backup_max_tasks,
             unix_socket,
+            tls_cert,
+            tls_key,
             allow_open_network,
             cors_origin,
             public_host,
@@ -1842,11 +1855,24 @@ fn run() -> Result<()> {
             if let Some(addr) = &metrics_addr {
                 exposure::check_metrics_addr(addr, auth_config.is_some(), allow_open_network)?;
             }
+            if tls_cert.is_some() && unix_socket.is_some() {
+                bail!("--tls-cert applies to the TCP listener, not to --unix-socket");
+            }
+            // a certificate that does not load stops the server before it binds
+            #[cfg(feature = "tls")]
+            let certs = match (&tls_cert, &tls_key) {
+                (Some(c), Some(k)) => Some(tls::Certs::open(c, k)?),
+                _ => None,
+            };
+            #[cfg(not(feature = "tls"))]
+            if tls_cert.is_some() || tls_key.is_some() {
+                bail!("--tls-cert: built without native TLS (cargo feature \"tls\")");
+            }
             // one server per data directory (held until the process exits)
             #[cfg(feature = "backup")]
             let _data_lock = backup::lock_data_dir(&data)?;
             let bound = if unix_socket.is_some() { "unix" } else { &host };
-            let auth = auth::load(auth_config.as_deref(), &data, bound)?;
+            let auth = auth::load(auth_config.as_deref(), &data, bound, tls_cert.is_some())?;
             // an in-place restore interrupted between its renames is undone before the
             // registry's datasets are opened
             #[cfg(feature = "backup")]
@@ -2085,9 +2111,10 @@ fn run() -> Result<()> {
                 if unix_socket.is_some() {
                     bail!("--unix-socket needs a Unix platform");
                 }
+                let scheme = if tls_cert.is_some() { "https" } else { "http" };
                 let listening = match &unix_socket {
                     Some(p) => format!("unix:{}", p.display()),
-                    None => format!("http://{addr}/"),
+                    None => format!("{scheme}://{addr}/"),
                 };
                 tracing::info!(
                     "Sparkles {} listening on {listening} (UI at /ui/)",
@@ -2126,6 +2153,33 @@ fn run() -> Result<()> {
                     tracing::info!("shutting down: finishing requests in flight (up to {grace:?})");
                     let _ = draining_tx.send(());
                 };
+                // over TLS the connection's handshakes run beside the accept loop, and
+                // requests say they came over https
+                #[cfg(feature = "tls")]
+                let (tls, tcp) = match (certs, tcp) {
+                    (Some(c), Some(l)) => {
+                        tls::spawn_reload(c.clone());
+                        (
+                            Some(tls::TlsListener::new(l, tls::server_config(c)?)?),
+                            None,
+                        )
+                    }
+                    (_, l) => (None, l),
+                };
+                #[cfg(feature = "tls")]
+                if let Some(l) = tls {
+                    let app = app.layer(axum::middleware::map_request(tls::mark_https));
+                    let service = app.into_make_service_with_connect_info::<auth::Peer>();
+                    use std::future::IntoFuture;
+                    let serve = axum::serve(l, service).with_graceful_shutdown(shutdown);
+                    let drained = shutdown::drain(serve.into_future(), draining, grace).await?;
+                    if drained == shutdown::Drained::GraceElapsed {
+                        tracing::warn!(
+                            "shutdown grace of {grace:?} elapsed: cancelling the requests still in flight"
+                        );
+                    }
+                    return anyhow::Ok(());
+                }
                 // the peer address feeds trusted-proxy checks
                 let service = app.into_make_service_with_connect_info::<auth::Peer>();
                 use std::future::IntoFuture;

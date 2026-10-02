@@ -1716,7 +1716,8 @@ fn hashes_and_tokens() {
         crate::auth::load(
             Some(std::path::Path::new("/nonexistent/auth.toml")),
             std::path::Path::new("/nonexistent"),
-            "127.0.0.1"
+            "127.0.0.1",
+            false
         )
         .is_err()
     );
