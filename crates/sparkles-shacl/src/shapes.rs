@@ -6,12 +6,13 @@
 
 use crate::path::PropertyPath;
 use crate::sparql::{ComponentConstraint, SparqlComponent, SparqlConstraint};
+use crate::syntax::ShapesSyntax;
 use crate::vocab::{rdf, rdfs, sh};
 use anyhow::{Context as _, Result, anyhow, bail};
 use oxrdf::vocab::xsd;
 use oxrdf::{Graph, Literal, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, Term, TermRef, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles::io::{RdfFormat, Source};
+use sparkles::io::Source;
 use sparkles::sparql::value::Value;
 use std::fmt;
 
@@ -252,23 +253,33 @@ pub struct Shapes {
 }
 
 impl Shapes {
-    /// Parse a shapes graph from RDF text (Turtle, N-Triples, RDF/XML, JSON-LD, TriG,
-    /// N-Quads; all graphs of a quad format are merged).
-    pub fn parse(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Shapes> {
-        let mut src = Source::from_bytes(text.as_bytes().to_vec(), format, None);
-        src.base = base.map(str::to_string);
-        src.name = "<shapes>".into();
-        let (quads, _) = sparkles::io::parse_to_vec(&src).context("parsing shapes graph")?;
-        let mut g = Graph::new();
-        for q in quads {
-            g.insert(&Triple::new(q.subject, q.predicate, q.object));
-        }
-        Shapes::from_graph(g)
+    /// Parse a shapes graph from text: an RDF syntax (Turtle, N-Triples, RDF/XML,
+    /// JSON-LD, TriG, N-Quads; all graphs of a quad format are merged), or SHACLC.
+    pub fn parse(
+        text: &str,
+        syntax: impl Into<ShapesSyntax>,
+        base: Option<&str>,
+    ) -> Result<Shapes> {
+        let doc = crate::syntax::read_document(text, syntax.into(), base)?;
+        Shapes::from_graph(doc.graph)
     }
 
-    /// Read RDF text into a graph for [`Shapes::from_store_graphs_with`]. Its blank
-    /// nodes get fresh labels, so they never name a blank node of the store.
-    pub fn read_graph(text: &str, format: RdfFormat, base: Option<&str>) -> Result<Graph> {
+    /// Read shapes text (RDF or SHACLC) into a graph for
+    /// [`Shapes::from_store_graphs_with`]. Its blank nodes get fresh labels, so they
+    /// never name a blank node of the store.
+    pub fn read_graph(
+        text: &str,
+        syntax: impl Into<ShapesSyntax>,
+        base: Option<&str>,
+    ) -> Result<Graph> {
+        let syntax = syntax.into();
+        if syntax == ShapesSyntax::Compact {
+            // the reader's blank nodes are fresh already
+            return Ok(crate::compact::parse(text, base)?.graph);
+        }
+        let ShapesSyntax::Rdf(format) = syntax else {
+            unreachable!()
+        };
         let mut src = Source::from_bytes(text.as_bytes().to_vec(), format, None);
         src.base = base.map(str::to_string);
         src.name = "<shapes>".into();

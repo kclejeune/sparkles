@@ -11,6 +11,12 @@
 //! The SHACL 1.2 list constraint tests are vendored in `tests/shacl12` (see its README)
 //! and always run.
 //!
+//! The SHACL Compact Syntax tests are the Working Group's pairs of `.shaclc` and `.ttl`
+//! files in Jena's `shaclc-valid` (next to `std`), and Jena's own syntax tests in
+//! `local/shaclc-syntax`. Each `.shaclc` file must parse to a graph isomorphic to its
+//! `.ttl` file (both with the base `urn:x-base:default`, as in Jena), and each `.ttl`
+//! graph must write as SHACLC and read back to an isomorphic graph.
+//!
 //! Each `sht:Validate` test loads its data graph into an in-memory store. When the
 //! shapes graph is the same document, the shapes are read back from the store
 //! ([`Shapes::from_store`]) so blank nodes are shared, as in Jena where both are the
@@ -381,4 +387,98 @@ fn w3c_shacl_sparql() {
 fn w3c_shacl12_lists() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shacl12");
     run_suite_in("SHACL 1.2 list constraints", &dir, "manifest.ttl");
+}
+
+// ------------------------------------------------------------------ SHACLC ----
+
+fn canonical(mut g: Graph) -> Graph {
+    use oxrdf::dataset::{CanonicalizationAlgorithm, CanonicalizationHashAlgorithm};
+    g.canonicalize(CanonicalizationAlgorithm::Rdfc10 {
+        hash_algorithm: CanonicalizationHashAlgorithm::Sha256,
+    });
+    g
+}
+
+const SHACLC_BASE: &str = "urn:x-base:default";
+
+fn turtle_file(path: &Path) -> (Graph, Vec<(String, String)>) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let doc =
+        sparkles_shacl::syntax::read_document(&text, RdfFormat::Turtle.into(), Some(SHACLC_BASE))
+            .unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+    (doc.graph, doc.prefixes)
+}
+
+/// Write a graph as SHACLC and read it back: the same graph.
+fn round_trip(name: &str, g: &Graph, prefixes: &[(String, String)]) -> Result<(), String> {
+    let text = sparkles_shacl::compact::write(g, prefixes).map_err(|e| format!("write: {e}"))?;
+    let back = sparkles_shacl::compact::parse(&text, None)
+        .map_err(|e| format!("read back: {e}\n{text}"))?;
+    if canonical(back.graph) != canonical(g.clone()) {
+        return Err(format!(
+            "{name}: the written SHACLC reads back to another graph\n{text}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn w3c_shaclc() {
+    let Some(std_dir) = suite_dir() else {
+        eprintln!("W3C SHACL test suite not found; skipping SHACLC");
+        return;
+    };
+    let dir = std_dir.join("../shaclc-valid");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".shaclc")?.to_string())
+        })
+        .collect();
+    names.sort();
+    let mut failures = Vec::new();
+    for name in &names {
+        let text = std::fs::read_to_string(dir.join(format!("{name}.shaclc"))).unwrap();
+        let (expected, prefixes) = turtle_file(&dir.join(format!("{name}.ttl")));
+        match sparkles_shacl::compact::parse(&text, Some(SHACLC_BASE)) {
+            Ok(doc) if canonical(doc.graph.clone()) == canonical(expected.clone()) => {}
+            Ok(doc) => failures.push(format!(
+                "{name}: graphs differ\n--- expected\n{expected}\n--- actual\n{}",
+                doc.graph
+            )),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+        if let Err(e) = round_trip(name, &expected, &prefixes) {
+            failures.push(e);
+        }
+    }
+    // Jena's syntax tests: two round trips and one error
+    let local = std_dir.join("../local/shaclc-syntax");
+    for name in ["nodeParams.shc", "propertyParams.shc"] {
+        let text = std::fs::read_to_string(local.join(name)).unwrap();
+        match sparkles_shacl::compact::parse(&text, None) {
+            Ok(doc) => {
+                if let Err(e) = round_trip(name, &doc.graph, &doc.prefixes) {
+                    failures.push(e);
+                }
+            }
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    let bad = std::fs::read_to_string(local.join("nodeParam-bad-01.shc")).unwrap();
+    if sparkles_shacl::compact::parse(&bad, None).is_ok() {
+        failures.push("nodeParam-bad-01.shc: parsed, but it is not valid SHACLC".into());
+    }
+    eprintln!(
+        "\nSHACLC: {} pairs, {} failures",
+        names.len(),
+        failures.len()
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    assert!(
+        names.len() >= 30,
+        "only {} SHACLC test pairs found",
+        names.len()
+    );
 }
