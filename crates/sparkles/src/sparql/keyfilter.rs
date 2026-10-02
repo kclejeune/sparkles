@@ -37,6 +37,8 @@ enum Test {
     Regex {
         arg: Arg,
         re: regex::Regex,
+        /// the text every match starts with, for a pattern anchored at the start
+        prefix: Option<Arc<str>>,
     },
     /// `LANGMATCHES(LANG(?v), "range")`
     LangMatches(Arc<str>),
@@ -182,9 +184,11 @@ impl KeyFilter {
                         [f] => const_str(f)?,
                         _ => "",
                     };
+                    let pattern = const_str(p)?;
                     Test::Regex {
                         arg: Arg::of(a, v)?,
-                        re: compile_regex(const_str(p)?, flags).ok()?,
+                        re: compile_regex(pattern, flags).ok()?,
+                        prefix: regex_prefix(pattern, flags).map(Into::into),
                     }
                 }
                 (Function::LangMatches, [Expr::Call(Func::Builtin(Function::Lang), l), r])
@@ -201,6 +205,37 @@ impl KeyFilter {
             add(e, v, &mut tests)?;
         }
         (!tests.is_empty()).then_some(KeyFilter(tests))
+    }
+
+    /// Key prefixes that every stored term passing the filter starts with, in key
+    /// order: those of the strings a conjunct's `STRSTARTS` or start-anchored `REGEX`
+    /// requires (literals for `?v`, literals and IRIs for `STR(?v)`). `None` when no
+    /// conjunct fixes a start.
+    pub fn key_prefixes(&self) -> Option<Vec<Vec<u8>>> {
+        self.0.iter().find_map(|t| {
+            let (arg, start): (Arg, &str) = match t {
+                Test::Str {
+                    f: Function::StrStarts,
+                    arg,
+                    needle,
+                    ..
+                } => (*arg, needle),
+                Test::Regex {
+                    arg,
+                    prefix: Some(p),
+                    ..
+                } => (*arg, p),
+                _ => return None,
+            };
+            if start.is_empty() {
+                return None;
+            }
+            let key = |first: u8| [&[first], start.as_bytes()].concat();
+            Some(match arg {
+                Arg::Term => vec![key(b'"')],
+                Arg::Str => vec![key(b'"'), key(b'<')],
+            })
+        })
     }
 
     /// Whether the term with this key passes (type errors fail the filter).
@@ -223,7 +258,7 @@ impl KeyFilter {
                         _ => s.ends_with(needle.as_bytes()),
                     }
             }),
-            Test::Regex { arg, re } => arg
+            Test::Regex { arg, re, .. } => arg
                 .read(&key)
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
@@ -236,6 +271,30 @@ impl KeyFilter {
             },
         }) && key.valid()
     }
+}
+
+/// The text every match of an XPath `pattern` starts with, when the pattern is anchored
+/// at the start (`^abc…`) and has no alternation. Flags other than `s` give none: `i`
+/// folds case, `m` anchors at every line, `x` drops spaces and `q` reads the pattern as
+/// text.
+fn regex_prefix(pattern: &str, flags: &str) -> Option<String> {
+    if !flags.chars().all(|c| c == 's') || pattern.contains('|') {
+        return None;
+    }
+    let mut chars = pattern.strip_prefix('^')?.chars().peekable();
+    let mut out = String::new();
+    while let Some(&c) = chars.peek() {
+        if !(c.is_alphanumeric() || " /:-_#@%=,;'\"<>!~&".contains(c)) {
+            break;
+        }
+        chars.next();
+        // a quantifier that allows no occurrence applies to the character before it
+        if matches!(chars.peek(), Some('?' | '*' | '{')) {
+            break;
+        }
+        out.push(c);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// [`super::expr::compatible`] on the bytes of a language tag: the needle's tag, if it
@@ -297,6 +356,55 @@ mod tests {
             Literal::new_language_tagged_literal_unchecked("Ada", "EN").into()
         )));
         assert!(!f.test(&key(Literal::new_simple_literal("Ada").into())));
+    }
+
+    #[test]
+    fn prefixes_of_anchored_patterns() {
+        assert_eq!(
+            regex_prefix("^http://x/a1", "").as_deref(),
+            Some("http://x/a1")
+        );
+        assert_eq!(regex_prefix("^ab?c", "").as_deref(), Some("a"));
+        assert_eq!(regex_prefix("^ab*", "s").as_deref(), Some("a"));
+        assert_eq!(regex_prefix("^ab{0,2}", "").as_deref(), Some("a"));
+        assert_eq!(regex_prefix("^ab+", "").as_deref(), Some("ab"));
+        assert_eq!(regex_prefix("^a.c", "").as_deref(), Some("a"));
+        assert_eq!(regex_prefix("^ünï[0-9]", "").as_deref(), Some("ünï"));
+        for (p, f) in [
+            ("^abc", "i"),
+            ("^abc", "m"),
+            ("^a b", "x"),
+            ("^abc", "q"),
+            ("^ab|cd", ""),
+            ("abc", ""),
+            ("^a?b", ""),
+            ("^[ab]", ""),
+            ("^\\d", ""),
+        ] {
+            assert_eq!(regex_prefix(p, f), None, "{p} {f}");
+        }
+        let v = 0;
+        let str_v = call(Function::Str, vec![Expr::Var(v)]);
+        let f = KeyFilter::new(&[call(Function::StrStarts, vec![str_v, lit("ab")])], v).unwrap();
+        assert_eq!(
+            f.key_prefixes(),
+            Some(vec![b"\"ab".to_vec(), b"<ab".to_vec()])
+        );
+        let f = KeyFilter::new(
+            &[call(
+                Function::Regex,
+                vec![Expr::Var(v), lit("^ab"), lit("s")],
+            )],
+            v,
+        )
+        .unwrap();
+        assert_eq!(f.key_prefixes(), Some(vec![b"\"ab".to_vec()]));
+        let f = KeyFilter::new(
+            &[call(Function::Contains, vec![Expr::Var(v), lit("ab")])],
+            v,
+        )
+        .unwrap();
+        assert_eq!(f.key_prefixes(), None);
     }
 
     #[test]

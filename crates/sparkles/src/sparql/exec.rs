@@ -10,7 +10,7 @@ use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Block, O, P, Perm, S, pad};
+use crate::index::{Block, Key, O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -644,7 +644,7 @@ fn count_filter_scan(
 ) -> Result<(u64, String)> {
     let kf = super::keyfilter::KeyFilter::new(filter, key);
     if let Some(kf) = &kf
-        && let Some(c) = par_count_on_keys(ctx, spec, kf)?
+        && let Some(c) = par_count_on_keys(ctx, spec, kf, &key_ranges(ctx, spec, Some(kf)))?
     {
         // the other values: inline literals and blank nodes
         let ids: Vec<Id> = c.other.iter().map(|r| r.0).collect();
@@ -660,7 +660,10 @@ fn count_filter_scan(
         let n = if distinct { passed } else { rows };
         return Ok((
             n,
-            format!("[{tested} values tested on vocabulary keys, {passed} passed]"),
+            format!(
+                "[{tested} values{} tested on vocabulary keys, {passed} passed]",
+                ranges_note(c.ranges)
+            ),
         ));
     }
     let (keys, counts) = key_runs(ctx, spec)?;
@@ -684,6 +687,55 @@ fn count_filter_scan(
     Ok((n, note))
 }
 
+/// All keys of a scan.
+fn whole_range(spec: &ScanSpec) -> (Key, Key) {
+    (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX))
+}
+
+/// Key ranges of a scan that hold every row whose first free column can pass a key
+/// filter: when the filter fixes the start of the string (`STRSTARTS`, `REGEX("^…")`),
+/// the base-vocabulary ids of the keys with that start, and every id outside the base
+/// vocabulary (inline values, terms added by updates), which are tested as usual.
+/// Otherwise the whole scan.
+fn key_ranges(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    kf: Option<&super::keyfilter::KeyFilter>,
+) -> Vec<(Key, Key)> {
+    let c = spec.prefix.len();
+    let Some(prefixes) = kf.and_then(|k| k.key_prefixes()) else {
+        return vec![whole_range(spec)];
+    };
+    if !ctx.opt.filter_key_ranges || spec.cols.first().map(|x| x.0) != Some(c) || c >= 4 {
+        return vec![whole_range(spec)];
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    let at = |v: u64, fill: u64| {
+        let mut k = pad(&spec.prefix, fill);
+        k[c] = v;
+        k
+    };
+    // ids sort by tag first: the base vocabulary is one block of ids
+    let mut ranges = vec![(at(0, 0), at(Id::vocab(0).0 - 1, u64::MAX))];
+    for p in prefixes {
+        let (a, b) = vocab.prefix_range(&p);
+        if a < b {
+            ranges.push((at(Id::vocab(a).0, 0), at(Id::vocab(b - 1).0, u64::MAX)));
+        }
+    }
+    ranges.push((at(Id::vocab(vocab.len()).0, 0), at(u64::MAX, u64::MAX)));
+    ranges
+}
+
+/// EXPLAIN text for a read restricted to key ranges.
+fn ranges_note(n: usize) -> String {
+    if n > 1 {
+        format!(" in {n} key ranges")
+    } else {
+        String::new()
+    }
+}
+
 /// What the index blocks of a scan contribute to a count on vocabulary keys.
 #[derive(Default)]
 struct KeyCount {
@@ -698,6 +750,8 @@ struct KeyCount {
     last: Option<(u64, bool)>,
     /// the runs of the other values (inline literals, blank nodes), in order
     other: Vec<(Id, u64)>,
+    /// key ranges read
+    ranges: usize,
 }
 
 /// The rows of a scan whose first free key column passes a key filter, counted per
@@ -709,15 +763,15 @@ fn par_count_on_keys(
     ctx: &Ctx,
     spec: &ScanSpec,
     kf: &super::keyfilter::KeyFilter,
+    ranges: &[(Key, Key)],
 ) -> Result<Option<KeyCount>> {
     if spec.dedup {
         return Ok(None);
     }
     let vocab = &ctx.snap.generation.vocab;
-    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     let parts =
         ctx.snap
-            .par_blocks_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |b, s, e| {
+            .par_blocks_in_ranges(spec.perm, ranges, run_mask(ctx, spec), |b, s, e| {
                 // threads sharing a regular expression contend for its match caches
                 let kf = kf.clone();
                 let mut out = KeyCount::default();
@@ -756,7 +810,10 @@ fn par_count_on_keys(
     let Some(parts) = parts else {
         return Ok(None);
     };
-    let mut all = KeyCount::default();
+    let mut all = KeyCount {
+        ranges: ranges.len(),
+        ..Default::default()
+    };
     let mut last: Option<(u64, bool)> = None;
     for p in parts {
         all.rows += p.rows;
@@ -854,18 +911,19 @@ fn filter_scan_runs(
     if on_key.is_empty() {
         return Ok(None);
     }
-    let Some((keys, counts)) = par_key_runs(ctx, spec)? else {
+    let kf = super::keyfilter::KeyFilter::new(&on_key, key);
+    let ranges = key_ranges(ctx, spec, kf.as_ref());
+    let Some((keys, counts)) = par_key_runs(ctx, spec, &ranges)? else {
         return Ok(None);
     };
     let read: u64 = counts.iter().sum();
     let (hit, on_keys) = super::exprcache::filter_values(ctx, &keys, key, &on_key)?;
     drop(counts);
     let passed = hit.iter().filter(|h| **h).count();
-    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     let width = spec.cols.len();
     let parts =
         ctx.snap
-            .par_blocks_between_cols(spec.perm, lo, hi, scan_mask(ctx, spec), |b, s, e| {
+            .par_blocks_in_ranges(spec.perm, &ranges, scan_mask(ctx, spec), |b, s, e| {
                 let mut cols: Vec<Vec<Id>> = vec![Vec::new(); width];
                 if s >= e {
                     return Ok(cols);
@@ -930,9 +988,10 @@ fn filter_scan_runs(
     table.len = rows;
     table.sorted = scan.sorted.clone();
     let note = format!(
-        "[runs of ?{}: {} values tested{}, {passed} passed]",
+        "[runs of ?{}: {} values{} tested{}, {passed} passed]",
         ctx.var_name(key),
         keys.len(),
+        ranges_note(ranges.len()),
         if on_keys { " on vocabulary keys" } else { "" }
     );
     Ok(Some(FilteredScan {
@@ -946,14 +1005,17 @@ fn filter_scan_runs(
 /// [`key_runs`] with the index blocks read in parallel, when the snapshot's delta has no
 /// key in the scan's range and rows need no comparison with their neighbours (no
 /// union-graph dedup); `None` otherwise.
-fn par_key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<Option<(Vec<Id>, Vec<u64>)>> {
+fn par_key_runs(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    ranges: &[(Key, Key)],
+) -> Result<Option<(Vec<Id>, Vec<u64>)>> {
     if spec.dedup {
         return Ok(None);
     }
-    let (lo, hi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
     let parts =
         ctx.snap
-            .par_blocks_between_cols(spec.perm, lo, hi, run_mask(ctx, spec), |b, s, e| {
+            .par_blocks_in_ranges(spec.perm, ranges, run_mask(ctx, spec), |b, s, e| {
                 let mut keys: Vec<Id> = Vec::new();
                 let mut counts: Vec<u64> = Vec::new();
                 block_runs(spec, b, s, e, |k, n| {
@@ -988,7 +1050,7 @@ fn par_key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<Option<(Vec<Id>, Vec<u64>)
 /// The distinct values of a scan's first free key column with the number of rows of each,
 /// in key order.
 fn key_runs(ctx: &Ctx, spec: &ScanSpec) -> Result<(Vec<Id>, Vec<u64>)> {
-    if let Some(runs) = par_key_runs(ctx, spec)? {
+    if let Some(runs) = par_key_runs(ctx, spec, &[whole_range(spec)])? {
         return Ok(runs);
     }
     let kc = spec.cols[0].0;

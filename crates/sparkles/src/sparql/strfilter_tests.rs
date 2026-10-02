@@ -96,6 +96,11 @@ const FILTERS: &[&str] = &[
     "STRSTARTS({X}, \"Ab\")",
     "STRSTARTS(STR({X}), \"http://ex.org/i1\")",
     "STRSTARTS(STR({X}), \"1\")",
+    "STRSTARTS({X}, \"ünï\")",
+    "STRSTARTS({X}, \"Ada\"@en-us)",
+    "REGEX({X}, \"^Ada\")",
+    "REGEX(STR({X}), \"^http://ex.org/s1\", \"s\")",
+    "REGEX(STR({X}), \"^b\\\"?q\")",
     "STRENDS(STR({X}), \"2\")",
     "STRENDS({X}, \"dé\")",
     "REGEX(STR({X}), \"^[a-r]\", \"i\")",
@@ -145,6 +150,8 @@ fn check(s: &Store, q: &str) -> bool {
     assert_eq!(a, solutions(&run(s, q, Optimizations::NONE)), "{q}");
     let counts = Optimizations::ALL.disable("filter_scan_runs").unwrap();
     assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
+    let whole = Optimizations::ALL.disable("filter_key_ranges").unwrap();
+    assert_eq!(a, solutions(&run(s, q, whole)), "{q}");
     has_op(&fast.plan, "CountFilterFromRuns") || has_desc(&fast.plan, "[runs of ?")
 }
 
@@ -285,6 +292,13 @@ fn counts_from_runs_are_chosen_and_explained() {
         "{:#?}",
         r.plan
     );
+    // a fixed start reads only the key ranges that can match
+    let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRSTARTS(STR(?v), \"Ab\")) }";
+    let r = run(&s, q, Optimizations::ALL);
+    assert!(has_desc(&r.plan, "in 3 key ranges"), "{:#?}", r.plan);
+    let q = "SELECT ?s WHERE { ?s ex:v ?v FILTER(REGEX(?v, \"^Ab\")) }";
+    let r = run(&s, q, Optimizations::ALL);
+    assert!(has_desc(&r.plan, "in 3 key ranges"), "{:#?}", r.plan);
     // a generic expression is evaluated per value
     let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ex:v ?v FILTER(STRLEN(STR(?v)) > 3) }";
     let r = run(&s, q, Optimizations::ALL);
