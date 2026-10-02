@@ -251,9 +251,10 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 7] = [
+const OPTIONAL_META: [&str; 8] = [
     "text.json",
     "geo.json",
+    "vector.json",
     "origin.json",
     crate::guard::config::CONFIG_FILE,
     crate::guard::config::SHACL_SHAPES_FILE,

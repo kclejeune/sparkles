@@ -388,6 +388,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         if let Some(t) = c.checks.iter_mut().find(|x| x.name == "geo") {
             t.millis += t_geo.elapsed().as_secs_f64() * 1000.0;
         }
+        c.vector(root, &dir);
     }
     c.reasoning();
     // a compaction while checking: the files read may belong to different generations
@@ -1567,6 +1568,58 @@ impl Checker<'_> {
         };
         self.checks
             .push(run.done(format!("configured for {preds} predicates; {files}")));
+    }
+
+    // ----------------------------------------------------------- vector indexes ------
+
+    /// `vector.json` and the current generation's index files (`gen_dir/vectors/`).
+    fn vector(&mut self, root: &Path, gen_dir: &Path) {
+        let t0 = Instant::now();
+        let file = crate::vector::config::CONFIG_FILE;
+        let cfg = match std::fs::read(root.join(file)) {
+            Ok(b) => serde_json::from_slice::<crate::vector::VectorConfigFile>(&b)
+                .map_err(|e| e.to_string())
+                .and_then(|f| f.validate().map(|()| f).map_err(|e| e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !gen_dir.join(crate::vector::persist::DIR).exists() {
+                    return;
+                }
+                Ok(Default::default())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let mut run = Run::new("vector");
+        let cfg = match cfg {
+            Ok(c) => c,
+            Err(e) => {
+                run.add(Issue::error(format!("{e}: the vector indexes do not open")).file(file));
+                self.checks.push(run.done("invalid configuration"));
+                return;
+            }
+        };
+        let bad = crate::vector::check_files(gen_dir, self.full);
+        for (f, problem) in &bad {
+            run.add(
+                Issue::warning(format!("{problem}: built again on open"))
+                    .file(format!("{}/{f}", crate::vector::persist::DIR)),
+            );
+        }
+        let mut done = run.done(format!(
+            "{} indexes configured; {} {}",
+            cfg.indexes.len(),
+            if bad.is_empty() {
+                "index files open"
+            } else {
+                "some index files are damaged"
+            },
+            if self.full {
+                "with their checksums"
+            } else {
+                "(headers, ids and graph metadata)"
+            }
+        ));
+        done.millis = t0.elapsed().as_secs_f64() * 1000.0;
+        self.checks.push(done);
     }
 
     // --------------------------------------------------------------- full-text ------

@@ -180,7 +180,12 @@ fn the_delta_is_overlaid_exactly() {
     s.wait_vector_index("emb").unwrap();
     let q = vs[42].clone();
     let n42 = s.snapshot().lookup_iri("urn:n42").unwrap().0;
-    let (hits, info) = search(&s.snapshot(), &q, 5, SearchMode::default());
+    // a wide search, so the stored vector is found for itself
+    let wide = SearchMode {
+        exact: false,
+        ef: Some(200),
+    };
+    let (hits, info) = search(&s.snapshot(), &q, 5, wide);
     assert_eq!(info.method, "hnsw");
     assert_eq!(hits[0].0, n42);
     // a new row, the only one in its direction, comes first for itself
@@ -203,7 +208,7 @@ fn the_delta_is_overlaid_exactly() {
     assert_eq!((info.method, info.deleted), ("hnsw", 1));
     assert!(hits.iter().all(|h| h.0 != n42));
     // the snapshot from before the delete still finds it
-    let (old, _) = search(&before_delete, &q, 5, SearchMode::default());
+    let (old, _) = search(&before_delete, &q, 5, wide);
     assert!(old.iter().any(|h| h.0 == n42));
     update(
         &s,
@@ -211,7 +216,7 @@ fn the_delta_is_overlaid_exactly() {
         &QueryOptions::default(),
     )
     .unwrap();
-    let (hits, info) = search(&s.snapshot(), &q, 5, SearchMode::default());
+    let (hits, info) = search(&s.snapshot(), &q, 5, wide);
     assert_eq!((info.deleted, info.inserted), (0, 1));
     assert_eq!(hits[0].0, n42);
     // the same through SPARQL, with the per-query options

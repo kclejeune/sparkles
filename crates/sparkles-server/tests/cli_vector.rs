@@ -132,6 +132,28 @@ fn vector_index_lifecycle() {
         0,
     );
     assert!(String::from_utf8_lossy(&o.stdout).contains("<urn:v3>"));
+    // check validates vector.json and the index file
+    let check = |code: i32| {
+        let o = expect(&["check", "--loc", &db, "--format", "json"], code);
+        let report: J = serde_json::from_slice(&o.stdout).unwrap();
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "vector")
+            .cloned()
+            .unwrap_or_else(|| panic!("{report}"))
+    };
+    assert_eq!(check(0)["status"], "ok");
+    let cfg = Path::new(&db).join("vector.json");
+    let saved = std::fs::read(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        br#"{"indexes":{"x":{"predicate":"urn:emb","dimension":0}}}"#,
+    )
+    .unwrap();
+    assert!(check(1).to_string().contains("dimension"));
+    std::fs::write(&cfg, saved).unwrap();
     // clone copies the configuration
     let copy = dir.path().join("copy");
     expect(&["clone", "--loc", &db, "--to", copy.to_str().unwrap()], 0);

@@ -315,69 +315,83 @@ fn pack(
         }
         Ok(())
     })?;
-    // parse every distinct literal once, in parallel batches
-    let mut objs: Vec<u64> = keys
-        .iter()
-        .map(|k| k[1])
-        .filter(|&o| Id(o).tag() == Tag::Vocab)
-        .collect();
-    objs.sort_unstable();
-    objs.dedup();
     /// What a literal is to the packing.
     enum Lit {
-        Vector(Arc<[f32]>),
+        Vector(Vec<f32>),
         /// a vector of another dimension than the configured one
         Wrong,
         /// of the vector datatype, but not a valid vector
         Malformed,
     }
-    let mut parsed: FxHashMap<u64, Lit> = FxHashMap::default();
-    let mut malformed_lits = 0u64;
-    let total = objs.len().max(1);
-    for (bi, batch) in objs.chunks(PARSE_BATCH).enumerate() {
+    // rows in batches: each batch's literals are parsed in parallel and copied into the
+    // segments in row order, so only one batch of parsed vectors is held at a time (a
+    // literal in rows of several batches is parsed once per batch)
+    let mut by_dim: FxHashMap<usize, Packing> = FxHashMap::default();
+    if let Some(d) = only {
+        // a configured index: room for every row at once, not doubling as it grows
+        let n = keys.len();
+        by_dim.insert(
+            d,
+            (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n * d),
+            ),
+        );
+    }
+    let (mut malformed_rows, mut wrong_dim) = (0u64, 0u64);
+    let mut malformed_lits: rustc_hash::FxHashSet<u64> = Default::default();
+    let total = keys.len().max(1);
+    for (bi, batch) in keys.chunks(PARSE_BATCH).enumerate() {
         if cancel() {
             return Err(Error::Cancelled);
         }
-        let payloads: Vec<u64> = batch.iter().map(|&o| Id(o).payload()).collect();
-        let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch.len());
+        let mut objs: Vec<u64> = batch
+            .iter()
+            .map(|k| k[1])
+            .filter(|&o| Id(o).tag() == Tag::Vocab)
+            .collect();
+        objs.sort_unstable();
+        objs.dedup();
+        let payloads: Vec<u64> = objs.iter().map(|&o| Id(o).payload()).collect();
+        let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(objs.len());
         snap.generation.vocab.get_sorted(&payloads, |pl, key| {
             // only literals of the vector datatype
             if key.ends_with(DATATYPE.as_bytes()) && key.first() == Some(&b'"') {
                 raw.push((pl, key.to_vec()));
             }
         });
-        let out: Vec<(u64, Lit)> = raw
+        let parsed: FxHashMap<u64, Lit> = raw
             .par_iter()
             .map(|(pl, key)| {
                 let lit = match from_key(key) {
                     None => Lit::Malformed,
                     Some(v) if only.is_some_and(|d| v.len() != d) => Lit::Wrong,
-                    Some(v) => Lit::Vector(v.into()),
+                    Some(v) => Lit::Vector(v),
                 };
-                (*pl, lit)
+                (Id::vocab(*pl).0, lit)
             })
             .collect();
-        for (pl, lit) in out {
-            malformed_lits += matches!(lit, Lit::Malformed) as u64;
-            parsed.insert(Id::vocab(pl).0, lit);
+        drop(raw);
+        for k in batch {
+            match parsed.get(&k[1]) {
+                Some(Lit::Vector(v)) => {
+                    let (ids, norms, data) = by_dim.entry(v.len()).or_default();
+                    ids.push(*k);
+                    norms.push(norm(v));
+                    data.extend_from_slice(v);
+                }
+                Some(Lit::Wrong) => wrong_dim += 1,
+                Some(Lit::Malformed) => {
+                    malformed_rows += 1;
+                    malformed_lits.insert(k[1]);
+                }
+                None => {}
+            }
         }
         progress(((bi + 1) * PARSE_BATCH).min(total) as f32 / total as f32);
     }
-    let mut by_dim: FxHashMap<usize, Packing> = FxHashMap::default();
-    let (mut malformed_rows, mut wrong_dim) = (0u64, 0u64);
-    for k in keys {
-        match parsed.get(&k[1]) {
-            Some(Lit::Vector(v)) => {
-                let (ids, norms, data) = by_dim.entry(v.len()).or_default();
-                ids.push(k);
-                norms.push(norm(v));
-                data.extend_from_slice(v);
-            }
-            Some(Lit::Wrong) => wrong_dim += 1,
-            Some(Lit::Malformed) => malformed_rows += 1,
-            None => {}
-        }
-    }
+    let malformed_lits = malformed_lits.len() as u64;
     Ok(Packed {
         by_dim: by_dim
             .into_iter()
