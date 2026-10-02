@@ -2,14 +2,14 @@
 
 > **Status:** implemented in part
 >
-> **Phases:** Phase 1 shipped: `spk:vector` literals, the similarity functions, and an
-> exact top-k `spk:vectorSearch` scoped to the active graph, with the delta overlay and a
-> memory budget. A small part of Phase 1b shipped with it: the read-only status route
-> `GET /$/vector/{ds}`, the budget flag, and "Similar" in the UI's explorer. Configured
-> indexes, persisted segments, `candidates:join`, variable queries, the `sparkles vector`
-> CLI, Phase 2 (HNSW) and Phase 3 are not built.
+> **Phases:** Phases 1, 1b and 2 shipped, apart from their UI pieces. They cover
+> `spk:vector` literals, the similarity functions, `spk:vectorSearch` with variable
+> queries, `candidates:join` and `distinct:subject`, configured indexes with persisted
+> files and background builds, `/$/vector/{ds}/{name}`, `sparkles vector`, and an HNSW
+> graph with an exact overlay of each snapshot's changes. The `/similar` page, the
+> dataset page's index cards and Phase 3 are not built.
 >
-> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [Features](../FEATURES.md#sparql-arq-equivalent)
+> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#sparql-arq-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -868,18 +868,104 @@ outputs also count against the per-query memory budget. The UI shows "Similar" i
 explorer instead of a separate `/similar` page, and the MCP server
 ([C11](C11-mcp-server.md)) exposes the search as its `similar_entities` tool.
 
-**Deviations.** The vector code is always compiled. There is no `vector` cargo feature,
-because the code has no dependencies. A variable query vector answers `501`, as Phase 1
-specified. Vector search results are not cached.
+Phases 1b and 2 landed on 2026-10-02.
+* **Configured indexes.** `vector.json` holds the indexes of a dataset by name, each with
+  its predicate, dimension, metric, model label, HNSW settings (`m`, `efConstruction`,
+  `efSearch`) and `exactThreshold`. `PUT`, `GET` and `DELETE /$/vector/{ds}/{name}`,
+  `POST …/rebuild` and `sparkles vector create|drop|rebuild|list|status` manage them,
+  locally or with `--server`. A predicate has at most one index (`409`), and a query of
+  another dimension against an indexed predicate gets `400`.
+* **Builds.** A build runs on a background thread from a snapshot, without the writer
+  lock, while writes go on. It packs the predicate's base vectors, publishes them (searches
+  then scan them exactly), builds the graph, writes `gen-NNNN/vectors/<name>.spkv`, and
+  maps it. Opening a store maps the file when its configuration hash, base commit, quad
+  and term counts and the checksum of its header and ids match. Otherwise the index is
+  built again. A compaction or bulk load starts a build for the new generation, and
+  writes to the replaced generation's directory stop. A new `efSearch`, threshold or
+  model keeps the build. `sparkles check` validates `vector.json` and the files, and
+  clones and backups keep `vector.json`.
+* **HNSW.** The graph follows the paper: levels from `⌊−ln(U)·mL⌋`, insertion by
+  Algorithm 1 with the neighbour heuristic of Algorithm 4 (keeping pruned candidates in
+  free places), and search by Algorithms 2 and 5, with rayon-parallel insertion and a
+  lock per node. It holds only links between node numbers and reads the vectors from the
+  packed segment, so it adds about 136 bytes per vector at M = 16. The rows of one
+  (subject, vector) pair in several graphs are one node.
+* **Searches through the graph.** The graph returns `ef` candidates (at least k) among
+  base rows the active graph accepts and the snapshot has not deleted. They are scored
+  with the §4.3 kernel, merged with the snapshot's inserted rows (scored exactly, parsed
+  once per generation), and cut to k. A row's score is the same on every path. The exact
+  path runs instead when `exact:true` is set, the snapshot is a past state, the metric
+  differs from the index's, the graph is still being built, at most `exactThreshold`
+  rows are in scope, or the active graph holds less than 5 % of the rows. A graph search
+  that finds fewer than k rows while more exist widens `ef` four times over, up to 4096,
+  and then falls back. Plan counters report `method`, `exactBecause`, `ef`, `rows`,
+  `scored` and the overlay counts.
+* **Bound queries.** A variable query, or `candidates:join`, makes the search a node over
+  the rest of its group, attached after the group's joins, paths and triple-term
+  unpacking. It runs once per distinct query value (literal or entity, at most 1000,
+  else `507`), and `candidates:join` scores only the rows of the bound subjects, found by
+  binary search in the PSO-ordered segment, always exactly. `distinct:subject` keeps the
+  best row per subject.
+* **Recall endpoint.** `POST /$/vector/{ds}/{name}/recall` answers synchronously with
+  `{ k, samples, ef, recall, hnswMs, exactMs }`, using stored vectors as queries.
 
-**Tests at landing.** Integration tests in `crates/sparkles/tests/vectors.rs`, and unit
-tests of the grammar and the kernel in `crates/sparkles/src/vector.rs`.
+**Deviations.**
+* The vector code is always compiled, and so is the HNSW graph. There is no `vector` or
+  `vector-hnsw` cargo feature, because neither adds a dependency. USearch was measured
+  against hnsw_rs, instant-distance and a graph written for Sparkles
+  ([PROVENANCE](PROVENANCE.md#vector-similarity-and-vector-indexes)). The Sparkles graph
+  matched USearch's recall and latency, reads the packed vectors instead of copying
+  them, takes `ef` per query, and needs no C++ toolchain, so no ANN crate was added.
+  There is no quantization (§2.4 `quantization`).
+* Past states are always searched exactly, also in the current generation where the
+  graph would answer them correctly. `?at=` reads of an older generation pack that
+  generation's vectors on demand, as Phase 1 did.
+* Packed vectors and graphs share the process-wide `--vector-memory-mb` budget, now a
+  global flag. Mapped files count in full. An index over budget is `over-budget`, and
+  searches of its predicate scan exactly, which needs the same budget.
+* The default `exactThreshold` is 10,000 rows, not 20,000.
+* `PUT` answers `{ index, task }` once the configuration is written, and the task
+  follows the build. The recall endpoint is synchronous, not a task.
+* `DatasetStats.vector` and the `/similar` UI are not built.
+* Vector search results are not cached.
 
-**Performance.** No vector benchmark has been published.
+**Tests at landing.**
+* `crates/sparkles/tests/vectors.rs`: the §7 examples, bound queries, `candidates:join`
+  and `distinct:subject`.
+* `crates/sparkles/tests/vector_index.rs`: recall@10 against the exact search on fixed
+  seeds (at least 0.95 at ef = 64), equal scores on both paths, random inserts, deletes
+  and re-inserts after a build, past states, files across reopens and damage, builds
+  while writes go on, and configuration errors.
+* Unit tests of the grammar, kernel, graph, file format and configuration in
+  `crates/sparkles/src/vector/`.
+* The server's router tests and `crates/sparkles-server/tests/cli_vector.rs` cover the
+  HTTP API and the CLI, locally and against a server.
 
-**Not built.** Configured indexes (`vector.json`, `PUT`/`DELETE /$/vector/{ds}/{name}`),
-persisted segment files, background builds, `candidates:join`, `distinct:subject`,
-variable query vectors, the `sparkles vector` CLI, the approximate HNSW index (Phase 2),
-and everything in Phase 3, including hybrid ranking with
-[F03](F03-full-text-search.md). The README lists the missing approximate index as a known
-gap.
+**Performance.** `scripts/bench-vector.sh` (`mise run bench:vector`) measures build time,
+memory, recall@10 and latency over HTTP. The first numbers were taken on a 16-core
+machine busy with other compiles (load about 30), so they are rough. The vectors are
+clustered (1000 centres, Gaussian noise), cosine, with M = 16, efConstruction = 128 and
+1000 queries. Latency is per query through a keep-alive HTTP client, median then p99.
+
+| Vectors | Build | Packed vectors + graph | Exact p50 | ef=32 | ef=64 | ef=128 | ef=256 |
+|---|---|---|---|---|---|---|---|
+| 100k × 384 | 16 s | 149 + 13 MB | 2.5 ms | 0.999 at 0.55 ms | 1.000 at 0.57 ms | 1.000 at 0.92 ms | 1.000 at 1.52 ms |
+| 100k × 768 | 35 s | 296 + 13 MB | 4.4 ms | 0.996 at 0.69 ms | 0.999 at 0.93 ms | 0.999 at 1.49 ms | 0.999 at 2.91 ms |
+| 1M × 384 | 175 s | 1,492 + 134 MB | 54.0 ms | 0.828 at 0.96 ms | 0.939 at 1.02 ms | 0.975 at 1.20 ms | 0.993 at 1.45 ms |
+| 1M × 768 | 332 s | 2,956 + 134 MB | 90.8 ms | 0.774 at 2.01 ms | 0.895 at 2.23 ms | 0.963 at 2.87 ms | 0.993 at 3.98 ms |
+
+Each cell after the exact search gives recall@10 and the median latency. The exact search
+runs in parallel on every core. At 1M vectors the default `efSearch` of 64 gives a recall
+of 0.89 to 0.94 on this data, and `ef:256` gives 0.993 at 1.5 to 4 ms, still 25 to 40
+times faster than the exact search. USearch, measured on the same kind of data at 1M ×
+384 outside Sparkles, reached a recall of 0.908 at ef = 64 and 0.992 at ef = 256, so the
+lower recall at 1M comes from the data, not the graph. USearch built its index 2.5 times
+faster (70 s against 176 s) and held 1.3 GB for it, against 130 MB for the Sparkles
+graph. The peak memory of a build is 0.7 GB at 100k × 384 and 4.7 GB at 1M × 384. At
+1M × 768 it reaches 9.3 GB, most of which is mapped vocabulary pages holding the literals'
+text. The server maps the index file and used 3.2 GB at 1M × 768 after the measurements.
+
+**Not built.** The `/similar` UI page and the dataset page's index cards, quantization,
+and everything in Phase 3: background catch-up of the graph with overlay inserts,
+keeping the graph across compactions, rewriting `ORDER BY spk:cosine(…) LIMIT k`, hybrid
+ranking with [F03](F03-full-text-search.md), and a compact datatype.

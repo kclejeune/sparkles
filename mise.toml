@@ -302,6 +302,28 @@ DATA="${usage_data:+$(realpath "$usage_data")}" PORT_BASE="$usage_port_base" \
 scripts/bench-text.sh "$usage_people" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:vector"]
+description = "Vector search: build time, memory, recall@10 and latency of the HNSW index against the exact search, over HTTP (hyperfine and a keep-alive client)"
+depends = ["build"]
+usage = '''
+arg "[n]" default="100000" help="vectors to generate and load"
+arg "[dim]" default="384" help="their dimension"
+arg "[workdir]" default="target/bench-vector" help="data, store and results/ (summary.md), per size"
+flag "--queries <n>" default="1000" help="query vectors (recall and client latency)"
+flag "--efs <list>" default="16 32 64 128 256" help="efSearch values to measure"
+flag "--runs <n>" default="20" help="hyperfine runs per mode"
+flag "--warmup <n>" default="3" help="hyperfine warm-up runs per mode"
+flag "--m <n>" default="16" help="HNSW links per node"
+flag "--ef-construction <n>" default="128" help="HNSW candidates while building"
+flag "--skip-load" help="reuse the store and index of an earlier run in the same workdir"
+flag "--port <n>" default="4800" help="the server's port"
+'''
+run = '''
+QUERIES="$usage_queries" EFS="$usage_efs" RUNS="$usage_runs" WARMUP="$usage_warmup" M="$usage_m" \
+EFC="$usage_ef_construction" SKIP_LOAD="${usage_skip_load:+1}" PORT="$usage_port" \
+scripts/bench-vector.sh "$usage_n" "$usage_dim" "$(realpath -m "$usage_workdir")"
+'''
+
 [tasks."bench:watdiv"]
 description = "WatDiv basic testing (20 templates: linear, star, snowflake, complex): the five engines of bench, answers checked first"
 depends = ["build"]

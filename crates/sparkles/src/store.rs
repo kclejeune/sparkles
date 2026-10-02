@@ -13,6 +13,7 @@
 mod backup;
 mod geo;
 mod quota;
+mod vector;
 pub use backup::{
     BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
     MemoryCaptureOptions,
@@ -739,6 +740,9 @@ pub struct StoreOptions {
     /// Persistent stores write the spatial index's files (`gen-NNNN/geo/`) after each
     /// build; `false` builds in memory only and writes nothing (read-only servers).
     pub geo_files: bool,
+    /// Persistent stores write each vector index build to `gen-NNNN/vectors/`; `false`
+    /// builds in memory only.
+    pub vector_files: bool,
     /// Compute a change digest for every WAL commit (see
     /// [`annotations::change_digest`](crate::annotations::change_digest)). A persistent
     /// store remembers it: once on, later openings compute digests too.
@@ -774,6 +778,7 @@ impl Default for StoreOptions {
             geo_op_vertices: 2_000_000,
             geo_query_rewrite: true,
             geo_files: true,
+            vector_files: true,
             commit_digests: false,
         }
     }
@@ -849,6 +854,8 @@ pub struct Store {
     text: arc_swap::ArcSwapOption<crate::text::TextIndex>,
     /// spatial index, when enabled for this dataset
     geo: arc_swap::ArcSwapOption<crate::geo::GeoIndex>,
+    /// configured vector indexes (`vector.json`)
+    vector: Arc<vector::VectorRegistry>,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// write guard checked before every commit (write-time validation)
@@ -957,6 +964,7 @@ impl Store {
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
+            vector: Default::default(),
             history: None,
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -1173,6 +1181,7 @@ impl Store {
             clock: Arc::new(Mutex::new(None)),
             text: Default::default(),
             geo: Default::default(),
+            vector: Default::default(),
             history: Some(Arc::new(Mutex::new(history))),
             guard: parking_lot::RwLock::new(None),
             guard_observer: parking_lot::RwLock::new(None),
@@ -1186,6 +1195,7 @@ impl Store {
         store.collect_history(gen_no, head.seq);
         store.open_text(&wal_text)?;
         store.open_geo();
+        store.open_vectors();
         if head.seq == 0 {
             store.digest_root(&head);
         }
@@ -2729,6 +2739,8 @@ impl Store {
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
         self.current.store(Arc::new(new_snap));
+        // and its own vector indexes, built in the background
+        self.vectors_switched(snap);
         // The old generation is kept if history needs it, else removed; open readers
         // keep their mmaps alive.
         if let (Some(root), Some(old)) = (&self.root, old)
@@ -2895,8 +2907,8 @@ impl Store {
                 &serde_json::to_vec_pretty(&prefixes).unwrap(),
             )?;
         }
-        // full-text search and the spatial index stay on: the clone rebuilds them when
-        // opened
+        // full-text search, the spatial index and the vector indexes stay on: the clone
+        // rebuilds them when opened
         for (file, cfg) in self.index_config_files()? {
             write_atomic(&dir.join(file), &cfg)?;
         }
@@ -2991,6 +3003,18 @@ impl Store {
         };
         if let Some(cfg) = geo_cfg {
             out.push((crate::geo::CONFIG_FILE, cfg));
+        }
+        // the vector indexes are built again where the copy opens
+        let vector_cfg = self.vector_configs();
+        if !vector_cfg.is_empty() {
+            let file = crate::vector::VectorConfigFile {
+                indexes: vector_cfg,
+                ..Default::default()
+            };
+            out.push((
+                crate::vector::config::CONFIG_FILE,
+                serde_json::to_vec_pretty(&file).unwrap(),
+            ));
         }
         Ok(out)
     }

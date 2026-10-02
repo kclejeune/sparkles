@@ -319,3 +319,67 @@ fn searches_count_toward_the_memory_budget() {
         "{e}"
     );
 }
+
+#[test]
+fn bound_queries_and_options() {
+    let s = store(StoreOptions::default());
+    // 4: the join after top-k, and candidates:join before it
+    let q = "SELECT ?s ?score { ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 2 OPTS) } ORDER BY DESC(?score) ?s";
+    assert_eq!(rows(&s, &q.replace("OPTS", "")), ["b 0.6"]);
+    assert_eq!(
+        rows(&s, &q.replace("OPTS", "\"candidates:join\"")),
+        ["b 0.6", "a 0"]
+    );
+    // a variable query: one search per bound entity or vector
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT ?q ?s ?score { VALUES ?q { ex:a ex:c } (?s ?score) spk:vectorSearch (ex:emb ?q 2) } ORDER BY ?q DESC(?score)"
+        ),
+        ["a a 1", "a b 0.8", "c c 1", "c b 0.6"]
+    );
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT ?s ?score { BIND(\"[0,1,0]\"^^spk:vector AS ?v) (?s ?score) spk:vectorSearch (ex:emb ?v 1) }"
+        ),
+        ["c 1"]
+    );
+    // the variable must be bound by the rest of the group
+    assert!(
+        err(
+            &s,
+            "SELECT ?s { (?s ?score) spk:vectorSearch (ex:emb ?q 2) }"
+        )
+        .contains("not bound")
+    );
+    // a variable query and candidates together: per query, among the bound subjects
+    assert_eq!(
+        rows(
+            &s,
+            "SELECT ?q ?s { VALUES (?q ?s) { (ex:c ex:a) (ex:c ex:b) } (?s ?score) spk:vectorSearch (ex:emb ?q 1 \"candidates:join\") }"
+        ),
+        ["c b"]
+    );
+    // distinct:subject: at most one row per entity
+    update(
+        &s,
+        &format!("{P}INSERT DATA {{ ex:b ex:emb \"[0.9, 0.1, 0]\"^^spk:vector }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let q = "SELECT ?s ?score { (?s ?score) spk:vectorSearch (ex:emb \"[1,0,0]\"^^spk:vector 3 OPTS) } ORDER BY DESC(?score)";
+    assert_eq!(
+        rows(&s, &q.replace("OPTS", "")),
+        ["a 1", "b 0.993884", "b 0.8"]
+    );
+    assert_eq!(
+        rows(&s, &q.replace("OPTS", "\"distinct:subject\"")),
+        ["a 1", "b 0.993884", "c 0"]
+    );
+    let named = rows(
+        &s,
+        "SELECT ?s ?score { GRAPH ?g { (?s ?score) spk:vectorSearch (ex:emb \"[1,0,0]\"^^spk:vector 5 \"distinct:subject\") } } ORDER BY DESC(?score)",
+    );
+    assert_eq!(named, ["a 1", "h 0.6"]);
+}

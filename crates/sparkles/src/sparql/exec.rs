@@ -365,7 +365,15 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t
         }
         Kind::TextSearch(spec) => crate::text::search(ctx, spec, &n.vars)?,
-        Kind::VectorSearch(spec) => vector_search(ctx, spec, &n.vars)?,
+        Kind::VectorSearch(spec) => {
+            let input = match n.children.len() {
+                0 => None,
+                _ => Some(child(0, &mut infos)?),
+            };
+            let (t, c) = vector_search(ctx, spec, input, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::SpatialScan(spec) => {
             let (t, c) = spatial_scan(ctx, spec, &n.vars)?;
             counters = Some(c);
@@ -2922,7 +2930,6 @@ use crate::geo::knn::spatial_knn;
 #[cfg(feature = "geo")]
 use crate::geo::rewrite::spatial_relate;
 
-#[cfg(not(feature = "geo"))]
 type Counters = serde_json::Map<String, serde_json::Value>;
 
 #[cfg(not(feature = "geo"))]
@@ -2968,83 +2975,258 @@ fn spatial_relate(
     Err(crate::geo::not_built())
 }
 
-fn vector_search(ctx: &Ctx, spec: &super::plan::VectorSpec, vars: &[VarId]) -> Result<Table> {
+/// The vector of entity `e` under `pred` in the active graph (`None`: it has none).
+fn entity_vector(
+    ctx: &Ctx,
+    spec: &super::plan::VectorSpec,
+    pred: Id,
+    e: Id,
+) -> Result<Option<Vec<f32>>> {
+    let mut found: Vec<Id> = Vec::new();
+    for k in ctx.snap.scan_keys(Perm::Pso, &[pred.0, e.0])? {
+        if spec.graph.accepts(k[3]) && !found.contains(&Id(k[2])) {
+            found.push(Id(k[2]));
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [o] => ctx
+            .snap
+            .key(*o)
+            .and_then(|k| crate::vector::from_key(&k))
+            .map(Some)
+            .ok_or_else(|| Error::invalid("the entity's vector is not a valid spk:vector")),
+        many => Err(Error::invalid(format!(
+            "entity {} has {} vectors for the predicate; pass a vector literal",
+            ctx.term(e).map_or("?".into(), |t| t.to_string()),
+            many.len()
+        ))),
+    }
+}
+
+/// Distinct query vectors a variable query may bind.
+const MAX_QUERY_VECTORS: usize = 1000;
+
+/// Top-k vector search (`spk:vectorSearch`). With `input` (a variable query or
+/// `candidates:join`), the search runs once per distinct query and joins with the input
+/// rows; else it is a leaf.
+fn vector_search(
+    ctx: &Ctx,
+    spec: &super::plan::VectorSpec,
+    input: Option<Table>,
+    vars: &[VarId],
+) -> Result<(Table, Counters)> {
     use super::plan::VectorQuery;
     use crate::vector;
     let mut t = Table::new(vars.to_vec());
+    let mut counters = Counters::new();
     let Some(pred) = spec.pred else {
-        return Ok(t);
+        return Ok((t, counters));
     };
     let graph = |g: u64| spec.graph.accepts(g);
-    let query: Vec<f32> = match &spec.query {
-        VectorQuery::Vector(v) => v.to_vec(),
-        VectorQuery::Entity(e) => {
-            // the entity's vectors under the predicate, in the active graph
-            let mut found: Vec<Id> = Vec::new();
-            for k in ctx.snap.scan_keys(Perm::Pso, &[pred.0, e.0])? {
-                if graph(k[3]) && !found.contains(&Id(k[2])) {
-                    found.push(Id(k[2]));
+    // (query, the input rows it serves) per search
+    let input_rows = |rows: &mut dyn Iterator<Item = usize>| rows.collect::<Vec<usize>>();
+    let mut runs: Vec<(Option<Vec<f32>>, Vec<usize>)> = Vec::new();
+    match (&spec.query, &input) {
+        (VectorQuery::Vector(v), None) => runs.push((Some(v.to_vec()), Vec::new())),
+        (VectorQuery::Entity(e), None) => {
+            runs.push((entity_vector(ctx, spec, pred, *e)?, Vec::new()))
+        }
+        (VectorQuery::Vector(v), Some(inp)) => {
+            runs.push((Some(v.to_vec()), input_rows(&mut (0..inp.len()))))
+        }
+        (VectorQuery::Entity(e), Some(inp)) => runs.push((
+            entity_vector(ctx, spec, pred, *e)?,
+            input_rows(&mut (0..inp.len())),
+        )),
+        (VectorQuery::Var(qv), Some(inp)) => {
+            let col = inp
+                .col_of(*qv)
+                .ok_or_else(|| Error::invalid("spk:vectorSearch: the query variable is unbound"))?;
+            let mut by_value: rustc_hash::FxHashMap<Id, Vec<usize>> = Default::default();
+            let mut order: Vec<Id> = Vec::new();
+            for r in 0..inp.len() {
+                let id = inp.get(r, col);
+                if id == Id::UNDEF {
+                    continue;
                 }
+                by_value
+                    .entry(id)
+                    .or_insert_with(|| {
+                        order.push(id);
+                        Vec::new()
+                    })
+                    .push(r);
             }
-            match found.as_slice() {
-                [] => return Ok(t),
-                [o] => ctx
-                    .snap
-                    .key(*o)
-                    .and_then(|k| vector::from_key(&k))
-                    .ok_or_else(|| {
-                        Error::invalid("the entity's vector is not a valid spk:vector")
-                    })?,
-                many => {
-                    return Err(Error::invalid(format!(
-                        "entity {} has {} vectors for the predicate; pass a vector literal",
-                        ctx.term(*e).map_or("?".into(), |t| t.to_string()),
-                        many.len()
-                    )));
-                }
+            if order.len() > MAX_QUERY_VECTORS {
+                return Err(Error::BudgetExceeded(crate::Budget {
+                    kind: crate::BudgetKind::Rows,
+                    limit: MAX_QUERY_VECTORS as u64,
+                    requested: order.len() as u64,
+                }));
+            }
+            for id in order {
+                ctx.check()?;
+                let v = match ctx.term(id) {
+                    Some(oxrdf::Term::Literal(l)) => {
+                        match (l.datatype().as_str() == vector::DATATYPE)
+                            .then(|| vector::parse(l.value()).ok())
+                            .flatten()
+                        {
+                            Some(v) => Some(v),
+                            // a literal that is not a vector matches nothing
+                            None => continue,
+                        }
+                    }
+                    _ => entity_vector(ctx, spec, pred, id)?,
+                };
+                runs.push((v, by_value.remove(&id).unwrap_or_default()));
             }
         }
-    };
-    let q = vector::Search {
-        pred: pred.0,
-        query: &query,
-        k: spec.k,
-        metric: spec.metric,
-        graph: &graph,
-        dedup: spec.dedup,
-    };
-    let hits = vector::search(&ctx.snap, &q, &|| ctx.check())?;
-    ctx.check_output(hits.len(), vars.len())?;
+        (VectorQuery::Var(_), None) => {
+            return Err(Error::invalid(
+                "spk:vectorSearch: the query variable is not bound by the rest of the group",
+            ));
+        }
+    }
     let col = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
     let cs = match spec.subject {
         PathEnd::Var(v) => col(Some(v)),
         _ => None,
     };
     let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    // where each input column goes
+    let in_map: Vec<(usize, usize)> = input
+        .as_ref()
+        .map(|inp| {
+            inp.vars
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| vars.iter().position(|x| x == v).map(|o| (i, o)))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut row = vec![Id::UNDEF; vars.len()];
-    for h in hits {
-        if let PathEnd::Const(s) = spec.subject
-            && s.0 != h.s
-        {
+    let mut info_all: Option<vector::SearchInfo> = None;
+    let mut searches = 0u64;
+    for (query, rows) in runs {
+        let Some(query) = query else { continue };
+        if input.is_some() && rows.is_empty() {
             continue;
         }
-        row.fill(Id::UNDEF);
-        if let Some(c) = cs {
-            row[c] = Id(h.s);
+        // candidates:join: the subjects of the input rows
+        let subjects: Option<Vec<u64>> = match (&input, spec.candidates, &spec.subject) {
+            (Some(inp), true, PathEnd::Var(sv)) => {
+                let sv = *sv;
+                let c = inp.col_of(sv).expect("planned with the subject bound");
+                let mut s: Vec<u64> = rows
+                    .iter()
+                    .map(|&r| inp.get(r, c).0)
+                    .filter(|&x| x != Id::UNDEF.0)
+                    .collect();
+                s.sort_unstable();
+                s.dedup();
+                Some(s)
+            }
+            _ => None,
+        };
+        let q = vector::Search {
+            pred: pred.0,
+            query: &query,
+            k: spec.k,
+            metric: spec.metric,
+            graph: &graph,
+            dedup: spec.dedup,
+            distinct_subject: spec.distinct_subject,
+            subjects: subjects.as_deref(),
+            mode: spec.mode,
+        };
+        let (hits, info) = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+        searches += 1;
+        match &mut info_all {
+            None => info_all = Some(info),
+            Some(a) => {
+                a.scored += info.scored;
+                if a.method != info.method {
+                    a.method = "mixed";
+                }
+            }
         }
-        if let Some(c) = cscore {
-            row[c] = Id::from_f64(h.score as f64)
+        let fill = |row: &mut Vec<Id>, h: &vector::Hit| -> bool {
+            let mut set = |c: Option<usize>, id: Id| -> bool {
+                match c {
+                    Some(c) if row[c] != Id::UNDEF && row[c] != id => false,
+                    Some(c) => {
+                        row[c] = id;
+                        true
+                    }
+                    None => true,
+                }
+            };
+            let score = Id::from_f64(h.score as f64)
                 .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+            set(cs, Id(h.s)) && set(cscore, score) && set(cvec, Id(h.o)) && set(cg, Id(h.g))
+        };
+        match &input {
+            None => {
+                ctx.check_output(t.len() + hits.len(), vars.len())?;
+                for h in &hits {
+                    if let PathEnd::Const(s) = spec.subject
+                        && s.0 != h.s
+                    {
+                        continue;
+                    }
+                    row.fill(Id::UNDEF);
+                    if fill(&mut row, h) {
+                        t.push_row(&row);
+                    }
+                }
+            }
+            Some(inp) => {
+                ctx.check_output(
+                    t.len() + rows.len() * hits.len().min(rows.len().max(1)),
+                    vars.len(),
+                )?;
+                for &r in &rows {
+                    for h in &hits {
+                        if let PathEnd::Const(s) = spec.subject
+                            && s.0 != h.s
+                        {
+                            continue;
+                        }
+                        row.fill(Id::UNDEF);
+                        for &(i, o) in &in_map {
+                            row[o] = inp.get(r, i);
+                        }
+                        if fill(&mut row, h) {
+                            t.push_row(&row);
+                        }
+                    }
+                    ctx.check_rows(t.len())?;
+                }
+            }
         }
-        if let Some(c) = cvec {
-            row[c] = Id(h.o);
-        }
-        if let Some(c) = cg {
-            row[c] = Id(h.g);
-        }
-        t.push_row(&row);
     }
-    Ok(t)
+    if let Some(i) = info_all {
+        counters.insert("method".into(), i.method.into());
+        if let Some(r) = i.reason {
+            counters.insert("exactBecause".into(), r.into());
+        }
+        if let Some(n) = i.index {
+            counters.insert("index".into(), n.into());
+        }
+        if i.ef > 0 {
+            counters.insert("ef".into(), i.ef.into());
+        }
+        counters.insert("rows".into(), i.rows.into());
+        counters.insert("scored".into(), i.scored.into());
+        counters.insert("overlayInserts".into(), i.inserted.into());
+        counters.insert("overlayDeletes".into(), i.deleted.into());
+    }
+    if input.is_some() {
+        counters.insert("searches".into(), searches.into());
+    }
+    Ok((t, counters))
 }
 
 // ---------------------------------------------------------------- service ------

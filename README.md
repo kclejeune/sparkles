@@ -84,7 +84,8 @@ running queries.
 
 **Search**
 * Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy ([API](docs/API.md#full-text-search)).
-* Exact vector similarity search over `spk:vector` literals ([API](docs/API.md#vector-similarity)).
+* Vector similarity search over `spk:vector` literals, exact or through an HNSW index that
+  sees every write at once ([API](docs/API.md#vector-similarity)).
 * GeoSPARQL 1.1 with a spatial index per dataset, Jena's `spatial:` and `spatialF:`
   functions, spatial joins and nearest-neighbour search ([API](docs/API.md#geosparql)).
 

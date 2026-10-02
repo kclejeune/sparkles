@@ -37,6 +37,7 @@ mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
 mod validation_common;
+mod vector;
 mod write_validation;
 
 use anyhow::{Context, Result, bail};
@@ -69,6 +70,10 @@ struct Cli {
     /// Memory for materialized past states (point-in-time reads), in MiB
     #[arg(long, global = true, default_value_t = 1024)]
     history_cache_mb: u64,
+    /// Memory for packed vectors and HNSW graphs (`spk:vectorSearch`, vector indexes),
+    /// per index generation, in MiB
+    #[arg(long, global = true, default_value_t = 4096)]
+    vector_memory_mb: u64,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -456,9 +461,6 @@ enum Cmd {
         /// unlimited); `max-rows-produced=` lowers it per request
         #[arg(long, default_value_t = 0)]
         max_rows_produced: u64,
-        /// Memory for the packed vectors of `spk:vectorSearch`, per index generation, in MiB
-        #[arg(long, default_value_t = 4096)]
-        vector_memory_mb: u64,
         /// Honor `validate=false` on writes, which skips write-time validation
         #[arg(long)]
         allow_unvalidated_writes: bool,
@@ -652,6 +654,9 @@ enum Cmd {
         #[arg(long)]
         disable: bool,
     },
+    /// Vector indexes for spk:vectorSearch: create, drop, rebuild, list, status (locally
+    /// with --loc, or with --server)
+    Vector(vector::VectorArgs),
     /// Build, rebuild or inspect a database's spatial index (GeoSPARQL)
     GeoIndex {
         #[arg(long)]
@@ -991,6 +996,7 @@ enum Cmd {
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
+    sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,
@@ -1368,7 +1374,6 @@ fn run() -> Result<()> {
             max_rows,
             max_rows_produced,
             update_timeout,
-            vector_memory_mb,
             allow_unvalidated_writes,
             auto_reason,
             auto_reason_max_delay,
@@ -1476,7 +1481,6 @@ fn run() -> Result<()> {
                 &http_compression_level,
                 &http_compression_algorithms,
             )?;
-            sparkles::vector::set_budget(vector_memory_mb << 20);
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.metrics.fuseki_names = metrics_fuseki_names;
@@ -1962,6 +1966,7 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "auth")]
         Cmd::Auth { cmd } => auth::cli::run(cmd),
+        Cmd::Vector(a) => vector::cli(a, opts),
         Cmd::GeoIndex {
             loc,
             predicate,
