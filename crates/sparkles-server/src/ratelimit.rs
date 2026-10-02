@@ -122,6 +122,7 @@ pub fn classify(
         }
         // reads that run queries over a dataset, and formatting (cheap, read-like work)
         if admin == "format"
+            || admin.starts_with("validate/")
             || admin.starts_with("schema/")
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
@@ -140,7 +141,7 @@ pub fn classify(
         | "/{ds}/diff"
         | "/{ds}/queries/{name}" => Some(Class::Query),
         "/{ds}/update" | "/{ds}/upload" => Some(Class::Update),
-        "/{ds}/data" => Some(if read { Class::Query } else { Class::Update }),
+        "/{ds}/data" | "/{ds}/{*graph}" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}" => {
             let q = uri.query().unwrap_or("");
             let has = |k: &str| form_urlencoded::parse(q.as_bytes()).any(|(a, _)| a == k);

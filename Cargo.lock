@@ -3744,6 +3744,8 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "oxilangtag",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "parking_lot",

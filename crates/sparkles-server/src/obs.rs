@@ -236,7 +236,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
     match r {
         "/{ds}/sparql" | "/{ds}/query" | "/{ds}/queries/{name}" => Op::Query,
         "/{ds}/update" => Op::Update,
-        "/{ds}/data" | "/{ds}/get" => Op::Gsp,
+        "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
         "/{ds}/shacl" => Op::Shacl,
         "/{ds}/shex" => Op::Shex,

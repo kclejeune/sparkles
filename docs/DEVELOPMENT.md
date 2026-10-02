@@ -92,6 +92,7 @@ mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, w
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
 mise run ui:e2e        # Playwright end-to-end tests against a real server
+mise run test:jena-clients  # Apache Jena's own HTTP clients against a real server
 ```
 
 `crates/sparkles/tests/w3c.rs` runs the W3C SPARQL suites vendored in an Apache Jena
@@ -102,6 +103,18 @@ at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
 and 20/20 for SHACL. `crates/sparkles/tests/w3c-known-failures.txt` lists known failures
 and is empty.
+
+`mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
+it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
+`testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program
+uses Jena's `RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`
+and `UpdateExecHTTP` with every query send mode, result format and RDF syntax Jena has,
+gzip in both directions, uploads, direct naming and SHACL. It also makes the admin calls
+Fuseki's clients make, such as creating datasets from forms and assemblers, backups,
+compaction, tasks, statistics, offline datasets and the validators. It prints a line per
+check and exits with the number of failures. Jena and a JDK come from nixpkgs unless
+`JENA_HOME` and `JAVA` name them, `SPARKLES_BIN` picks another server binary, and `PORT`
+another port. The task is not part of `mise run ci`.
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
@@ -352,6 +365,8 @@ The flake is built on flake-parts and rust-overlay, with the toolchain from
     * on Linux, a NixOS VM test of the module behind nginx;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
       in nixpkgs' headless Chromium, inside the build sandbox on 127.0.0.1;
+    * on Linux, `jena-clients`, which runs the Jena client tests against `sparkles-cli`
+      with nixpkgs' `apache-jena` and JDK, inside the build sandbox;
   * `nixosModules.default` (see [Deploying on NixOS](USAGE.md#deploying-on-nixos)).
 
 ```sh

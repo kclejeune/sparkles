@@ -25,8 +25,8 @@ pub(super) const SPARKLES_COMMIT_MESSAGE: &str = "sparkles-commit-message";
 const FORMATS: [&str; 6] = ["ttl", "nt", "nq", "trig", "rdf", "jsonld"];
 
 /// The entity tag of a Graph Store representation read at commit `seq`.
-pub(super) fn etag(dataset_id: DatasetId, seq: u64, fmt: RdfFormat) -> String {
-    format!("W/\"{dataset_id}:{seq}:{}\"", fmt.file_extension())
+pub(super) fn etag(dataset_id: DatasetId, seq: u64, ext: &str) -> String {
+    format!("W/\"{dataset_id}:{seq}:{ext}\"")
 }
 
 /// The value of an `If-Match` or `If-None-Match` field.
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn tags_name_a_commit() {
         let id = DatasetId::new_v4();
-        let t = etag(id, 42, RdfFormat::Turtle);
+        let t = etag(id, 42, RdfFormat::Turtle.file_extension());
         assert_eq!(t, format!("W/\"{id}:42:ttl\""));
         let o = t.trim_start_matches("W/").trim_matches('"');
         assert!(names_commit(o, id, 42));

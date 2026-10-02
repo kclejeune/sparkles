@@ -1855,3 +1855,14 @@ server's create, verify and restore with SHACL validation, the validation files 
 languages, and policy runs.
 
 **Not built:** the items listed under Phases at the top.
+
+**Follow-up: Fuseki's `/$/backups` alias.** Fuseki routes `POST /$/backups/{ds}` to the
+same action as `POST /$/backup/{ds}`, an N-Quads dump, and its clients send no body. Such a
+request reached the repository API and failed with `404 no-such-repository`. Now
+`POST /$/backups/{ds}` is a repository backup only when its body is JSON, by its
+`application/json` content type or because it is a JSON object, and is Fuseki's dump
+otherwise. Every repository backup names its `repository` in a JSON body, and the UI sends
+`application/json`, so no existing request changed meaning. The other `/$/backups/{ds}…`
+routes are unchanged. Moving the repository routes was rejected because the UI, the docs
+and running scripts already use them, and because Fuseki has no other route under
+`/$/backups/` that they would collide with.

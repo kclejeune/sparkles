@@ -185,7 +185,10 @@ pub fn format_for_path(path: &Path) -> Option<(RdfFormat, Option<Codec>)> {
 pub fn format_for_media_type(mt: &str) -> Option<RdfFormat> {
     let base = mt.split(';').next()?.trim().to_ascii_lowercase();
     match base.as_str() {
-        "text/turtle" | "application/x-turtle" => Some(RdfFormat::Turtle),
+        // Jena reads N3 as Turtle (`text/rdf+n3` is its N3 media type)
+        "text/turtle" | "application/x-turtle" | "text/rdf+n3" | "text/n3" | "application/n3" => {
+            Some(RdfFormat::Turtle)
+        }
         "application/n-triples" | "text/plain" => Some(RdfFormat::NTriples),
         "application/n-quads" | "text/x-nquads" => Some(RdfFormat::NQuads),
         "application/trig" => Some(RdfFormat::TriG),

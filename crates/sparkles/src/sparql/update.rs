@@ -64,9 +64,46 @@ pub fn update_as(
             .with_prefix(k, v)
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
-    let parsed = p.parse_update(u)?;
+    let mut parsed = p.parse_update(u)?;
+    protocol_dataset(&mut parsed, opts)?;
     let depth = super::depth::check_update(&parsed)?;
     super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+}
+
+/// SPARQL 1.1 Protocol §2.2.3: for an update, [`QueryOptions::default_graph_uris`] and
+/// [`QueryOptions::named_graph_uris`] are the `using-graph-uri` and
+/// `using-named-graph-uri` parameters. They are the `USING` and `USING NAMED` of every
+/// DELETE/INSERT operation, and an operation with `USING`, `USING NAMED` or `WITH` of
+/// its own makes the request an error.
+fn protocol_dataset(u: &mut spargebra::Update, opts: &QueryOptions) -> Result<()> {
+    if opts.default_graph_uris.is_empty() && opts.named_graph_uris.is_empty() {
+        return Ok(());
+    }
+    let iris = |v: &[String]| -> Result<Vec<NamedNode>> {
+        v.iter()
+            .map(|s| {
+                NamedNode::new(s.clone())
+                    .map_err(|e| Error::invalid(format!("invalid graph IRI <{s}>: {e}")))
+            })
+            .collect()
+    };
+    let default = iris(&opts.default_graph_uris)?;
+    let named = iris(&opts.named_graph_uris)?;
+    for op in &mut u.operations {
+        if let GraphUpdateOperation::DeleteInsert { using, .. } = op {
+            if using.is_some() {
+                return Err(Error::invalid(
+                    "using-graph-uri and using-named-graph-uri cannot be combined with USING, \
+                     USING NAMED or WITH",
+                ));
+            }
+            *using = Some(QueryDataset {
+                default: default.clone(),
+                named: Some(named.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether `u` parses as an update that only inserts or deletes data (`INSERT DATA`,
@@ -888,5 +925,50 @@ mod tests {
         assert!(!data_only("CLEAR ALL", &o));
         assert!(!data_only("INSERT DATA { <urn:a> <urn:p> ", &o));
         assert!(!data_only("", &o));
+    }
+}
+
+#[cfg(test)]
+mod protocol_dataset_tests {
+    use crate::sparql::{QueryOptions, query, update::update};
+    use crate::store::{Store, StoreOptions};
+
+    fn ask(s: &Store, q: &str) -> bool {
+        query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .boolean
+    }
+
+    #[test]
+    fn using_graph_uri_is_the_using_of_each_modify() {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = "INSERT DATA { <urn:a> <urn:p> 1 . GRAPH <urn:g1> { <urn:b> <urn:p> 2 } \
+                    GRAPH <urn:g2> { <urn:c> <urn:p> 3 } }";
+        update(&s, data, &QueryOptions::default()).unwrap();
+        let copy = "INSERT { GRAPH <urn:out> { ?s <urn:p> ?o } } WHERE { ?s <urn:p> ?o }";
+        let opts = QueryOptions {
+            default_graph_uris: vec!["urn:g1".into()],
+            ..Default::default()
+        };
+        update(&s, copy, &opts).unwrap();
+        assert!(ask(&s, "ASK { GRAPH <urn:out> { <urn:b> <urn:p> 2 } }"));
+        assert!(!ask(&s, "ASK { GRAPH <urn:out> { <urn:a> <urn:p> 1 } }"));
+        // only named graphs: the default graph is empty
+        let named = QueryOptions {
+            named_graph_uris: vec!["urn:g2".into()],
+            ..Default::default()
+        };
+        let both = "INSERT { GRAPH <urn:out2> { ?s <urn:p> ?o } } \
+                    WHERE { { ?s <urn:p> ?o } UNION { GRAPH ?g { ?s <urn:p> ?o } } }";
+        let r = update(&s, both, &named).unwrap();
+        assert_eq!(r.inserted, 1);
+        assert!(ask(&s, "ASK { GRAPH <urn:out2> { <urn:c> <urn:p> 3 } }"));
+        // USING or WITH of the request's own is an error
+        let with = "WITH <urn:g1> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }";
+        let e = update(&s, with, &opts);
+        assert!(matches!(e, Err(crate::error::Error::Invalid(_))), "{e:?}");
+        let using = "INSERT { <urn:x> <urn:y> <urn:z> } USING <urn:g2> WHERE {}";
+        let e = update(&s, using, &opts);
+        assert!(matches!(e, Err(crate::error::Error::Invalid(_))), "{e:?}");
     }
 }

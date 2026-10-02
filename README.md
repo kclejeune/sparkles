@@ -78,6 +78,8 @@ running queries.
   endpoints for commits, schema discovery, clones, reasoning and validation ([API](docs/API.md)).
 * Stored queries with typed parameters, which clients and MCP agents run by name. Values
   are bound as terms and never spliced into the text ([API](docs/API.md#stored-queries)).
+* Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
+  against the server ([usage](docs/USAGE.md#fuseki-and-jena-clients)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
   directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)).
 

@@ -69,7 +69,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .merge(
             Router::new()
-                .route("/$/backups/{ds}", get(dataset_backups).post(create_backup))
+                .route(
+                    "/$/backups/{ds}",
+                    get(dataset_backups).post(create_backup_or_dump),
+                )
                 .route(
                     "/$/backups/{ds}/{repo}/{backup}",
                     get(get_backup).delete(delete_backup),
@@ -865,6 +868,39 @@ async fn dataset_backups(
         backups: out,
     })
     .into_response())
+}
+
+/// `POST /$/backups/{ds}`: a backup into a repository when the body is JSON (an
+/// `application/json` content type, or a body that is a JSON object), else Fuseki's
+/// alias of `POST /$/backup/{ds}`, an N-Quads dump. Fuseki clients send no body.
+async fn create_backup_or_dump(
+    st: St,
+    Path(ds_name): Path<String>,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if repository_request(&headers, &body) {
+        create_backup(st, Path(ds_name), body).await.into_response()
+    } else {
+        crate::http::backup(st, Path(ds_name), uri)
+            .await
+            .into_response()
+    }
+}
+
+/// Whether a `POST /$/backups/{ds}` is for the repository API.
+fn repository_request(headers: &axum::http::HeaderMap, body: &[u8]) -> bool {
+    let json_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"));
+    json_type
+        || body
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| *b == b'{')
 }
 
 /// `POST /$/backups/{ds}` (body `CreateBackupRequest`) → `202` task `backup-create` +

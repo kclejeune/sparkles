@@ -76,7 +76,23 @@ async fn backup_routes_are_authorized() {
         status("POST", "/$/backups/wiki", "bob").await,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(status("POST", "/$/backups/wiki", "carol").await, passed);
+    // a JSON body is the repository API; without one it is Fuseki's N-Quads dump
+    let json = call(
+        &s.app,
+        "POST",
+        "/$/backups/wiki",
+        &[
+            ("authorization", &b("carol")),
+            ("content-type", "application/json"),
+        ],
+        "{}",
+    )
+    .await;
+    assert_eq!(json.status, passed);
+    assert_eq!(
+        status("POST", "/$/backups/wiki", "carol").await,
+        StatusCode::ACCEPTED
+    );
     assert_eq!(
         status("POST", "/$/backups/wiki/local/b1/restore", "bob").await,
         StatusCode::FORBIDDEN

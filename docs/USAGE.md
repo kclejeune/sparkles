@@ -119,6 +119,30 @@ INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:title> "A" . <urn:b> <urn:title> "B" 
 To make a graph equal to a file, `PUT` the file to `/ds/data?graph=…`. The commit records
 only the quads that changed.
 
+### Fuseki and Jena clients
+
+Clients written for Fuseki work unchanged. Jena's `RDFConnectionRemote` and
+`RDFConnectionFuseki` connect to `http://host:3030/ds`, and `GSP`, `DSP`,
+`QueryExecHTTP` and `UpdateExecHTTP` to the endpoints under it. `RDFConnectionFuseki`
+sends and asks for RDF Thrift, which the server reads and writes. Fuseki's admin calls
+work too: `POST /$/datasets?dbName=ds&dbType=tdb2`, a `config.ttl` body on
+`POST /$/datasets`, `POST /$/backup/ds` and its alias `POST /$/backups/ds`,
+`GET /$/backups-list`, `POST /$/compact/ds?deleteOld=true`, `GET /$/tasks/{id}`,
+`GET /$/stats`, `POST /$/datasets/ds?state=offline` and the `/$/validate/*` services.
+[API.md](API.md#datasets-admin) lists where Sparkles differs, such as the assembler
+settings it refuses.
+
+Fuseki's direct Graph Store naming, where the request URL names the graph, is off by
+default. `sparkles serve --gsp-direct-naming` turns it on for every dataset, so that
+`curl -X PUT -H 'Content-Type: text/turtle' --data-binary @g.ttl
+http://localhost:3030/ds/graphs/one` writes the graph
+`<http://localhost:3030/ds/graphs/one>`. Behind a proxy, the graph IRI takes its scheme
+and host from `X-Forwarded-Proto` and `X-Forwarded-Host`.
+
+`mise run test:jena-clients` runs Jena's own clients against a server on a temporary
+directory. It takes Jena and a JDK from nixpkgs, or from `JENA_HOME` and `JAVA`
+([DEVELOPMENT.md](DEVELOPMENT.md)).
+
 ### Restricting users to some graphs
 
 With `--auth-config`, a grant can cover only some named graphs of a dataset, or only some
@@ -198,6 +222,7 @@ Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
 | `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
 | `--metrics-fuseki-names` | off | Also expose Fuseki's metric names (`fuseki_requests`, `fuseki_requests_good`, `fuseki_requests_bad`) on `/$/metrics`, for dashboards built for Fuseki. See [API.md](API.md#fuseki-metric-names). |
+| `--gsp-direct-naming` | off | Fuseki's direct Graph Store naming on every dataset: a request to `/{ds}/{path}` that names no endpoint reads or writes the graph whose IRI is the request URL. See [Fuseki and Jena clients](#fuseki-and-jena-clients). |
 | `--metrics-addr HOST:PORT` | | Also serve `/$/metrics` on this address, with the same authentication. Without `--auth-config`, an address that is not loopback needs `--allow-open-network`. |
 | `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
 | `--otel-logs` | off | Export log events over OTLP as well. |

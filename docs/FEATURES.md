@@ -73,6 +73,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 |---|---|
 | The SPARQL protocol, GSP, upload, the `/$/` admin API (datasets, stats, compact, backup, tasks) and Jena's special graphs (`urn:x-arq:DefaultGraph` and `UnionGraph`). | ✅ |
 | A SPARQL 1.1 Service Description at `/{ds}/sparql` and `/{ds}/query` for a GET without a query. It describes the query and update services, their languages, formats and features, every extension function, aggregate and property function, the entailment regime of materialized inferences and the default dataset, and links the VoID description. Named graphs and counts follow the caller's grants ([API.md](API.md#service-description)). | ✅ |
+| Fuseki compatibility beyond the endpoints. The admin API has Fuseki's `/$/backups` alias (an N-Quads dump unless the body is JSON), `/$/backups-list`, `/$/stats` with request counters, `?state=offline\|active`, `deleteOld`, the `/$/validate/*` services and assembler bodies on `POST /$/datasets` for the part of a `config.ttl` that maps to a dataset. Dataset, task and server JSON carry Fuseki's members (`ds.name`, `ds.services`, `taskId`, `finished`, `success`). The protocol has `using-graph-uri`, `?graph=union`, `?target=` on `/shacl`, direct Graph Store naming (`--gsp-direct-naming`), `output=`, `results=` and `force-accept`, and Jena's RDF Thrift, RDF Protobuf, RDF/JSON and SPARQL Results Thrift. Jena's own clients (`RDFConnectionRemote`, `RDFConnectionFuseki`, `GSP`, `DSP`, `QueryExecHTTP`, `UpdateExecHTTP`) are tested against the server with `mise run test:jena-clients`. | ✅ |
 | A Jena-style CLI that works on the database directory: `load`, `query`, `update`, `dump`, `compact`, `backup`, `repo`, `stats`, `infer`, `shacl`, `shex`, `schema`, `queries`, `clone` and `check`. | ✅ |
 | Backup repositories (`sparkles-backup`, with the `backup` cargo feature, on by default). Online backups go to a file system or S3 (AWS, MinIO, R2, Ceph RGW) and hold the writer lock for only a few system calls. An in-memory dataset is backed up through a temporary generation that the bulk builder writes from its snapshot. Backups are incremental and deduplicated: data is stored as content-addressed 32 MiB pieces, only the appended bytes of the WAL and catalog are copied, and the manifest is written last. A restore goes to a new dataset or replaces one in place. It follows dataset-id rules (`auto`, `new`, `keep`) and runs an integrity check before publishing. During an in-place swap, requests get `503` with `Retry-After`, never `404`. Backups can be verified (`exists`, `data`, `restore`). Lifecycle policies run on cron or `every` schedules in an IANA time zone, with catch-up, retention and optional GC. GC runs in two phases with a grace period. Lease locks are judged by the storage server's clock, so several servers and the CLI can share a repository. Repositories come from a config file or are registered through the API, within operator limits on named credential sources, the outbound policy and `fs` roots. The interfaces are `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo`, `sparkles backup create\|list\|show\|restore\|verify\|delete\|policy` and a Backups page in the UI. Backups report `sparkles_backup_*` metrics and audit events. See [API.md](API.md#backup-repositories) and [USAGE.md](USAGE.md#backup-repositories). Not supported yet: encryption, server-wide backups and running policies offline. | ✅ |
 | Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`). The clone has the same quads and blank-node ids, and a new dataset id with `forkedFrom`. Inferences are copied or dropped. | ✅ |
@@ -153,13 +154,15 @@ These are features other RDF stores have and Sparkles does not have yet.
   whose queries are not anchored at the focus node, in full on every write. ShEx keeps no
   typing across a restart, so after one the first writes to a recursive schema over a
   large connected graph may be validated in full.
-* **Formats and change logs.** There is no RDF Thrift for data, and no RDF Protobuf, TriX
-  or RDF/JSON. RDF Patch is written for diffs, the change feed and write previews, but
-  Sparkles cannot apply a patch.
+* **Formats and change logs.** RDF Thrift, RDF Protobuf and RDF/JSON are read and written
+  by the server only, not by the CLI or the library, and there is no TriX. RDF Patch is
+  written for diffs, the change feed and write previews, but Sparkles cannot apply
+  a patch.
 * **Stored queries.** There are no stored updates, no parameters bound to several values
   at once, and no private queries per user.
 * **Operations.** There are no triple-level or data-dependent access rules, no JVM
-  metrics, no assembler configuration and no ontology object API. Validation endpoints
+  metrics and no ontology object API. Assembler bodies are read only for the part that maps
+  to a dataset, and direct Graph Store naming is on for every dataset or none. Validation endpoints
   refuse callers whose grants cover only some graphs. Backups cannot be encrypted, cover the whole
   server at once or run their policies offline.
 * **History.** There are no history queries across commits, such as when a triple

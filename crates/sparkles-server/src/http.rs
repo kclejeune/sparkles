@@ -29,8 +29,10 @@ mod diff;
 mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
+mod fuseki;
 pub(crate) mod history;
 mod inline;
+mod jena_formats;
 mod queries;
 mod schema;
 mod sd;
@@ -83,14 +85,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/{*path}", get(crate::ui::serve))
         .route("/$/ping", get(ping).post(ping))
         .merge(crate::auth::routes())
-        .route("/$/server", get(server_info))
+        .route("/$/server", get(server_info).post(server_info))
         .route("/$/metrics", get(crate::obs::metrics_endpoint))
         .route("/$/ready", get(crate::obs::ready_endpoint))
         .route("/$/ready/{ds}", get(crate::obs::ready_dataset))
         .route("/$/datasets", get(list_datasets).post(create_dataset))
-        .route("/$/datasets/{ds}", get(get_dataset).delete(delete_dataset))
+        .route(
+            "/$/datasets/{ds}",
+            get(get_dataset)
+                .post(fuseki::set_state)
+                .delete(delete_dataset),
+        )
         .route("/$/datasets/{ds}/clone", post(clone_dataset))
-        .route("/$/stats/{ds}", get(stats))
+        .route("/$/stats/{ds}", get(stats).post(stats))
         .route("/$/schema/{ds}", get(schema::summary))
         .route("/$/schema/{ds}/classes", get(schema::classes))
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
@@ -174,6 +181,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         );
     // the spatial index (`/$/geo`)
     let app = app.merge(crate::geo::routes());
+    // Fuseki's admin routes that Sparkles has no route of its own for
+    let app = app.merge(fuseki::routes());
     // vector indexes (`/$/vector`)
     let app = app.merge(crate::vector::routes());
     // RDFS on read (`/$/rdfs`)
@@ -379,6 +388,14 @@ async fn restoring_guard(
         }
     };
     match checked {
+        // a dataset taken offline (Fuseki's `?state=offline`) refuses its services, not
+        // the admin routes that name it
+        Ok(Some(d))
+            if d.offline.load(std::sync::atomic::Ordering::Relaxed)
+                && route.is_some_and(|r| r.starts_with("/{ds}")) =>
+        {
+            fuseki::offline_response(&ds)
+        }
         Ok(held) => {
             let resp = next.run(req).await;
             drop(held);
@@ -610,24 +627,42 @@ fn negotiate(accept: &str, offers: &[&str]) -> Option<usize> {
     best.map(|b| b.2)
 }
 
+/// The SELECT and ASK result formats offered, in order of preference. The last one,
+/// Jena's SPARQL Results Thrift, is written for SELECT only ([`results_thrift`]).
+const SOLUTION_OFFERS: [&str; 8] = [
+    "application/sparql-results+json",
+    "application/x-sparkles+json",
+    "application/sparql-results+xml",
+    "text/csv",
+    "text/tab-separated-values",
+    "application/json",
+    "application/xml",
+    jena_formats::RESULTS_THRIFT,
+];
+
+/// The response format parameter: `format`, or Fuseki's `output` or `results`.
+fn format_param(params: &Params) -> Option<&str> {
+    params
+        .get("format")
+        .or_else(|| params.get("output"))
+        .or_else(|| params.get("results"))
+}
+
 fn solutions_format(params: &Params, headers: &HeaderMap) -> SolutionsFormat {
-    if let Some(f) = params.get("format").and_then(SolutionsFormat::from_name) {
+    // Fuseki's short name `sparql` is the XML format
+    let named = format_param(params)
+        .map(|f| {
+            if f.eq_ignore_ascii_case("sparql") {
+                "xml"
+            } else {
+                f
+            }
+        })
+        .and_then(SolutionsFormat::from_name);
+    if let Some(f) = named {
         return f;
     }
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("*/*");
-    const OFFERS: [&str; 7] = [
-        "application/sparql-results+json",
-        "application/x-sparkles+json",
-        "application/sparql-results+xml",
-        "text/csv",
-        "text/tab-separated-values",
-        "application/json",
-        "application/xml",
-    ];
-    match negotiate(accept, &OFFERS) {
+    match negotiate(accept_header(headers), &SOLUTION_OFFERS) {
         Some(1) => SolutionsFormat::Sparkles,
         Some(2) | Some(6) => SolutionsFormat::Xml,
         Some(3) => SolutionsFormat::Csv,
@@ -636,20 +671,79 @@ fn solutions_format(params: &Params, headers: &HeaderMap) -> SolutionsFormat {
     }
 }
 
-fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> RdfFormat {
-    if let Some(f) = params.get("format").and_then(results::rdf_format_from_name) {
-        return f;
+/// Whether SELECT results go out in SPARQL Results Thrift (`format=thrift`, or the
+/// `Accept` header prefers it): what `RDFConnectionFuseki` asks for.
+fn results_thrift(params: &Params, headers: &HeaderMap) -> bool {
+    match format_param(params) {
+        Some(f) => f == "thrift" || f == jena_formats::RESULTS_THRIFT,
+        None => negotiate(accept_header(headers), &SOLUTION_OFFERS) == Some(7),
     }
-    let accept = headers
+}
+
+fn accept_header(headers: &HeaderMap) -> &str {
+    headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("*/*");
+        .unwrap_or("*/*")
+}
+
+/// The RDF syntax of a response: one oxrdfio writes, or one of Jena's
+/// ([`jena_formats`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OutFormat {
+    Rdf(RdfFormat),
+    Jena(jena_formats::JenaFormat),
+}
+
+impl OutFormat {
+    fn file_extension(self) -> &'static str {
+        match self {
+            OutFormat::Rdf(f) => f.file_extension(),
+            OutFormat::Jena(j) => j.file_extension(),
+        }
+    }
+
+    fn media_type(self) -> &'static str {
+        match self {
+            OutFormat::Rdf(f) => results::rdf_media_type(f),
+            OutFormat::Jena(j) => j.media_type(),
+        }
+    }
+}
+
+fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> OutFormat {
+    use jena_formats::JenaFormat;
+    if let Some(f) = format_param(params) {
+        // Fuseki's short names for graphs, then Sparkles' and the media types
+        let f = match f.to_ascii_lowercase().as_str() {
+            "json" => "jsonld".to_string(),
+            "text" => "turtle".to_string(),
+            "n-quads" => "nquads".to_string(),
+            other => other.to_string(),
+        };
+        if let Some(f) = results::rdf_format_from_name(&f) {
+            return OutFormat::Rdf(f);
+        }
+        if let Some(j) = JenaFormat::from_media_type(&f) {
+            return OutFormat::Jena(j);
+        }
+        match f.as_str() {
+            "thrift" | "rdf-thrift" => return OutFormat::Jena(JenaFormat::Thrift),
+            "protobuf" | "rdf-protobuf" => return OutFormat::Jena(JenaFormat::Protobuf),
+            "json-rdf" | "rdfjson" | "rdf-json" if !quads => {
+                return OutFormat::Jena(JenaFormat::RdfJson);
+            }
+            _ => {}
+        }
+    }
     let offers: &[&str] = if quads {
         &[
             "application/trig",
             "application/n-quads",
             "application/ld+json",
             "text/plain",
+            "application/rdf+thrift",
+            "application/rdf+protobuf",
         ]
     } else {
         &[
@@ -660,15 +754,24 @@ fn rdf_format(params: &Params, headers: &HeaderMap, quads: bool) -> RdfFormat {
             "application/trig",
             "application/n-quads",
             "text/plain",
+            "application/rdf+thrift",
+            "application/rdf+protobuf",
+            "application/rdf+json",
         ]
     };
-    negotiate(accept, offers)
-        .and_then(|i| results::rdf_format_from_name(offers[i]))
-        .unwrap_or(if quads {
-            RdfFormat::TriG
-        } else {
-            RdfFormat::Turtle
-        })
+    let picked = negotiate(accept_header(headers), offers).map(|i| offers[i]);
+    if let Some(j) = picked.and_then(JenaFormat::from_media_type) {
+        return OutFormat::Jena(j);
+    }
+    OutFormat::Rdf(
+        picked
+            .and_then(results::rdf_format_from_name)
+            .unwrap_or(if quads {
+                RdfFormat::TriG
+            } else {
+                RdfFormat::Turtle
+            }),
+    )
 }
 
 fn truthy(v: &str) -> bool {
@@ -924,6 +1027,7 @@ pub(crate) async fn run_query(
     opts.cancel = Some(cancel);
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
+    let thrift = results_thrift(&params, &headers);
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let prefixes = ds.store.prefixes();
@@ -982,12 +1086,22 @@ pub(crate) async fn run_query(
             .into());
         }
     }
+    // SPARQL Results Thrift is written for SELECT; ASK falls back to the negotiated format
+    let thrift = thrift && r.kind == QueryKind::Select && !sparkles_doc;
     let ct: String = if sparkles_doc {
         SolutionsFormat::Sparkles.media_type().into()
     } else if is_graph {
-        results::rdf_media_type(rfmt).into()
+        rfmt.media_type().into()
+    } else if thrift {
+        jena_formats::RESULTS_THRIFT.into()
     } else {
         sfmt.media_type().into()
+    };
+    // Fuseki's `force-accept`: the same body, labelled plain text (for browsers)
+    let ct = if params.has("force-accept") {
+        "text/plain; charset=utf-8".to_string()
+    } else {
+        ct
     };
     let report = RequestReport {
         operation: Some(Op::Query),
@@ -1000,18 +1114,22 @@ pub(crate) async fn run_query(
     let dataset_id = ds.store.dataset_id().to_string();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
-        let written = serialize_result(
-            &r,
-            w,
-            sparkles_doc,
-            is_graph,
-            sfmt,
-            rfmt,
-            send,
-            &prefixes,
-            seq,
-            dataset_id,
-        );
+        let written = if thrift {
+            write_thrift_results(&r, w, send)
+        } else {
+            serialize_result(
+                &r,
+                w,
+                sparkles_doc,
+                is_graph,
+                sfmt,
+                rfmt,
+                send,
+                &prefixes,
+                seq,
+                dataset_id,
+            )
+        };
         // phase spans once serialization has ended (the request span is current here)
         crate::otel::query_done(t0, &r, ts.elapsed().as_secs_f64() * 1000.0);
         written
@@ -1073,7 +1191,7 @@ fn serialize_result(
     sparkles_doc: bool,
     is_graph: bool,
     sfmt: SolutionsFormat,
-    rfmt: RdfFormat,
+    rfmt: OutFormat,
     send: Option<usize>,
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
@@ -1095,10 +1213,38 @@ fn serialize_result(
         }
         serde_json::to_writer(w, &doc).map_err(|e| Error::Io(e.into()))
     } else if is_graph {
-        results::write_graph(r, rfmt, prefixes, w)
+        match rfmt {
+            OutFormat::Rdf(f) => results::write_graph(r, f, prefixes, w),
+            OutFormat::Jena(j) => {
+                let mut out = jena_formats::RdfWriter::new(j, w);
+                for t in &r.triples {
+                    out.triple(t)?;
+                }
+                out.finish()?;
+                Ok(())
+            }
+        }
     } else {
         results::write_solutions(r, sfmt, w, send)
     }
+}
+
+/// SELECT results in SPARQL Results Thrift, `send` rows at most.
+fn write_thrift_results(
+    r: &sparkles::sparql::QueryResult,
+    w: &mut LimitedWriter<stream::SwitchWriter>,
+    send: Option<usize>,
+) -> sparkles::Result<()> {
+    let mut out = jena_formats::ThriftResults::new(w, &r.vars)?;
+    let n = send.map_or(r.table.len(), |s| s.min(r.table.len()));
+    let mut row = Vec::with_capacity(r.vars.len());
+    for i in 0..n {
+        row.clear();
+        row.extend(r.table.cols.iter().map(|c| r.term(c[i])));
+        out.row(&row)?;
+    }
+    out.finish()?;
+    Ok(())
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).
@@ -1637,6 +1783,9 @@ async fn update_endpoint(
         allow_service: st.allow_service,
         outbound: st.outbound.clone(),
         file_loads: st.file_loads.clone(),
+        // the protocol's USING and USING NAMED
+        default_graph_uris: params.all("using-graph-uri"),
+        named_graph_uris: params.all("using-named-graph-uri"),
         timeout: update_timeout(&st, &params),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
@@ -1777,6 +1926,8 @@ fn write_report(op: Op, quads: u64) -> RequestReport {
 enum Target {
     Default,
     Named(String),
+    /// Fuseki's `?graph=union`: the union of the named graphs, read-only
+    Union,
     Dataset,
 }
 
@@ -1786,6 +1937,8 @@ fn gsp_target(params: &Params) -> Target {
     } else if let Some(g) = params.get("graph") {
         if g == "default" || g == sparkles::sparql::ctx::DEFAULT_GRAPH_IRI {
             Target::Default
+        } else if g == "union" || g == sparkles::sparql::ctx::UNION_GRAPH_IRI {
+            Target::Union
         } else {
             Target::Named(g.to_string())
         }
@@ -1830,6 +1983,37 @@ impl Spooled {
                 },
                 Some(f),
             ),
+        }
+    }
+}
+
+/// A body in one of Jena's syntaxes ([`jena_formats`]) as N-Quads (`quads`) or
+/// N-Triples, in memory or in a temporary file as the body was.
+fn transcode_body(body: Spooled, fmt: jena_formats::JenaFormat, quads: bool) -> ApiResult<Spooled> {
+    use std::io::Write;
+    let bad = |e: jena_formats::DecodeError| err(StatusCode::BAD_REQUEST, e.to_string());
+    let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    match body {
+        Spooled::Memory(b) => {
+            let mut out = Vec::with_capacity(b.len().saturating_mul(2));
+            jena_formats::transcode(fmt, &b[..], quads, &mut out).map_err(bad)?;
+            Ok(Spooled::Memory(out))
+        }
+        Spooled::File(f) => {
+            let src = std::fs::File::open(f.path()).map_err(io)?;
+            let dir = f
+                .path()
+                .parent()
+                .map_or_else(std::env::temp_dir, |d| d.to_path_buf());
+            let mut tmp = tempfile::Builder::new()
+                .prefix("sparkles-body-")
+                .tempfile_in(dir)
+                .map_err(io)?;
+            let mut w = std::io::BufWriter::new(tmp.as_file_mut());
+            jena_formats::transcode(fmt, src, quads, &mut w).map_err(bad)?;
+            w.flush().map_err(io)?;
+            drop(w);
+            Ok(Spooled::File(tmp))
         }
     }
 }
@@ -2042,15 +2226,76 @@ async fn spool_after(
     })
 }
 
-/// Graph Store GET body: the quads of graph `g` (every graph when `None`) of one
-/// snapshot, serialized while scanning (see [`stream`]) under the result-size budget.
-/// Returns the body and, for a body returned whole, its bytes and quads.
+/// A serializer of a Graph Store GET body: oxrdfio's, or one of Jena's syntaxes.
+enum GraphOut<W: std::io::Write> {
+    Rdf(Box<oxrdfio::WriterQuadSerializer<W>>),
+    Jena(jena_formats::RdfWriter<W>),
+    /// a writer that has finished
+    Done,
+}
+
+impl<W: std::io::Write> GraphOut<W> {
+    fn new(fmt: OutFormat, prefixes: std::collections::BTreeMap<String, String>, w: W) -> Self {
+        match fmt {
+            OutFormat::Rdf(f) => GraphOut::Rdf(Box::new(
+                sparkles::io::with_prefixes(RdfSerializer::from_format(f), prefixes).for_writer(w),
+            )),
+            OutFormat::Jena(j) => GraphOut::Jena(jena_formats::RdfWriter::new(j, w)),
+        }
+    }
+
+    fn triple(&mut self, t: oxrdf::Triple) -> sparkles::Result<()> {
+        match self {
+            GraphOut::Rdf(s) => s.serialize_triple(&t)?,
+            GraphOut::Jena(s) => s.triple(&t)?,
+            GraphOut::Done => {}
+        }
+        Ok(())
+    }
+
+    fn quad(&mut self, q: &oxrdf::Quad) -> sparkles::Result<()> {
+        match self {
+            GraphOut::Rdf(s) => s.serialize_quad(q)?,
+            GraphOut::Jena(s) => s.quad(q)?,
+            GraphOut::Done => {}
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> sparkles::Result<()> {
+        match std::mem::replace(self, GraphOut::Done) {
+            GraphOut::Rdf(s) => {
+                s.finish()?;
+            }
+            GraphOut::Jena(s) => {
+                s.finish()?;
+            }
+            GraphOut::Done => {}
+        }
+        Ok(())
+    }
+}
+
+/// What a Graph Store GET exports.
+#[derive(Clone, Copy)]
+enum Export {
+    /// one graph's triples
+    Graph(Id),
+    /// the triples of every named graph, each once (Fuseki's `?graph=union`)
+    Union,
+    /// every quad
+    Dataset,
+}
+
+/// Graph Store GET body: the triples or quads `what` names, of one snapshot,
+/// serialized while scanning (see [`stream`]) under the result-size budget. Returns the
+/// body and, for a body returned whole, its bytes and quads.
 async fn graph_body(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
     snap: Arc<sparkles::store::Snapshot>,
-    g: Option<Id>,
-    fmt: RdfFormat,
+    what: Export,
+    fmt: OutFormat,
     view: Option<Arc<sparkles::access::GraphAccess>>,
 ) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
     let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2059,33 +2304,46 @@ async fn graph_body(
     let snap = snap.without_cache_fill();
     let prefixes = ds.store.prefixes();
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
-        let ser = sparkles::io::with_prefixes(RdfSerializer::from_format(fmt), prefixes);
-        let mut s = ser.for_writer(w);
-        let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
+        let mut s = GraphOut::new(fmt, prefixes, w);
+        let (perm, prefix) = match what {
+            Export::Graph(g) => (Perm::Gspo, vec![g.0]),
+            Export::Dataset => (Perm::Gspo, Vec::new()),
+            // SPOG order: the copies of a triple in several graphs are adjacent
+            Export::Union => (Perm::Spo, Vec::new()),
+        };
         let mut n = 0u64;
+        let mut last: Option<[u64; 3]> = None;
         // the whole dataset through a graph view: the quads of the graphs it reads
         let mut readable: std::collections::HashMap<u64, bool> = Default::default();
         let view = view.filter(|v| !v.reads_all());
         let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
+            let quad = perm.to_quad(k);
             if let Some(v) = &view
                 && !*readable
-                    .entry(k[0])
-                    .or_insert_with(|| v.readable_id(&snap, Id(k[0])))
+                    .entry(quad[3].0)
+                    .or_insert_with(|| v.readable_id(&snap, quad[3]))
             {
                 return Ok(());
             }
-            if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
-                if g.is_some() {
-                    s.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object))?;
+            if let Export::Union = what {
+                let spo = [quad[0].0, quad[1].0, quad[2].0];
+                if quad[3] == Id::DEFAULT_GRAPH || last == Some(spo) {
+                    return Ok(());
+                }
+                last = Some(spo);
+            }
+            if let Some(q) = snap.quad_to_terms(&quad) {
+                if let Export::Dataset = what {
+                    s.quad(&q)?;
                 } else {
-                    s.serialize_quad(&q)?;
+                    s.triple(q.into())?;
                 }
                 n += 1;
             }
             Ok(())
         };
         // serialize while scanning: nothing but the current block is held
-        snap.scan(Perm::Gspo, &prefix, |c| {
+        snap.scan(perm, &prefix, |c| {
             match c {
                 Chunk::Block(b, start, end) => {
                     for i in start..end {
@@ -2124,6 +2382,21 @@ async fn graph_body(
 }
 
 async fn gsp(
+    st: St,
+    name: Path<String>,
+    p: Extension<Principal>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult {
+    gsp_on(st, name, p, method, uri, headers, body, None).await
+}
+
+/// A Graph Store request on the graph `direct` names (direct naming), else on the
+/// target its parameters name.
+#[allow(clippy::too_many_arguments)]
+async fn gsp_on(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -2131,6 +2404,7 @@ async fn gsp(
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Body,
+    direct: Option<String>,
 ) -> ApiResult {
     // every write needs write access, whichever route (or fallthrough) led here
     if !matches!(method, Method::GET | Method::HEAD)
@@ -2147,7 +2421,16 @@ async fn gsp(
     }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
-    let target = gsp_target(&params);
+    let target = match direct {
+        Some(iri) => Target::Named(iri),
+        None => gsp_target(&params),
+    };
+    if matches!(target, Target::Union) && !matches!(method, Method::GET | Method::HEAD) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "the union graph is read-only: name a graph, or the default graph",
+        ));
+    }
     let reads = matches!(method, Method::GET | Method::HEAD);
     let view = p.view(
         &name,
@@ -2167,12 +2450,15 @@ async fn gsp(
             // replacing or clearing everything needs every graph; a POST of quads is
             // checked quad by quad
             Target::Dataset => method == Method::POST,
+            Target::Union => false,
         };
         if !ok {
             let msg = match &target {
                 Target::Default => format!("write access to the default graph of /{name} required"),
                 Target::Named(iri) => format!("write access to graph <{iri}> of /{name} required"),
-                Target::Dataset => format!("write access to every graph of /{name} required"),
+                Target::Dataset | Target::Union => {
+                    format!("write access to every graph of /{name} required")
+                }
             };
             return Ok(crate::auth::forbidden(&p, &msg));
         }
@@ -2214,7 +2500,7 @@ async fn gsp(
                 }
                 _ => {}
             }
-            let (snap, g, resolved) = blocking({
+            let (snap, what, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
                     let at = match datetime {
@@ -2222,36 +2508,37 @@ async fn gsp(
                         None => at,
                     };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
-                    let g = match &target {
-                        Target::Default => Some(Id::DEFAULT_GRAPH),
-                        Target::Named(iri) => Some(
+                    let what = match &target {
+                        Target::Default => Export::Graph(Id::DEFAULT_GRAPH),
+                        Target::Named(iri) => Export::Graph(
                             snap.lookup_iri(iri)
                                 .filter(|g| snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0)
                                 .ok_or_else(|| {
                                     err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>"))
                                 })?,
                         ),
-                        Target::Dataset => None,
+                        Target::Union => Export::Union,
+                        Target::Dataset => Export::Dataset,
                     };
-                    Ok((snap, g, resolved))
+                    Ok((snap, what, resolved))
                 }
             })
             .await?;
             let seq = snap.commit;
-            let ct = [(header::CONTENT_TYPE, results::rdf_media_type(fmt))];
+            let ct = [(header::CONTENT_TYPE, fmt.media_type())];
             let mut report = RequestReport {
                 operation: Some(Op::Gsp),
                 ..Default::default()
             };
             let id = ds.store.dataset_id();
-            let tag = conditional::etag(id, seq, fmt);
-            let negotiated = !params.has("format");
+            let tag = conditional::etag(id, seq, fmt.file_extension());
+            let negotiated = format_param(&params).is_none();
             let resp = match conditional::check_read(&headers, id, seq, &tag)? {
                 conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
                 conditional::ReadOutcome::Send if head => ct.into_response(),
                 conditional::ReadOutcome::Send => {
                     let (body, whole) =
-                        graph_body(st.clone(), ds.clone(), snap, g, fmt, view.clone()).await?;
+                        graph_body(st.clone(), ds.clone(), snap, what, fmt, view.clone()).await?;
                     if let Some((bytes, quads)) = whole {
                         report.response_bytes = Some(bytes);
                         report.rows = Some(quads);
@@ -2280,14 +2567,22 @@ async fn gsp(
             }
             history::reject_at(&params)?;
             let ct = content_type(&headers);
-            let format = sparkles::io::format_for_media_type(&ct)
-                .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
-                .ok_or_else(|| {
-                    err(
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        format!("unsupported content type '{ct}'"),
-                    )
-                })?;
+            // Jena's RDF Thrift, RDF Protobuf and RDF/JSON are read into N-Quads or
+            // N-Triples first
+            let jena = jena_formats::JenaFormat::from_media_type(&ct);
+            let quads = matches!(target, Target::Dataset);
+            let format = match jena {
+                Some(_) if quads => RdfFormat::NQuads,
+                Some(_) => RdfFormat::NTriples,
+                None => sparkles::io::format_for_media_type(&ct)
+                    .or_else(|| params.get("format").and_then(results::rdf_format_from_name))
+                    .ok_or_else(|| {
+                        err(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("unsupported content type '{ct}'"),
+                        )
+                    })?,
+            };
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
             let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
@@ -2308,6 +2603,10 @@ async fn gsp(
                             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
                     ),
                     _ => None,
+                };
+                let body = match jena {
+                    Some(j) => transcode_body(body, j, quads)?,
+                    None => body,
                 };
                 let (src, _spooled) =
                     body.into_source(format, graph.clone(), st.limits.max_decompressed_bytes);
@@ -2384,6 +2683,7 @@ async fn gsp(
                         format!("CLEAR GRAPH <{iri}>")
                     }
                     Target::Dataset => "CLEAR ALL".to_string(),
+                    Target::Union => unreachable!("refused above"),
                 };
                 let stats = match (
                     sparkles::sparql::update::update_as(
@@ -2502,19 +2802,26 @@ async fn upload(
         }
     } else {
         // plain body: format from content type
-        let format = sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
-            err(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("unsupported content type '{ct}'"),
-            )
-        })?;
+        let jena = jena_formats::JenaFormat::from_media_type(&ct);
+        let format = match jena {
+            Some(_) => None,
+            None => Some(sparkles::io::format_for_media_type(&ct).ok_or_else(|| {
+                err(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    format!("unsupported content type '{ct}'"),
+                )
+            })?),
+        };
         let body = spool_after(request.into_body(), 0, &mut budget).await?;
-        let ext = match format {
-            RdfFormat::NTriples => "nt",
-            RdfFormat::NQuads => "nq",
-            RdfFormat::TriG => "trig",
-            RdfFormat::RdfXml => "rdf",
-            RdfFormat::JsonLd { .. } => "jsonld",
+        let ext = match (jena, format) {
+            (Some(jena_formats::JenaFormat::Thrift), _) => "rt",
+            (Some(jena_formats::JenaFormat::Protobuf), _) => "rpb",
+            (Some(jena_formats::JenaFormat::RdfJson), _) => "rj",
+            (None, Some(RdfFormat::NTriples)) => "nt",
+            (None, Some(RdfFormat::NQuads)) => "nq",
+            (None, Some(RdfFormat::TriG)) => "trig",
+            (None, Some(RdfFormat::RdfXml)) => "rdf",
+            (None, Some(RdfFormat::JsonLd { .. })) => "jsonld",
             _ => "ttl",
         };
         let path = tmp.path().join(format!("body.{ext}"));
@@ -2539,6 +2846,26 @@ async fn upload(
             ),
             None => None,
         };
+        // files in Jena's RDF Thrift, RDF Protobuf or RDF/JSON (by extension) are read
+        // into N-Quads, or N-Triples for a graph
+        let mut files = files;
+        for f in files.iter_mut() {
+            let name = f
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(j) = jena_formats::JenaFormat::from_file_name(&name) {
+                let quads = g.is_none();
+                let out = f.with_extension(if quads { "nq" } else { "nt" });
+                let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                let src = std::fs::File::open(&*f).map_err(io)?;
+                let mut w = std::io::BufWriter::new(std::fs::File::create(&out).map_err(io)?);
+                jena_formats::transcode(j, src, quads, &mut w)
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{name}: {e}")))?;
+                std::io::Write::flush(&mut w).map_err(io)?;
+                *f = out;
+            }
+        }
         let sources = files
             .iter()
             .map(|p| {
@@ -2592,7 +2919,7 @@ fn text_summary(ds: &Dataset) -> J {
     J::Null
 }
 
-fn dataset_info(ds: &Dataset) -> J {
+fn dataset_info(st: &AppState, ds: &Dataset) -> J {
     let n = &ds.name;
     #[allow(unused_mut)]
     let mut endpoints = json!({
@@ -2635,6 +2962,10 @@ fn dataset_info(ds: &Dataset) -> J {
     if let Some(r) = ds.store.root().and_then(crate::backup::restored_from) {
         info["restoredFrom"] = r;
     }
+    // Fuseki's description of the dataset and its services
+    if let Some(o) = info.as_object_mut() {
+        o.extend(fuseki::describe(st, ds));
+    }
     info
 }
 
@@ -2645,12 +2976,12 @@ fn visible_datasets(st: &AppState, p: &Principal) -> Vec<J> {
     datasets
         .iter()
         .filter(|d| p.can(&d.name, Level::Read))
-        .map(|d| dataset_info_for(d, p))
+        .map(|d| dataset_info_for(st, d, p))
         .collect()
 }
 
-fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
-    let mut info = dataset_info(d);
+fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
+    let mut info = dataset_info(st, d);
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
@@ -2689,6 +3020,9 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
     let mut doc = json!({
         "startedAt": st.started_at,
         "uptimeSeconds": uptime_secs(&st),
+        // Fuseki's names
+        "startDateTime": st.started_at,
+        "uptime": uptime_secs(&st),
         "readOnly": st.read_only,
         "datasets": visible_datasets(&st, &p),
         "auth": crate::auth::server_json(&st),
@@ -2712,7 +3046,7 @@ async fn get_dataset(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    Ok(Json(dataset_info_for(&ds, &p)))
+    Ok(Json(dataset_info_for(&st, &ds, &p)))
 }
 
 async fn create_dataset(
@@ -2725,7 +3059,38 @@ async fn create_dataset(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let mut params = Params::from_query(&uri);
-    let (name, kind, geo) = if content_type(&headers) == "application/json" {
+    let ct = content_type(&headers);
+    // Fuseki: parameters first, then a service description (an assembler) in an RDF
+    // syntax; Sparkles also takes JSON
+    let assembler = match ct.as_str() {
+        _ if params.has("dbName") => None,
+        "" | "application/json" | "application/x-www-form-urlencoded" => None,
+        "multipart/form-data" => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "Service configuration from a multipart upload not supported",
+            ));
+        }
+        other => Some(sparkles::io::format_for_media_type(other).ok_or_else(|| {
+            err(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("unsupported content type '{other}'"),
+            )
+        })?),
+    };
+    let (name, kind, geo) = if let Some(format) = assembler {
+        let server = fuseki::assembler::Server {
+            union_default_graph: st.store_opts.union_default_graph,
+            gsp_direct_naming: st.gsp_direct_naming,
+        };
+        let spec = fuseki::assembler::parse(&body, format, &server)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        let kind = match spec.kind {
+            DbType::Mem => "mem",
+            DbType::Persistent => "persistent",
+        };
+        (spec.name, kind.to_string(), None)
+    } else if ct == "application/json" {
         let v: J = serde_json::from_slice(&body)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
         (
@@ -2796,7 +3161,7 @@ async fn create_dataset(
         Ok(ds)
     })
     .await?;
-    Ok((StatusCode::CREATED, Json(dataset_info(&ds))).into_response())
+    Ok((StatusCode::CREATED, Json(dataset_info(&st, &ds))).into_response())
 }
 
 /// `POST /$/datasets/{ds}/clone?name=NEW[&inferences=copy|drop]` (query, form or JSON
@@ -2925,6 +3290,8 @@ async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
 async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     let ds = dataset(&st, &name)?;
     let reasoning = crate::reasoning::status_json(&st, &ds);
+    // Fuseki's form: `{datasets: {"/ds": counters}}`
+    let fuseki = json!({ format!("/{name}"): fuseki::fuseki_stats(&st, &ds) });
     let params = Params::from_query(&uri);
     let at = history::at_param(&params)?;
     let opts = query_options(&st, &ds, &params);
@@ -3016,6 +3383,7 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
             "diskBytes": ds.store.disk_bytes(),
             "quota": (ds.kind == DbType::Persistent).then(|| budgets::quota_json(&ds)),
             "reasoning": reasoning,
+            "datasets": fuseki,
             "geo": crate::geo::status_json(&ds),
             "cache": {
                 "entries": cache.entries(),
@@ -3126,11 +3494,28 @@ async fn dataset_prefixes(
     }
 }
 
-async fn compact(State(st): St, Path(name): Path<String>) -> ApiResult {
+/// `POST /$/compact/{ds}[?deleteOld=true]`. Fuseki keeps the old storage unless
+/// `deleteOld` is given. Sparkles always removes the old generation once neither a
+/// reader nor retained history needs it, which is what `deleteOld=true` asks for, so
+/// `deleteOld=false` is refused.
+async fn compact(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = dataset(&st, &name)?;
+    match Params::from_query(&uri).get("deleteOld") {
+        None => {}
+        Some(v) if v.is_empty() || v.eq_ignore_ascii_case("true") => {}
+        Some(v) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "deleteOld={v} is not supported: compaction always removes the old \
+                     generation once no reader or retained history needs it"
+                ),
+            ));
+        }
+    }
     task_start_check(&st, Some("compact"), &name)?;
     let task = st.start_task("compact", &name, move |h| {
         h.progress(0.1, "rebuilding index");
@@ -3232,7 +3617,7 @@ impl<W: std::io::Write> std::io::Write for GuardedFile<W> {
 /// backup in `backups/`, zstd by default (`compression=gzip` writes Fuseki's `.nq.gz`).
 /// One per dataset at a time; `507` when the data directory's file system keeps less
 /// than `--min-free-disk-mb` free, and the task fails once writing would go below it.
-async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
+pub(crate) async fn backup(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
     use sparkles::codec::{Codec, Level};
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -3888,6 +4273,12 @@ async fn shacl(
     };
     let graph = GraphParam::parse(params.get("graph").unwrap_or("default"))
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Fuseki's `?target=`: validate one node, an IRI or a prefixed name of the dataset's
+    // prefixes
+    let target = params
+        .get("target")
+        .map(|t| shacl_target(t, &ds.store.prefixes()))
+        .transpose()?;
     let rfmt = match params.get("format") {
         Some(f) => ReportFormat::from_name(f).ok_or_else(|| {
             err(
@@ -3948,7 +4339,11 @@ async fn shacl(
         opts.pool = crate::validation_common::validation_pool();
         let t = std::time::Instant::now();
         let _validate = tracing::info_span!("shacl.validate").entered();
-        let report = sparkles_shacl::validate(&snap, &shapes, &opts).map_err(|e| {
+        let report = match &target {
+            Some(node) => sparkles_shacl::validate_node(&snap, &shapes, node, &opts),
+            None => sparkles_shacl::validate(&snap, &shapes, &opts),
+        }
+        .map_err(|e| {
             let msg = format!("{e:#}");
             if let Some(r) = e.downcast_ref::<sparkles_shacl::TooManyResults>() {
                 // the report would be at least this large
@@ -3985,6 +4380,29 @@ async fn shacl(
         ))
     })
     .await
+}
+
+/// The node of a SHACL `?target=`: a prefixed name of `prefixes` expanded, else the IRI.
+#[cfg(feature = "shacl")]
+fn shacl_target(
+    t: &str,
+    prefixes: &std::collections::BTreeMap<String, String>,
+) -> ApiResult<oxrdf::Term> {
+    let iri = match t.split_once(':') {
+        Some((p, local)) if !local.starts_with("//") => match prefixes.get(p) {
+            Some(ns) => format!("{ns}{local}"),
+            None => t.to_string(),
+        },
+        _ => t.to_string(),
+    };
+    oxrdf::NamedNode::new(iri)
+        .map(oxrdf::Term::NamedNode)
+        .map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid target '{t}': {e}"),
+            )
+        })
 }
 
 #[cfg(not(feature = "shacl"))]
