@@ -98,10 +98,19 @@ pub struct Optimizations {
     /// those two read only the key ranges of the values whose string starts as a
     /// `STRSTARTS` or a `REGEX` anchored on a literal start requires
     pub filter_key_ranges: bool,
+    /// hash joins group the build side's rows by key in one flat array instead of a list
+    /// per key
+    pub flat_hash_join: bool,
+    /// index joins find each key's rows by galloping from the previous key's position
+    /// and keep the current block, instead of a binary search and a scan per cluster
+    pub gallop_index_join: bool,
+    /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
+    /// runs as a merge in the left side's order
+    pub merge_left_join: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 22] = [
+    pub const NAMES: [&str; 25] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -124,6 +133,9 @@ impl Optimizations {
         "count_filter_runs",
         "filter_scan_runs",
         "filter_key_ranges",
+        "flat_hash_join",
+        "gallop_index_join",
+        "merge_left_join",
     ];
 
     /// Everything on.
@@ -150,6 +162,9 @@ impl Optimizations {
         count_filter_runs: true,
         filter_scan_runs: true,
         filter_key_ranges: true,
+        flat_hash_join: true,
+        gallop_index_join: true,
+        merge_left_join: true,
     };
 
     /// Everything off: the generic operators only.
@@ -176,6 +191,9 @@ impl Optimizations {
         count_filter_runs: false,
         filter_scan_runs: false,
         filter_key_ranges: false,
+        flat_hash_join: false,
+        gallop_index_join: false,
+        merge_left_join: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -202,6 +220,9 @@ impl Optimizations {
             "count_filter_runs" => &mut self.count_filter_runs,
             "filter_scan_runs" => &mut self.filter_scan_runs,
             "filter_key_ranges" => &mut self.filter_key_ranges,
+            "flat_hash_join" => &mut self.flat_hash_join,
+            "gallop_index_join" => &mut self.gallop_index_join,
+            "merge_left_join" => &mut self.merge_left_join,
             _ => return None,
         })
     }

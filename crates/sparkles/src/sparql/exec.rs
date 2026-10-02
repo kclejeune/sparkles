@@ -17,6 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use spargebra::algebra::AggregateFunction;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 const PAR_THRESHOLD: usize = 16_384;
@@ -235,7 +236,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
-        Kind::Join { algo, keys } => {
+        Kind::Join { algo, .. } => {
             let l = child(0, &mut infos)?;
             if l.is_empty() {
                 infos.push(describe(ctx, &n.children[1]));
@@ -244,8 +245,8 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
                 let r = child(1, &mut infos)?;
                 match algo {
                     JoinAlgo::Cross => cross(ctx, &l, &r)?,
-                    JoinAlgo::Merge => join_tables(ctx, &l, &r, keys, true)?,
-                    JoinAlgo::Hash => join_tables(ctx, &l, &r, keys, false)?,
+                    JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
+                    JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
                 }
             }
         }
@@ -306,7 +307,7 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
         Kind::LeftJoin { expr } => {
             let l = child(0, &mut infos)?;
             let r = child(1, &mut infos)?;
-            left_join(ctx, &l, &r, expr.as_ref())?
+            left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
         Kind::Minus => {
             let l = child(0, &mut infos)?;
@@ -1789,6 +1790,164 @@ fn gallop(col: &[Id], from: usize, target: Id) -> usize {
     lo.min(hi) + col[lo.min(hi)..hi].partition_point(|x| *x < target)
 }
 
+/// The rows of a hash join's build side grouped by key, in partitions of about
+/// [`PART_ROWS`] rows chosen by bits of a hash of the key, so that each partition's table
+/// stays in the CPU caches while it is built. Within a partition the rows of the `g`-th
+/// key, in row order, are `rows[start[g]..start[g + 1]]`, and `map` finds `g` from the
+/// key (the id of a single key column, or a hash of several). A partition is laid out by
+/// counting each key's rows and then placing every row, so the build allocates a few
+/// arrays per partition instead of a list per key, and the partitions are built in
+/// parallel.
+struct KeyGroups {
+    /// the partition of a key is its mixed hash shifted right by this (64: one)
+    shift: u32,
+    parts: Vec<KeyPart>,
+}
+
+struct KeyPart {
+    map: FxHashMap<u64, u32>,
+    start: Vec<u32>,
+    rows: Vec<u32>,
+}
+
+/// Rows per partition of a hash join's build side: a partition's table of about 24 bytes
+/// per row fits in the per-core cache.
+const PART_ROWS: usize = 8192;
+
+/// Probe rows per parallel piece of a hash join.
+const PROBE_PIECE: usize = 1 << 15;
+
+impl KeyGroups {
+    fn build(ctx: &Ctx, t: &Table, cols: &[usize]) -> Result<KeyGroups> {
+        let n = t.len();
+        let keys: Vec<u64> = map_rows(ctx, n, n >= PAR_MIN_LEN, |i| Self::key_of(t, cols, i))?;
+        let bits = (n / PART_ROWS)
+            .max(1)
+            .next_power_of_two()
+            .trailing_zeros()
+            .min(12);
+        let shift = 64 - bits;
+        if bits == 0 {
+            let part = KeyPart::build(&keys, (0..n as u32).collect());
+            return Ok(KeyGroups {
+                shift,
+                parts: vec![part],
+            });
+        }
+        // the rows of each partition, in row order (a counting sort on the partition)
+        let part_of = |k: u64| (mix(k) >> shift) as usize;
+        let mut count = vec![0u32; 1 << bits];
+        for &k in &keys {
+            count[part_of(k)] += 1;
+        }
+        let mut at: Vec<u32> = Vec::with_capacity(count.len() + 1);
+        let mut sum = 0u32;
+        at.push(0);
+        for c in &count {
+            sum += c;
+            at.push(sum);
+        }
+        let mut next = at.clone();
+        let mut order = vec![0u32; n];
+        for (i, &k) in keys.iter().enumerate() {
+            let p = &mut next[part_of(k)];
+            order[*p as usize] = i as u32;
+            *p += 1;
+        }
+        ctx.check()?;
+        let parts = (0..count.len())
+            .into_par_iter()
+            .map(|p| KeyPart::build(&keys, order[at[p] as usize..at[p + 1] as usize].to_vec()))
+            .collect();
+        Ok(KeyGroups { shift, parts })
+    }
+
+    /// The table key of row `i` of `t` on the key columns `cols`.
+    #[inline]
+    fn key_of(t: &Table, cols: &[usize], i: usize) -> u64 {
+        match cols {
+            [c] => t.cols[*c][i].0,
+            _ => {
+                use std::hash::{Hash, Hasher};
+                let mut h = rustc_hash::FxHasher::default();
+                for &c in cols {
+                    t.cols[c][i].0.hash(&mut h);
+                }
+                h.finish()
+            }
+        }
+    }
+
+    /// The build rows of key `k`, in row order (none for a key not in the table).
+    #[inline]
+    fn rows(&self, k: u64) -> &[u32] {
+        let part = if self.shift == 64 {
+            &self.parts[0]
+        } else {
+            &self.parts[(mix(k) >> self.shift) as usize]
+        };
+        match part.map.get(&k) {
+            Some(&g) => {
+                let g = g as usize;
+                &part.rows[part.start[g] as usize..part.start[g + 1] as usize]
+            }
+            None => &[],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.parts.iter().map(|p| p.map.len()).sum()
+    }
+}
+
+impl KeyPart {
+    /// The groups of the rows `rows` (in row order) of the keys `keys`.
+    fn build(keys: &[u64], rows: Vec<u32>) -> KeyPart {
+        let mut map: FxHashMap<u64, u32> = FxHashMap::default();
+        map.reserve(rows.len().min(PART_ROWS * 2));
+        let mut group: Vec<u32> = Vec::with_capacity(rows.len());
+        let mut count: Vec<u32> = Vec::new();
+        for &i in &rows {
+            let next = count.len() as u32;
+            let g = *map.entry(keys[i as usize]).or_insert(next);
+            if g == next {
+                count.push(0);
+            }
+            count[g as usize] += 1;
+            group.push(g);
+        }
+        // `start[g]` is where the next row of key `g` goes, then the end of its rows
+        let mut start: Vec<u32> = Vec::with_capacity(count.len() + 1);
+        start.push(0);
+        let mut at = 0u32;
+        for c in &count {
+            at += c;
+            start.push(at);
+        }
+        let mut placed = vec![0u32; rows.len()];
+        for (&i, &g) in rows.iter().zip(&group) {
+            let p = &mut start[g as usize];
+            placed[*p as usize] = i;
+            *p += 1;
+        }
+        // placing the rows moved each start to the next key's start
+        start.rotate_right(1);
+        start[0] = 0;
+        KeyPart {
+            map,
+            start,
+            rows: placed,
+        }
+    }
+}
+
+/// A hash of an id for choosing its partition, unlike the hash tables' own hash (whose
+/// high bits pick the slots' tags).
+#[inline]
+fn mix(k: u64) -> u64 {
+    (k ^ (k >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 /// Pairs of compatible rows (inner join).
 fn join_pairs(
     ctx: &Ctx,
@@ -1796,6 +1955,7 @@ fn join_pairs(
     r: &Table,
     lay: &JoinLayout,
     merge: bool,
+    note: &mut Option<String>,
 ) -> Result<Vec<(u32, u32)>> {
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     // a pair per output row now, the materialized row later
@@ -1902,7 +2062,63 @@ fn join_pairs(
             pairs.push((i as u32, j as u32));
         }
     };
-    if bcols.len() == 1 {
+    if ctx.opt.flat_hash_join {
+        let groups = KeyGroups::build(ctx, bt, &bcols)?;
+        let single = bcols.len() == 1;
+        // with several key columns the table is keyed by a hash of them, so a key's
+        // rows can include rows of other keys with the same hash
+        let same = |bi: usize, pi: usize| {
+            single
+                || bcols
+                    .iter()
+                    .zip(&pcols)
+                    .all(|(&b, &p)| bt.cols[b][bi] == pt.cols[p][pi])
+        };
+        // the pairs of the probe rows `[s, e)`, in probe order; `total` counts the pairs
+        // of all pieces for the output limits
+        let total = AtomicUsize::new(0);
+        let piece = |s: usize, e: usize| -> Result<Vec<(u32, u32)>> {
+            let mut out = Vec::new();
+            let mut counted = 0;
+            for pi in s..e {
+                if (pi - s) % 4096 == 4095 {
+                    let n = out.len() - counted;
+                    counted = out.len();
+                    let all = total.fetch_add(n, AtomicOrdering::Relaxed) + n;
+                    ctx.check()?;
+                    ctx.check_output(all, w)?;
+                }
+                let m = groups.rows(KeyGroups::key_of(pt, &pcols, pi));
+                if m.len() > 1024 {
+                    let all = total.load(AtomicOrdering::Relaxed);
+                    ctx.check_output(all.saturating_add(out.len() - counted + m.len()), w)?;
+                }
+                for &bi in m {
+                    if same(bi as usize, pi) {
+                        emit(bi as usize, pi, &mut out);
+                    }
+                }
+            }
+            total.fetch_add(out.len() - counted, AtomicOrdering::Relaxed);
+            Ok(out)
+        };
+        let n = pt.len();
+        if n < 2 * PROBE_PIECE {
+            pairs = piece(0, n)?;
+        } else {
+            let parts: Vec<Vec<(u32, u32)>> = (0..n.div_ceil(PROBE_PIECE))
+                .into_par_iter()
+                .map(|p| piece(p * PROBE_PIECE, ((p + 1) * PROBE_PIECE).min(n)))
+                .collect::<Result<_>>()?;
+            ctx.check_output(parts.iter().map(Vec::len).sum(), w)?;
+            pairs = parts.concat();
+        }
+        *note = Some(format!(
+            "[flat hash table: {} keys in {} parts]",
+            groups.len(),
+            groups.parts.len()
+        ));
+    } else if bcols.len() == 1 {
         let mut map: FxHashMap<Id, Vec<u32>> = FxHashMap::default();
         for (i, v) in bt.cols[bcols[0]].iter().enumerate() {
             map.entry(*v).or_default().push(i as u32);
@@ -1975,7 +2191,7 @@ fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
             return Ok(n);
         }
     }
-    Ok(join_pairs(ctx, l, r, &lay, merge)?.len() as u64)
+    Ok(join_pairs(ctx, l, r, &lay, merge, &mut None)?.len() as u64)
 }
 
 /// Decompose RDF 1.2 triple terms: rows whose `t` is not a triple term, or whose
@@ -2038,8 +2254,19 @@ pub(super) fn join_tables(
     _keys: &[VarId],
     merge: bool,
 ) -> Result<Table> {
+    join_noted(ctx, l, r, merge, &mut None)
+}
+
+/// The join of two tables, with a note on how the rows were matched.
+fn join_noted(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    merge: bool,
+    note: &mut Option<String>,
+) -> Result<Table> {
     let lay = layout(l, r);
-    let pairs = join_pairs(ctx, l, r, &lay, merge)?;
+    let pairs = join_pairs(ctx, l, r, &lay, merge, note)?;
     ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
     let mut t = materialize(l, r, &lay, &pairs);
     t.sorted = kept_order(l, r, &lay, &pairs);
@@ -2077,31 +2304,57 @@ fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> V
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
     let lay = layout(l, r);
     ctx.check_output(l.len().saturating_mul(r.len()), lay.vars.len() + 1)?;
-    let pairs = join_pairs(ctx, l, r, &lay, false)?;
+    let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
     Ok(materialize(l, r, &lay, &pairs))
 }
 
-fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Table> {
+/// Whether `t` is sorted on its column `c` first.
+fn sorted_on(t: &Table, c: usize) -> bool {
+    t.sorted.first().is_some_and(|v| t.col_of(*v) == Some(c))
+}
+
+/// Which rows of `joined` pass the OPTIONAL's FILTER `e`.
+fn left_filter(ctx: &Ctx, joined: &Table, e: &Expr) -> Vec<bool> {
+    let map = joined.var_map(ctx.nvars());
+    (0..joined.len())
+        .map(|i| {
+            ebv(
+                e,
+                &Row {
+                    table: joined,
+                    i,
+                    map: &map,
+                    dec: None,
+                },
+                ctx,
+            )
+            .unwrap_or(false)
+        })
+        .collect()
+}
+
+pub(super) fn left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    expr: Option<&Expr>,
+    note: &mut Option<String>,
+) -> Result<Table> {
     let lay = layout(l, r);
-    let mut pairs = join_pairs(ctx, l, r, &lay, false)?;
+    if ctx.opt.merge_left_join
+        && let [(lc, rc)] = lay.shared[..]
+        && sorted_on(l, lc)
+        && sorted_on(r, rc)
+        && !has_undef(l, lc)
+        && !has_undef(r, rc)
+    {
+        *note = Some(format!("[merge on ?{}]", ctx.var_name(l.vars[lc])));
+        return merge_left_join(ctx, l, r, &lay, (lc, rc), expr);
+    }
+    let mut pairs = join_pairs(ctx, l, r, &lay, false, note)?;
     let mut joined = materialize(l, r, &lay, &pairs);
     if let Some(e) = expr {
-        let map = joined.var_map(ctx.nvars());
-        let keep: Vec<bool> = (0..joined.len())
-            .map(|i| {
-                ebv(
-                    e,
-                    &Row {
-                        table: &joined,
-                        i,
-                        map: &map,
-                        dec: None,
-                    },
-                    ctx,
-                )
-                .unwrap_or(false)
-            })
-            .collect();
+        let keep = left_filter(ctx, &joined, e);
         joined.filter_rows(&keep);
         let mut k = keep.iter();
         pairs.retain(|_| *k.next().unwrap());
@@ -2121,6 +2374,156 @@ fn left_join(ctx: &Ctx, l: &Table, r: &Table, expr: Option<&Expr>) -> Result<Tab
         joined.len += missing.len();
     }
     Ok(joined)
+}
+
+/// A right row index standing for no row: the left row is kept with the right side's
+/// variables unbound.
+const NO_ROW: u32 = u32::MAX;
+
+/// OPTIONAL by a merge on the key columns `(lc, rc)`, which both sides are sorted on and
+/// neither leaves unbound. The output keeps the left side's rows in order, each one with
+/// its matches or alone, so it is sorted like the left side.
+fn merge_left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    lay: &JoinLayout,
+    (lc, rc): (usize, usize),
+    expr: Option<&Expr>,
+) -> Result<Table> {
+    let (a, b) = (&l.cols[lc], &r.cols[rc]);
+    // `first[i]`: the first right row whose key is at least left row i's
+    let mut first = vec![b.len() as u32; a.len()];
+    let (mut i, mut j) = (0, 0);
+    if b.len() > 8 * a.len() {
+        // gallop over a much larger right side
+        for (i, &x) in a.iter().enumerate() {
+            if j < b.len() && b[j] < x {
+                j = gallop(b, j, x);
+            }
+            first[i] = j as u32;
+        }
+    } else {
+        // branch-free zipper: each step advances the side with the smaller id (the left
+        // one on equal ids, which may repeat), and the left row's position is final once
+        // it advances
+        while i < a.len() && j < b.len() {
+            if (i + j) % 65536 == 0 {
+                ctx.check()?;
+            }
+            let (x, y) = (a[i], b[j]);
+            first[i] = j as u32;
+            i += (x <= y) as usize;
+            j += (x > y) as usize;
+        }
+    }
+    // each left row with the right rows of its key, or with none
+    let w = lay.vars.len() + 1;
+    let mut li: Vec<u32> = Vec::with_capacity(a.len());
+    let mut rj: Vec<u32> = Vec::with_capacity(a.len());
+    let mut run = (usize::MAX, 0);
+    for (i, (&x, &s)) in a.iter().zip(&first).enumerate() {
+        if i % 65536 == 65535 {
+            ctx.check()?;
+            ctx.check_output(li.len(), w)?;
+        }
+        let s = s as usize;
+        if s < b.len() && b[s] == x {
+            if run.0 != s {
+                run = (s, run_end(b, s));
+            }
+            let e = run.1;
+            if e - s > 1024 {
+                ctx.check_output(li.len().saturating_add(e - s), w)?;
+            }
+            li.extend(std::iter::repeat_n(i as u32, e - s));
+            rj.extend(s as u32..e as u32);
+        } else {
+            li.push(i as u32);
+            rj.push(NO_ROW);
+        }
+    }
+    drop(first);
+    if let Some(e) = expr {
+        // the FILTER is tested on the matched rows; a left row none of whose matches
+        // pass is kept alone
+        let matched: Vec<(u32, u32)> = li
+            .iter()
+            .zip(&rj)
+            .filter(|(_, j)| **j != NO_ROW)
+            .map(|(&i, &j)| (i, j))
+            .collect();
+        let joined = materialize(l, r, lay, &matched);
+        let mut keep = left_filter(ctx, &joined, e).into_iter();
+        drop(joined);
+        let (mut li2, mut rj2) = (Vec::with_capacity(li.len()), Vec::with_capacity(li.len()));
+        let mut k = 0;
+        while k < li.len() {
+            let i = li[k];
+            let mut e = k;
+            let mut any = false;
+            while e < li.len() && li[e] == i {
+                if rj[e] != NO_ROW && keep.next().unwrap_or(false) {
+                    li2.push(i);
+                    rj2.push(rj[e]);
+                    any = true;
+                }
+                e += 1;
+            }
+            if !any {
+                li2.push(i);
+                rj2.push(NO_ROW);
+            }
+            k = e;
+        }
+        (li, rj) = (li2, rj2);
+    }
+    ctx.check_output(li.len(), w)?;
+    let mut t = materialize_left(l, r, lay, &li, &rj);
+    t.sorted = l.sorted.clone();
+    Ok(t)
+}
+
+/// The rows of a left join from left row indices and right row indices (`NO_ROW` for
+/// none). The left side's unbound shared variables take the right row's values.
+fn materialize_left(l: &Table, r: &Table, lay: &JoinLayout, li: &[u32], rj: &[u32]) -> Table {
+    // every left row once, in order: the left columns are copied whole
+    let whole = li.len() == l.len() && li.iter().enumerate().all(|(n, &i)| n == i as usize);
+    let mut cols: Vec<Vec<Id>> = Vec::with_capacity(lay.vars.len());
+    for (lc, col) in l.cols.iter().enumerate() {
+        let fill = lay.shared.iter().find(|(x, _)| *x == lc).map(|(_, rc)| *rc);
+        let fill = fill.filter(|_| has_undef(l, lc));
+        cols.push(match fill {
+            None if whole => col.clone(),
+            None => li.iter().map(|&i| col[i as usize]).collect(),
+            Some(rc) => li
+                .iter()
+                .zip(rj)
+                .map(|(&i, &j)| {
+                    let v = col[i as usize];
+                    if v.is_undef() && j != NO_ROW {
+                        r.cols[rc][j as usize]
+                    } else {
+                        v
+                    }
+                })
+                .collect(),
+        });
+    }
+    for &rc in &lay.right_only {
+        let col = &r.cols[rc];
+        cols.push(
+            rj.iter()
+                .map(|&j| col.get(j as usize).copied().unwrap_or(Id::UNDEF))
+                .collect(),
+        );
+    }
+    Table {
+        vars: lay.vars.clone(),
+        cols,
+        len: li.len(),
+        sorted: Vec::new(),
+    }
 }
 
 fn minus(ctx: &Ctx, mut l: Table, r: &Table, note: &mut Option<String>) -> Result<Table> {

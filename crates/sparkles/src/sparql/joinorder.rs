@@ -143,7 +143,7 @@ fn joins(
     pb: Option<&ProbeSide>,
     shared: &[Shared],
     est: f64,
-    batched: bool,
+    batched: plan::Costing,
     keep: &mut impl FnMut(f64, Option<VarId>) -> bool,
     out: &mut Vec<Cand>,
 ) {
@@ -164,13 +164,13 @@ fn joins(
             });
         }
     }
-    let base = plan::hash_base(a.est, b.est);
+    let base = plan::hash_base(batched.hash_build, a.est, b.est);
     out.push(Cand {
         cost: a.cost + b.cost + base + est,
         sorted: if a.est >= b.est { a.sorted } else { b.sorted },
         how: How::Hash,
     });
-    if batched {
+    if batched.index_joins {
         if let Some(p) = pb
             && let Some((cost, sorted)) = probe(a, b, p, shared, est, false, keep)
         {
@@ -489,7 +489,7 @@ struct Greedy {
 impl Greedy {
     fn run(g: &Group, items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Greedy> {
         let nv = g.vars.len();
-        let batched = ctx.opt.batched_join;
+        let batched = plan::Costing::of(ctx);
         let mut placed = vec![false; filters.len()];
         let mut units: Vec<Unit> = Vec::with_capacity(2 * items.len());
         let mut leaves = Vec::with_capacity(items.len());
@@ -542,7 +542,7 @@ impl Greedy {
                 has,
                 certain,
                 d,
-                probe: if batched {
+                probe: if batched.index_joins {
                     indexjoin::probe_side(&node, ctx)
                 } else {
                     None
@@ -595,7 +595,7 @@ impl Greedy {
         g: &Group,
         a: usize,
         b: usize,
-        batched: bool,
+        batched: plan::Costing,
         heap: &mut BinaryHeap<Pair>,
         cands: &mut Vec<Cand>,
         shared: &mut Vec<Shared>,
@@ -1027,7 +1027,7 @@ impl Dp {
     ) -> Result<Option<u32>> {
         let ctx = pl.ctx;
         let ub = bound.unwrap_or(f64::INFINITY);
-        let batched = ctx.opt.batched_join;
+        let batched = plan::Costing::of(ctx);
         let fvars = dp_filter_vars(filters);
         // the inputs: every access path with the filters it binds
         let mut parts = Vec::with_capacity(items.len());
@@ -1052,7 +1052,7 @@ impl Dp {
                     how: How::Hash,
                     a: i as u32,
                     b: k as u32,
-                    probe: if batched {
+                    probe: if batched.index_joins {
                         indexjoin::probe_side(&o, ctx)
                     } else {
                         None
@@ -1158,7 +1158,7 @@ impl Dp {
         r: &mut Round,
         size: usize,
         ub: f64,
-        batched: bool,
+        batched: plan::Costing,
         ctx: &Ctx,
     ) -> Result<()> {
         let k = r.parts.len();
@@ -1192,7 +1192,7 @@ impl Dp {
         sub: u32,
         rest: u32,
         ub: f64,
-        batched: bool,
+        batched: plan::Costing,
         cur: &mut Vec<Best>,
         sc: &mut Scratch,
     ) {
@@ -1260,8 +1260,8 @@ impl Dp {
                     s.db = self.dval[(b.d + pb) as usize];
                 }
                 let est = pair_est(&a.sum, &b.sum, shared);
-                let probe_a = batched && a.probe.is_some();
-                let probe_b = batched && b.probe.is_some();
+                let probe_a = batched.index_joins && a.probe.is_some();
+                let probe_b = batched.index_joins && b.probe.is_some();
                 let mut floor = pair_floor(&a.sum, probe_a, &b.sum, probe_b, est);
                 if nf > 0 {
                     floor += est;

@@ -723,6 +723,8 @@ mod exprcache_tests;
 #[cfg(test)]
 mod indexjoin_tests;
 #[cfg(test)]
+mod join_tests;
+#[cfg(test)]
 mod joinorder_tests;
 #[cfg(test)]
 mod opt_tests;

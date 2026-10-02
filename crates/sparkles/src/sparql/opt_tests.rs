@@ -397,7 +397,7 @@ fn incremental_grouping_matches_the_generic_aggregates() {
     let s = group_store();
     for q in [
         "SELECT ?o (AVG(?a) AS ?avg) (COUNT(?p) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
-        "SELECT ?o (SUM(?a) AS ?s) (COUNT(?a) AS ?c) (COUNT(*) AS ?n) (MIN(?a) AS ?lo) (MAX(?a) AS ?hi) (SAMPLE(?p) AS ?x) WHERE { ?p ex:org ?o OPTIONAL { ?p ex:age ?a } } GROUP BY ?o",
+        "SELECT ?o (SUM(?a) AS ?s) (COUNT(?a) AS ?c) (COUNT(*) AS ?n) (MIN(?a) AS ?lo) (MAX(?a) AS ?hi) WHERE { ?p ex:org ?o OPTIONAL { ?p ex:age ?a } } GROUP BY ?o",
         "SELECT ?o (SUM(?b) AS ?s) (AVG(?b) AS ?m) WHERE { ?p ex:org ?o ; ex:big ?b } GROUP BY ?o",
         "SELECT (SUM(?a) AS ?s) (AVG(?a) AS ?m) (COUNT(*) AS ?n) (MAX(?a) AS ?hi) WHERE { ?p ex:age ?a }",
         "SELECT (SUM(?a) AS ?s) (AVG(?a) AS ?m) (COUNT(*) AS ?n) (MIN(?a) AS ?lo) WHERE { ?p ex:age ?a FILTER(?a > 1000) }",
@@ -406,6 +406,19 @@ fn incremental_grouping_matches_the_generic_aggregates() {
     ] {
         same_answer(&s, q, "desc:[incremental]");
     }
+    // SAMPLE takes a row that depends on the input's order, which other operators
+    // change (a merge left join keeps the left side's order, a hash left join puts the
+    // unmatched rows last): compared with only the incremental grouping off
+    let q = "SELECT ?o (COUNT(*) AS ?n) (SAMPLE(?p) AS ?x) (SAMPLE(?a) AS ?y) \
+             WHERE { ?p ex:org ?o OPTIONAL { ?p ex:age ?a } } GROUP BY ?o";
+    let fast = run(&s, q, Optimizations::ALL);
+    let slow = Optimizations {
+        incremental_group: false,
+        ..Optimizations::ALL
+    };
+    let slow = run(&s, q, slow);
+    assert_eq!(solutions(&fast), solutions(&slow), "{q}");
+    assert!(has_desc(&fast.plan, "[incremental]") && !has_desc(&slow.plan, "[incremental]"));
     // not admitted: DISTINCT, expressions, GROUP_CONCAT, several keys
     for q in [
         "SELECT ?o (COUNT(DISTINCT ?a) AS ?n) WHERE { ?p ex:org ?o ; ex:age ?a } GROUP BY ?o",
