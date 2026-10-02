@@ -115,3 +115,92 @@ fn subject_classes_and_constraints() {
         assert_eq!(o.status.code(), Some(1), "{bad:?}: {}", out(&o));
     }
 }
+
+#[test]
+fn profiles_and_diffs() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("data.trig"), DATA).unwrap();
+    let o = sparkles(dir, &["load", "--loc", "db", "data.trig"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &[
+            "update",
+            "--loc",
+            "db",
+            "PREFIX ex: <http://ex.org/> INSERT DATA { ex:b a ex:Person ; ex:name \"B\", \"Bee\" ; ex:worksFor ex:o }",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+
+    let o = sparkles(dir, &["schema", "--loc", "db", "--profiles"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = out(&o);
+    assert!(
+        text.contains("<http://ex.org/Person>  instances 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("<http://ex.org/name>  instances 2/2  triples 3  values 1..2  string 3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("<http://ex.org/worksFor>  instances 1/2"),
+        "{text}"
+    );
+    assert!(text.contains("→ Org 1"), "{text}");
+    assert!(
+        text.contains("← <http://ex.org/worksFor>  triples 1  instances 1"),
+        "{text}"
+    );
+    let o = sparkles(
+        dir,
+        &[
+            "schema",
+            "--loc",
+            "db",
+            "--profiles",
+            "--class",
+            "http://ex.org/Org",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["classes"].as_array().unwrap().len(), 1);
+    assert_eq!(j["classes"][0]["class"], "http://ex.org/Org");
+
+    // the load is commit 1, the update commit 2
+    let o = sparkles(dir, &["schema", "--loc", "db", "--diff", "1"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = out(&o);
+    assert!(
+        text.contains("schema diff from commit 1 to commit 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("+ predicate http://ex.org/worksFor (triples 1)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("~ class http://ex.org/Person: observed.instances 1 -> 2"),
+        "{text}"
+    );
+    let o = sparkles(
+        dir,
+        &[
+            "schema", "--loc", "db", "--diff", "commit:2", "--to", "2", "--format", "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["counts"]["classesChanged"], 0);
+    // --class needs --profiles or --draft-shapes
+    let o = sparkles(
+        dir,
+        &["schema", "--loc", "db", "--class", "http://ex.org/Org"],
+    );
+    assert_ne!(o.status.code(), Some(0));
+}

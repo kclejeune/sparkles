@@ -1774,6 +1774,12 @@ use source::Src;
 mod maintain;
 pub use maintain::{max_changes, update};
 
+pub mod profile;
+pub use profile::{ClassProfiles, ProfileOptions, profiles};
+
+pub mod compare;
+pub use compare::{SchemaDiff, compare, diff_text};
+
 mod void;
 pub use void::{VOID_NS, VoidOptions, description_iri, void_text, void_triples};
 
@@ -1788,3 +1794,9 @@ mod tests;
 
 #[cfg(test)]
 mod maintain_tests;
+
+#[cfg(test)]
+mod profile_tests;
+
+#[cfg(test)]
+mod compare_tests;

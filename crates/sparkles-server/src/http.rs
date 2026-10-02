@@ -107,6 +107,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/predicates", get(schema::predicates))
         .route("/$/schema/{ds}/shapes", get(schema::shapes))
         .route("/$/schema/{ds}/constraints", get(schema::constraints))
+        .route("/$/schema/{ds}/profiles", get(schema::profiles))
+        .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -3381,17 +3383,36 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
                 })
             })
             .collect();
-        // classes
+        // classes: distinct subjects typed with each class over every graph, as the
+        // build statistics count them; after updates, from one ordered pass over
+        // POS[rdf:type], where a subject typed in several graphs counts once
         let mut classes: Vec<(u64, u64)> = if snap.delta.is_empty() {
             gen_.stats.classes.clone()
         } else {
-            let mut m: std::collections::HashMap<u64, u64> = Default::default();
+            let mut v: Vec<(u64, u64)> = Vec::new();
             if let Some(t) = snap.lookup_iri(oxrdf::vocab::rdf::TYPE.as_str()) {
-                for k in snap.scan_keys(Perm::Pos, &[t.0])? {
-                    *m.entry(k[1]).or_default() += 1;
-                }
+                let mut prev: Option<(u64, u64)> = None;
+                let mut visit = |k: &sparkles::index::Key| {
+                    if prev == Some((k[1], k[2])) {
+                        return;
+                    }
+                    match v.last_mut() {
+                        Some((c, n)) if *c == k[1] => *n += 1,
+                        _ => v.push((k[1], 1)),
+                    }
+                    prev = Some((k[1], k[2]));
+                };
+                snap.scan(Perm::Pos, &[t.0], |c| {
+                    match c {
+                        sparkles::store::Chunk::Block(b, s, e) => {
+                            (s..e).for_each(|i| visit(&b.key(i)))
+                        }
+                        sparkles::store::Chunk::Row(k) => visit(&k),
+                    }
+                    Ok(true)
+                })?;
             }
-            m.into_iter().collect()
+            v
         };
         classes.sort_by_key(|c| std::cmp::Reverse(c.1));
         let classes: Vec<J> = classes

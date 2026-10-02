@@ -935,3 +935,123 @@ async fn reports_are_updated_from_changes() {
         }
     }
 }
+
+#[tokio::test]
+async fn stats_count_distinct_instances_after_updates() {
+    let s = server("ex:a a ex:C . ex:b a ex:C . ex:g { ex:a a ex:C }");
+    let instances = |j: &J| {
+        j["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["iri"] == "http://ex.org/C")
+            .map(|c| c["instances"].as_u64().unwrap())
+    };
+    let j = ok(&s.app, "/$/stats/t").await;
+    assert_eq!(instances(&j), Some(2));
+    // a subject typed in several graphs counts once, before and after a compaction
+    update(
+        &s.app,
+        "INSERT DATA { ex:c a ex:C . GRAPH ex:g2 { ex:b a ex:C } } ; DELETE DATA { ex:a a ex:C }",
+    )
+    .await;
+    let j = ok(&s.app, "/$/stats/t").await;
+    assert_eq!(instances(&j), Some(3), "{}", j["classes"]);
+    s.state.get("t").unwrap().store.compact().unwrap();
+    let j = ok(&s.app, "/$/stats/t").await;
+    assert_eq!(instances(&j), Some(3));
+}
+
+#[tokio::test]
+async fn profiles_of_classes() {
+    let s = server(
+        "ex:a a ex:P ; ex:name \"A\" ; ex:knows ex:b . ex:b a ex:P ; ex:name \"B\", \"Bee\" .",
+    );
+    let j = ok(&s.app, "/$/schema/t/profiles").await;
+    assert_eq!(j["profileFormat"], 1);
+    let p = &j["classes"][0];
+    assert_eq!(p["class"], "http://ex.org/P");
+    assert_eq!(p["instances"], 2);
+    let name = &p["properties"][0];
+    assert_eq!(name["predicate"], "http://ex.org/name");
+    assert_eq!(
+        (
+            &name["instances"],
+            &name["triples"],
+            &name["minPerInstance"],
+            &name["maxPerInstance"]
+        ),
+        (&J::from(2), &J::from(3), &J::from(1), &J::from(2))
+    );
+    assert_eq!(p["incoming"][0]["predicate"], "http://ex.org/knows");
+    let j = ok(
+        &s.app,
+        &format!(
+            "/$/schema/t/profiles?class={}&class={}",
+            enc("http://ex.org/P"),
+            enc("<http://ex.org/None>")
+        ),
+    )
+    .await;
+    assert_eq!(j["classes"].as_array().unwrap().len(), 2);
+    assert_eq!(j["classes"][0]["instances"], 0);
+    let (status, _) = get(&s.app, "/$/schema/t/profiles?class=not%20an%20iri").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(&s.app, "/$/schema/t/profiles?graph=http://ex.org/none").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn diff_between_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ds = state.attach("t", DbType::Persistent, None).unwrap();
+    let app = router(state.clone());
+    update(&app, "INSERT DATA { ex:a a ex:P ; ex:p 1 }").await;
+    let first = ds.store.head_commit().seq;
+    update(&app, "INSERT DATA { ex:b a ex:P, ex:Q ; ex:p \"x\" }").await;
+    let j = ok(&app, &format!("/$/schema/t/diff?from=commit:{first}")).await;
+    assert_eq!(j["diffFormat"], 1);
+    assert_eq!(j["from"]["commit"], first);
+    assert_eq!(j["to"]["commit"], first + 1);
+    assert_eq!(j["counts"]["classesAdded"], 1);
+    assert_eq!(j["classes"]["added"][0]["iri"], "http://ex.org/Q");
+    let changed = &j["classes"]["changed"][0];
+    assert_eq!(changed["iri"], "http://ex.org/P");
+    assert_eq!(
+        changed["changes"][0],
+        serde_json::json!({"path": "observed.instances", "from": 1, "to": 2})
+    );
+    // the same diff as text, and an empty one
+    let (status, ctype, text) = get_accept(
+        &app,
+        &format!("/$/schema/t/diff?from=commit:{first}&format=text"),
+        "*/*",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ctype.starts_with("text/plain"), "{ctype}");
+    assert!(
+        text.contains("+ class http://ex.org/Q (instances 1)"),
+        "{text}"
+    );
+    let j = ok(
+        &app,
+        &format!("/$/schema/t/diff?from=commit:{first}&to=commit:{first}"),
+    )
+    .await;
+    assert_eq!(j["report"], serde_json::json!([]));
+    assert_eq!(j["classes"]["changed"], serde_json::json!([]));
+    // errors
+    for (q, code) in [
+        ("", StatusCode::BAD_REQUEST),
+        ("?from=nonsense", StatusCode::BAD_REQUEST),
+        ("?from=commit:1&at=commit:1", StatusCode::BAD_REQUEST),
+        ("?from=commit:99", StatusCode::NOT_FOUND),
+    ] {
+        let (status, j) = get(&app, &format!("/$/schema/t/diff{q}")).await;
+        assert_eq!(status, code, "{q}: {j}");
+    }
+}

@@ -513,6 +513,9 @@ pub(super) async fn predicates(
 mod shapes;
 pub(super) use shapes::shapes;
 
+mod analysis;
+pub(super) use analysis::{diff, profiles};
+
 pub(crate) mod constraints;
 pub(super) use constraints::constraints;
 

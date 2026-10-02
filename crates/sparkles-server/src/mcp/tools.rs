@@ -41,6 +41,7 @@ pub fn run(
         "list_datasets" => t.list_datasets(args),
         "describe_schema" => t.describe_schema(args),
         "draft_shapes" => t.draft_shapes(args),
+        "diff_schema" => t.diff_schema(args),
         "sparql_query" => t.sparql_query(args),
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
@@ -257,6 +258,7 @@ enum Section {
     Classes,
     Predicates,
     Constraints,
+    Profiles,
 }
 
 impl Section {
@@ -266,6 +268,7 @@ impl Section {
             Section::Classes => "classes",
             Section::Predicates => "predicates",
             Section::Constraints => "constraints",
+            Section::Profiles => "profiles",
         }
     }
 }
@@ -283,6 +286,7 @@ struct DescribeSchemaArgs {
     at_commit: Option<u64>,
     subject_classes: Option<bool>,
     shapes: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
 }
 
 /// describe_schema continuation: base64url JSON.
@@ -600,12 +604,27 @@ impl Tools<'_> {
                 "shapes applies to section=constraints",
             ));
         }
+        if a.classes.is_some() && section != Section::Profiles {
+            return Err(ToolError::bad_argument(
+                "classes applies to section=profiles",
+            ));
+        }
+        let mut profile_classes: Vec<String> = Vec::new();
+        for c in a.classes.iter().flatten() {
+            match parse_iri(c, &prefix_map, false)? {
+                Term::NamedNode(n) => profile_classes.push(n.into_string()),
+                _ => return Err(ToolError::bad_argument("classes must be IRIs")),
+            }
+        }
         let stale = |status: u16, msg: &str| {
             ToolError::new("stale-cursor", status, msg.to_string()).hint("restart without cursor")
         };
         let (snap, after) = match a.cursor.as_deref() {
             Some(c) => {
-                if matches!(section, Section::Summary | Section::Constraints) {
+                if matches!(
+                    section,
+                    Section::Summary | Section::Constraints | Section::Profiles
+                ) {
                     return Err(ToolError::bad_argument(
                         "cursor applies to section=classes or section=predicates",
                     ));
@@ -723,6 +742,17 @@ impl Tools<'_> {
                     .take(limit)
                     .map(|p| predicate_json(p, &mut terms))
                     .collect();
+            }
+            Section::Profiles => {
+                let schema = SchemaOptions {
+                    graph: graph.clone(),
+                    inferred_graph: Some(INFERRED_GRAPH.to_string()),
+                    include_inferred: reasoning,
+                    deadline: Some(self.call.arrived + timeout),
+                    ..Default::default()
+                };
+                let p = self.class_profiles(&ds, &snap, schema, profile_classes, &ctx)?;
+                out["profiles"] = super::schema_history::profiles_json(&p, limit, &mut terms);
             }
             Section::Constraints => {
                 let view = self

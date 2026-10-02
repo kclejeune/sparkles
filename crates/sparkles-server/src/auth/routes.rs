@@ -58,6 +58,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/predicates", &["GET"]),
     ("/$/schema/{ds}/shapes", &["GET"]),
     ("/$/schema/{ds}/constraints", &["GET"]),
+    ("/$/schema/{ds}/profiles", &["GET"]),
+    ("/$/schema/{ds}/diff", &["GET"]),
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
@@ -221,6 +223,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/predicates"
         | "/$/schema/{ds}/shapes"
         | "/$/schema/{ds}/constraints"
+        | "/$/schema/{ds}/profiles"
+        | "/$/schema/{ds}/diff"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
