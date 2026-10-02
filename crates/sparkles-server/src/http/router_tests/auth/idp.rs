@@ -477,11 +477,21 @@ async fn cloudflare_access_assertions() {
     assert_eq!(w["method"], "proxy");
     assert_eq!(w["datasets"]["wiki"], "write");
     assert_eq!(w["canMintTokens"], true);
+    assert_eq!(w["logout"], true);
     // the edge adds it to every browser request: ambient, so CSRF applies
     let csrf = w["csrfToken"].as_str().unwrap().to_string();
     let ct = ("content-type", "application/sparql-update");
     let no = cf_call(&s, "POST", "/wiki/update", &t, &[ct]).await;
     assert_eq!(no.status, StatusCode::FORBIDDEN);
+    let lo = cf_call(
+        &s,
+        "POST",
+        "/$/auth/logout",
+        &t,
+        &[("x-sparkles-csrf", &csrf)],
+    )
+    .await;
+    assert_eq!(lo.json()["redirect"], "/cdn-cgi/access/logout");
     let yes = cf_call(
         &s,
         "POST",

@@ -200,10 +200,7 @@ pub fn whoami_details(auth: &Auth, p: &Principal, doc: &mut J) {
     doc["canMintTokens"] = (!p.is_anonymous() && !p.info.static_token && !p.info.idp_token).into();
     let logout = match p.scheme {
         Scheme::Session => true,
-        Scheme::Proxy => policy
-            .proxy
-            .as_ref()
-            .is_some_and(|x| x.logout_url.is_some()),
+        Scheme::Proxy => proxy_logout_url(&policy).is_some(),
         _ => false,
     };
     doc["logout"] = logout.into();
@@ -392,7 +389,7 @@ async fn logout(State(st): St, Extension(p): Extension<Principal>, headers: Head
         }
         tracing::info!(target: "sparkles::audit", event = "logout", principal = p.id().as_str());
     } else if p.scheme == Scheme::Proxy
-        && let Some(u) = policy.proxy.as_ref().and_then(|x| x.logout_url.clone())
+        && let Some(u) = proxy_logout_url(&policy)
     {
         redirect = J::String(u);
     }
@@ -401,6 +398,18 @@ async fn logout(State(st): St, Extension(p): Extension<Principal>, headers: Head
         r.headers_mut().append(header::SET_COOKIE, h);
     }
     no_store(r)
+}
+
+/// Where a proxy principal signs out: `proxy.logout_url`, else Cloudflare Access's own
+/// logout path when `[cloudflare_access]` is set.
+fn proxy_logout_url(policy: &Policy) -> Option<String> {
+    match policy.proxy.as_ref().and_then(|x| x.logout_url.clone()) {
+        Some(u) => Some(u),
+        None => policy
+            .cloudflare
+            .as_ref()
+            .map(|_| "/cdn-cgi/access/logout".to_string()),
+    }
 }
 
 // ------------------------------------------------------------------------- OIDC ------
