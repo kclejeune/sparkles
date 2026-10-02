@@ -98,8 +98,8 @@ running queries.
 
 **Operations**
 * A SvelteKit web UI, embedded in the binary. It has a query editor, results as a table,
-  graph, plan or map, a resource explorer, a schema browser, validation and backups
-  ([screenshots](#web-ui)).
+  graph, plan or map, a resource explorer, a schema browser, vector similarity search and
+  index management, validation and backups ([screenshots](#web-ui)).
 * Authentication with Basic, API tokens, OIDC or trusted proxies, per-dataset access
   control, and rate limiting ([API](docs/API.md#authentication-and-access-control)).
 * Access logs, Prometheus metrics, a readiness endpoint and OpenTelemetry traces

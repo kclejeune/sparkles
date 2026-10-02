@@ -98,6 +98,8 @@ test('the dataset list and a dataset with its panels and dialogs', async ({ page
     /^Restore…$/,
     'Back up now',
     /^(Configure|Enable)…$/,
+    'New index…',
+    /^Edit…$/,
   ]) {
     await open(page, dialog);
     await page.keyboard.press('Escape');
@@ -105,6 +107,20 @@ test('the dataset list and a dataset with its panels and dialogs', async ({ page
   }
   // the spatial index panel
   await visit(page, '/ui/datasets/places');
+});
+
+test('Similar: from an entity and from a pasted vector', async ({ page }) => {
+  await visit(
+    page,
+    `/ui/similar?ds=foaf&index=embedding&iri=${encodeURIComponent('http://example.org/resource/Ada_Lovelace')}`,
+  );
+  await expect(page.locator('tbody tr')).toHaveCount(10);
+  await expectNoSidewaysScroll(page, 'the Similar results');
+  await page.getByRole('radio', { name: 'Vector' }).click();
+  await page
+    .getByLabel(/^Vector/)
+    .fill(`[${Array.from({ length: 8 }, () => '0.123456').join(', ')}]`);
+  await open(page, /^Search$/);
 });
 
 test('backups: every tab, the drawer and the dialogs', async ({ page }) => {

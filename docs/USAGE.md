@@ -202,6 +202,13 @@ build. Later openings of the database map the built index from its file. Every
 `sparkles vector` command also works against a server with `--server URL --dataset NAME`
 in place of `--loc` ([API](API.md#vector-indexes)).
 
+The web UI manages the same indexes. The dataset page has a card for each index, and an
+admin of the dataset can create, edit, rebuild and drop indexes there. Anyone who can
+read the dataset can measure an index's recall from its card. The **Similar** page
+(`/ui/similar`) searches an index from an entity's vector or from a pasted vector, with
+controls for k, the metric, `ef` and exact search, and it shows how the server ran each
+search.
+
 `sparkles update` and `sparkles load` take `--message TEXT`, which is stored with the
 commit they make and shown by `sparkles log` and `/$/commits`. With `--server`, the
 message travels in the `Sparkles-Commit-Message` header, and each file that `load` sends
