@@ -310,6 +310,11 @@ fn make_ctx(
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
+    // a view that hides triples reads the snapshot without them
+    let snap = match &opts.graphs {
+        Some(a) => a.masked(&snap)?,
+        None => snap,
+    };
     let mut ctx = Ctx::new(snap);
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
@@ -397,7 +402,7 @@ pub(crate) fn restrict_ctx(
     ctx: &mut Ctx,
     graphs: Option<&Arc<crate::access::GraphAccess>>,
 ) -> Result<()> {
-    let Some(a) = graphs.filter(|a| !a.reads_all()) else {
+    let Some(a) = graphs.filter(|a| !a.reads_everything()) else {
         return Ok(());
     };
     let mut ds = std::mem::take(&mut ctx.dataset);

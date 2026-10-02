@@ -17,6 +17,7 @@ mod proxy;
 mod sessions;
 mod tasks;
 mod tokens;
+pub(super) mod triples;
 
 pub(super) fn tok(c: char) -> String {
     format!("spk_{}", c.to_string().repeat(43))

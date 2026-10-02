@@ -1014,7 +1014,12 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
 
 /// Draft SHACL shapes and a ShEx schema from `snap`.
 pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesDraft, SchemaError> {
-    let snap: &Snapshot = snap;
+    // a view that hides triples drafts from the triples it sees
+    let masked = match &opts.schema.graphs {
+        Some(a) => a.masked(snap)?,
+        None => snap.clone(),
+    };
+    let snap: &Snapshot = &masked;
     let so = &opts.schema;
     let budget = Budget {
         deadline: so.deadline,

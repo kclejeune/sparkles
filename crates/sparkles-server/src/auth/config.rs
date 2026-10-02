@@ -33,6 +33,157 @@ pub struct GrantCfg {
     /// endpoint names; absent: every endpoint
     #[serde(default)]
     pub endpoints: Option<Vec<String>>,
+    /// names of `[[protections]]` this grant lifts in its graphs, at its level
+    #[serde(default)]
+    pub lifts: Vec<String>,
+}
+
+/// `[[protections]]`: triples of a dataset that only grants lifting the protection
+/// read or write.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionCfg {
+    /// the name grants lift it by
+    pub name: String,
+    /// a dataset name or `*` pattern
+    pub dataset: String,
+    /// predicate IRIs and IRI patterns with `*`; absent: every predicate
+    #[serde(default)]
+    pub predicates: Option<Vec<String>>,
+    /// subject classes; absent: every subject
+    #[serde(default)]
+    pub classes: Option<Vec<String>>,
+    /// instances of subclasses (through rdfs:subClassOf) count too
+    #[serde(default = "yes")]
+    pub subclasses: bool,
+    /// the graphs it applies in; absent: every graph
+    #[serde(default)]
+    pub graphs: Option<Vec<String>>,
+    /// a SPARQL group graph pattern that lets a matched triple through when it has a
+    /// solution for the triple and the caller
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// prefixes of the pattern
+    #[serde(default)]
+    pub prefixes: BTreeMap<String, String>,
+    /// hide the graph of materialized inferences from a caller it applies to
+    #[serde(default = "yes")]
+    pub hide_inferences: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `[protection_limits]`: what applying protections may cost.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionLimitsCfg {
+    /// the most quads one caller's protections may hide at one commit
+    #[serde(default = "max_hidden_quads")]
+    pub max_hidden_quads: u64,
+    /// the most solutions a protection's pattern may have
+    #[serde(default = "max_pattern_rows")]
+    pub max_pattern_rows: u64,
+}
+
+impl Default for ProtectionLimitsCfg {
+    fn default() -> Self {
+        ProtectionLimitsCfg {
+            max_hidden_quads: max_hidden_quads(),
+            max_pattern_rows: max_pattern_rows(),
+        }
+    }
+}
+
+fn max_hidden_quads() -> u64 {
+    sparkles::access::Limits::default().max_hidden
+}
+fn max_pattern_rows() -> u64 {
+    sparkles::access::Limits::default().max_pattern_rows
+}
+
+impl ProtectionCfg {
+    /// The protection, once [`FileConfig::validate`] has accepted it.
+    pub fn protection(&self) -> sparkles::access::Protection {
+        sparkles::access::Protection {
+            name: self.name.clone(),
+            predicates: self.predicates.clone(),
+            classes: self.classes.clone(),
+            subclasses: self.subclasses,
+            graphs: self.graphs.as_ref().map(|g| {
+                sparkles::access::Graphs::Only(sparkles::access::GraphRule::new(
+                    g,
+                    &[super::INFERRED_GRAPH],
+                ))
+            }),
+            pattern: self.pattern.clone(),
+            prefixes: self.prefixes.clone(),
+            hide_inferences: self.hide_inferences,
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        let what = format!("protection '{}'", self.name);
+        if !valid_principal_name(&self.name) {
+            bail!("invalid protection name '{}'", self.name);
+        }
+        if !valid_pattern(&self.dataset) {
+            bail!("{what}: invalid dataset pattern '{}'", self.dataset);
+        }
+        let iri = |x: &str| oxrdf::NamedNode::new(x.replace('*', "x")).is_ok();
+        if let Some(ps) = &self.predicates {
+            if ps.is_empty() {
+                bail!("{what}: an empty predicates list (omit it to cover every predicate)");
+            }
+            if let Some(x) = ps.iter().find(|x| !iri(x)) {
+                bail!(
+                    "{what}: invalid predicate '{x}' (expected an absolute IRI, which may contain *)"
+                );
+            }
+        }
+        if let Some(cs) = &self.classes {
+            if cs.is_empty() {
+                bail!("{what}: an empty classes list (omit it to cover every subject)");
+            }
+            if let Some(x) = cs
+                .iter()
+                .find(|x| x.contains('*') || oxrdf::NamedNode::new(x.as_str()).is_err())
+            {
+                bail!("{what}: invalid class '{x}' (expected an absolute IRI)");
+            }
+        }
+        if let Some(gs) = &self.graphs {
+            if gs.is_empty() {
+                bail!("{what}: an empty graphs list (omit it to cover every graph)");
+            }
+            if let Some(x) = gs.iter().find(|x| !valid_graph_name(x)) {
+                bail!(
+                    "{what}: invalid graph '{x}' (expected an absolute IRI, a pattern with *, or \
+                     urn:x-arq:DefaultGraph)"
+                );
+            }
+        }
+        for (k, v) in &self.prefixes {
+            if oxrdf::NamedNode::new(v.as_str()).is_err() {
+                bail!("{what}: prefix {k} is not an absolute IRI");
+            }
+        }
+        if let Some(pat) = &self.pattern {
+            // the pattern parses, with every attribute of a caller bound
+            let caller = sparkles::access::Caller {
+                user: Some("u".into()),
+                roles: vec!["r".into()],
+                groups: vec!["g".into()],
+            };
+            let p = self.protection();
+            let (q, _) = sparkles::access::triples::pattern_query(&p, pat, &caller)
+                .context("unreachable: every attribute is bound")?;
+            sparkles::sparql::parse_query(&q, None, &[])
+                .map_err(|e| anyhow::anyhow!("{what}: the pattern does not parse: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 impl GrantCfg {
@@ -47,6 +198,7 @@ impl GrantCfg {
                     .filter_map(|e| super::Endpoint::parse(e))
                     .collect()
             }),
+            lifts: self.lifts.clone(),
         }
     }
 }
@@ -65,8 +217,14 @@ fn valid_graph_name(g: &str) -> bool {
 }
 
 /// Validate the restricted grants of a grantee.
-fn check_restricted(what: &str, grants: &[GrantCfg]) -> Result<()> {
+fn check_restricted(what: &str, grants: &[GrantCfg], protections: &BTreeSet<&str>) -> Result<()> {
     for g in grants {
+        if let Some(x) = g.lifts.iter().find(|x| !protections.contains(x.as_str())) {
+            bail!(
+                "{what}: the grant on '{}' lifts an unknown protection '{x}'",
+                g.dataset
+            );
+        }
         if !valid_pattern(&g.dataset) {
             bail!("{what}: invalid dataset pattern '{}' in grants", g.dataset);
         }
@@ -135,9 +293,10 @@ fn restricted_warnings(
     out: &mut Vec<String>,
 ) {
     for g in grants {
-        if datasets
-            .iter()
-            .any(|(p, l)| *l >= g.level && (p == "*" || p == &g.dataset))
+        if g.lifts.is_empty()
+            && datasets
+                .iter()
+                .any(|(p, l)| *l >= g.level && (p == "*" || p == &g.dataset))
         {
             out.push(format!(
                 "{what}: the restricted {} grant on '{}' has no effect, since datasets already \
@@ -444,6 +603,10 @@ pub struct FileConfig {
     pub proxy: Option<ProxyCfg>,
     #[serde(default)]
     pub cors: CorsCfg,
+    #[serde(default)]
+    pub protections: Vec<ProtectionCfg>,
+    #[serde(default)]
+    pub protection_limits: ProtectionLimitsCfg,
 }
 
 fn default_realm() -> String {
@@ -607,11 +770,23 @@ impl FileConfig {
                 bail!("invalid role name '{name}'");
             }
         }
+        let mut prot = BTreeSet::new();
+        for p in &self.protections {
+            p.check()?;
+            if !prot.insert(p.name.as_str()) {
+                bail!("duplicate protection '{}'", p.name);
+            }
+        }
+        if self.protection_limits.max_hidden_quads == 0
+            || self.protection_limits.max_pattern_rows == 0
+        {
+            bail!("protection_limits must be at least 1");
+        }
         check_grants("[anonymous]", &self.anonymous.datasets, &[], &self.roles)?;
-        check_restricted("[anonymous]", &self.anonymous.grants)?;
+        check_restricted("[anonymous]", &self.anonymous.grants, &prot)?;
         for (name, r) in &self.roles {
             check_grants(&format!("role {name}"), &r.datasets, &[], &self.roles)?;
-            check_restricted(&format!("role {name}"), &r.grants)?;
+            check_restricted(&format!("role {name}"), &r.grants, &prot)?;
         }
         let mut names = BTreeSet::new();
         for u in &self.users {
@@ -633,7 +808,7 @@ impl FileConfig {
                 &u.roles,
                 &self.roles,
             )?;
-            check_restricted(&format!("user {}", u.name), &u.grants)?;
+            check_restricted(&format!("user {}", u.name), &u.grants, &prot)?;
         }
         let mut names = BTreeSet::new();
         let mut hashes = BTreeSet::new();
@@ -662,7 +837,7 @@ impl FileConfig {
                 &t.roles,
                 &self.roles,
             )?;
-            check_restricted(&format!("token {}", t.name), &t.grants)?;
+            check_restricted(&format!("token {}", t.name), &t.grants, &prot)?;
         }
         for o in &self.cors.origins {
             if !crate::exposure::valid_origin(o) {

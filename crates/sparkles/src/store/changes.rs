@@ -167,6 +167,18 @@ impl Store {
     /// [`Error::HistoryGone`]. A page ends early where the readable history does, so
     /// the next page reports the commit that cannot be read.
     pub fn changes(&self, after: u64, o: &ChangesOptions) -> Result<ChangePage> {
+        // protections that depend on the data would need the view of every commit
+        if o.graphs
+            .as_ref()
+            .and_then(|a| a.triples.as_ref())
+            .is_some_and(|t| t.hides() && !t.state_independent())
+        {
+            return Err(Error::NotPermitted(
+                "the change feed is not available to a caller whose protections depend on \
+                 the data (classes or patterns); the diff between two commits is"
+                    .into(),
+            ));
+        }
         let head = self.head_commit();
         if after > head.seq {
             return Err(Error::NotFound(format!(
@@ -240,7 +252,7 @@ impl Store {
                     let (gen_, mut cursor) = self.open_log(generation, a)?;
                     let mut keys = Keys::new(&gen_);
                     let mut local: FxHashMap<[Id; 4], bool> = FxHashMap::default();
-                    let view = o.graphs.as_ref().filter(|a| !a.reads_all());
+                    let view = o.graphs.as_ref().filter(|a| !a.reads_everything());
                     let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
                     loop {
                         let Some((seq, txn)) = cursor.next()? else {
@@ -267,7 +279,7 @@ impl Store {
                                 let k = keys.quad(&q)?;
                                 // a graph view lists the changes of its graphs only
                                 if view.is_some_and(|a| {
-                                    !super::diff::readable_key(a, &mut readable, &k)
+                                    !super::diff::visible_key(a, &mut readable, &k)
                                 }) {
                                     continue;
                                 }

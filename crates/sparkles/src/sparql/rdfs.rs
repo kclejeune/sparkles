@@ -220,8 +220,9 @@ pub enum SchemaSource {
     Graph(Option<String>),
 }
 
-/// A snapshot's state: its generation, delta version and commit.
-type StateKey = (usize, u64, u64);
+/// A snapshot's state: its generation, delta version and commit, and the mask of a view
+/// that hides triples (0: none).
+type StateKey = (usize, u64, u64, u64);
 
 /// RDFS on read for a dataset: the schema's source, and the schema of a graph source as
 /// last read.
@@ -256,6 +257,7 @@ impl RdfsOnRead {
             Arc::as_ptr(&snap.generation) as usize,
             snap.version,
             snap.commit,
+            snap.mask.as_ref().map_or(0, |m| m.id),
         );
         if let Some((k, s)) = &*self.last.lock()
             && *k == key

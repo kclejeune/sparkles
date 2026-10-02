@@ -2216,12 +2216,19 @@ async fn gsp(
             }
             let (snap, g, resolved) = blocking({
                 let ds = ds.clone();
+                let read_view = view.clone();
                 move || {
                     let at = match datetime {
                         Some(ms) => Some(history::negotiate_datetime(&ds, ms)?),
                         None => at,
                     };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+                    // protections of triples: the graph as the caller sees it, and a
+                    // graph whose every quad is hidden answers like a missing one
+                    let snap = match &read_view {
+                        Some(v) => v.masked(&snap)?,
+                        None => snap,
+                    };
                     let g = match &target {
                         Target::Default => Some(Id::DEFAULT_GRAPH),
                         Target::Named(iri) => Some(
@@ -2657,7 +2664,10 @@ fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
     if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
         redact_dataset_info(&mut info);
         // the quads the caller can read
-        if let Ok(n) = v.visible_quads(&d.store.snapshot()) {
+        if let Ok(n) = v
+            .masked(&d.store.snapshot())
+            .and_then(|snap| v.visible_quads(&snap))
+        {
             info["quads"] = n.into();
         }
     }

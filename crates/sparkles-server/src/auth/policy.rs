@@ -105,6 +105,8 @@ pub struct Policy {
     /// id, name, expiry and grants summary of each static token, for listings
     pub static_list: Vec<(String, String, Option<i64>, String)>,
     roles: HashMap<String, Grants>,
+    /// the protections of triples, shared by every principal's grants
+    protections: Option<Arc<super::Protections>>,
     external: External,
     pub default_ttl: i64,
     pub max_ttl: i64,
@@ -127,6 +129,7 @@ fn grants_of(
     restricted: &[config::GrantCfg],
     roles: &[String],
     role_grants: &HashMap<String, Grants>,
+    protections: &Option<Arc<super::Protections>>,
 ) -> Grants {
     let mut g = Grants {
         datasets: datasets.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -135,6 +138,8 @@ fn grants_of(
             .iter()
             .map(config::GrantCfg::restricted)
             .collect(),
+        roles: roles.to_vec(),
+        protections: protections.clone(),
     };
     for s in server {
         if !g.server.contains(s) {
@@ -166,13 +171,33 @@ fn summarize(g: &Grants) -> String {
 
 impl Policy {
     pub fn build(cfg: &FileConfig) -> Result<Policy> {
+        let protections = (!cfg.protections.is_empty()).then(|| {
+            Arc::new(super::Protections {
+                list: cfg
+                    .protections
+                    .iter()
+                    .map(|p| (p.dataset.clone(), Arc::new(p.protection())))
+                    .collect(),
+                limits: sparkles::access::Limits {
+                    max_hidden: cfg.protection_limits.max_hidden_quads,
+                    max_pattern_rows: cfg.protection_limits.max_pattern_rows,
+                },
+            })
+        });
         let roles: HashMap<String, Grants> = cfg
             .roles
             .iter()
             .map(|(n, r)| {
                 (
                     n.clone(),
-                    grants_of(&r.datasets, &r.server, &r.grants, &[], &HashMap::new()),
+                    grants_of(
+                        &r.datasets,
+                        &r.server,
+                        &r.grants,
+                        &[],
+                        &HashMap::new(),
+                        &protections,
+                    ),
                 )
             })
             .collect();
@@ -182,6 +207,7 @@ impl Policy {
             &cfg.anonymous.grants,
             &[],
             &roles,
+            &protections,
         );
         let mut users = HashMap::new();
         for u in &cfg.users {
@@ -189,14 +215,28 @@ impl Policy {
                 u.name.clone(),
                 UserEntry {
                     password: u.password.clone(),
-                    grants: grants_of(&u.datasets, &u.server, &u.grants, &u.roles, &roles),
+                    grants: grants_of(
+                        &u.datasets,
+                        &u.server,
+                        &u.grants,
+                        &u.roles,
+                        &roles,
+                        &protections,
+                    ),
                 },
             );
         }
         let mut static_tokens = HashMap::new();
         let mut static_list = Vec::new();
         for t in &cfg.tokens {
-            let grants = grants_of(&t.datasets, &t.server, &t.grants, &t.roles, &roles);
+            let grants = grants_of(
+                &t.datasets,
+                &t.server,
+                &t.grants,
+                &t.roles,
+                &roles,
+                &protections,
+            );
             let digest = config::parse_token_hash(&t.hash).context("token hash")?;
             let expires = t
                 .expires
@@ -242,6 +282,7 @@ impl Policy {
             static_tokens,
             static_list,
             roles,
+            protections,
             external,
             default_ttl: config::parse_duration(&cfg.tokens_policy.default_ttl)?,
             max_ttl: config::parse_duration(&cfg.tokens_policy.max_ttl)?,
@@ -284,8 +325,14 @@ impl Policy {
                     roles.extend(x.group_roles.get(g).into_iter().flatten());
                 }
                 roles.extend(x.user_roles.get(&who.name).into_iter().flatten());
-                let mut grants = Grants::default();
+                let mut grants = Grants {
+                    protections: self.protections.clone(),
+                    ..Default::default()
+                };
                 for r in roles {
+                    if !grants.roles.contains(r) {
+                        grants.roles.push(r.clone());
+                    }
                     if let Some(rg) = self.roles.get(r) {
                         grants.extend(rg);
                     }

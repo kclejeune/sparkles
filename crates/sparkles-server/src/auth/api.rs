@@ -275,9 +275,12 @@ pub async fn whoami(
         };
         if let Some(l) = lvl {
             datasets.insert(name.clone(), l.as_str().into());
-            if let Some((graphs, endpoints)) = p.limits(name) {
-                let mut r = json!({ "graphs": graphs });
-                if let Some(es) = endpoints {
+            if let Some(l) = p.limits(name) {
+                let mut r = json!({ "graphs": l.graphs });
+                if l.triples {
+                    r["triples"] = true.into();
+                }
+                if let Some(es) = l.endpoints {
                     r["endpoints"] = json!(es.iter().map(|e| e.as_str()).collect::<Vec<_>>());
                 }
                 restricted.insert(name.clone(), r);

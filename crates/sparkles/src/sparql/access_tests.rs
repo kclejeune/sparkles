@@ -62,6 +62,7 @@ fn view(names: &[&str]) -> Option<Arc<GraphAccess>> {
     Some(Arc::new(GraphAccess {
         read: r.clone(),
         write: r,
+        triples: None,
     }))
 }
 

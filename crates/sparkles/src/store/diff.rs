@@ -286,10 +286,37 @@ pub(crate) fn readable_key(
     ok
 }
 
+/// Whether a quad key is visible under `access`: its graph is read, and (for rules
+/// that depend on the quad alone) no protection hides it.
+pub(crate) fn visible_key(
+    access: &crate::access::GraphAccess,
+    memo: &mut FxHashMap<Arc<[u8]>, bool>,
+    k: &QuadKey,
+) -> bool {
+    if !access.read.is_all() && !readable_key(access, memo, k) {
+        return false;
+    }
+    // rules that depend on the data are applied to the states compared instead
+    match access
+        .triples
+        .as_ref()
+        .filter(|t| t.hides() && t.state_independent())
+    {
+        Some(t) => {
+            let oxrdf::Term::NamedNode(p) = crate::id::key_to_term(&k[2]) else {
+                return true;
+            };
+            let g = (!k[0].is_empty()).then(|| crate::id::key_to_term(&k[0]));
+            !t.hides_quad(p.as_str(), g.as_ref())
+        }
+        None => true,
+    }
+}
+
 impl Net<'_> {
     fn toggle(&mut self, k: QuadKey, added: bool) -> Result<()> {
-        if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_all())
-            && !readable_key(a, &mut self.readable, &k)
+        if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_everything())
+            && !visible_key(a, &mut self.readable, &k)
         {
             return Ok(());
         }
@@ -617,7 +644,25 @@ impl Store {
         };
         let (mut log_changes, mut compared) = (0u64, 0u64);
         let mut method = DiffMethod::Same;
-        if lo != hi {
+        // protections that depend on the data: the difference of the two states as the
+        // view sees them, so that triples whose visibility changed count too
+        let data_view = o.graphs.as_ref().filter(|a| {
+            a.triples
+                .as_ref()
+                .is_some_and(|t| t.hides() && !t.state_independent())
+        });
+        if lo != hi
+            && let Some(view) = data_view
+        {
+            for (r, at) in [(&rf, from), (&rt, to)] {
+                self.check_readable(r, at)?;
+            }
+            method = DiffMethod::Compare;
+            let (sa, _) = self.snapshot_at(&At::Commit(lo), &self.history_opts(o))?;
+            let (sb, _) = self.snapshot_at(&At::Commit(hi), &self.history_opts(o))?;
+            let (sa, sb) = (view.masked(&sa)?, view.masked(&sb)?);
+            compared += compare_states(&sa, &sb, &mut net)?;
+        } else if lo != hi {
             if self.root.is_some() {
                 // both ends must be readable, whatever path leads between them
                 for (r, at) in [(&rf, from), (&rt, to)] {
