@@ -71,7 +71,7 @@ time, and this comparison draws on its public documentation.
 | History | An immutable, content-addressed commit chain; time travel (`@t:`, `@iso:`, `@commit:`); history queries; branches, merge and revert | Durable, ordered commit ids and a commit catalog. Point-in-time reads of every commit since the last compaction, and of older commits kept by named snapshots or a retention window. No cross-commit history queries, diffs, branches or merges. |
 | Security | Access policies stored in the ledger, JWS / `did:key` signed requests and commits, OIDC, encryption at rest | Per-dataset access levels with Basic, API tokens, OIDC sign-in for the UI and trusted proxy headers. No policy language, signed requests or encryption at rest. |
 | Interfaces | JSON-LD transactions and queries (FQL), openCypher with Bolt, GraphQL, SQL / R2RML / Iceberg graph sources, an MCP server | SPARQL, the Rust API and a read-only MCP server over stdio. JSON-LD is an RDF format only. |
-| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), exact vector search (`spk:vectorSearch`) and GeoSPARQL with a spatial index. No approximate (HNSW) vector index. |
+| Search | BM25 full-text, vector (HNSW), geospatial | BM25 full-text (`text:query`), vector search (`spk:vectorSearch`) with an HNSW index or exactly, and GeoSPARQL with a spatial index. Vector indexes have no quantization. |
 | Deployment | S3, DynamoDB or IPFS storage; Raft clustering; read replicas ("query peers") | A single node on local disk, with incremental, deduplicated backups to a file system or S3 |
 | Reasoning | At query time (RDFS / OWL 2 QL rewriting; OWL 2 RL / Datalog with a fact budget) | Materialized (RDFS, OWL 2 RL, Jena rules) |
 

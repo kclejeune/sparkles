@@ -802,7 +802,7 @@ past state they also add `Memento-Datetime`, the commit's time, and
 `Link: <…>; rel="original"` (RFC 7089). `Sparkles-Commit` is the commit read. The
 freshness of inferences (`Sparkles-Inferences`) is reported for the live state only.
 `text:query` works only at the head and returns `501` at a past commit. Vector search
-works at any commit. Writes with `at`, even `at=head`, are refused with `400` and
+works at any commit, and a past commit is always searched exactly. Writes with `at`, even `at=head`, are refused with `400` and
 `code: "at-on-write"`.
 
 Errors carry a `code`. A malformed selector is `400 invalid-at`. A commit beyond the
@@ -1541,7 +1541,7 @@ matched.
 * **Functions.** `spk:cosine(?a, ?b)`, `spk:dot(?a, ?b)`, `spk:euclidean(?a, ?b)` (L2
   distance) and `spk:dimension(?a)`. They raise a type error on a malformed argument, a
   dimension mismatch, or a zero vector with cosine.
-* **Exact top-k search:**
+* **Top-k search:**
 
   ```sparql
   SELECT ?s ?score WHERE {
@@ -1550,26 +1550,117 @@ matched.
   ```
 
   * The first argument is the embedding predicate.
-  * The query is a vector literal, or an entity whose single vector under that
-    predicate is used.
-  * `k` defaults to 10 (at most 10000). `metric:` is `cosine` (default), `dot` or
-    `euclidean`.
+  * The query is a vector literal, an entity whose single vector under that predicate is
+    used, or a variable that the rest of the group binds to either.
+  * `k` defaults to 10 (at most 10000).
+  * Options are string literals after `k`:
+
+    | Option | Effect |
+    |---|---|
+    | `metric:cosine`, `metric:dot`, `metric:euclidean` | Sets the metric. The default is the index's metric, or cosine without an index. |
+    | `ef:N` | The HNSW search keeps N candidates, and at least k. More candidates raise recall and latency. |
+    | `exact:true` | Searches exactly, even with an index. |
+    | `distinct:subject` | Returns at most one row per subject, its best one. |
+    | `candidates:join` | Ranks only the subjects that the rest of the group binds. |
+
   * Higher scores are better, except for euclidean, where lower is better.
   * The search covers the active graph, and `GRAPH ?g` binds each row's graph. The top
-    k are taken before any join, and ties break by term id.
+    k are taken before any join, unless `candidates:join` is set. Ties break by term id.
   * Only vectors of the query's dimension are compared. If the predicate has vectors
-    but none of that dimension, the result is a `400` naming the dimensions it has.
+    but none of that dimension, the result is a `400` naming the dimensions it has. A
+    predicate with an index accepts only queries of the index's dimension.
   * Rows with the same subject and vector in several graphs of a merged default graph
     count once.
-* **Implementation.** Vectors are packed per predicate and dimension on first use and
-  cached per index generation. Every query overlays its snapshot's uncommitted inserts
-  and deletes, so results always match its data. A process-wide budget caps the packed
-  vectors. `sparkles serve --vector-memory-mb` sets it, and the default is 4096 (4 GiB).
-  Beyond it a search returns `507`. A variable query vector gives `501`.
-* **Status.** `GET /$/vector/{ds}` returns
-  `{ budgetBytes, usedBytes, generation, predicates: [{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }] }`
-  for the predicates packed so far in the current generation. Packing happens on a
-  predicate's first search. `vectors` counts a vector once per graph it is in.
+* **Bound queries.** When the query is a variable, the rest of the group runs first.
+  The search then runs once per distinct value it binds, which can be a vector literal
+  or an entity, and each input row joins with the rows of its own search. More than 1000
+  distinct values give `507`. With `candidates:join`, the search ranks only the subjects
+  bound by the rest of the group. `{ ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb ?q
+  10 "candidates:join") }` returns the 10 best documents, where the plain search returns
+  the documents among the 10 best rows.
+* **Without an index.** Vectors are packed per predicate and dimension on their first
+  search and cached per index generation. Each search scans them exactly. Every query
+  overlays its snapshot's inserts and deletes, so results always match its data. A
+  process-wide budget caps packed vectors and graphs. `--vector-memory-mb` sets it for
+  every command, and the default is 4096 (4 GiB). Beyond it a search returns `507`.
+
+### Vector indexes
+
+A vector index packs one predicate's vectors of one dimension and builds an HNSW graph
+over them (Malkov and Yashunin, arXiv:1603.09320). A search through the graph scores a
+few thousand vectors instead of all of them. The graph only chooses which stored
+vectors are scored. Every score comes from the same kernel as the exact search, so a
+row has the same score on either path, and the paths differ only by the rows the graph
+misses.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `predicate` | required | The embedding predicate. A predicate has at most one index. |
+| `dimension` | required | Vectors of other dimensions are not indexed. |
+| `metric` | `cosine` | The graph's metric, and the default metric of searches. |
+| `model` | none | A label of the embedding model. Sparkles does not interpret it. |
+| `hnsw.m` | 16 | Links per node, and twice as many on the bottom layer. More links raise recall, memory and build time. |
+| `hnsw.efConstruction` | 128 | Candidates kept while a node is inserted. More raise recall and build time. |
+| `hnsw.efSearch` | 64 | Candidates kept by a search. A query can override it with `ef:N`. |
+| `exactThreshold` | 10000 | Searches over at most this many rows are exact. |
+
+With `"hnsw": false` the index keeps only the packed vectors, which are searched
+exactly.
+
+* **Freshness.** The graph covers the generation's base. Every search adds the
+  snapshot's inserted vectors, scored exactly, and leaves out its deleted ones, so new
+  and deleted vectors count at once. Commits do no index work. A compaction or a bulk
+  load starts a new generation, whose index is built in the background. Searches are
+  exact until it is ready.
+* **Exact fallback.** A search skips the graph and scans exactly in these cases:
+  `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
+  is still being built, at most `exactThreshold` rows are in scope, or the active graph
+  holds less than 5 % of the indexed rows. It also falls back when the graph finds fewer
+  than k rows although more exist. The counters of an executed plan name the path
+  (`method`) and the reason (`exactBecause`).
+* **Builds and files.** Creating an index starts a background build, and writes go on
+  meanwhile. The build first publishes the packed vectors, which searches then scan
+  exactly, and then the graph. A persistent store writes the build to
+  `gen-NNNN/vectors/<name>.spkv` and maps it from there, also after a restart. A file
+  that is damaged, or was built for another configuration or generation, is built again.
+  Changing only `efSearch`, `exactThreshold` or `model` keeps the build.
+* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about
+  `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
+  copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
+  would pass the budget leaves the index `over-budget`, and searches then scan exactly
+  within the same budget.
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/$/vector/{ds}` | `{ budgetBytes, usedBytes, generation, indexes, predicates }`. `indexes` holds a `VectorIndexStatus` per index. `predicates` lists the predicates packed without an index, as `{ predicate, bytes, malformed, dimensions: [{ dimension, vectors }] }`. |
+| GET | `/$/vector/{ds}/{name}` | One `VectorIndexStatus`, or `404`. |
+| PUT | `/$/vector/{ds}/{name}` | Creates (`201`) or replaces (`200`) the index. The body is its configuration, and the response is `{ index, task }`, where the task follows the build. `409` when another index has the predicate. |
+| DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
+| POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
+| POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. |
+
+A `VectorIndexStatus` is
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild? }`.
+`state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
+rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
+`mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
+`files` is `{ bytes, opened }`, where `opened` means the build was read from its file.
+The configuration lives in `vector.json` in the database directory.
+
+The CLI is `sparkles vector`:
+
+```sh
+sparkles vector create  --loc DB --name NAME --predicate IRI --dim D [--metric cosine|dot|euclidean]
+                        [--model LABEL] [--m 16] [--ef-construction 128] [--ef-search 64]
+                        [--exact-threshold 10000] [--no-hnsw]
+sparkles vector drop    --loc DB --name NAME
+sparkles vector rebuild --loc DB --name NAME
+sparkles vector list    --loc DB
+sparkles vector status  --loc DB [--name NAME]
+```
+
+Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
+`rebuild` wait for the build.
 
 ## GeoSPARQL
 
@@ -2895,7 +2986,7 @@ levels are `read` < `write` < `admin`.
 |---|---|
 | `read` | Queries (including full-text and vector search), explain, Graph Store GET/HEAD, SHACL, `DatasetInfo`, stats, schema, prefixes, commits, reasoning status and diagnostics, text index status, `/$/ready/{ds}` and the dataset's tasks. |
 | `write` | `read`, plus SPARQL Update, Graph Store PUT/POST/DELETE and upload. |
-| `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text index configuration, clearing the result cache, cloning (as the source) and deletion. |
+| `admin` | `write`, plus compaction, N-Quads backups, backups to repositories (create, delete, verify, restore), reasoning and clearing inferences, text and vector index configuration, clearing the result cache, cloning (as the source) and deletion. |
 
 There are three server permissions:
 
@@ -2948,8 +3039,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/auth/logout`, `/$/format` (POST) | | Any caller. `/$/format` admits nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
-| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/vector/{ds}/{name}/recall`, `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/{ds}/prefixes` (GET) | GET | `read` |
+| `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
 | `/$/repositories` | GET | Any caller. `server-admin` gets the full list, callers with `admin` on some dataset get names and types, and other callers get an empty list. |

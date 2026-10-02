@@ -455,7 +455,8 @@ pub fn cli(a: VectorArgs, opts: StoreOptions) -> Result<()> {
 }
 
 #[cfg(not(feature = "auth"))]
-fn run_remote(_: &Target, _: Action) -> Result<()> {
+fn run_remote(t: &Target, _: Action) -> Result<()> {
+    let _ = (&t.server, &t.dataset, t.insecure_http);
     bail!("--server: built without the remote client (cargo feature \"auth\")")
 }
 

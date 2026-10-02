@@ -44,7 +44,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | The function library: the SPARQL 1.1 built-ins, XSD casts, and selected `fn:`, `afn:` and `math:` functions. | ✅ |
 | SPARQL 1.1 Update: INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE, ADD, COPY and MOVE. | ✅ |
 | SERVICE (federated query, with SILENT) under an outbound network policy. On a server, only public destinations are allowed by default. The local `query` and `update` commands also reach private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a response ceiling ([USAGE.md](USAGE.md#outbound-requests-service-and-load)). | ✅ |
-| Vector similarity over `spk:vector` literals, with `spk:cosine`, `spk:dot` and `spk:euclidean`. `spk:vectorSearch` returns the exact top k within the active graph. There is no approximate (HNSW) index yet. | ✅ |
+| Vector similarity over `spk:vector` literals, with `spk:cosine`, `spk:dot` and `spk:euclidean`. `spk:vectorSearch` returns the top k within the active graph. Its query can be a literal, an entity or a variable bound by the rest of the group, and it takes `ef:`, `exact:true`, `distinct:subject` and `candidates:join`. | ✅ |
+| Vector indexes (`vector.json`, `/$/vector/{ds}/{name}`, `sparkles vector`). An index packs one predicate's vectors and builds an HNSW graph over them in the background, written to a file of the generation and mapped after a restart. Searches overlay each snapshot's inserted and deleted vectors exactly, past commits are searched exactly, and `M`, `efConstruction` and `efSearch` are set per index and `ef:` per query ([API.md](API.md#vector-indexes)). | ✅ |
 | Full-text search with a subset of Jena's `text:query`, ranked by BM25 through Tantivy. Each quad is a document, kept current in each commit: a write stages its documents, and the next search or a 1 s tick commits them. A search returns the top k within a graph. It needs the `text` cargo feature, which the server enables. | ✅ |
 | GeoSPARQL 1.1 functions, with the `geo` cargo feature (on in the server). Literals are `geo:wktLiteral` and `geo:geoJSONLiteral`, with Z/M layouts and EMPTY, and parse errors give byte offsets. The built-in CRSs are CRS84, CRS84h, EPSG:4326 and EPSG:4979 (with their latitude-first axes) and Web Mercator, with OGC, QUDT and EPSG units. The functions cover the 24 topological relations and `relate` on DE-9IM, `convexHull`, `envelope`, `boundary`, `centroid`, the four overlay operations and the accessors. `distance` is geodesic on WGS 84 by default, haversine if a dataset asks for it, and Euclidean for projected CRSs. `buffer` makes metric buffers through a local projection, and `area`, `length` and `perimeter` are geodesic. See [API.md](API.md#geosparql). | ✅ |
 | A spatial index per dataset (`geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, `serve --geo`). It is a packed Hilbert R-tree over a generation's geometry literals, plus an overlay of committed writes, and it is exact for every MVCC snapshot. It stays within a memory budget (`--geo-mb`), reports its status, rows, skipped literals and CRSs, and exports `sparkles_geo_*` metrics. | ✅ |
@@ -115,7 +116,9 @@ These are features other RDF stores have and Sparkles does not have yet.
   functions. It has only the common `fn:`, `afn:` and `math:` functions. SERVICE is plain,
   with no batching or caching.
 * **Search.** Full-text search has no highlighting, per-language stemming or multi-field
-  documents. Vector search is exact, with no HNSW index.
+  documents. A vector index has no quantization, so its packed vectors take 4 bytes per
+  dimension. Its graph is not carried across compactions and is built again for each new
+  generation.
 * **GeoSPARQL.** There is no geometry-type entailment, no GML or KML literals and no EPSG
   database.
 * **Shapes.** There is no ShEx 2.2. Write-time validation validates in full on every

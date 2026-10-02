@@ -102,13 +102,13 @@ Every response carries an `X-Request-Id`, and each request is logged once under 
 | `--max-upload-mb N` | `4096` | Largest Graph Store write or upload body; `0` means unlimited. The body is streamed to a temporary file and counted after HTTP decompression. |
 | `--min-free-disk-mb N` | `1024` | Free disk space to keep; `0` turns the check off. The server refuses with `507` to spool a request body when the temporary directory's file system would keep less. It refuses to commit, rebuild, clone or write an N-Quads backup (`/$/backup`) when the data directory's file system would keep less. |
 | `--max-mem-dataset-mb N` | `4096` | Largest in-memory dataset; `0` means unlimited. A commit that would grow one past it fails with `507`. |
-| `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text and spatial index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
+| `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
 | `--backup-config FILE` | | TOML file with the backup repositories, policies, credential sources and the limits on repositories registered through the API. Also `$SPARKLES_BACKUP_CONFIG`. Re-read on SIGHUP, and read-only through the API. |
 | `--backup-max-tasks N` | `2` | Backup, restore, verify and GC tasks that may run at once. More wait as `queued`. |
 | `--format-endpoint on\|authenticated\|off` | `on` | Who may use `POST /$/format` (see [API.md](API.md#formatting)). `on` admits every caller the server admits, `authenticated` every caller but the anonymous principal (`401`), and `off` nobody (`404`). A UI built with the formatter's WebAssembly module formats in the page and needs the endpoint only as a fallback. |
 | `--format-max-mb N` | `16` | Largest `POST /$/format` body; `0` means unlimited. |
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
-| `--vector-memory-mb N` | `4096` | Memory for the packed vectors of `spk:vectorSearch`, per index generation. |
+| `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--geo NAME[=FILE]` | | Enable the spatial index for a dataset. `FILE` is a `geo.json`-shaped configuration file. The build runs before the server starts listening. |
 | `--geo-mb N` | `4096` | Memory for each dataset's spatial index (geometry column and trees). A build that would exceed it is refused, the status says `over-budget`, and queries run without the index. |
@@ -171,7 +171,16 @@ sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPAR
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --rebuild, --status, --disable
 sparkles geo-index  --loc db                  # spatial index: --predicate, --feature-link, --exclude-graph, --wgs84,
                                               #   --distance geodesic|haversine, --rebuild, --status (JSON), --disable
+sparkles vector create --loc db --name emb --predicate http://example.org/emb --dim 384
+                                              # vector index with an HNSW graph: --metric, --m, --ef-construction,
+                                              #   --ef-search, --exact-threshold, --no-hnsw
+sparkles vector list|status|rebuild|drop --loc db [--name emb]   # or --server URL --dataset NAME
 ```
+
+`sparkles vector create` writes the index to `vector.json`, builds it, and waits for the
+build. Later openings of the database map the built index from its file. Every
+`sparkles vector` command also works against a server with `--server URL --dataset NAME`
+in place of `--loc` ([API](API.md#vector-indexes)).
 
 `sparkles geo-index` enables the spatial index if it is off, with the defaults or the
 given options. It then builds the index and prints its status to stderr. When the index

@@ -171,7 +171,7 @@ args=()
 for f in q-exact-true.rq $(for ef in $EFS; do echo "q-ef-$ef.rq"; done); do
   args+=(-n "${f%.rq}" "curl -sf -o /dev/null -H 'Content-Type: application/sparql-query' -H 'Accept: text/tab-separated-values' --data-binary @$f http://127.0.0.1:$PORT/bench/sparql")
 done
-hyperfine -N --warmup "$WARMUP" --runs "$RUNS" --export-json results/hyperfine.json "${args[@]}" > /dev/null
+hyperfine -N --warmup "$WARMUP" --runs "$RUNS" --export-json results/hyperfine.json "${args[@]}" > results/hyperfine.log 2>&1
 
 # ------------------------------------------------------------------------ summary
 python3 - "$N" "$DIM" "$M" "$EFC" > summary.md << 'EOF'
