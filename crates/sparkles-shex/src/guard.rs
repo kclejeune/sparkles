@@ -185,6 +185,9 @@ pub struct ShexGuard {
     associations: AtomicU64,
     /// the last validation's warnings (semantic actions not run, …)
     warnings: Mutex<Vec<String>>,
+    /// the schema copy an in-memory dataset keeps for backups (a persistent one has
+    /// it in its directory)
+    copy: Option<String>,
 }
 
 impl ShexGuard {
@@ -201,11 +204,19 @@ impl ShexGuard {
             last_full: AtomicU64::new(u64::MAX),
             associations: AtomicU64::new(u64::MAX),
             warnings: Mutex::new(Vec::new()),
+            copy: None,
         }
     }
 
     pub fn config(&self) -> &ShexValidationConfig {
         &self.cfg
+    }
+
+    /// The schema copy of an in-memory dataset: its file name in a database directory
+    /// (`schema.file` of the configuration) and its text. `None` for a persistent
+    /// dataset, whose copy is in its directory.
+    pub fn schema_copy(&self) -> Option<(&str, &str)> {
+        Some((self.cfg.schema.file.as_deref()?, self.copy.as_deref()?))
     }
 
     pub fn status(&self) -> ShexValidationStatus {
@@ -688,7 +699,11 @@ pub fn set_config(
     }
     let file = loaded.file;
     let text = std::mem::take(&mut loaded.text);
-    let guard = Arc::new(ShexGuard::new(cfg, loaded, map));
+    let mut guard = ShexGuard::new(cfg, loaded, map);
+    if root.is_none() {
+        guard.copy = Some(text.clone());
+    }
+    let guard = Arc::new(guard);
 
     let view = Arc::new(txn.view());
     let summary = guard.validate_state(&view, &WriteOptions::default())?;

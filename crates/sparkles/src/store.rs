@@ -12,7 +12,10 @@
 
 mod backup;
 mod geo;
-pub use backup::{BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard};
+pub use backup::{
+    BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard, MEMORY_CAPTURE_PREFIX,
+    MemoryCaptureOptions,
+};
 
 use crate::builder::{BuildOptions, Builder, IndexMeta, Slot, Stats};
 use crate::codec::{Codec, Level};
@@ -2593,22 +2596,17 @@ impl Store {
         };
         let name = "gen-0001";
         let gdir = dir.join(name);
-        let mut bopts = self.opts.build.clone();
-        bopts.first_bnode = next_bnode;
-        let mut builder = Builder::new(&gdir, bopts)?;
-        // the clone's file system keeps the same free space as this store's
-        if let Some(reserve) = self.opts.min_free_disk_bytes {
-            let gdir = gdir.clone();
-            builder = builder.with_interrupt(Arc::new(move || {
-                crate::disk::check_reserve(&gdir, reserve, 0, false)
-            }));
-        }
         let total = snap.len().max(1);
         let (mut seen, mut graphs, mut last_graph) = (0u64, 0u64, None);
         report(0.0, "copying quads");
-        write_snapshot(
-            &builder,
+        let prefixes = self.prefixes();
+        // the clone's file system keeps the same free space as this store's
+        let meta = self.build_from_snapshot(
+            &gdir,
             &snap,
+            next_bnode,
+            self.opts.min_free_disk_bytes,
+            prefixes.clone(),
             |q| {
                 seen += 1;
                 if seen % 65_536 == 0 {
@@ -2630,12 +2628,8 @@ impl Store {
                 }
                 Ok(true)
             },
-            &[],
+            || report(0.7, "building indexes"),
         )?;
-        report(0.7, "building indexes");
-        let prefixes = self.prefixes();
-        builder.add_prefixes(prefixes.clone());
-        let meta = builder.finish()?;
         // a new lineage: its own id and root commit, forked from the snapshot
         let id = uuid::Uuid::new_v4();
         let now = commit::now_ms();
@@ -2672,38 +2666,10 @@ impl Store {
                 &serde_json::to_vec_pretty(&prefixes).unwrap(),
             )?;
         }
-        // full-text search stays on: the clone rebuilds its index when opened
-        #[cfg(feature = "text")]
-        let text_cfg = self
-            .text
-            .load()
-            .as_ref()
-            .map(|ti| serde_json::to_vec_pretty(ti.config()).unwrap());
-        #[cfg(not(feature = "text"))]
-        let text_cfg = match &self.root {
-            Some(root) => match std::fs::read(root.join("text.json")) {
-                Ok(b) => Some(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e.into()),
-            },
-            None => None,
-        };
-        if let Some(cfg) = text_cfg {
-            write_atomic(&dir.join("text.json"), &cfg)?;
-        }
-        // so does the spatial index
-        let geo_cfg = match &self.root {
-            Some(root) => match std::fs::read(root.join(crate::geo::CONFIG_FILE)) {
-                Ok(b) => Some(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e.into()),
-            },
-            None => self
-                .geo_status()
-                .map(|s| serde_json::to_vec_pretty(&s.config).unwrap()),
-        };
-        if let Some(cfg) = geo_cfg {
-            write_atomic(&dir.join(crate::geo::CONFIG_FILE), &cfg)?;
+        // full-text search and the spatial index stay on: the clone rebuilds them when
+        // opened
+        for (file, cfg) in self.index_config_files()? {
+            write_atomic(&dir.join(file), &cfg)?;
         }
         // write-time validation stays configured; the clone judges its first write in full
         if let Some(root) = &self.root {
@@ -2730,6 +2696,74 @@ impl Store {
             graphs,
             millis: t0.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Build the generation directory `gdir` from `snap`: every quad `keep` accepts, the
+    /// `prefixes`, and new blank nodes numbered from `next_bnode` on. Building stops
+    /// with `507` once the file system would keep less than `reserve` bytes free.
+    /// `indexing` is called between writing the quads and building the indexes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_from_snapshot(
+        &self,
+        gdir: &Path,
+        snap: &Snapshot,
+        next_bnode: u64,
+        reserve: Option<u64>,
+        prefixes: BTreeMap<String, String>,
+        keep: impl FnMut(&[Id; 4]) -> Result<bool>,
+        indexing: impl FnOnce(),
+    ) -> Result<IndexMeta> {
+        let mut bopts = self.opts.build.clone();
+        bopts.first_bnode = next_bnode;
+        let mut builder = Builder::new(gdir, bopts)?;
+        if let Some(reserve) = reserve {
+            let gdir = gdir.to_path_buf();
+            builder = builder.with_interrupt(Arc::new(move || {
+                crate::disk::check_reserve(&gdir, reserve, 0, false)
+            }));
+        }
+        write_snapshot(&builder, snap, keep, &[])?;
+        indexing();
+        builder.add_prefixes(prefixes);
+        builder.finish()
+    }
+
+    /// The configuration files of the indexes that a copy of this store rebuilds when
+    /// it is opened: `text.json` (full-text search) and `geo.json` (the spatial index),
+    /// when they are on. An in-memory store renders them from its running indexes.
+    pub(crate) fn index_config_files(&self) -> Result<Vec<(&'static str, Vec<u8>)>> {
+        let read = |file: &str| -> Result<Option<Vec<u8>>> {
+            let Some(root) = &self.root else {
+                return Ok(None);
+            };
+            match std::fs::read(root.join(file)) {
+                Ok(b) => Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        };
+        let mut out = Vec::new();
+        #[cfg(feature = "text")]
+        let text_cfg = self
+            .text
+            .load()
+            .as_ref()
+            .map(|ti| serde_json::to_vec_pretty(ti.config()).unwrap());
+        #[cfg(not(feature = "text"))]
+        let text_cfg = read("text.json")?;
+        if let Some(cfg) = text_cfg {
+            out.push(("text.json", cfg));
+        }
+        let geo_cfg = match &self.root {
+            Some(_) => read(crate::geo::CONFIG_FILE)?,
+            None => self
+                .geo_status()
+                .map(|s| serde_json::to_vec_pretty(&s.config).unwrap()),
+        };
+        if let Some(cfg) = geo_cfg {
+            out.push((crate::geo::CONFIG_FILE, cfg));
+        }
+        Ok(out)
     }
 
     /// `forkedFrom` of a database made by [`clone_to`](Self::clone_to) (or restored
