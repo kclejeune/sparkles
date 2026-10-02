@@ -27,6 +27,8 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs. | ✅ |
 | MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay. | ✅ |
 | Durable commit ids. Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts. Writes return receipts and `Sparkles-Commit` headers, and the commit catalog is available through `/$/commits` and `sparkles log`. | ✅ |
+| Commit messages and change digests. A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. An optional SHA-256 digest chains each commit's net changes (`--commit-digests`). | ✅ |
+| Entity tags on Graph Store GET and HEAD, named after the commit read. `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic-concurrency check made under the writer lock (`412` on a mismatch). | ✅ |
 | Point-in-time reads with `?at=commit:N`, `time:…` or `snapshot:NAME` on queries, explain and Graph Store GET, with Memento headers. Named snapshots keep a commit readable across compaction, and an optional retention window keeps older commits readable too. The commands and endpoints are `/$/snapshots`, `/$/history`, `sparkles snapshot`, `query --at` and `dump --at`. | ✅ |
 | Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. | ✅ |
 | N-Quads backups (`/$/backup`) and dumps, compressed with zstd by default or with gzip, brotli or LZ4. Request bodies and responses can be compressed with `zstd`, `br` or `gzip`. | ✅ |
