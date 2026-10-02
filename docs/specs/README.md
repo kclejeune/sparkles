@@ -55,7 +55,7 @@ not built; the status block says which. *Designed, not built* means there is no 
 |---|---|---|
 | [CI](CI-commit-identity.md) | Durable dataset ids, a gap-free commit sequence, commit receipts and headers, `/$/commits` and `sparkles log` | implemented in part (Phases 1–2) |
 | [C01](C01-observability-and-budgets.md) | Request ids, access log, Prometheus metrics, readiness, OpenTelemetry, memory and result-size budgets, cancellation on disconnect | implemented in part |
-| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, VoID export, Phase 4) |
+| [C02](C02-schema-discovery.md) | `GET /$/schema/{ds}` with paginated class and predicate listings computed on the server, a VoID export, a SHACL constraints layer, subject classes per predicate, shapes drafted from the data, `sparkles schema`, and the UI's schema browser | implemented in part (Phase 1, most of Phase 2, Phase 4) |
 | [C06](C06-clone-to-sandbox.md) | Cloning a consistent snapshot of a dataset into a new, independent dataset | implemented in part (Phase 1) |
 | [C08](C08-inference-freshness.md) | Whether materialized inferences are current, re-running them incrementally, and inconsistency diagnostics | implemented (Phases 1–3) |
 | [C09](C09-dataset-access-control.md) | Authentication (Basic, API tokens, OIDC, trusted proxies, CLI logins) and per-dataset permissions | implemented in part (Phase 1, part of Phase 2, Phase 3 as C12) |

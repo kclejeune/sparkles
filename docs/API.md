@@ -507,6 +507,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}`             | *Extension.* `SchemaSummary`: classes and predicates with exact counts and their declarations. An RDF `Accept` gets the same report as a VoID description. See [Schema discovery](#schema-discovery). |
 | GET    | `/$/schema/{ds}/classes`     | *Extension.* `Page<ClassEntry>` |
 | GET    | `/$/schema/{ds}/predicates`  | *Extension.* `Page<PredicateEntry>` |
+| GET    | `/$/schema/{ds}/constraints` | *Extension.* The SHACL constraints layer of the report alone. See [Constraints layer](#constraints-layer). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -765,7 +766,7 @@ language tag validator answers in HTML only. A missing parameter is a `400`.
 
 The design and its rationale are in [C02 Schema discovery](specs/C02-schema-discovery.md).
 
-`GET /$/schema/{ds}` reports the classes and predicates of a dataset in two separate
+`GET /$/schema/{ds}` reports the classes and predicates of a dataset in three separate
 layers:
 
 * **observed** holds exact counts over the selected graphs at one snapshot. A triple
@@ -775,6 +776,10 @@ layers:
   `owl:Class`, `rdfs:subClassOf`, `rdfs:domain`, `owl:FunctionalProperty` and labels. Only
   IRI objects are listed. Blank-node class expressions such as `owl:Restriction` are
   counted in `totals.anonymousClassExpressions`.
+* **constraints** holds what the dataset's SHACL shapes require of the instances of each
+  class, and what enforces each constraint. It is described under
+  [Constraints layer](#constraints-layer). It is read from the shapes alone and never
+  from the counts.
 
 A class is listed if any of these hold:
 
@@ -796,6 +801,8 @@ All parameters are optional, and the read-only server accepts them:
 | `declaredGraph` | same | same as `graph` | Graphs read for declarations, for example an ontology in its own named graph. |
 | `reasoning` | `true`, `false` | `true` if the dataset has materialized inferences | Counts `urn:x-sparkles:inferred` as part of `default` / `union`. |
 | `declared` | `asserted`, `all` | `asserted` | `all` also reads declarations from the inferred graph. That graph holds the transitive closure of `rdfs:subClassOf`, the `rdfs:Resource` superclasses, and similar inferences. |
+| `detail` | `subjectClasses` | none | Each predicate also lists the classes of its subjects. See [Subject classes](#subject-classes). |
+| `shapes` | `guard`, `default`, a graph IRI, `none` (repeatable) | `guard` when the dataset has write-time SHACL validation | The sources of the constraints layer. Only the summary and `/constraints` read it. |
 | `limit` | 1–10000 | 1000 | Page size. The summary uses it for both first pages. |
 | `cursor` | opaque | — | The `next` of the previous page. Send the same selection parameters with it. |
 | `timeout` | seconds | server query timeout | Time budget for computing the report. |
@@ -818,6 +825,7 @@ type SchemaSummary = {
                cycles: string[][] };// subClassOf cycles with more than one member (A ⊑ A is not a cycle)
   classes: Page<ClassEntry>;
   predicates: Page<PredicateEntry>;
+  constraints?: ConstraintsLayer;  // left out when no source has shapes
 };
 type Page<T> = { items: T[]; total: number; next: string | null };  // items in IRI order
 type Lit = { value: string; lang?: string };
@@ -843,6 +851,8 @@ type PredicateEntry = {
                   triples: number; distinct: number;  // distinct terms: "01"^^xsd:integer ≠ "1"^^xsd:integer
                   languages?: { lang: string; direction?: "ltr" | "rtl"; triples: number }[] }[];
     };
+    subjectClasses?: { class: string; triples: number; subjects: number }[];  // detail=subjectClasses
+    untypedSubjects?: { triples: number; subjects: number };                  // detail=subjectClasses
   };
   declared: { types: string[];     // rdf:Property, owl:ObjectProperty, owl:FunctionalProperty, …
               domains: string[]; ranges: string[]; superProperties: string[]; inverseOf: string[];
@@ -916,13 +926,103 @@ tags.
 
 The CLI equivalent prints the complete report without pagination:
 `sparkles schema --loc DB [--graph default|union|IRI] [--declared-graph G]
-[--no-inferences] [--declared asserted|all] [--format text|json|void|turtle]
-[--timeout S] [--max-entries N]`, or `--data FILE…` in place of `--loc`. `json` is the
-`SchemaSummary` with every item and `next: null`. `text` prints one line per class and per
-predicate. `void` prints the VoID description in Turtle, and `turtle` prints it with the
-declarations. The command exits with status 2 when the timeout or the entry cap is
-exceeded. The Rust API is `sparkles::schema::discover`, and
-`sparkles::schema::void_text` renders a report as VoID.
+[--no-inferences] [--declared asserted|all] [--subject-classes] [--shapes SOURCE]…
+[--format text|json|void|turtle] [--timeout S] [--max-entries N]`, or `--data FILE…` in
+place of `--loc`. `json` is the `SchemaSummary` with every item and `next: null`. `text`
+prints one line per class and per predicate, a line of subject classes under each
+predicate with `--subject-classes`, and then the constraints layer. `--shapes` takes the
+values of `shapes`, and without it the layer holds the database's write-time SHACL
+validation, if any. `void` prints the VoID description in Turtle, and `turtle` prints it
+with the declarations. The command exits with status 2 when the timeout or the entry cap
+is exceeded. The Rust API is `sparkles::schema::discover`, with
+`SchemaOptions::subject_classes`, and `sparkles::schema::void_text` renders a report as
+VoID. `sparkles_shacl::constraints` builds the constraints layer from parsed shapes with
+`class_constraints`, `graphs_source` and `guard_source`, and
+`SchemaSummary::with_constraints` adds it to a summary.
+
+### Subject classes
+
+The design is in [C02 §6, Phase 2](specs/C02-schema-discovery.md#6-phasing).
+
+With `detail=subjectClasses`, each predicate's `observed` also lists the classes of its
+subjects. For each class, `triples` counts the predicate's triples whose subject has that
+class in the selection, and `subjects` counts those subjects. A subject with several
+classes counts under each of them. `untypedSubjects` counts the triples and subjects
+whose subject has no `rdf:type` with an IRI object in the selection. Classes are listed
+in IRI order, and only direct types count, unless `reasoning` includes materialized
+ones. The detail costs one more pass over the selection's `rdf:type` triples and memory
+for them, so it is computed only on request. It is part of the report's selection, so a
+cursor issued with it does not continue a listing without it.
+
+### Constraints layer
+
+The design is in [C02 §6, Phase 2](specs/C02-schema-discovery.md#6-phasing), and the
+decisions taken for it are in its Outcome.
+
+The constraints layer lists, for each class that SHACL shapes target, the property shapes
+whose path is a single predicate, with their `sh:minCount`, `sh:maxCount`, `sh:datatype`,
+`sh:class` and `sh:nodeKind`. A class's property shapes are those of the shapes that
+target it with `sh:targetClass` or an implicit class target, and those reached from them
+through `sh:node` and `sh:and`. Shapes under `sh:or`, `sh:xone` and `sh:not` are left out,
+and so are deactivated shapes. Other constraints of a property shape are named by their
+component in `other`. Property shapes with other paths are counted in `otherPaths`, and
+shapes with other targets in `otherTargets`.
+
+The layer has one source per origin of shapes, and the `shapes` parameter picks them.
+
+* `guard` gives the shapes of the dataset's write-time SHACL validation, read from its
+  shapes graphs and its shapes file. Without `shapes`, the summary includes this source
+  when the dataset has SHACL validation, and leaves `constraints` out otherwise.
+* `default` and graph IRIs read shapes graphs of the dataset. Several graphs make one
+  source.
+* `none` leaves the layer out.
+
+Each property shape says what checks it in `enforcement`:
+
+| Value | When |
+|---|---|
+| `reject-on-write` | The shape belongs to write-time validation in `reject` mode, and its severity is at or above the configuration's threshold. A write that breaks it is refused. |
+| `warn-on-write` | The shape belongs to write-time validation in `warn` mode, or its severity is below the threshold. A write that breaks it is committed and reported. |
+| `validated-on-request` | The shape comes from a shapes graph named by `shapes`. Nothing checks it until the data is validated, for example with `POST /{ds}/shacl`. |
+
+```ts
+type ConstraintsLayer = { sources: ConstraintSource[] };
+type ConstraintSource = {
+  kind: "guard" | "graphs";
+  graphs: string[];               // shapes graphs read; "default" for the default graph
+  file?: true;                    // the guard also has shapes from a file or given inline
+  mode?: "reject" | "warn";       // guard only
+  threshold?: "violation" | "warning" | "info";  // guard only
+  shapes: number;                 // node and property shapes of the source
+  otherTargets: number;           // active shapes whose targets are not classes
+  classes: { class: string;
+             shapes: string[];    // IRIs of the shapes that target the class
+             closed: boolean;     // a shape of the class has sh:closed true
+             properties: PropertyConstraint[];  // sorted by path
+             otherPaths: number }[];
+};
+type PropertyConstraint = {
+  path: string; shape?: string;   // the property shape's IRI, if it has one
+  severity: string;               // sh:Violation unless the shape says otherwise
+  enforcement: "reject-on-write" | "warn-on-write" | "validated-on-request";
+  minCount?: number; maxCount?: number; datatype?: string; class?: string[]; nodeKind?: string;
+  other?: string[];               // components of the other constraints, such as sh:PatternConstraintComponent
+};
+```
+
+`GET /$/schema/{ds}/constraints` answers `{schemaFormat, dataset, snapshot: {version,
+generation}, constraints}` with the layer alone, without counting anything. It takes
+`shapes` and `at`. The layer is built for every request and is not cached with the
+report. With `at`, shapes graphs are read at that state, and the guard's shapes are
+always those installed now.
+
+A caller limited to some graphs reads only the shapes graphs it may read. It sees the
+guard's shapes only when it may read every shapes graph of the guard. Otherwise the
+summary leaves the guard source out, and `shapes=guard` answers `404`. `shapes=guard`
+also answers `404` when the dataset has no write-time SHACL validation. A ShEx guard is
+not summarized. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
+IRI answer `400`, and a build without the `shacl` feature answers `501` when shapes are
+named.
 
 ### Drafted shapes
 
@@ -5147,7 +5247,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | Tool | Arguments (besides the common ones) | Result |
 |---|---|---|
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}` |
-| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. |
+| `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes` | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, in SHACL Turtle or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. |

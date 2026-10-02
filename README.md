@@ -108,6 +108,9 @@ running queries.
 * Shapes drafted from the data give a guard a starting point. Each constraint has a
   support threshold and a count of the instances it would exclude
   ([API](docs/API.md#drafted-shapes)).
+* The schema report lists a guard's SHACL constraints per class next to the observed
+  counts, and says which ones a write cannot break
+  ([API](docs/API.md#constraints-layer)).
 
 **Search**
 * Full-text search through Jena's `text:query`, ranked by BM25 with Tantivy and stemmed per
