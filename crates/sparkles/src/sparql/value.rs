@@ -267,7 +267,7 @@ impl Num {
             _ => return Err(TypeError),
         })
     }
-    fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> u8 {
         match self {
             Num::Integer(_) => 0,
             Num::Decimal(_) => 1,
@@ -275,14 +275,14 @@ impl Num {
             Num::Double(_) => 3,
         }
     }
-    fn to_decimal(self) -> Option<Decimal> {
+    pub(crate) fn to_decimal(self) -> Option<Decimal> {
         match self {
             Num::Integer(i) => Some(i.into()),
             Num::Decimal(d) => Some(d),
             _ => None,
         }
     }
-    fn to_float(self) -> Float {
+    pub(crate) fn to_float(self) -> Float {
         match self {
             Num::Integer(i) => i.into(),
             Num::Decimal(d) => d.into(),

@@ -30,6 +30,25 @@ use georust::{Coord, Geometry, LineString, Point, Polygon};
 
 const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
 
+/// Jena's `spatialF:` filter functions, by local name.
+pub const FUNCTIONS: &[&str] = &[
+    "convertLatLon",
+    "convertLatLonBox",
+    "equals",
+    "nearby",
+    "withinCircle",
+    "distance",
+    "greatCircle",
+    "greatCircleGeom",
+    "angle",
+    "angleDeg",
+    "azimuth",
+    "azimuthDeg",
+    "transform",
+    "transformDatatype",
+    "transformSRS",
+];
+
 /// Evaluate the Jena filter function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     let local = iri.strip_prefix(SPATIALF)?;
