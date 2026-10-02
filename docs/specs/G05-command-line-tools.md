@@ -1,9 +1,13 @@
 # G05: Command-line equivalents of Jena's tools, and IRI and language-tag checks
 
-> **Status:** designed, not built
+> **Status:** implemented
 >
-> **User docs:** [Usage: Command-line tools](../USAGE.md#command-line-tools) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> **Phases:** One phase. Every command of §3 shipped, with the checks of §4 in `convert`,
+> `load` and `/$/validate/iri`.
+>
+> **User docs:** [Usage: File tools](../USAGE.md#file-tools) ·
+> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Comparison with Jena](../COMPARISON.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -329,4 +333,50 @@ New dependencies: none. `sparesults` (MIT OR Apache-2.0) is already a dependency
 
 ## Outcome
 
-Not built yet.
+**Delivered.** All of §3 and §4 landed on 2026-10-02 in `crates/sparkles-server/src/tools/`,
+with the commands flattened into `sparkles`' own through one variant of the CLI enum:
+- `convert` (alias `riot`) with `--syntax`, `--output` (alias `--out`), `--count`,
+  `--sink` (alias `--null`), `--validate`, `--check`, `--strict`, `--lenient`, `--base`,
+  `--merge` (alias `--union`), `--compression`, `--compress [CODEC]` and `--time`;
+- `qparse` and `uparse` with `--print query|algebra|plan` (and Jena's `op` and `opt`);
+- `compare` (aliases `rdfcompare` and `rdfdiff`) with the per-group comparison of §3.3;
+- `iri` and `langtag`, with `--format json` and `--strict`;
+- `rsparql`, `rupdate` and `rset`;
+- `load --check` and `load --strict`, and the scheme warnings of `/$/validate/iri`.
+
+The language-tag canonical case of `/$/validate/langtag` now comes from oxilangtag's
+normalization, shared with `langtag`. The text table of `query` moved to
+`tools/table.rs` and is shared with `rsparql` and `rset`. The core crate's only change is
+that `sparql::update::parse_update` became public.
+
+**Deviations and decisions.**
+- `qparse` and `uparse` print the input formatted by `sparkles fmt` rather than
+  spargebra's rendering of the parse. The rendering moves aggregates into a subquery and
+  names them with random hex, which reads worse than the input. The parse still decides
+  whether the text is valid. Without the `fmt` feature the rendering is printed.
+- The made-up names of aggregates and blank nodes in the algebra and the plan print as
+  `?.0` and `_:b0`, as Jena names them, instead of spargebra's random hex.
+- oxrdf lowercases language tags while parsing, so data checks cannot see a tag's
+  original case. The `case` warning is given by `langtag` only, and `convert --check` and
+  `load --check` skip it.
+- `load --check` also runs before `load --server`, since it only reads the files.
+- `rsparql` and `rupdate` are built with the `auth` cargo feature, which brings the HTTP
+  client, as `--server` is.
+- `iri` reports the position of the first character that cannot occur in an IRI, which
+  oxiri's errors do not give.
+- A missing input file is reported before anything is read, and `compare` exits with 2.
+
+**Tests.** `tests/cli_tools.rs` runs the binary for A1–A10, including `rsparql` and
+`rupdate` against a server on a port in 5380–5399. Unit tests cover the IRI and
+language-tag rules, dot-segment removal, normalization, the term checker's merge, SSE
+indentation and renaming, the group comparison and multiplicities, and result
+conversions. The router test of `/$/validate/iri` checks the new warnings. The W3C SPARQL
+suites are unchanged (482/328/157/269).
+
+**Measurements.** On the 1.05M-triple benchmark N-Triples file, with a debug build:
+`convert --count` takes 2.5 s on 16 threads, and `convert --output ttl` streams in 5.0 s
+with 55 MiB peak memory, which does not grow with the input. Release builds were not
+measured.
+
+**Not built.** `rdfpatch` and `schemagen` (§1 non-goals). Jena's `--rdfs` and
+`--formatted` flags of `riot`. A configurable severity per rule.

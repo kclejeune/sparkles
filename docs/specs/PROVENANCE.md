@@ -783,6 +783,31 @@ implementation landed.
   - a size-only or ratio-only trigger;
   - compacting every idle period whatever the delta's size.
 
+## Command-line tools and IRI and language-tag checks
+
+- **Spec:** [`G05-command-line-tools.md`](G05-command-line-tools.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code;
+  - Apache Jena's `jena-cmds` (`riot`, `CmdLangParse`, `ModLangParse`, `ModLangOutput`,
+    `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `rsparql`, `rupdate`, `rset`),
+    `jena-langtag` (`CmdLangTag`) and `jena-iri3986` (`Issue`) sources (Apache-2.0),
+    read for behaviour, flags, output and the list of IRI issues. No code was copied;
+  - RFC 3986, RFC 3987, RFC 9110 §4.2, RFC 8141, RFC 9562, RFC 3061, RFC 8089, W3C DID
+    Core 1.0 §3.1, the IANA URI scheme registry, BCP 47 (RFC 5646), RDF 1.1 and 1.2
+    Concepts, RDFC-1.0, the SPARQL 1.1 Protocol and the SPARQL result formats.
+
+  Fluree was not consulted.
+- **Implementation** (2026-10-02): from the spec and the Sparkles code. The IRI and
+  language-tag rules, dot-segment removal and the per-group isomorphism check are written
+  from the RFCs. **Dependencies:** none new. `sparesults` 0.3 (MIT OR Apache-2.0), already
+  a dependency of `sparkles`, became a direct dependency of `sparkles-server`.
+- **Rejected** (spec §8):
+  - a plain endpoint URL in `query --server`, which would send saved tokens to other
+    servers;
+  - canonicalizing whole datasets for the diff of `compare`;
+  - checking terms inside the loader;
+  - a subtag registry for `langtag`.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):
