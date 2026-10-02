@@ -59,6 +59,7 @@ mise run doc          # API docs of the library crates
 mise run docs:screenshots # the README's screenshots (docs/images) from the demo dataset in docs/demo
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki vs QLever; `bench 1000000 --runs 5` for 10.5M triples
+mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs QLever
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
@@ -132,6 +133,30 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 [BENCHMARKS.md](BENCHMARKS.md) has the results and describes how each run was set up.
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
+* `scripts/bench-text.sh` (`mise run bench:text [people] [workdir]`) compares full-text
+  search on the same generated data. Sparkles and Jena Fuseki both answer `text:query`.
+  Fuseki serves a TDB2 store wrapped in a jena-text dataset with a Lucene index, and QLever
+  answers `ql:contains-word` over a text index built from its literals. Fluree is left out
+  because its documentation offers full-text scoring only in JSON-LD queries, and
+  Oxigraph has no text search.
+
+  The script loads each store without timing it, then times each text index build and
+  records the index size on disk. Sparkles and Jena index `foaf:name`, `ex:title` and
+  `rdfs:label`. QLever indexes every literal, since its text index cannot be limited to
+  predicates, so its queries join the matching literal with the predicate. There are five
+  queries. Two take the top 10 by score, one for a rare word and one for a common word.
+  The third counts all hits of the common word, the fourth joins them with a structural
+  pattern, and the fifth asks for two words that must both occur. Before timing, the script compares every engine's hit counts and hit
+  sets with `scripts/bench-answers.py`. Scores and their order are never compared,
+  because the engines rank differently. QLever builds its index with explicit scoring,
+  because its BM25 and TF-IDF scoring fail on language-tagged literals in version 0.5.48.
+
+  The query words are ones that the Lucene standard analyzer, the Tantivy tokenizer in
+  Sparkles and QLever split and lowercase the same way. A prefix query is left out because
+  Sparkles finds nothing for a single word followed by `*`. The script writes
+  `results/text-summary.md` in the work directory. `DATA` reuses a dataset that
+  `scripts/bench.sh` generated. `PORT_BASE` moves the three servers to the ports after
+  it, and its default is 3940.
 * `scripts/bench-billion.sh` (`mise run bench:billion [scale]`) runs a comparison on real
   data: English DBpedia, release 2022.12.01 (every English file of its generic, mappings
   and text groups, and the DBpedia ontology), 1.24 billion triples in all. The files, their
