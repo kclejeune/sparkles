@@ -33,7 +33,7 @@ def test_commits_and_snapshots(tmp_path: Path) -> None:
     ds.update("DELETE DATA { <http://ex.org/a> <http://ex.org/name> 'A' }")
     log = ds.commits()
     assert [c.seq for c in log] == [3, 2, 1, 0]
-    assert [c.kind for c in log[:2]] == ["update", "transaction"] or log[0].kind == "update"
+    assert [c.kind for c in log[:3]] == ["update", "transaction", "transaction"]
     assert [c.seq for c in ds.commits(2, after=0)] == [1, 2]
     assert [c.seq for c in ds.commits(before=2)] == [1, 0]
     # point-in-time queries

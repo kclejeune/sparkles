@@ -815,13 +815,16 @@ the API documentation of the library crates.
 
 The `sparkles` Python package embeds the same engine. It is built from
 `crates/sparkles-py` with PyO3 and maturin into an abi3 wheel, which works on CPython
-3.10 and later on Linux and macOS. The package is not on PyPI. Build and install it from
-the repository:
+3.10 and later. The release workflow builds wheels for Linux (manylinux 2.28 and
+musllinux 1.2, on x86_64 and aarch64), macOS (x86_64 and arm64) and Windows x64, and a
+source distribution. The package is not on PyPI. Build and install it from the
+repository:
 
 ```sh
 mise run py:build                                  # target/wheels/sparkles_rdf-*.whl
 pip install target/wheels/sparkles_rdf-*.whl
 pip install ./crates/sparkles-py                   # or build from source with pip (needs Rust)
+mise run py:sdist                                  # the source distribution
 nix build .#sparkles-py                            # or the flake's package for nixpkgs' Python
 ```
 
@@ -838,7 +841,7 @@ ds = Dataset()                                     # in memory
 ds = Dataset("mydb")                               # a database directory, locked while open
 ds.load(path="data.ttl.gz")                        # format and compression from the name
 ds.load(text, "turtle", to_graph="http://ex.org/g")
-ds.load(open("data.nq.zst", "rb"), "nq")           # compressed data is recognized by its bytes
+ds.load(open("data.nq.zst", "rb"), "nq")           # read as it is parsed, in one commit
 
 rows = ds.query("""
     PREFIX foaf: <http://xmlns.com/foaf/0.1/>
@@ -852,6 +855,9 @@ ds.ask("ASK { ?s ?p ?o }")                         # True or False
 for t in ds.construct("CONSTRUCT WHERE { ?s ?p ?o }"):
     print(t.subject, t.predicate, t.object)
 ds.update("INSERT DATA { <http://ex.org/a> <http://ex.org/p> 1 }").inserted   # 1
+
+ds.select(query).serialize("results.srj")          # SPARQL results: json, xml, csv or tsv
+ds.construct(query).serialize(format="turtle")     # bytes of Turtle
 ```
 
 `query` returns a `QuerySolutions` for SELECT, a `bool` for ASK and a `QueryTriples` for
@@ -863,9 +869,19 @@ CONSTRUCT and DESCRIBE. `select`, `ask` and `construct` check the query form and
   protocol's `default-graph-uri` and `named-graph-uri`.
 * `include_inferred=True` adds the reasoner's inferences to the default graph.
 * `prefixes` declares prefixes, `base_iri` sets the base, and `timeout` is in seconds.
+* `max_rows`, `max_memory_bytes` and `max_rows_produced` are budgets. A query past one
+  raises `BudgetExceededError`.
+* `cancel` takes a `CancelToken`, and `at` reads a past state (see below).
 
-A row is `None` at an unbound variable. `row.get("name", default)` returns the default
-instead.
+`update` takes the same `timeout`, budgets and `cancel`. A row is `None` at an unbound
+variable, and `row.get("name", default)` returns the default instead.
+`QuerySolutions.serialize` must come before the rows are iterated, and it consumes them.
+
+`sparkles.parse` parses as it reads, from a path, bytes or a file object, so the first
+quads come before the input has been read to the end. A syntax error is raised by the
+iteration, after the quads that came before it. `Dataset.load` from a file object streams
+the same way into one transaction. Loads from a path or from bytes go through the
+engine's bulk loader instead.
 
 ### Terms
 
@@ -907,6 +923,8 @@ with ds.transaction() as tx:                       # commits at the end of the b
     tx.add(quad)
     tx.remove(other)
     tx.quads_for_pattern(alice)                    # sees the transaction's own changes
+    tx.update("DELETE WHERE { ?s <http://ex.org/old> ?o }")
+    tx.query("SELECT ?s WHERE { ?s ?p ?o }")       # also sees them
 ```
 
 `graph_name=None` matches every graph, and `DefaultGraph()` matches only the default
@@ -917,36 +935,124 @@ not the open transaction. A write on the dataset from the thread that holds the
 transaction raises `ConflictError` instead of waiting for itself. Writes from other
 threads wait.
 
-A blank node read from the dataset has a label like `_:b1f` that names the stored node,
-so it works in later patterns, removals and bindings. Any other label, such as
-`BlankNode("x")`, names a new node in each write. The same label within one `extend` or
-transaction names one node. pyoxigraph keeps a label's node across writes. A blank node
-that a query makes, such as with `BNODE()`, has a label like `_:q0`. It is not stored,
-so a later pattern finds nothing for it and a query binding takes it for a new node.
+An update in a transaction that fails after it began to change data may have done part
+of its work. The transaction is then aborted. Later writes raise `InvalidInputError`, and
+`commit()` rolls it back and raises. A SPARQL syntax error changes nothing, so it does
+not abort the transaction.
 
-### Output, maintenance, reasoning and validation
+A blank node read from the dataset has a label like `_:b1f` that names the stored node.
+It names that node in later patterns, removals, bindings and writes. Any other label,
+such as `BlankNode("x")`, names a new node in each write. The same label within one
+`extend` or transaction names one node. pyoxigraph keeps a label's node across writes. A
+blank node that a query makes, such as with `BNODE()`, has a label like `_:q0`. It is not
+stored, so a later pattern finds nothing for it and a query binding takes it for a new
+node.
+
+### History, snapshots and clones
 
 ```python
-data = ds.dump(format="nq")                        # bytes of every graph
-ds.dump("out.ttl.zst")                             # Turtle of the default graph, zstd
-ds.dump("g.nt", from_graph="http://ex.org/g")
-ds.compact(); ds.backup("backups/")
-
-ds.reason("owl-rl")                                # rdfs, rdfs-simple, owl-rl, or rules="…"
-ds.ask("ASK { ?x a <http://ex.org/Animal> }", include_inferred=True)
-ds.clear_inferences()
-
-report = ds.validate_shacl(shapes_turtle)          # or shapes_graph="http://ex.org/shapes"
-for r in report.results:
-    print(r.focus_node, r.path, r.message)
-result = ds.validate_shex(shexc, "{FOCUS a ex:Person}@ex:PersonShape")
-print(result.conforms, [(r.node, r.conformant) for r in result.results])
+ds.head_commit                                     # Commit(seq, kind, inserted, deleted, quads, timestamp)
+ds.commits(10)                                     # the latest ten, newest first
+ds.create_snapshot("before-cleanup", note="…")     # keeps the head readable under a name
+ds.query(q, at="snapshot:before-cleanup")          # also at=42, "commit:42" or "time:<RFC 3339>"
+ds.set_retention(keep_commits=100, keep_age=86400) # keep recent states readable
+ds.history()                                       # the readable ranges, retention and snapshots
+ds.clone_to("copy-db", at="snapshot:before-cleanup")
 ```
 
-`parse` and `serialize` work without a dataset, and `RdfFormat` names the formats. Every
-`format` argument also takes a name, extension or media type, such as `"ttl"` or
-`"application/n-quads"`. `sparkles.FEATURES` lists the cargo features of the build.
-Without `reasoning`, `shacl` or `shex`, the matching methods raise `UnsupportedError`.
+A past state is readable while a snapshot or the retention window holds it. Reading one
+that is gone raises `NotFoundError`. An in-memory dataset keeps the states its snapshots
+and window hold. `clone_to` writes a new database directory with its own dataset id and
+can leave graphs out with `exclude_graphs`.
+
+### Search indexes and write-time validation
+
+```python
+ds.enable_text({"predicates": ["http://www.w3.org/2000/01/rdf-schema#label"]})
+ds.query("""PREFIX text: <http://jena.apache.org/text#>
+            SELECT ?s WHERE { ?s text:query 'fox' }""")
+ds.create_vector_index("emb", "http://ex.org/embedding", 384, options={"metric": "cosine"})
+ds.vector_index("emb", wait=True)                  # the status once the build is done
+
+ds.set_write_validation({"mode": "reject", "shapes": {"inline": shapes_turtle}})
+ds.add(quad_that_breaks_the_shapes)                # raises WriteRejectedError
+ds.write_validation()                              # the configuration and its status
+ds.set_write_validation(None)                      # removes it
+```
+
+The configurations and statuses are dicts in the server's JSON shape: `text.json` for
+the text index ([API](API.md#full-text-search)), the vector index configuration, and
+`validation.json` with the shapes or ShEx schema given inline
+([API](API.md#write-time-validation)). A ShEx configuration has `"language": "shex"`,
+a `schema` and a `shapeMap`. Opening a database directory installs the write-time
+validation its `validation.json` sets up, as the server does. When the configuration
+cannot be loaded, the package warns and writes stay refused. `text_status`,
+`rebuild_text`, `disable_text`, `drop_vector_index`, `rebuild_vector_index` and
+`vector_indexes` complete the administration.
+
+### Query builder
+
+`sparkles.querybuilder` has `SelectBuilder`, `AskBuilder`, `ConstructBuilder`,
+`DescribeBuilder`, `UpdateBuilder` and `WhereBuilder`, the bindings of the Rust builder.
+Each method returns a new builder, so a partly built query serves as a template.
+
+```python
+from sparkles.querybuilder import SelectBuilder, WhereBuilder
+
+by_name = (SelectBuilder()
+    .select("?age")
+    .where_("?p", "foaf:name", "?name")
+    .optional(WhereBuilder().where_("?p", "foaf:age", "?age")))
+ds.query(by_name.set_var("?name", Literal(user_input)).build())
+```
+
+A `str` argument is SPARQL term syntax, such as `"?x"`, `"<http://ex.org/a>"`,
+`"foaf:name"` or a property path in predicate position. Terms, numbers and booleans are
+values, which are always escaped, so `set_var` with a term makes a prepared query.
+Expressions are SPARQL text. `build()` checks the text with the SPARQL parser, and
+`str(builder)` returns it unchecked.
+
+### rdflib
+
+The wheel registers an rdflib store plugin, `Sparkles`, which keeps rdflib's triples in
+a Sparkles dataset:
+
+```python
+import rdflib
+
+g = rdflib.Graph("Sparkles", identifier="http://ex.org/g")
+g.open("mydb", create=True)                        # or leave it in memory
+g.parse("data.ttl")                                # one commit for the whole parse
+g.query("SELECT ?s WHERE { ?s ?p ?o }")            # runs in Sparkles' engine
+g.close()
+
+ds = rdflib.Dataset("Sparkles")                    # rdflib's default graph is Sparkles'
+store = sparkles.rdflib.SparklesStore(dataset=sparkles_dataset, autocommit=False)
+```
+
+`Graph`, `ConjunctiveGraph` and `Dataset` work on it. The store is context-aware,
+formula-aware and graph-aware. rdflib's default graph is the dataset's default graph,
+and a context named by an IRI is that named graph. A context named by a blank node, such
+as a `Graph` made without an identifier, is the named graph
+`urn:x-sparkles:rdflib:graph:<label>`, so that SPARQL can name it. N3 formulae are named
+graphs under `urn:x-sparkles:rdflib:formula:`, and their triples are left out of the
+union of the contexts. Blank nodes keep their rdflib labels for the life of the store
+object. Graphs added empty are listed until the store is closed, because Sparkles keeps
+no empty graphs. IRIs must be absolute, while rdflib also takes relative ones.
+
+SPARQL queries and updates run in Sparkles' engine, with `initNs` and `initBindings`,
+and not in rdflib's evaluator. A prepared query, an update with `initBindings`, and an
+update of a graph other than the default graph fall back to rdflib's evaluator over the
+store. With `autocommit=True`, the default, every write is committed. Writes are
+gathered and committed together before the next read or query through the store,
+`commit()` or `close()`, so a parse is one commit. Another handle on the same dataset
+sees them after that. With `autocommit=False`, writes go into a transaction that reads
+and queries through the store see, and `commit()` or `rollback()` ends it. `close()`
+without `commit_pending_transaction=True` rolls it back.
+
+On 100,000 triples, compared with rdflib's in-memory store on the same machine, a parse
+into the plugin takes about as long, iterating every triple takes about four times as
+long, and a SPARQL join with grouping runs about 40 times faster.
 
 ### Errors and threads
 
@@ -960,16 +1066,20 @@ built-in exception Python code expects:
 | `UnsupportedError` | `NotImplementedError` | a feature the engine or the build lacks |
 | `QueryTimeoutError` | `TimeoutError` | a query past its `timeout` |
 | `StorageError`, `DatasetLockedError` | `OSError` | corruption, a full disk, a directory that another process or `Dataset` holds |
+| `NotFoundError` | `LookupError` | a missing graph or snapshot, and a past state that is no longer kept |
 | `ConflictError` | | write conflicts, and a write that would wait for its own thread's transaction |
 | `BudgetExceededError` | | a request past a budget, with `kind`, `limit` and `requested` |
+| `CancelledError` | | a request cancelled through its `CancelToken` |
 
 I/O failures raise the built-in `OSError` subclasses, such as `FileNotFoundError`. The
-other classes are `CancelledError`, `NotFoundError`, `PermissionDeniedError`,
-`ServiceError` and `WriteRejectedError`.
+other classes are `PermissionDeniedError`, `ServiceError` and `WriteRejectedError`.
 
 Queries, updates, loads, dumps, reasoning and validation release the GIL, so other
-Python threads keep running and several threads can query one dataset at once. A running
-query cannot be interrupted with Ctrl-C, so give long queries a `timeout`.
+Python threads keep running and several threads can query one dataset at once. Ctrl-C
+stops a running query or update and raises `KeyboardInterrupt`. On the main thread a
+request runs on a helper thread while the main thread waits and handles signals, which
+adds a few microseconds to each request. A `CancelToken` passed as `cancel=` stops the
+requests it was given from any thread.
 
 ## Deploying on NixOS
 

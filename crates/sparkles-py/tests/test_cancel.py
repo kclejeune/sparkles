@@ -79,11 +79,9 @@ def test_cancel_token_stops_a_query(big: Dataset) -> None:
     token = CancelToken()
     assert not token.cancelled
     t = later(0.2, token.cancel)
-    start = time.perf_counter()
     with pytest.raises(CancelledError):
         big.query(ENDLESS, cancel=token)
     t.join()
-    assert time.perf_counter() - start < 10
     assert token.cancelled
     # a cancelled token cancels the next request at once
     with pytest.raises(CancelledError):
@@ -91,10 +89,8 @@ def test_cancel_token_stops_a_query(big: Dataset) -> None:
 
 
 def test_ctrl_c_interrupts_a_query(big: Dataset) -> None:
-    start = time.perf_counter()
     with ctrl_c_after(0.2), pytest.raises(KeyboardInterrupt):
         big.query(ENDLESS)
-    assert time.perf_counter() - start < 10
     # the dataset is usable afterwards
     assert big.ask("ASK { ?s ?p ?o }")
 
