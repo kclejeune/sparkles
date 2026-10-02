@@ -37,6 +37,7 @@ mod shacl;
 mod shex_cmd;
 mod shutdown;
 mod state;
+mod tools;
 mod ui;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validation_cmd;
@@ -990,6 +991,13 @@ enum Cmd {
         /// valid (DBpedia's, for one); syntax errors still fail the load
         #[arg(long)]
         lenient: bool,
+        /// Warn about suspicious IRIs and language tags before loading (scheme rules,
+        /// percent-encoding, extlang, …), at the cost of a second parse of the files
+        #[arg(long)]
+        check: bool,
+        /// With --check: load nothing when any IRI or language tag has a warning
+        #[arg(long, requires = "check")]
+        strict: bool,
         /// A message recorded with the commit (shown by `log` and in /$/commits)
         #[arg(long)]
         message: Option<String>,
@@ -1374,6 +1382,10 @@ enum Cmd {
     /// ShEx: validate a database (or data files) against a schema and a shape map
     /// (exits with status 1 when an association does not conform), or print schemas
     Shex(shex_cmd::ShexArgs),
+    // convert (riot), qparse, uparse, compare (rdfdiff), iri, langtag, rsparql, rupdate,
+    // rset
+    #[command(flatten)]
+    Tools(tools::ToolCmd),
 }
 
 fn store_opts(cli: &Cli) -> StoreOptions {
@@ -2177,12 +2189,15 @@ fn run() -> Result<()> {
         #[cfg(feature = "fmt")]
         Cmd::Lsp(args) => lsp::run(args),
         Cmd::Shex(args) => shex_cmd::run(args, opts),
+        Cmd::Tools(cmd) => tools::run(cmd, opts),
         Cmd::Load {
             loc,
             graph,
             files,
             compression,
             lenient,
+            check,
+            strict,
             message,
             server,
             dataset,
@@ -2193,6 +2208,14 @@ fn run() -> Result<()> {
                 .map(sparkles::annotations::validate_message)
                 .transpose()?
                 .flatten();
+            // the term checks read the files once before anything is written
+            if check {
+                let explicit = match compression.as_str() {
+                    "auto" => None,
+                    c => Some(sparkles::codec::Codec::parse(c)?),
+                };
+                tools::convert::precheck(&files, explicit, lenient, strict)?;
+            }
             let Some(loc) = loc else {
                 if lenient {
                     bail!("--lenient applies to a local database (--loc) only");
@@ -3473,60 +3496,9 @@ fn print_table(
     out: &mut impl Write,
 ) -> Result<()> {
     if r.kind == QueryKind::Ask {
-        writeln!(out, "{}", if r.boolean { "yes" } else { "no" })?;
+        tools::table::write_boolean(r.boolean, out)?;
         return Ok(());
     }
-    let prefixes = store.prefixes();
-    let show = |t: Option<oxrdf::Term>| -> String {
-        match t {
-            None => String::new(),
-            Some(oxrdf::Term::NamedNode(n)) => {
-                for (p, ns) in &prefixes {
-                    if let Some(l) = n.as_str().strip_prefix(ns.as_str())
-                        && l.chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                    {
-                        return format!("{p}:{l}");
-                    }
-                }
-                format!("<{}>", n.as_str())
-            }
-            Some(t) => t.to_string(),
-        }
-    };
-    let rows: Vec<Vec<String>> = r
-        .rows()
-        .into_iter()
-        .map(|row| row.into_iter().map(show).collect())
-        .collect();
-    let mut widths: Vec<usize> = r.vars.iter().map(|v| v.chars().count() + 1).collect();
-    for row in &rows {
-        for (i, c) in row.iter().enumerate() {
-            widths[i] = widths[i].max(c.chars().count());
-        }
-    }
-    let line: String = widths
-        .iter()
-        .map(|w| "-".repeat(w + 2))
-        .collect::<Vec<_>>()
-        .join("-");
-    writeln!(out, "-{line}-")?;
-    let hdr: Vec<String> = r
-        .vars
-        .iter()
-        .enumerate()
-        .map(|(i, v)| format!(" {:w$} ", format!("?{v}"), w = widths[i]))
-        .collect();
-    writeln!(out, "|{}|", hdr.join("|"))?;
-    writeln!(out, "={}=", "=".repeat(line.chars().count()))?;
-    for row in &rows {
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!(" {:w$} ", c, w = widths[i]))
-            .collect();
-        writeln!(out, "|{}|", cells.join("|"))?;
-    }
-    writeln!(out, "-{line}-")?;
+    tools::table::write_table(&r.vars, &r.rows(), &store.prefixes(), out)?;
     Ok(())
 }

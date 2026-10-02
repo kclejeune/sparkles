@@ -412,7 +412,10 @@ The other commands are:
 * `auth`, for password hashes, tokens, and `auth login` for remote `query`, `update` and
   `load --server`;
 * `mcp` ([below](#mcp-server-llm-agents));
-* `fmt` and `lsp` ([below](#formatting)).
+* `fmt` and `lsp` ([below](#formatting));
+* `convert` (`riot`), `qparse`, `uparse`, `compare` (`rdfcompare`, `rdfdiff`), `iri`,
+  `langtag`, `rsparql`, `rupdate` and `rset`, for files and endpoints
+  ([below](#file-tools)).
 
 `sparkles help COMMAND` describes each one.
 
@@ -420,6 +423,83 @@ The other commands are:
 in Turtle, and `--format turtle` adds the declared RDFS/OWL schema. The server answers
 `GET /$/schema/{ds}` the same way when the request asks for Turtle or another RDF syntax
 ([API.md](API.md#schema-discovery)).
+
+### File tools
+
+These commands work on files and endpoints rather than databases. They match Jena's
+`riot`, `qparse`, `uparse`, `rdfdiff`, `rdfcompare`, `iri`, `langtag`, `rsparql`,
+`rupdate` and `rset`, and `convert` and `compare` answer to Jena's names as aliases. The
+design is in [spec G05](specs/G05-command-line-tools.md).
+
+```sh
+sparkles convert data.ttl.gz --output nt      # stream to N-Triples (default output: N-Quads)
+sparkles riot --syntax ttl --output trig < in # standard input needs --syntax, else N-Quads
+sparkles convert data.trig --output ttl --merge   # named graphs into the default graph
+sparkles convert big.nt --output nq --compress zstd > big.nq.zst   # --compress alone is gzip
+sparkles convert --count *.ttl                # triples (or quads) per file and a total
+sparkles convert --validate data.ttl          # syntax errors and term warnings, exit 1 on any
+sparkles convert --check data.ttl > out.nq    # convert, and warn about IRIs and language tags
+sparkles load --loc db --check --strict data.ttl   # the same checks before a load
+sparkles qparse 'SELECT ...'                  # the query, formatted
+sparkles qparse --print algebra,plan --query q.rq  # SPARQL algebra (SSE) and the physical plan
+sparkles uparse --print algebra 'DELETE ...'  # the update as SPARQL algebra
+sparkles compare a.ttl b.nt                   # exit 0 when isomorphic, 1 with a diff, 2 on errors
+sparkles iri '<http://Example.org:80/a/../b>' # components, normal form, warnings
+sparkles langtag en-us zh-yue-HK en--ltr      # subtags, canonical case, warnings
+sparkles rsparql --service https://query.wikidata.org/sparql --query q.rq --results csv
+sparkles rupdate --service http://localhost:3030/ds/update 'INSERT DATA {...}'
+sparkles rset results.srj --results text      # JSON, XML or TSV results to another format
+```
+
+`convert` reads files, or standard input when no file is given or a file is `-`. It takes
+the syntax from `--syntax`, then from the file extension, and reads standard input as
+N-Quads by default. Compressed inputs are detected as `load` detects them. The output
+streams, so a file larger than memory converts in bounded memory. Turtle, TriG and
+RDF/XML output declare the prefixes that the input declared before its first statement.
+A quad in a named graph cannot be written in a triple syntax, so `convert` drops it with
+a warning, or with `--merge` writes it into the default graph.
+
+`--count`, `--sink` and `--validate` write no data. Files are then parsed in parallel, as
+`load` parses them. When a file has a syntax error, it is parsed again in order so that
+up to 20 errors are reported with their exact line and column. `--validate` is `--sink
+--check --strict`, as in Jena. The exit status is 1 when an input had errors, or warnings
+under `--strict`.
+
+`--check` reports suspicious IRIs and language tags that the parsers accept. The IRI
+rules cover upper-case schemes and hosts, lower-case or needless percent-encodings, user
+information, dot segments, empty and default ports, `http` IRIs without a host, and the
+syntax of `urn:` (with `uuid` and `oid`), `file:` and `did:` IRIs. The language-tag rules
+flag grandfathered tags, extended language subtags and unusual primary languages. Each
+distinct value is reported once per file. `load --check` runs the same checks as a
+separate pass before the load, and `--strict` then loads nothing when a value has a
+warning. `iri` and `langtag` show the rules for one value at a time, with the
+components, the RFC 3986 normal form or the canonical case, and `--format json`.
+`/$/validate/iri` returns the same warnings.
+
+`qparse` uses the engine's own parser. Its default output is the query formatted by
+`sparkles fmt`. `--print algebra` prints the SPARQL algebra in SSE, the form of Jena's
+`qparse --print=op`. The operators are spargebra's, which are close to Jena's but not
+the same, and made-up names of aggregates and blank nodes print as `?.0` and `_:b0`.
+`--print plan` prints the physical plan of `query --explain`. It is planned against an
+empty database unless `--loc` or `--data` gives one with real statistics. A syntax
+error exits with status 1.
+
+`compare` reads both files into memory and compares them as RDF datasets up to
+blank-node isomorphism. The diff lists quads only in the first file with `<` and quads
+only in the second with `>`. Blank nodes are labeled by RDFC-1.0 canonicalization, one
+group of connected blank nodes at a time, so a change shows only the group it touches.
+`--merge` ignores graph names, and `-q` prints nothing.
+
+`rsparql` and `rupdate` take any SPARQL 1.1 Protocol endpoint as a full URL, such as a
+Fuseki, QLever or Wikidata endpoint. `query --server` is different, because it names a
+Sparkles server and a dataset and sends the token of `sparkles auth login`. `rsparql`
+sends a query by GET, or as a POST form when it is long or `--post` is given. With
+`--results text`, the default, it prints result sets as a table and graphs as Turtle.
+The other formats are `json`, `xml`, `csv`, `tsv`, and for graphs `ttl`, `nt`, `nq`,
+`trig`, `jsonld` and `rdfxml`. `--header 'Name: value'` and `--user NAME[:PASSWORD]` add
+credentials, which are refused over plain http to a host other than localhost unless
+`--insecure-http` is given. `--default-graph-uri`, `--named-graph-uri` and, for
+`rupdate`, `--using-graph-uri` and `--using-named-graph-uri` set the protocol's dataset.
 
 ### Drafting shapes from the data
 

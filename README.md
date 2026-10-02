@@ -83,7 +83,9 @@ running queries.
 * Jena's own HTTP clients, including `RDFConnectionFuseki` and its RDF Thrift, are tested
   against the server ([usage](docs/USAGE.md#fuseki-and-jena-clients)).
 * A Jena-style CLI with `tdb2.*` and `arq` equivalents. The commands work on a database
-  directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)).
+  directory or on a remote server ([usage](docs/USAGE.md#command-line-tools)). File tools
+  match Jena's `riot`, `qparse`, `uparse`, `rdfdiff`, `iri`, `langtag`, `rsparql`,
+  `rupdate` and `rset` ([usage](docs/USAGE.md#file-tools)).
 
 **Reasoning**
 * RDFS, OWL 2 RL and Jena's rule syntax, materialized by semi-naive forward chaining.
@@ -245,6 +247,8 @@ sparkles fmt     --check queries/ shapes/     # SPARQL, Turtle, TriG, N-Triples,
 | `auth` | Hash passwords, manage API tokens and sign in for remote commands (`auth login`). |
 | `mcp` | Run the MCP server for LLM agents over stdio. `serve --mcp` serves it over HTTP. |
 | `fmt`, `lsp` | Run the formatter or its language server. |
+| `convert` (`riot`), `compare` (`rdfdiff`), `qparse`, `uparse`, `iri`, `langtag` | Convert, validate and count RDF files, compare them up to blank-node isomorphism, print a query's algebra or plan, and check IRIs and language tags. |
+| `rsparql`, `rupdate`, `rset` | Query and update any SPARQL endpoint, and convert result sets. |
 
 [docs/USAGE.md](docs/USAGE.md#command-line-tools) describes each one.
 

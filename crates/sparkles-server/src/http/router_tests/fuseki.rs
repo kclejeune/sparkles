@@ -152,14 +152,18 @@ async fn validators_answer_json_and_html() {
     assert!(u["formatted"].is_string(), "{u}");
     let iri = get(
         &s.app,
-        "/$/validate/iri?iri=http%3A%2F%2Fa%2Fb&iri=rel&iri=a%20b%3Ac",
+        "/$/validate/iri?iri=http%3A%2F%2Fa%2Fb&iri=rel&iri=a%20b%3Ac&iri=HTTP%3A%2F%2Fa%3A80%2F",
         j,
     )
     .await
     .json();
     assert_eq!(iri["iris"][0]["errors"], serde_json::json!([]));
+    assert_eq!(iri["iris"][0]["warning"], serde_json::json!([]));
     assert_eq!(iri["iris"][1]["warning"].as_array().unwrap().len(), 1);
     assert_eq!(iri["iris"][2]["errors"].as_array().unwrap().len(), 1);
+    // the scheme and normalization warnings of `sparkles iri`
+    let w = iri["iris"][3]["warning"].to_string();
+    assert!(w.contains("scheme") && w.contains("port 80"), "{w}");
     let form = call(
         &s.app,
         "POST",
