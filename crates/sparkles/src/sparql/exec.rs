@@ -336,7 +336,10 @@ fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             expr_report = apply_filter(ctx, &mut t, &rest)?;
             (note, counters) = super::exists::explain(ctx, es);
             if let Some(r) = runs_note {
-                note = Some(note.map_or(r.clone(), |n| format!("{r} {n}")));
+                note = Some(match note {
+                    Some(n) => format!("{r} {n}"),
+                    None => r,
+                });
             }
             t
         }

@@ -31,7 +31,7 @@ enum Test {
         arg: Arg,
         needle: Arc<str>,
         /// substring search for `CONTAINS`, built once for the needle
-        finder: memchr::memmem::Finder<'static>,
+        finder: Box<memchr::memmem::Finder<'static>>,
         lang: Option<Arc<str>>,
     },
     Regex {
@@ -174,7 +174,7 @@ impl KeyFilter {
                     Test::Str {
                         f: f.clone(),
                         arg: Arg::of(a, v)?,
-                        finder: memchr::memmem::Finder::new(needle.as_bytes()).into_owned(),
+                        finder: Box::new(memchr::memmem::Finder::new(needle.as_bytes()).into_owned()),
                         needle,
                         lang,
                     }

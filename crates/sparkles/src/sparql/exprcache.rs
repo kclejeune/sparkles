@@ -473,7 +473,7 @@ pub(super) fn filter_values(
     Ok((super::exec::filter_mask(ctx, &values, exprs)?, false))
 }
 
-/// Outcome of a key filter for sorted distinct ids:base-vocabulary terms are tested on
+/// Outcome of a key filter for sorted distinct ids: base-vocabulary terms are tested on
 /// their keys straight from the front-coded blocks (in parallel, each block visited once),
 /// update-added terms on their delta keys, and everything else (inline literals, blank
 /// nodes, unbound) by the general evaluator.

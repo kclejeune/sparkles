@@ -75,6 +75,15 @@ fn store(seed: u64, n: usize, union: bool) -> Store {
                 value(r >> 20 & 0xff)
             ));
         }
+        // repeated variables: some subjects point to themselves
+        if (r >> 30).is_multiple_of(9) {
+            let o = if (r >> 33).is_multiple_of(2) {
+                i
+            } else {
+                i + 1
+            };
+            trig.push_str(&format!("ex:s{i} ex:self ex:s{o} .\n"));
+        }
     }
     s.load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
         .unwrap();
@@ -133,6 +142,7 @@ const PATTERNS: &[&str] = &[
     "GRAPH ex:g1 { ?s ex:v ?v }",
     "GRAPH <urn:x-arq:UnionGraph> { ?s ex:v ?v }",
     "?s ?p ?v",
+    "?s ex:self ?s",
 ];
 
 fn without() -> Optimizations {
@@ -161,7 +171,11 @@ fn queries(next: &mut impl FnMut() -> u64, n: usize) -> Vec<String> {
             let shape = SHAPES[(next() % SHAPES.len() as u64) as usize];
             let f = FILTERS[(next() % FILTERS.len() as u64) as usize];
             let p = PATTERNS[(next() % PATTERNS.len() as u64) as usize];
-            let x = if next().is_multiple_of(4) { "?s" } else { "?v" };
+            let x = if next().is_multiple_of(4) || p.contains("self") {
+                "?s"
+            } else {
+                "?v"
+            };
             shape.replace("{E}", f).replace("{P}", p).replace("{X}", x)
         })
         .collect()
