@@ -1,8 +1,10 @@
 //! Where an incremental run finds the previous closure, and what it keeps for the next.
 //!
-//! The previous closure comes from memory when the caller keeps a [`Cache`] (the server
-//! does), and otherwise from the dataset: the default graph and the inferred graph as of
-//! the previous run, recovered from their state now and the commit diff since, plus the
+//! The explicit facts are the union of the input graphs (the default graph unless the run
+//! names others). The previous closure comes from memory when the caller keeps a
+//! [`Cache`] (the server does), and otherwise from the dataset: the input graphs and the
+//! inferred graph as of the previous run, recovered from their state now and the commit
+//! diff since, plus the
 //! derived facts that are not valid RDF. Those generalized facts (a literal subject, a
 //! blank node predicate) are never written to the inferred graph but can take part in
 //! derivations, so a persistent dataset keeps them in `reasoning-generalized.bin`, bound
@@ -11,6 +13,7 @@
 use crate::INFERRED_GRAPH;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
+use crate::inputs::GraphRef;
 use crate::terms::Terms;
 use oxrdf::{GraphName, NamedNode, Term};
 use parking_lot::Mutex;
@@ -85,6 +88,8 @@ pub(crate) struct Kept {
     /// the commit the closure is the materialization of
     commit: u64,
     digest: u64,
+    /// the input graphs, sorted
+    inputs: Vec<GraphRef>,
     /// the snapshot at `commit`
     snap: Arc<Snapshot>,
     closure: Closure,
@@ -93,8 +98,8 @@ pub(crate) struct Kept {
     saved: Option<SavedMeta>,
 }
 
-/// The default graph's and the inferred graph's changes between two commits, as ids of
-/// the later one (or local ids for terms it lacks).
+/// The changes of the union of the input graphs and of the inferred graph between two
+/// commits, as ids of the later one (or local ids for terms it lacks).
 #[derive(Default)]
 pub(crate) struct Changes {
     pub base_added: Vec<Triple>,
@@ -125,12 +130,13 @@ pub(crate) fn changes(
     since: u64,
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
+    inputs: &[GraphRef],
 ) -> Result<RawChanges, String> {
-    let e = match logged_changes(store, since, snap.commit) {
+    let e = match logged_changes(store, since, snap.commit, inputs) {
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
-    match kept_changes(store, since, snap, cache) {
+    match kept_changes(store, since, snap, cache, inputs) {
         Some(r) => r,
         None => Err(format!(
             "commit {since} cannot be compared with the head: {e:#}"
@@ -145,6 +151,7 @@ pub(crate) fn kept_changes(
     since: u64,
     snap: &Arc<Snapshot>,
     cache: Option<&Cache>,
+    inputs: &[GraphRef],
 ) -> Option<Result<RawChanges, String>> {
     let old = cache.and_then(|c| {
         let k = c.kept.lock();
@@ -156,7 +163,7 @@ pub(crate) fn kept_changes(
             })
             .map(|k| k.snap.clone())
     })?;
-    Some(delta_changes(&old, snap).map_err(|e| e.to_string()))
+    Some(delta_changes(&old, snap, inputs).map_err(|e| e.to_string()))
 }
 
 /// Find the closure of the materialization at commit `since`, for an update with the
@@ -166,11 +173,14 @@ pub(crate) fn previous(
     snap: &Arc<Snapshot>,
     since: u64,
     digest: u64,
+    inputs: &[GraphRef],
     cache: Option<&Cache>,
     raw: Result<RawChanges, String>,
 ) -> anyhow::Result<Previous> {
     let dataset_id = store.dataset_id();
     let rules_changed = || Fallback("the rules changed since the previous run".into());
+    let inputs_changed = || Fallback("the input graphs changed since the previous run".into());
+    let ids = input_ids(snap, None, inputs);
     let kept = cache.and_then(Cache::take).filter(|k| {
         k.dataset_id == dataset_id
             && k.commit == since
@@ -178,6 +188,9 @@ pub(crate) fn previous(
     });
     if kept.as_ref().is_some_and(|k| k.digest != digest) {
         return Err(rules_changed().into());
+    }
+    if kept.as_ref().is_some_and(|k| k.inputs != inputs) {
+        return Err(inputs_changed().into());
     }
     if let Some(k) = kept {
         let Kept {
@@ -190,7 +203,7 @@ pub(crate) fn previous(
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
         remap_set(&mut generalized, &moved);
-        let changes = raw.resolve(&closure.terms);
+        let changes = raw.resolve(&closure.terms, snap, &ids)?;
         return Ok(Previous {
             closure,
             generalized,
@@ -203,6 +216,9 @@ pub(crate) fn previous(
         return Err(Fallback("no closure of the previous run is kept in memory".into()).into());
     };
     let (meta, keys) = match read_saved(root, dataset_id, since, digest)? {
+        Saved::Found(meta, _) if meta.input_graphs() != inputs => {
+            return Err(inputs_changed().into());
+        }
         Saved::Found(meta, keys) => (meta, keys),
         Saved::OtherRules => return Err(rules_changed().into()),
         Saved::Missing => {
@@ -211,7 +227,7 @@ pub(crate) fn previous(
     };
     let raw = raw.map_err(Fallback)?;
     let terms = Terms::new(snap.clone());
-    let changes = raw.resolve(&terms);
+    let changes = raw.resolve(&terms, snap, &ids)?;
     let generalized: FxHashSet<Triple> = keys
         .iter()
         .map(|k| {
@@ -219,7 +235,7 @@ pub(crate) fn previous(
             [id(&k[0]), id(&k[1]), id(&k[2])]
         })
         .collect();
-    let closure = reconstruct(snap, terms, &changes, &generalized)?;
+    let closure = reconstruct(snap, terms, &changes, &generalized, &ids)?;
     Ok(Previous {
         closure,
         generalized,
@@ -237,13 +253,14 @@ fn remap_set(s: &mut FxHashSet<Triple>, moved: &FxHashMap<u64, u64>) {
     *s = s.iter().map(|t| [m(t[0]), m(t[1]), m(t[2])]).collect();
 }
 
-/// The closure as of the previous run: the default graph and the inferred graph then,
-/// and the generalized facts.
+/// The closure as of the previous run: the input graphs and the inferred graph then, and
+/// the generalized facts.
 fn reconstruct(
     snap: &Arc<Snapshot>,
     terms: Terms,
     ch: &Changes,
     generalized: &FxHashSet<Triple>,
+    inputs: &[Id],
 ) -> anyhow::Result<Closure> {
     let scan = |g: Id, skip: &FxHashSet<Triple>, out: &mut Vec<Triple>| -> anyhow::Result<()> {
         snap.scan(Perm::Gspo, &[g.0], |c| {
@@ -264,12 +281,15 @@ fn reconstruct(
         })?;
         Ok(())
     };
-    let mut base = Vec::with_capacity(snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0])? as usize);
-    scan(
-        Id::DEFAULT_GRAPH,
-        &ch.base_added.iter().copied().collect(),
-        &mut base,
-    )?;
+    let mut n = 0;
+    for g in inputs {
+        n += snap.count(Perm::Gspo, &[g.0])?;
+    }
+    let mut base = Vec::with_capacity(n as usize);
+    let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
+    for g in inputs {
+        scan(*g, &added, &mut base)?;
+    }
     base.extend(&ch.base_removed);
     let mut derived = Vec::new();
     if let Some(g) = snap.lookup_iri(INFERRED_GRAPH) {
@@ -291,8 +311,12 @@ fn reconstruct(
 /// Changes as the commit diff reports them, or as ids of one generation.
 pub(crate) enum RawChanges {
     Quads {
+        /// the changes of each input graph
         base: Vec<(DiffOp, oxrdf::Quad)>,
         inferred: Vec<(DiffOp, oxrdf::Quad)>,
+        /// whether there is more than one input graph: a triple then joins or leaves the
+        /// union only when no other input graph holds it
+        union: bool,
     },
     Ids(Changes),
 }
@@ -308,19 +332,63 @@ impl RawChanges {
         }
     }
 
-    fn resolve(self, terms: &Terms) -> Changes {
-        match self {
+    /// The changes as ids of `terms`, whose snapshot is `snap`; `inputs` are the ids of
+    /// the input graphs in it.
+    fn resolve(self, terms: &Terms, snap: &Snapshot, inputs: &[Id]) -> anyhow::Result<Changes> {
+        Ok(match self {
             RawChanges::Ids(c) => c,
-            RawChanges::Quads { base, inferred } => {
+            RawChanges::Quads {
+                base,
+                inferred,
+                union,
+            } => {
                 let id = |t: Term| terms.id_for(&t);
                 let triple = |q: oxrdf::Quad| -> Triple {
                     [id(q.subject.into()), id(q.predicate.into()), id(q.object)]
                 };
                 let mut c = Changes::default();
-                for (op, q) in base {
-                    match op {
-                        DiffOp::Add => c.base_added.push(triple(q)),
-                        DiffOp::Remove => c.base_removed.push(triple(q)),
+                if union {
+                    // per triple, the graphs whose change the diff reports, and whether
+                    // the triple was added there
+                    let mut by_triple: FxHashMap<Triple, Vec<(Option<Id>, bool)>> =
+                        FxHashMap::default();
+                    for (op, q) in base {
+                        let g = match &q.graph_name {
+                            GraphName::NamedNode(n) => snap.lookup_iri(n.as_str()),
+                            _ => Some(Id::DEFAULT_GRAPH),
+                        };
+                        by_triple
+                            .entry(triple(q))
+                            .or_default()
+                            .push((g, op == DiffOp::Add));
+                    }
+                    for (t, changed) in by_triple {
+                        let stored = t.iter().all(|&x| Id(x).tag() != sparkles::id::Tag::Local);
+                        let (mut before, mut after) = (false, false);
+                        for &g in inputs {
+                            let now =
+                                stored && snap.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+                            after |= now;
+                            before |= match changed.iter().find(|(cg, _)| *cg == Some(g)) {
+                                Some((_, added)) => !added,
+                                None => now,
+                            };
+                        }
+                        // a graph the snapshot no longer names held the triple before when
+                        // the diff removed it there
+                        before |= changed.iter().any(|(cg, added)| cg.is_none() && !added);
+                        match (before, after) {
+                            (false, true) => c.base_added.push(t),
+                            (true, false) => c.base_removed.push(t),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    for (op, q) in base {
+                        match op {
+                            DiffOp::Add => c.base_added.push(triple(q)),
+                            DiffOp::Remove => c.base_removed.push(triple(q)),
+                        }
                     }
                 }
                 for (op, q) in inferred {
@@ -331,12 +399,33 @@ impl RawChanges {
                 }
                 c
             }
-        }
+        })
     }
 }
 
+/// The ids of the input graphs in `snap` (or in `other`, for a graph only it names).
+pub(crate) fn input_ids(snap: &Snapshot, other: Option<&Snapshot>, inputs: &[GraphRef]) -> Vec<Id> {
+    let mut ids: Vec<Id> = inputs
+        .iter()
+        .filter_map(|g| match g {
+            GraphRef::Default => Some(Id::DEFAULT_GRAPH),
+            GraphRef::Named(n) => snap
+                .lookup_iri(n)
+                .or_else(|| other.and_then(|o| o.lookup_iri(n))),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// The changes between two commits from the store's commit diff.
-fn logged_changes(store: &Store, since: u64, head: u64) -> anyhow::Result<RawChanges> {
+fn logged_changes(
+    store: &Store,
+    since: u64,
+    head: u64,
+    inputs: &[GraphRef],
+) -> anyhow::Result<RawChanges> {
     if since == head {
         return Ok(RawChanges::Ids(Changes::default()));
     }
@@ -348,22 +437,45 @@ fn logged_changes(store: &Store, since: u64, head: u64) -> anyhow::Result<RawCha
         let d = store.diff(&At::Commit(since), &At::Commit(head), &o)?;
         Ok(d.iter().collect())
     };
+    let mut base = Vec::new();
+    for g in inputs {
+        base.extend(diff(match g {
+            GraphRef::Default => GraphName::DefaultGraph,
+            GraphRef::Named(n) => GraphName::NamedNode(NamedNode::new_unchecked(n.as_str())),
+        })?);
+    }
     Ok(RawChanges::Quads {
-        base: diff(GraphName::DefaultGraph)?,
+        base,
         inferred: diff(GraphName::NamedNode(NamedNode::new_unchecked(
             INFERRED_GRAPH,
         )))?,
+        union: inputs.len() > 1,
     })
 }
 
 /// The changes between two snapshots of one generation, from their deltas.
-fn delta_changes(old: &Snapshot, new: &Snapshot) -> anyhow::Result<RawChanges> {
+fn delta_changes(
+    old: &Snapshot,
+    new: &Snapshot,
+    inputs: &[GraphRef],
+) -> anyhow::Result<RawChanges> {
     let i = Perm::Gspo.index();
     let inferred = new
         .lookup_iri(INFERRED_GRAPH)
         .or_else(|| old.lookup_iri(INFERRED_GRAPH));
+    let ids = input_ids(new, Some(old), inputs);
+    // whether a triple is in one of the input graphs of a snapshot
+    let in_union = |s: &Snapshot, t: &Triple| -> anyhow::Result<bool> {
+        for g in &ids {
+            if s.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), *g])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let mut c = Changes::default();
     let mut seen: FxHashSet<[u64; 4]> = FxHashSet::default();
+    let mut seen_base: FxHashSet<Triple> = FxHashSet::default();
     for set in [
         &old.delta.ins[i],
         &old.delta.del[i],
@@ -371,18 +483,26 @@ fn delta_changes(old: &Snapshot, new: &Snapshot) -> anyhow::Result<RawChanges> {
         &new.delta.del[i],
     ] {
         for k in set.iter() {
-            let base = k[0] == Id::DEFAULT_GRAPH.0;
+            let base = ids.binary_search(&Id(k[0])).is_ok();
             if !(base || inferred.is_some_and(|g| g.0 == k[0])) || !seen.insert(*k) {
                 continue;
             }
             let q = Perm::Gspo.to_quad(k);
-            let (a, b) = (old.contains(&q)?, new.contains(&q)?);
             let t = [q[0].0, q[1].0, q[2].0];
-            match (a, b, base) {
-                (false, true, true) => c.base_added.push(t),
-                (true, false, true) => c.base_removed.push(t),
-                (false, true, false) => c.inferred_added.push(t),
-                (true, false, false) => c.inferred_removed.push(t),
+            if base {
+                if !seen_base.insert(t) {
+                    continue;
+                }
+                match (in_union(old, &t)?, in_union(new, &t)?) {
+                    (false, true) => c.base_added.push(t),
+                    (true, false) => c.base_removed.push(t),
+                    _ => {}
+                }
+                continue;
+            }
+            match (old.contains(&q)?, new.contains(&q)?) {
+                (false, true) => c.inferred_added.push(t),
+                (true, false) => c.inferred_removed.push(t),
                 _ => {}
             }
         }
@@ -400,6 +520,7 @@ pub(crate) fn keep(
     receipt: &sparkles::commit::Receipt,
     before: &Arc<Snapshot>,
     digest: u64,
+    inputs: &[GraphRef],
     mut closure: Closure,
     mut generalized: FxHashSet<Triple>,
     stored: &FxHashMap<u64, Id>,
@@ -430,6 +551,7 @@ pub(crate) fn keep(
         dataset_id: receipt.dataset_id,
         commit: receipt.commit.seq,
         digest,
+        inputs: inputs.to_vec(),
         snap,
         closure,
         generalized,
@@ -469,6 +591,17 @@ pub(crate) struct SavedMeta {
     log_bytes: u64,
     #[serde(default)]
     log_checksum: String,
+    /// the input graphs, sorted (absent: the default graph alone)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<Vec<GraphRef>>,
+}
+
+impl SavedMeta {
+    fn input_graphs(&self) -> Vec<GraphRef> {
+        self.inputs
+            .clone()
+            .unwrap_or_else(|| vec![GraphRef::Default])
+    }
 }
 
 /// The generalized facts a run added and removed.
@@ -609,6 +742,7 @@ pub(crate) fn save(
     store: &Store,
     receipt: &sparkles::commit::Receipt,
     digest: u64,
+    inputs: &[GraphRef],
     terms: &Terms,
     generalized: &FxHashSet<Triple>,
     prev: Option<(&SavedMeta, &GeneralizedChanges)>,
@@ -674,9 +808,11 @@ pub(crate) fn save(
                 checksum: format!("{:016x}", fnv(&bin, FNV_START)),
                 log_bytes: 0,
                 log_checksum: String::new(),
+                inputs: None,
             }
         }
     };
+    meta.inputs = (inputs != [GraphRef::Default]).then(|| inputs.to_vec());
     meta.dataset_id = receipt.dataset_id.to_string();
     meta.commit = receipt.commit.seq;
     meta.rules = format!("{digest:016x}");

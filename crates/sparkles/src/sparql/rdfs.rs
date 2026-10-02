@@ -220,13 +220,16 @@ pub enum SchemaSource {
     Graph(Option<String>),
 }
 
+/// A snapshot's state: its generation, delta version and commit.
+type StateKey = (usize, u64, u64);
+
 /// RDFS on read for a dataset: the schema's source, and the schema of a graph source as
 /// last read.
 #[derive(Debug)]
 pub struct RdfsOnRead {
     pub source: SchemaSource,
-    /// (generation, delta version, commit) of the snapshot last read, and its schema
-    last: Mutex<Option<((usize, u64, u64), Arc<RdfsSchema>)>>,
+    /// the snapshot last read, and its schema
+    last: Mutex<Option<(StateKey, Arc<RdfsSchema>)>>,
 }
 
 impl RdfsOnRead {

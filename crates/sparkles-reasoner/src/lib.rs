@@ -1,18 +1,19 @@
 //! Forward-chaining reasoning for Sparkles (Jena `GenericRuleReasoner` FORWARD mode /
 //! `infer` equivalent).
 //!
-//! The reasoner loads the store's **default graph** into memory as id-level triples,
-//! runs a rule set to a fixpoint with semi-naive evaluation, and writes every derived
-//! triple that is not already asserted into the named graph [`INFERRED_GRAPH`]. Queries
-//! see the entailments by adding that graph to their default graph
-//! (`QueryOptions::default_graph_extra`).
+//! The reasoner loads its input graphs into memory as id-level triples, runs a rule set
+//! to a fixpoint with semi-naive evaluation, and writes every derived triple that is not
+//! already asserted into the named graph [`INFERRED_GRAPH`]. The input graphs are the
+//! **default graph** unless [`ReasonOptions::inputs`] names others, plus the graphs their
+//! `owl:imports` lead to (see [`inputs`]). Queries see the entailments by adding that
+//! graph to their default graph (`QueryOptions::default_graph_extra`).
 //!
 //! Rule sets: [`Profile::Rdfs`] (full RDFS entailment), [`Profile::RdfsSimple`]
 //! (subClassOf / subPropertyOf / domain / range), [`Profile::OwlRl`] (an OWL 2 RL subset
 //! comparable to Jena's OWL Mini) or any Jena rule text ([`Profile::Rules`]).
 //!
 //! [`materialize_incremental`] updates a previous materialization from the changes to
-//! the default graph since its commit, with the same result as a full run.
+//! the input graphs since its commit, with the same result as a full run.
 
 mod builtins;
 pub mod diagnostics;
@@ -20,11 +21,15 @@ mod engine;
 pub mod extras;
 mod graph;
 mod incremental;
+pub mod inputs;
 mod maintain;
 pub mod parser;
 mod terms;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
+pub use inputs::{
+    Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
+};
 pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
@@ -127,6 +132,8 @@ pub struct ReasonOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Called with (fraction done in `[0, 1]`, message).
     pub progress: Option<ProgressFn>,
+    /// The graphs the rules read (the default graph and its imports by default).
+    pub inputs: Inputs,
 }
 
 impl Default for ReasonOptions {
@@ -136,6 +143,7 @@ impl Default for ReasonOptions {
             max_inferred: 50_000_000,
             cancel: None,
             progress: None,
+            inputs: Inputs::default(),
         }
     }
 }
@@ -147,6 +155,7 @@ impl fmt::Debug for ReasonOptions {
             .field("max_inferred", &self.max_inferred)
             .field("cancel", &self.cancel)
             .field("progress", &self.progress.as_ref().map(|_| "…"))
+            .field("inputs", &self.inputs)
             .finish()
     }
 }
@@ -176,6 +185,8 @@ pub struct ReasonReport {
     pub inferred_added: u64,
     /// triples the run removed from [`INFERRED_GRAPH`]
     pub inferred_removed: u64,
+    /// the graphs the run read, with its imports
+    pub inputs: Option<Resolved>,
 }
 
 /// How a run materialized.
@@ -200,9 +211,9 @@ impl Method {
 /// What an incremental run changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
-    /// triples added to the default graph since the previous run
+    /// triples added to the input graphs since the previous run (to their union)
     pub base_added: u64,
-    /// triples removed from the default graph since the previous run
+    /// triples removed from the input graphs since the previous run (from their union)
     pub base_removed: u64,
     /// derived facts whose other proofs were searched for
     pub checked: u64,
@@ -230,18 +241,24 @@ struct Derivation {
     warnings: Vec<String>,
 }
 
-fn load_default_graph(snap: &Snapshot) -> anyhow::Result<graph::Graph> {
-    let n = snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0]).unwrap_or(0) as usize;
+/// The union of the triples of graphs `graphs`.
+fn load_graphs(snap: &Snapshot, graphs: &[Id]) -> anyhow::Result<graph::Graph> {
+    let mut n = 0;
+    for g in graphs {
+        n += snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) as usize;
+    }
     let mut triples = Vec::with_capacity(n);
-    snap.scan(Perm::Gspo, &[Id::DEFAULT_GRAPH.0], |c| {
-        match c {
-            Chunk::Block(b, s, e) => {
-                triples.extend((s..e).map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]]));
+    for g in graphs {
+        snap.scan(Perm::Gspo, &[g.0], |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    triples.extend((s..e).map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]]));
+                }
+                Chunk::Row(k) => triples.push([k[1], k[2], k[3]]),
             }
-            Chunk::Row(k) => triples.push([k[1], k[2], k[3]]),
-        }
-        Ok(true)
-    })?;
+            Ok(true)
+        })?;
+    }
     let mut g = graph::Graph::with_capacity(n + n / 2);
     g.add_batch(triples);
     Ok(g)
@@ -251,11 +268,12 @@ fn derive(
     snap: Arc<Snapshot>,
     profile: &Profile,
     extras: &Extras,
+    graphs: &[Id],
     opts: &ReasonOptions,
 ) -> anyhow::Result<Derivation> {
     let rules = profile_rules(profile, extras)?;
-    progress(opts, 0.0, "loading default graph");
-    let mut g = load_default_graph(&snap)?;
+    progress(opts, 0.0, "loading the input graphs");
+    let mut g = load_graphs(&snap, graphs)?;
     // rows from here on are derived
     let base_len = g.len();
     let terms = Terms::new(snap);
@@ -283,7 +301,7 @@ fn derive(
     })
 }
 
-/// `F geo:hasDefaultGeometry G` for every `F` of the default graph with exactly one
+/// `F geo:hasDefaultGeometry G` for every `F` of the input graphs with exactly one
 /// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
 /// `applyDefaultGeometry`).
 fn default_geometries(g: &graph::Graph, terms: &Terms) -> Vec<[u64; 3]> {
@@ -418,17 +436,20 @@ pub fn materialize_incremental(
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
+    opts.inputs.validate()?;
     let t0 = Instant::now();
-    let (mut txn, raw) = lock_with_changes(store, inc);
+    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
     let snap = txn.base().clone();
     let digest = rules_digest(profile, extras);
     let mut fallback = None;
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
-            store, &mut txn, &snap, profile, extras, since, digest, inc, raw, opts,
+            store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
         ) {
             Ok(done) => {
-                return finish(store, txn, &snap, profile, digest, inc, opts, t0, done);
+                return finish(
+                    store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+                );
             }
             Err(e) => {
                 let f = e.downcast::<Fallback>()?;
@@ -437,7 +458,7 @@ pub fn materialize_incremental(
             }
         }
     }
-    let d = derive(snap.clone(), profile, extras, opts)?;
+    let d = derive(snap.clone(), profile, extras, &resolved.ids(&snap), opts)?;
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
     let w = write_full(&mut txn, &snap, &d, opts)?;
@@ -466,41 +487,62 @@ pub fn materialize_incremental(
         fallback,
         changes: None,
     };
-    finish(store, txn, &snap, profile, digest, inc, opts, t0, done)
+    finish(
+        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done,
+    )
 }
 
-/// Take the writer lock, with the changes since `inc.since` up to the state it locks.
+/// Take the writer lock, with the input graphs resolved in the state it locks, and the
+/// changes since `inc.since` up to that state.
 ///
 /// The commit diff takes the writer lock itself, so the changes are read before. A commit
 /// that lands in between makes them stale. A closure kept in memory then gives the
 /// changes from its deltas, under the lock; otherwise the lock is released and they are
-/// read again, up to three times.
+/// read again, up to three times. The changes are those of the input graphs that the
+/// state before the lock resolves; when the locked state resolves others, the run is a
+/// full one.
 fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
+    inputs: &Inputs,
 ) -> (
     sparkles::store::WriteTxn<'s>,
     Option<Result<maintain::RawChanges, String>>,
+    Resolved,
 ) {
+    let locked = |txn: sparkles::store::WriteTxn<'s>| {
+        let r = inputs::resolve(txn.base(), inputs);
+        (txn, r)
+    };
     let Some(since) = inc.since else {
-        return (store.write_as(sparkles::commit::CommitKind::Reason), None);
+        let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
+        return (txn, None, r);
     };
     for _ in 0..3 {
         let live = store.snapshot();
-        let raw = maintain::changes(store, since, &live, inc.cache);
-        let txn = store.write_as(sparkles::commit::CommitKind::Reason);
-        if txn.base().commit == live.commit {
-            return (txn, Some(raw));
-        }
-        if let Some(raw) = maintain::kept_changes(store, since, txn.base(), inc.cache) {
-            return (txn, Some(raw));
-        }
+        let graphs = inputs::resolve(&live, inputs).graph_set();
+        let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
+        let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
+        let raw = if r.graph_set() != graphs {
+            Err("the input graphs changed while the changes were read".into())
+        } else if txn.base().commit == live.commit {
+            raw
+        } else if let Some(raw) =
+            maintain::kept_changes(store, since, txn.base(), inc.cache, &graphs)
+        {
+            raw
+        } else {
+            continue;
+        };
+        return (txn, Some(raw), r);
     }
+    let (txn, r) = locked(store.write_as(sparkles::commit::CommitKind::Reason));
     (
-        store.write_as(sparkles::commit::CommitKind::Reason),
+        txn,
         Some(Err(
             "commits kept arriving while the changes were read".into()
         )),
+        r,
     )
 }
 
@@ -540,6 +582,7 @@ fn finish(
     snap: &Arc<Snapshot>,
     profile: &Profile,
     digest: u64,
+    resolved: &Resolved,
     inc: Incremental<'_>,
     opts: &ReasonOptions,
     t0: Instant,
@@ -554,12 +597,15 @@ fn finish(
     }
     let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
-    let warnings = done.warnings;
+    let mut warnings = resolved.warnings.clone();
+    warnings.extend(done.warnings);
+    let graphs = resolved.graph_set();
     if let Some(closure) = done.closure {
         let saved = maintain::save(
             store,
             &receipt,
             digest,
+            &graphs,
             &closure.terms,
             &done.generalized,
             done.generalized_saved.as_ref().map(|(m, c)| (m, c)),
@@ -574,6 +620,7 @@ fn finish(
             &receipt,
             snap,
             digest,
+            &graphs,
             closure,
             done.generalized,
             &done.written.stored,
@@ -595,6 +642,7 @@ fn finish(
         changes: done.changes,
         inferred_added: done.written.added,
         inferred_removed: done.written.removed,
+        inputs: Some(resolved.clone()),
     };
     tracing::info!(
         profile = %report.profile,
@@ -715,6 +763,7 @@ fn update_closure(
     extras: &Extras,
     since: u64,
     digest: u64,
+    resolved: &Resolved,
     inc: Incremental<'_>,
     raw: Result<maintain::RawChanges, String>,
     opts: &ReasonOptions,
@@ -735,9 +784,13 @@ fn update_closure(
             }
         }
     }
+    let graphs = resolved.graph_set();
     if let Ok(r) = &raw {
         let removed = r.base_removed() as u64;
-        let explicit = snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0])? + removed;
+        let mut explicit = removed;
+        for g in resolved.ids(snap) {
+            explicit += snap.count(Perm::Gspo, &[g.0])?;
+        }
         if explicit >= 10_000 && removed * LARGE_DELETION > explicit {
             return Err(Fallback(format!(
                 "{removed} of {explicit} explicit triples were removed, more than a full run handles faster"
@@ -746,7 +799,7 @@ fn update_closure(
         }
     }
     progress(opts, 0.0, "reading the previous closure");
-    let prev = maintain::previous(store, snap, since, digest, inc.cache, raw)?;
+    let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw)?;
     let mut closure = prev.closure;
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &closure.terms, &mut warnings);
@@ -868,9 +921,9 @@ fn write_changes<'a>(
     Ok(w)
 }
 
-/// Clear [`INFERRED_GRAPH`], run the rules over the default graph, and write every
-/// derived triple that is not already in the default graph into [`INFERRED_GRAPH`] in
-/// one write transaction.
+/// Clear [`INFERRED_GRAPH`], run the rules over the input graphs, and write every derived
+/// triple that is not already in one of them into [`INFERRED_GRAPH`] in one write
+/// transaction.
 ///
 /// The store's writer lock is held for the whole run, so the entailments are exactly
 /// those of the committed default graph at the start.
@@ -911,7 +964,13 @@ pub fn dred_overdeletion(
     profile: &Profile,
     removed: &[Triple],
 ) -> anyhow::Result<usize> {
-    let d = derive(snap, profile, &Extras::default(), &ReasonOptions::default())?;
+    let d = derive(
+        snap,
+        profile,
+        &Extras::default(),
+        &[Id::DEFAULT_GRAPH],
+        &ReasonOptions::default(),
+    )?;
     let mut warnings = Vec::new();
     let rules = engine::compile(
         &profile_rules(profile, &Extras::default())?,
@@ -940,16 +999,19 @@ pub fn dred_overdeletion(
     ))
 }
 
-/// Run the rules over a snapshot's default graph and return the derived triples that
-/// are valid RDF, without writing anything (dry run / testing). Blank nodes created by
-/// `makeTemp` / `makeSkolem` get labels `r<hex>`.
+/// Run the rules over a snapshot's input graphs ([`ReasonOptions::inputs`]) and return
+/// the derived triples that are valid RDF, without writing anything (dry run / testing).
+/// Blank nodes created by `makeTemp` / `makeSkolem` get labels `r<hex>`.
 pub fn infer(
     snap: Arc<Snapshot>,
     profile: &Profile,
     opts: &ReasonOptions,
 ) -> anyhow::Result<(Vec<Triple>, ReasonReport)> {
     let t0 = Instant::now();
-    let d = derive(snap, profile, &Extras::default(), opts)?;
+    opts.inputs.validate()?;
+    let resolved = inputs::resolve(&snap, &opts.inputs);
+    let ids = resolved.ids(&snap);
+    let d = derive(snap, profile, &Extras::default(), &ids, opts)?;
     let mut out = Vec::new();
     for t in d.derived() {
         if !d.valid(t) {
@@ -975,6 +1037,7 @@ pub fn infer(
         millis: t0.elapsed().as_millis() as u64,
         warnings: d.warnings,
         receipt: None,
+        inputs: Some(resolved),
         ..Default::default()
     };
     Ok((out, report))
