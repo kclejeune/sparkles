@@ -281,6 +281,7 @@ pub fn recorded_extras(info: &ReasoningInfo) -> anyhow::Result<sparkles_reasoner
 }
 
 /// What started a reasoning run.
+#[cfg(feature = "reasoning")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     /// `POST /$/reason/{ds}`

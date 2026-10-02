@@ -2914,17 +2914,24 @@ async fn reason_auto_clear(State(st): St, Path(name): Path<String>) -> ApiResult
     set_auto(&st, &name, None).await
 }
 
+#[cfg(not(feature = "reasoning"))]
+async fn set_auto(
+    _: &Arc<AppState>,
+    _: &str,
+    _: Option<crate::state::AutoSetting>,
+) -> ApiResult<Json<J>> {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `reasoning` feature",
+    ))
+}
+
+#[cfg(feature = "reasoning")]
 async fn set_auto(
     st: &Arc<AppState>,
     name: &str,
     auto: Option<crate::state::AutoSetting>,
 ) -> ApiResult<Json<J>> {
-    if !cfg!(feature = "reasoning") {
-        return Err(err(
-            StatusCode::NOT_IMPLEMENTED,
-            "built without the `reasoning` feature",
-        ));
-    }
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
