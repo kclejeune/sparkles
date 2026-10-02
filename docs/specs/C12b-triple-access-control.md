@@ -149,8 +149,8 @@ equal the triple's, for those of the three it uses. A pattern that uses none of 
 as `ex:config ex:open true`, lets every covered triple through or none. A pattern that
 uses a caller variable the caller lacks has no solution. The pattern is matched against
 the union of every graph of the dataset as its default graph, and `GRAPH` reaches the
-named graphs. Other claims of an identity are not kept after sign-in, so they are not
-available.
+named graphs. A principal carries its name and groups, not the other claims of its
+identity provider, so patterns see those two only.
 
 ### 2.4 Evaluation
 
