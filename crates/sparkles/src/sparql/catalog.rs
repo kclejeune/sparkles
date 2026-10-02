@@ -156,6 +156,7 @@ pub fn extension_aggregates() -> Vec<String> {
 /// Every property function IRI: `text:query`, the vector and hybrid searches, and with
 /// the `geo` feature Jena's `spatial:` property functions.
 pub fn property_functions() -> Vec<String> {
+    #[cfg_attr(not(feature = "geo"), allow(unused_mut))]
     let mut out = vec![
         super::textpf::TEXT_QUERY.to_string(),
         crate::vector::VECTOR_SEARCH.to_string(),
