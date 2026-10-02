@@ -56,8 +56,8 @@ full feature list is in [FEATURES.md](FEATURES.md).
 
 | Area | QLever | Sparkles |
 |---|---|---|
-| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Tested to 10.5M. The external-sort path has tests but no measurements at 100M+. |
-| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. |
+| Scale | Tested to tens of billions of triples (Wikidata, UniProt) | Measured up to 11M triples (WatDiv at scale 100). The external-sort path has tests but no measurements at 100M+. |
+| Streaming execution | Lazy, block-wise scans, joins, filters and GROUP BY; results streamed to the client | Every operator materializes its result, within row and memory budgets. Responses over 1 MiB are streamed as they are serialized. Materialization and the 1 GiB block cache trade memory for speed. After the 10.5M benchmark, Sparkles' server holds 892 MiB to QLever's 676 MiB, and 513 MiB without its block cache ([BENCHMARKS.md](BENCHMARKS.md#memory-and-the-speed-it-buys)). |
 | Block prefiltering | FILTER ranges and STRSTARTS checked against block min/max to skip blocks | Numeric range FILTERs on a scan's sort column read only the matching id ranges (inline integers and decimals). Non-canonical numerals are tested row by row. `STRSTARTS` and a `REGEX` anchored on a literal start read only the vocabulary ids of the keys with that start. |
 | Pattern trick | `ql:has-predicate`, per-subject predicate patterns | ✗ (predicate counts come from index runs) |
 | Text and spatial | `ql:contains-word`, BM25 scoring, spatial joins, a geo index | BM25 search through `text:query` (no text/entity co-occurrence index). GeoSPARQL functions, a spatial index, spatial joins and nearest-neighbour ORDER BY. |
@@ -132,9 +132,12 @@ Sparkles' own.
 | Write durability | One RocksDB transaction per request, written to RocksDB's WAL without an fsync (RocksDB's default) | The WAL is fsynced before a write is acknowledged. A commit waits for one `fdatasync`. When it adds terms the dataset has not seen before, they go to a separate file, which is synced at the same time as the WAL. A commit message or change digest adds one more. |
 
 Oxigraph describes its query evaluation as "not optimized yet". It evaluates lazily, one
-iterator per RocksDB scan. In the benchmarks it loads data second fastest, after Sparkles,
-but joins, grouping, sorting and counting run 10–400× slower than Sparkles at 10.5M
-triples, and it serves 2 concurrent star-join queries per second to Sparkles' 191.
+iterator per RocksDB scan. In the benchmarks at 10.5M triples, it answers point lookups
+and single paths about as fast as Sparkles, within 1.1–1.4×. Joins, grouping, sorting and
+counting run about 40–1,400× slower, and one EXISTS join 8,553× slower. It serves 1.7
+concurrent star-join queries per second to Sparkles' 242. Its load, including
+`optimize`, takes 13.2 s to Sparkles' 6.5 s. Its single-triple updates are the fastest
+of the five engines, 3.7 ms to Sparkles' 4.9 ms, because it does not fsync them.
 Oxigraph has no reasoning, SHACL, full-text or vector search, point-in-time reads,
 authentication or per-dataset permissions, Fuseki admin API, query budgets, result cache
 or web UI.
