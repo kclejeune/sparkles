@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod conditional;
 #[cfg(feature = "fmt")]
 mod format;
 mod history;
@@ -46,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
         header::LINK,
+        header::ETAG,
         header::RETRY_AFTER,
         header::HeaderName::from_static("ratelimit"),
         header::HeaderName::from_static("ratelimit-policy"),
@@ -391,6 +393,7 @@ impl From<Error> for ApiError {
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
@@ -399,6 +402,7 @@ impl From<Error> for ApiError {
             Error::Rejected(r) => return validation::rejection(&r),
             Error::HistoryUnsupported(_) => json!({ "error": msg, "code": "history-unsupported" }),
             Error::StorageFull(_) => json!({ "error": msg, "code": "storage-full" }),
+            Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -1285,10 +1289,15 @@ async fn get_commit(
             format!("commit metadata before {} is no longer retained", seq + 1),
         )
     })?;
+    let note = ds.store.annotation(seq);
+    let commit = sparkles::commit::AnnotatedCommit {
+        commit: &c,
+        annotation: note.as_ref(),
+    };
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
-        "commit": c,
+        "commit": commit,
     })))
 }
 
@@ -1803,17 +1812,22 @@ async fn gsp(
                 operation: Some(Op::Gsp),
                 ..Default::default()
             };
-            let resp = if head {
-                ct.into_response()
-            } else {
-                let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
-                if let Some((bytes, quads)) = whole {
-                    report.response_bytes = Some(bytes);
-                    report.rows = Some(quads);
+            let id = ds.store.dataset_id();
+            let tag = conditional::etag(id, seq, fmt);
+            let negotiated = !params.has("format");
+            let resp = match conditional::check_read(&headers, id, seq, &tag)? {
+                conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
+                conditional::ReadOutcome::Send if head => ct.into_response(),
+                conditional::ReadOutcome::Send => {
+                    let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
+                    if let Some((bytes, quads)) = whole {
+                        report.response_bytes = Some(bytes);
+                        report.rows = Some(quads);
+                    }
+                    (ct, body).into_response()
                 }
-                (ct, body).into_response()
             };
-            let resp = with_commit(resp, &ds, seq);
+            let resp = with_commit(conditional::with_etag(resp, &tag, negotiated), &ds, seq);
             Ok(report.attach(history::history_headers(resp, resolved.as_ref(), &uri)))
         }
         Method::PUT | Method::POST => {
@@ -1832,7 +1846,9 @@ async fn gsp(
                 })?;
             let replace = method == Method::PUT;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -1882,7 +1898,9 @@ async fn gsp(
             }
             history::reject_at(&params)?;
             let wanted = receipt_wanted(&params, &headers);
-            let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+            wopts.opts.precondition =
+                conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();

@@ -353,15 +353,48 @@ pub fn query(
     Ok(())
 }
 
+/// The `Sparkles-Commit-Message` value of `m`: as is when it is ASCII, else an RFC 8187
+/// extended value (`UTF-8''…`, percent-encoded), which every HTTP stack passes through.
+fn message_header(m: &str) -> String {
+    let ext = m
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("utf-8''"));
+    if m.is_ascii() && !ext {
+        m.to_string()
+    } else {
+        format!(
+            "UTF-8''{}",
+            percent_encoding::utf8_percent_encode(m, percent_encoding::NON_ALPHANUMERIC)
+        )
+    }
+}
+
+/// Add `Sparkles-Commit-Message` to a write request.
+fn with_message(
+    req: reqwest::blocking::RequestBuilder,
+    message: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match message {
+        Some(m) => req.header("sparkles-commit-message", message_header(m)),
+        None => req,
+    }
+}
+
 /// `sparkles update --server URL --dataset DS`: prints the stats JSON.
-pub fn update(server: Option<&str>, insecure: bool, dataset: &str, update: &str) -> Result<()> {
+pub fn update(
+    server: Option<&str>,
+    insecure: bool,
+    dataset: &str,
+    update: &str,
+    message: Option<&str>,
+) -> Result<()> {
     let r = Remote::open(server, insecure)?;
+    let req = r
+        .req(Method::POST, &format!("/{}/update", ds_path(dataset)))
+        .header("content-type", "application/sparql-update")
+        .header("accept", "application/json");
     let resp = r.check(
-        r.req(Method::POST, &format!("/{}/update", ds_path(dataset)))
-            .header("content-type", "application/sparql-update")
-            .header("accept", "application/json")
-            .body(update.to_string())
-            .send(),
+        with_message(req, message).body(update.to_string()).send(),
         Some(dataset),
     )?;
     println!("{}", resp.text()?);
@@ -376,6 +409,7 @@ pub fn load(
     dataset: &str,
     graph: Option<&str>,
     files: &[PathBuf],
+    message: Option<&str>,
 ) -> Result<()> {
     if files.is_empty() {
         bail!("no files given");
@@ -419,7 +453,7 @@ pub fn load(
                 (reqwest::blocking::Body::new(tmp), None)
             }
         };
-        let mut req = r.req(Method::POST, &path);
+        let mut req = with_message(r.req(Method::POST, &path), message);
         if let Some(e) = encoding {
             req = req.header("content-encoding", e);
         }
@@ -438,4 +472,14 @@ pub fn load(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod message_tests {
+    #[test]
+    fn non_ascii_messages_travel_as_extended_values() {
+        assert_eq!(super::message_header("fix labels"), "fix labels");
+        assert_eq!(super::message_header("café"), "UTF-8''caf%C3%A9");
+        assert_eq!(super::message_header("utf-8''x"), "UTF-8''utf%2D8%27%27x");
+    }
 }
