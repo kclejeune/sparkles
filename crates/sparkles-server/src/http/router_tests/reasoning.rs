@@ -337,6 +337,9 @@ async fn automatic_runs_after_the_debounce() {
     );
     let s = get_json(&app, "/$/reason/t").await;
     assert_eq!(s["stale"], false);
+    // the automatic run updated the closure the dataset keeps in memory
+    assert_eq!(tasks[1].detail.as_ref().unwrap()["method"], "incremental");
+    assert_eq!(s["run"]["changes"]["source"], "memory", "{s}");
     let (rows, _) = b_instances(&app, "t").await;
     assert_eq!(rows.len(), 3);
 
@@ -353,6 +356,90 @@ async fn automatic_runs_after_the_debounce() {
     crate::reasoning::auto_reason_tick(&st, t1 + Duration::from_secs(20));
     wait_tasks(&st).await;
     assert_eq!(st.tasks.lock().len(), 3);
+}
+
+/// The last task's detail and message.
+fn last_task(st: &AppState) -> (J, String) {
+    let t = st.tasks.lock().last().unwrap().clone();
+    (t.detail.unwrap(), t.message.unwrap())
+}
+
+#[tokio::test]
+async fn incremental_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = open(dir.path(), None, false);
+    st.create("t", DbType::Persistent).unwrap();
+    load(&st, "t", "ex:C rdfs:subClassOf ex:B . ex:x a ex:C .");
+    let app = router(st.clone());
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs"}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["run"]["method"], "full", "{s}");
+    assert_eq!(s["run"].get("fallback"), None);
+
+    update(
+        &app,
+        "t",
+        "DELETE DATA { ex:x a ex:C } ; INSERT DATA { ex:y a ex:C }",
+    )
+    .await;
+    post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["stale"], false);
+    assert_eq!(s["run"]["method"], "incremental", "{s}");
+    let c = &s["run"]["changes"];
+    assert_eq!(
+        (&c["explicitAdded"], &c["explicitRemoved"], &c["source"]),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!("memory")
+        ),
+        "{s}"
+    );
+    let (detail, message) = last_task(&st);
+    assert_eq!(detail["method"], "incremental");
+    assert!(
+        message.contains("incremental: 1 explicit triples added, 1 removed"),
+        "{message}"
+    );
+    let (rows, _) = b_instances(&app, "t").await;
+    assert_eq!(rows, ["http://ex.org/y"]);
+
+    // asked for in full
+    update(&app, "t", "INSERT DATA { ex:z a ex:C }").await;
+    post_json(&app, "/$/reason/t", r#"{"rerun":true,"full":true}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(
+        (&s["run"]["method"], &s["stale"]),
+        (&serde_json::json!("full"), &serde_json::json!(false))
+    );
+
+    // after a restart the closure comes from the dataset
+    drop(app);
+    drop(st);
+    let st = open(dir.path(), None, false);
+    let app = router(st.clone());
+    update(&app, "t", "DELETE DATA { ex:y a ex:C }").await;
+    post_json(&app, "/$/reason/t", r#"{"rerun":true}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["run"]["method"], "incremental", "{s}");
+    assert_eq!(s["run"]["changes"]["source"], "store", "{s}");
+    let (rows, _) = b_instances(&app, "t").await;
+    assert_eq!(rows, ["http://ex.org/z"]);
+
+    // another profile runs in full, and says why
+    post_json(&app, "/$/reason/t", r#"{"profile":"rdfs-simple"}"#).await;
+    wait_tasks(&st).await;
+    let s = get_json(&app, "/$/reason/t").await;
+    assert_eq!(s["run"]["method"], "full");
+    assert_eq!(
+        s["run"]["fallback"], "the rules changed since the previous run",
+        "{s}"
+    );
 }
 
 #[tokio::test]

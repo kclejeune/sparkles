@@ -656,6 +656,11 @@ enum Cmd {
         /// became stale, even while writes continue (default: 12 x the debounce)
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
+        /// Keep the closure of each dataset's last materialization in memory, up to this
+        /// many triples, so that the next run updates it incrementally (0: keep none; a
+        /// run then reads it back from a persistent dataset)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
+        reason_cache_triples: usize,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -1106,6 +1111,10 @@ enum Cmd {
         /// Remove materialized inferences instead
         #[arg(long)]
         clear: bool,
+        /// Materialize in full instead of updating the previous materialization
+        /// incrementally
+        #[arg(long, conflicts_with = "clear")]
+        full: bool,
         /// Print the reasoning status (are the inferences up to date?)
         #[arg(long, conflicts_with_all = ["clear", "check", "profile", "rules"])]
         status: bool,
@@ -1584,6 +1593,7 @@ fn run() -> Result<()> {
             allow_unvalidated_writes,
             auto_reason,
             auto_reason_max_delay,
+            reason_cache_triples,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -1736,6 +1746,7 @@ fn run() -> Result<()> {
                     max.as_secs_f64()
                 );
             }
+            st.reason_cache_triples = reason_cache_triples;
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
                     bail!("--auto-reason: built without the `reasoning` feature");
@@ -2424,6 +2435,7 @@ fn run() -> Result<()> {
             vocab,
             geo_default_geometry,
             clear,
+            full,
             status,
             check,
             checks,
@@ -2477,23 +2489,31 @@ fn run() -> Result<()> {
                             .map_err(|_| anyhow::anyhow!("unknown profile '{p}'"))?
                     }
                 };
-                let r = sparkles_reasoner::materialize_with(
+                // the previous materialization, updated incrementally when it can be
+                let previous = state::read_reasoning_file(&loc);
+                let since = if full {
+                    None
+                } else {
+                    reasoning::incremental_since(previous.as_ref(), &store)
+                };
+                let r = sparkles_reasoner::materialize_incremental(
                     &store,
                     &profile,
                     &extras,
+                    sparkles_reasoner::Incremental { since, cache: None },
                     &Default::default(),
                 )?;
                 // lets `sparkles serve` pick the inferences up for this database, with
                 // the database's automatic re-run setting kept
                 let mut info = reasoning::recorded(&profile, &extras, &r, &store);
-                info.auto = state::read_reasoning_file(&loc).and_then(|i| i.auto);
+                info.auto = previous.and_then(|i| i.auto);
                 state::write_reasoning_file(&loc, Some(&info))?;
                 eprintln!(
-                    "{} inferred triples ({} rules, {} iterations, {} ms) → graph <{}>{}",
+                    "{} inferred triples ({} rules, {} ms; {}) → graph <{}>{}",
                     r.inferred,
                     r.rules,
-                    r.iterations,
                     r.millis,
+                    reasoning::run_text(&r),
                     sparkles_reasoner::INFERRED_GRAPH,
                     validation_note(r.receipt.as_ref().and_then(|r| r.validation.as_deref()))
                 );
