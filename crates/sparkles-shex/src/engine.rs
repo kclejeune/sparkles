@@ -32,8 +32,8 @@ pub fn validate(
     Ok(validate_typed(snap, schema, map, opts, None, &[])?.0)
 }
 
-/// The pairs of a typing and their values, of store nodes only.
-pub(crate) type PairValues = Vec<((Id, PairKind), bool)>;
+/// The pairs of a typing and their verdicts, of store nodes only.
+pub(crate) type PairValues = Vec<((Id, PairKind), typing::Verdict)>;
 
 /// [`validate`], with the pairs `fixed` answers read as its values, the pairs `extra`
 /// typed too, and the typing's pairs of store nodes returned with their values.

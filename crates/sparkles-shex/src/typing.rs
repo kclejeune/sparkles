@@ -117,6 +117,23 @@ pub type Read<'r> = dyn Fn(Id, PairKind) -> Tri + 'r;
 /// changed): a pair it answers is read as that value and never discovered.
 pub type Fixed<'f> = dyn Fn(Id, PairKind) -> Option<bool> + Sync + 'f;
 
+/// The final value of a pair, and whether it fails whatever the pairs it reads are:
+/// `AlwaysFalse` when its evaluation with every reference unknown was already `false`
+/// (a failing node constraint, say), so only a change to its own neighbourhood can make
+/// it `true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    True,
+    False,
+    AlwaysFalse,
+}
+
+impl Verdict {
+    pub fn holds(self) -> bool {
+        self == Verdict::True
+    }
+}
+
 impl<'a> Env<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -359,6 +376,8 @@ pub struct Typing {
     /// the pairs each pair read (forward edges), as offsets into `edges`
     starts: Vec<u32>,
     edges: Vec<u32>,
+    /// the pairs that failed with every reference unknown (see [`Verdict::AlwaysFalse`])
+    always_false: Vec<bool>,
     /// refinement waves per stratum
     pub waves: Vec<usize>,
     /// pair evaluations
@@ -406,12 +425,18 @@ impl Typing {
         }
     }
 
-    /// Every discovered pair and its final value.
-    pub fn values(&self) -> impl Iterator<Item = ((Id, PairKind), bool)> + '_ {
-        self.pairs
-            .iter()
-            .enumerate()
-            .map(|(i, &p)| (p, self.value(i as u32)))
+    /// Every discovered pair and its verdict.
+    pub fn values(&self) -> impl Iterator<Item = ((Id, PairKind), Verdict)> + '_ {
+        self.pairs.iter().enumerate().map(|(i, &p)| {
+            let v = if self.value(i as u32) {
+                Verdict::True
+            } else if self.always_false[i] {
+                Verdict::AlwaysFalse
+            } else {
+                Verdict::False
+            };
+            (p, v)
+        })
     }
 
     /// The value of a pair decided for good, if it is.
@@ -463,6 +488,7 @@ pub fn run_fixed(
         state: Vec::new(),
         starts: vec![0],
         edges: Vec::new(),
+        always_false: Vec::new(),
         waves: Vec::new(),
         evaluations: 0,
     };
@@ -486,14 +512,22 @@ fn discover(env: &Env<'_>, t: &mut Typing, fixed: Option<&Fixed<'_>>) -> anyhow:
         let results = env.par_map(&env.registry, &frontier, |w, i| {
             let (node, kind) = tr.pairs[i as usize];
             let reads = RefCell::new(Vec::new());
+            // whether a read answered with a value (the result may depend on it)
+            let definite = std::cell::Cell::new(false);
             // decided pairs are final; the others are unknown and become edges
             let read = |n: Id, k: PairKind| match tr.decided(n, k) {
-                Some(b) => Tri::from(b),
+                Some(b) => {
+                    definite.set(true);
+                    Tri::from(b)
+                }
                 None => match fixed
                     .filter(|_| tr.get(n, k).is_none())
                     .and_then(|f| f(n, k))
                 {
-                    Some(b) => Tri::from(b),
+                    Some(b) => {
+                        definite.set(true);
+                        Tri::from(b)
+                    }
                     None => {
                         reads.borrow_mut().push((n, k));
                         Tri::Unknown
@@ -505,9 +539,11 @@ fn discover(env: &Env<'_>, t: &mut Typing, fixed: Option<&Fixed<'_>>) -> anyhow:
             if r != Tri::Unknown {
                 reads.clear();
             }
-            Ok((r, reads))
+            let always_false = r == Tri::False && !definite.get();
+            Ok((r, reads, always_false))
         })?;
-        for (i, (r, mut reads)) in results.into_iter().enumerate() {
+        for (i, (r, mut reads, always_false)) in results.into_iter().enumerate() {
+            t.always_false.push(always_false);
             let state = match r {
                 Tri::True => TRUE,
                 Tri::False => FALSE,

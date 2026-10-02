@@ -18,7 +18,8 @@
 //! the pairs of the nodes the write touched, reading the other pairs the head had as
 //! `true` from that typing, and goes on to the nodes that refer to a pair whose value
 //! changed. A pair the head had as `false` is typed again wherever it is read, because
-//! a greatest fixed point can turn it `true`. So a new `foaf:knows` arc between two
+//! a greatest fixed point can turn it `true`, unless it failed with every reference
+//! unknown: only a change to its own neighbourhood can turn such a pair `true`. So a new `foaf:knows` arc between two
 //! people who conform validates one node, not every person who knows them.
 //!
 //! A `{FOCUS p o}` or `{s p FOCUS}` selector selects a node by an arc, so a changed `p`

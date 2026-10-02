@@ -38,6 +38,7 @@ use crate::ast::Schema;
 use crate::engine::PairValues;
 use crate::ir::{Ir, PairKind};
 use crate::resolve::Resolver;
+use crate::typing::Verdict;
 use crate::{
     CompiledSchema, NoImports, NodeSelector, PrefixMap, ResultMap, SchemaFormat, ShapeMap,
     ValidateOptions,
@@ -236,7 +237,7 @@ struct HeadTyping {
     commit: u64,
     /// the generation whose ids it uses (a compaction renumbers terms)
     generation: u64,
-    values: FxHashMap<(Id, PairKind), bool>,
+    values: FxHashMap<(Id, PairKind), Verdict>,
     /// the pair kinds of each node
     by_node: FxHashMap<Id, Vec<PairKind>>,
 }
@@ -544,8 +545,16 @@ impl ShexGuard {
                 .filter_map(|id| c.view.term(id).map(|term| (id, term)))
                 .collect();
             let map = incremental::associations(&self.map, &c.view, Some(post_data), &nodes)?;
+            // outside the region: what conformed, and what fails whatever it reads
             let fixed = |n: Id, k: PairKind| -> Option<bool> {
-                (!region.contains(&n) && t.values.get(&(n, k)) == Some(&true)).then_some(true)
+                if region.contains(&n) {
+                    return None;
+                }
+                match t.values.get(&(n, k))? {
+                    Verdict::True => Some(true),
+                    Verdict::AlwaysFalse => Some(false),
+                    Verdict::False => None,
+                }
             };
             let (after, values) = crate::engine::validate_typed(
                 &c.view,
@@ -561,7 +570,10 @@ impl ShexGuard {
             // along a chain takes one more typing, not one per link
             let mut stack: Vec<Id> = Vec::new();
             for &((n, k), v) in &values {
-                if t.values.get(&(n, k)).is_some_and(|&old| old != v) {
+                if t.values
+                    .get(&(n, k))
+                    .is_some_and(|old| old.holds() != v.holds())
+                {
                     stack.push(n);
                 }
             }
@@ -600,7 +612,7 @@ impl ShexGuard {
             ) else {
                 return Ok(Propagation::Unknown);
             };
-            match t.values.get(&(id, kind)) {
+            match t.values.get(&(id, kind)).map(|v| v.holds()) {
                 Some(true) => {}
                 Some(false) => before.push(crate::ShapeResult {
                     node: node.clone(),
