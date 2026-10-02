@@ -284,7 +284,21 @@ impl Dataset {
             Some(GraphNameRef::NamedNode(n)) => GraphSel::Named(n.into_owned()),
             Some(GraphNameRef::BlankNode(b)) => GraphSel::Blank(b.into_owned()),
         };
-        let plan = scan_plan(&snap, &sel, subject, predicate, object);
+        let plan = scan_plan(&snap, &sel, subject, predicate, object, false);
+        QuadIter::new(snap, plan)
+    }
+
+    /// [`quads`](Self::quads) over every graph, read from an index that orders the
+    /// quads of one triple next to each other, so that a caller can group a triple's
+    /// graphs without collecting the match.
+    pub fn quads_by_triple(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+    ) -> QuadIter {
+        let snap = self.store.snapshot();
+        let plan = scan_plan(&snap, &GraphSel::Any, subject, predicate, object, true);
         QuadIter::new(snap, plan)
     }
 
@@ -577,6 +591,65 @@ impl Transaction<'_> {
         };
         find_quads(&self.txn.view(), &sel, subject, predicate, object)
     }
+
+    /// [`insert`](Self::insert), except that a blank node whose label names a stored
+    /// node (`b…`, as [`find`](Self::find) and the dataset's reads hand it out) is that
+    /// node rather than a new one. Other labels are scoped to the transaction as in
+    /// `insert`, and a `b…` label that names no stored node is such a label.
+    pub fn insert_linked(&mut self, quad: QuadRef<'_>) -> Result<bool> {
+        let mut link = |b: oxrdf::BlankNodeRef<'_>| {
+            if self.labels.contains_key(b.as_str()) {
+                return;
+            }
+            if let Some(id) = crate::store::parse_bnode_label(b.as_str())
+                && self.txn.bnode_allocated(id)
+            {
+                self.labels.insert(b.as_str().to_string(), id);
+            }
+        };
+        if let oxrdf::NamedOrBlankNodeRef::BlankNode(b) = quad.subject {
+            link(b);
+        }
+        each_blank_node(quad.object, &mut link);
+        if let GraphNameRef::BlankNode(b) = quad.graph_name {
+            link(b);
+        }
+        self.insert(quad)
+    }
+
+    /// The stored blank node that `label` names in this transaction: the node an
+    /// earlier insert made or linked for the label, or `None` when no insert has used
+    /// it. Its label is the one later reads and writes use for the node.
+    pub fn blank_node(&self, label: &str) -> Option<oxrdf::BlankNode> {
+        self.labels
+            .get(label)
+            .map(|id| crate::store::bnode_for(*id))
+    }
+
+    /// Run a SPARQL query that sees this transaction's changes.
+    pub fn query_with(&self, query: &str, opts: &QueryOptions) -> Result<QueryResult> {
+        crate::sparql::query(Arc::new(self.txn.view()), query, opts)
+    }
+
+    /// Run a SPARQL Update request in this transaction. Its operations see the
+    /// transaction's changes, and they commit or roll back with it.
+    pub fn update_with(&mut self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
+        crate::sparql::update::update_in(&mut self.txn, update, opts)
+    }
+}
+
+/// Call `f` on each blank node of a term, inside triple terms too.
+fn each_blank_node<'a>(t: oxrdf::TermRef<'a>, f: &mut impl FnMut(oxrdf::BlankNodeRef<'a>)) {
+    match t {
+        oxrdf::TermRef::BlankNode(b) => f(b),
+        oxrdf::TermRef::Triple(tr) => {
+            if let oxrdf::NamedOrBlankNode::BlankNode(b) = &tr.subject {
+                f(b.as_ref());
+            }
+            each_blank_node(tr.object.as_ref(), f);
+        }
+        _ => {}
+    }
 }
 
 // ------------------------------------------------------------------------ solutions ----
@@ -699,12 +772,15 @@ impl ScanPlan {
 }
 
 /// The scan of a pattern, or `None` when a bound term is not in the store (no match).
+/// With `graph_last`, the scan reads a permutation that ends with the graph, so the
+/// quads of one triple are adjacent.
 fn scan_plan(
     snap: &Snapshot,
     graph: &GraphSel,
     subject: Option<&NamedOrBlankNode>,
     predicate: Option<&NamedNode>,
     object: Option<&Term>,
+    graph_last: bool,
 ) -> Option<ScanPlan> {
     let mut bound: [Option<u64>; 4] = [None; 4];
     if let Some(s) = subject {
@@ -729,6 +805,7 @@ fn scan_plan(
     // permutation with the longest prefix of bound components
     let (perm, plen) = Perm::ALL
         .iter()
+        .filter(|&&p| !(graph_last && p.order()[3] != G))
         .map(|&p| {
             (
                 p,
@@ -758,7 +835,7 @@ fn find_quads(
     predicate: Option<&NamedNode>,
     object: Option<&Term>,
 ) -> Result<Vec<Quad>> {
-    let Some(plan) = scan_plan(snap, graph, subject, predicate, object) else {
+    let Some(plan) = scan_plan(snap, graph, subject, predicate, object, false) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -1061,5 +1138,102 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(it.count() as u64, ds.len() - 1);
+    }
+
+    #[test]
+    fn quads_by_triple_groups_a_triples_graphs() {
+        let ds = Dataset::memory();
+        let mut nq = String::new();
+        for i in 0..300 {
+            for g in ["", " <http://ex.org/g1>", " <http://ex.org/g2>"] {
+                if (i + g.len()) % 2 == 0 || g.is_empty() {
+                    nq.push_str(&format!(
+                        "<http://ex.org/s{}> <http://ex.org/p> \"{i}\"{g} .\n",
+                        i % 7
+                    ));
+                }
+            }
+        }
+        ds.load_str(&nq, RdfFormat::NQuads).unwrap();
+        for s in [None, Some(NamedOrBlankNode::from(n("s3")))] {
+            let got: Vec<Quad> = ds
+                .quads_by_triple(s.as_ref(), None, None)
+                .collect::<Result<_>>()
+                .unwrap();
+            let mut want = ds.find(None, s.as_ref(), None, None).unwrap();
+            assert_eq!(got.len(), want.len());
+            // each triple's quads form one run
+            let mut seen = FxHashSet::default();
+            for (i, q) in got.iter().enumerate() {
+                let t = (q.subject.clone(), q.predicate.clone(), q.object.clone());
+                let same = i > 0 && {
+                    let p = &got[i - 1];
+                    (p.subject.clone(), p.predicate.clone(), p.object.clone()) == t
+                };
+                assert!(same || seen.insert(t), "a triple's quads are not adjacent");
+            }
+            let mut got = got;
+            got.sort_by_key(|q| q.to_string());
+            want.sort_by_key(|q| q.to_string());
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn transactions_link_stored_blank_nodes_and_run_sparql() {
+        let ds = Dataset::memory();
+        ds.load_str("_:a <http://ex.org/p> \"1\" .", RdfFormat::NTriples)
+            .unwrap();
+        let stored = ds.find(None, None, None, None).unwrap()[0].subject.clone();
+        let NamedOrBlankNode::BlankNode(b) = &stored else {
+            panic!("not a blank node")
+        };
+        let q =
+            |s: &NamedOrBlankNode| Quad::new(s.clone(), n("q"), n("o"), GraphName::DefaultGraph);
+        let fresh = NamedOrBlankNode::from(oxrdf::BlankNode::new_unchecked("x"));
+        let unallocated = NamedOrBlankNode::from(oxrdf::BlankNode::new_unchecked("bfffff"));
+        let made = ds
+            .transaction(|tx| {
+                // a stored label names the stored node; others name new nodes
+                assert!(tx.insert_linked(q(&stored).as_ref())?);
+                assert!(tx.insert_linked(q(&fresh).as_ref())?);
+                assert!(tx.insert_linked(q(&unallocated).as_ref())?);
+                assert_eq!(tx.blank_node(b.as_str()).as_ref(), Some(b));
+                let made = tx.blank_node("x").unwrap();
+                assert_ne!(&made, b);
+                assert_ne!(tx.blank_node("bfffff").unwrap().as_str(), "bfffff");
+                // queries and updates in the transaction see its changes
+                let r = tx.query_with(
+                    "SELECT ?s WHERE { ?s <http://ex.org/q> ?o }",
+                    &QueryOptions::default(),
+                )?;
+                assert_eq!(r.table.len(), 3);
+                let st = tx.update_with(
+                    "DELETE WHERE { ?s <http://ex.org/p> ?o }",
+                    &QueryOptions::default(),
+                )?;
+                assert_eq!(st.deleted, 1);
+                Ok(made)
+            })
+            .unwrap();
+        let s_of = |p: &str| -> Vec<NamedOrBlankNode> {
+            ds.find(None, None, Some(&n(p)), None)
+                .unwrap()
+                .into_iter()
+                .map(|q| q.subject)
+                .collect()
+        };
+        assert!(s_of("p").is_empty());
+        let qs = s_of("q");
+        assert_eq!(qs.len(), 3);
+        assert!(qs.contains(&stored));
+        assert!(qs.contains(&made.into()));
+        // an update that fails leaves the transaction's earlier work to its caller
+        let r = ds.transaction(|tx| {
+            tx.insert(q(&n("t").into()).as_ref())?;
+            tx.update_with("INSERT DATA { <a:x> <a:y> }", &QueryOptions::default())
+        });
+        assert!(r.is_err());
+        assert!(s_of("q").len() == 3);
     }
 }

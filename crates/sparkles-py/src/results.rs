@@ -324,6 +324,16 @@ pub struct PyUpdateStats {
     pub operations: usize,
 }
 
+impl From<sparkles::sparql::update::UpdateStats> for PyUpdateStats {
+    fn from(s: sparkles::sparql::update::UpdateStats) -> Self {
+        PyUpdateStats {
+            inserted: s.inserted,
+            deleted: s.deleted,
+            operations: s.operations,
+        }
+    }
+}
+
 #[pymethods]
 impl PyUpdateStats {
     fn __repr__(&self) -> String {

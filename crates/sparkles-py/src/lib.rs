@@ -4,6 +4,7 @@
 
 mod dataset;
 mod errors;
+mod interrupt;
 mod io;
 mod results;
 mod terms;
@@ -32,6 +33,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     validate::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
+    m.add_class::<interrupt::PyCancelToken>()?;
     m.add("INFERRED_GRAPH", dataset::INFERRED_GRAPH)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     let features: Vec<&str> = FEATURES

@@ -317,6 +317,16 @@ class ShexReport:
 # ----------------------------------------------------------------------- dataset ----
 
 @final
+class CancelToken:
+    """Cancels the queries and updates it is passed to; `cancel()` works from any
+    thread."""
+
+    def __new__(cls) -> CancelToken: ...
+    def cancel(self) -> None: ...
+    @property
+    def cancelled(self) -> bool: ...
+
+@final
 class Transaction:
     """A write transaction; as a context manager it commits at the end of the block and
     rolls back if the block raises."""
@@ -332,6 +342,35 @@ class Transaction:
         graph_name: _GraphName | str | None = None,
     ) -> list[Quad]: ...
     def __contains__(self, quad: Quad | Triple, /) -> bool: ...
+    def query(
+        self,
+        query: str,
+        *,
+        base_iri: str | None = None,
+        prefixes: Mapping[str, str] | None = None,
+        bindings: Mapping[str | Variable, _Term] | None = None,
+        default_graph: Iterable[NamedNode | str] | None = None,
+        named_graphs: Iterable[NamedNode | str] | None = None,
+        include_inferred: bool = False,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+    ) -> _QueryResult: ...
+    def update(
+        self,
+        update: str,
+        *,
+        base_iri: str | None = None,
+        prefixes: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+    ) -> UpdateStats: ...
+    def _apply(self, ops: Iterable[tuple[bool, Quad]]) -> tuple[int, int, dict[str, str]]: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
     def __enter__(self) -> Transaction: ...
@@ -384,6 +423,11 @@ class Dataset:
         named_graphs: Iterable[NamedNode | str] | None = None,
         include_inferred: bool = False,
         timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
     ) -> _QueryResult: ...
     def select(
         self,
@@ -396,6 +440,11 @@ class Dataset:
         named_graphs: Iterable[NamedNode | str] | None = None,
         include_inferred: bool = False,
         timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
     ) -> QuerySolutions: ...
     def ask(
         self,
@@ -408,6 +457,11 @@ class Dataset:
         named_graphs: Iterable[NamedNode | str] | None = None,
         include_inferred: bool = False,
         timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
     ) -> bool: ...
     def construct(
         self,
@@ -420,6 +474,11 @@ class Dataset:
         named_graphs: Iterable[NamedNode | str] | None = None,
         include_inferred: bool = False,
         timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
+        at: int | str | None = None,
     ) -> QueryTriples: ...
     def update(
         self,
@@ -427,6 +486,11 @@ class Dataset:
         *,
         base_iri: str | None = None,
         prefixes: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+        max_memory_bytes: int | None = None,
+        max_rows_produced: int | None = None,
+        cancel: CancelToken | None = None,
     ) -> UpdateStats: ...
     def add(self, quad: Quad | Triple) -> bool: ...
     def remove(self, quad: Quad | Triple) -> bool: ...
@@ -437,6 +501,13 @@ class Dataset:
         predicate: NamedNode | None = None,
         object: _Term | None = None,
         graph_name: _GraphName | str | None = None,
+    ) -> QuadIterator: ...
+    def _apply(self, ops: Iterable[tuple[bool, Quad]]) -> tuple[int, int, dict[str, str]]: ...
+    def _quads_by_triple(
+        self,
+        subject: _Subject | None = None,
+        predicate: NamedNode | None = None,
+        object: _Term | None = None,
     ) -> QuadIterator: ...
     def __iter__(self) -> QuadIterator: ...
     def __contains__(self, quad: Quad | Triple, /) -> bool: ...

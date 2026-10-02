@@ -53,6 +53,60 @@ pub fn update_as(
     kind: crate::commit::CommitKind,
 ) -> Result<UpdateStats> {
     let t0 = Instant::now();
+    let parsed = parse_update(u, opts)?;
+    let depth = super::depth::check_update(&parsed)?;
+    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+}
+
+/// Run a SPARQL Update request inside an open write transaction without committing it.
+/// The operations see the transaction's earlier changes, and the transaction commits or
+/// discards them with the rest of its work. The request's timeout and cancellation apply
+/// to its own operations. `opts.write` does not apply, because the transaction was
+/// opened with write options of its own.
+pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
+    let t0 = Instant::now();
+    let parsed = parse_update(u, opts)?;
+    let depth = super::depth::check_update(&parsed)?;
+    super::depth::with_stack(depth, || {
+        validate_geometry(&parsed)?;
+        if let Some(access) = opts.graphs.as_ref() {
+            for op in &parsed.operations {
+                check_constant_graphs(access, op)?;
+            }
+        }
+        let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut stats = UpdateStats {
+            operations: parsed.operations.len(),
+            ..Default::default()
+        };
+        let t1 = Instant::now();
+        let req = Request {
+            opts,
+            deadline: opts.timeout.map(|t| t0 + t),
+            base: parsed.base_iri.clone(),
+            budget: RequestBudget::new(&opts.outbound),
+            produced: Default::default(),
+        };
+        for op in &parsed.operations {
+            req.check()?;
+            run_op(txn, op, &req, &mut stats)?;
+        }
+        req.check()?;
+        stats.rows_produced = req.produced.load(std::sync::atomic::Ordering::Relaxed);
+        let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        stats.timing = Timing {
+            parse_ms,
+            plan_ms: 0.0,
+            exec_ms,
+            serialize_ms: 0.0,
+            total_ms: parse_ms + exec_ms,
+        };
+        Ok(stats)
+    })
+}
+
+/// Parse an update request with the base IRI and prefixes of `opts`.
+fn parse_update(u: &str, opts: &QueryOptions) -> Result<spargebra::Update> {
     let mut p = super::aggext::register(SparqlParser::new());
     if let Some(b) = &opts.base_iri {
         p = p
@@ -64,9 +118,17 @@ pub fn update_as(
             .with_prefix(k, v)
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
-    let parsed = p.parse_update(u)?;
-    let depth = super::depth::check_update(&parsed)?;
-    super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
+    Ok(p.parse_update(u)?)
+}
+
+/// Malformed geometry constants fail before anything is written.
+fn validate_geometry(parsed: &spargebra::Update) -> Result<()> {
+    for op in &parsed.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
+            crate::geo::validate_query(pattern, &mut |_| {})?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `u` parses as an update that only inserts or deletes data (`INSERT DATA`,
@@ -106,11 +168,7 @@ fn run_update(
     t0: Instant,
 ) -> Result<UpdateStats> {
     // malformed geometry constants fail before the writer lock is taken
-    for op in &parsed.operations {
-        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
-            crate::geo::validate_query(pattern, &mut |_| {})?;
-        }
-    }
+    validate_geometry(parsed)?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut stats = UpdateStats {
         operations: parsed.operations.len(),
@@ -145,7 +203,7 @@ fn run_update(
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
-        run_op(&mut txn, op, &req, &mut stats, store)?;
+        run_op(&mut txn, op, &req, &mut stats)?;
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
@@ -229,7 +287,6 @@ fn run_op(
     op: &GraphUpdateOperation,
     req: &Request<'_>,
     stats: &mut UpdateStats,
-    store: &Store,
 ) -> Result<()> {
     match op {
         GraphUpdateOperation::InsertData { data } => {
@@ -530,7 +587,6 @@ fn run_op(
         }
         GraphUpdateOperation::Create { .. } => {}
     }
-    let _ = store;
     Ok(())
 }
 
