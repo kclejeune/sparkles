@@ -536,3 +536,41 @@ class) and `docs` (class `ex:Doc` with `?s ex:owner ?user`). Users `tadmin` (adm
   runs, refused routes, listings, `whoami`, schema reports, drafted shapes, diffs, the
   change feed and stored queries, and validates configurations.
   `router_tests::mcp::auth::tools_follow_triple_protections` covers the MCP tools.
+- Crate and server tests, Clippy over all targets, `mise run lint:features`, the W3C
+  suites (SPARQL 1.0 482/482, 1.1 query 328/328, 1.1 update 157/157, 1.2 269/269), the
+  SHACL suites (98/98 and 20/20), shexTest (validation 1062 passed with its one known
+  failure), `mise run test:jena-clients` (138 checks) and `mise run ci` pass.
+
+**Performance.** Measured over HTTP on the 1.05M-quad benchmark data
+(`scripts/gen-data.py 100000`), with the result cache off, through keep-alive
+connections, as medians of 60 rounds that run every caller once per round in a rotating
+order. The machine was shared with other builds (load average about 20 on 16 cores), so
+differences under about 0.2 ms are noise. `main` is the commit this work started from,
+and the full callers are an `admin` token and, on this change, a token whose grants lift
+every protection. The protected callers hide salaries (100,000 quads, by predicate), the
+triples of managers (81,295 quads of 10,000 subjects, by class), or books that the caller
+did not write (56,118 quads, by class and a pattern over `ex:authorOf` and `foaf:name`).
+
+| Query (median ms) | `main`, full | This change, full | Lifted | Salaries hidden | Managers hidden | Books by pattern |
+|---|---|---|---|---|---|---|
+| `COUNT(*)` of everything | 0.56 | 0.46 | 0.39 | 1.01 | 0.96 | 0.79 |
+| average salary | 6.65 | 6.54 | 6.54 | 1.30 | 7.57 | 6.65 |
+| instances per class | 0.85 | 0.81 | 0.75 | 0.79 | 2.25 | 2.41 |
+| a star join on managers | 2.75 | 2.76 | 2.64 | 2.75 | 2.29 | 2.67 |
+| one subject | 0.24 | 0.20 | 0.19 | 0.19 | 0.19 | 0.18 |
+| a three-hop `foaf:knows` path | 0.35 | 0.27 | 0.27 | 0.26 | 0.70 | 0.27 |
+| a numeric filter | 0.55 | 0.44 | 0.44 | 0.44 | 0.93 | 0.43 |
+| books and titles | 1.23 | 0.89 | 0.91 | 0.82 | 0.88 | 0.90 |
+| a join with salaries | 1.65 | 1.44 | 1.38 | 0.88 | 3.21 | 1.35 |
+| the ten lowest salaries | 3.74 | 3.62 | 3.55 | 1.08 | 3.84 | 3.48 |
+
+A caller without protections in force runs as before: its options carry no rules, the
+snapshot has no mask, and the plans of the graph-view tests' full views are unchanged.
+The differences between the first two columns are noise of the shared machine. A
+protected caller pays once per commit for its mask: the first request after a commit took
+0.16 s to 0.6 s for these views across runs, and later requests reuse the masked
+snapshot. On the mask, counts from statistics correct for the hidden quads (0.4 ms more
+for `COUNT(*)`), and scans through blocks with hidden quads merge them like any deleted
+quads, which costs up to twice the time where the hidden quads are spread over the
+subjects a query reads (the managers' class counts, paths, filters and joins). Queries
+over hidden predicates get faster, since there is less to read.
