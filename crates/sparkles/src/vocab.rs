@@ -373,6 +373,14 @@ impl AppendVocab {
         self.map.insert(k, i);
         (i, true)
     }
+    /// Keep the first `n` entries only.
+    pub fn truncate(&mut self, n: u64) {
+        while self.keys.len() as u64 > n {
+            let k = self.keys.pop().expect("longer than n");
+            self.key_bytes -= k.len();
+            self.map.remove(&k);
+        }
+    }
     pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> {
         self.keys.iter().enumerate().map(|(i, k)| (i as u64, &**k))
     }
@@ -399,6 +407,14 @@ pub(crate) fn delta_entries(buf: &[u8]) -> (Vec<&[u8]>, usize) {
     (keys, pos)
 }
 
+/// The end of a delta vocabulary at some moment (see [`DeltaVocab::mark`]).
+#[derive(Clone, Copy, Debug)]
+pub struct VocabMark {
+    entries: u64,
+    bytes: u64,
+    unsynced: bool,
+}
+
 /// The persisted, append-only delta vocabulary (terms introduced by updates).
 ///
 /// Readers and the single writer share it through an `RwLock`; ids only ever grow, so a
@@ -411,6 +427,8 @@ pub struct DeltaVocab {
 /// The append handle of a delta vocabulary file.
 struct DeltaFile {
     w: BufWriter<File>,
+    /// the file's length with the entries still in `w`'s buffer
+    len: u64,
     /// entries were appended since the last [`DeltaVocab::sync`]
     unsynced: bool,
     #[cfg(test)]
@@ -460,10 +478,12 @@ impl DeltaVocab {
             }
         }
         let f = OpenOptions::new().create(true).append(true).open(path)?;
+        let len = f.metadata()?.len();
         Ok(DeltaVocab {
             inner: RwLock::new(v),
             file: Some(parking_lot::Mutex::new(DeltaFile {
                 w: BufWriter::new(f),
+                len,
                 unsynced: false,
                 #[cfg(test)]
                 fail_next_sync: false,
@@ -495,8 +515,63 @@ impl DeltaVocab {
             f.unsynced = true;
             f.w.write_all(&(key.len() as u32).to_le_bytes())?;
             f.w.write_all(key)?;
+            f.len += 4 + key.len() as u64;
         }
         Ok(id)
+    }
+
+    /// Where the vocabulary ends now, for a later [`rollback`](Self::rollback).
+    pub fn mark(&self) -> VocabMark {
+        let entries = self.len();
+        match &self.file {
+            Some(f) => {
+                let f = f.lock();
+                VocabMark {
+                    entries,
+                    bytes: f.len,
+                    unsynced: f.unsynced,
+                }
+            }
+            None => VocabMark {
+                entries,
+                bytes: 0,
+                unsynced: false,
+            },
+        }
+    }
+
+    /// Remove every entry inserted since `m` (writer only, with no snapshot reaching
+    /// those ids). Entries still in the write buffer are dropped unwritten; when the
+    /// buffer already spilled past the mark, the file is truncated back to it.
+    pub fn rollback(&self, m: &VocabMark) -> Result<()> {
+        let mut inner = self.inner.write();
+        if inner.len() <= m.entries {
+            return Ok(());
+        }
+        inner.truncate(m.entries);
+        let Some(f) = &self.file else {
+            return Ok(());
+        };
+        let mut guard = f.lock();
+        let f = &mut *guard;
+        // take the buffered bytes out without writing them (`into_parts` does not flush)
+        let dup = f.w.get_ref().try_clone()?;
+        let old = std::mem::replace(&mut f.w, BufWriter::new(dup));
+        let (_, buf) = old.into_parts();
+        let buf = buf.unwrap_or_default();
+        let on_disk = f.len - buf.len() as u64;
+        let w = &mut f.w;
+        if on_disk <= m.bytes {
+            // the entries since the mark are all still buffered
+            w.write_all(&buf[..(m.bytes - on_disk) as usize])?;
+            f.unsynced = m.unsynced;
+        } else {
+            // the buffer spilled past the mark: cut the file back
+            w.get_ref().set_len(m.bytes)?;
+            f.unsynced = true;
+        }
+        f.len = m.bytes;
+        Ok(())
     }
 
     /// Make every inserted entry durable. Without new entries since the last sync this

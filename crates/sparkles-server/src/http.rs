@@ -26,6 +26,7 @@ mod budgets;
 mod changes;
 mod conditional;
 mod diff;
+mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
 pub(crate) mod history;
@@ -48,6 +49,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         header::HeaderName::from_static(crate::reasoning::SPARKLES_INFERENCES),
         header::HeaderName::from_static(history::SPARKLES_AT),
         header::HeaderName::from_static(validation::SPARKLES_VALIDATION),
+        header::HeaderName::from_static(dry_run::SPARKLES_DRY_RUN),
+        header::HeaderName::from_static(dry_run::SPARKLES_DRY_RUN_OUTCOME),
         header::HeaderName::from_static(history::SPARKLES_HEAD),
         header::HeaderName::from_static("memento-datetime"),
         header::HeaderName::from_static("sparkles-diff-from"),
@@ -426,6 +429,7 @@ impl From<Error> for ApiError {
             Error::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::GuardMissing(_) => StatusCode::NOT_IMPLEMENTED,
             Error::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+            // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = match e {
@@ -1609,6 +1613,21 @@ async fn update_endpoint(
     let wanted = receipt_wanted(&params, &headers);
     let timeout = opts.timeout;
     let restricted = opts.graphs.is_some();
+    let dry = opts
+        .write
+        .dry_run
+        .as_ref()
+        .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
+    // the response to the update's result: a dry run's preview, its statistics, or the
+    // write's error
+    let finish =
+        move |ds: &Dataset, r: Result<sparkles::sparql::update::UpdateStats, Error>| match (r, dry)
+        {
+            (Err(Error::DryRun(p)), Some(d)) => Ok(d.respond(ds, &p)),
+            (r, _) => r
+                .map_err(|e| write_error(e, restricted))
+                .map(|stats| update_response(ds, stats, wanted, restricted)),
+        };
     let run = |ds: &Dataset, update: &str, opts: &QueryOptions| {
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
@@ -1631,21 +1650,13 @@ async fn update_endpoint(
         now.write.no_wait = true;
         match inline::run(|| run(&ds, &update, &now)) {
             Ok(Err(Error::WriterBusy)) => {}
-            Ok(r) => {
-                return r
-                    .map_err(|e| write_error(e, restricted))
-                    .map(|stats| update_response(&ds, stats, wanted, restricted))
-                    .map_err(|e| with_timeout(e, timeout));
-            }
+            Ok(r) => return finish(&ds, r).map_err(|e| with_timeout(e, timeout)),
             Err(e) => return Err(e),
         }
     }
-    blocking(move || {
-        let stats = run(&ds, &update, &opts).map_err(|e| write_error(e, restricted))?;
-        Ok(update_response(&ds, stats, wanted, restricted))
-    })
-    .await
-    .map_err(|e| with_timeout(e, timeout))
+    blocking(move || finish(&ds, run(&ds, &update, &opts)))
+        .await
+        .map_err(|e| with_timeout(e, timeout))
 }
 
 /// The response to a SPARQL Update: its statistics, and the receipt when `wanted`.
@@ -2241,6 +2252,11 @@ async fn gsp(
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             wopts.opts.graphs = view.clone();
+            let dry = wopts
+                .opts
+                .dry_run
+                .as_ref()
+                .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -2261,14 +2277,18 @@ async fn gsp(
                         None if matches!(target, Target::Dataset) => ReplaceTarget::All,
                         None => ReplaceTarget::Default,
                     };
-                    ds.store
-                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)
-                        .map_err(|e| write_error(e, restricted))?
+                    match (
+                        ds.store.replace_with(t, &[src], CommitKind::GspPut, &wopts),
+                        dry,
+                    ) {
+                        (Err(Error::DryRun(p)), Some(d)) => return Ok(d.respond(&ds, &p)),
+                        (r, _) => r.map_err(|e| write_error(e, restricted))?,
+                    }
                 } else {
-                    let r = ds
-                        .store
-                        .load_with(&[src], CommitKind::GspPost, &wopts)
-                        .map_err(|e| write_error(e, restricted))?;
+                    let r = match (ds.store.load_with(&[src], CommitKind::GspPost, &wopts), dry) {
+                        (Err(Error::DryRun(p)), Some(d)) => return Ok(d.respond(&ds, &p)),
+                        (r, _) => r.map_err(|e| write_error(e, restricted))?,
+                    };
                     (if r.committed { r.commit.inserted } else { 0 }, r)
                 };
                 let status = if replace {
@@ -2299,6 +2319,11 @@ async fn gsp(
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
             wopts.opts.graphs = view.clone();
+            let dry = wopts
+                .opts
+                .dry_run
+                .as_ref()
+                .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
             let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -2318,19 +2343,24 @@ async fn gsp(
                     }
                     Target::Dataset => "CLEAR ALL".to_string(),
                 };
-                let stats = sparkles::sparql::update::update_as(
-                    &ds.store,
-                    &clear,
-                    &QueryOptions {
-                        timeout,
-                        cancel: wopts.cancel.clone(),
-                        graphs: wopts.graphs.clone(),
-                        write: wopts,
-                        ..Default::default()
-                    },
-                    sparkles::commit::CommitKind::GspDelete,
-                )
-                .map_err(|e| write_error(e, restricted))?;
+                let stats = match (
+                    sparkles::sparql::update::update_as(
+                        &ds.store,
+                        &clear,
+                        &QueryOptions {
+                            timeout,
+                            cancel: wopts.cancel.clone(),
+                            graphs: wopts.graphs.clone(),
+                            write: wopts,
+                            ..Default::default()
+                        },
+                        sparkles::commit::CommitKind::GspDelete,
+                    ),
+                    dry,
+                ) {
+                    (Err(Error::DryRun(p)), Some(d)) => return Ok(d.respond(&ds, &p)),
+                    (r, _) => r.map_err(|e| write_error(e, restricted))?,
+                };
                 let receipt = stats.commit.clone().expect("update receipts");
                 Ok(write_report(Op::Gsp, stats.deleted).attach(write_response(
                     &ds,
@@ -2369,6 +2399,11 @@ async fn upload(
         .get::<Principal>()
         .and_then(|p| p.view(&name, crate::auth::Endpoint::Upload));
     let restricted = wopts.opts.graphs.is_some();
+    let dry = wopts
+        .opts
+        .dry_run
+        .as_ref()
+        .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -2471,10 +2506,14 @@ async fn upload(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let receipt = ds
-            .store
-            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)
-            .map_err(|e| write_error(e, restricted))?;
+        let receipt = match (
+            ds.store
+                .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts),
+            dry,
+        ) {
+            (Err(Error::DryRun(p)), Some(d)) => return Ok(d.respond(&ds, &p)),
+            (r, _) => r.map_err(|e| write_error(e, restricted))?,
+        };
         let count = if receipt.committed {
             receipt.commit.inserted
         } else {
@@ -3875,6 +3914,8 @@ mod budgets_tests;
 mod compress_tests;
 #[cfg(test)]
 mod diff_tests;
+#[cfg(test)]
+mod dry_run_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

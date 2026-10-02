@@ -432,10 +432,13 @@ impl ShexGuard {
             _ => None,
         };
         let ms = t0.elapsed().as_millis() as u64;
-        self.last_full.store(ms, Ordering::Relaxed);
-        self.associations
-            .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
-        *self.warnings.lock() = rm.warnings.clone();
+        // a dry run changes none of the status the guard reports
+        if o.dry_run.is_none() {
+            self.last_full.store(ms, Ordering::Relaxed);
+            self.associations
+                .store((rm.conformant + rm.nonconformant) as u64, Ordering::Relaxed);
+            *self.warnings.lock() = rm.warnings.clone();
+        }
         Ok((self.summarize(rm, introduced, self.limit(o), ms), typing))
     }
 
@@ -681,7 +684,9 @@ impl ShexGuard {
             (false, _) => GuardStatus::Passed,
         };
         s.focus_nodes = Some(focus);
-        self.associations.store(total, Ordering::Relaxed);
+        if c.opts.dry_run.is_none() {
+            self.associations.store(total, Ordering::Relaxed);
+        }
         let exact = Exact {
             commit: c.base.commit + 1,
             nonconformant,
@@ -907,7 +912,20 @@ fn engine_error(e: anyhow::Error) -> sparkles::Error {
 impl CommitGuard for ShexGuard {
     fn check(&self, c: &Candidate<'_>) -> sparkles::Result<ValidationSummary> {
         let seq = c.base.commit + 1;
+        // a dry run validates like a write and records nothing: no counters, no history,
+        // no state for the next commit
+        let live = c.opts.dry_run.is_none();
         if !self.relevant(&c.view, &c.changes) {
+            if !live {
+                let mut s = ValidationSummary::empty(
+                    GuardStatus::Skipped,
+                    self.cfg.mode,
+                    Severity::Violation,
+                );
+                s.language = GuardLanguage::Shex;
+                s.limit = self.cfg.report_limit;
+                return Ok(s);
+            }
             self.counters.count(GuardStatus::Skipped);
             let baseline = self
                 .baseline
@@ -930,6 +948,9 @@ impl CommitGuard for ShexGuard {
             return Ok(s);
         }
         let (summary, exact, typing) = self.check_data(c)?;
+        if !live {
+            return Ok(summary);
+        }
         self.counters.count(summary.status);
         self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {

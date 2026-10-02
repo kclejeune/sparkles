@@ -586,6 +586,94 @@ async fn updates_pass_write_time_validation() {
     assert!(r["structuredContent"]["validation"].is_object(), "{r}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_runs_preview_updates() {
+    let s = open(&["--mcp-allow-update"], false);
+    let head = s.state.get("t").unwrap().store.head_commit().seq;
+    let r = tool(
+        &s.app,
+        "sparql_update",
+        json!({"update": "INSERT DATA { ex:carol a ex:Person . GRAPH ex:g { ex:carol ex:p 1 } }",
+               "dryRun": true, "changes": 1, "message": "add carol"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    let out = &r["structuredContent"];
+    assert_eq!(
+        (
+            &out["dryRun"],
+            &out["committed"],
+            &out["wouldCommit"],
+            &out["outcome"]
+        ),
+        (&json!(true), &json!(false), &json!(true), &json!("commit"))
+    );
+    assert_eq!(
+        (&out["head"], &out["commit"]),
+        (&json!(head), &json!(head + 1))
+    );
+    assert_eq!((&out["inserted"], &out["deleted"]), (&json!(2), &json!(0)));
+    assert_eq!(out["graphs"].as_array().unwrap().len(), 2, "{out}");
+    assert_eq!(out["changes"]["total"], 2);
+    assert_eq!(out["changes"]["truncated"], true);
+    assert!(
+        out["changes"]["quads"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("+ "),
+        "{out}"
+    );
+    assert_eq!(out["message"], "add carol");
+    assert_eq!(s.state.get("t").unwrap().store.head_commit().seq, head);
+    // changes needs a dry run, and is bounded
+    let r = tool(
+        &s.app,
+        "sparql_update",
+        json!({"update": "INSERT DATA { ex:x ex:y ex:z }", "changes": 1}),
+        &[],
+    )
+    .await;
+    assert_eq!(tool_error(&r), "bad-argument");
+    let r = tool(
+        &s.app,
+        "sparql_update",
+        json!({"update": "INSERT DATA { ex:x ex:y ex:z }", "dryRun": true, "changes": 101}),
+        &[],
+    )
+    .await;
+    assert_eq!(tool_error(&r), "bad-argument");
+    assert_eq!(s.state.get("t").unwrap().store.head_commit().seq, head);
+}
+
+#[cfg(feature = "shacl")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_dry_run_is_a_result() {
+    let s = open(&["--mcp-allow-update"], false);
+    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix ex: <http://ex.org/> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\nex:S a sh:NodeShape ; sh:targetClass ex:Person ; sh:property [ sh:path rdfs:label ; sh:minCount 1 ] .\n";
+    let cfg = json!({"mode": "reject", "shapes": {"inline": shapes}});
+    let put = Request::put("/$/validation/t")
+        .header("content-type", "application/json")
+        .body(Body::from(cfg.to_string()))
+        .unwrap();
+    assert_eq!(send(&s.app, put).await.status, StatusCode::OK);
+    let r = tool(
+        &s.app,
+        "sparql_update",
+        json!({"update": "INSERT DATA { ex:eve a ex:Person }", "dryRun": true}),
+        &[],
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    let out = &r["structuredContent"];
+    assert_eq!(out["outcome"], "rejected");
+    assert_eq!(out["validation"]["status"], "rejected");
+    assert!(
+        out["error"].as_str().unwrap().contains("blocking result"),
+        "{out}"
+    );
+}
+
 // --------------------------------------------------------- resources, prompts ------
 
 #[tokio::test(flavor = "multi_thread")]

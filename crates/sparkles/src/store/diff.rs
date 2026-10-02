@@ -535,6 +535,32 @@ fn compare_states(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
     Ok(read)
 }
 
+/// The net changes from state `a` to state `b`, removals first, each by graph, subject,
+/// predicate and object. A state comparison under `o`'s budget and deadline (a write
+/// preview of a bulk write).
+pub(super) fn compare_changes(
+    a: &Snapshot,
+    b: &Snapshot,
+    o: &DiffOptions,
+) -> Result<Vec<(DiffOp, Quad)>> {
+    let mut net = Net {
+        map: FxHashMap::default(),
+        opts: o,
+        readable: FxHashMap::default(),
+    };
+    compare_states(a, b, &mut net)?;
+    o.over(net.map.len() as u64)?;
+    let mut changes: Vec<(QuadKey, bool)> = net.map.into_iter().collect();
+    changes.sort_unstable_by(|x, y| (x.1, &x.0).cmp(&(y.1, &y.0)));
+    Ok(changes
+        .into_iter()
+        .filter_map(|(k, added)| {
+            let op = if added { DiffOp::Add } else { DiffOp::Remove };
+            key_quad(&k).map(|q| (op, q))
+        })
+        .collect())
+}
+
 /// Two states of one generation differ only where their deltas do.
 fn compare_deltas(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> {
     let spo = Perm::Spo.index();

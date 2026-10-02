@@ -158,6 +158,33 @@ impl Quota {
         Ok(())
     }
 
+    /// For a preview of a small commit: the quota, the bytes used, and the bytes after
+    /// appending `wal_bytes` (`None` without a quota).
+    pub(crate) fn project_commit(&self, wal_bytes: u64) -> Option<(u64, u64, u64)> {
+        let limit = self.limit()?;
+        let used = self.used();
+        Some((limit, used, used.saturating_add(wal_bytes)))
+    }
+
+    /// For a preview of a rebuild: the quota, the bytes used before the generation in
+    /// `new` was built, and the bytes once it replaced `old`, as
+    /// [`check_rebuild`](Self::check_rebuild) measures them (`None` without a quota).
+    pub(crate) fn project_rebuild(
+        &self,
+        old: Option<&Path>,
+        new: &Path,
+    ) -> Option<(u64, u64, u64)> {
+        let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
+            return None;
+        };
+        let now = dir_size(root);
+        Some((
+            limit,
+            now.saturating_sub(dir_size(new)),
+            now.saturating_sub(old.map_or(0, dir_size)),
+        ))
+    }
+
     pub(crate) fn status(&self) -> QuotaStatus {
         let own = *self.own.read();
         QuotaStatus {

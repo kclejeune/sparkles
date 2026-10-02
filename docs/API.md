@@ -906,6 +906,98 @@ matches. Sparkles compares the commit a tag names instead. Its tags identify the
 exactly, even though they cannot promise identical bytes, and that is what a concurrency
 check needs.
 
+### Write previews
+
+The design and its rationale are in [C15 Write previews](specs/C15-write-previews.md).
+
+Any write can run as a dry run. An update, a Graph Store `PUT`, `POST` or `DELETE`, or an
+upload becomes one with the parameter `dryRun=true`, in the query string or an update's
+form body, or with the header `Sparkles-Dry-Run: true`. `dryRun` with no value means
+`true`, and `dryRun=false` is an ordinary write. Any other value is a `400`, so a typo
+never turns a preview into a write.
+
+A dry run runs the write as it would run. It takes the writer lock, executes the update
+or the Graph Store change in a transaction against the head, and runs the dataset's
+write-time validation on the result. It then reports what the commit would be and rolls
+the transaction back. Nothing is written. The write-ahead log, the commit catalog, the
+change feed, the published snapshot, the full-text, vector and spatial indexes, the
+inference status and the validation guard's counters stay as they were, and the next
+commit gets the number it would have got. Terms the write would add to the vocabulary
+are removed again. A write large enough for the bulk path builds its new index
+generation, validates and measures it, then deletes it.
+
+Every other parameter of the write applies: `timeout`, the query budgets of an update,
+`validate=false`, `validationLimit`, `Sparkles-Commit-Message`, `If-Match` and
+`If-None-Match`. A dry run needs the permission the write needs, and a read-only server
+refuses it like any write.
+
+`changes=N`, from 0 to 10,000, lists up to `N` changed quads. A response looks like this:
+
+```json
+{ "dryRun": true, "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "committed": false, "wouldCommit": true, "outcome": "commit", "head": 42,
+  "commit": { "seq": 43, "parent": 42, "ref": "commit:43", "kind": "update",
+              "inserted": 2, "deleted": 1, "quads": 1205, "generation": "gen-0007",
+              "bulk": false, "exact": true, "message": "fix titles" },
+  "graphs": [ { "graph": null, "inserted": 1, "deleted": 1 },
+              { "graph": "http://example.org/g1", "inserted": 1, "deleted": 0 } ],
+  "changes": { "total": 3, "limit": 10, "truncated": false,
+               "quads": [ { "op": "-", "subject": "<urn:a>", "predicate": "<urn:p>",
+                            "object": "\"old\"", "graph": null }, … ] },
+  "validation": { "language": "shacl", "status": "passed", … },
+  "precondition": { "status": "passed" },
+  "storage": { "status": "fits", "limit": 1073741824, "used": 52428800, "projected": 52428899 } }
+```
+
+| Member | Meaning |
+|---|---|
+| `committed` | Always `false`. |
+| `wouldCommit` | Whether the write would create a commit. A write with no net effect would not. |
+| `outcome` | `commit`, `no-change`, `precondition-failed`, `rejected` or `storage-refused`. |
+| `head` | The commit the write ran against. `Sparkles-Commit` names it too. |
+| `commit` | The commit the write would create, as in a [receipt](#commits), without `timestamp` and `digest`, which only a real commit has. When `wouldCommit` is false, the head, as in a receipt of a write with no net effect. |
+| `graphs` | Each graph the write changes, with its net counts. `graph` is `null` for the default graph. The default graph comes first, then the named graphs by IRI. The counts add up to the commit's. |
+| `changes` | With `changes=N`. `total` counts every changed quad, and `quads` lists the first `N`, removals first, in the form of [diffs](#diffs-between-commits). |
+| `validation` | The write-time validation summary the write would get, in the guard's mode, including grandfather mode. Absent when no guard runs. |
+| `precondition` | With `If-Match` or `If-None-Match`, whether the condition holds, with the `error` the write would get when it does not. |
+| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write. A refusal has the `error` and its `budget` or `code`. |
+
+The status is the one the write would get. A write that would succeed answers `200`. A
+write that a failed precondition would stop answers `412`, one the guard would reject
+answers `422`, and one the quota would refuse answers `507`. Each of these still carries
+the whole preview, with every check evaluated, plus the `error`, `code`, `budget` and
+`validation` members of the real error. When several apply, the status is the one the
+write would meet first: the precondition, then the validation, then the storage, except
+that a bulk write measures its new generation before it validates it. Any other failure,
+such as a syntax error, a missing permission or a timeout, is the write's own error.
+Responses carry `Sparkles-Dry-Run: true` and `Sparkles-Dry-Run-Outcome` with the
+outcome, and `Sparkles-Validation` when a guard ran.
+
+With `Accept: application/rdf-patch` (or `text/rdf-patch`, or
+`application/rdf-patch+thrift` for the binary form), a write that would succeed answers
+with its whole net change as an [RDF Patch](#diffs-between-commits). Its `id` is the IRI
+of the commit the write would create and its `prev` that of the head. A patch lists every
+change, so `changes` is a `400` with a patch format. The listing and the patch count
+against the `rows` budget (`--max-rows`), and a patch larger than `--max-export-mb`
+fails with `result-bytes`. On the bulk path they compare the two states, which reads
+both.
+
+A caller limited to some graphs gets the counts of the graphs it may write, without the
+commit's dataset-wide counts, the validation results or the quota's byte counts, as in
+its receipts.
+
+```sh
+curl 'localhost:3030/ds/update?dryRun=true&changes=20' \
+  -H 'Content-Type: application/sparql-update' --data-binary @migration.ru
+curl -X PUT 'localhost:3030/ds/data?graph=http://ex/g&dryRun' \
+  -H 'Content-Type: text/turtle' -H 'Accept: application/rdf-patch' --data-binary @g.ttl
+```
+
+A Graph Store `PUT` that goes through the write-ahead log deletes only the old quads the
+new content lacks, and inserts only the quads the graph lacks. Its result and its
+receipt are those of replacing the graph, and its log, change feed entry and incremental
+validation cover only what changed.
+
 ## Commits
 
 The design and its rationale are in [CI Durable commit identity](specs/CI-commit-identity.md).
@@ -4412,7 +4504,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
-| `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. Listed only when the server allows updates and the caller may write to a dataset (below). |
+| `sparql_update` | `update` (required, ≤ 1 Mi characters), `message` (the commit message), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, message?, validation?, elapsedMs}`: the receipt of the write. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
 
 Every tool except `sparql_query` declares an `outputSchema` and returns
 `structuredContent` plus the same object as one compact JSON text block. `tools/list`
@@ -4487,6 +4579,16 @@ refused with `load-disabled`, because it would read files or fetch URLs. A query
 this tool fails with `not-an-update`. The result is the write's receipt, with the
 commit's sequence number, the quads inserted and deleted, and the validation summary when
 a guard ran.
+
+With `dryRun: true` the update is a [write preview](#write-previews). It runs up to its
+commit and writes nothing. The result has `dryRun: true`, `committed: false`,
+`wouldCommit`, `outcome`, the `head` it ran against, the sequence number the commit would
+get as `commit`, its net `inserted` and `deleted` counts, the counts per graph, and
+`storage` (`fits` or `refused`). `changes: N` lists up to 100 changed quads as lines of
+rendered terms, such as `+ ex:carol a ex:Person`. A dry run that validation would reject
+or the quota would refuse is not a tool error. Its result says so in `outcome` and
+`error`, with the validation summary, so an agent can read the findings and revise the
+update. A dry run needs the same permission as the write, and `--mcp-allow-update` too.
 
 ### Resources and prompts
 

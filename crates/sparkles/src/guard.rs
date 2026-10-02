@@ -58,6 +58,7 @@ pub struct Candidate<'a> {
 }
 
 /// What a transaction changed.
+#[derive(Clone, Copy)]
 pub enum Changes<'a> {
     /// effective inserts (`1`) and deletes (`2`) of the WAL path
     Log(&'a [(u8, [Id; 4])]),
@@ -110,6 +111,11 @@ pub struct WriteOptions {
     /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)
     /// before the quad is looked up.
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
+    /// Preview the write instead of committing it: it runs as it would, then ends with
+    /// [`Error::DryRun`](crate::Error::DryRun) where it would have committed, and
+    /// nothing is written (see [`crate::preview`]). Guards see it on
+    /// [`Candidate::opts`] and must record nothing for such a check.
+    pub dry_run: Option<crate::preview::DryRun>,
 }
 
 /// A check of the committed state that a write depends on (an HTTP `If-Match`, say).

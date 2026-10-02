@@ -1,11 +1,13 @@
 //! `sparql_update`: the one write tool. It is offered only when the operator turns it on
 //! (`sparkles mcp --allow-update`, `serve --mcp-allow-update`), never on a read-only
 //! server, and only to callers that may write to the dataset. LOAD is refused, the write
-//! passes the dataset's write-time validation, and the commit carries a message.
+//! passes the dataset's write-time validation, and the commit carries a message. With
+//! `dryRun` the update is previewed instead: it runs up to its commit, and the result
+//! says what the commit would be (see `docs/specs/C15-write-previews.md`).
 
 use super::Outcome;
 use super::errors::ToolError;
-use super::render::Prefixes;
+use super::render::{Prefixes, Terms};
 use super::tools::{Tools, dataset_prefixes, parse};
 use crate::auth::Level;
 use serde::Deserialize;
@@ -18,6 +20,9 @@ use std::time::Instant;
 /// The longest update text, in characters.
 const MAX_UPDATE_CHARS: usize = 1 << 20;
 
+/// The most changed quads a dry run lists.
+const MAX_CHANGES: usize = 100;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct UpdateArgs {
@@ -25,6 +30,8 @@ struct UpdateArgs {
     update: String,
     message: Option<String>,
     timeout_seconds: Option<f64>,
+    dry_run: Option<bool>,
+    changes: Option<usize>,
 }
 
 /// What the update parses to, as far as this tool cares.
@@ -80,6 +87,16 @@ impl Tools<'_> {
             )));
         }
         let timeout = self.timeout(a.timeout_seconds)?;
+        let dry_run = a.dry_run.unwrap_or(false);
+        let changes = a.changes.unwrap_or(0);
+        if changes > MAX_CHANGES {
+            return Err(ToolError::bad_argument(format!(
+                "changes must be at most {MAX_CHANGES}"
+            )));
+        }
+        if changes > 0 && !dry_run {
+            return Err(ToolError::bad_argument("changes needs dryRun"));
+        }
         let ds = self.dataset(a.dataset.as_deref())?;
         let p = &self.call.principal;
         if !p.can(&ds.name, Level::Write) {
@@ -139,12 +156,23 @@ impl Tools<'_> {
             precondition: None,
             no_wait: false,
             graphs: opts.graphs.clone(),
+            dry_run: dry_run.then_some(sparkles::preview::DryRun {
+                changes,
+                all_changes: false,
+                max_changes: 0,
+            }),
         };
         // a caller limited to some graphs learns that the guard refused, not its results
         let restricted = opts.graphs.is_some();
-        let stats =
-            sparkles::sparql::update::update_as(&ds.store, &a.update, &opts, CommitKind::Update)
-                .map_err(|e| match e {
+        let result =
+            sparkles::sparql::update::update_as(&ds.store, &a.update, &opts, CommitKind::Update);
+        if let Err(sparkles::Error::DryRun(p)) = result {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return Ok(Outcome::Structured(preview_json(
+                &ds.name, &p, &prefixes, restricted, changes, elapsed_ms,
+            )));
+        }
+        let stats = result.map_err(|e| match e {
                     sparkles::Error::Rejected(_) if restricted => ToolError::new(
                         "validation-failed",
                         422,
@@ -190,4 +218,99 @@ impl Tools<'_> {
             },
         }
     }
+}
+
+/// The result of a dry run: what the commit would be, its counts by graph, the first
+/// `changes` changed quads as rendered terms, and the checks the write would meet. A
+/// rejected or refused update is a result here, not a tool error, so that an agent can
+/// read the findings and revise the update.
+fn preview_json(
+    dataset: &str,
+    p: &sparkles::preview::Preview,
+    prefixes: &Prefixes,
+    restricted: bool,
+    changes: usize,
+    elapsed_ms: f64,
+) -> Value {
+    let c = p.receipt_commit();
+    let mut terms = Terms::new(prefixes, 500);
+    let mut out = json!({
+        "dataset": dataset,
+        "dryRun": true,
+        "committed": false,
+        "wouldCommit": p.commit.is_some(),
+        "outcome": p.outcome().name(),
+        "head": p.head.seq,
+        "commit": c.seq,
+        "inserted": if p.commit.is_some() { c.inserted } else { 0 },
+        "deleted": if p.commit.is_some() { c.deleted } else { 0 },
+        "graphs": p.graphs.iter().map(|g| {
+            let name = match &g.graph {
+                oxrdf::GraphName::DefaultGraph => Value::Null,
+                oxrdf::GraphName::NamedNode(n) => json!(terms.term(&oxrdf::Term::NamedNode(n.clone()))),
+                oxrdf::GraphName::BlankNode(b) => json!(b.to_string()),
+            };
+            json!({ "graph": name, "inserted": g.inserted, "deleted": g.deleted })
+        }).collect::<Vec<_>>(),
+        "storage": if p.storage.refused.is_some() { "refused" } else { "fits" },
+        "elapsedMs": elapsed_ms,
+    });
+    if let Some(m) = &p.message {
+        out["message"] = json!(m.as_ref());
+    }
+    if let Some(total) = p.changes_total.filter(|_| changes > 0) {
+        let rows: Vec<Value> = p
+            .changes
+            .iter()
+            .take(changes)
+            .map(|(op, q)| {
+                let mut line = format!(
+                    "{} {} {} {}",
+                    op.sign(),
+                    terms.term(&q.subject.clone().into()),
+                    terms.term(&oxrdf::Term::NamedNode(q.predicate.clone())),
+                    terms.term(&q.object),
+                );
+                match &q.graph_name {
+                    oxrdf::GraphName::DefaultGraph => {}
+                    oxrdf::GraphName::NamedNode(n) => {
+                        line.push(' ');
+                        line.push_str(&terms.term(&oxrdf::Term::NamedNode(n.clone())));
+                    }
+                    oxrdf::GraphName::BlankNode(b) => {
+                        line.push(' ');
+                        line.push_str(&b.to_string());
+                    }
+                }
+                json!(line)
+            })
+            .collect();
+        out["changes"] = json!({
+            "total": total,
+            "truncated": (rows.len() as u64) < total,
+            "quads": rows,
+        });
+    }
+    if let Some(v) = p
+        .validation
+        .as_deref()
+        .filter(|_| !restricted)
+        .and_then(|v| serde_json::to_value(v).ok())
+    {
+        out["validation"] = v;
+    }
+    match p.outcome() {
+        sparkles::preview::Outcome::Rejected if restricted => {
+            out["error"] = json!(
+                "the update does not conform to the dataset's validation guard; it would not be committed"
+            );
+        }
+        _ => {
+            if let Some(e) = p.error() {
+                out["error"] = json!(e);
+            }
+        }
+    }
+    out["prefixes"] = json!(terms.used());
+    out
 }

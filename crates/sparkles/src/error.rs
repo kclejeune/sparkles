@@ -65,6 +65,11 @@ pub enum Error {
     /// found the writer lock taken; nothing was written.
     #[error("another write is in progress")]
     WriterBusy,
+    /// A dry run ([`WriteOptions::dry_run`](crate::guard::WriteOptions)) stopped where
+    /// the write would have committed, with what the commit would be; nothing was
+    /// written. [`preview::catch`](crate::preview::catch) turns it into an `Ok`.
+    #[error("dry run: nothing was committed")]
+    DryRun(Box<crate::preview::Preview>),
 }
 
 /// Which budget a request exceeded.

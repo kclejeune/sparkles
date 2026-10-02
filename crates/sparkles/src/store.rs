@@ -15,6 +15,7 @@ mod changes;
 mod diff;
 mod geo;
 mod mem_history;
+mod preview;
 mod quota;
 mod schedule;
 mod vector;
@@ -2569,7 +2570,10 @@ impl Store {
                 }
             }
         };
-        if let Some(p) = &o.precondition {
+        // a dry run reports the precondition with the rest of its preview
+        if let Some(p) = &o.precondition
+            && o.dry_run.is_none()
+        {
             p.check(&self.snapshot())?;
         }
         if let Some(m) = &o.message {
@@ -2648,10 +2652,14 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> WriteTxn<'a> {
         let base = self.snapshot();
+        let mark = base.generation.dvocab.mark();
+        let start_bnode = guard.next_bnode;
         WriteTxn {
             store: self,
             delta: base.delta.clone(),
             base,
+            mark,
+            start_bnode,
             guard,
             log: Vec::new(),
             bulk: Vec::new(),
@@ -2712,6 +2720,10 @@ impl Store {
                 Severity::Violation,
             );
             summary.language = language;
+            // a dry run bypasses nothing: the guard, the metrics and the log see no write
+            if opts.dry_run.is_some() {
+                return Ok(Some(Arc::new(summary)));
+            }
             if let Some(g) = &g {
                 g.bypassed();
             }
@@ -2740,7 +2752,9 @@ impl Store {
             changes,
             opts,
         });
-        if let Some(o) = &observer {
+        if let Some(o) = &observer
+            && opts.dry_run.is_none()
+        {
             o.observe(language, kind, checked.as_ref(), t0.elapsed());
         }
         let summary = checked?;
@@ -2894,14 +2908,6 @@ impl Store {
                 v
             }
         };
-        for g in graphs {
-            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
-                if i % 65_536 == 65_535 {
-                    o.check()?;
-                }
-                txn.delete(Perm::Gspo.to_quad(&k))?;
-            }
-        }
         let mut ids = Vec::new();
         for quads in &parsed {
             o.check()?;
@@ -2910,6 +2916,22 @@ impl Store {
                 ids.push(txn.encode_quad(q, &mut labels)?);
             }
         }
+        // Only the old quads the new content lacks are deleted, and inserting a quad
+        // the graph still has changes nothing, so the transaction logs the difference
+        // alone. The result is the same as clearing the graphs first.
+        let keep: rustc_hash::FxHashSet<[Id; 4]> = ids.iter().copied().collect();
+        for g in graphs {
+            for (i, k) in view.scan_keys(Perm::Gspo, &[g.0])?.into_iter().enumerate() {
+                if i % 65_536 == 65_535 {
+                    o.check()?;
+                }
+                let q = Perm::Gspo.to_quad(&k);
+                if !keep.contains(&q) {
+                    txn.delete(q)?;
+                }
+            }
+        }
+        drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
         let r = txn.commit()?;
@@ -2992,13 +3014,20 @@ impl Store {
             (Some(_), Some(m)) => crate::annotations::validate_message(m)?,
             _ => None,
         };
-        // the old generation's WAL is the only other copy of the recent commits' ids:
-        // the catalog must be durable before it is discarded
-        self.catalog.lock().sync()?;
-        // and so must the full-text index, which could otherwise only catch up from it
-        #[cfg(feature = "text")]
-        if let Some(ti) = self.text.load_full() {
-            ti.checkpoint()?;
+        // a dry run builds and checks the generation, then removes it (see `preview`)
+        let dry = match (&bulk, &check) {
+            (Some(_), Some((_, o))) => o.dry_run.clone(),
+            _ => None,
+        };
+        if dry.is_none() {
+            // the old generation's WAL is the only other copy of the recent commits' ids:
+            // the catalog must be durable before it is discarded
+            self.catalog.lock().sync()?;
+            // and so must the full-text index, which could otherwise only catch up from it
+            #[cfg(feature = "text")]
+            if let Some(ti) = self.text.load_full() {
+                ti.checkpoint()?;
+            }
         }
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
@@ -3045,14 +3074,23 @@ impl Store {
             if let Some(i) = &interrupt {
                 i()?;
             }
+            let mut storage = crate::preview::StorageCheck::default();
             if bulk.is_some() {
-                self.check_memory(dir_size(&dir))?;
-                self.quota
-                    .check_rebuild(snap.generation.dir.as_deref(), &dir)?;
+                let old = snap.generation.dir.as_deref();
+                if dry.is_some() {
+                    storage = self.rebuild_storage(old, &dir);
+                }
+                let fits = self
+                    .check_memory(dir_size(&dir))
+                    .and_then(|_| self.quota.check_rebuild(old, &dir));
+                match fits {
+                    Err(e) if dry.is_some() => storage.refused = Some(e),
+                    r => r?,
+                }
             }
-            Ok(meta)
+            Ok((meta, storage))
         })();
-        let meta = match built {
+        let (meta, storage) = match built {
             Ok(m) => m,
             Err(e) => {
                 // the unfinished generation's space is freed now, not at the next rebuild
@@ -3065,30 +3103,34 @@ impl Store {
         let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
-        w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        if dry.is_none() {
+            w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        }
+        let head_seq = w.head.seq;
+        let candidate = || {
+            Arc::new(Snapshot {
+                generation: gen_.clone(),
+                delta: Delta::default(),
+                version: 0,
+                cache: self.cache.clone(),
+                results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
+                dvocab_len: gen_.dvocab.len(),
+                commit: head_seq,
+                text: None,
+                geo: None,
+                union_default_graph: self.opts.union_default_graph,
+                geo_op_vertices: self.opts.geo_op_vertices,
+                delta_stats: Default::default(),
+                counts: Default::default(),
+                historical: false,
+            })
+        };
         // a bulk commit is validated on the built generation, before anything is published
         let validation = match (&bulk, check) {
             (Some(b), Some((changes, o))) => {
-                let candidate = || {
-                    Arc::new(Snapshot {
-                        generation: gen_.clone(),
-                        delta: Delta::default(),
-                        version: 0,
-                        cache: self.cache.clone(),
-                        results: Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)),
-                        dvocab_len: gen_.dvocab.len(),
-                        commit: w.head.seq,
-                        text: None,
-                        geo: None,
-                        union_default_graph: self.opts.union_default_graph,
-                        geo_op_vertices: self.opts.geo_op_vertices,
-                        delta_stats: Default::default(),
-                        counts: Default::default(),
-                        historical: false,
-                    })
-                };
-                match self.run_guard(snap, candidate, b.kind, changes, o, w.head.seq) {
+                match self.run_guard(snap, candidate, b.kind, changes, o, head_seq) {
                     Ok(v) => v,
+                    Err(Error::Rejected(r)) if dry.is_some() => Some(Arc::new(r.summary)),
                     Err(e) => {
                         drop(gen_);
                         if self.root.is_some() {
@@ -3119,6 +3161,28 @@ impl Store {
             },
             None => w.head,
         };
+        if let (Some(dr), Some((changes, o))) = (&dry, check) {
+            let preview = self.preview_bulk(crate::store::preview::BulkPreview {
+                head: w.head,
+                view: snap,
+                candidate: &candidate(),
+                commit: head,
+                changes,
+                drop_graphs,
+                opts: o,
+                dr,
+                validation,
+                storage,
+                message,
+            });
+            drop(gen_);
+            if self.root.is_some() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            // a walk of the directory during the build counted the candidate
+            self.quota.invalidate();
+            return Err(Error::DryRun(Box::new(preview?)));
+        }
         let mut annotation = crate::annotations::Annotation::default();
         if let Some(root) = &self.root {
             // Publication order: the new generation's files (with the commit its base
@@ -3730,6 +3794,23 @@ pub struct WriteTxn<'s> {
     opts: crate::guard::WriteOptions,
     /// graphs already checked against [`WriteOptions::graphs`](crate::guard::WriteOptions::graphs)
     writable: rustc_hash::FxHashMap<u64, bool>,
+    /// the delta vocabulary and the blank-node counter at the start, where a dry run
+    /// rolls them back to
+    mark: crate::vocab::VocabMark,
+    start_bnode: u64,
+}
+
+impl Drop for WriteTxn<'_> {
+    fn drop(&mut self) {
+        // a dry run leaves no terms and no blank-node ids behind, however it ended; the
+        // writer lock is still held here, and only this transaction's views reached them
+        if self.opts.dry_run.is_some() {
+            if let Err(e) = self.base.generation.dvocab.rollback(&self.mark) {
+                tracing::warn!("a dry run could not remove the terms it added: {e}");
+            }
+            self.guard.next_bnode = self.start_bnode;
+        }
+    }
 }
 
 impl WriteTxn<'_> {
@@ -4020,6 +4101,9 @@ impl WriteTxn<'_> {
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
         if self.bulk.is_empty() {
+            if let Some(dr) = self.opts.dry_run.clone() {
+                return Err(Error::DryRun(Box::new(self.preview_log(&dr)?)));
+            }
             if self.net_ins == 0 && self.net_del == 0 {
                 // no net change: no commit, nothing to validate
                 return self.publish_log(None);
@@ -4090,20 +4174,7 @@ impl WriteTxn<'_> {
         };
         // nothing is written when the disk (or an in-memory store's limit, or a
         // persistent one's quota) has no room
-        let wal_bytes = (self.log.len() as u64 + 1) * WAL_REC as u64;
-        self.store.check_disk(wal_bytes)?;
-        if self.net_ins > 0 {
-            self.store.quota.check_commit(wal_bytes)?;
-        }
-        if self.net_ins > 0
-            && self.store.root.is_none()
-            && self.store.opts.max_memory_bytes.is_some()
-        {
-            let size = gen_.disk_bytes()
-                + delta_bytes(&self.delta)
-                + gen_.dvocab.with(|v| v.bytes()) as u64;
-            self.store.check_memory(size)?;
-        }
+        self.check_storage()?;
         // A commit that added terms syncs them together with its WAL records (see
         // `sync_commit`); without a WAL they are synced here. They are written to the
         // file first, so that a reader of the WAL (`sparkles check`, a backup) finds
@@ -4113,22 +4184,7 @@ impl WriteTxn<'_> {
         } else if gen_.dvocab.needs_sync() {
             gen_.dvocab.flush()?;
         }
-        let c = CommitInfo {
-            seq: head.seq + 1,
-            timestamp_ms: self.store.commit_time(&head),
-            kind: self.kind,
-            inserted: self.net_ins,
-            deleted: self.net_del,
-            quads: (head.quads + self.net_ins).saturating_sub(self.net_del),
-            generation: commit::generation_number(&gen_.name),
-            bulk: false,
-            exact: true,
-            reconstructed: false,
-            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH),
-            unvalidated: validation
-                .as_ref()
-                .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
-        };
+        let c = self.next_commit(validation.as_deref());
         // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
             .store
@@ -4210,6 +4266,62 @@ impl WriteTxn<'_> {
             validation,
             annotation,
         })
+    }
+
+    /// The bytes the commit appends to the WAL.
+    fn wal_bytes(&self) -> u64 {
+        (self.log.len() as u64 + 1) * WAL_REC as u64
+    }
+
+    /// The in-memory size of the store after this transaction (in-memory stores).
+    fn memory_size(&self) -> u64 {
+        let gen_ = &self.base.generation;
+        gen_.disk_bytes() + delta_bytes(&self.delta) + gen_.dvocab.with(|v| v.bytes()) as u64
+    }
+
+    /// The storage checks of a commit through the WAL: the free disk space the store
+    /// keeps, and for a commit that adds quads the quota or the in-memory size limit.
+    fn check_storage(&self) -> Result<()> {
+        let wal_bytes = self.wal_bytes();
+        self.store.check_disk(wal_bytes)?;
+        if self.net_ins > 0 {
+            self.store.quota.check_commit(wal_bytes)?;
+        }
+        if self.net_ins > 0
+            && self.store.root.is_none()
+            && self.store.opts.max_memory_bytes.is_some()
+        {
+            self.store.check_memory(self.memory_size())?;
+        }
+        Ok(())
+    }
+
+    /// The commit this transaction makes through the WAL, after the head.
+    fn next_commit(&self, validation: Option<&crate::guard::ValidationSummary>) -> CommitInfo {
+        let head = self.guard.head;
+        CommitInfo {
+            seq: head.seq + 1,
+            timestamp_ms: self.store.commit_time(&head),
+            kind: self.kind,
+            inserted: self.net_ins,
+            deleted: self.net_del,
+            quads: (head.quads + self.net_ins).saturating_sub(self.net_del),
+            generation: commit::generation_number(&self.base.generation.name),
+            bulk: false,
+            exact: true,
+            reconstructed: false,
+            default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH),
+            unvalidated: validation
+                .is_some_and(|v| v.status == crate::guard::GuardStatus::Bypassed),
+        }
+    }
+
+    /// Preview this transaction instead of committing it (see [`crate::preview`]):
+    /// what the commit would be, with the changes `dr` asks for. Nothing is written,
+    /// and the terms it added are removed again.
+    pub fn preview(mut self, dr: crate::preview::DryRun) -> Result<crate::preview::Preview> {
+        self.opts.dry_run = Some(dr);
+        crate::preview::catch(self.commit())
     }
 
     /// The net changes of this transaction as canonical N-Quads lines: (deleted,
