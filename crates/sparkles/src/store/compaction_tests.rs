@@ -242,9 +242,7 @@ fn a_reopen_replays_the_carried_commits() {
     )
     .unwrap();
     assert!(
-        readable
-            .iter()
-            .any(|&(a, b)| a <= head.seq - 1 && head.seq + 1 <= b),
+        readable.iter().any(|&(a, b)| a < head.seq && head.seq < b),
         "{readable:?}"
     );
 }

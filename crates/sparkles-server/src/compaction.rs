@@ -401,6 +401,7 @@ fn record(
 
 /// Cancel the running compaction of `name`, if there is one (an in-place restore needs
 /// the dataset to itself).
+#[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
 pub fn cancel(st: &AppState, name: &str) {
     if let Some(id) = st.active_task(TASK, name) {
         let _ = st.cancel_task(&id);
