@@ -270,7 +270,10 @@ are separate crates. [docs/USAGE.md](docs/USAGE.md#embedding-the-library) maps e
 them to its Jena equivalent.
 
 The same engine is a Python package, built from `crates/sparkles-py` with
-`mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms.
+`mise run py:build`. Its API follows pyoxigraph's and accepts rdflib terms. It also
+registers an rdflib store plugin, so `rdflib.Graph("Sparkles")` keeps its triples in
+Sparkles and runs SPARQL in its engine. A GitHub Actions workflow builds and tests the
+wheels for Linux, macOS and Windows.
 
 ```python
 from sparkles import Dataset

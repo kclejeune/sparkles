@@ -3949,6 +3949,15 @@ impl WriteTxn<'_> {
         Id::bnode(id)
     }
 
+    /// Whether `id` is a stored blank node this store has handed out: one that
+    /// [`new_bnode`](Self::new_bnode) or a load numbered before now. Any other blank node
+    /// id could still be given to a new node.
+    pub fn bnode_allocated(&self, id: Id) -> bool {
+        id.tag() == crate::id::Tag::BNode
+            && id.payload() & Id::LOCAL_BNODE_BIT == 0
+            && id.payload() < self.guard.next_bnode
+    }
+
     /// Encode a parsed quad; blank node labels are scoped by `labels` (fresh ids).
     pub fn encode_quad(
         &mut self,

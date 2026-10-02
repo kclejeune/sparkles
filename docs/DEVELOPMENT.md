@@ -55,6 +55,7 @@ mise run ui:test      # UI unit tests (Vitest)
 mise run ui:e2e       # UI end-to-end tests (Playwright; Chromium from `nix develop`, see below)
 mise run ui:e2e:mock  # UI end-to-end tests against the mock backend
 mise run py:build     # the Python wheel (crates/sparkles-py) into target/wheels, with maturin
+mise run py:sdist     # the Python source distribution into target/wheels
 mise run py:test      # build the Python extension and run its pytest suite (in ci, with py:lint)
 mise run py:lock      # refresh crates/sparkles-py/Cargo.lock from Cargo.lock
 mise run ci           # fmt:check + lint + lint:features + fmt:wasm + test + ui:test + py:lint + py:test + licenses:check
@@ -155,6 +156,38 @@ into a virtual environment in `target/py-venv`. Extra arguments go to pytest, as
 `mise run py:test -- -k transaction`. `mise run py:lint` runs clippy on the crate with its
 default features and with none. Both tasks are part of `mise run ci`. The first run
 compiles the crate and the engine for the Python build, and later runs take seconds.
+
+`mise run py:sdist` writes the source distribution to `target/wheels` with
+`scripts/py-sdist.py`. `maturin sdist` copies the crate and its path dependencies but not
+the vendored spargebra that the crate's `[patch.crates-io]` names, so the script adds it
+to the archive and points the patch at it. `mise run py:wheel-test -- <wheel or sdist>
+<python>...` installs a package into a fresh virtual environment for each interpreter
+and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
+
+#### Release workflow
+
+`.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
+`py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
+and musllinux 1.2 on x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64, and
+the source distribution. The arm64 Linux wheels build on GitHub's arm64 runners, so
+their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
+runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
+wheels are tested in an Alpine container, and the sdist job builds a wheel from the
+sdist before testing it. Every package is uploaded as an artifact.
+
+The publish job sends the artifacts to PyPI with trusted publishing, and as committed it
+never runs. It needs a `py-v<version>` tag that matches the crate's version, the
+repository variable `PYPI_PUBLISH` set to `true`, and a `pypi` environment that PyPI
+trusts for the `sparkles-rdf` project. No token is stored. To publish, register the
+workflow as a trusted publisher on PyPI, create the `pypi` environment, preferably with
+required reviewers, set the variable, and push the tag.
+
+The x86_64 manylinux and musllinux builds can be reproduced locally with Docker in the
+`quay.io/pypa/manylinux_2_28_x86_64` and `musllinux_1_2_x86_64` images, with
+`maturin build --compatibility manylinux_2_28` or `musllinux_1_2`. Both were built that
+way, the musllinux one from the sdist, and passed the suite on CPython 3.10 and 3.14 and
+in Alpine. The macOS, Windows and aarch64 wheels are built only by the workflow.
+`actionlint` checks the workflow file.
 
 `mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
 port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth

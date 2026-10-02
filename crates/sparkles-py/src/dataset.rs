@@ -12,16 +12,18 @@ use crate::terms::{
     subject_from_py, term_from_py,
 };
 use crate::txn::{PyTransaction, WriterSlot};
+use crate::{admin, interrupt};
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use sparkles::sparql::{QueryKind, QueryOptions};
+use sparkles::history::{At, HistoryOptions};
+use sparkles::sparql::{QueryKind, QueryOptions, QueryResult};
 use sparkles::store::{Store, StoreOptions};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The named graph that `reason` writes and `include_inferred` reads.
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
@@ -33,18 +35,119 @@ pub struct PyDataset {
     inner: RwLock<Option<sparkles::Dataset>>,
     path: Option<String>,
     writer: WriterSlot,
+    /// the write-time validation installed through this handle
+    guard: Mutex<Option<admin::Guard>>,
 }
 
-/// Arguments shared by the query methods.
+/// Arguments shared by the query methods of datasets and transactions.
 #[derive(Default)]
-struct QueryArgs<'py> {
-    base_iri: Option<String>,
-    prefixes: Option<BTreeMap<String, String>>,
-    bindings: Option<Bound<'py, PyAny>>,
-    default_graph: Option<Bound<'py, PyAny>>,
-    named_graphs: Option<Bound<'py, PyAny>>,
-    include_inferred: bool,
-    timeout: Option<f64>,
+pub struct QueryArgs<'py> {
+    pub base_iri: Option<String>,
+    pub prefixes: Option<BTreeMap<String, String>>,
+    pub bindings: Option<Bound<'py, PyAny>>,
+    pub default_graph: Option<Bound<'py, PyAny>>,
+    pub named_graphs: Option<Bound<'py, PyAny>>,
+    pub include_inferred: bool,
+    pub timeout: Option<f64>,
+    pub max_rows: Option<usize>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_rows_produced: Option<u64>,
+    pub cancel: Option<Bound<'py, PyAny>>,
+    pub at: Option<Bound<'py, PyAny>>,
+}
+
+/// The engine's options for a query's arguments, and the state it reads (`None`: the
+/// last commit). The options always carry a cancellation flag.
+pub fn query_options(args: &QueryArgs<'_>) -> PyResult<(QueryOptions, Option<At>)> {
+    let mut opts = QueryOptions {
+        base_iri: args.base_iri.clone(),
+        prefixes: args
+            .prefixes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        timeout: args.timeout.map(Duration::from_secs_f64),
+        max_rows: args.max_rows,
+        max_memory_bytes: args.max_memory_bytes,
+        max_rows_produced: args.max_rows_produced,
+        cancel: Some(interrupt::flag(args.cancel.as_ref())?),
+        ..Default::default()
+    };
+    if let Some(b) = &args.bindings {
+        let items = b.call_method0("items")?;
+        for item in items.try_iter()? {
+            let item = item?;
+            let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+            let name = if let Ok(var) = k.cast::<PyVariable>() {
+                var.get().name.clone()
+            } else if let Ok(s) = k.cast::<PyString>() {
+                s.to_str()?.trim_start_matches(['?', '$']).to_string()
+            } else {
+                return Err(PyTypeError::new_err("binding names are str or Variable"));
+            };
+            opts.initial_bindings.push((name, term_from_py(&v)?));
+        }
+    }
+    let iris = |ob: &Option<Bound<'_, PyAny>>| -> PyResult<Vec<String>> {
+        match ob {
+            None => Ok(Vec::new()),
+            Some(ob) => ob
+                .try_iter()?
+                .map(|g| Ok(iri_from_py(&g?)?.into_string()))
+                .collect(),
+        }
+    };
+    opts.default_graph_uris = iris(&args.default_graph)?;
+    opts.named_graph_uris = iris(&args.named_graphs)?;
+    if args.include_inferred {
+        opts.default_graph_extra = vec![INFERRED_GRAPH.to_string()];
+    }
+    let at = args.at.as_ref().map(at_from_py).transpose()?;
+    Ok((opts, at))
+}
+
+/// A point in a dataset's history: a commit number, or `head`, `commit:N`,
+/// `time:<RFC 3339>` or `snapshot:<name>`.
+pub fn at_from_py(ob: &Bound<'_, PyAny>) -> PyResult<At> {
+    if let Ok(n) = ob.extract::<u64>() {
+        return Ok(At::Commit(n));
+    }
+    let s: String = ob
+        .extract()
+        .map_err(|_| PyTypeError::new_err("at must be an int or a str"))?;
+    s.parse::<At>().py(ob.py())
+}
+
+/// A query's result as Python objects, after checking its form against `want`.
+pub fn result_to_py<'py>(
+    py: Python<'py>,
+    r: QueryResult,
+    want: Option<&[QueryKind]>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(want) = want
+        && !want.contains(&r.kind)
+    {
+        let name = |k: &QueryKind| format!("{k:?}").to_uppercase();
+        let names: Vec<String> = want.iter().map(name).collect();
+        return Err(invalid(
+            py,
+            format!(
+                "not a {} query (it is a {} query)",
+                names.join(" or "),
+                name(&r.kind)
+            ),
+        ));
+    }
+    Ok(match r.kind {
+        QueryKind::Select => PyQuerySolutions::new(r).into_pyobject(py)?.into_any(),
+        QueryKind::Ask => pyo3::types::PyBool::new(py, r.boolean)
+            .to_owned()
+            .into_any(),
+        QueryKind::Construct | QueryKind::Describe => {
+            PyQueryTriples::new(r.triples).into_pyobject(py)?.into_any()
+        }
+    })
 }
 
 impl PyDataset {
@@ -53,6 +156,7 @@ impl PyDataset {
             inner: RwLock::new(Some(ds)),
             path,
             writer: Arc::new(Mutex::new(None)),
+            guard: Mutex::new(None),
         }
     }
 
@@ -65,7 +169,26 @@ impl PyDataset {
         let ds = py
             .detach(|| sparkles::Dataset::open_with(&path, opts))
             .py(py)?;
-        Ok(PyDataset::from_dataset(ds, Some(shown)))
+        // the write-time validation the database sets up, as the server installs it;
+        // when it cannot be loaded, writes stay refused
+        let guard = match py.detach(|| admin::install(ds.store())) {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = format!(
+                    "{shown}: write-time validation could not be loaded, so writes are refused: {e:#}"
+                );
+                PyErr::warn(
+                    py,
+                    &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                    &std::ffi::CString::new(msg).unwrap_or_default(),
+                    1,
+                )?;
+                None
+            }
+        };
+        let d = PyDataset::from_dataset(ds, Some(shown));
+        *d.guard.lock().unwrap() = guard;
+        Ok(d)
     }
 
     fn in_memory(union_default_graph: bool) -> PyDataset {
@@ -98,50 +221,6 @@ impl PyDataset {
         self.ds(py)
     }
 
-    fn query_options(&self, args: &QueryArgs<'_>) -> PyResult<QueryOptions> {
-        let mut opts = QueryOptions {
-            base_iri: args.base_iri.clone(),
-            prefixes: args
-                .prefixes
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            timeout: args.timeout.map(Duration::from_secs_f64),
-            ..Default::default()
-        };
-        if let Some(b) = &args.bindings {
-            let items = b.call_method0("items")?;
-            for item in items.try_iter()? {
-                let item = item?;
-                let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-                let name = if let Ok(var) = k.cast::<PyVariable>() {
-                    var.get().name.clone()
-                } else if let Ok(s) = k.cast::<PyString>() {
-                    s.to_str()?.trim_start_matches(['?', '$']).to_string()
-                } else {
-                    return Err(PyTypeError::new_err("binding names are str or Variable"));
-                };
-                opts.initial_bindings.push((name, term_from_py(&v)?));
-            }
-        }
-        let iris = |ob: &Option<Bound<'_, PyAny>>| -> PyResult<Vec<String>> {
-            match ob {
-                None => Ok(Vec::new()),
-                Some(ob) => ob
-                    .try_iter()?
-                    .map(|g| Ok(iri_from_py(&g?)?.into_string()))
-                    .collect(),
-            }
-        };
-        opts.default_graph_uris = iris(&args.default_graph)?;
-        opts.named_graph_uris = iris(&args.named_graphs)?;
-        if args.include_inferred {
-            opts.default_graph_extra = vec![INFERRED_GRAPH.to_string()];
-        }
-        Ok(opts)
-    }
-
     fn run_query<'py>(
         &self,
         py: Python<'py>,
@@ -150,31 +229,65 @@ impl PyDataset {
         want: Option<&[QueryKind]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds(py)?;
-        let opts = self.query_options(&args)?;
-        let r = py.detach(|| ds.query_with(query, &opts)).py(py)?;
-        if let Some(want) = want
-            && !want.contains(&r.kind)
-        {
-            let name = |k: &QueryKind| format!("{k:?}").to_uppercase();
-            let names: Vec<String> = want.iter().map(name).collect();
-            return Err(invalid(
-                py,
-                format!(
-                    "not a {} query (it is a {} query)",
-                    names.join(" or "),
-                    name(&r.kind)
-                ),
-            ));
+        let (opts, at) = query_options(&args)?;
+        let cancel = opts.cancel.clone().unwrap_or_default();
+        let query = query.to_string();
+        let r = interrupt::run(py, &cancel, move || {
+            query_at(&ds, &query, &opts, at.as_ref())
+        })?;
+        result_to_py(py, r, want)
+    }
+}
+
+/// Run a query on the last commit, or on the state `at` names.
+fn query_at(
+    ds: &sparkles::Dataset,
+    query: &str,
+    opts: &QueryOptions,
+    at: Option<&At>,
+) -> sparkles::Result<QueryResult> {
+    match at {
+        None => ds.query_with(query, opts),
+        Some(at) => {
+            let ho = HistoryOptions {
+                cancel: opts.cancel.clone(),
+                deadline: opts.timeout.map(|t| Instant::now() + t),
+            };
+            let (snap, _) = ds.store().snapshot_at(at, &ho)?;
+            sparkles::sparql::query(snap, query, opts)
         }
-        Ok(match r.kind {
-            QueryKind::Select => PyQuerySolutions::new(r).into_pyobject(py)?.into_any(),
-            QueryKind::Ask => pyo3::types::PyBool::new(py, r.boolean)
-                .to_owned()
-                .into_any(),
-            QueryKind::Construct | QueryKind::Describe => {
-                PyQueryTriples::new(r.triples).into_pyobject(py)?.into_any()
-            }
-        })
+    }
+}
+
+/// The arguments of a query method.
+#[allow(clippy::too_many_arguments)]
+pub fn query_args<'py>(
+    base_iri: Option<String>,
+    prefixes: Option<BTreeMap<String, String>>,
+    bindings: Option<Bound<'py, PyAny>>,
+    default_graph: Option<Bound<'py, PyAny>>,
+    named_graphs: Option<Bound<'py, PyAny>>,
+    include_inferred: bool,
+    timeout: Option<f64>,
+    max_rows: Option<usize>,
+    max_memory_bytes: Option<u64>,
+    max_rows_produced: Option<u64>,
+    cancel: Option<Bound<'py, PyAny>>,
+    at: Option<Bound<'py, PyAny>>,
+) -> QueryArgs<'py> {
+    QueryArgs {
+        base_iri,
+        prefixes,
+        bindings,
+        default_graph,
+        named_graphs,
+        include_inferred,
+        timeout,
+        max_rows,
+        max_memory_bytes,
+        max_rows_produced,
+        cancel,
+        at,
     }
 }
 
@@ -258,6 +371,36 @@ impl PyDataset {
         lenient: bool,
     ) -> PyResult<u64> {
         let graph = opt(to_graph, iri_from_py)?;
+        if let Some(i) = input.filter(|i| !i.is_none())
+            && path.is_none()
+            && crate::io::is_file_object(i)?
+        {
+            // a file object streams into one transaction as it is read
+            let mut stream = crate::io::quad_stream(
+                py,
+                Some(i),
+                format,
+                None,
+                base_iri,
+                graph,
+                compression,
+                lenient,
+            )?;
+            let ds = self.ds_for_write(py)?;
+            return py
+                .detach(|| {
+                    let n = ds.transaction(|tx| {
+                        let mut n = 0;
+                        for q in stream.by_ref() {
+                            n += tx.insert(q?.as_ref())? as u64;
+                        }
+                        Ok(n)
+                    })?;
+                    ds.store().add_prefixes(stream.prefixes())?;
+                    Ok(n)
+                })
+                .py(py);
+        }
         let src = source_from_py(
             py,
             input,
@@ -304,7 +447,7 @@ impl PyDataset {
 
     /// Run a SPARQL query: `QuerySolutions` for SELECT, `bool` for ASK, `QueryTriples`
     /// for CONSTRUCT and DESCRIBE.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
@@ -317,8 +460,13 @@ impl PyDataset {
         named_graphs: Option<Bound<'py, PyAny>>,
         include_inferred: bool,
         timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let args = QueryArgs {
+        let args = query_args(
             base_iri,
             prefixes,
             bindings,
@@ -326,12 +474,17 @@ impl PyDataset {
             named_graphs,
             include_inferred,
             timeout,
-        };
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+        );
         self.run_query(py, query, args, None)
     }
 
     /// Run a SELECT query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
     #[allow(clippy::too_many_arguments)]
     fn select<'py>(
         &self,
@@ -344,8 +497,13 @@ impl PyDataset {
         named_graphs: Option<Bound<'py, PyAny>>,
         include_inferred: bool,
         timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let args = QueryArgs {
+        let args = query_args(
             base_iri,
             prefixes,
             bindings,
@@ -353,12 +511,17 @@ impl PyDataset {
             named_graphs,
             include_inferred,
             timeout,
-        };
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+        );
         self.run_query(py, query, args, Some(&[QueryKind::Select]))
     }
 
     /// Run an ASK query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
     #[allow(clippy::too_many_arguments)]
     fn ask<'py>(
         &self,
@@ -371,8 +534,13 @@ impl PyDataset {
         named_graphs: Option<Bound<'py, PyAny>>,
         include_inferred: bool,
         timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let args = QueryArgs {
+        let args = query_args(
             base_iri,
             prefixes,
             bindings,
@@ -380,12 +548,17 @@ impl PyDataset {
             named_graphs,
             include_inferred,
             timeout,
-        };
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+        );
         self.run_query(py, query, args, Some(&[QueryKind::Ask]))
     }
 
     /// Run a CONSTRUCT or DESCRIBE query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None))]
     #[allow(clippy::too_many_arguments)]
     fn construct<'py>(
         &self,
@@ -398,8 +571,13 @@ impl PyDataset {
         named_graphs: Option<Bound<'py, PyAny>>,
         include_inferred: bool,
         timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'py, PyAny>>,
+        at: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let args = QueryArgs {
+        let args = query_args(
             base_iri,
             prefixes,
             bindings,
@@ -407,7 +585,12 @@ impl PyDataset {
             named_graphs,
             include_inferred,
             timeout,
-        };
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
+            at,
+        );
         self.run_query(
             py,
             query,
@@ -417,26 +600,36 @@ impl PyDataset {
     }
 
     /// Run a SPARQL Update request in one transaction.
-    #[pyo3(signature = (update, *, base_iri = None, prefixes = None))]
+    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
         py: Python<'_>,
         update: &str,
         base_iri: Option<String>,
         prefixes: Option<BTreeMap<String, String>>,
+        timeout: Option<f64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<u64>,
+        max_rows_produced: Option<u64>,
+        cancel: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyUpdateStats> {
         let ds = self.ds_for_write(py)?;
-        let opts = QueryOptions {
+        let args = QueryArgs {
             base_iri,
-            prefixes: prefixes.unwrap_or_default().into_iter().collect(),
+            prefixes,
+            timeout,
+            max_rows,
+            max_memory_bytes,
+            max_rows_produced,
+            cancel,
             ..Default::default()
         };
-        let s = py.detach(|| ds.update_with(update, &opts)).py(py)?;
-        Ok(PyUpdateStats {
-            inserted: s.inserted,
-            deleted: s.deleted,
-            operations: s.operations,
-        })
+        let (opts, _) = query_options(&args)?;
+        let flag = opts.cancel.clone().unwrap_or_default();
+        let update = update.to_string();
+        let s = interrupt::run(py, &flag, move || ds.update_with(&update, &opts))?;
+        Ok(PyUpdateStats::from(s))
     }
 
     // ------------------------------------------------------------------ quads ----
@@ -445,7 +638,41 @@ impl PyDataset {
     fn add(&self, py: Python<'_>, quad: &Bound<'_, PyAny>) -> PyResult<bool> {
         let q = quad_from_py(quad)?;
         let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.insert(q.as_ref())).py(py)
+        py.detach(|| ds.transaction(|tx| tx.insert_linked(q.as_ref())))
+            .py(py)
+    }
+
+    /// Apply inserts and removals in order in one commit. `ops` holds
+    /// `(insert, quad)` pairs. Returns the number of quads inserted and removed, and the
+    /// stored label of each blank node label that an insert gave a new node.
+    /// `sparkles.rdflib` writes through this.
+    fn _apply(
+        &self,
+        py: Python<'_>,
+        ops: &Bound<'_, PyAny>,
+    ) -> PyResult<(u64, u64, BTreeMap<String, String>)> {
+        let ops = crate::txn::ops_from_py(ops)?;
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.transaction(|tx| crate::txn::apply_ops(tx, &ops)))
+            .py(py)
+    }
+
+    /// The quads of a pattern over every graph, with the quads of one triple next to
+    /// each other (for `sparkles.rdflib`).
+    #[pyo3(signature = (subject = None, predicate = None, object = None))]
+    fn _quads_by_triple(
+        &self,
+        py: Python<'_>,
+        subject: Option<&Bound<'_, PyAny>>,
+        predicate: Option<&Bound<'_, PyAny>>,
+        object: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyQuadIterator> {
+        let s: Option<NamedOrBlankNode> = opt(subject, subject_from_py)?;
+        let p = opt(predicate, named_node_from_py)?;
+        let o: Option<Term> = opt(object, term_from_py)?;
+        let ds = self.ds(py)?;
+        let it = py.detach(|| ds.quads_by_triple(s.as_ref(), p.as_ref(), o.as_ref()));
+        Ok(PyQuadIterator::from_scan(it))
     }
 
     /// Remove a quad; true if it was present.
@@ -463,8 +690,14 @@ impl PyDataset {
             .map(|q| quad_from_py(&q?))
             .collect::<PyResult<Vec<Quad>>>()?;
         let ds = self.ds_for_write(py)?;
-        py.detach(|| ds.extend(quads.iter().map(Quad::as_ref)))
-            .py(py)
+        py.detach(|| {
+            ds.transaction(|tx| {
+                quads
+                    .iter()
+                    .try_fold(0, |n, q| Ok(n + tx.insert_linked(q.as_ref())? as u64))
+            })
+        })
+        .py(py)
     }
 
     /// The quads matching a pattern; `None` matches anything, and `graph_name=None`
@@ -693,5 +926,219 @@ impl PyDataset {
             data_graph,
             include_inferred,
         )
+    }
+
+    // ------------------------------------------------------- history, snapshots ----
+
+    /// The latest commit.
+    #[getter]
+    fn head_commit(&self, py: Python<'_>) -> PyResult<admin::PyCommit> {
+        Ok(admin::head_commit(&self.ds(py)?))
+    }
+
+    /// Commits, newest first, or oldest first with `after`.
+    #[pyo3(signature = (limit = 100, *, before = None, after = None))]
+    fn commits(
+        &self,
+        py: Python<'_>,
+        limit: usize,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> PyResult<Vec<admin::PyCommit>> {
+        admin::commits(py, &self.ds(py)?, limit, before, after)
+    }
+
+    /// Keep a commit readable under a name (`at="snapshot:<name>"`).
+    #[pyo3(signature = (name, at = None, *, note = None, expires_ms = None))]
+    fn create_snapshot(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        at: Option<&Bound<'_, PyAny>>,
+        note: Option<String>,
+        expires_ms: Option<i64>,
+    ) -> PyResult<admin::PySnapshot> {
+        let at = opt(at, at_from_py)?.unwrap_or(At::Head);
+        admin::create_snapshot(py, &self.ds(py)?, name, at, note, expires_ms)
+    }
+
+    /// The named snapshots.
+    fn snapshots(&self, py: Python<'_>) -> PyResult<Vec<admin::PySnapshot>> {
+        Ok(admin::snapshots(&self.ds(py)?))
+    }
+
+    /// Remove a named snapshot; true if it existed.
+    fn delete_snapshot(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        admin::delete_snapshot(py, &self.ds(py)?, name)
+    }
+
+    /// What the dataset's history holds: the head, the readable commit ranges, the
+    /// retention window and the number of snapshots.
+    fn history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        admin::history(py, &self.ds(py)?)
+    }
+
+    /// Keep past states readable for the last `keep_commits` commits or `keep_age`
+    /// seconds, in at most `max_bytes` of disk; returns `history()`.
+    #[pyo3(signature = (*, keep_commits = None, keep_age = None, max_bytes = None))]
+    fn set_retention<'py>(
+        &self,
+        py: Python<'py>,
+        keep_commits: Option<u64>,
+        keep_age: Option<f64>,
+        max_bytes: Option<u64>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        admin::set_retention(py, &self.ds(py)?, keep_commits, keep_age, max_bytes)
+    }
+
+    /// Copy the dataset, or its state `at`, into a new database directory with a new
+    /// dataset id; returns a report.
+    #[pyo3(signature = (directory, *, at = None, exclude_graphs = None))]
+    fn clone_to<'py>(
+        &self,
+        py: Python<'py>,
+        directory: PathBuf,
+        at: Option<&Bound<'py, PyAny>>,
+        exclude_graphs: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let at = opt(at, at_from_py)?;
+        let exclude = match exclude_graphs {
+            None => Vec::new(),
+            Some(g) => g
+                .try_iter()?
+                .map(|g| iri_from_py(&g?))
+                .collect::<PyResult<_>>()?,
+        };
+        admin::clone_to(py, &self.ds(py)?, directory, at, exclude)
+    }
+
+    // --------------------------------------------------------- text and vectors ----
+
+    /// Enable (or reconfigure) full-text search, as a dict like `text.json`, and build
+    /// the index; returns its status.
+    #[pyo3(signature = (config = None))]
+    fn enable_text<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::enable_text(py, &ds, config);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = (ds, config);
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// Rebuild the full-text index from the current state; returns its status.
+    fn rebuild_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::rebuild_text(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// Turn full-text search off and remove the index.
+    fn disable_text(&self, py: Python<'_>) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        #[cfg(feature = "text")]
+        return admin::disable_text(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Err(crate::errors::missing_feature(py, "text"))
+        }
+    }
+
+    /// The full-text index's status, or `None` when it is off.
+    fn text_status<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let ds = self.ds(py)?;
+        #[cfg(feature = "text")]
+        return admin::text_status(py, &ds);
+        #[cfg(not(feature = "text"))]
+        {
+            let _ = ds;
+            Ok(None)
+        }
+    }
+
+    /// Create or replace a vector index over the embeddings of `predicate`, and start
+    /// building it in the background; true when it was created. `options` holds more of
+    /// the configuration (`metric`, `model`, `hnsw`, `exactThreshold`).
+    #[pyo3(signature = (name, predicate, dimension, *, options = None))]
+    fn create_vector_index(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        predicate: &Bound<'_, PyAny>,
+        dimension: usize,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let predicate = iri_from_py(predicate)?;
+        let ds = self.ds_for_write(py)?;
+        admin::create_vector_index(py, &ds, name, predicate, dimension, options)
+    }
+
+    /// Remove a vector index.
+    fn drop_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.store().drop_vector_index(name)).py(py)
+    }
+
+    /// Rebuild a vector index in the background.
+    fn rebuild_vector_index(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let ds = self.ds_for_write(py)?;
+        py.detach(|| ds.store().rebuild_vector_index(name)).py(py)
+    }
+
+    /// The status of a vector index, or `None`; with `wait`, once its build is done.
+    #[pyo3(signature = (name, *, wait = false))]
+    fn vector_index<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        wait: bool,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        admin::vector_index(py, &self.ds(py)?, name, wait)
+    }
+
+    /// The status of every vector index.
+    fn vector_indexes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        admin::vector_indexes(py, &self.ds(py)?)
+    }
+
+    // ---------------------------------------------------------- write validation ----
+
+    /// Set, replace or (with `None`) remove write-time validation, from a dict like
+    /// `validation.json` with the shapes or schema given inline. Returns the outcome
+    /// and the validation of the current state.
+    #[pyo3(signature = (config))]
+    fn set_write_validation<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let ds = self.ds_for_write(py)?;
+        let (out, guard) = admin::set_write_validation(py, &ds, config)?;
+        if let Some(g) = guard {
+            *self.guard.lock().unwrap() = g;
+        }
+        Ok(out)
+    }
+
+    /// The installed write-time validation's configuration and status, or `None`.
+    fn write_validation<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        self.ds(py)?;
+        let g = self.guard.lock().unwrap();
+        g.as_ref().map(|g| admin::guard_status(py, g)).transpose()
     }
 }
