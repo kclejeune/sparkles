@@ -160,6 +160,16 @@ pub enum Constraint {
     Sparql(Box<SparqlConstraint>),
     /// SPARQL-based constraint component instance (SHACL-SPARQL §6)
     Component(Box<ComponentConstraint>),
+    /// `sh:memberShape` (SHACL 1.2 Core): every member of each value node, a SHACL list,
+    /// conforms to the shape
+    MemberShape(ShapeId),
+    /// `sh:minListLength` (SHACL 1.2 Core)
+    MinListLength(u64),
+    /// `sh:maxListLength` (SHACL 1.2 Core)
+    MaxListLength(u64),
+    /// `sh:uniqueMembers` (SHACL 1.2 Core): with `true`, no member repeats; with either
+    /// value, each value node must be a SHACL list
+    UniqueMembers(bool),
 }
 
 impl Constraint {
@@ -196,6 +206,10 @@ impl Constraint {
             Constraint::HasValue(_) => sh::HAS_VALUE_CC,
             Constraint::In(_) => sh::IN_CC,
             Constraint::Sparql(_) => sh::SPARQL_CC,
+            Constraint::MemberShape(_) => sh::MEMBER_SHAPE_CC,
+            Constraint::MinListLength(_) => sh::MIN_LIST_LENGTH_CC,
+            Constraint::MaxListLength(_) => sh::MAX_LIST_LENGTH_CC,
+            Constraint::UniqueMembers(_) => sh::UNIQUE_MEMBERS_CC,
             Constraint::Component(c) => return c.component.iri.clone(),
         };
         c.into_owned()
@@ -584,6 +598,10 @@ const SHAPE_PARAMS: &[NamedNodeRef<'static>] = &[
     sh::IN,
     sh::SPARQL,
     sh::PATH,
+    sh::MEMBER_SHAPE,
+    sh::MIN_LIST_LENGTH,
+    sh::MAX_LIST_LENGTH,
+    sh::UNIQUE_MEMBERS,
 ];
 
 struct Parser<'g> {
@@ -933,6 +951,26 @@ impl<'g> Parser<'g> {
             let items = g.list(&t)?;
             let ids = items.into_iter().map(|i| self.out.intern(i)).collect();
             cs.push(Constraint::In(ids));
+        }
+        for t in g.objects(node, sh::MEMBER_SHAPE) {
+            cs.push(Constraint::MemberShape(self.shape(&t)?));
+        }
+        for t in g.objects(node, sh::MIN_LIST_LENGTH) {
+            cs.push(Constraint::MinListLength(literal_u64(
+                &t,
+                "sh:minListLength",
+            )?));
+        }
+        for t in g.objects(node, sh::MAX_LIST_LENGTH) {
+            cs.push(Constraint::MaxListLength(literal_u64(
+                &t,
+                "sh:maxListLength",
+            )?));
+        }
+        for t in g.objects(node, sh::UNIQUE_MEMBERS) {
+            let b = literal_bool(&t)
+                .ok_or_else(|| anyhow!("sh:uniqueMembers expects a boolean literal, found {t}"))?;
+            cs.push(Constraint::UniqueMembers(b));
         }
         for t in g.objects(node, sh::SPARQL) {
             let path = self.out.shapes[id].path.clone();

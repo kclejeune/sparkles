@@ -8,6 +8,9 @@
 //! (separate blank nodes) instead of reading it back from the store.
 //! Failures listed in `tests/known-failures.txt` do not fail the run.
 //!
+//! The SHACL 1.2 list constraint tests are vendored in `tests/shacl12` (see its README)
+//! and always run.
+//!
 //! Each `sht:Validate` test loads its data graph into an in-memory store. When the
 //! shapes graph is the same document, the shapes are read back from the store
 //! ([`Shapes::from_store`]) so blank nodes are shared, as in Jena where both are the
@@ -301,6 +304,10 @@ fn run_suite(name: &str, manifest: &str) {
         eprintln!("W3C SHACL test suite not found; skipping {name}");
         return;
     };
+    run_suite_in(name, &dir, manifest);
+}
+
+fn run_suite_in(name: &str, dir: &Path, manifest: &str) {
     let mut tests = Vec::new();
     collect_tests(&path_to_url(&dir.join(manifest)), &mut tests);
     let known: BTreeSet<String> = std::fs::read_to_string(
@@ -320,6 +327,7 @@ fn run_suite(name: &str, manifest: &str) {
         let short =
             t.id.trim_matches(['<', '>'])
                 .rsplit_once("/std/")
+                .or_else(|| t.id.rsplit_once("/tests/shacl12/"))
                 .map(|x| x.1.to_string())
                 .unwrap_or_else(|| t.id.clone());
         if filter.as_ref().is_some_and(|f| !short.contains(f.as_str())) {
@@ -367,4 +375,10 @@ fn w3c_shacl_core() {
 #[test]
 fn w3c_shacl_sparql() {
     run_suite("SHACL-SPARQL", "sparql/manifest.ttl");
+}
+
+#[test]
+fn w3c_shacl12_lists() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shacl12");
+    run_suite_in("SHACL 1.2 list constraints", &dir, "manifest.ttl");
 }
