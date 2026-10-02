@@ -23,6 +23,7 @@ mod mcp;
 mod obs;
 mod otel;
 mod outbound;
+mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;
 mod reasoning;
@@ -1077,6 +1078,11 @@ enum Cmd {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// Stored, parameterized queries of a database: list, get, put, delete and run them
+    Queries {
+        #[command(subcommand)]
+        cmd: queries_cmd::QueriesCmd,
     },
     /// Merge updates into a freshly built index generation
     Compact {
@@ -2429,6 +2435,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         Cmd::Diff {
             loc,
             from,
