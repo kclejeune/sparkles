@@ -380,3 +380,66 @@ async fn switching_languages() {
     let r = update(&app, "INSERT DATA { ex:dave a ex:Person }").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+/// A schema kept in a ShExR graph of the dataset: configured by naming the graph,
+/// validated again when a write changes it, refused when a write breaks it, and read
+/// from the graph after a restart.
+#[tokio::test]
+async fn schema_in_a_graph() {
+    let (dir, st, app) = server(|_| {}).await;
+    let shexr = sparkles_shex::parse_schema(SCHEMA, None, None)
+        .unwrap()
+        .to_shexr_turtle();
+    let r = send(
+        &app,
+        req("PUT", "/v/data?graph=urn:x:schema", "text/turtle", &shexr),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let cfg = json!({"language": "shex", "mode": "warn",
+        "schema": {"graphs": ["urn:x:schema"], "prefixes": {"ex": "http://ex.org/"}},
+        "shapeMap": MAP});
+    let r = put_config(&app, &cfg).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get(&app, "/$/validation/v").await.json();
+    assert_eq!(j["config"]["schema"]["graphs"], json!(["urn:x:schema"]));
+    assert!(!dir.path().join("v").join(SHEX_SCHEMA_SHEXC_FILE).exists());
+    // people may now be 250
+    let r = update(
+        &app,
+        "PREFIX sx: <http://www.w3.org/ns/shex#>
+         DELETE { GRAPH <urn:x:schema> { ?x sx:maxinclusive ?m } }
+         INSERT { GRAPH <urn:x:schema> { ?x sx:maxinclusive 250 } }
+         WHERE { GRAPH <urn:x:schema> { ?x sx:maxinclusive ?m } }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        r.header("sparkles-validation").contains("lang=shex"),
+        "{:?}",
+        r.headers
+    );
+    // a write that leaves no schema is refused
+    let r = update(&app, "DROP GRAPH <urn:x:schema>").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.text().contains("hold no triples"), "{}", r.text());
+    // a restart reads the schema from the graph
+    drop(app);
+    drop(st);
+    let st = state(dir.path(), |_| {});
+    let app = router(st.clone());
+    let r = update(
+        &app,
+        "INSERT DATA { ex:dan a ex:Person ; foaf:name \"Dan\" ; foaf:age 240 }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get(&app, "/$/validation/v").await.json();
+    assert_eq!(
+        j["config"]["schema"]["graphs"],
+        json!(["urn:x:schema"]),
+        "{j}"
+    );
+    // carol still has no name; dan conforms under the raised maximum
+    assert_eq!(j["status"]["baseline"]["blocking"], 1, "{j}");
+}

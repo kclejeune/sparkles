@@ -161,3 +161,69 @@ fn flags_of_the_other_language_are_usage_errors() {
         assert!(err(&o).contains("SHACL"), "{extra:?}: {}", err(&o));
     }
 }
+
+#[test]
+fn schema_in_a_graph_from_the_command_line() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("data.ttl"), DATA).unwrap();
+    let shexr = sparkles_shex::parse_schema(SCHEMA, None, None)
+        .unwrap()
+        .to_shexr_turtle();
+    std::fs::write(dir.join("s.ttl"), shexr).unwrap();
+    let o = sparkles(dir, &["load", "--loc", "db", "data.ttl"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &["load", "--loc", "db", "--graph", "urn:x:schema", "s.ttl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &[
+            "validation",
+            "--loc",
+            "db",
+            "--schema-graph",
+            "urn:x:schema",
+            "--schema-prefix",
+            "ex=http://ex.org/",
+            "--shape-map",
+            MAP,
+            "--mode",
+            "warn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}{}", out(&o), err(&o));
+    assert!(
+        out(&o).starts_with("validation on: 3 associations (1 nonconformant)"),
+        "{}",
+        out(&o)
+    );
+    let o = sparkles(
+        dir,
+        &["validation", "--loc", "db", "--status", "--format", "json"],
+    );
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["config"]["schema"]["graphs"][0], "urn:x:schema", "{j}");
+    assert!(!dir.join("db/validation-schema.shex").exists());
+    // a write that empties the schema graph is refused
+    let o = sparkles(dir, &["update", "--loc", "db", "DROP GRAPH <urn:x:schema>"]);
+    assert_eq!(o.status.code(), Some(3), "{}{}", out(&o), err(&o));
+    // --schema-graph is ShEx, and goes without --schema
+    let o = sparkles(
+        dir,
+        &[
+            "validation",
+            "--loc",
+            "db",
+            "--lang",
+            "shacl",
+            "--schema-graph",
+            "urn:x:schema",
+            "--mode",
+            "warn",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0));
+}

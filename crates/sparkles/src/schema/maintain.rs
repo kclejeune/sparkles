@@ -307,8 +307,13 @@ pub fn update(
     assemble(&src, opts, &sel, &budget, obs, Some(&reuse)).map(Some)
 }
 
-/// The number of changes past which a report is computed again rather than updated: an
-/// eighth of its triples, and at least 1,000.
+/// The number of changes past which a report is computed again rather than updated: one
+/// per 500 triples of the report, and at least 256.
+///
+/// An update costs a few index lookups per changed triple, about 30 to 45 µs each on the
+/// 1.05M-triple benchmark dataset, while a new report reads every selected triple twice,
+/// at 40 to 140 ns per triple there. The two cost about the same near one change per
+/// 500 triples.
 pub fn max_changes(old: &SchemaReport) -> u64 {
-    (old.totals.triples / 8).max(1000)
+    (old.totals.triples / 500).max(256)
 }
