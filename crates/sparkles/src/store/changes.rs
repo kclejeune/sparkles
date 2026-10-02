@@ -26,6 +26,9 @@ pub struct ChangesOptions {
     pub max_quads: u64,
     pub cancel: Option<Arc<AtomicBool>>,
     pub deadline: Option<Instant>,
+    /// The graphs the caller may read (`None`: every graph). Each commit lists only its
+    /// changes in these graphs, and they alone count against `max_quads`.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 impl Default for ChangesOptions {
@@ -35,6 +38,7 @@ impl Default for ChangesOptions {
             max_quads: 0,
             cancel: None,
             deadline: None,
+            graphs: None,
         }
     }
 }
@@ -150,6 +154,7 @@ impl ChangesOptions {
             max_quads,
             cancel: self.cancel.clone(),
             deadline: self.deadline,
+            graphs: self.graphs.clone(),
         }
     }
 }
@@ -235,6 +240,8 @@ impl Store {
                     let (gen_, mut cursor) = self.open_log(generation, a)?;
                     let mut keys = Keys::new(&gen_);
                     let mut local: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+                    let view = o.graphs.as_ref().filter(|a| !a.reads_all());
+                    let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
                     loop {
                         let Some((seq, txn)) = cursor.next()? else {
                             return Err(Error::Corrupt(format!(
@@ -257,7 +264,14 @@ impl Store {
                             }
                             let mut net: FxHashMap<QuadKey, bool> = FxHashMap::default();
                             for (q, added) in local.drain() {
-                                net.insert(keys.quad(&q)?, added);
+                                let k = keys.quad(&q)?;
+                                // a graph view lists the changes of its graphs only
+                                if view.is_some_and(|a| {
+                                    !super::diff::readable_key(a, &mut readable, &k)
+                                }) {
+                                    continue;
+                                }
+                                net.insert(k, added);
                             }
                             if !page.push(CommitChanges::from_net(meta(seq)?, net)) {
                                 return Ok(ChangePage {

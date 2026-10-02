@@ -86,6 +86,43 @@ nothing ([API.md](API.md#shutdown)). `/$/metrics` serves Prometheus metrics.
 Every response carries an `X-Request-Id`, and each request is logged once under the
 `sparkles::access` target.
 
+### Restricting users to some graphs
+
+With `--auth-config`, a grant can cover only some named graphs of a dataset, or only some
+of its endpoints. A dataset that keeps each tenant's data in its own named graphs can
+then be shared without splitting it:
+
+```toml
+# a tenant reads the shared reference data and writes its own graphs
+[[roles.tenant-a.grants]]
+dataset = "crm"
+level = "read"
+graphs = ["urn:x-arq:DefaultGraph", "https://example.org/reference/*"]
+[[roles.tenant-a.grants]]
+dataset = "crm"
+level = "write"
+graphs = ["https://example.org/tenant/a/*"]
+
+# analysts query every graph but cannot download the data through the Graph Store
+[[roles.analysts.grants]]
+dataset = "crm"
+level = "read"
+endpoints = ["query", "info"]
+
+[[users]]
+name = "ann"
+password = "$argon2id$…"
+roles = ["tenant-a"]
+```
+
+A member of `tenant-a` sees the default graph, the reference graphs and its own graphs.
+Its queries, Graph Store reads, searches, schema pages and diffs cover those graphs only,
+and the other tenants' graphs behave as if they did not exist. Its writes may change only
+`https://example.org/tenant/a/*`. Routes that summarize the whole dataset, such as
+`/$/stats/crm`, refuse it with `403`. `sparkles auth check --config FILE` validates the
+grants. [API.md](API.md#graph-level-access-control) describes every rule and maps
+Fuseki's `access:entry` and `fuseki:allowedUsers` settings onto grants.
+
 ### `serve` options
 
 | Flag | Default | Meaning |

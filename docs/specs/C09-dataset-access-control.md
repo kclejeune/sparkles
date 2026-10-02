@@ -5,7 +5,8 @@
 > **Phases:** Phase 1 is complete: Basic users, API tokens, OIDC sign-in for the UI,
 > trusted proxy headers, CLI logins, remote `query`/`update`/`load`, and the UI pages.
 > Phase 2 is built in part: rate limiting of failed logins and a Content Security Policy
-> for the UI. Phase 3, graph-level ACLs, is not built.
+> for the UI. Phase 3, graph-level ACLs and endpoint permissions, shipped as
+> [C12](C12-graph-access-control.md).
 >
 > **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
 >
@@ -1508,7 +1509,7 @@ the whole dataset is visible:
   over the union all touch every graph.
 
 Phase 1 prepares for this: every request carries a `Principal`, which can later reach the
-engine through `QueryOptions`.
+engine through `QueryOptions`. [C12](C12-graph-access-control.md) specifies this phase.
 
 ### 12.4 Phase 2 design note: IdP JWTs on the API
 
@@ -2010,6 +2011,6 @@ limits. The NixOS VM test gained an authentication node later (`b149524`).
 
 
 **Not built.** Native TLS, IdP JWT access tokens on the API and Cloudflare Access JWTs,
-sliding sessions and back-channel logout, endpoint-level permissions, and graph-level ACLs
-(Phase 3). Device grants stay in memory (open question 9), and the groups recorded for
+sliding sessions and back-channel logout. Endpoint-level permissions and graph-level ACLs
+(Phase 3) were built later, as [C12](C12-graph-access-control.md) describes. Device grants stay in memory (open question 9), and the groups recorded for
 OIDC and proxy token owners are not refreshed (open question 10).

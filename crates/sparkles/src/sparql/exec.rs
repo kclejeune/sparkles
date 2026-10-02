@@ -74,6 +74,28 @@ pub struct PlanInfo {
     pub warnings: Vec<super::ctx::PlanWarning>,
 }
 
+impl PlanInfo {
+    /// Remove what the plan tells about graphs a graph view does not read: estimates
+    /// (from statistics of every graph), the quads of unread graphs that statistics
+    /// notes count, and operator counters (a spatial index counts candidates of every
+    /// graph). Actual rows and times describe the view and stay.
+    pub fn redact(&mut self) {
+        self.estimated_rows = -1.0;
+        self.estimated_cost = -1.0;
+        self.counters = None;
+        const NOTE: &str = " [from statistics";
+        if let Some(i) = self.description.find(NOTE)
+            && let Some(end) = self.description[i..].find(']')
+        {
+            self.description
+                .replace_range(i..i + end + 1, " [from statistics]");
+        }
+        for c in &mut self.children {
+            c.redact();
+        }
+    }
+}
+
 fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
     vars.iter()
         .map(|v| ctx.var_name(*v))

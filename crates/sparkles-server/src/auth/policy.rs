@@ -124,12 +124,17 @@ pub struct Policy {
 fn grants_of(
     datasets: &BTreeMap<String, Level>,
     server: &[ServerPerm],
+    restricted: &[config::GrantCfg],
     roles: &[String],
     role_grants: &HashMap<String, Grants>,
 ) -> Grants {
     let mut g = Grants {
         datasets: datasets.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         server: Vec::new(),
+        restricted: restricted
+            .iter()
+            .map(config::GrantCfg::restricted)
+            .collect(),
     };
     for s in server {
         if !g.server.contains(s) {
@@ -150,6 +155,11 @@ fn summarize(g: &Grants) -> String {
         .iter()
         .map(|(k, v)| format!("{k}={}", v.as_str()))
         .collect();
+    parts.extend(
+        g.restricted
+            .iter()
+            .map(|r| format!("{}={} (limited)", r.dataset, r.level.as_str())),
+    );
     parts.extend(g.server.iter().map(|s| s.as_str().to_string()));
     parts.join(", ")
 }
@@ -162,25 +172,31 @@ impl Policy {
             .map(|(n, r)| {
                 (
                     n.clone(),
-                    grants_of(&r.datasets, &r.server, &[], &HashMap::new()),
+                    grants_of(&r.datasets, &r.server, &r.grants, &[], &HashMap::new()),
                 )
             })
             .collect();
-        let anonymous = grants_of(&cfg.anonymous.datasets, &cfg.anonymous.server, &[], &roles);
+        let anonymous = grants_of(
+            &cfg.anonymous.datasets,
+            &cfg.anonymous.server,
+            &cfg.anonymous.grants,
+            &[],
+            &roles,
+        );
         let mut users = HashMap::new();
         for u in &cfg.users {
             users.insert(
                 u.name.clone(),
                 UserEntry {
                     password: u.password.clone(),
-                    grants: grants_of(&u.datasets, &u.server, &u.roles, &roles),
+                    grants: grants_of(&u.datasets, &u.server, &u.grants, &u.roles, &roles),
                 },
             );
         }
         let mut static_tokens = HashMap::new();
         let mut static_list = Vec::new();
         for t in &cfg.tokens {
-            let grants = grants_of(&t.datasets, &t.server, &t.roles, &roles);
+            let grants = grants_of(&t.datasets, &t.server, &t.grants, &t.roles, &roles);
             let digest = config::parse_token_hash(&t.hash).context("token hash")?;
             let expires = t
                 .expires

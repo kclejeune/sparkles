@@ -19,6 +19,13 @@ use std::io::Write;
 /// The diff line format.
 pub(super) const DIFF_MEDIA_TYPE: &str = "text/x-sparkles-diff";
 
+/// FNV-1a of a graph view's rule (part of a diff's entity tag).
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
 /// The body formats of a diff.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DiffFormat {
@@ -119,10 +126,14 @@ fn graph_param(params: &Params) -> ApiResult<Option<oxrdf::GraphName>> {
     }
 }
 
-fn side(r: &sparkles::history::Resolved) -> J {
+fn side(r: &sparkles::history::Resolved, restricted: bool) -> J {
+    let mut commit = json!(r.commit);
+    if restricted {
+        super::redact_commit_json(&mut commit);
+    }
     json!({
         "selector": r.at.to_string(),
-        "commit": r.commit,
+        "commit": commit,
     })
 }
 
@@ -140,28 +151,38 @@ pub(super) fn quad_json(op: DiffOp, q: &oxrdf::Quad) -> J {
     })
 }
 
-/// The JSON members of a diff besides its quads.
-fn summary(name: &str, ds: &Dataset, d: &Diff) -> J {
-    json!({
+/// The JSON members of a diff besides its quads. For a caller limited to some graphs,
+/// without the work counts and the commits' quad counts, which cover every graph.
+fn summary(name: &str, ds: &Dataset, d: &Diff, restricted: bool) -> J {
+    let mut j = json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
-        "from": side(&d.from),
-        "to": side(&d.to),
+        "from": side(&d.from, restricted),
+        "to": side(&d.to, restricted),
         "added": d.added,
         "removed": d.removed,
         "method": d.method.as_str(),
         "logChanges": d.log_changes,
         "compared": d.compared,
-    })
+    });
+    if restricted && let Some(m) = j.as_object_mut() {
+        m.remove("logChanges");
+        m.remove("compared");
+    }
+    j
 }
 
 pub(super) async fn diff(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
+    // the changes of the graphs the caller may read
+    let view = p.view(&ds.name, crate::auth::Endpoint::Diff);
+    let restricted = view.is_some();
     let params = Params::from_query(&uri);
     let to = selector(&params, "to")?.unwrap_or(At::Head);
     let from = selector(&params, "from")?;
@@ -191,6 +212,7 @@ pub(super) async fn diff(
         max_quads: st.limits.max_rows as u64,
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
+        graphs: view.clone(),
     };
     let d = blocking({
         let ds = ds.clone();
@@ -235,7 +257,16 @@ pub(super) async fn diff(
             _ => String::new(),
         }
     );
-    let summary = summary(&name, &ds, &d);
+    // a view's body differs from the full one
+    let tag = match &view {
+        Some(v) => format!(
+            "{}:view={:016x}\"",
+            tag.trim_end_matches('"'),
+            fnv(&v.read_key())
+        ),
+        None => tag,
+    };
+    let summary = summary(&name, &ds, &d, restricted);
     let counts = [
         ("sparkles-diff-from", d.from.commit.seq),
         ("sparkles-diff-to", d.to.commit.seq),

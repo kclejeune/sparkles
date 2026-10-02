@@ -2752,6 +2752,7 @@ fn run() -> Result<()> {
                 cancel: None,
                 max_entries,
                 term_totals: void.is_some(),
+                graphs: None,
             };
             let report = match sparkles::schema::discover(&snap, &sopts) {
                 Ok(r) => r,

@@ -183,6 +183,31 @@ implementation landed.
   - deny rules, and `403` for hidden datasets;
   - trusting proxy headers from any peer, or behind a global flag.
 
+## Graph-level access control and endpoint permissions
+
+- **Spec:** [`C12-graph-access-control.md`](C12-graph-access-control.md), written on
+  2026-10-02 independently from:
+  - the Sparkles code and the specs C09, C10, C11, F03, F04 and F06;
+  - Apache Jena Fuseki's "Data Access Control for Fuseki" documentation (Apache-2.0),
+    for `access:AccessControlledDataset`, `access:entry`, `urn:x-arq:DefaultGraph` in
+    entries, and `allowedUsers` at the server, dataset and endpoint levels;
+  - W3C Solid Web Access Control and Access Control Policy, the NIST RBAC model and
+    SPARQL 1.1 Query, Update, Protocol and Graph Store Protocol, cited from working
+    knowledge.
+
+  Fluree was not consulted, including its policy language.
+- **Implementation:** from the spec plus Sparkles code only (2026-10-02). The engine part
+  is in `sparkles::access` and the query, update, store, schema and diff modules. The
+  server part is in the `auth` module of `sparkles-server` and its handlers.
+  - **Dependencies:** none added.
+- **Rejected** (spec §11):
+  - filtering in the HTTP handlers instead of the engine;
+  - turning off the fast paths or the result cache for restricted principals;
+  - checking writes against the changes that took effect;
+  - making `CLEAR ALL` fail for every restricted principal;
+  - deny rules, Solid WAC ACL documents, and a parser for Fuseki's `access:` assembler
+    vocabulary.
+
 ## Write-time SHACL validation
 
 - **Spec:** [`C10-write-time-validation.md`](C10-write-time-validation.md), written on

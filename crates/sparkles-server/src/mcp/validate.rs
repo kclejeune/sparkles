@@ -90,6 +90,17 @@ impl Tools<'_> {
     ) -> Result<Target, ToolError> {
         let timeout = self.timeout(timeout_seconds)?;
         let ds = self.dataset(dataset)?;
+        // validation reads every graph a shape reaches, and its report quotes them
+        if self.call.principal.restricted(&ds.name) {
+            return Err(ToolError::new(
+                "forbidden",
+                403,
+                format!(
+                    "validation covers every graph of /{}, and your access is limited to some graphs",
+                    ds.name
+                ),
+            ));
+        }
         let prefixes = dataset_prefixes(&ds);
         let graph = match graph.map(str::trim) {
             None | Some("default") => GraphParam::Default,

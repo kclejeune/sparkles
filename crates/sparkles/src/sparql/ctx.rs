@@ -31,6 +31,57 @@ pub struct DatasetSpec {
     pub union_default: bool,
 }
 
+impl DatasetSpec {
+    /// Limit the dataset of a query on `snap` to the graphs `access` may read: hidden
+    /// graphs leave `FROM` and `FROM NAMED` (as if they did not exist), the default graph
+    /// is empty when it is hidden, and the union of named graphs (the store's union
+    /// default graph, or `urn:x-arq:UnionGraph`) becomes the visible named graphs.
+    pub fn restrict(
+        &mut self,
+        snap: &Snapshot,
+        access: &crate::access::GraphAccess,
+        term: &dyn Fn(Id) -> Option<Term>,
+    ) -> Result<()> {
+        if access.reads_all() {
+            return Ok(());
+        }
+        let (visible, every) = access.visible_named_all(snap)?;
+        let allowed = |g: &Id| {
+            if *g == Id::DEFAULT_GRAPH {
+                access.read.default_graph()
+            } else if visible.binary_search(g).is_ok() {
+                true
+            } else {
+                // a graph without quads (or a query-local term): by its name
+                match g.tag() {
+                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => false,
+                    _ => access.readable(term(*g).as_ref()),
+                }
+            }
+        };
+        let union = || visible.to_vec();
+        self.default = match self.default.take() {
+            // every named graph is visible: the union of them all, with its fast paths
+            None if every && (self.union_default || snap.union_default_graph) => None,
+            _ if self.union_default => Some(union()),
+            None if snap.union_default_graph => Some(union()),
+            // the store's default graph, as before (which keeps its fast paths)
+            None if access.read.default_graph() => None,
+            None => Some(Vec::new()),
+            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+        };
+        if self.default.is_some() {
+            self.union_default = false;
+        }
+        self.named = match self.named.take() {
+            None if every => None,
+            None => Some(union()),
+            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+        };
+        Ok(())
+    }
+}
+
 const VALUE_SHARDS: usize = 64;
 /// decoded values kept per shard before the shard is cleared
 const VALUE_SHARD_CAP: usize = 1 << 16;
@@ -307,6 +358,9 @@ pub struct Ctx {
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
     pub dataset: DatasetSpec,
+    /// the request's graph view when it does not read every graph: `dataset` is already
+    /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
     pub now: oxsdatatypes::DateTime,
     pub base_iri: Option<oxiri::Iri<String>>,
     pub var_names: RwLock<Vec<String>>,
@@ -363,6 +417,7 @@ impl Ctx {
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
             dataset: DatasetSpec::default(),
+            graphs: None,
             now: oxsdatatypes::DateTime::now(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),

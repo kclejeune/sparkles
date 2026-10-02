@@ -194,6 +194,10 @@ pub struct SchemaOptions {
     /// ([`SchemaReport::term_totals`], which the VoID export needs). This costs one more
     /// pass over the SPO and the OSP index.
     pub term_totals: bool,
+    /// The graphs the caller may read (`None`: every graph). The report covers only
+    /// these, and a hidden graph named by `graph` or `declared_graph` is reported as
+    /// missing.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 impl Default for SchemaOptions {
@@ -208,6 +212,7 @@ impl Default for SchemaOptions {
             cancel: None,
             max_entries: DEFAULT_MAX_ENTRIES,
             term_totals: false,
+            graphs: None,
         }
     }
 }
@@ -561,6 +566,40 @@ fn resolve(
             GraphFilter::Set(vec![g.0])
         }
     })
+}
+
+/// Limit a resolved selection to the graphs a view reads; a hidden graph named by the
+/// selection is reported as missing.
+fn within_view(
+    snap: &Snapshot,
+    f: GraphFilter,
+    sel: &GraphSelection,
+    access: &crate::access::GraphAccess,
+) -> Result<GraphFilter, SchemaError> {
+    let mut visible: Vec<u64> = access
+        .visible_named(snap)
+        .map_err(SchemaError::from)?
+        .iter()
+        .map(|g| g.0)
+        .collect();
+    if access.read.default_graph() {
+        visible.push(Id::DEFAULT_GRAPH.0);
+    }
+    if let GraphSelection::Named(n) = sel
+        && !access.read.allows_iri(n.as_str())
+    {
+        return Err(SchemaError::NoSuchGraph(n.as_str().to_string()));
+    }
+    Ok(GraphFilter::Set(match f {
+        GraphFilter::All => visible,
+        GraphFilter::AllExcept(x) => visible.into_iter().filter(|g| *g != x).collect(),
+        GraphFilter::Set(s) => s
+            .into_iter()
+            .filter(|g| {
+                visible.contains(g) || *g == Id::DEFAULT_GRAPH.0 && access.read.default_graph()
+            })
+            .collect(),
+    }))
 }
 
 /// Deadline and cancellation checks.
@@ -1009,6 +1048,13 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     let observed = resolve(snap, &opts.graph, inferred, opts.include_inferred)?;
     let declared_sel = opts.declared_graph.as_ref().unwrap_or(&opts.graph);
     let declared = resolve(snap, declared_sel, inferred, opts.declared_from_inferred)?;
+    let (observed, declared) = match opts.graphs.as_ref().filter(|a| !a.reads_all()) {
+        Some(a) => (
+            within_view(snap, observed, &opts.graph, a)?,
+            within_view(snap, declared, declared_sel, a)?,
+        ),
+        None => (observed, declared),
+    };
     let rdf_type = snap.lookup_iri(RDF_TYPE).map(|i| i.0);
 
     // -- observed: two passes per predicate -------------------------------------------

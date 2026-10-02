@@ -106,6 +106,10 @@ pub struct WriteOptions {
     /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
     /// when another write holds the writer lock
     pub no_wait: bool,
+    /// The graphs the write may change (`None`: every graph). An insert or delete in
+    /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)
+    /// before the quad is looked up.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 /// A check of the committed state that a write depends on (an HTTP `If-Match`, say).

@@ -78,6 +78,9 @@ pub struct DiffOptions {
     pub max_quads: u64,
     pub cancel: Option<Arc<AtomicBool>>,
     pub deadline: Option<Instant>,
+    /// The graphs the caller may read (`None`: every graph). Changes in other graphs are
+    /// left out before they count against `max_quads`.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
 }
 
 impl DiffOptions {
@@ -260,10 +263,36 @@ fn dangling(id: Id) -> Error {
 struct Net<'o> {
     map: FxHashMap<QuadKey, bool>,
     opts: &'o DiffOptions,
+    /// whether each graph (by key) is readable, under `opts.graphs`
+    readable: FxHashMap<Arc<[u8]>, bool>,
+}
+
+/// Whether the graph of a quad key may be read under `access`, remembered per graph in
+/// `memo`.
+pub(crate) fn readable_key(
+    access: &crate::access::GraphAccess,
+    memo: &mut FxHashMap<Arc<[u8]>, bool>,
+    k: &QuadKey,
+) -> bool {
+    if let Some(ok) = memo.get(&k[0]) {
+        return *ok;
+    }
+    let ok = if k[0].is_empty() {
+        access.read.default_graph()
+    } else {
+        access.readable(Some(&crate::id::key_to_term(&k[0])))
+    };
+    memo.insert(k[0].clone(), ok);
+    ok
 }
 
 impl Net<'_> {
     fn toggle(&mut self, k: QuadKey, added: bool) -> Result<()> {
+        if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_all())
+            && !readable_key(a, &mut self.readable, &k)
+        {
+            return Ok(());
+        }
         match self.map.entry(k) {
             Entry::Occupied(e) => {
                 // a change back: the quad is as it was at `from`
@@ -558,6 +587,7 @@ impl Store {
         let mut net = Net {
             map: FxHashMap::default(),
             opts: o,
+            readable: FxHashMap::default(),
         };
         let (mut log_changes, mut compared) = (0u64, 0u64);
         let mut method = DiffMethod::Same;

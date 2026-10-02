@@ -51,6 +51,7 @@ pub(super) fn write_options(
         message: super::conditional::commit_message(headers)?,
         precondition: None,
         no_wait: false,
+        graphs: None,
     })
 }
 

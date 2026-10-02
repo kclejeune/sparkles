@@ -1609,6 +1609,19 @@ impl Phase {
     }
 }
 
+/// [`dataset_ready`] for `p`: without the sizes, which count every graph, when its
+/// grants cover only some of the dataset's graphs.
+fn dataset_ready_for(d: &crate::state::Dataset, p: &crate::auth::Principal) -> J {
+    let mut v = dataset_ready(d);
+    if p.restricted(&d.name)
+        && let Some(m) = v.as_object_mut()
+    {
+        m.remove("walBytes");
+        m.remove("deltaQuads");
+    }
+    v
+}
+
 fn dataset_ready(d: &crate::state::Dataset) -> J {
     let snap = d.store.snapshot();
     let mut v = json!({
@@ -1636,7 +1649,7 @@ fn ready_for(st: &AppState, p: &crate::auth::Principal) -> (bool, J) {
         .read()
         .values()
         .filter(|d| all || p.can(&d.name, crate::auth::Level::Read))
-        .map(|d| dataset_ready(d))
+        .map(|d| dataset_ready_for(d, p))
         .collect();
     let ok = phase == Phase::Ready;
     (
@@ -1680,7 +1693,11 @@ pub async fn ready_endpoint(
 }
 
 /// `GET /$/ready/{ds}`: readiness of the server and one dataset; 404 if unknown.
-pub async fn ready_dataset(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+pub async fn ready_dataset(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    axum::Extension(p): axum::Extension<crate::auth::Principal>,
+) -> Response {
     let Some(d) = st.get(&name) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1694,7 +1711,7 @@ pub async fn ready_dataset(State(st): State<Arc<AppState>>, Path(name): Path<Str
         "status": phase.as_str(),
         "ready": ok,
         "uptimeSeconds": st.started.elapsed().as_secs(),
-        "datasets": [dataset_ready(&d)],
+        "datasets": [dataset_ready_for(&d, &p)],
     });
     ready_response(ok, body)
 }

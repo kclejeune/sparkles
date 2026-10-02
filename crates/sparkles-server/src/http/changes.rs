@@ -32,19 +32,32 @@ fn bad(msg: impl Into<String>) -> ApiError {
     err(StatusCode::BAD_REQUEST, msg)
 }
 
-/// The JSON of one commit of a page.
-fn commit_json(ds: &Dataset, c: &CommitChanges) -> J {
+/// The JSON of one commit of a page. For a caller whose grants cover only some graphs
+/// the commit has no quad counts, and a commit too large to list has no change counts,
+/// since both would count every graph.
+fn commit_json(ds: &Dataset, c: &CommitChanges, restricted: bool) -> J {
     let note = ds.store.annotation(c.commit.seq);
     let commit = sparkles::commit::AnnotatedCommit {
         commit: &c.commit,
         annotation: note.as_ref(),
     };
+    let mut commit = json!(commit);
+    if restricted {
+        super::redact_commit_json(&mut commit);
+    }
     let mut j = json!({
         "commit": commit,
         "added": c.added,
         "removed": c.removed,
         "complete": c.complete(),
     });
+    if restricted
+        && !c.complete()
+        && let Some(m) = j.as_object_mut()
+    {
+        m.remove("added");
+        m.remove("removed");
+    }
     if c.complete() {
         j["changes"] = J::Array(
             c.iter()
@@ -78,6 +91,8 @@ struct Ask {
     after: u64,
     limit: usize,
     max_quads: u64,
+    /// the caller's graph view, when it does not cover every graph
+    graphs: Option<Arc<sparkles::access::GraphAccess>>,
 }
 
 /// Read a page off the request's thread.
@@ -88,6 +103,7 @@ async fn page(ds: &Arc<Dataset>, ask: &Ask) -> ApiResult<ChangePage> {
         max_quads: ask.max_quads,
         cancel: None,
         deadline: None,
+        graphs: ask.graphs.clone(),
     };
     let after = ask.after;
     match tokio::task::spawn_blocking(move || ds.store.changes(after, &o)).await {
@@ -128,10 +144,13 @@ async fn wait_for_commit(
 pub(super) async fn changes(
     State(st): St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
+    // the changes of the graphs the caller may read
+    let graphs = p.view(&ds.name, crate::auth::Endpoint::Diff);
     let params = Params::from_query(&uri);
     let sse = headers
         .get(header::ACCEPT)
@@ -180,7 +199,9 @@ pub(super) async fn changes(
         after,
         limit,
         max_quads: st.limits.max_rows as u64,
+        graphs,
     };
+    let restricted = ask.graphs.is_some();
     if sse {
         return Ok(event_stream(st, ds, ask, fmt).into_response());
     }
@@ -197,13 +218,17 @@ pub(super) async fn changes(
         if let Some(i) = p.commits.iter().position(|c| !c.complete()) {
             if i == 0 {
                 let c = &p.commits[0];
+                let n = if restricted {
+                    "more".to_string()
+                } else {
+                    (c.added + c.removed).to_string()
+                };
                 return Err(ApiError(
                     StatusCode::INSUFFICIENT_STORAGE,
                     json!({
                         "error": format!(
-                            "commit {} changes {} quads, more than a page may list ({}); read the state at commit:{} instead",
+                            "commit {} changes {n} quads, more than a page may list ({}); read the state at commit:{} instead",
                             c.commit.seq,
-                            c.added + c.removed,
                             ask.max_quads,
                             c.commit.seq
                         ),
@@ -242,7 +267,7 @@ pub(super) async fn changes(
             if i > 0 {
                 w.write_all(b",")?;
             }
-            serde_json::to_writer(&mut *w, &commit_json(&body_ds, c))
+            serde_json::to_writer(&mut *w, &commit_json(&body_ds, c, restricted))
                 .map_err(std::io::Error::other)?;
         }
         w.write_all(b"]}")?;
@@ -300,7 +325,7 @@ impl Feed {
             .event("commit")
             .id(c.commit.seq.to_string());
         if self.fmt == DiffFormat::Json {
-            return e.data(commit_json(&self.ds, c).to_string());
+            return e.data(commit_json(&self.ds, c, self.ask.graphs.is_some()).to_string());
         }
         let mut w = sparkles::patch::PatchWriter::new(Vec::new(), false);
         let text = match write_patch(&mut w, &self.ds, c) {

@@ -126,6 +126,16 @@ fn ranges(r: &[(u64, u64)]) -> J {
     )
 }
 
+/// [`snapshot_json`] without the pinned commit's counts, which cover every graph, for a
+/// caller whose grants cover only some graphs.
+fn snapshot_json_for(s: &NamedSnapshot, restricted: bool) -> J {
+    let mut j = snapshot_json(s);
+    if restricted && let Some(c) = j.get_mut("commit") {
+        super::redact_commit_json(c);
+    }
+    j
+}
+
 fn snapshot_json(s: &NamedSnapshot) -> J {
     json!({
         "name": s.name,
@@ -235,9 +245,19 @@ pub(crate) fn parse_age(v: &J) -> Option<u64> {
     }
 }
 
-pub(super) async fn list_snapshots(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+pub(super) async fn list_snapshots(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let snaps: Vec<J> = ds.store.snapshots().iter().map(snapshot_json).collect();
+    let restricted = p.restricted(&ds.name);
+    let snaps: Vec<J> = ds
+        .store
+        .snapshots()
+        .iter()
+        .map(|s| snapshot_json_for(s, restricted))
+        .collect();
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
@@ -331,6 +351,7 @@ pub(super) async fn create_snapshot(
 pub(super) async fn get_snapshot(
     State(st): St,
     Path((name, snap)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
     let s = ds.store.named_snapshot(&snap).ok_or_else(|| {
@@ -340,7 +361,7 @@ pub(super) async fn get_snapshot(
             format!("no snapshot '{snap}' in dataset {name}"),
         )
     })?;
-    Ok(Json(snapshot_json(&s)))
+    Ok(Json(snapshot_json_for(&s, p.restricted(&ds.name))))
 }
 
 pub(super) async fn delete_snapshot(

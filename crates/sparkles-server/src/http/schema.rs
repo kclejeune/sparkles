@@ -10,7 +10,9 @@
 //! syntaxes, or `format=`), followed by the declarations unless `declarations=false`.
 
 use super::{ApiError, ApiResult, INFERRED_GRAPH, Params, St, blocking, dataset, err};
+use crate::auth::Principal;
 use crate::state::{AppState, Dataset, SchemaCacheEntry};
+use axum::Extension;
 use axum::Json;
 use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -73,7 +75,7 @@ fn fnv(s: &str) -> u64 {
     })
 }
 
-fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
+fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Request> {
     let params = Params::from_query(uri);
     let graph_param = |k: &str| -> ApiResult<Option<GraphSelection>> {
         params
@@ -119,8 +121,11 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
         .transpose()?;
     let at = super::history::at_param(&params)?;
     let declared_name = declared_graph.as_ref().unwrap_or(&graph).name().to_string();
+    // a caller limited to some graphs gets a report of those only
+    let graphs = p.view(&ds.name, crate::auth::Endpoint::Info);
+    let view = graphs.as_ref().map_or(String::new(), |g| g.read_key());
     let selection = fnv(&format!(
-        "{}\n{declared_name}\n{reasoning}\n{declared_all}",
+        "{}\n{declared_name}\n{reasoning}\n{declared_all}\n{view}",
         graph.name()
     ));
     Ok(Request {
@@ -134,6 +139,7 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri) -> ApiResult<Request> {
             cancel: None,
             max_entries: st.schema_max_entries,
             term_totals: false,
+            graphs,
         },
         selection,
         limit,
@@ -219,11 +225,14 @@ fn report(ds: &Dataset, req: &mut Request) -> ApiResult<Arc<SchemaReport>> {
         report.classes.len(),
         report.predicates.len()
     );
-    *ds.schema_cache.lock() = Some(SchemaCacheEntry {
-        identity: current,
-        selection: req.selection,
-        report: report.clone(),
-    });
+    // the cache keeps the report everyone with access to every graph shares
+    if req.opts.graphs.is_none() {
+        *ds.schema_cache.lock() = Some(SchemaCacheEntry {
+            identity: current,
+            selection: req.selection,
+            report: report.clone(),
+        });
+    }
     Ok(report)
 }
 
@@ -298,9 +307,9 @@ fn rdf_format(params: &Params, headers: &HeaderMap) -> ApiResult<Option<RdfForma
     })
 }
 
-async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
+async fn serve(st: St, name: String, uri: Uri, p: Principal, what: What) -> ApiResult {
     let ds = dataset(&st, &name)?;
-    let mut req = parse(&st, &ds, &uri)?;
+    let mut req = parse(&st, &ds, &uri, &p)?;
     // VoID is always complete (no cursor), and reports the distinct subjects and objects
     // of the selection as well
     if matches!(what, What::Void(..)) {
@@ -342,6 +351,7 @@ async fn serve(st: St, name: String, uri: Uri, what: What) -> ApiResult {
 pub(super) async fn summary(
     st: St,
     Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
 ) -> ApiResult {
@@ -361,15 +371,25 @@ pub(super) async fn summary(
             What::Void(f, declarations)
         }
     };
-    serve(st, name, uri, what).await
+    serve(st, name, uri, p, what).await
 }
 
-pub(super) async fn classes(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult<Response> {
-    serve(st, name, uri, What::Classes).await
+pub(super) async fn classes(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Response> {
+    serve(st, name, uri, p, What::Classes).await
 }
 
-pub(super) async fn predicates(st: St, Path(name): Path<String>, uri: Uri) -> ApiResult<Response> {
-    serve(st, name, uri, What::Predicates).await
+pub(super) async fn predicates(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Response> {
+    serve(st, name, uri, p, What::Predicates).await
 }
 
 #[cfg(test)]

@@ -809,14 +809,28 @@ async fn dataset_root(
                 "use POST for SPARQL Update",
             ));
         }
-        if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+        if let Some(denied) = crate::auth::dataset_denial(
+            &st,
+            &p,
+            &headers,
+            &name,
+            Level::Write,
+            crate::auth::Endpoint::Update,
+        ) {
             return Ok(denied);
         }
         return update_endpoint(st, Path(name), p, uri, headers, UpdateBody(body)).await;
     }
     // a form with neither a query nor an update: refused as the write any other POST body
     // would be, and never taken for an RDF payload
-    if let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write) {
+    if let Some(denied) = crate::auth::dataset_denial(
+        &st,
+        &p,
+        &headers,
+        &name,
+        Level::Write,
+        crate::auth::Endpoint::Update,
+    ) {
         return Ok(denied);
     }
     dataset(&st, &name)?;
@@ -863,7 +877,7 @@ async fn query_endpoint(
     // budgets the request asked for, never above the server's
     let asked = budgets::Overrides::parse(&params)?;
     asked.apply(&mut opts);
-    crate::auth::restrict(&mut opts, &p);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -1207,7 +1221,7 @@ async fn text_search(
     };
     let query = format!("SELECT ?s ?score ?lit ?g ?p WHERE {{ {pattern} }} ORDER BY DESC(?score)");
     let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     blocking(move || {
         let snap = ds.store.snapshot();
         let seq = snap.commit;
@@ -1333,18 +1347,30 @@ fn receipt_wanted(params: &Params, headers: &HeaderMap) -> bool {
 
 /// A write response: `body` as JSON, plus the receipt members when asked for (as the
 /// Sparkles media type), plus the commit headers.
+/// The response to a write. `restricted`: the caller's grants cover only some graphs,
+/// so the receipt leaves out the commit's quad counts and the guard's validation summary,
+/// which cover every graph.
 fn write_response(
     ds: &Dataset,
     status: StatusCode,
     body: Option<J>,
     receipt: &sparkles::commit::Receipt,
     wanted: bool,
+    restricted: bool,
 ) -> Response {
     crate::otel::commit(receipt);
-    let validation = receipt.validation.clone();
+    let validation = receipt.validation.clone().filter(|_| !restricted);
     let r = if wanted {
         let mut doc = body.unwrap_or_else(|| json!({}));
-        if let (Some(m), Ok(J::Object(rm))) = (doc.as_object_mut(), serde_json::to_value(receipt)) {
+        if let (Some(m), Ok(J::Object(mut rm))) =
+            (doc.as_object_mut(), serde_json::to_value(receipt))
+        {
+            if restricted {
+                rm.remove("validation");
+                if let Some(c) = rm.get_mut("commit") {
+                    redact_commit_json(c);
+                }
+            }
             m.insert("dataset".into(), ds.name.clone().into());
             m.extend(rm);
         }
@@ -1371,6 +1397,39 @@ fn write_response(
     )
 }
 
+/// Leave out of a commit's JSON what describes every graph of the dataset: its quad
+/// counts, whether they are exact, whether it touched the default graph, and its change
+/// digest (which could confirm a guess at a hidden change).
+pub(crate) fn redact_commit_json(c: &mut J) {
+    if let Some(m) = c.as_object_mut() {
+        for k in [
+            "inserted",
+            "deleted",
+            "quads",
+            "exact",
+            "digest",
+            "defaultGraph",
+        ] {
+            m.remove(k);
+        }
+    }
+}
+
+/// An error of a write for a caller whose grants cover only some graphs: a refusal by
+/// the write guard without its results, which can quote any graph.
+pub(crate) fn write_error(e: Error, restricted: bool) -> ApiError {
+    match e {
+        Error::Rejected(r) if restricted => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "error": "the write does not conform to the dataset's validation guard; nothing was committed",
+                "head": r.head,
+            }),
+        ),
+        e => e.into(),
+    }
+}
+
 /// Parse `N`, `commit:N` or `head` (resolved by the caller).
 fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
     if s == "head" {
@@ -1383,7 +1442,12 @@ fn parse_commit_ref(s: &str) -> Option<Option<u64>> {
         .map(Some)
 }
 
-async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult<Json<J>> {
+async fn list_commits(
+    State(st): St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    uri: Uri,
+) -> ApiResult<Json<J>> {
     use sparkles::commit::CommitRange;
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
@@ -1436,7 +1500,10 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
         }
         _ => None,
     };
-    let (oldest, reconstructable, commits) = history::commit_list_extras(&ds, &page.commits);
+    let (oldest, reconstructable, mut commits) = history::commit_list_extras(&ds, &page.commits);
+    if p.restricted(&ds.name) {
+        commits.iter_mut().for_each(redact_commit_json);
+    }
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
@@ -1453,6 +1520,7 @@ async fn list_commits(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiR
 async fn get_commit(
     State(st): St,
     Path((name, reference)): Path<(String, String)>,
+    Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
     let head = ds.store.head_commit();
@@ -1481,6 +1549,10 @@ async fn get_commit(
         commit: &c,
         annotation: note.as_ref(),
     };
+    let mut commit = json!(commit);
+    if p.restricted(&ds.name) {
+        redact_commit_json(&mut commit);
+    }
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.dataset_id(),
@@ -1526,8 +1598,9 @@ async fn update_endpoint(
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
-    crate::auth::restrict(&mut opts, &p);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
+    opts.write.graphs = opts.graphs.clone();
     // a client that disconnects drops this future: the update stops at its next check
     // (or while it waits for the writer lock) and commits nothing
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -1535,6 +1608,7 @@ async fn update_endpoint(
     opts.write.cancel = Some(cancel);
     let wanted = receipt_wanted(&params, &headers);
     let timeout = opts.timeout;
+    let restricted = opts.graphs.is_some();
     let run = |ds: &Dataset, update: &str, opts: &QueryOptions| {
         let t0 = crate::otel::start();
         let stats = sparkles::sparql::update::update_as(
@@ -1559,16 +1633,16 @@ async fn update_endpoint(
             Ok(Err(Error::WriterBusy)) => {}
             Ok(r) => {
                 return r
-                    .map_err(ApiError::from)
-                    .map(|stats| update_response(&ds, stats, wanted))
+                    .map_err(|e| write_error(e, restricted))
+                    .map(|stats| update_response(&ds, stats, wanted, restricted))
                     .map_err(|e| with_timeout(e, timeout));
             }
             Err(e) => return Err(e),
         }
     }
     blocking(move || {
-        let stats = run(&ds, &update, &opts)?;
-        Ok(update_response(&ds, stats, wanted))
+        let stats = run(&ds, &update, &opts).map_err(|e| write_error(e, restricted))?;
+        Ok(update_response(&ds, stats, wanted, restricted))
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
@@ -1579,6 +1653,7 @@ fn update_response(
     ds: &Dataset,
     stats: sparkles::sparql::update::UpdateStats,
     wanted: bool,
+    restricted: bool,
 ) -> Response {
     let receipt = stats.commit.clone().expect("update receipts");
     let report = RequestReport {
@@ -1594,6 +1669,7 @@ fn update_response(
         Some(body),
         &receipt,
         wanted,
+        restricted,
     ))
 }
 
@@ -1618,7 +1694,7 @@ async fn explain(
         params.get("query").unwrap_or_default().to_string()
     };
     let mut opts = query_options(&st, &ds, &params);
-    crate::auth::restrict(&mut opts, &p);
+    crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let at = history::at_param(&params)?;
     blocking(move || {
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
@@ -1922,6 +1998,7 @@ async fn graph_body(
     snap: Arc<sparkles::store::Snapshot>,
     g: Option<Id>,
     fmt: RdfFormat,
+    view: Option<Arc<sparkles::access::GraphAccess>>,
 ) -> ApiResult<(axum::body::Body, Option<(u64, u64)>)> {
     let quads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = quads.clone();
@@ -1933,7 +2010,17 @@ async fn graph_body(
         let mut s = ser.for_writer(w);
         let prefix: Vec<u64> = g.map(|g| vec![g.0]).unwrap_or_default();
         let mut n = 0u64;
+        // the whole dataset through a graph view: the quads of the graphs it reads
+        let mut readable: std::collections::HashMap<u64, bool> = Default::default();
+        let view = view.filter(|v| !v.reads_all());
         let mut write = |k: &[u64; 4]| -> sparkles::Result<()> {
+            if let Some(v) = &view
+                && !*readable
+                    .entry(k[0])
+                    .or_insert_with(|| v.readable_id(&snap, Id(k[0])))
+            {
+                return Ok(());
+            }
             if let Some(q) = snap.quad_to_terms(&Perm::Gspo.to_quad(k)) {
                 if g.is_some() {
                     s.serialize_triple(oxrdf::TripleRef::new(&q.subject, &q.predicate, &q.object))?;
@@ -1994,13 +2081,49 @@ async fn gsp(
 ) -> ApiResult {
     // every write needs write access, whichever route (or fallthrough) led here
     if !matches!(method, Method::GET | Method::HEAD)
-        && let Some(denied) = crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write)
+        && let Some(denied) = crate::auth::dataset_denial(
+            &st,
+            &p,
+            &headers,
+            &name,
+            Level::Write,
+            crate::auth::Endpoint::GspRw,
+        )
     {
         return Ok(denied);
     }
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let target = gsp_target(&params);
+    let reads = matches!(method, Method::GET | Method::HEAD);
+    let view = p.view(
+        &name,
+        if reads {
+            crate::auth::Endpoint::GspR
+        } else {
+            crate::auth::Endpoint::GspRw
+        },
+    );
+    let restricted = view.is_some();
+    // a write to a graph outside the caller's write graphs is refused before the body is
+    // read or the graph looked up
+    if !reads && let Some(v) = &view {
+        let ok = match &target {
+            Target::Default => v.writable(None),
+            Target::Named(iri) => v.writable_iri(iri),
+            // replacing or clearing everything needs every graph; a POST of quads is
+            // checked quad by quad
+            Target::Dataset => method == Method::POST,
+        };
+        if !ok {
+            let msg = match &target {
+                Target::Default => format!("write access to the default graph of /{name} required"),
+                Target::Named(iri) => format!("write access to graph <{iri}> of /{name} required"),
+                Target::Dataset => format!("write access to every graph of /{name} required"),
+            };
+            return Ok(crate::auth::forbidden(&p, &msg));
+        }
+    }
     match method {
         Method::GET | Method::HEAD => {
             let quads = matches!(target, Target::Dataset);
@@ -2014,6 +2137,30 @@ async fn gsp(
                 Some(_) => None,
             };
             let opts = query_options(&st, &ds, &params);
+            let hidden = |t: &Target| match (&view, t) {
+                (Some(v), Target::Default) => !v.read.default_graph(),
+                (Some(v), Target::Named(iri)) => !v.read.allows_iri(iri),
+                _ => false,
+            };
+            // a graph the caller cannot read answers like a missing one
+            match &target {
+                Target::Default if hidden(&target) => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "no such graph: <{}>",
+                            sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
+                        ),
+                    ));
+                }
+                Target::Named(iri) if hidden(&target) => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("no such graph: <{iri}>"),
+                    ));
+                }
+                _ => {}
+            }
             let (snap, g, resolved) = blocking({
                 let ds = ds.clone();
                 move || {
@@ -2050,7 +2197,8 @@ async fn gsp(
                 conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
                 conditional::ReadOutcome::Send if head => ct.into_response(),
                 conditional::ReadOutcome::Send => {
-                    let (body, whole) = graph_body(st.clone(), ds.clone(), snap, g, fmt).await?;
+                    let (body, whole) =
+                        graph_body(st.clone(), ds.clone(), snap, g, fmt, view.clone()).await?;
                     if let Some((bytes, quads)) = whole {
                         report.response_bytes = Some(bytes);
                         report.rows = Some(quads);
@@ -2092,6 +2240,7 @@ async fn gsp(
             let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
+            wopts.opts.graphs = view.clone();
             let body = spool(body, &mut BodyBudget::new(&st.limits)).await?;
             let (wopts, timeout) = wopts.start();
             blocking(move || {
@@ -2113,9 +2262,13 @@ async fn gsp(
                         None => ReplaceTarget::Default,
                     };
                     ds.store
-                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)?
+                        .replace_with(t, &[src], CommitKind::GspPut, &wopts)
+                        .map_err(|e| write_error(e, restricted))?
                 } else {
-                    let r = ds.store.load_with(&[src], CommitKind::GspPost, &wopts)?;
+                    let r = ds
+                        .store
+                        .load_with(&[src], CommitKind::GspPost, &wopts)
+                        .map_err(|e| write_error(e, restricted))?;
                     (if r.committed { r.commit.inserted } else { 0 }, r)
                 };
                 let status = if replace {
@@ -2130,6 +2283,7 @@ async fn gsp(
                     Some(body),
                     &receipt,
                     wanted,
+                    restricted,
                 )))
             })
             .await
@@ -2144,6 +2298,7 @@ async fn gsp(
             let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
             wopts.opts.precondition =
                 conditional::write_precondition(&headers, ds.store.dataset_id(), &target);
+            wopts.opts.graphs = view.clone();
             let (wopts, timeout) = wopts.start();
             blocking(move || {
                 let snap = ds.store.snapshot();
@@ -2169,11 +2324,13 @@ async fn gsp(
                     &QueryOptions {
                         timeout,
                         cancel: wopts.cancel.clone(),
+                        graphs: wopts.graphs.clone(),
                         write: wopts,
                         ..Default::default()
                     },
                     sparkles::commit::CommitKind::GspDelete,
-                )?;
+                )
+                .map_err(|e| write_error(e, restricted))?;
                 let receipt = stats.commit.clone().expect("update receipts");
                 Ok(write_report(Op::Gsp, stats.deleted).attach(write_response(
                     &ds,
@@ -2181,6 +2338,7 @@ async fn gsp(
                     None,
                     &receipt,
                     wanted,
+                    restricted,
                 )))
             })
             .await
@@ -2204,7 +2362,13 @@ async fn upload(
     let params = Params::from_query(&uri);
     history::reject_at(&params)?;
     let wanted = receipt_wanted(&params, &headers);
-    let (wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers)?;
+    // each quad must land in a graph the caller may write
+    wopts.opts.graphs = request
+        .extensions()
+        .get::<Principal>()
+        .and_then(|p| p.view(&name, crate::auth::Endpoint::Upload));
+    let restricted = wopts.opts.graphs.is_some();
     let ct = content_type(&headers);
     let tmp = tempfile::Builder::new()
         .prefix("sparkles-upload-")
@@ -2309,7 +2473,8 @@ async fn upload(
             .collect::<Result<Vec<_>, _>>()?;
         let receipt = ds
             .store
-            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)?;
+            .load_with(&sources, sparkles::commit::CommitKind::Upload, &wopts)
+            .map_err(|e| write_error(e, restricted))?;
         let count = if receipt.committed {
             receipt.commit.inserted
         } else {
@@ -2323,6 +2488,7 @@ async fn upload(
             Some(body),
             &receipt,
             wanted,
+            restricted,
         )))
     })
     .await
@@ -2406,7 +2572,34 @@ fn dataset_info_for(d: &Dataset, p: &Principal) -> J {
     if let Some(a) = p.access(&d.name) {
         info["access"] = a.as_str().into();
     }
+    if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
+        redact_dataset_info(&mut info);
+        // the quads the caller can read
+        if let Ok(n) = v.visible_quads(&d.store.snapshot()) {
+            info["quads"] = n.into();
+        }
+    }
     info
+}
+
+/// Leave out of a `DatasetInfo` the figures that count every graph (quads, index
+/// entries, inferences), for a caller whose grants cover only some graphs; `graphs:
+/// "limited"` says so. The caller fills in the quads it can read.
+pub(crate) fn redact_dataset_info(info: &mut J) {
+    if let Some(m) = info.as_object_mut() {
+        m.remove("quads");
+        for k in ["text", "geo", "reasoning"] {
+            if let Some(J::Object(o)) = m.get_mut(k) {
+                o.retain(|k, _| {
+                    matches!(
+                        k.as_str(),
+                        "state" | "profile" | "stale" | "at" | "commit" | "commitsSince"
+                    )
+                });
+            }
+        }
+        m.insert("graphs".into(), "limited".into());
+    }
 }
 
 /// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
@@ -3407,7 +3600,9 @@ fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
     if t.dataset.is_empty() {
         return p.has(crate::auth::ServerPerm::ServerAdmin);
     }
-    p.can(&t.dataset, Level::Read) || t.target.as_deref().is_some_and(|x| p.can(x, Level::Read))
+    // a task acts on a whole dataset: hidden from callers who see only some of its graphs
+    let sees = |ds: &str| p.can(ds, Level::Read) && !p.restricted(ds);
+    sees(&t.dataset) || t.target.as_deref().is_some_and(sees)
 }
 
 /// A task as `p` sees it: without `server-admin`, absolute paths in its message and in

@@ -1105,6 +1105,109 @@ mod auth {
         app.clone().oneshot(req).await.unwrap().status()
     }
 
+    /// MCP tools through grants limited to some graphs (C12): queries and schemas see
+    /// the view, listings leave out counts, validation is refused, and updates write the
+    /// write graphs only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_follow_graph_grants() {
+        use crate::http::router_tests::auth::graphs::{DATA, users};
+        let s = authed(&["--mcp-allow-update"], &[], &users());
+        let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let q = |user: &str| {
+            (
+                json!({"dataset": "graphs", "query": "SELECT ?s { GRAPH ?g { ?s ?p ?o } }"}),
+                b(user),
+            )
+        };
+        let text = |r: &J| {
+            r["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (args, auth) = q("gfull");
+        let full = text(&tool(&s.app, "sparql_query", args, &[("authorization", &auth)]).await);
+        assert!(full.contains("b1"), "{full}");
+        let (args, auth) = q("gra");
+        let r = tool(&s.app, "sparql_query", args, &[("authorization", &auth)]).await;
+        assert_eq!(r["isError"], false, "{r}");
+        let mine = text(&r);
+        assert!(mine.contains("a1") && !mine.contains("b1"), "{mine}");
+        // an endpoint the grants do not name
+        let (args, auth) = q("gep");
+        let r = tool(&s.app, "sparql_query", args, &[("authorization", &auth)]).await;
+        assert_eq!(tool_error(&r), "forbidden");
+        // listings without counts, schemas of the view, commits without counts
+        let gra = b("gra");
+        let r = tool(
+            &s.app,
+            "list_datasets",
+            json!({}),
+            &[("authorization", &gra)],
+        )
+        .await;
+        let d = r["structuredContent"]["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "graphs")
+            .unwrap()
+            .clone();
+        assert_eq!(d["quads"], 3, "{d}");
+        let r = tool(
+            &s.app,
+            "describe_schema",
+            json!({"dataset": "graphs", "graph": "union"}),
+            &[("authorization", &gra)],
+        )
+        .await;
+        assert_eq!(r["isError"], false, "{r}");
+        let r = tool(
+            &s.app,
+            "list_commits",
+            json!({"dataset": "graphs"}),
+            &[("authorization", &gra)],
+        )
+        .await;
+        let c = &r["structuredContent"]["commits"][0];
+        assert!(c["seq"].is_u64() && c.get("quads").is_none(), "{r}");
+        // validation reads every graph
+        let r = tool(
+            &s.app,
+            "validate_shacl",
+            json!({"dataset": "graphs", "shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> ."}),
+            &[("authorization", &gra)],
+        )
+        .await;
+        assert_eq!(tool_error(&r), "forbidden");
+        // updates: the write graphs only
+        let grad = b("grad");
+        let up = |u: &str| json!({"dataset": "graphs", "update": u});
+        let r = tool(
+            &s.app,
+            "sparql_update",
+            up("INSERT DATA { GRAPH <http://ex/a/1> { <http://ex/n> <http://ex/p> 1 } }"),
+            &[("authorization", &grad)],
+        )
+        .await;
+        assert_eq!(r["structuredContent"]["committed"], true, "{r}");
+        let r = tool(
+            &s.app,
+            "sparql_update",
+            up("INSERT DATA { GRAPH <http://ex/b/1> { <http://ex/n> <http://ex/p> 1 } }"),
+            &[("authorization", &grad)],
+        )
+        .await;
+        assert_eq!(tool_error(&r), "forbidden");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn service_needs_federate() {
         let s = authed(&["--mcp-allow-service"], &[], "");

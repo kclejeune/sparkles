@@ -139,7 +139,7 @@ fn plan(snap: &Arc<Snapshot>, q: &str, opt: Optimizations) -> Node {
         no_cache: true,
         ..Default::default()
     };
-    let ctx = make_ctx(snap.clone(), &opts, dataset, base);
+    let ctx = make_ctx(snap.clone(), &opts, dataset, base).unwrap();
     Planner::new(&ctx)
         .plan(pattern, &ActiveGraph::Default, Vec::new())
         .unwrap_or_else(|e| panic!("{q}: {e}"))

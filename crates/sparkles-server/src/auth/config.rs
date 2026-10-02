@@ -14,6 +14,152 @@ pub struct GrantsCfg {
     pub datasets: BTreeMap<String, Level>,
     #[serde(default)]
     pub server: Vec<ServerPerm>,
+    #[serde(default)]
+    pub grants: Vec<GrantCfg>,
+}
+
+/// `[[….grants]]`: a dataset grant limited to some graphs or endpoints.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantCfg {
+    /// a dataset name or `*` pattern
+    pub dataset: String,
+    /// `read` or `write`
+    pub level: Level,
+    /// graph IRIs, IRI patterns with `*`, and `urn:x-arq:DefaultGraph` (or `default`);
+    /// absent: every graph
+    #[serde(default)]
+    pub graphs: Option<Vec<String>>,
+    /// endpoint names; absent: every endpoint
+    #[serde(default)]
+    pub endpoints: Option<Vec<String>>,
+}
+
+impl GrantCfg {
+    /// The grant, once [`check_restricted`] has accepted it.
+    pub fn restricted(&self) -> super::Restricted {
+        super::Restricted {
+            dataset: self.dataset.clone(),
+            level: self.level,
+            graphs: self.graphs.clone(),
+            endpoints: self.endpoints.as_ref().map(|es| {
+                es.iter()
+                    .filter_map(|e| super::Endpoint::parse(e))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A graph entry of a grant: the default graph's name, or an absolute IRI that may
+/// contain `*`.
+fn valid_graph_name(g: &str) -> bool {
+    if matches!(g, "default" | sparkles::sparql::ctx::DEFAULT_GRAPH_IRI) || g == "*" {
+        return true;
+    }
+    if g == sparkles::sparql::ctx::UNION_GRAPH_IRI {
+        return false;
+    }
+    // with every `*` replaced, the rest must be an absolute IRI
+    oxrdf::NamedNode::new(g.replace('*', "x")).is_ok()
+}
+
+/// Validate the restricted grants of a grantee.
+fn check_restricted(what: &str, grants: &[GrantCfg]) -> Result<()> {
+    for g in grants {
+        if !valid_pattern(&g.dataset) {
+            bail!("{what}: invalid dataset pattern '{}' in grants", g.dataset);
+        }
+        if g.level == Level::Admin {
+            bail!(
+                "{what}: a grant on '{}' cannot be admin (admin covers every graph and \
+                 endpoint: grant it under datasets)",
+                g.dataset
+            );
+        }
+        if let Some(gs) = &g.graphs {
+            if gs.is_empty() {
+                bail!(
+                    "{what}: the grant on '{}' has an empty graphs list (omit graphs to cover \
+                     every graph)",
+                    g.dataset
+                );
+            }
+            for x in gs {
+                if x == sparkles::sparql::ctx::UNION_GRAPH_IRI {
+                    bail!(
+                        "{what}: the grant on '{}' names {x}, which is not a graph (list the \
+                         graphs, or a pattern such as *)",
+                        g.dataset
+                    );
+                }
+                if !valid_graph_name(x) {
+                    bail!(
+                        "{what}: the grant on '{}' has an invalid graph '{x}' (expected an \
+                         absolute IRI, a pattern with *, or urn:x-arq:DefaultGraph)",
+                        g.dataset
+                    );
+                }
+            }
+        }
+        if let Some(es) = &g.endpoints {
+            if es.is_empty() {
+                bail!(
+                    "{what}: the grant on '{}' has an empty endpoints list (omit endpoints to \
+                     cover every endpoint)",
+                    g.dataset
+                );
+            }
+            for e in es {
+                if super::Endpoint::parse(e).is_none() {
+                    let known: Vec<&str> =
+                        super::Endpoint::ALL.iter().map(|e| e.as_str()).collect();
+                    bail!(
+                        "{what}: the grant on '{}' names an unknown endpoint '{e}' (known: {})",
+                        g.dataset,
+                        known.join(", ")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Warnings about the restricted grants of a grantee: a restriction that a grant of the
+/// same grantee lifts, and a wildcard that leaves the inferred graph out.
+fn restricted_warnings(
+    what: &str,
+    datasets: &BTreeMap<String, Level>,
+    grants: &[GrantCfg],
+    out: &mut Vec<String>,
+) {
+    for g in grants {
+        if datasets
+            .iter()
+            .any(|(p, l)| *l >= g.level && (p == "*" || p == &g.dataset))
+        {
+            out.push(format!(
+                "{what}: the restricted {} grant on '{}' has no effect, since datasets already \
+                 grants it on every graph and endpoint",
+                g.level.as_str(),
+                g.dataset
+            ));
+        }
+        if let Some(gs) = &g.graphs
+            && gs
+                .iter()
+                .any(|x| x.contains('*') && super::glob(x, super::INFERRED_GRAPH))
+            && !gs.iter().any(|x| x == super::INFERRED_GRAPH)
+        {
+            out.push(format!(
+                "{what}: a pattern of the grant on '{}' would match {}, which only an exact \
+                 name covers (it holds inferences from every graph)",
+                g.dataset,
+                super::INFERRED_GRAPH
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -28,6 +174,8 @@ pub struct UserCfg {
     pub datasets: BTreeMap<String, Level>,
     #[serde(default)]
     pub server: Vec<ServerPerm>,
+    #[serde(default)]
+    pub grants: Vec<GrantCfg>,
 }
 
 impl std::fmt::Debug for UserCfg {
@@ -38,6 +186,7 @@ impl std::fmt::Debug for UserCfg {
             .field("roles", &self.roles)
             .field("datasets", &self.datasets)
             .field("server", &self.server)
+            .field("grants", &self.grants)
             .finish()
     }
 }
@@ -54,6 +203,8 @@ pub struct TokenCfg {
     pub datasets: BTreeMap<String, Level>,
     #[serde(default)]
     pub server: Vec<ServerPerm>,
+    #[serde(default)]
+    pub grants: Vec<GrantCfg>,
     /// RFC 3339
     #[serde(default)]
     pub expires: Option<String>,
@@ -67,6 +218,7 @@ impl std::fmt::Debug for TokenCfg {
             .field("roles", &self.roles)
             .field("datasets", &self.datasets)
             .field("server", &self.server)
+            .field("grants", &self.grants)
             .field("expires", &self.expires)
             .finish()
     }
@@ -456,8 +608,10 @@ impl FileConfig {
             }
         }
         check_grants("[anonymous]", &self.anonymous.datasets, &[], &self.roles)?;
+        check_restricted("[anonymous]", &self.anonymous.grants)?;
         for (name, r) in &self.roles {
             check_grants(&format!("role {name}"), &r.datasets, &[], &self.roles)?;
+            check_restricted(&format!("role {name}"), &r.grants)?;
         }
         let mut names = BTreeSet::new();
         for u in &self.users {
@@ -479,6 +633,7 @@ impl FileConfig {
                 &u.roles,
                 &self.roles,
             )?;
+            check_restricted(&format!("user {}", u.name), &u.grants)?;
         }
         let mut names = BTreeSet::new();
         let mut hashes = BTreeSet::new();
@@ -507,6 +662,7 @@ impl FileConfig {
                 &t.roles,
                 &self.roles,
             )?;
+            check_restricted(&format!("token {}", t.name), &t.grants)?;
         }
         for o in &self.cors.origins {
             if !crate::exposure::valid_origin(o) {
@@ -607,16 +763,36 @@ impl FileConfig {
                     u.name
                 ));
             }
-            if u.datasets.is_empty() && u.server.is_empty() && u.roles.is_empty() {
+            if u.datasets.is_empty()
+                && u.server.is_empty()
+                && u.roles.is_empty()
+                && u.grants.is_empty()
+            {
                 w.push(format!("user {} has no grants", u.name));
             }
+            restricted_warnings(&format!("user {}", u.name), &u.datasets, &u.grants, &mut w);
         }
         for t in &self.tokens {
-            if t.datasets.is_empty() && t.server.is_empty() && t.roles.is_empty() {
+            if t.datasets.is_empty()
+                && t.server.is_empty()
+                && t.roles.is_empty()
+                && t.grants.is_empty()
+            {
                 w.push(format!("token {} has no grants", t.name));
             }
+            restricted_warnings(&format!("token {}", t.name), &t.datasets, &t.grants, &mut w);
         }
+        for (name, r) in &self.roles {
+            restricted_warnings(&format!("role {name}"), &r.datasets, &r.grants, &mut w);
+        }
+        restricted_warnings(
+            "[anonymous]",
+            &self.anonymous.datasets,
+            &self.anonymous.grants,
+            &mut w,
+        );
         if self.anonymous.datasets.values().any(|l| *l > Level::Read)
+            || self.anonymous.grants.iter().any(|g| g.level > Level::Read)
             || !self.anonymous.server.is_empty()
         {
             w.push("anonymous holds write, admin or a server permission".into());

@@ -50,6 +50,15 @@ pub struct BoxQuery {
 /// (`null` for the default graph) and `properties.predicate`, and a top-level
 /// `truncated`.
 pub fn features_in_box(snap: &Snapshot, q: &BoxQuery) -> Result<Value> {
+    features_in_box_of(snap, q, None)
+}
+
+/// [`features_in_box`] of the graphs `graphs` reads (every graph when `None`).
+pub fn features_in_box_of(
+    snap: &Snapshot,
+    q: &BoxQuery,
+    graphs: Option<&crate::access::GraphAccess>,
+) -> Result<Value> {
     let empty = |truncated: bool| json!({"type": "FeatureCollection", "features": [], "truncated": truncated});
     let cfg = snap
         .geo
@@ -73,6 +82,23 @@ pub fn features_in_box(snap: &Snapshot, q: &BoxQuery) -> Result<Value> {
         Some(g) => match snap.lookup_iri(g) {
             Some(id) => GraphFilter::One(id.0),
             None => return Ok(empty(false)),
+        },
+    };
+    // a graph view: the graphs it reads, and a hidden graph answers like a missing one
+    let graph = match graphs.filter(|a| !a.reads_all()) {
+        None => graph,
+        Some(a) => match graph {
+            GraphFilter::Default if a.read.default_graph() => graph,
+            GraphFilter::One(g) if a.readable_id(snap, Id(g)) => graph,
+            GraphFilter::All => {
+                let mut v: Vec<u64> = a.visible_named(snap)?.iter().map(|g| g.0).collect();
+                if a.read.default_graph() {
+                    v.push(Id::DEFAULT_GRAPH.0);
+                }
+                v.sort_unstable();
+                GraphFilter::Set(v)
+            }
+            _ => return Ok(empty(false)),
         },
     };
     if pred_ids.is_empty() || q.limit == 0 {

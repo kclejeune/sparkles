@@ -358,6 +358,23 @@ impl Tools<'_> {
         self.server.cfg()
     }
 
+    /// [`ToolError`] 403 unless the caller's grants reach the `info` endpoint of `ds`.
+    pub(super) fn info_endpoint(&self, ds: &str) -> Result<(), ToolError> {
+        if self
+            .call
+            .principal
+            .can_at(ds, crate::auth::Endpoint::Info, crate::auth::Level::Read)
+        {
+            Ok(())
+        } else {
+            Err(ToolError::new(
+                "forbidden",
+                403,
+                format!("the info endpoint of /{ds} is not allowed"),
+            ))
+        }
+    }
+
     /// The dataset the call names, among those its principal may read.
     pub(super) fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
         self.server.dataset(&self.call.principal, name)
@@ -398,10 +415,23 @@ impl Tools<'_> {
 
     pub(super) fn query_options(
         &self,
+        ds: &str,
+        endpoint: crate::auth::Endpoint,
         reasoning: bool,
         deadline: Instant,
         prefixes: &BTreeMap<String, String>,
     ) -> Result<QueryOptions, Error> {
+        // a grant limited to other endpoints does not reach this tool
+        if !self
+            .call
+            .principal
+            .can_at(ds, endpoint, crate::auth::Level::Read)
+        {
+            return Err(Error::NotPermitted(format!(
+                "the {} endpoint of /{ds} is not allowed",
+                endpoint.as_str()
+            )));
+        }
         let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),
             max_rows: Some(self.server.state.limits.max_rows),
@@ -418,8 +448,9 @@ impl Tools<'_> {
             prefixes: prefix_vec(prefixes),
             ..Default::default()
         };
-        // SERVICE and LOAD are the principal's server permissions, as over HTTP
-        crate::auth::restrict(&mut opts, &self.call.principal);
+        // SERVICE and LOAD are the principal's server permissions, and the graphs its
+        // grants cover, as over HTTP
+        crate::auth::restrict(&mut opts, &self.call.principal, ds, endpoint);
         Ok(opts)
     }
 
@@ -463,9 +494,14 @@ impl Tools<'_> {
                     let f = crate::reasoning::freshness(info, &ds.store, snap.commit);
                     json!({ "profile": info.profile, "stale": f.stale })
                 });
+                // the quads the caller can read
+                let quads = match p.view(&ds.name, crate::auth::Endpoint::Info) {
+                    Some(v) => v.visible_quads(&snap).ok(),
+                    None => Some(snap.len()),
+                };
                 json!({
                     "name": ds.name,
-                    "quads": snap.len(),
+                    "quads": quads,
                     "commit": snap.commit,
                     "modified": modified,
                     "reasoning": reasoning,
@@ -704,8 +740,15 @@ impl Tools<'_> {
         timeout: Duration,
         ctx: &ErrorContext,
     ) -> Result<Arc<SchemaReport>, ToolError> {
+        self.info_endpoint(&ds.name)?;
         let identity = schema::snapshot_identity(snap);
-        if let Some(e) = ds.schema_cache.lock().as_ref()
+        // a caller limited to some graphs gets a report of those, outside the cache
+        let graphs = self
+            .call
+            .principal
+            .view(&ds.name, crate::auth::Endpoint::Info);
+        if graphs.is_none()
+            && let Some(e) = ds.schema_cache.lock().as_ref()
             && e.identity == identity
             && e.selection == selection
         {
@@ -722,13 +765,16 @@ impl Tools<'_> {
             cancel: Some(self.call.cancel.clone()),
             max_entries: self.server.state.schema_max_entries,
             term_totals: false,
+            graphs: graphs.clone(),
         };
         let report = Arc::new(schema::discover(snap, &opts).map_err(|e| ctx.schema(e))?);
-        *ds.schema_cache.lock() = Some(SchemaCacheEntry {
-            identity,
-            selection,
-            report: report.clone(),
-        });
+        if graphs.is_none() {
+            *ds.schema_cache.lock() = Some(SchemaCacheEntry {
+                identity,
+                selection,
+                report: report.clone(),
+            });
+        }
         Ok(report)
     }
 
@@ -785,7 +831,13 @@ impl Tools<'_> {
         }
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &prefix_map)
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &prefix_map,
+            )
             .map_err(|e| ctx.engine(e))?;
         let mut r = sparql::execute_query(snap.clone(), &parsed, &opts, parse_ms)
             .map_err(|e| ctx.engine(e))?;
@@ -849,7 +901,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let opts = self
-            .query_options(reasoning, self.call.arrived + timeout, &prefix_map)
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                self.call.arrived + timeout,
+                &prefix_map,
+            )
             .map_err(|e| ctx.engine(e))?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
@@ -945,7 +1003,13 @@ impl Tools<'_> {
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let deadline = self.call.arrived + timeout;
         let opts = self
-            .query_options(reasoning, deadline, &BTreeMap::new())
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
             .map_err(|e| ctx.engine(e))?;
         let q = Queries {
             snap: &snap,
@@ -1057,6 +1121,8 @@ impl Tools<'_> {
         let a: ListCommitsArgs = parse(args)?;
         let limit = bounded("limit", a.limit, 10, 1, 100)? as usize;
         let ds = self.dataset(a.dataset.as_deref())?;
+        self.info_endpoint(&ds.name)?;
+        let restricted = self.call.principal.restricted(&ds.name);
         let range = a.before.map_or(CommitRange::Latest, CommitRange::Before);
         let head = ds.store.head_commit().seq;
         let page = ds.store.commits(range, limit);
@@ -1069,14 +1135,19 @@ impl Tools<'_> {
             .commits
             .iter()
             .map(|c| {
-                json!({
+                let mut j = json!({
                     "seq": c.seq,
                     "timestamp": c.timestamp(),
                     "kind": c.kind.name(),
                     "inserted": c.inserted,
                     "deleted": c.deleted,
                     "quads": c.quads,
-                })
+                });
+                // the counts cover every graph
+                if restricted {
+                    crate::http::redact_commit_json(&mut j);
+                }
+                j
             })
             .collect();
         Ok(Outcome::Structured(json!({
