@@ -8,11 +8,14 @@
 //! The output must prune to itself, as with the SPARQL prologue: a document of
 //! directives alone stays as written (only comments could be left, the file header the
 //! next time); the first declaration of the file, right under the header comments, stays
-//! when it would be printed first (those comments would lead it the next time); and a
-//! label bound to different namespaces keeps all its declarations. Detached blocks left
-//! with no item after them in their block are printed at its end: the next time they
-//! are detached before the statement that follows, which prints them the same way (and
-//! they are a sort barrier there, as the block was).
+//! when it would be printed first (those comments would lead it the next time); and an
+//! unused redefinition of a label stays when the declaration of that label printed last
+//! before it binds a different namespace (without the redefinition, that binding would
+//! cover its scope, and the IRIs there would be compacted with it the next time). An
+//! unused declaration whose label is redefined later goes like any other: its scope ends
+//! at the redefinition. Detached blocks left with no item after them in their block are
+//! printed at its end: the next time they are detached before the statement that follows,
+//! which prints them the same way (and they are a sort barrier there, as the block was).
 
 use super::Tx;
 use crate::normalize::prune;
@@ -69,69 +72,95 @@ impl Pruned {
 }
 
 /// The declarations of directive block `decls` that `prune-prefixes` drops (none
-/// without the key): those nothing uses that have no comment of their own (leading or
-/// trailing). `leading`: the block is the document's first, sorted and grouped.
-pub fn pruned(tx: &mut Tx<'_, '_>, decls: &[NodeId], leading: bool) -> Pruned {
+/// without the key), of those the whole document drops ([`dropped`]).
+pub fn pruned(tx: &mut Tx<'_, '_>, decls: &[NodeId]) -> Pruned {
     if !tx.opts.prune_prefixes {
         return Pruned::default();
     }
-    let root = tx.tree.root();
-    let directive = |k: NodeKind| {
-        matches!(
-            k,
-            NodeKind::PrefixDecl | NodeKind::BaseDecl | NodeKind::VersionDecl
-        )
-    };
-    if tx
-        .tree
-        .child_nodes(root)
-        .all(|c| directive(tx.tree.kind(c)))
-    {
-        return Pruned::default();
+    if tx.dropped_prefixes.is_none() {
+        let dropped = dropped(tx);
+        tx.dropped_prefixes = Some(dropped);
     }
-    if tx.unused_prefixes.is_none() {
-        let comments = tx.comments;
-        let unused =
-            prune::unused_declarations_with(tx.tree, &tx.scope, tx.opts, |n| comments.ignored(n));
-        tx.unused_prefixes = Some(unused);
-    }
-    // a label bound to different namespaces keeps every declaration: dropping one would
-    // extend the scope of the binding before it, and the IRIs it covers would be
-    // compacted the next time
-    let mut bindings: HashMap<String, HashSet<String>> = HashMap::new();
-    for c in tx.tree.child_nodes(root) {
-        if tx.tree.kind(c) == NodeKind::PrefixDecl {
-            let (label, iri) = prefix_parts(tx, c);
-            bindings.entry(label).or_default().insert(iri);
-        }
-    }
-    let unused = tx.unused_prefixes.as_ref().expect("worked out above");
-    let comments = tx.comments;
+    let dropped = tx.dropped_prefixes.as_ref().expect("worked out above");
     let mut out = Pruned {
         nodes: decls
             .iter()
             .copied()
-            .filter(|&d| {
-                tx.tree.kind(d) == NodeKind::PrefixDecl
-                    && unused.contains(&d)
-                    && comments.leading(d).is_empty()
-                    && comments.trailing(d).is_empty()
-                    && bindings[&prefix_parts(tx, d).0].len() == 1
-            })
+            .filter(|d| dropped.contains(d))
             .collect(),
         ..Pruned::default()
     };
-    if leading
-        && let Some(&first) = decls.first()
-        && out.nodes.contains(&first)
+    out.pass_on(tx, decls);
+    out
+}
+
+/// The prefix declarations of the document that `prune-prefixes` drops: those nothing
+/// uses that have no comment of their own (leading or trailing), but the first one under
+/// the file header when it would be printed first, and those [`scoped`] keeps. None in a
+/// document of directives alone.
+fn dropped(tx: &Tx<'_, '_>) -> HashSet<NodeId> {
+    let root = tx.tree.root();
+    let directive = |d: NodeId| {
+        matches!(
+            tx.tree.kind(d),
+            NodeKind::PrefixDecl | NodeKind::BaseDecl | NodeKind::VersionDecl
+        )
+    };
+    let items: Vec<NodeId> = tx.tree.child_nodes(root).collect();
+    if items.iter().all(|&d| directive(d)) {
+        return HashSet::new();
+    }
+    let comments = tx.comments;
+    let unused =
+        prune::unused_declarations_with(tx.tree, &tx.scope, tx.opts, |n| comments.ignored(n));
+    let decls: Vec<NodeId> = items
+        .iter()
+        .copied()
+        .filter(|&d| tx.tree.kind(d) == NodeKind::PrefixDecl)
+        .collect();
+    let mut candidates: HashSet<NodeId> = decls
+        .iter()
+        .copied()
+        .filter(|d| {
+            unused.contains(d)
+                && comments.leading(*d).is_empty()
+                && comments.trailing(*d).is_empty()
+        })
+        .collect();
+    let mut out = scoped(tx, &decls, &candidates);
+    // the leading block: the directives the document starts with
+    let leading: Vec<NodeId> = items
+        .iter()
+        .copied()
+        .take_while(|&d| directive(d))
+        .collect();
+    if let Some(&first) = leading.first()
+        && out.contains(&first)
         && tx.tree.first_token(first) == tx.tree.first_token(root)
         && !comments.header().is_empty()
         && !comments.blank_before(first)
-        && printed_first(tx, decls, &out.nodes)
+        && printed_first(tx, &leading, &out)
     {
-        out.nodes.remove(&first);
+        candidates.remove(&first);
+        out = scoped(tx, &decls, &candidates);
     }
-    out.pass_on(tx, decls);
+    out
+}
+
+/// The `candidates` among the prefix declarations `decls` (in document order) that go.
+/// A candidate stays when the last declaration of its label kept before it binds a
+/// different namespace, since dropping it would extend that binding over its scope.
+fn scoped(tx: &Tx<'_, '_>, decls: &[NodeId], candidates: &HashSet<NodeId>) -> HashSet<NodeId> {
+    let mut in_force: HashMap<String, String> = HashMap::new();
+    let mut out = HashSet::new();
+    for &d in decls {
+        let (label, iri) = prefix_parts(tx, d);
+        if candidates.contains(&d) && in_force.get(&label).is_none_or(|kept| *kept == iri) {
+            out.insert(d);
+        } else {
+            in_force.insert(label, iri);
+        }
+    }
     out
 }
 
@@ -269,13 +298,35 @@ mod tests {
             ),
             "PREFIX a: <http://e/1#>\n\na:s a:p 1 .\nPREFIX b: <http://e/b#>\n\nb:s b:p 2 .\n"
         );
-        // to different namespaces: both stay (without the second, the first would
-        // compact the IRI below the next time)
+        // to different namespaces, the first one printed: the unused redefinition stays
+        // (without it, the first would compact the IRI below the next time)
         assert_eq!(
             pruned(
                 "PREFIX a: <http://e/1#>\na:s a:p 1 .\nPREFIX a: <http://e/2#>\nPREFIX b: <http://e/b#>\nb:s b:p <http://e/1#o> ."
             ),
             "PREFIX a: <http://e/1#>\n\na:s a:p 1 .\nPREFIX a: <http://e/2#>\nPREFIX b: <http://e/b#>\n\nb:s b:p <http://e/1#o> .\n"
+        );
+        // the first one unused: its scope ends at the redefinition, and it goes; so does
+        // the redefinition when nothing uses it either
+        assert_eq!(
+            pruned(
+                "PREFIX a: <http://e/1#>\n<http://e/s> <http://e/p> 1 .\nPREFIX a: <http://e/2#>\na:s a:p 2 ."
+            ),
+            "<http://e/s> <http://e/p> 1 .\nPREFIX a: <http://e/2#>\n\na:s a:p 2 .\n"
+        );
+        assert_eq!(
+            pruned(
+                "PREFIX ex: <http://example.org/>\n PREFIX o: <http://example.org/o/> ex:s ex:p _:x . ex:s ex:p '''two\nlines''', '''two\nlines''' . @prefix o: <http://other.org/> . ex:s ex:p '''two\nlines''' .\n"
+            ),
+            "PREFIX ex: <http://example.org/>\n\nex:s ex:p _:x .\n\nex:s\n  ex:p \"\"\"two\nlines\"\"\", \"\"\"two\nlines\"\"\" ;\n.\n\nex:s ex:p \"\"\"two\nlines\"\"\" .\n"
+        );
+        // a redefinition dropped in between: the first binding is still the one printed
+        // before the third
+        assert_eq!(
+            pruned(
+                "PREFIX a: <http://e/1#>\na:s a:p 1 .\nPREFIX a: <http://e/1#>\n<http://e/s> <http://e/p> 2 .\nPREFIX a: <http://e/2#>\n<http://e/s> <http://e/p> <http://e/1#o> ."
+            ),
+            "PREFIX a: <http://e/1#>\n\na:s a:p 1 .\n<http://e/s> <http://e/p> 2 .\nPREFIX a: <http://e/2#>\n\n<http://e/s> <http://e/p> <http://e/1#o> .\n"
         );
         // a later block that prints nothing goes, and is no sort barrier any more
         let sorted = Options {

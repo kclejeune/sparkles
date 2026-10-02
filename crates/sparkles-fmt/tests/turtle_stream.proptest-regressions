@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a91121328dc132e438eb34c10d7c6def7f76100f7f56b9d11e61935c3e59ded0 # shrinks to trig = false, doc = "PREFIX ex: <http://example.org/>\n @prefix o: <http://other.org/> .\n# c\nex:s ex:p _:x . ex:s ex:p '''two\nlines''' . PREFIX o: <http://example.org/o/> ex:s ex:p '''two\nlines''' .\n", window = 1, read = 1, prune = true, conventional = false

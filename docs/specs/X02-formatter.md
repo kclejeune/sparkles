@@ -2187,10 +2187,15 @@ default.
 **Chosen during implementation** (open to revision): with sort off, the CLI streams
 Turtle/TriG of any size, and `--max-bytes` (256 MiB) then bounds the largest statement.
 The "convert to N-Triples" error remains for SPARQL, JSON-LD and sorted Turtle/TriG.
-`sparkles lsp` reads only the nearest `.sparklesfmt.toml`. The opt-in task
-`fmt:jsonld-compare`, outside `ci`, compares the JSON-LD layout with `oxfmt`, which
-follows Prettier's JSON conventions and is already pinned in `ui/`. The SHACL shapes
-field became a CodeMirror editor so that its Format keeps one-step undo.
+`sparkles lsp` reads only the nearest `.sparklesfmt.toml`. In Turtle and TriG,
+`prune-prefixes` drops an unused declaration even when a later directive redefines its
+label, because its scope ends at the redefinition. An unused redefinition stays only when
+the last declaration of its label that the output keeps binds a different namespace.
+Dropping it would extend that binding over the redefinition's scope, and the next run
+would compact IRIs there with it. Streamed and in-memory formatting follow the same rule.
+The opt-in task `fmt:jsonld-compare`, outside `ci`, compares the JSON-LD layout with
+`oxfmt`, which follows Prettier's JSON conventions and is already pinned in `ui/`. The
+SHACL shapes field became a CodeMirror editor so that its Format keeps one-step undo.
 
 **Other deviations:** the body limit flag is `--format-max-mb` (default 16), like the
 server's other size flags. An ignore pragma right before the first node leads that node
