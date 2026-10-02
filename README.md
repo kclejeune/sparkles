@@ -50,8 +50,8 @@ running queries.
   snapshot ([API](docs/API.md#point-in-time-reads-and-snapshots)).
 * A read-only integrity check ([usage](docs/USAGE.md#checking-a-database)).
 * Parallel bulk loading with external sort.
-* N-Quads dumps, and incremental, deduplicated backups to a file system or S3
-  ([usage](docs/USAGE.md#backup-repositories)).
+* N-Quads dumps, and incremental, deduplicated backups of persistent and in-memory
+  datasets to a file system or S3 ([usage](docs/USAGE.md#backup-repositories)).
 
 **SPARQL**
 * SPARQL 1.1 Query and Update, and SPARQL 1.2 / RDF 1.2. Sparkles passes the W3C suites

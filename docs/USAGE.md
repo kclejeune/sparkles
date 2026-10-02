@@ -273,6 +273,16 @@ Backup repositories (see [API.md](API.md#backup-repositories)) also work offline
 stopped database. A server's own datasets are backed up through its HTTP API or UI, or by
 its policies.
 
+In-memory datasets (`--mem`, or `dbType=mem`) are backed up by the server too. They have
+no files on disk, so each backup first writes the dataset's current state to a temporary
+index generation in `<data>/tmp`. That needs about as much free disk space as the
+compacted dataset, on top of the `--min-free-disk-mb` reserve. The copy is removed when
+the upload ends. A backup taken this way restores as a new persistent dataset, with the
+same content, prefixes, validation and index settings. Each server start gives an
+in-memory dataset a new id, and retention keeps `min_count` backups per id. A policy for
+such datasets should therefore set `expire_after` with `min_count = 0` (see
+[API.md](API.md#lifecycle-policies)).
+
 `--repo` takes either a name from the backup config file or a URL. The config file is
 `--backup-config FILE` or `$SPARKLES_BACKUP_CONFIG`, and defaults to
 `$XDG_CONFIG_HOME/sparkles/backup.toml`. A URL is `file:///srv/backups/r`,
